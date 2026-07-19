@@ -18,7 +18,7 @@ from langchain_core.tools import tool
 
 from mimir.models import AuthContext
 from mimir.saga.client import SagaStore
-from mimir.sagatools import _format_saga_payload
+from mimir.sagatools import _format_saga_payload, _provenance_tag, _trust_groups
 
 
 # The PoC uses a single SagaStore instance per-process. Production
@@ -109,12 +109,21 @@ def _format_get_atoms(payload: dict) -> str:
     atoms = payload.get("atoms") or []
     missing = payload.get("missing") or []
     lines: list[str] = []
-    for a in atoms:
-        label = a.get("memory_type") or a.get("stream") or "raw"
-        content = (a.get("content") or "").strip().replace("\n", " ")
-        if len(content) > _GET_CONTENT_CAP:
-            content = content[:_GET_CONTENT_CAP] + "…"
-        lines.append(f"- [{a.get('id')}] [{label}] {content}")
+    trusted, untrusted = _trust_groups(atoms)
+    for heading, group in (("Trusted-origin memories:", trusted), ("Untrusted-origin memories:", untrusted)):
+        if not group:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(heading)
+        for a in group:
+            label = a.get("memory_type") or a.get("stream") or "raw"
+            content = (a.get("content") or "").strip().replace("\n", " ")
+            if len(content) > _GET_CONTENT_CAP:
+                content = content[:_GET_CONTENT_CAP] + "…"
+            lines.append(
+                f"- [{a.get('id')}] [{label}]{_provenance_tag(a)} {content}"
+            )
     body = "\n".join(lines) if lines else "(no atoms found)"
     if missing:
         body += (

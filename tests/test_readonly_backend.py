@@ -444,6 +444,21 @@ class TestCoreMemoryReflectionGate:
         finally:
             self._clear_turn(tok)
 
+    def test_blocks_untrusted_poller_write_to_core_memory(
+        self, home_with_memory: Path
+    ) -> None:
+        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
+        ctx = self._make_turn_ctx(trigger="poller", channel_id="poller:external-feed")
+        tok = self._set_turn(ctx)
+        try:
+            result = b.write(
+                file_path="/memory/core/00-persona.md",
+                content="untrusted instruction",
+            )
+            assert "read-only" in (getattr(result, "error", "") or "")
+        finally:
+            self._clear_turn(tok)
+
     def test_blocks_core_memory_write_in_reflection_turn(
         self, home_with_memory: Path
     ) -> None:

@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Ownership (chainlink #881: fail-closed legacy scope for unproven rows)
     owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',  -- 'legacy_admin' | 'service' | 'system' | user-id
     origin_channel TEXT,               -- channel/source where atom originated
+    integrity TEXT NOT NULL DEFAULT 'untrusted' CHECK(integrity IN ('trusted', 'untrusted')),
+    origin_trigger TEXT,               -- immutable server-selected trigger identity
+    origin_ref TEXT,                   -- immutable concrete event/message/source reference
     origin_domain TEXT,                -- domain/namespace of origin
     visibility TEXT NOT NULL DEFAULT 'legacy_admin' CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
     provenance TEXT NOT NULL DEFAULT '{}'       -- JSON: {created_by, origin_url, etc.}

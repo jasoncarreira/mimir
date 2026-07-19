@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterator
 
 
-CURRENT_SCHEMA_VERSION: int = 9
+CURRENT_SCHEMA_VERSION: int = 10
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -480,6 +480,14 @@ WHERE a.source_type = 'session_boundary'
             ON atoms(content_hash, agent_id, owner_principal)
             WHERE tombstoned = 0;
     """,
+    10: """
+        -- v10: Immutable, server-stamped provenance for recallable atoms.
+        -- Legacy rows fail closed as untrusted and have no invented origin.
+        ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted'
+            CHECK(integrity IN ('trusted', 'untrusted'));
+        ALTER TABLE atoms ADD COLUMN origin_trigger TEXT;
+        ALTER TABLE atoms ADD COLUMN origin_ref TEXT;
+    """,
 }
 
 
@@ -522,6 +530,16 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    # v10 marker: recallable-write integrity provenance (chainlink #948).
+    try:
+        atoms_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        atoms_cols = set()
+    if {"integrity", "origin_trigger", "origin_ref"} <= atoms_cols:
+        return 10
+
     # v9 marker: owner-scoped exact-content dedup index (chainlink #895).
     try:
         dedup_columns = [
@@ -686,6 +704,8 @@ _OWNERSHIP_COLUMNS = {
     "provenance",
 }
 
+_ATOM_PROVENANCE_COLUMNS = {"integrity", "origin_trigger", "origin_ref"}
+
 
 def _validate_ownership_schema(
     conn: sqlite3.Connection,
@@ -713,6 +733,16 @@ def _validate_ownership_schema(
             continue
         missing.extend(
             f"{table}.{column}" for column in sorted(_OWNERSHIP_COLUMNS - columns)
+        )
+
+    if target_version >= 10:
+        atom_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info('atoms')").fetchall()
+        }
+        missing.extend(
+            f"atoms.{column}"
+            for column in sorted(_ATOM_PROVENANCE_COLUMNS - atom_columns)
         )
 
     if missing:

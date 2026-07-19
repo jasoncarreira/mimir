@@ -3340,4 +3340,14 @@ def create_auth_context(
         domain=domain,
         resource_id=canonical_resource,
         bridge_instance=bridge_instance,
+        origin_trigger=(
+            f"{registered_service.authority_profile}-poller:{extra.get('poller_name')}"
+            if registered_service is not None
+            and event.trigger == "poller"
+            and registered_service.authority_profile
+            and isinstance(extra.get("poller_name"), str)
+            and extra.get("poller_name")
+            else event.trigger
+        ),
+        origin_ref=event.source_id,
     )

@@ -237,6 +237,46 @@ def _prompt_source_labels(
     ))
 
 
+def _auto_recall_source_labels(
+    auth_context: AuthContext,
+    payload: Mapping[str, Any],
+) -> InformationFlowLabels:
+    """Build per-atom informational labels from authorized recall metadata."""
+    labels = InformationFlowLabels()
+    sources = payload.get("_ifc_sources")
+    if not isinstance(sources, list):
+        return labels
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        owner = item.get("owner_principal")
+        resource_id = item.get("resource_id")
+        if not isinstance(resource_id, str) or not resource_id:
+            continue
+        integrity = item.get("integrity")
+        if integrity not in Integrity._value2member_map_:
+            integrity = Integrity.UNTRUSTED
+        labels = labels.with_source(SourceLabel(
+            principal=owner if isinstance(owner, str) and owner else None,
+            domain="saga",
+            resource_id=resource_id,
+            bridge_instance="saga",
+            sensitivity="private",
+            authorized_principals=_protected_owner_acl(
+                auth_context,
+                owner if isinstance(owner, str) else None,
+                requester_visible=True,
+            ),
+            source_kind="auto_recall",
+            integrity=integrity,
+            # Accepted residual (#948): an untrusted fact can influence a later
+            # trusted turn. Auto-recall remains informational so it never
+            # handcuffs a user turn; see enforcement-enablement.md section 5.3.
+            integrity_effect=IntegrityEffect.INFORMATIONAL,
+        ))
+    return labels
+
+
 def _is_prompt_operator(auth_context: AuthContext) -> bool:
     return auth_context.is_service or "admin" in auth_context.roles
 
@@ -2425,6 +2465,7 @@ class Agent:
         # retrieval is wasteful noise; session summaries still fire
         # via _assemble_session_summaries for all trigger types.
         memory_block: str | None = None
+        memory_labels = InformationFlowLabels()
         saga_atom_ids: list[str] = []
         if self._saga is not None and event.trigger not in NON_USER_QUERY_TRIGGERS:
             try:
@@ -2447,6 +2488,9 @@ class Agent:
                     auth_context=initial_auth_context,
                 )
                 raw_block = _format_saga_payload(payload)
+                memory_labels = _auto_recall_source_labels(
+                    initial_auth_context, payload,
+                )
                 if raw_block and raw_block != "(no atoms)":
                     memory_block = raw_block
                 ids = _atom_ids_from_response(payload)
@@ -2486,6 +2530,7 @@ class Agent:
             saga_block=memory_block,
             subagent_block=subagent_block,
             initial_auth_context=initial_auth_context,
+            saga_labels=memory_labels,
         )
 
         # Protected loaders merge their authoritative provenance into the turn
@@ -3841,6 +3886,7 @@ class Agent:
         saga_block: str | None,
         subagent_block: str | None,
         initial_auth_context: AuthContext | None = None,
+        saga_labels: InformationFlowLabels | None = None,
     ) -> tuple[str, list]:
         """Assemble the per-turn user-side prompt + the recent-message
         list. Synthesis turns get a dedicated synthesis prompt; everything
@@ -4097,7 +4143,7 @@ class Agent:
         if saga_block:
             source_blocks.append(PromptBlock(
                 saga_block,
-                _prompt_source_labels(
+                saga_labels if saga_labels and saga_labels.sources else _prompt_source_labels(
                     auth_context, domain="saga", resource="query",
                     channel_id=event.channel_id, principal=effective_principal,
                 ),

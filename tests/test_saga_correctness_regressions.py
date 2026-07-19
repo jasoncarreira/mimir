@@ -454,11 +454,11 @@ def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_cur
     tmp_path,
 ):
     """The mid-init retry scenario: ``schema.sql`` ran (producing
-    v9-shape tables), then the migration step raised and the connection
+    current-shape tables), then the migration step raised and the connection
     got closed before schema_version was stamped. Next ``_ensure_conn``
     sees ``fresh=False, applied={}``, but tables are already at
-    ``CURRENT_SCHEMA_VERSION``. ``_detect_schema_version`` returns 9
-    via the owner-scoped dedup index marker — stamp v1..v9 and skip the migrations
+    ``CURRENT_SCHEMA_VERSION``. ``_detect_schema_version`` returns 10
+    via the atom provenance marker and skips the migrations
     loop rather than re-running migrations on already-current tables.
 
     Regression guard: under the naive "treat empty applied as v1"
@@ -468,24 +468,24 @@ def test_apply_pending_migrations_fresh_false_empty_applied_skips_when_db_is_cur
     """
     from mimir.saga.client import SagaStore
 
-    # Real SagaStore against a real v9 DB (the file-backed path triggers
+    # Real SagaStore against a current DB (the file-backed path triggers
     # schema.sql; we don't patch CURRENT_SCHEMA_VERSION or MIGRATIONS
     # here because we want the production schema to fire).
-    db_path = tmp_path / "v9.saga.db"
+    db_path = tmp_path / "v10.saga.db"
     store = SagaStore(db_path=db_path)
-    conn = store._ensure_conn()  # creates v9-shape tables + stamps v9
+    conn = store._ensure_conn()  # creates current-shape tables + stamps v10
 
     # Simulate the mid-init failure by clearing schema_version.
     conn.execute("DELETE FROM schema_version")
     conn.commit()
 
     # Now call _apply_pending_migrations(fresh=False) — it should
-    # detect v9 via the owner-scoped dedup index and stamp without running anything.
+    # Detect v10 via provenance columns and stamp without running anything.
     store._apply_pending_migrations(conn, fresh=False)
 
     versions = {r[0] for r in conn.execute("SELECT version FROM schema_version")}
-    assert versions == {1, 2, 3, 4, 5, 6, 7, 8, 9}, (
-        f"all baselines 1..9 should be stamped on a v9-shape DB; got {sorted(versions)}"
+    assert versions == set(range(1, 11)), (
+        f"all baselines 1..10 should be stamped on a current DB; got {sorted(versions)}"
     )
 
 
@@ -499,13 +499,13 @@ def test_detect_schema_version_returns_one_for_bare_db(tmp_path):
     assert store._detect_schema_version(conn) == 1
 
 
-def test_detect_schema_version_returns_nine_for_current_schema(tmp_path):
-    """A DB created via the current ``schema.sql`` → v9 (owner-scoped dedup index)."""
+def test_detect_schema_version_returns_ten_for_current_schema(tmp_path):
+    """A DB created via the current ``schema.sql`` has provenance columns."""
     from mimir.saga.client import SagaStore
 
     store = SagaStore(db_path=tmp_path / "v8.saga.db")
     conn = store._ensure_conn()
-    assert store._detect_schema_version(conn) == 9
+    assert store._detect_schema_version(conn) == 10
 
 
 def test_detect_schema_version_distinguishes_v2_v3_v4(tmp_path):

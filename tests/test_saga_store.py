@@ -294,6 +294,46 @@ async def test_get_atoms_batch_load_preserves_order(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_atoms_round_trips_immutable_provenance(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    stored = await client.store(
+        "poller finding", owner_principal="service:poller:feed",
+        integrity="untrusted", origin_trigger="research-poller:feed",
+        origin_ref="https://example.test/finding/7",
+    )
+    result = await client.get_atoms([stored["atom_id"]], auth_context=ADMIN_SCOPE)
+
+    atom = result["atoms"][0]
+    assert atom["integrity"] == "untrusted"
+    assert atom["origin_trigger"] == "research-poller:feed"
+    assert atom["origin_ref"] == "https://example.test/finding/7"
+    assert atom["captured_at"] == atom["created_at"]
+    assert result["_ifc_sources"][0]["integrity"] == "untrusted"
+
+
+def test_recall_renderer_groups_trust_and_shows_origin() -> None:
+    from mimir.sagatools import _format_saga_payload
+
+    rendered = _format_saga_payload({"atoms": [
+        {
+            "content": "operator fact", "integrity": "trusted",
+            "origin_trigger": "user_message", "origin_ref": "msg-1",
+        },
+        {
+            "content": "poller fact", "integrity": "untrusted",
+            "origin_trigger": "research-poller:feed",
+            "origin_ref": "https://example.test/finding/7",
+        },
+    ]})
+
+    assert rendered.index("Trusted-origin memories:") < rendered.index(
+        "Untrusted-origin memories:"
+    )
+    assert "trigger=research-poller:feed" in rendered
+    assert "ref=https://example.test/finding/7" in rendered
+
+
+@pytest.mark.asyncio
 async def test_get_atoms_reports_missing(client, monkeypatch):
     _patch_provider(monkeypatch)
     a = await client.store("a real atom")

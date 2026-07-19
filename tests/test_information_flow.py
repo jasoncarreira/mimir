@@ -28,6 +28,7 @@ from mimir.access_control import (
 from mimir.agent import (
     Agent,
     _initialize_ifc_labels,
+    _auto_recall_source_labels,
     _merge_ifc_labels,
     _prompt_source_labels,
     _propagate_ifc_labels,
@@ -301,6 +302,22 @@ def test_protected_prompt_sources_are_informational():
     ).sources))
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "informational"
+
+
+def test_auto_recalled_untrusted_atom_is_visible_but_never_active_ingest():
+    auth = _auth()
+    labels = _auto_recall_source_labels(auth, {"_ifc_sources": [{
+        "resource_id": "atom:a1",
+        "owner_principal": "user-1",
+        "integrity": "untrusted",
+        "origin_trigger": "research-poller:hn-ai",
+        "origin_ref": "https://example.test/item/1",
+    }]})
+
+    source = next(iter(labels.sources))
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "informational"
+    assert labels.has_untrusted_active_ingest is False
 
 
 def test_delegation_wires_service_derived_acl_intersection_into_carrier():

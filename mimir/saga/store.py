@@ -86,6 +86,9 @@ def store(
     session_dedup_threshold: float | None = None,
     owner_principal: str | None = None,
     origin_channel: str | None = None,
+    integrity: str = "untrusted",
+    origin_trigger: str | None = None,
+    origin_ref: str | None = None,
     origin_domain: str | None = None,
     visibility: str | None = None,
     provenance: dict | None = None,
@@ -113,6 +116,8 @@ def store(
     """
     if not content or not content.strip():
         raise ValueError("store: content cannot be empty")
+    if integrity not in {"trusted", "untrusted"}:
+        raise ValueError(f"store: invalid integrity {integrity!r}")
     content = content.strip()
     content_hash = _hash_content(content)
     created_at = _utc_now_iso()
@@ -209,8 +214,9 @@ def store(
             "stream, profile, memory_type, arousal, valence, "
             "encoding_confidence, topics, source_type, metadata, "
             "agent_id, session_id, is_pinned, owner_principal, "
-            "origin_channel, origin_domain, visibility, provenance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "origin_channel, integrity, origin_trigger, origin_ref, "
+            "origin_domain, visibility, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 atom_id, content, content_hash, created_at,
                 stream, profile, memory_type, arousal, valence,
@@ -219,6 +225,9 @@ def store(
                 agent_id, session_id, 1 if is_pinned else 0,
                 owner_principal or "legacy_admin",
                 origin_channel,
+                integrity,
+                origin_trigger,
+                origin_ref,
                 origin_domain,
                 visibility or "legacy_admin",
                 json.dumps(provenance or {}),
