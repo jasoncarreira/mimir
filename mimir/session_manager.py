@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .event_logger import log_event
-from .models import AuthContext, SessionACL
+from .models import AuthContext, EgressSessionState, SessionACL
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ class ChannelSession:
     )
     ended: bool = False
     source_acl: SessionACL = field(default_factory=SessionACL)
+    egress_state: EgressSessionState = field(default_factory=EgressSessionState)
 
 
 def _make_saga_session_id(channel_id: str) -> str:

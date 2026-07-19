@@ -16,6 +16,7 @@ from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     CapabilityTier,
+    EgressOrigin,
     ServicePrincipal,
     ServiceSinkPolicy,
     SinkCategory,
@@ -770,6 +771,131 @@ def test_poller_unbounded_sink_requires_trusted_content(
 
     assert trusted.allowed is True
     assert untrusted.allowed is False
+
+
+def test_deterministic_heartbeat_fetch_is_taint_independent_but_model_choice_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = "https://approved.example/fixed?check=1"
+    monkeypatch.setenv("MIMIR_HEARTBEAT_APPROVED_URLS", destination)
+    service = ServicePrincipal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        capabilities=("fetch_url",),
+        readable_domains=("configured_inputs",),
+        sink_policies=(ServiceSinkPolicy(
+            "fetch_url", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS",
+        ),),
+        capability_tier=CapabilityTier.UNBOUNDED,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+
+    deterministic = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+        egress_origin=EgressOrigin.TRUSTED_CONFIG,
+    )
+    model_chosen = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+    other_path = SinkGate.check_sink_flow(
+        "fetch_url", "https://approved.example/other", labels, auth, enforce=True,
+        egress_origin=EgressOrigin.TRUSTED_CONFIG,
+    )
+
+    assert deterministic.allowed is True
+    assert model_chosen.reason == "ifc_label_blocked:network"
+    assert other_path.reason == "egress_destination_not_approved"
+
+
+def test_model_payload_is_gated_after_active_ingest_but_config_payload_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://api.tavily.com/search"
+    monkeypatch.setenv("MIMIR_TEST_SEARCH_URLS", target)
+    service = ServicePrincipal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        capabilities=("web_search",),
+        readable_domains=("configured_inputs",),
+        sink_policies=(ServiceSinkPolicy(
+            "web_search", "approved_urls", "MIMIR_TEST_SEARCH_URLS",
+        ),),
+        capability_tier=CapabilityTier.UNBOUNDED,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+    model_payload = SinkGate.check_sink_flow(
+        "web_search", target, labels, auth, enforce=True,
+    )
+    config_payload = SinkGate.check_sink_flow(
+        "web_search", target, labels, auth, enforce=True,
+        egress_origin=EgressOrigin.TRUSTED_CONFIG,
+    )
+
+    assert model_payload.reason == "ifc_label_blocked:network"
+    assert config_payload.allowed is True
+
+
+def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    source = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_channel("slack-C1").with_source(source)
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    exact = "https://example.test/report?day=1"
+    init_logger(tmp_path / "events.jsonl", session_id="egress-approval-test")
+    try:
+        assert SinkGate.check_sink_flow(
+            "fetch_url", exact, labels, auth, enforce=True,
+        ).reason == "egress_destination_not_approved"
+        assert approve_live_declassification(
+            auth, sink_category="network", destination=exact,
+            reason="operator approved this exact fetch URL",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+
+    assert SinkGate.check_sink_flow(
+        "fetch_url", exact, labels, auth, enforce=True,
+    ).allowed is True
+    assert SinkGate.check_sink_flow(
+        "fetch_url", "https://example.test/report?day=2", labels, auth, enforce=True,
+    ).reason == "egress_destination_not_approved"
+    assert SinkGate.check_sink_flow(
+        "fetch_url", "https://example.test/other?day=1", labels, auth, enforce=True,
+    ).reason == "egress_destination_not_approved"
+
+
+def test_approved_fetch_destination_does_not_trust_later_model_invocations(
+    tmp_path: Path,
+) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    destination = "https://example.test/fixed"
+    labels = _labels()
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    init_logger(tmp_path / "events.jsonl", session_id="egress-payload-test")
+    try:
+        assert approve_live_declassification(
+            auth, sink_category="network", destination=destination,
+            reason="approve this exact URL and one tainted invocation",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+
+    first = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+    later = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+
+    assert first.reason == "ifc_declassification_approved"
+    assert later.reason == "ifc_label_blocked:network"
 
 
 def test_trigger_sink_must_be_exact_declared_capability() -> None:

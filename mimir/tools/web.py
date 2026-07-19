@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import socket
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -54,12 +55,24 @@ UTC = timezone.utc
 # tests can override without monkeypatching the @tool decorators.
 
 _home: Path | None = None
+_authorized_fetch_urls: ContextVar[frozenset[str] | None] = ContextVar(
+    "mimir_authorized_fetch_urls", default=None,
+)
 
 
 def set_home(home: Path) -> None:
     """Mimir home path. Used to compute the fetch-cache directory."""
     global _home
     _home = home
+
+
+def begin_authorized_fetch(urls: frozenset[str]) -> Token:
+    """Bind the exact URLs authorized for one middleware-controlled fetch."""
+    return _authorized_fetch_urls.set(urls)
+
+
+def end_authorized_fetch(token: Token) -> None:
+    _authorized_fetch_urls.reset(token)
 
 
 def _fetch_cache_dir() -> Path:
@@ -181,6 +194,15 @@ class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         # Will raise SSRFBlocked if the redirect target is unsafe.
         _validate_fetch_url(newurl)
+        allowed = _authorized_fetch_urls.get()
+        if allowed is not None:
+            from ..access_control import SinkCategory, normalize_sink_destination
+
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, newurl)
+            if normalized not in allowed:
+                raise SSRFBlocked(
+                    f"redirect target exact URL {newurl!r} is not approved"
+                )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 

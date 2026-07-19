@@ -395,6 +395,22 @@ async def test_fetch_url_blocks_redirect_to_metadata_service(
         )
 
 
+def test_fetch_url_rejects_public_redirect_not_on_exact_url_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    handler = web_tools_mod._SSRFCheckingRedirectHandler()
+    token = web_tools_mod.begin_authorized_fetch(frozenset({"https://example.com/start"}))
+    try:
+        with pytest.raises(web_tools_mod.SSRFBlocked, match="exact URL"):
+            handler.redirect_request(
+                web_tools_mod.Request("https://example.com/start"), None, 302, "Found", {},
+                "https://example.com/other",
+            )
+    finally:
+        web_tools_mod.end_authorized_fetch(token)
+
+
 @pytest.mark.asyncio
 async def test_fetch_url_max_bytes_exceeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

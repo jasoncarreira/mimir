@@ -142,9 +142,11 @@ def test_routine_tools_have_explicit_catalog_decisions(
 def test_web_tools_are_open_but_remain_network_sinks_when_enforced(
     tool_name: str,
     roles: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.access_control import SinkCategory, get_sink_category
 
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://external.example")
     result = ToolRegistry().authorize_tool(
         tool_name,
         _auth_context(roles=roles, enforce=True),
