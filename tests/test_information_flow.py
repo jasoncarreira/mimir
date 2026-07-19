@@ -38,6 +38,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     SourceLabel,
     TurnInteractivity,
 )
@@ -311,6 +312,17 @@ def test_merge_cannot_erase_labels_during_continuation_or_summary():
     merged = _merge_ifc_labels(original, asserted_public)
 
     assert merged.labels == frozenset({"private", "internal", "public"})
+
+
+def test_information_flow_state_merge_clean_carrier_preserves_current_taint():
+    current = _labels(labels=frozenset({"private", "confidential"}))
+    state = InformationFlowState(labels=current)
+
+    merged = state.merge(InformationFlowLabels())
+
+    assert merged.labels == current.labels
+    assert merged.source_channels == current.source_channels
+    assert merged.sources == current.sources
 
 
 @pytest.mark.parametrize("label", sorted(ALL_LABELS))
