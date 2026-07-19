@@ -24,6 +24,7 @@ import logging
 import os
 import shlex
 from contextvars import ContextVar, Token
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -122,6 +123,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "web_search": SinkCategory.NETWORK,
     "shell_exec": SinkCategory.SHELL_PROCESS,
     "bash_async": SinkCategory.SHELL_PROCESS,
+    "Bash": SinkCategory.SHELL_PROCESS,
+    "bash": SinkCategory.SHELL_PROCESS,
+    "bash_exec": SinkCategory.SHELL_PROCESS,
+    "execute": SinkCategory.SHELL_PROCESS,
+    "aexecute": SinkCategory.SHELL_PROCESS,
+    "shell": SinkCategory.SHELL_PROCESS,
     "spawn_claude_code": SinkCategory.SPAWN,
     "spawn_codex": SinkCategory.SPAWN,
     "spawn_open_code": SinkCategory.SPAWN,
@@ -129,6 +136,12 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
+    "Write": SinkCategory.FILE,
+    "Edit": SinkCategory.FILE,
+    "download_files": SinkCategory.FILE,
+    "adownload_files": SinkCategory.FILE,
+    "rebuild_index": SinkCategory.FILE,
+    "request_mimir_update": SinkCategory.FILE,
     "memory_store": SinkCategory.SAGA,
     "saga_record_skill_learning": SinkCategory.SAGA,
     "saga_feedback": SinkCategory.SAGA,
@@ -137,17 +150,107 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "saga_end_session": SinkCategory.SAGA,
     "add_schedule": SinkCategory.SCHEDULER,
     "set_schedule_priority": SinkCategory.SCHEDULER,
+    "remove_schedule": SinkCategory.SCHEDULER,
+    "set_poller_overrides": SinkCategory.SCHEDULER,
+    "reload_pollers": SinkCategory.SCHEDULER,
+    "commitment_complete": SinkCategory.SAGA,
+    "commitment_snooze": SinkCategory.SAGA,
+    "commitment_dismiss": SinkCategory.SAGA,
+    "defer_injected_message": SinkCategory.SAGA,
     "open_proposal": SinkCategory.PROPOSAL,
     "submit_proposal": SinkCategory.PROPOSAL,
     "abandon_proposal": SinkCategory.PROPOSAL,
 }
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
-    **{name: ToolFlowDirection.SINK for name in _SINK_CATEGORY_MAP},
+    # Native model tools. This is intentionally exhaustive rather than derived
+    # from the sink map: startup checks the assembled surface against this map,
+    # so adding a tool without making an IFC decision fails closed.
+    # Declassification mutates the live authorization carrier but does not itself
+    # read protected data or emit it; the subsequent exact sink remains gated.
+    "approve_declassification": ToolFlowDirection.NEITHER,
+    "memory_query": ToolFlowDirection.SOURCE,
+    "memory_get": ToolFlowDirection.SOURCE,
+    "memory_store": ToolFlowDirection.SINK,
+    "open_proposal": ToolFlowDirection.SINK,
+    "submit_proposal": ToolFlowDirection.SINK,
+    "abandon_proposal": ToolFlowDirection.SINK,
+    "saga_feedback": ToolFlowDirection.SINK,
+    "saga_mark_contributions": ToolFlowDirection.SINK,
+    "saga_end_session": ToolFlowDirection.SINK,
+    "saga_forget": ToolFlowDirection.SINK,
+    "saga_record_skill_learning": ToolFlowDirection.SINK,
+    "file_search": ToolFlowDirection.SOURCE,
+    "rebuild_index": ToolFlowDirection.SINK,
+    "mimir_get_turn": ToolFlowDirection.SOURCE,
+    "get_turn": ToolFlowDirection.SOURCE,
+    "shell_exec": ToolFlowDirection.BOTH,
+    "bash_async": ToolFlowDirection.BOTH,
+    "bash_jobs_list": ToolFlowDirection.SOURCE,
+    "bash_job_output": ToolFlowDirection.SOURCE,
+    "send_message": ToolFlowDirection.SINK,
+    "react": ToolFlowDirection.SINK,
     "fetch_channel_history": ToolFlowDirection.SOURCE,
+    "list_channels": ToolFlowDirection.SOURCE,
+    "defer_injected_message": ToolFlowDirection.SINK,
+    "list_schedules": ToolFlowDirection.SOURCE,
+    "add_schedule": ToolFlowDirection.SINK,
+    "set_schedule_priority": ToolFlowDirection.SINK,
+    "remove_schedule": ToolFlowDirection.SINK,
+    "set_poller_overrides": ToolFlowDirection.SINK,
+    "reload_pollers": ToolFlowDirection.SINK,
+    "commitment_complete": ToolFlowDirection.SINK,
+    "commitment_snooze": ToolFlowDirection.SINK,
+    "commitment_dismiss": ToolFlowDirection.SINK,
+    "commitment_list": ToolFlowDirection.SOURCE,
+    "worklink_run": ToolFlowDirection.BOTH,
+    "request_mimir_update": ToolFlowDirection.SINK,
+    "web_search": ToolFlowDirection.BOTH,
+    "fetch_url": ToolFlowDirection.BOTH,
+    "post_message": ToolFlowDirection.SINK,
+    "webhook": ToolFlowDirection.SINK,
+    "http_request": ToolFlowDirection.BOTH,
+    "ntfy_send": ToolFlowDirection.SINK,
+    "spawn_claude_code": ToolFlowDirection.BOTH,
+    "spawn_codex": ToolFlowDirection.BOTH,
+    "spawn_open_code": ToolFlowDirection.BOTH,
+    # Deepagents model-bound built-ins and their async/compatibility aliases.
+    "read_file": ToolFlowDirection.SOURCE,
+    "aread": ToolFlowDirection.SOURCE,
+    "ls": ToolFlowDirection.SOURCE,
+    "als": ToolFlowDirection.SOURCE,
+    "glob": ToolFlowDirection.SOURCE,
+    "aglob": ToolFlowDirection.SOURCE,
+    "grep": ToolFlowDirection.SOURCE,
+    "agrep": ToolFlowDirection.SOURCE,
+    "write_file": ToolFlowDirection.SINK,
+    "edit_file": ToolFlowDirection.SINK,
+    "download_files": ToolFlowDirection.BOTH,
+    "adownload_files": ToolFlowDirection.BOTH,
+    "write_todos": ToolFlowDirection.NEITHER,
+    # Built-in subagents remain inside the current IFC carrier; delegation
+    # propagation is handled separately and is not an external sink itself.
+    "task": ToolFlowDirection.NEITHER,
+    "Bash": ToolFlowDirection.BOTH,
+    "bash": ToolFlowDirection.BOTH,
+    "bash_exec": ToolFlowDirection.BOTH,
+    "execute": ToolFlowDirection.BOTH,
+    "aexecute": ToolFlowDirection.BOTH,
+    "shell": ToolFlowDirection.BOTH,
+    "Write": ToolFlowDirection.SINK,
+    "Edit": ToolFlowDirection.SINK,
+    "Read": ToolFlowDirection.SOURCE,
+    "Glob": ToolFlowDirection.SOURCE,
+    "Grep": ToolFlowDirection.SOURCE,
+    # Harness egress is not model-bound but shares the same gate.
+    "harness_auto_deliver": ToolFlowDirection.SINK,
+    "harness_resend_nudge": ToolFlowDirection.SINK,
+    "activity_panel_post": ToolFlowDirection.SINK,
+    "activity_panel_edit": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
+DECLASSIFICATION_LIFETIME_SECONDS = 30.0
 
 
 def get_sink_category(tool_name: str) -> SinkCategory:
@@ -156,18 +259,12 @@ def get_sink_category(tool_name: str) -> SinkCategory:
     Unknown operations are not presumed public: doing so would make a newly
     added harness send an implicit IFC bypass until the map was updated.
     """
-    for prefix, category in _SINK_CATEGORY_MAP.items():
-        if tool_name.startswith(prefix):
-            return category
-    return SinkCategory.UNKNOWN
+    return _SINK_CATEGORY_MAP.get(tool_name, SinkCategory.UNKNOWN)
 
 
 def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
     """Return explicit native-tool flow metadata without name-prefix inference."""
-    for prefix, direction in _TOOL_FLOW_MAP.items():
-        if tool_name.startswith(prefix):
-            return direction
-    return ToolFlowDirection.UNKNOWN
+    return _TOOL_FLOW_MAP.get(tool_name, ToolFlowDirection.UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -623,6 +720,28 @@ class SinkGate:
         can_flow = ifc_labels.can_flow_to(effective_target or "", allowed_sinks)
 
         if not can_flow:
+            normalized_target = normalize_sink_destination(sink_category, target)
+            state = getattr(auth_context, "ifc_state", None)
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            if (
+                enforce
+                and normalized_target is not None
+                and isinstance(canonical_principal, str)
+                and state is not None
+                and state.consume_sink_approval(
+                    current=ifc_labels,
+                    sink_category=sink_category.value,
+                    destination=normalized_target,
+                    canonical_principal=canonical_principal,
+                )
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="ifc_declassification_approved",
+                    enforcement_enabled=enforce,
+                )
             reason = f"ifc_label_blocked:{sink_category.value}"
             is_shadow = not enforce
             return ToolAuthorization(
@@ -732,6 +851,9 @@ class SinkGate:
         for source in sources:
             if not getattr(source, "is_complete", False):
                 return frozenset()
+            # Fresh protected-result sources include the authenticated reader by
+            # construction; inherited or externally supplied labels do not, so
+            # keep this check as the fail-closed guard for those paths.
             if effective_principal not in source.authorized_principals:
                 return frozenset()
             source_kind = getattr(source, "source_kind", "channel")
@@ -761,6 +883,139 @@ class SinkGate:
         return frozenset({resolved_triggering})
 
 
+def normalize_sink_destination(
+    sink_category: SinkCategory | str,
+    destination: Any,
+) -> str | None:
+    """Return the canonical exact destination used by approval and enforcement."""
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return None
+    if category is SinkCategory.UNKNOWN or not isinstance(destination, str):
+        return None
+    value = destination.strip()
+    if not value or "\x00" in value:
+        return None
+    if category in {SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}:
+        return ChannelResourceAdapter._resolve_channel(value) or None
+    if category in {SinkCategory.FILE, SinkCategory.SPAWN}:
+        try:
+            return str(Path(value).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return None
+    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return None
+            if parsed.username is not None or parsed.password is not None:
+                return None
+            port = parsed.port
+            host = parsed.hostname.lower()
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            default_port = 80 if parsed.scheme.lower() == "http" else 443
+            netloc = host if port in {None, default_port} else f"{host}:{port}"
+            return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
+        except ValueError:
+            return None
+    return value
+
+
+def approve_live_declassification(
+    auth_context: Any,
+    *,
+    sink_category: Any,
+    destination: Any,
+    reason: Any,
+) -> tuple[bool, str]:
+    """Approve one exact sink on the exact live admin request carrier."""
+    from .models import AuthContext, InformationFlowLabels, InformationFlowState
+
+    if not isinstance(auth_context, AuthContext):
+        return False, "missing_auth_context"
+    if "admin" not in auth_context.roles:
+        return False, "admin_required"
+    principal = auth_context.principal
+    canonical_principal = auth_context.canonical_principal
+    if not isinstance(principal, str) or not principal.strip():
+        return False, "missing_authenticated_admin"
+    if not isinstance(canonical_principal, str) or not canonical_principal.strip():
+        return False, "missing_authenticated_admin"
+    if not isinstance(reason, str) or not reason.strip():
+        return False, "invalid_reason"
+    try:
+        category = SinkCategory(sink_category)
+    except (TypeError, ValueError):
+        return False, "unknown_sink_category"
+    normalized = normalize_sink_destination(category, destination)
+    if normalized is None:
+        return False, "malformed_destination"
+    state = auth_context.ifc_state
+    if not isinstance(state, InformationFlowState):
+        return False, "missing_ifc_state"
+
+    def durable_audit(
+        labels: InformationFlowLabels, issued_at: float, expires_at: float,
+    ) -> bool:
+        source_labels = [
+            {
+                "principal": source.principal,
+                "domain": source.domain,
+                "resource_id": source.resource_id,
+                "bridge_instance": source.bridge_instance,
+                "sensitivity": source.sensitivity,
+                "authorized_principals": sorted(source.authorized_principals),
+                "source_kind": source.source_kind,
+            }
+            for source in sorted(
+                labels.sources,
+                key=lambda item: (
+                    str(item.domain), str(item.resource_id), str(item.principal),
+                    str(item.sensitivity),
+                ),
+            )
+        ]
+        try:
+            from .event_logger import log_durable_event_sync
+
+            log_durable_event_sync(
+                "ifc_declassification",
+                source_labels=source_labels,
+                labels=sorted(labels.labels),
+                source_channels=sorted(labels.source_channels),
+                authenticated_admin={
+                    "principal": principal,
+                    "canonical_principal": canonical_principal,
+                    "roles": sorted(auth_context.roles),
+                },
+                reason=reason.strip(),
+                destination=normalized,
+                sink_category=category.value,
+                policy_version=IFC_POLICY_VERSION,
+                outcome="approved",
+                use_limit=1,
+                lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+                issued_at_monotonic=issued_at,
+                expires_at_monotonic=expires_at,
+            )
+        except Exception as exc:
+            log.warning("ifc declassification audit failed: %s", exc)
+            return False
+        return True
+
+    approved = state.approve_sink_once(
+        fallback=auth_context.ifc_labels,
+        sink_category=category.value,
+        destination=normalized,
+        canonical_principal=canonical_principal,
+        lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
+        durable_audit=durable_audit,
+    )
+    return (True, "approved") if approved else (False, "approval_failed")
+
+
 def audit_declassification(
     labels: Any,
     declassification_reason: str,
@@ -769,86 +1024,8 @@ def audit_declassification(
     destination: str,
     policy_version: str = IFC_POLICY_VERSION,
 ) -> Any:
-    """Audit admin declassification of IFC labels (chainlink #871).
-
-    This is the ONLY way to remove immutable/monotonic labels. Summarization,
-    model assertions, failures, and ordinary admin status do NOT erase labels.
-
-    Args:
-        labels: Current InformationFlowLabels
-        declassification_reason: Human-readable reason for declassification
-        auth_context: AuthContext with admin role
-
-    Returns:
-        New labels instance with declassification applied, or original if not admin
-    """
-    from .models import InformationFlowLabels
-
-    if not isinstance(labels, InformationFlowLabels):
-        return labels
-
-    is_admin = False
-    if auth_context is not None:
-        roles = getattr(auth_context, "roles", ()) or ()
-        is_admin = "admin" in roles
-
-    principal = getattr(auth_context, "principal", None)
-    canonical_principal = getattr(auth_context, "canonical_principal", None)
-    if (
-        not is_admin
-        or not isinstance(principal, str) or not principal.strip()
-        or not isinstance(canonical_principal, str) or not canonical_principal.strip()
-        or not isinstance(declassification_reason, str) or not declassification_reason.strip()
-        or not isinstance(destination, str) or not destination.strip()
-        or not isinstance(policy_version, str) or not policy_version.strip()
-    ):
-        return labels
-
-    source_labels = [
-        {
-            "principal": source.principal,
-            "domain": source.domain,
-            "resource_id": source.resource_id,
-            "bridge_instance": source.bridge_instance,
-            "sensitivity": source.sensitivity,
-            "authorized_principals": sorted(source.authorized_principals),
-            "source_kind": source.source_kind,
-        }
-        for source in sorted(
-            labels.sources,
-            key=lambda item: (
-                str(item.domain), str(item.resource_id), str(item.principal),
-                str(item.sensitivity),
-            ),
-        )
-    ]
-    try:
-        from .event_logger import log_durable_event_sync
-
-        log_durable_event_sync(
-            "ifc_declassification",
-            source_labels=source_labels,
-            labels=sorted(labels.labels),
-            authenticated_admin={
-                "principal": principal,
-                "canonical_principal": canonical_principal,
-                "roles": sorted(getattr(auth_context, "roles", ()) or ()),
-            },
-            reason=declassification_reason.strip(),
-            destination=destination,
-            policy_version=policy_version,
-            outcome="approved",
-        )
-    except Exception as exc:  # fail closed without breaking the admin action caller
-        log.warning("ifc declassification audit failed: %s", exc)
-        return labels
-
-    return InformationFlowLabels(
-        labels=frozenset(),
-        source_channels=labels.source_channels,
-        sources=labels.sources,
-        created_at=labels.created_at,
-    )
+    """Deprecated no-op; only the live middleware action can authorize egress."""
+    return labels
 
 
 class ChannelResourceAdapter:
@@ -1018,6 +1195,7 @@ class OperationCatalog:
     })
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "approve_declassification",
         "list_channels",
         "list_schedules",
         "add_schedule",
@@ -1299,6 +1477,9 @@ class MCPResourceAdapter:
         provenance = get_tool_provenance(tool) if tool is not None else None
         decision = OperationDecision.ADMIN_REQUIRED
         reason = "mcp_missing_provenance"
+        validated_result: MCPAuthorizationResult | None = None
+        flow_direction = ToolFlowDirection.UNKNOWN
+        sink_check: ToolAuthorization | None = None
         if provenance is not None and provenance.is_tombstoned:
             reason = "mcp_drift_detected"
         elif provenance is not None:
@@ -1360,10 +1541,9 @@ class MCPResourceAdapter:
                                 decision = OperationDecision.ADMIN_REQUIRED
                                 reason = "mcp_flow_metadata_mismatch"
                                 result = None
-                        if isinstance(result, MCPAuthorizationResult) and result.allowed and decision is not OperationDecision.ADMIN_REQUIRED:
+                        if isinstance(result, MCPAuthorizationResult) and result.allowed:
                             if ifc_labels is None and context is not None:
                                 ifc_labels = getattr(context, "ifc_labels", None)
-                            sink_check = None
                             if result.sink_resources:
                                 sink_check = SinkGate.check_sink_flow(
                                     tool_name,
@@ -1375,41 +1555,54 @@ class MCPResourceAdapter:
                                 )
                             if sink_check is not None and not sink_check.allowed:
                                 return sink_check
-                            return ToolAuthorization(
-                                tool_name=tool_name,
-                                decision=decision,
-                                allowed=True,
-                                reason=(
-                                    sink_check.reason
-                                    if sink_check is not None and sink_check.is_shadow_decision
-                                    else None
-                                ),
-                                enforcement_enabled=enforce,
-                                is_shadow_decision=(
-                                    sink_check.is_shadow_decision if sink_check is not None else False
-                                ),
-                                protected_source_resources=result.source_resources,
-                                flow_direction=flow_direction,
-                            )
+                            validated_result = result
+                            if decision is not OperationDecision.ADMIN_REQUIRED:
+                                return ToolAuthorization(
+                                    tool_name=tool_name,
+                                    decision=decision,
+                                    allowed=True,
+                                    reason=(
+                                        sink_check.reason
+                                        if sink_check is not None and sink_check.is_shadow_decision
+                                        else None
+                                    ),
+                                    enforcement_enabled=enforce,
+                                    is_shadow_decision=(
+                                        sink_check.is_shadow_decision if sink_check is not None else False
+                                    ),
+                                    protected_source_resources=result.source_resources,
+                                    protected_sink_resources=result.sink_resources,
+                                    flow_direction=flow_direction,
+                                )
+                            reason = "admin_required"
                         elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
                             reason = result.reason or "mcp_resource_denied"
 
         is_admin = decision is OperationDecision.ADMIN_REQUIRED
         admin = context is not None and "admin" in (getattr(context, "roles", ()) or ())
-        hard_failure = reason in {
-            "mcp_unknown_flow_direction",
-            "mcp_flow_metadata_mismatch",
-        }
-        denied_by_policy = not admin
+        hard_failure = validated_result is None
+        denied_by_policy = hard_failure or (is_admin and not admin)
         allowed = (admin and not hard_failure) or not enforce
+        shadow_sink = sink_check is not None and sink_check.is_shadow_decision
         return ToolAuthorization(
             tool_name=tool_name,
             decision=decision,
             allowed=allowed,
-            reason=None if admin and not hard_failure else reason,
+            reason=(
+                sink_check.reason
+                if shadow_sink
+                else None if admin and not hard_failure else reason
+            ),
             required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
             enforcement_enabled=enforce,
-            is_shadow_decision=not enforce and denied_by_policy,
+            is_shadow_decision=shadow_sink or (not enforce and denied_by_policy),
+            protected_source_resources=(
+                validated_result.source_resources if validated_result is not None else None
+            ),
+            protected_sink_resources=(
+                validated_result.sink_resources if validated_result is not None else None
+            ),
+            flow_direction=flow_direction,
         )
 
     @staticmethod
@@ -1539,6 +1732,7 @@ class ToolAuthorization:
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
+    protected_sink_resources: tuple[str, ...] | None = None
     flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
 
     def as_log_fields(self) -> dict[str, Any]:
@@ -2329,6 +2523,15 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "abandon_proposal": "proposal",
     "add_schedule": "scheduler",
     "set_schedule_priority": "scheduler",
+    "remove_schedule": "scheduler",
+    "set_poller_overrides": "scheduler",
+    "reload_pollers": "scheduler",
+    "commitment_complete": "commitments",
+    "commitment_snooze": "commitments",
+    "commitment_dismiss": "commitments",
+    "defer_injected_message": "injected_messages",
+    "rebuild_index": "filesystem",
+    "request_mimir_update": "filesystem",
     "saga_feedback": "saga",
     "saga_mark_contributions": "saga",
     "saga_record_skill_learning": "saga",
@@ -2337,6 +2540,27 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "send_message": "message",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
+    "react": "message",
+    "web_search": "network",
+    "fetch_url": "network",
+    "post_message": "message",
+    "webhook": "network",
+    "http_request": "network",
+    "ntfy_send": "notification",
+    "download_files": "filesystem",
+    "adownload_files": "filesystem",
+    "Bash": "shell_process",
+    "bash": "shell_process",
+    "bash_exec": "shell_process",
+    "execute": "shell_process",
+    "aexecute": "shell_process",
+    "shell": "shell_process",
+    "Write": "filesystem",
+    "Edit": "filesystem",
+    "harness_auto_deliver": "message",
+    "harness_resend_nudge": "message",
+    "activity_panel_post": "message",
+    "activity_panel_edit": "message",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
@@ -2359,6 +2583,17 @@ class ProviderEnforcementCompatibilityError(Exception):
 
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
+    for operation, direction in sorted(_TOOL_FLOW_MAP.items()):
+        if direction not in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+            continue
+        if get_sink_category(operation) is SinkCategory.UNKNOWN:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no sink category"
+            )
+        if operation not in _OPERATION_SINK_DESTINATION:
+            errors.append(
+                f"IFC {direction.value} operation '{operation}' has no destination extraction"
+            )
     for operation in sorted(_OPERATION_SINK_DESTINATION):
         if get_sink_category(operation) is SinkCategory.UNKNOWN:
             errors.append(
@@ -2494,19 +2729,40 @@ def assert_capability_matrix_complete() -> None:
 
 
 def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
-    """Raise if the assembled model-bound Mimir tool surface is uncataloged."""
+    """Raise if the assembled native model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
 
     catalog = get_operation_catalog()
+    tools = tuple(all_mimir_tools(model_spec=model_spec))
     unknown_tools = sorted({
-        tool.name
-        for tool in all_mimir_tools(model_spec=model_spec)
+        tool.name for tool in tools
         if catalog.get_decision(tool.name) == OperationDecision.UNKNOWN
     })
+    unknown_flows = sorted({
+        tool.name for tool in tools
+        if get_tool_flow_direction(tool.name) == ToolFlowDirection.UNKNOWN
+    })
+    incomplete_sinks = sorted({
+        tool.name for tool in tools
+        if get_tool_flow_direction(tool.name) in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        }
+        and (
+            get_sink_category(tool.name) == SinkCategory.UNKNOWN
+            or tool.name not in _OPERATION_SINK_DESTINATION
+        )
+    })
+    errors: list[str] = []
     if unknown_tools:
+        errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
+    if unknown_flows:
+        errors.append("model-bound tools without explicit IFC flow metadata: " + ", ".join(unknown_flows))
+    if incomplete_sinks:
+        errors.append("model-bound IFC sinks without category/destination extraction: " + ", ".join(incomplete_sinks))
+    if errors:
         raise CapabilityMatrixError(
-            "Access-control enforcement blocked by UNKNOWN model-bound tools: "
-            + ", ".join(unknown_tools)
+            "Access-control enforcement blocked by incomplete model tool inventory: "
+            + "; ".join(errors)
         )
 
 

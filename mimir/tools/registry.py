@@ -413,6 +413,20 @@ def reset_current_turn_interactive(token: contextvars.Token) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 @tool
+def approve_declassification(
+    sink_category: str,
+    destination: str,
+    reason: str,
+) -> str:
+    """Authorize one audited egress to an exact destination for this private turn.
+
+    This admin-only action is executed by the authorization middleware against
+    the live turn carrier. Direct invocation cannot grant authority.
+    """
+    return "approve_declassification failed: missing live authorization middleware"
+
+
+@tool
 async def send_message(
     text: str,
     channel_id: Optional[str] = None,
@@ -1543,10 +1557,13 @@ async def commitment_list(
     from ..access_control import protected_result_source, publish_protected_result
 
     auth_context = runtime.context if runtime is not None else None
+    # ``actor_principal`` is the authority the store used to admit every row.
+    # Legacy/admin-visible records may not carry an owner, so provenance must
+    # retain the authenticated reader rather than emitting an incomplete label.
     publish_protected_result(tuple(
         protected_result_source(
             auth_context,
-            principal=getattr(c, "owner_principal", None),
+            principal=getattr(c, "owner_principal", None) or actor_principal,
             domain="commitments",
             resource_id=f"commitment:{c.id}",
             bridge_instance="mimir",
@@ -2031,6 +2048,88 @@ async def spawn_codex(
     return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
 
 
+def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
+    """Resolve a model-supplied ``artifact_root``, confined to the agent home.
+
+    ``spawn_open_code`` persists run artifacts (prompt.md / stdout.txt /
+    stderr.txt / manifest.json) with raw filesystem writes that BYPASS the
+    file-tool WriteGuard, at a path the model chose. Confine them to the home
+    so a steered / prompt-injected call can't persist the task prompt and
+    subprocess output to an arbitrary (e.g. externally-synced or world-readable)
+    location outside the sandbox. ``resolve()`` collapses ``..`` and follows
+    symlinks, so a link that escapes the home is caught. Raises ``ValueError``
+    if the resolved root is not the home or under it.
+    """
+    base = Path(artifact_root).expanduser().resolve()
+    home_resolved = Path(home).expanduser().resolve()
+    if base != home_resolved and not base.is_relative_to(home_resolved):
+        raise ValueError(
+            "artifact_root must be within the agent home "
+            f"({home_resolved}); got {base}"
+        )
+    return base
+
+
+def _write_run_artifacts_confined(
+    home: str | Path,
+    artifact_base: Path,
+    run_id: str,
+    files: dict[str, str],
+) -> Path:
+    """Create ``<artifact_base>/.factory/runs/<run_id>/`` and write ``files``
+    into it without ever following a symlink.
+
+    ``_confined_artifact_base`` validates the root BEFORE the spawn, but the
+    untrusted subprocess runs between that check and these writes and can plant
+    a symlink at a predictable path component (``.factory`` / ``runs``) so a
+    later ``Path.mkdir``/``write_text`` would escape the home — a TOCTOU that a
+    single pre-spawn ``resolve()`` cannot close. Walk from the trusted
+    (already-resolved, confined) home directory fd, creating and re-opening each
+    component with ``O_NOFOLLOW`` (openat semantics), and write each file with
+    ``O_NOFOLLOW | O_CREAT | O_EXCL``. A symlink planted at any component is
+    rejected (``OSError``) rather than followed, so the writes cannot leave the
+    home. ``run_id`` is unpredictable to the subprocess, so the run dir and its
+    files cannot be pre-planted. Returns the lexical run-dir path on success;
+    raises ``OSError`` if any component is a symlink or a write fails.
+    """
+    home_resolved = Path(home).expanduser().resolve()
+    rel_parts = artifact_base.relative_to(home_resolved).parts
+    components = [*rel_parts, ".factory", "runs", run_id]
+    # Anchor on the trusted, fully-resolved home (resolve() leaves no symlinks
+    # in it); every child below is opened O_NOFOLLOW.
+    opened: list[int] = [os.open(home_resolved, os.O_RDONLY | os.O_DIRECTORY)]
+    try:
+        for part in components:
+            try:
+                os.mkdir(part, 0o700, dir_fd=opened[-1])
+            except FileExistsError:
+                pass
+            opened.append(
+                os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=opened[-1],
+                )
+            )
+        run_fd = opened[-1]
+        for name, content in files.items():
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=run_fd,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+    finally:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return artifact_base / ".factory" / "runs" / run_id
+
+
 @tool
 async def spawn_open_code(
     prompt: str,
@@ -2086,6 +2185,18 @@ async def spawn_open_code(
     rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
     if rate_err is not None:
         return rate_err.replace("spawn_claude_code", "spawn_open_code")
+
+    # Validate the (model-controlled) artifact_root BEFORE spawning so a
+    # bad/escaping path is refused up front rather than after burning a run.
+    artifact_base: Optional[Path] = None
+    if artifact_root:
+        home = cfg.get("default_cwd")
+        if not home:
+            return "spawn_open_code refused: artifact_root set but no home is configured"
+        try:
+            artifact_base = _confined_artifact_base(artifact_root, home)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return f"spawn_open_code refused: {exc}"
 
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
     import shlex
@@ -2155,34 +2266,42 @@ async def spawn_open_code(
         )
 
     artifact_dir: Optional[Path] = None
-    if artifact_root:
+    if artifact_base is not None:
+        manifest = json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "launcher": "mimir.spawn_open_code",
+                "name": name,
+                "cwd": str(cwd_path) if cwd_path else None,
+                "model": model,
+                "agent": agent,
+                "status": status,
+                "exit_code": returncode,
+                "started_at": started.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
         try:
-            artifact_dir = Path(artifact_root).expanduser() / ".factory" / "runs" / run_id
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            (artifact_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-            (artifact_dir / "stdout.txt").write_text(stdout, encoding="utf-8")
-            (artifact_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
-            (artifact_dir / "manifest.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "run_id": run_id,
-                        "launcher": "mimir.spawn_open_code",
-                        "name": name,
-                        "cwd": str(cwd_path) if cwd_path else None,
-                        "model": model,
-                        "agent": agent,
-                        "status": status,
-                        "exit_code": returncode,
-                        "started_at": started.isoformat(),
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
+            # Symlink-safe: the untrusted subprocess has already run and may have
+            # planted a symlink at the predictable .factory/runs prefix, so the
+            # writes go through openat + O_NOFOLLOW rather than Path.mkdir /
+            # write_text (which would follow it out of the home). A rejected
+            # symlink / write failure simply skips artifacts (best-effort).
+            artifact_dir = _write_run_artifacts_confined(
+                home,
+                artifact_base,
+                run_id,
+                {
+                    "prompt.md": prompt,
+                    "stdout.txt": stdout,
+                    "stderr.txt": stderr,
+                    "manifest.json": manifest,
+                },
             )
         except OSError:
-            pass  # artifacts are best-effort; the structured return is primary
+            artifact_dir = None  # artifacts are best-effort; structured return is primary
 
     if status == "spawn_failed":
         stderr = "'opencode' CLI not on PATH"
@@ -2427,6 +2546,7 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
         saga_record_skill_learning,
     )
     tools = [
+        approve_declassification,
         # Memory (read + write)
         memory_query, memory_get, memory_store,
         # Change proposals for protected files (PR-gated; never writes live).

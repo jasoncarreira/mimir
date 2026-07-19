@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     SinkCategory,
     SinkGate,
+    ToolFlowDirection,
     ToolRegistry,
+    approve_live_declassification,
     audit_declassification,
     create_auth_context,
+    get_sink_category,
+    get_tool_flow_direction,
 )
 from mimir.agent import (
     Agent,
@@ -536,6 +545,101 @@ def test_persistent_writes_are_ifc_gated_not_merely_admin_gated(
     assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "sink_category"),
+    [
+        ("set_poller_overrides", SinkCategory.SCHEDULER),
+        ("reload_pollers", SinkCategory.SCHEDULER),
+        ("remove_schedule", SinkCategory.SCHEDULER),
+        ("commitment_complete", SinkCategory.SAGA),
+        ("commitment_snooze", SinkCategory.SAGA),
+        ("commitment_dismiss", SinkCategory.SAGA),
+        ("request_mimir_update", SinkCategory.FILE),
+        ("rebuild_index", SinkCategory.FILE),
+    ],
+)
+def test_inventory_omission_mutations_are_explicit_ifc_sinks(
+    tool_name: str,
+    sink_category: SinkCategory,
+) -> None:
+    assert get_tool_flow_direction(tool_name) is ToolFlowDirection.SINK
+    assert get_sink_category(tool_name) is sink_category
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _auth(roles=("admin",)),
+        enforce=True,
+        ifc_labels=_labels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == f"ifc_label_blocked:{sink_category.value}"
+
+
+@pytest.mark.asyncio
+async def test_tainted_poller_override_is_denied_before_handler_execution() -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    request = ToolCallRequest(
+        tool_call={
+            "name": "set_poller_overrides",
+            "args": {"poller_name": "mail", "overrides": {"prompt": "tainted"}},
+            "id": "ifc-poller-override",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth),
+    )
+    handler_calls = 0
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="mutated", tool_call_id="ifc-poller-override")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert handler_calls == 0
+    assert result.status == "error"
+    assert "ifc_label_blocked:scheduler" in str(result.content)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_direction"),
+    [
+        ("commitment_list", ToolFlowDirection.SOURCE),
+        ("write_todos", ToolFlowDirection.NEITHER),
+    ],
+)
+def test_non_sink_tools_have_explicit_flow_directions(
+    tool_name: str,
+    expected_direction: ToolFlowDirection,
+) -> None:
+    assert get_tool_flow_direction(tool_name) is expected_direction
+    assert get_sink_category(tool_name) is SinkCategory.UNKNOWN
+
+    with patch.object(SinkGate, "check_sink_flow") as sink_gate:
+        decision = ToolRegistry().authorize_tool(
+            tool_name,
+            _auth(),
+            enforce=True,
+            ifc_labels=_labels(),
+        )
+
+    assert decision.allowed is True
+    sink_gate.assert_not_called()
+
+
+def test_declassification_action_has_explicit_non_sink_flow_metadata() -> None:
+    assert (
+        get_tool_flow_direction("approve_declassification")
+        is ToolFlowDirection.NEITHER
+    )
+    assert get_sink_category("approve_declassification") is SinkCategory.UNKNOWN
+
+
 def test_same_scope_synthesis_write_remains_allowed():
     channel = "saga:session-end"
     synthesis = AuthContext(
@@ -846,7 +950,7 @@ def test_summarization_model_assertion_failure_and_ordinary_admin_do_not_erase_l
     assert after_ordinary_admin.labels == ALL_LABELS
 
 
-def test_only_explicit_audited_admin_declassification_erases_labels(
+def test_legacy_declassification_audit_cannot_erase_live_labels(
     tmp_path, caplog: pytest.LogCaptureFixture,
 ):
     from mimir.event_logger import _reset_logger_for_tests, init_logger
@@ -866,17 +970,10 @@ def test_only_explicit_audited_admin_declassification_erases_labels(
     finally:
         _reset_logger_for_tests()
 
-    assert admin.labels == frozenset()
+    assert admin is labels
+    assert admin.labels == ALL_LABELS
     assert admin.source_channels == labels.source_channels
-    record = json.loads(events_path.read_text(encoding="utf-8"))
-    assert record["type"] == "ifc_declassification"
-    assert record["labels"] == sorted(ALL_LABELS)
-    assert record["source_labels"]
-    assert record["authenticated_admin"]["canonical_principal"] == "user-1"
-    assert record["reason"] == "operator-approved destination"
-    assert record["destination"] == "slack-C-public"
-    assert record["policy_version"] == "ifc-test-v2"
-    assert record["outcome"] == "approved"
+    assert not events_path.exists()
 
 
 def test_declassification_audit_failure_keeps_labels():
@@ -891,6 +988,120 @@ def test_declassification_audit_failure_keeps_labels():
         destination="slack-C-public",
     )
     assert result is labels
+
+
+def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path):
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="ifc-live-test")
+    labels = _labels(labels=ALL_LABELS)
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    destination = str(tmp_path / "approved.txt")
+    try:
+        denied = SinkGate.check_sink_flow(
+            "write_file", destination, labels, auth, enforce=True,
+        )
+        approved, reason = approve_live_declassification(
+            auth,
+            sink_category="file",
+            destination=destination,
+            reason="operator approved this exact file write",
+        )
+        mismatch = SinkGate.check_sink_flow(
+            "write_file", str(tmp_path / "other.txt"), labels, auth, enforce=True,
+        )
+        admitted = SinkGate.check_sink_flow(
+            "write_file", destination, labels, auth, enforce=True,
+        )
+        reused = SinkGate.check_sink_flow(
+            "write_file", destination, labels, auth, enforce=True,
+        )
+    finally:
+        _reset_logger_for_tests()
+
+    assert denied.allowed is False
+    assert (approved, reason) == (True, "approved")
+    assert mismatch.allowed is False
+    assert admitted.allowed is True
+    assert admitted.reason == "ifc_declassification_approved"
+    assert reused.allowed is False
+    assert auth.ifc_state.current(auth.ifc_labels) is labels
+    record = json.loads(events_path.read_text(encoding="utf-8"))
+    assert record["destination"] == str(Path(destination).resolve())
+    assert record["sink_category"] == "file"
+    assert record["policy_version"] == "ifc-v1"
+    assert record["outcome"] == "approved"
+    assert record["use_limit"] == 1
+    assert record["lifetime_seconds"] == 30.0
+    assert record["source_labels"]
+
+
+def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path):
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    init_logger(tmp_path / "events.jsonl", session_id="ifc-isolation-test")
+    labels = _labels()
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    other_turn = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    destination = str(tmp_path / "approved.txt")
+    try:
+        assert approve_live_declassification(
+            auth,
+            sink_category="file",
+            destination=destination,
+            reason="one exact write",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+
+    panel = SinkGate.check_sink_flow(
+        "activity_panel_post", auth.channel_id, labels, auth, enforce=True,
+    )
+    other = SinkGate.check_sink_flow(
+        "write_file", destination, labels, other_turn, enforce=True,
+    )
+    original = SinkGate.check_sink_flow(
+        "write_file", destination, labels, auth, enforce=True,
+    )
+
+    assert panel.reason != "ifc_declassification_approved"
+    assert other.allowed is False
+    assert original.allowed is True
+
+
+def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path):
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    labels = _labels()
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    destination = str(tmp_path / "approved.txt")
+    _reset_logger_for_tests()
+    assert approve_live_declassification(
+        auth,
+        sink_category="file",
+        destination=destination,
+        reason="audit is unavailable",
+    ) == (False, "approval_failed")
+    assert SinkGate.check_sink_flow(
+        "write_file", destination, labels, auth, enforce=True,
+    ).allowed is False
+
+    init_logger(tmp_path / "events.jsonl", session_id="ifc-taint-test")
+    try:
+        assert approve_live_declassification(
+            auth,
+            sink_category="file",
+            destination=destination,
+            reason="source snapshot must remain exact",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+    tainted = labels.with_label("confidential")
+    auth.ifc_state.merge(tainted, fallback=labels)
+    assert SinkGate.check_sink_flow(
+        "write_file", destination, tainted, auth, enforce=True,
+    ).allowed is False
 
 
 class _Bridge(Bridge):

@@ -41,6 +41,7 @@ from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
 from .search import Indexer
 from .session_manager import ChannelSession, SessionManager
+from .web_channels import web_channel_for_identity
 from .skill_defs import (
     home_skills_dir,
     migrate_legacy_skills_dir,
@@ -355,6 +356,21 @@ async def _handle_event(request: web.Request) -> web.Response:
         author = identity.canonical
         author_display = identity.display_name
         author_id = identity.canonical
+        # Security: a per-user web key may target ONLY its own channel. The
+        # request-body channel_id is spoofable (the modern /chat path binds it
+        # to the authenticated identity for exactly this reason — web_chat.py).
+        # Without this bind, one authorized non-admin key could POST /event with
+        # another user's channel_id, run a turn on that channel, and pull that
+        # user's private history into context (or steer its egress). The master
+        # key (identity is None, below) and admins may target any channel for
+        # automation/operator use.
+        if not request.get("auth_is_admin", False):
+            own_channel = web_channel_for_identity(identity.canonical)
+            if channel_id != own_channel:
+                return web.json_response(
+                    {"error": "channel_id not permitted for this identity"},
+                    status=403,
+                )
     else:
         # Preserve master-key and dev/open automation compatibility. Neither
         # path has a per-user identity to bind here.
@@ -438,15 +454,18 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # dashboards expose global operational/project state and Worklink artifacts
 # (chainlink #593). SAGA and file-backed memory/state dashboards expose global
 # cross-channel history and raw markdown content (chainlink #592); wiki viewer
-# APIs expose global markdown state and graph health (chainlink #690). This is
-# the SECURITY gate; React section-hiding is UX only and must never be the sole
-# control.
+# APIs expose global markdown state and graph health (chainlink #690). The
+# factory-runs dashboard exposes global Worklink factory artifacts — run.json,
+# prompts, transcripts, PR URLs — across all runs (not per-user scoped). This
+# is the SECURITY gate; React section-hiding (a manifest ``requires_role``) is
+# UX only and must never be the sole control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin",
     "/api/ops",
     "/api/v1/ops",
     "/api/v1/scheduler",
     "/api/v1/chainlink-board",
+    "/api/v1/factory-runs",
     "/api/v1/saga",
     "/api/v1/memory",
     "/api/v1/wiki",

@@ -514,6 +514,32 @@ def _event_app(
     return app, stub
 
 
+def _event_app_authed(
+    identity: Any,
+    *,
+    is_admin: bool = False,
+) -> tuple[web.Application, MagicMock]:
+    """/event app that injects an authenticated per-user identity.
+
+    Mirrors the request keys the real auth middleware stamps
+    (``auth_identity`` / ``auth_is_admin``) so the per-user channel-binding
+    path in ``_handle_event`` is exercised.
+    """
+    stub = MagicMock()
+    stub.enqueue = AsyncMock(return_value=True)
+
+    @web.middleware
+    async def _inject(request: web.Request, handler: Any) -> web.StreamResponse:
+        request["auth_identity"] = identity
+        request["auth_is_admin"] = is_admin
+        return await handler(request)
+
+    app = web.Application(middlewares=[_inject])
+    app["dispatcher"] = stub
+    app.router.add_post("/event", _handle_event)
+    return app, stub
+
+
 class TestHandleEvent:
     @pytest.mark.asyncio
     async def test_valid_event_returns_200(self) -> None:
@@ -751,6 +777,63 @@ class TestHandleEvent:
         assert body.get("channel_id") == "busy-channel"
 
     @pytest.mark.asyncio
+    async def test_non_admin_key_cannot_target_another_users_channel(self) -> None:
+        # Security: the request-body channel_id is spoofable. A per-user web key
+        # must not be able to run a turn on another user's channel (which would
+        # pull that user's private history into context / steer its egress).
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={
+                    "channel_id": web_channel_for_identity("alice"),
+                    "content": "read alice's history",
+                },
+            )
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_key_may_target_own_channel(self) -> None:
+        from types import SimpleNamespace
+
+        from mimir.web_channels import web_channel_for_identity
+
+        bob = SimpleNamespace(canonical="bob", display_name="Bob")
+        own = web_channel_for_identity("bob")
+        app, stub = _event_app_authed(bob, is_admin=False)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": own, "content": "hi"},
+            )
+        assert resp.status == 200
+        event = stub.enqueue.call_args.args[0]
+        assert event.channel_id == own
+        assert event.author == "bob"
+
+    @pytest.mark.asyncio
+    async def test_admin_key_may_target_any_channel(self) -> None:
+        # Admins (and the master key, which has identity=None) target any
+        # channel for operator/automation use.
+        from types import SimpleNamespace
+
+        admin = SimpleNamespace(canonical="op", display_name="Op")
+        app, stub = _event_app_authed(admin, is_admin=True)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                json={"channel_id": "web-alice", "content": "ops broadcast"},
+            )
+        assert resp.status == 200
+        stub.enqueue.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_trigger_defaults_to_user_message(self) -> None:
         """A body with no ``trigger`` field should default to ``user_message``."""
         app, stub = _event_app()
@@ -804,6 +887,7 @@ class TestHandleEvent:
         from mimir.access_control import create_auth_context
         from mimir.identities import IdentityResolver
         from mimir.identities_populator import issue_web_key
+        from mimir.web_channels import web_channel_for_identity
 
         user_key = issue_web_key(tmp_path, "alice", roles=["user"])
         issue_web_key(tmp_path, "operator", roles=["admin"])
@@ -822,7 +906,10 @@ class TestHandleEvent:
                 "/event",
                 headers={"X-API-Key": user_key},
                 json={
-                    "channel_id": "ch",
+                    # A non-admin per-user key may only target its own channel;
+                    # the spoofed author/service_principal below must still be
+                    # stripped regardless.
+                    "channel_id": web_channel_for_identity("alice"),
                     "author": "operator",
                     "author_id": "operator",
                     "trigger": "scheduled_tick",

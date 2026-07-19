@@ -26,6 +26,7 @@ from .extra import (
 from .registry import (
     add_schedule,
     all_mimir_tools,
+    approve_declassification,
     commitment_complete,
     commitment_dismiss,
     commitment_list,
@@ -92,6 +93,7 @@ __all__ = [
     "list_channels",
     "list_schedules",
     "add_schedule",
+    "approve_declassification",
     "set_schedule_priority",
     "remove_schedule",
     "set_poller_overrides",

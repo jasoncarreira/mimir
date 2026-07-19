@@ -76,6 +76,87 @@ def _make_request(
     )
 
 
+def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
+    tmp_path: Path,
+) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"ch-1"}),
+        sources=frozenset({SourceLabel(
+            principal="user-1",
+            domain="channel",
+            resource_id="ch-1",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"user-1"}),
+        )}),
+    )
+    auth = AuthContext(
+        principal="test-U1",
+        canonical_principal="user-1",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+    middleware = BudgetGateMiddleware()
+    approved_path = str(tmp_path / "approved.txt")
+    other_path = str(tmp_path / "other.txt")
+    executions: list[str] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        executions.append(str(request.tool_call["args"]["file_path"]))
+        return ToolMessage(
+            content="written",
+            tool_call_id=str(request.tool_call["id"]),
+            name="write_file",
+        )
+
+    denied_before = middleware.wrap_tool_call(
+        _make_request("write_file", auth_context=auth, args={"file_path": approved_path}),
+        handler,
+    )
+    init_logger(tmp_path / "events.jsonl", session_id="ifc-middleware-test")
+    try:
+        approval = middleware.wrap_tool_call(
+            _make_request(
+                "approve_declassification",
+                tool_call_id="approval-1",
+                auth_context=auth,
+                args={
+                    "sink_category": "file",
+                    "destination": approved_path,
+                    "reason": "write this exact output",
+                },
+            ),
+            lambda _request: pytest.fail("approval handler must not receive authority"),
+        )
+        written = middleware.wrap_tool_call(
+            _make_request("write_file", auth_context=auth, args={"file_path": approved_path}),
+            handler,
+        )
+        denied_other = middleware.wrap_tool_call(
+            _make_request("write_file", auth_context=auth, args={"file_path": other_path}),
+            handler,
+        )
+    finally:
+        _reset_logger_for_tests()
+
+    assert denied_before.status == "error"
+    assert approval.status == "success"
+    assert written.status != "error"
+    assert denied_other.status == "error"
+    assert executions == [approved_path]
+
+
 @pytest.mark.asyncio
 async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
     from dataclasses import replace
@@ -308,6 +389,131 @@ async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
     assert handler_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import OperationDecision, ToolFlowDirection, ToolRegistry
+    from mimir.mcp_client import (
+        MCPAuthorizationResult,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_mcp_adapter,
+    )
+
+    input_schema = {
+        "type": "object",
+        "properties": {"destination": {"type": "string"}},
+        "required": ["destination"],
+    }
+    config = MCPServerConfig(name="publisher", command="x", args=[])
+    provenance = replace(
+        MCPProvenance.create(config, "publish", input_schema),
+        classification="admin_required",
+        adapter_name="publisher-policy",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+    )
+    tool = _bridge_mcp_tool(
+        server_name="publisher",
+        tool_name="publish",
+        description="",
+        input_schema=input_schema,
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("admin",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="private-channel",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    arguments = {"destination": "public-destination"}
+
+    def classify(request):  # type: ignore[no-untyped-def]
+        assert request.arguments == arguments
+        return MCPAuthorizationResult(
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+            source_resources=("private-source",),
+            sink_resources=("public-destination",),
+        )
+
+    clear_mcp_adapter_registry()
+    register_mcp_adapter(
+        "publisher-policy",
+        "adapter-v1",
+        "policy-v1",
+        classify,
+        flow_direction="both",
+    )
+    compatible = ToolRegistry().authorize_tool(
+        tool.name,
+        context,
+        enforce=True,
+        mcp_tool=tool,
+        arguments=arguments,
+        ifc_labels=InformationFlowLabels(),
+    )
+    assert compatible.allowed is True
+    assert compatible.decision is OperationDecision.ADMIN_REQUIRED
+    assert compatible.required_tier.value == "admin"
+    assert compatible.flow_direction is ToolFlowDirection.BOTH
+    assert compatible.protected_source_resources == ("private-source",)
+    assert compatible.protected_sink_resources == ("public-destination",)
+
+    handler_calls = 0
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    def request(call_id: str) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={
+                "name": tool.name,
+                "args": arguments,
+                "id": call_id,
+                "type": "tool_call",
+            },
+            tool=tool,
+            state=None,
+            runtime=Runtime(context=context),
+        )
+
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"private-channel"}),
+    )
+    token = set_current_turn(turn)
+    try:
+        denied = await BudgetGateMiddleware().awrap_tool_call(
+            request("tainted"), handler,
+        )
+        turn.ifc_labels = InformationFlowLabels()
+        allowed = await BudgetGateMiddleware().awrap_tool_call(
+            request("untainted"), handler,
+        )
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert denied.status == "error"
+    assert "ifc_label_blocked:external_mcp" in str(denied.content)
+    assert allowed.content == "ok"
+    assert handler_calls == 1
+
+
 def _ifc_labels(
     channel: str = "ch-1",
     *,
@@ -368,6 +574,7 @@ def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> 
         domain="channel",
         resource_id=ctx.channel_id,
         bridge_instance="test",
+        ifc_labels=InformationFlowLabels(),
     )
 
 
@@ -686,6 +893,56 @@ def test_sync_protected_read_allows_compatible_harness_egress():
 
     assert result.content == "protected file"
     assert any(source.domain == "filesystem" for source in ctx.ifc_labels.sources)
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_real_commitment_list_with_ownerless_record_allows_same_channel_reply(
+    tmp_path: Path,
+):
+    from mimir.agent import Agent
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.commitments.store import CommitmentsStore
+    from mimir.tools.registry import commitment_list, set_commitments_store
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="ch-1",
+        text="legacy ownerless commitment",
+        owner_principal=None,
+    ))
+    set_commitments_store(store)
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        result = await commitment_list.coroutine(  # type: ignore[misc]
+            due_within_days=0,
+            runtime=req.runtime,
+        )
+        return ToolMessage(content=result, tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request("commitment_list", "commitments-ownerless", auth),
+            handler,
+        )
+        allowed = Agent._harness_sink_allowed(ctx, "ch-1", "harness_auto_deliver")
+    finally:
+        reset_current_turn(token)
+        set_commitments_store(None)
+
+    assert "legacy ownerless commitment" in str(result.content)
+    commitment_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "commitments"
+    ]
+    assert len(commitment_sources) == 1
+    assert commitment_sources[0].is_complete
+    assert "user-1" in commitment_sources[0].authorized_principals
     assert allowed is True
 
 
@@ -1607,6 +1864,7 @@ def test_all_mimir_tools_includes_both_names(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "claude-code:foo")
     names = {t.name for t in all_mimir_tools()}
+    assert "approve_declassification" in names
     assert "mimir_get_turn" in names
     assert "get_turn" in names
 

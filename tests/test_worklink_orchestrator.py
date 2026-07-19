@@ -324,8 +324,12 @@ def _orchestrator_runner(
             return cp(args, stdout="ok\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "add"]:
             return cp(args)
-        if isinstance(args, list) and args[:5] == ["git", "-C", str(worktree), "diff", "--cached"]:
+        # `--quiet` uses the exit code to signal staged changes; `-U0` (the
+        # secret scan) returns 0 with the diff on stdout — no secret here.
+        if isinstance(args, list) and args[:6] == ["git", "-C", str(worktree), "diff", "--cached", "--quiet"]:
             return cp(args, returncode=1 if files_stdout else 0)
+        if isinstance(args, list) and args[:6] == ["git", "-C", str(worktree), "diff", "--cached", "-U0"]:
+            return cp(args, returncode=0, stdout="")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "commit"]:
             commit_seen = True
             return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
@@ -1290,3 +1294,83 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     handle, waited_timeout = compute.waited
     assert handle is compute.specs[0], "wait() did not receive the launch handle"
     assert waited_timeout == compute.specs[0].timeout_s
+
+
+def _commit_runner(
+    diff_stdout: str, committed: dict, *, diff_returncode: int = 0
+) -> object:
+    """Fake runner for _commit_worktree_changes: staged changes present, with a
+    controllable `git diff --cached -U0` body/exit; records whether commit ran."""
+    def runner(args: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        tail = list(args)[3:]
+        if tail[:2] == ["add", "-A"]:
+            return cp(args)
+        if tail == ["diff", "--cached", "--quiet"]:
+            return cp(args, returncode=1)  # something is staged
+        if tail == ["diff", "--cached", "-U0"]:
+            return cp(args, returncode=diff_returncode, stdout=diff_stdout)
+        if tail[:1] == ["commit"]:
+            committed["ran"] = True
+            return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
+        return cp(args)
+    return runner
+
+
+def test_commit_worktree_changes_refuses_staged_secret() -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    secret = "ghp_" + "B" * 36
+    committed = {"ran": False}
+    runner = _commit_runner(
+        f'+++ b/config.py\n+API_TOKEN = "{secret}"\n', committed
+    )
+
+    with pytest.raises(WorklinkError, match="secret-shaped"):
+        _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    # Fail closed BEFORE the commit — nothing reaches a branch/PR.
+    assert committed["ran"] is False
+
+
+def test_commit_worktree_changes_fails_closed_when_scan_command_fails() -> None:
+    # A security gate must not silently pass when it cannot verify: a non-zero
+    # `git diff --cached -U0` (bad index/config/permissions) must refuse the
+    # commit, not accept empty stdout as "clean".
+    from mimir.worklink.orchestrator import WorklinkError, _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    committed = {"ran": False}
+    runner = _commit_runner("", committed, diff_returncode=128)
+
+    with pytest.raises(WorklinkError, match="cannot scan"):
+        _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    assert committed["ran"] is False
+
+
+def test_commit_worktree_changes_allows_benign_low_signal_token() -> None:
+    # The scan uses high-signal, length-floored patterns (mirroring the
+    # pre-commit hook), NOT the broad log redactor — so a benign placeholder
+    # `token=` in generated content must not block the commit.
+    from mimir.worklink.orchestrator import _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    committed = {"ran": False}
+    runner = _commit_runner(
+        "+++ b/docs/example.md\n+Set the header: token=YOUR_TOKEN_HERE\n", committed
+    )
+
+    _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    assert committed["ran"] is True
+
+
+def test_commit_worktree_changes_commits_clean_diff() -> None:
+    from mimir.worklink.orchestrator import _commit_worktree_changes
+
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    committed = {"ran": False}
+    runner = _commit_runner(
+        "+++ b/app.py\n+def hello():\n+    return 42\n", committed
+    )
+
+    _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    assert committed["ran"] is True
