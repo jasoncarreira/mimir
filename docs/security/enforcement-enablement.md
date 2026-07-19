@@ -1,13 +1,15 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 8. Incorporates mimir review rounds 1–6 (spawn and
+**Status:** DRAFT — revision 9. Incorporates mimir review rounds 1–7 (spawn and
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
 prerequisite; approved-URL authorizes the request, not the response bytes;
 destination-allowlisting alone is insufficient for payload-bearing network sinks;
 even exact-URL fetch leaks via invocation-pattern/redirects unless dispatch is
 trusted-deterministic; integrity is a distinct axis needing its own executable
-representation, not the confidentiality `ifc_state`) and the operator's decisions
+representation, not the confidentiality `ifc_state`; the gate must distinguish
+active-ingest from informational-recall sources that share the accumulator) and
+the operator's decisions
 (per-trigger policy;
 approved-URL = egress-only; trust the contributor / JIRA instance wholesale;
 provenance schema; auto-recall must never handcuff a user turn; a heartbeat may
@@ -188,15 +190,25 @@ folded into a trusted turn and then driving an action.
 NOT the existing `ifc_state`.** `ifc_state` today carries *confidentiality* labels
 and ACLs, and it is **never "clean"**: every turn stamps its own `{private}`
 confidentiality label at ingress, so "IFC empty/clean" is meaningless as an
-integrity signal (mimir round 6). Represent integrity as a **new field on
-`SourceLabel`** — `integrity: trusted | untrusted`, set from the trust rules above
-at ingest. `ifc_state` already *accumulates* sources across the turn, so it is the
-right vehicle; the **gate checks whether any accumulated source has
-`integrity == untrusted`** — the turn's own trusted operator/config sources never
-trip it, and an untrusted ingest (a fetched page, an unknown-author issue) does.
-Wherever this doc says "untrusted taint" / "the turn-taint gate," that is the test
-— *any untrusted-integrity source ingested this turn* — **not** confidentiality
-emptiness.
+integrity signal (mimir round 6). Represent integrity with **two fields on
+`SourceLabel`**, both set server-side at the point a source enters:
+- `integrity: trusted | untrusted` — from the trust rules above.
+- `integrity_effect: active_ingest | informational` — **whether the source should
+  gate actions**. `active_ingest` = the turn's own trigger content and live tool
+  reads/fetches *this turn* (a fetched page, an unknown-author issue, an MCP
+  result). `informational` = sources injected at prompt assembly that must inform
+  but not gate — **auto-recalled memory (§5.3) and protected-prompt blocks**
+  (recent-activity, identities, …).
+
+Both `active_ingest` and `informational` sources ride the same `ifc_state`
+accumulator (mimir round 7 — recalled/prompt sources already do), so the field is
+what separates them. The **integrity gate fires iff an accumulated source is
+`integrity == untrusted` AND `integrity_effect == active_ingest`.** An untrusted
+*informational* source (a recalled untrusted memory) is rendered/visible but does
+**not** gate — reconciling this gate with §5.3's "auto-recall never handcuffs a
+user turn." Wherever this doc says "untrusted taint" / "the turn-taint gate," that
+is the exact test — *any untrusted **active-ingest** source this turn* — never
+confidentiality emptiness and never an informational recall.
 
 ### Per-trigger policy
 
@@ -286,13 +298,16 @@ None of these are editable by the content or the model.
 **Recall is informational, not enforcing** (mimir's "provenance informs, the gate
 enforces", applied to recall — and required so an incidental auto-recall never
 handcuffs a user turn):
-- **Auto-recall** (relevance-based injection at prompt assembly) renders the
-  provenance tag so the agent (and operator) can weigh an untrusted-origin fact,
-  but it does **not** taint the turn or gate actions. A user turn stays fully
-  able to work even if an untrusted memory is recalled into context.
-- **Enforcement taint comes only from what the turn actively ingests** — the
-  trigger's own content (poller payload, unknown-author issue) and live tool
-  reads/fetches this turn — never from ambient recalled memory.
+- **Auto-recall** (relevance-based injection at prompt assembly) enters `ifc_state`
+  as an `integrity_effect: informational` source (§4), so it renders its
+  provenance tag but the integrity gate (which fires only on `active_ingest`
+  sources) ignores it — no taint, no gating. A user turn stays fully able to work
+  even if an untrusted memory is recalled into context.
+- **Enforcement taint comes only from `active_ingest` sources** — the trigger's own
+  content (poller payload, unknown-author issue) and live tool reads/fetches this
+  turn — never from `informational` recalled/prompt sources. (This is exactly the
+  distinction §4's `integrity_effect` field makes executable; without it, recalled
+  sources riding the shared accumulator would wrongly trip the gate — mimir r7.)
 
 The memory-poisoning defense is therefore: (1) **core memory is always blocked
 and PR-gated — pre-existing and universal, for every principal, not
@@ -570,18 +585,21 @@ masked-check-verified):
    for heartbeat/session-boundary; named capabilities validated against the tier
    table; narrow per-trigger roots from immutable operator config (not the global
    file-tool roots); manifest cannot self-grant/mutate its authority.
-2. **Integrity axis + trust derivation** (§4): add an `integrity: trusted |
-   untrusted` field to `SourceLabel`, set from source identity at ingest (GitHub
-   permission graph, pointed-at JIRA instance, internal triggers → trusted;
-   everything else untrusted; wholesale for trusted sources). The turn's integrity
-   state = *any accumulated source with `integrity == untrusted`* — a **distinct
-   axis from the confidentiality labels `ifc_state` already carries** (which is
-   never empty), even though it rides the same source-accumulation.
+2. **Integrity axis + trust derivation** (§4): add **two** fields to `SourceLabel`,
+   both server-set at ingest — `integrity: trusted | untrusted` (from source
+   identity: GitHub permission graph, pointed-at JIRA instance, internal triggers →
+   trusted; else untrusted; wholesale for trusted sources) and `integrity_effect:
+   active_ingest | informational` (active = trigger content + live tool reads/
+   fetches; informational = auto-recall + protected-prompt blocks). A **distinct
+   axis from the confidentiality labels `ifc_state` already carries** (never empty),
+   riding the same source-accumulation.
 3. **`_get_allowed_sinks` → tier + integrity gate** (§3, §5.2): replace the `#906`
    blanket poller block with the 2×2 (integrity × blast-radius) deferring to
-   containment policy; the gate tests "any untrusted-integrity source ingested",
-   not IFC emptiness; keep unbounded/exfil hard-blocked; add the Code-execution
-   tier (worklink_run trusted-only; spawn_* blocked pending an isolation contract).
+   containment policy; the gate fires iff an accumulated source is
+   `integrity == untrusted` **AND** `integrity_effect == active_ingest` (so
+   informational recalls never gate — §5.3), not IFC emptiness; keep unbounded/exfil
+   hard-blocked; add the Code-execution tier (worklink_run trusted-only; spawn_*
+   blocked pending an isolation contract).
 4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
