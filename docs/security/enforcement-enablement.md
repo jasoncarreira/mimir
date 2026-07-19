@@ -185,7 +185,7 @@ folded into a trusted turn and then driving an action.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org / write) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted. `fetch_url` limited to the approved-URL list (**egress authorization only**); fetched **content stays untrusted** but can still drive scoped sinks — it can save state / wiki / memory; only fetch → code/shell/further-egress needs a one-use declassify (§5.4) |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted. `fetch_url` is gated by the **destination allowlist**, so it may fetch **any approved URL, repeatedly and in any order** — a prior fetch's untrusted content does not lock it out of further approved fetches. Fetched **content stays untrusted**: it can drive scoped sinks (save state / wiki / memory) but not code/shell, and egress to a **non-approved** destination stays blocked. Allowlist should be **exact URLs / fixed templates, not host wildcards** (§5.4) |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
@@ -288,21 +288,35 @@ the blast radius.
 ### 5.4 Network egress: `fetch_url` and the uniform egress boundary
 
 `fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are where "let the agent
-act" and "let data leak out" are the same action. By trigger:
+act" and "let data leak out" are the same action.
+
+**Network egress is gated by the destination allowlist, independent of the turn's
+taint.** A request to an approved destination is allowed regardless of what the
+turn has ingested; a request to a non-approved destination is blocked. That means
+the taint gates *code/shell/action* sinks, not egress-to-an-already-approved
+destination — so a heartbeat can fetch **all** its approved URLs, repeatedly and
+in any order, without a prior fetch's untrusted content locking it out (this is
+the intended behavior, not a hole). By trigger:
 
 - **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
   their own subprocess; the capability is simply not in their set).
-- **Heartbeat:** `fetch_url` allowed against an **operator-approved URL/host
-  list** — but the allowlist is **egress authorization only** (which hosts may be
-  fetched), **not** a trust signal for the response (mimir: approving a host
-  authorizes the request, not the bytes). **Fetched content stays untrusted.**
-  The heartbeat still does its work because untrusted fetched content can drive
-  the scoped sinks — it can **save state / wiki / memory** (provenance-tagged);
-  only fetch → code/shell/further-egress needs a one-use declassify.
-- **User / operator turns:** **exact-host/URL grant with ask-on-first-use**
-  (mimir rec) — the agent asks the first time it wants a host, the operator
-  approves that host/URL, and it's remembered for that scope. Not a blanket
-  standing network grant, and not an ask on literally every call.
+- **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist** —
+  authorization to reach those destinations, **not** a trust signal for the
+  response (mimir: approving a host authorizes the request, not the bytes).
+  **Fetched content stays untrusted** — it can drive scoped sinks (save state /
+  wiki / memory, provenance-tagged) but not code/shell. The heartbeat fetches its
+  approved URLs freely.
+  - **The allowlist must be exact URLs / fixed templates, not host wildcards.**
+    Otherwise untrusted fetched content could steer the agent to a *new*
+    data-carrying URL on an approved host (`https://approved/?leak=<secret>`) and
+    exfil via that host's logs/reflection — "approved to fetch from" ≠ "safe to
+    send arbitrary data to." Exact URLs make taint-independent egress
+    unconditionally safe; a genuinely-needed wildcard host would additionally
+    require the request to carry no turn-derived data.
+- **User / operator turns:** **ask-on-first-use per host** (mimir rec) — the agent
+  asks the first time it wants a destination, the operator approves it (adding it
+  to the session allowlist), then it's remembered for that scope. Not a blanket
+  standing grant, and not an ask on every call.
 
 **One uniform egress boundary, including child processes** (mimir finding).
 `fetch_url` is not the only way data leaves the box — **spawned agents and
@@ -368,11 +382,12 @@ for the current enablement.
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
-- **Network egress → §5.4**: pollers have no `fetch_url`; heartbeat's approved-URL
-  list is **egress authorization only** (fetched content stays untrusted — it can
-  still save state/wiki/memory); user turns ask-on-first-use per host; one
-  **uniform egress boundary including child processes**, not a per-tool special
-  case.
+- **Network egress → §5.4**: gated by the **destination allowlist, independent of
+  turn taint** — so a heartbeat fetches all its approved URLs freely (a prior
+  fetch's untrusted content doesn't lock it out). Allowlist = **exact URLs /
+  templates, not host wildcards** (closes exfil-via-approved-host). Pollers have
+  no `fetch_url`; user turns ask-on-first-use per host; one **uniform egress
+  boundary including child processes**, not a per-tool special case.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
