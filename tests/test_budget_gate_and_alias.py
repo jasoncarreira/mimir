@@ -863,14 +863,22 @@ def test_middleware_sync_wrap_passes_through_under_budget():
     assert ctx.tool_call_count == 1
 
 
-def test_sync_protected_read_taints_live_turn_before_harness_egress():
+def test_sync_protected_read_allows_compatible_harness_egress():
     from mimir.agent import Agent
+    from mimir.access_control import protected_result_source, publish_protected_result
 
     auth = _ifc_auth()
     ctx = _ifc_turn(auth)
     middleware = BudgetGateMiddleware()
 
     def handler(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((protected_result_source(
+            auth,
+            principal="filesystem",
+            domain="filesystem",
+            resource_id="/private/data",
+            bridge_instance="filesystem",
+        ),))
         return ToolMessage(content="protected file", tool_call_id=req.tool_call["id"])
 
     token = set_current_turn(ctx)
@@ -885,7 +893,201 @@ def test_sync_protected_read_taints_live_turn_before_harness_egress():
 
     assert result.content == "protected file"
     assert any(source.domain == "filesystem" for source in ctx.ifc_labels.sources)
-    assert allowed is False
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_real_commitment_list_with_ownerless_record_allows_same_channel_reply(
+    tmp_path: Path,
+):
+    from mimir.agent import Agent
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.commitments.store import CommitmentsStore
+    from mimir.tools.registry import commitment_list, set_commitments_store
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="ch-1",
+        text="legacy ownerless commitment",
+        owner_principal=None,
+    ))
+    set_commitments_store(store)
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        result = await commitment_list.coroutine(  # type: ignore[misc]
+            due_within_days=0,
+            runtime=req.runtime,
+        )
+        return ToolMessage(content=result, tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request("commitment_list", "commitments-ownerless", auth),
+            handler,
+        )
+        allowed = Agent._harness_sink_allowed(ctx, "ch-1", "harness_auto_deliver")
+    finally:
+        reset_current_turn(token)
+        set_commitments_store(None)
+
+    assert "legacy ownerless commitment" in str(result.content)
+    commitment_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "commitments"
+    ]
+    assert len(commitment_sources) == 1
+    assert commitment_sources[0].is_complete
+    assert "user-1" in commitment_sources[0].authorized_principals
+    assert allowed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "domain", "args"),
+    [
+        ("memory_query", "saga", {"query": "project"}),
+        ("memory_get", "saga", {"atom_ids": ["a-1"]}),
+        ("file_search", "filesystem", {"query": "project"}),
+        ("get_turn", "turn_history", {"turn_id": "t-1"}),
+        ("commitment_list", "commitments", {}),
+        ("bash_jobs_list", "shell_jobs", {}),
+        ("list_schedules", "schedule_metadata", {}),
+        ("list_channels", "channel_metadata", {}),
+    ],
+)
+async def test_exact_protected_native_result_can_reply_to_triggering_channel(
+    tool_name: str,
+    domain: str,
+    args: dict[str, Any],
+):
+    from mimir.access_control import protected_result_source, publish_protected_result
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def protected(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((protected_result_source(
+            auth,
+            principal=f"owner:{domain}",
+            domain=domain,
+            resource_id=f"{domain}:resource-1",
+            bridge_instance="mimir",
+        ),))
+        return ToolMessage(content="protected", tool_call_id=req.tool_call["id"])
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(tool_name, "read", auth, args), protected,
+        )
+        reply = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}),
+            send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert reply.status != "error"
+    assert any(source.domain == domain for source in ctx.ifc_labels.sources)
+
+
+@pytest.mark.asyncio
+async def test_mixed_protected_result_requires_requester_in_every_resource_acl():
+    from mimir.access_control import publish_protected_result
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    compatible = SourceLabel(
+        principal="owner-a", domain="saga", resource_id="atom:a",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), source_kind="protected_tool",
+    )
+    incompatible = SourceLabel(
+        principal="owner-b", domain="saga", resource_id="atom:b",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"owner-b"}), source_kind="protected_tool",
+    )
+
+    async def protected(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((compatible, incompatible))
+        return ToolMessage(content="mixed", tool_call_id=req.tool_call["id"])
+
+    send_calls = 0
+
+    async def send(req: ToolCallRequest) -> ToolMessage:
+        nonlocal send_calls
+        send_calls += 1
+        return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request("memory_query", "read", auth, {"query": "mixed"}), protected,
+        )
+        denied = await middleware.awrap_tool_call(
+            _make_request("send_message", "reply", auth, {"channel_id": "ch-1"}), send,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert denied.status == "error"
+    assert "ifc_label_blocked:same_channel" in str(denied.content)
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_authoritative_empty_protected_result_does_not_add_taint():
+    from mimir.access_control import publish_protected_result
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def empty(req: ToolCallRequest) -> ToolMessage:
+        publish_protected_result(())
+        return ToolMessage(content="(no atoms)", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        before = ctx.ifc_labels
+        await middleware.awrap_tool_call(
+            _make_request("memory_query", "empty", auth, {"query": "none"}), empty,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert ctx.ifc_labels == before
+
+
+@pytest.mark.asyncio
+async def test_success_without_protected_result_provenance_remains_fail_closed():
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+
+    async def unknown(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="unproven memory", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request("memory_get", "unknown", auth, {"atom_ids": ["a-1"]}), unknown,
+        )
+    finally:
+        reset_current_turn(token)
+
+    source = next(source for source in ctx.ifc_labels.sources if source.domain == "saga")
+    assert source.is_complete is False
 
 
 @pytest.mark.asyncio

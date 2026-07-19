@@ -1000,6 +1000,33 @@ class SagaStore:
                     triples_payload.append(
                         {k: v for k, v in t.items() if not k.startswith("_")}
                     )
+            provenance_ids = list(dict.fromkeys(
+                returned_atom_ids
+                + [
+                    str(item["source_atom_id"])
+                    for item in triples_payload
+                    if item.get("source_atom_id")
+                ]
+            ))
+            ifc_sources: list[dict[str, Any]] = []
+            if provenance_ids:
+                placeholders = ",".join(["?"] * len(provenance_ids))
+                rows = conn.execute(
+                    "SELECT id, owner_principal, origin_channel, origin_domain, visibility "
+                    f"FROM atoms WHERE id IN ({placeholders})",
+                    provenance_ids,
+                ).fetchall()
+                by_id = {row[0]: row for row in rows}
+                for atom_id in provenance_ids:
+                    row = by_id.get(atom_id)
+                    if row is not None:
+                        ifc_sources.append({
+                            "resource_id": f"atom:{row[0]}",
+                            "owner_principal": row[1],
+                            "origin_channel": row[2],
+                            "origin_domain": row[3],
+                            "visibility": row[4],
+                        })
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
             return {
@@ -1013,6 +1040,7 @@ class SagaStore:
                 "triples": triples_payload,
                 "items_returned": len(result.observations) + len(result.raws),
                 "rewritten_query": (rewritten_query or (result.rewritten_query or "")),
+                "_ifc_sources": ifc_sources,
             }
 
         def _do():
@@ -1178,6 +1206,10 @@ class SagaStore:
                 "created_at",
                 "session_id",
                 "encoding_confidence",
+                "owner_principal",
+                "origin_channel",
+                "origin_domain",
+                "visibility",
             )
             unique = list(dict.fromkeys(clean))
             placeholders = ",".join(["?"] * len(unique))
@@ -1211,7 +1243,20 @@ class SagaStore:
                 )
             returned = {a["id"] for a in atoms}
             missing = [i for i in unique if i not in returned]
-            return {"atoms": atoms, "missing": missing}
+            return {
+                "atoms": atoms,
+                "missing": missing,
+                "_ifc_sources": [
+                    {
+                        "resource_id": f"atom:{a['id']}",
+                        "owner_principal": found[a["id"]].get("owner_principal"),
+                        "origin_channel": found[a["id"]].get("origin_channel"),
+                        "origin_domain": found[a["id"]].get("origin_domain"),
+                        "visibility": found[a["id"]].get("visibility"),
+                    }
+                    for a in atoms
+                ],
+            }
 
         def _do():
             conn, should_close = self._operation_conn()

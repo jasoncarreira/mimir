@@ -357,7 +357,11 @@ async def bash_jobs_list(scope: Optional[str] = None) -> str:
         return f"bash_jobs_list failed: {exc}"
     snapshots = shell_job_snapshots(_REGISTRY, scope=resolved_scope)
     if not snapshots:
+        from ..access_control import publish_protected_result
+
+        publish_protected_result(())
         return f"No jobs in scope={resolved_scope}."
+    _publish_shell_job_provenance([str(s["job_id"]) for s in snapshots])
     lines = [f"Jobs (scope={resolved_scope}, count={len(snapshots)}):"]
     for s in snapshots:
         cmd = (s.get("command") or "")[:120]
@@ -408,6 +412,7 @@ async def bash_job_output(
     )
     if "error" in result:
         return result["error"]
+    _publish_shell_job_provenance([job_id])
     lines = [
         f"Job {result['job_id']} [{result['status']}] "
         f"elapsed={result['elapsed_seconds']}s pid={result['pid']} "
@@ -425,6 +430,38 @@ async def bash_job_output(
         lines.append("--- stderr tail ---")
         lines.append(stderr)
     return "\n".join(lines)
+
+
+def _publish_shell_job_provenance(job_ids: list[str]) -> None:
+    """Preserve both job metadata ACLs and the labels inherited at spawn."""
+    from .._context import get_current_turn
+    from ..access_control import protected_result_source, publish_protected_result
+    from ..models import InformationFlowLabels
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    sources = []
+    for job_id in job_ids:
+        job = _REGISTRY.get(job_id) if _REGISTRY is not None else None
+        sources.append(protected_result_source(
+            auth_context,
+            principal="mimir:shell-jobs",
+            domain="shell_jobs",
+            resource_id=f"job:{job_id}",
+            bridge_instance="shell",
+        ))
+        inherited = getattr(job, "ifc_labels", None)
+        if inherited is None:
+            sources.append(protected_result_source(
+                auth_context,
+                principal=None,
+                domain="shell_jobs",
+                resource_id=f"job:{job_id}:output",
+                bridge_instance="shell",
+            ))
+        elif isinstance(inherited, InformationFlowLabels):
+            sources.extend(inherited.sources)
+    publish_protected_result(tuple(sources))
 
 
 __all__ = (
