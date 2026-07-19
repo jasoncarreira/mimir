@@ -78,6 +78,14 @@ class TestDetectSchemaVersion:
         conn.execute("CREATE TABLE atoms (id TEXT PRIMARY KEY, visibility TEXT)")
         assert m.detect_schema_version(conn) == 7
 
+    def test_atom_provenance_columns_return_v10(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE atoms (id TEXT PRIMARY KEY, integrity TEXT, "
+            "origin_trigger TEXT, origin_ref TEXT)"
+        )
+        assert m.detect_schema_version(conn) == 10
+
 
 class TestApplyPendingMigrations:
     def test_fresh_true_stamps_target_only(self) -> None:
@@ -955,7 +963,7 @@ class TestV7OwnershipMigration:
             )
 
 
-def test_v9_migration_scopes_atom_dedup_index_by_owner() -> None:
+def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
     conn = sqlite3.connect(":memory:")
     try:
         from pathlib import Path
@@ -967,6 +975,29 @@ def test_v9_migration_scopes_atom_dedup_index_by_owner() -> None:
             ).fetchall()
         ]
         assert columns == ["content_hash", "agent_id", "owner_principal"]
-        assert m.detect_schema_version(conn) == 9
+        atom_columns = {
+            row[1]: row for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+        }
+        assert {"integrity", "origin_trigger", "origin_ref"} <= atom_columns.keys()
+        assert atom_columns["integrity"][3] == 1
+        assert atom_columns["integrity"][4] == "'untrusted'"
+        assert m.detect_schema_version(conn) == 10
+    finally:
+        conn.close()
+
+
+def test_v10_migration_backfills_legacy_atoms_fail_closed() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            "CREATE TABLE atoms (id TEXT PRIMARY KEY);"
+            "INSERT INTO atoms (id) VALUES ('legacy');"
+        )
+        m._execute_migration_script(conn, m.MIGRATIONS[10])
+        assert conn.execute(
+            "SELECT integrity, origin_trigger, origin_ref FROM atoms"
+        ).fetchone() == ("untrusted", None, None)
+        # Interrupted migrations may retry ADD COLUMN statements safely.
+        m._execute_migration_script(conn, m.MIGRATIONS[10])
     finally:
         conn.close()

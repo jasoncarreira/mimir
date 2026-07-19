@@ -9,9 +9,11 @@ from typing import Any
 import pytest
 from langchain.tools import ToolRuntime
 
-from mimir.access_control import create_auth_context
+from mimir.access_control import CapabilityTier, build_trigger_service_principal, create_auth_context
 from mimir.identities import IdentityResolver
-from mimir.models import AgentEvent, AuthContext, SessionACL
+from mimir.models import (
+    AgentEvent, AuthContext, InformationFlowLabels, SessionACL, SourceLabel,
+)
 from mimir.saga.client import SagaStore
 from mimir.tools import saga_ops
 from mimir.tools.memory import _MEMORY_STATE
@@ -176,6 +178,47 @@ async def test_synthesis_memory_store_preserves_service_provenance(
     assert call["owner_principal"] == "service:synthesis"
     assert call["origin_channel"] == f"{trigger}:owned"
     assert call["visibility"] == "service"
+
+
+@pytest.mark.asyncio
+async def test_research_poller_write_stamps_frozen_integrity_and_origin(
+    write_store: _WriteStore,
+) -> None:
+    authority = build_trigger_service_principal(
+        canonical="poller:hn-ai",
+        trigger="poller",
+        profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("memory_store", "saga_feedback", "saga_mark_contributions"),
+        creation_path="test",
+    )
+    principal = "service:poller:hn-ai"
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=principal, domain="channel", resource_id="poller:hn-ai",
+        bridge_instance="poller", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="service",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id="poller:hn-ai", source="poller",
+        source_id="poller:hn-ai:123:batch:0", service_principal=authority.canonical,
+        service_authority=authority, ifc_labels=labels,
+        extra={"poller_name": "hn-ai"},
+    ), enforce=True, ifc_labels=labels)
+
+    out = await memory_store.coroutine(
+        content="untrusted finding", stream="semantic",
+        runtime=_runtime(context, "poller-store"),
+    )
+
+    assert "stored" in out
+    call = write_store.atom_calls[-1]
+    assert call["integrity"] == "untrusted"
+    assert call["origin_trigger"] == "research-poller:hn-ai"
+    assert call["origin_ref"] == "poller:hn-ai:123:batch:0"
+    assert {"integrity", "origin_trigger", "origin_ref"}.isdisjoint(
+        memory_store.args_schema.model_fields
+    )
 
 
 @pytest.mark.asyncio

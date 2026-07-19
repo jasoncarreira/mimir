@@ -22,6 +22,27 @@ def _atom_label(atom: dict[str, Any]) -> str:
     return base
 
 
+def _provenance_tag(item: dict[str, Any]) -> str:
+    """Render only immutable server-stamped provenance fields."""
+    fields: list[str] = []
+    for label, key in (
+        ("trigger", "origin_trigger"),
+        ("ref", "origin_ref"),
+        ("captured", "captured_at"),
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            fields.append(f"{label}={value.strip().replace(chr(10), ' ')}")
+    return f" [{'; '.join(fields)}]" if fields else ""
+
+
+def _trust_groups(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    trusted = [item for item in items if item.get("integrity") == "trusted"]
+    # Missing/invalid legacy provenance fails closed and is visibly untrusted.
+    untrusted = [item for item in items if item.get("integrity") != "trusted"]
+    return trusted, untrusted
+
+
 #: Per-atom content cap when rendering hits into the pre-message hook
 #: prompt block. Was 240 (tuned for short conversational atoms) — bumped
 #: to 1200 on 2026-05-14 after LongMemEval bench surfaced answers buried
@@ -41,18 +62,25 @@ _ATOM_CONTENT_CAP = 1200
 
 
 def _format_atoms(hits: list[dict[str, Any]]) -> str:
-    """Render SAGA hits as a brief bullet list — tag + content, no IDs."""
+    """Render SAGA hits grouped by their server-stamped origin trust."""
     if not hits:
         return "(no atoms)"
     lines: list[str] = []
-    for h in hits:
-        label = _atom_label(h)
-        score = h.get("score") or h.get("similarity")
-        content = (h.get("content") or "").strip().replace("\n", " ")
-        if len(content) > _ATOM_CONTENT_CAP:
-            content = content[:_ATOM_CONTENT_CAP] + "…"
-        score_str = f" ({score:.3f})" if isinstance(score, (int, float)) else ""
-        lines.append(f"- [{label}{score_str}] {content}")
+    trusted, untrusted = _trust_groups(hits)
+    for heading, group in (("Trusted-origin memories:", trusted), ("Untrusted-origin memories:", untrusted)):
+        if not group:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(heading)
+        for h in group:
+            label = _atom_label(h)
+            score = h.get("score") or h.get("similarity")
+            content = (h.get("content") or "").strip().replace("\n", " ")
+            if len(content) > _ATOM_CONTENT_CAP:
+                content = content[:_ATOM_CONTENT_CAP] + "…"
+            score_str = f" ({score:.3f})" if isinstance(score, (int, float)) else ""
+            lines.append(f"- [{label}{score_str}]{_provenance_tag(h)} {content}")
     return "\n".join(lines)
 
 
@@ -87,25 +115,34 @@ def _format_triples(triples: list[dict[str, Any]]) -> str:
     if not triples:
         return ""
     lines: list[str] = []
-    for t in triples:
-        subj = t.get("subject") or "?"
-        pred = t.get("predicate") or "?"
-        obj = t.get("object") or "?"
-        valid_from = _fmt_iso_date(t.get("valid_from"))
-        valid_until = _fmt_iso_date(t.get("valid_until"))
-        if valid_from and valid_until:
-            date_part = f" [valid {valid_from} → {valid_until}]"
-        elif valid_from:
-            date_part = f" [valid {valid_from} → present]"
-        elif valid_until:
-            date_part = f" [valid → {valid_until}]"
-        else:
-            date_part = ""
-        conf = t.get("confidence")
-        conf_part = ""
-        if isinstance(conf, (int, float)) and conf < 1.0:
-            conf_part = f" (conf {conf:.2f})"
-        lines.append(f"- ({subj}, {pred}, {obj}){date_part}{conf_part}")
+    trusted, untrusted = _trust_groups(triples)
+    for heading, group in (("Trusted-origin triples:", trusted), ("Untrusted-origin triples:", untrusted)):
+        if not group:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(heading)
+        for t in group:
+            subj = t.get("subject") or "?"
+            pred = t.get("predicate") or "?"
+            obj = t.get("object") or "?"
+            valid_from = _fmt_iso_date(t.get("valid_from"))
+            valid_until = _fmt_iso_date(t.get("valid_until"))
+            if valid_from and valid_until:
+                date_part = f" [valid {valid_from} → {valid_until}]"
+            elif valid_from:
+                date_part = f" [valid {valid_from} → present]"
+            elif valid_until:
+                date_part = f" [valid → {valid_until}]"
+            else:
+                date_part = ""
+            conf = t.get("confidence")
+            conf_part = ""
+            if isinstance(conf, (int, float)) and conf < 1.0:
+                conf_part = f" (conf {conf:.2f})"
+            lines.append(
+                f"- ({subj}, {pred}, {obj}){date_part}{conf_part}{_provenance_tag(t)}"
+            )
     return "\n".join(lines)
 
 
@@ -137,7 +174,6 @@ def _format_saga_payload(payload: dict[str, Any]) -> str:
         if triples_block:
             if parts:
                 parts.append("")
-            parts.append("Triples:")
             parts.append(triples_block)
     if not parts:
         return "(no atoms)"
@@ -174,4 +210,3 @@ def _hits_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
             item["evidence_count"] = ec
         out.append(item)
     return out
-

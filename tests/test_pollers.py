@@ -131,6 +131,14 @@ def _authority(**updates: object) -> dict:
     return value
 
 
+def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
+    from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
+
+    profile = TRIGGER_AUTHORITY_PROFILES["research"]
+    assert {"memory_store", "saga_feedback", "saga_mark_contributions"} <= profile
+    assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+
+
 def test_authority_is_strict_and_per_instance(tmp_path: Path) -> None:
     skills = tmp_path / "skills"
     entries = [

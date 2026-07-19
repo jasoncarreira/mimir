@@ -29,7 +29,7 @@ from ..access_control import (
     get_provenance_from_auth_context,
     is_trusted_service,
 )
-from ..models import AuthContext
+from ..models import AuthContext, InformationFlowLabels, Integrity
 from .memory import _MEMORY_STATE
 
 
@@ -96,6 +96,14 @@ async def memory_store(
     owner_principal = provenance["created_by"]
     origin_channel = auth_context.channel_id
     visibility = "service" if is_trusted_service(auth_context) else "private"
+    labels = auth_context.ifc_state.current(auth_context.ifc_labels)
+    integrity = (
+        Integrity.TRUSTED
+        if isinstance(labels, InformationFlowLabels)
+        and labels.sources
+        and all(source.integrity == Integrity.TRUSTED for source in labels.sources)
+        else Integrity.UNTRUSTED
+    )
 
     try:
         result = await client.store(
@@ -105,6 +113,9 @@ async def memory_store(
             session_id=effective_session_id,
             owner_principal=owner_principal,
             origin_channel=origin_channel,
+            integrity=integrity,
+            origin_trigger=auth_context.origin_trigger or auth_context.trigger,
+            origin_ref=auth_context.origin_ref,
             origin_domain=None,
             visibility=visibility,
             provenance=provenance,

@@ -490,6 +490,10 @@ class AuthContext:
     domain: str | None = None
     resource_id: str | None = None
     bridge_instance: str | None = None
+    # Write provenance selected at ingress. These are deliberately absent from
+    # model-facing tool arguments and cannot be changed after construction.
+    origin_trigger: str | None = None
+    origin_ref: str | None = None
     # Mutable only through its monotonic merge API. Keeping this cell on the
     # frozen carrier lets later forked requests observe post-tool taint without
     # making identity, roles, or any authority field mutable.
