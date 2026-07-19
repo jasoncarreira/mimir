@@ -897,6 +897,56 @@ def test_sync_protected_read_allows_compatible_harness_egress():
 
 
 @pytest.mark.asyncio
+async def test_real_commitment_list_with_ownerless_record_allows_same_channel_reply(
+    tmp_path: Path,
+):
+    from mimir.agent import Agent
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.commitments.store import CommitmentsStore
+    from mimir.tools.registry import commitment_list, set_commitments_store
+
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="ch-1",
+        text="legacy ownerless commitment",
+        owner_principal=None,
+    ))
+    set_commitments_store(store)
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        result = await commitment_list.coroutine(  # type: ignore[misc]
+            due_within_days=0,
+            runtime=req.runtime,
+        )
+        return ToolMessage(content=result, tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request("commitment_list", "commitments-ownerless", auth),
+            handler,
+        )
+        allowed = Agent._harness_sink_allowed(ctx, "ch-1", "harness_auto_deliver")
+    finally:
+        reset_current_turn(token)
+        set_commitments_store(None)
+
+    assert "legacy ownerless commitment" in str(result.content)
+    commitment_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "commitments"
+    ]
+    assert len(commitment_sources) == 1
+    assert commitment_sources[0].is_complete
+    assert "user-1" in commitment_sources[0].authorized_principals
+    assert allowed is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "domain", "args"),
     [

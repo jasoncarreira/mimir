@@ -1557,10 +1557,13 @@ async def commitment_list(
     from ..access_control import protected_result_source, publish_protected_result
 
     auth_context = runtime.context if runtime is not None else None
+    # ``actor_principal`` is the authority the store used to admit every row.
+    # Legacy/admin-visible records may not carry an owner, so provenance must
+    # retain the authenticated reader rather than emitting an incomplete label.
     publish_protected_result(tuple(
         protected_result_source(
             auth_context,
-            principal=getattr(c, "owner_principal", None),
+            principal=getattr(c, "owner_principal", None) or actor_principal,
             domain="commitments",
             resource_id=f"commitment:{c.id}",
             bridge_instance="mimir",

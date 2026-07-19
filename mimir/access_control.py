@@ -851,6 +851,9 @@ class SinkGate:
         for source in sources:
             if not getattr(source, "is_complete", False):
                 return frozenset()
+            # Fresh protected-result sources include the authenticated reader by
+            # construction; inherited or externally supplied labels do not, so
+            # keep this check as the fail-closed guard for those paths.
             if effective_principal not in source.authorized_principals:
                 return frozenset()
             source_kind = getattr(source, "source_kind", "channel")
