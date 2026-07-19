@@ -873,7 +873,10 @@ class SinkGate:
                         return frozenset()
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
                         return frozenset()
-            elif source_kind not in {"protected_prompt", "protected_tool"}:
+            elif source_kind == "protected_prompt":
+                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                    return frozenset()
+            elif source_kind != "protected_tool":
                 # Other derived/tool sources require their own destination adapter;
                 # an ACL alone must not silently widen arbitrary provenance kinds.
                 return frozenset()

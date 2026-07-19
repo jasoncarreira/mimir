@@ -649,7 +649,12 @@ class FeedbackLog:
                 labels = labels.with_source(SourceLabel(
                     principal=principal,
                     domain="feedback",
-                    resource_id=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+                    resource_id=(
+                        record.get("channel_id")
+                        or auth_context.resource_id
+                        or auth_context.channel_id
+                        or f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}"
+                    ),
                     bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
                     sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
