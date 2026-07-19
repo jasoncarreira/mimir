@@ -163,6 +163,143 @@ async def test_artifacts_written_with_labels_only_manifest(
     assert "sk-secret-value" not in (run_dir / "manifest.json").read_text()
 
 
+def test_confined_artifact_base_confines_to_home(tmp_path: Path) -> None:
+    from mimir.tools.registry import _confined_artifact_base
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "sub").mkdir()
+
+    # home itself and paths under it resolve; escaping paths raise.
+    assert _confined_artifact_base(str(home), home) == home.resolve()
+    assert _confined_artifact_base(str(home / "sub"), home) == (home / "sub").resolve()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(ValueError):
+        _confined_artifact_base(str(outside), home)
+    with pytest.raises(ValueError):
+        _confined_artifact_base(str(home / ".." / "outside"), home)
+
+
+@pytest.mark.asyncio
+async def test_artifact_root_outside_home_refused_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A model-controlled artifact_root outside the home must be refused up
+    # front — before a subprocess runs and before any file is written.
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    set_spawn_config({"default_cwd": home})
+    from mimir.tools import registry
+
+    ran = {"spawned": False}
+
+    def runner(argv, cwd, timeout_s, env=None):
+        ran["spawned"] = True
+        return 0, "done", ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+
+    raw = await spawn_open_code.ainvoke(
+        {"prompt": "leak it", "artifact_root": str(outside)}
+    )
+    assert raw.startswith("spawn_open_code refused")
+    assert ran["spawned"] is False
+    assert not (outside / ".factory").exists()
+
+
+@pytest.mark.asyncio
+async def test_artifact_root_symlink_escape_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / "escape").symlink_to(outside, target_is_directory=True)
+    set_spawn_config({"default_cwd": home})
+    from mimir.tools import registry
+
+    ran = {"spawned": False}
+
+    def runner(argv, cwd, timeout_s, env=None):
+        ran["spawned"] = True
+        return 0, "done", ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+
+    raw = await spawn_open_code.ainvoke(
+        {"prompt": "leak it", "artifact_root": str(home / "escape")}
+    )
+    assert raw.startswith("spawn_open_code refused")
+    assert ran["spawned"] is False
+    assert not (outside / ".factory").exists()
+
+
+@pytest.mark.asyncio
+async def test_artifact_root_within_home_subdir_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    sub = home / "artifacts"
+    sub.mkdir()
+    set_spawn_config({"default_cwd": home})
+    from mimir.tools import registry
+
+    monkeypatch.setattr(
+        registry, "_run_claude_subprocess", _capture_run({"stdout": "done"})
+    )
+
+    payload = json.loads(
+        await spawn_open_code.ainvoke(
+            {"prompt": "build it", "artifact_root": str(sub)}
+        )
+    )
+    run_dir = Path(payload["artifact_dir"])
+    assert run_dir.is_dir()
+    assert sub.resolve() in run_dir.resolve().parents
+    assert (run_dir / "prompt.md").read_text() == "build it"
+
+
+@pytest.mark.asyncio
+async def test_artifact_write_refuses_symlink_planted_during_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # TOCTOU: artifact_root is validated BEFORE the spawn, but the untrusted
+    # subprocess runs before the writes and can plant a symlink at the
+    # predictable `.factory` prefix. The writes must not follow it out of home.
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    set_spawn_config({"default_cwd": home})
+    from mimir.tools import registry
+
+    def runner(argv, cwd, timeout_s, env=None):
+        # Simulate the spawned process planting the symlink during its run.
+        (home / ".factory").symlink_to(outside, target_is_directory=True)
+        return 0, "secret model output", ""
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+
+    payload = json.loads(
+        await spawn_open_code.ainvoke(
+            {"prompt": "leak me", "artifact_root": str(home)}
+        )
+    )
+    # The spawn still returns a structured result...
+    assert payload["status"] == "completed"
+    # ...but nothing was written through the planted symlink to outside the home,
+    # and no artifact dir is reported (the write was refused, not silently
+    # redirected).
+    assert list(outside.rglob("*")) == []
+    assert payload["artifact_dir"] is None
+
+
 @pytest.mark.asyncio
 async def test_empty_prompt_rejected(tmp_path: Path) -> None:
     set_spawn_config({"default_cwd": tmp_path})
