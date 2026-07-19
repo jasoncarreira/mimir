@@ -7,6 +7,12 @@
       "cron": "0 6 * * *",
       "priority": "low",
       "batch_size": 10,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
+        "scoped_roots": ["state"]
+      },
       "pass_env": ["ROOT_DIR", "OSV_SCANNER"]
     }
   ]

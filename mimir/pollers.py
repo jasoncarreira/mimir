@@ -84,6 +84,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .billing import normalize_priority
+from .access_control import (
+    CapabilityTier,
+    ServicePrincipal,
+    TRIGGER_AUTHORITY_PROFILES,
+    TRIGGER_CAPABILITY_TIERS,
+    build_trigger_service_principal,
+)
 from .event_logger import log_event, get_events_path
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
@@ -563,6 +570,9 @@ class PollerConfig:
     #: ``<home>/pollers-overrides.yaml``. Malformed budget config is ignored
     #: fail-open so a tuning typo cannot drop the poller itself.
     budget: PollerBudgetConfig | None = None
+    #: Immutable, per-instance authority resolved from this manifest. ``None``
+    #: means an explicit empty grant, never the former shared poller principal.
+    authority: ServicePrincipal | None = None
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -576,6 +586,19 @@ class PollerConfig:
         explicitly set (compactness for tests + niche call sites)."""
         return self.persist_dir if self.persist_dir is not None else self.skill_dir
 
+    def resolved_authority(self) -> ServicePrincipal:
+        if self.authority is not None:
+            return self.authority
+        return build_trigger_service_principal(
+            canonical=f"poller:{self.name}",
+            trigger="poller",
+            profile="custom",
+            tier=CapabilityTier.SCOPE_CONTAINED,
+            capabilities=(),
+            roots=(self.resolved_persist_dir().resolve(),),
+            creation_path="mimir.pollers.run_poller",
+        )
+
 
 #: Per-poller fields an operator may override from
 #: ``<home>/pollers-overrides.yaml`` — the same set skill updates treat
@@ -588,6 +611,113 @@ POLLER_OVERRIDE_KEYS = frozenset(
     {"cron", "priority", "batch_size", "recover_failed_turns", "env", "pass_env",
      "deliver", "budget"}
 )
+
+POLLER_AUTHORITY_FIELDS = frozenset({
+    "authority", "capabilities", "tier", "profile", "principal_id",
+    "scoped_roots", "operator_alert", "operator_alert_destination",
+})
+
+_AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
+_TIER_RANK = {
+    CapabilityTier.SCOPE_CONTAINED: 0,
+    CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
+    CapabilityTier.CODE_EXECUTION: 2,
+    CapabilityTier.UNBOUNDED: 3,
+}
+
+
+def _parse_poller_authority(
+    raw: object,
+    *,
+    name: str,
+    persist_dir: Path,
+    state_root: Path | None,
+    manifest_path: Path,
+) -> ServicePrincipal:
+    """Strictly resolve one manifest authority declaration or raise ValueError."""
+    if not isinstance(raw, dict):
+        raise ValueError("authority must be an object")
+    unknown = set(raw) - _AUTHORITY_KEYS
+    if unknown:
+        raise ValueError(f"unknown authority fields: {', '.join(sorted(map(str, unknown)))}")
+    if set(raw) != _AUTHORITY_KEYS:
+        missing = _AUTHORITY_KEYS - set(raw)
+        raise ValueError(f"missing authority fields: {', '.join(sorted(missing))}")
+
+    profile = raw["profile"]
+    if not isinstance(profile, str) or profile not in TRIGGER_AUTHORITY_PROFILES:
+        raise ValueError(f"unknown authority profile: {profile!r}")
+    try:
+        tier = CapabilityTier(raw["tier"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unknown authority tier: {raw['tier']!r}") from exc
+    capabilities_raw = raw["capabilities"]
+    if (
+        not isinstance(capabilities_raw, list)
+        or not all(isinstance(item, str) and item for item in capabilities_raw)
+    ):
+        raise ValueError("authority capabilities must be a list of non-empty names")
+    capabilities = tuple(dict.fromkeys(capabilities_raw))
+    unknown_caps = set(capabilities) - set(TRIGGER_CAPABILITY_TIERS)
+    if unknown_caps:
+        raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown_caps))}")
+    outside_profile = set(capabilities) - TRIGGER_AUTHORITY_PROFILES[profile]
+    if outside_profile:
+        raise ValueError(
+            f"capabilities outside {profile!r} profile: {', '.join(sorted(outside_profile))}"
+        )
+    builtin_profile = {
+        "heartbeat": "heartbeat",
+        "session-boundary": "session-boundary",
+    }.get(name)
+    if builtin_profile is not None:
+        if profile != builtin_profile:
+            raise ValueError(
+                f"built-in {name!r} may only narrow profile {builtin_profile!r}"
+            )
+        if name == "session-boundary" and _TIER_RANK[tier] > _TIER_RANK[CapabilityTier.SCOPED_WITH_PROVENANCE]:
+            raise ValueError("session-boundary manifest cannot widen the built-in tier")
+    if any(_TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier] for cap in capabilities):
+        raise ValueError(f"capability exceeds declared tier {tier.value!r}")
+    if tier is CapabilityTier.UNBOUNDED or any(
+        TRIGGER_CAPABILITY_TIERS[cap] is CapabilityTier.UNBOUNDED for cap in capabilities
+    ):
+        raise ValueError("skill pollers cannot declare unbounded authority")
+
+    roots_raw = raw["scoped_roots"]
+    if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
+        raise ValueError("authority scoped_roots must be a list of names")
+    roots: list[Path] = []
+    expected_state = persist_dir.resolve()
+    home = state_root.parent.parent.resolve() if state_root is not None else None
+    for root_name in roots_raw:
+        if root_name == "state":
+            candidate = expected_state
+        elif root_name.startswith("wiki:") and home is not None:
+            slug = root_name.removeprefix("wiki:")
+            if not slug or Path(slug).name != slug or slug in {".", ".."}:
+                raise ValueError(f"invalid scoped root: {root_name!r}")
+            candidate = (home / "state" / "wiki" / slug).resolve()
+            wiki_base = (home / "state" / "wiki").resolve()
+            if candidate.parent != wiki_base:
+                raise ValueError(f"scoped root escapes allowed base: {root_name!r}")
+        else:
+            raise ValueError(f"unknown scoped root: {root_name!r}")
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError(f"scoped root does not exist: {root_name!r}")
+        roots.append(candidate)
+    if {"write_file", "edit_file"} & set(capabilities) and not roots:
+        raise ValueError("file capabilities require at least one scoped root")
+
+    return build_trigger_service_principal(
+        canonical=f"poller:{name}",
+        trigger="poller",
+        profile=profile,
+        tier=tier,
+        capabilities=capabilities,
+        roots=tuple(roots),
+        creation_path=f"mimir.pollers.run_poller:{manifest_path}",
+    )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps
 #: bare ``yes``/``no``/``on``/``off``/``true``/``false`` to real bools, but a
@@ -943,6 +1073,14 @@ def discover_pollers(
                     pollers_file, entry,
                 )
                 continue
+            misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
+            if misplaced_authority:
+                log.warning(
+                    "poller_authority_rejected: %s name=%r — authority fields must "
+                    "be inside authority: %s",
+                    pollers_file, name, ", ".join(sorted(misplaced_authority)),
+                )
+                continue
             # chainlink #420: duplicate-name guard. ``log.warning``
             # (sync context, same as the other discovery warnings —
             # ``log_event`` is async and there may be no loop here).
@@ -1038,6 +1176,30 @@ def discover_pollers(
                         "persist_dir=%s — %s",
                         pollers_file, name, persist_dir, exc,
                     )
+                    continue
+            authority: ServicePrincipal | None = None
+            if "authority" in entry:
+                if schema_version not in (None, POLLER_MANIFEST_SCHEMA_VERSION):
+                    log.warning(
+                        "poller_authority_rejected: %s name=%r — authority cannot "
+                        "be interpreted under unknown schema_version=%r",
+                        pollers_file, name, schema_version,
+                    )
+                    continue
+                try:
+                    authority = _parse_poller_authority(
+                        entry["authority"],
+                        name=name,
+                        persist_dir=persist_dir or skill_dir,
+                        state_root=state_root,
+                        manifest_path=pollers_file,
+                    )
+                except (OSError, ValueError) as exc:
+                    log.warning(
+                        "poller_authority_rejected: %s name=%r — %s; poller not registered",
+                        pollers_file, name, exc,
+                    )
+                    continue
             # ``batch_size`` is optional; defaults to per-item-per-turn
             # to preserve the open-strix-equivalent shape. Garbage
             # values (negative, non-int, zero) fall back to default
@@ -1128,6 +1290,7 @@ def discover_pollers(
                     manifest_path=pollers_file,
                     deliver=deliver,
                     budget=budget,
+                    authority=authority,
                 ),
             )
 
@@ -1285,12 +1448,15 @@ async def run_poller(
         _events_path = get_events_path()
         if _events_path is not None:
             try:
+                authority = poller.resolved_authority()
                 _rec = await poller_recovery.reconcile_failed_turns(
                     poller_name=poller.name,
                     channel_id=poller.channel_id(),
                     persist_dir=persist_dir,
                     events_path=_events_path,
                     enqueue=enqueue,
+                    service_principal=authority.canonical,
+                    service_authority=authority,
                 )
                 if _rec["reenqueued"] or _rec["gave_up"]:
                     await log_event(
@@ -1816,7 +1982,8 @@ async def run_poller(
         if poller.deliver:  # chainlink #508 — raw value; resolved at turn time
             extra["deliver"] = poller.deliver
         channel_id = poller.channel_id()
-        service_principal = "service:poller"
+        authority = poller.resolved_authority()
+        service_principal = f"service:{authority.canonical}"
         item_labels = InformationFlowLabels()
         for item in batch:
             item_extras = item["extras"]
@@ -1850,7 +2017,8 @@ async def run_poller(
         event = AgentEvent(
             trigger="poller",
             channel_id=channel_id,
-            service_principal="poller",
+            service_principal=authority.canonical,
+            service_authority=authority,
             content=content,
             source="poller",
             source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",

@@ -67,7 +67,6 @@ _SAGA_MUTATIONS = (
     ("trigger", "allowed_operations"),
     [
         ("scheduled_tick", {"saga_forget"}),
-        ("poller", set()),
         (
             "saga_session_end",
             {

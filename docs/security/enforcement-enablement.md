@@ -479,21 +479,35 @@ issue/PR, or a non-contributor comment, is untrusted → **notify-only** (§4). 
 even the trusted path is contained by Worklink, and the untrusted path does not
 autonomously touch code at all.
 
-**Defense-in-depth now (cheap, worth setting regardless):** run worklink's
-opencode with `permission.external_directory: {"/**": "deny"}`, which confines
-opencode's **file tools** (read/write/edit/ls/glob/grep) to the working
-directory. Note the limits: opencode's permission model is **approval-based**
-(`bash`/`edit`/`webfetch` → allow/ask/deny), **not** an OS sandbox — the **shell
-is the escape hatch** `external_directory` doesn't close (an allowed `bash`
-command can still write outside cwd or reach the network), and a `shell.sandbox:
-"strict"` key is **not confirmed** in the opencode docs we can see. So opencode's
-config hardens the file-tool surface but is not, by itself, a real sandbox; treat
-it as one layer, verify `shell.sandbox` against the opencode version we actually
-run, and set `permission.bash` to a **deny-by-default operator-configurable
-allowlist** of the build/test/git commands worklink needs — **not** `ask`
-(headless worklink would wedge on the prompt). This is defense-in-depth for
-**trusted** code work only: an allowed command's arguments are still an escape
-hatch, acceptable solely because worklink is trusted-code-only.
+**Defense-in-depth now (implemented):** worklink passes the pinned OpenCode
+runtime a final `OPENCODE_PERMISSION` override containing
+`external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
+The allowlist is operator-configurable at
+`backends.opencode.bash_allowlist`; its Mimir-repository default permits the
+needed `git *` and `uv *` command families. Pure command launchers such as
+`env *` are deliberately excluded because they would bypass the allowlist.
+OpenCode evaluates the
+last matching permission rule, so Worklink emits the catch-all denial first and
+the explicit grants after it. It rejects a catch-all allow entry. Denials become
+tool errors captured in the headless run/transcript; there is no `ask` rule that
+could wedge waiting for an interactive reply.
+
+**Pinned-runtime verification (2026-07-19):** the shipped runtime is
+`opencode-ai@1.17.15`. Its config schema accepts `permission.bash` and
+`permission.external_directory`; its permission evaluator uses last-match-wins,
+and its external-directory guard is invoked by path-taking file tools. The
+runtime's schema and source tree contain no `permission.shell.sandbox`,
+`shell.sandbox`, or equivalent OS process sandbox. Its `shell` config field only
+selects the shell executable, and the bash tool launches with the host user's
+filesystem, process, and network authority. There is therefore no additional
+OpenCode sandbox to wire in this version.
+
+These controls are **defense-in-depth for trusted code work only**, not an OS
+sandbox or a boundary for hostile payloads. File-tool path checks do not revoke
+the authority of an allowed command; command arguments can still read or write
+outside the worktree and reach the network. That residual is accepted only
+because Worklink is trusted-code-only. Untrusted code work remains notify-only
+and requires the future isolated-compute substrate before it may execute.
 
 **Decision: untrusted code work is notify-only for now.** We do **not** build an
 isolated compute substrate as part of this enablement. Unknown-author GitHub

@@ -704,7 +704,7 @@ defaults:
   compute_backend: local_subprocess  # the only built-in compute substrate (#832)
   timeout_s: 1800
   priority: normal
-  test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  test_command: "uv run pytest -q"
   base_branch: main          # worktrees cut from + PRs target this branch
 
 backends:
@@ -713,6 +713,12 @@ backends:
     args: ["exec", "--json", "--sandbox", "danger-full-access"]
   claude_cli:
     bin: claude
+  opencode:
+    bin: opencode
+    # Replaces the built-in Mimir-repo list: ["git *", "uv *"].
+    # OpenCode evaluates the last matching pattern. Worklink always installs a
+    # leading "*": deny rule, then these grants; "*" itself is rejected.
+    bash_allowlist: ["git *", "uv *"]
     args: ["-p", "--output-format", "json"]
 ```
 
@@ -740,7 +746,7 @@ worktree, evidence bundle, branch, or PR.
 cd /workspace/mimir
 uv run mimir worklink run <issue-id> \
   --home /mimir-home \
-  --test-command 'env -u MIMIR_MODEL_SPEC uv run pytest -q <focused-tests> --tb=short'
+  --test-command 'uv run pytest -q <focused-tests> --tb=short'
 ```
 
 Expected success output is shaped like:
@@ -825,7 +831,7 @@ defaults:
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
-  test_command: "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+  test_command: "uv run pytest -q"
   max_review_retries: 3             # reviewer-requested rebuild attempts before blocking a leaf
   # Retained-but-INERT since #830 (integrated-epic runner removed). These parse
   # for back-compat but no code consumes them; safe to omit:
@@ -888,6 +894,22 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
 
 Invalid or unknown compute-backend fields fail closed during config load
 instead of falling back to local execution.
+
+Worklink's OpenCode backend passes a per-run `OPENCODE_PERMISSION` override with
+`external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
+This is deliberately `deny`, never `ask`: Worklink runs headlessly, so an
+approval request would wait forever. A denied tool call is returned by OpenCode
+as a permission error and recorded in the Worklink transcript rather than
+opening an interactive prompt. Configure `backends.opencode.bash_allowlist` with
+the command patterns required by the selected repository's test runner, package
+manager/build, and Git workflow. The list replaces the defaults; an empty list
+denies every shell command.
+
+This policy is defense-in-depth for **trusted code work only**, not process
+confinement. OpenCode's file/path checks and shell command matcher run inside the
+OpenCode process. An allowed command and its arguments still have the host
+user's filesystem and network authority, so untrusted code work remains
+notify-only until Worklink has an isolated compute substrate.
 
 `tiered_review` and the inert `epic_branch_prefix`/`reviewer_backend` settings
 live under `defaults`. Since #830 removed the integrated-epic runner these are

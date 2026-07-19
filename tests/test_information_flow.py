@@ -150,7 +150,6 @@ def test_labels_without_source_provenance_fail_closed():
     [
         ("scheduled_tick", "scheduler", "scheduler:heartbeat", None, "trusted"),
         ("saga_session_end", "synthesis", "synthesis:session", "system", "trusted"),
-        ("poller", "poller", "poller:github-activity", "poller", "untrusted"),
     ],
 )
 def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enforce(
@@ -836,7 +835,6 @@ def test_same_scope_synthesis_write_remains_allowed():
     ("trigger", "canonical", "tool_name"),
     [
         ("scheduled_tick", "scheduler", "write_file"),
-        ("saga_session_end", "synthesis", "edit_file"),
         ("upgrade", "system", "write_file"),
     ],
 )

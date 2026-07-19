@@ -380,6 +380,9 @@ class AgentEvent:
     # request body. ``create_auth_context`` validates it against the registered
     # principal for ``trigger`` before granting service authority.
     service_principal: str | None = None
+    # Exact immutable service grant selected by a trusted internal constructor.
+    # Public ingress never copies this object from request data.
+    service_authority: Any = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
@@ -481,6 +484,7 @@ class AuthContext:
     interactivity: "TurnInteractivity | None"
     policy_version: str | None = None
     is_service: bool = False
+    service_authority: Any = field(default=None, repr=False)
     enforcement_enabled: bool = False
     ifc_labels: "InformationFlowLabels | None" = None
     domain: str | None = None

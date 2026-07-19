@@ -38,6 +38,9 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
+from mimir.access_control import CapabilityTier, SinkGate, create_auth_context
+from mimir.agent import _create_turn_auth_context
+from mimir.models import InformationFlowLabels, SourceLabel
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────
@@ -115,6 +118,147 @@ def test_discover_parses_valid_pollers_json(tmp_path: Path):
     assert p.trust_source == "external"
     assert p.skill_dir == skill_dir
     assert p.channel_id() == "poller:github-activity"
+
+
+def _authority(**updates: object) -> dict:
+    value = {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "write_file", "send_message"],
+        "scoped_roots": ["state"],
+    }
+    value.update(updates)
+    return value
+
+
+def test_authority_is_strict_and_per_instance(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    entries = [
+        {"name": name, "command": "echo", "cron": "* * * * *", "authority": _authority()}
+        for name in ("feed-a", "feed-b")
+    ]
+    _write_pollers_json(skills / "feeds", entries)
+
+    pollers = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")
+
+    assert [p.authority.canonical for p in pollers if p.authority] == [
+        "poller:feed-a", "poller:feed-b",
+    ]
+    assert all(p.authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE for p in pollers if p.authority)
+    roots = [p.authority.sink_policy_for("write_file").destination for p in pollers if p.authority]
+    assert roots[0] != roots[1]
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        _authority(capabilities=["made_up"]),
+        _authority(tier="scope-contained"),
+        _authority(profile="made-up"),
+        _authority(scoped_roots=["../skills"]),
+        _authority(scoped_roots=["wiki:missing"]),
+        _authority(extra="not-allowed"),
+    ],
+)
+def test_unknown_or_out_of_bounds_authority_rejects_instance(
+    tmp_path: Path, authority: dict,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "bad", [
+        {"name": "bad", "command": "echo", "cron": "* * * * *", "authority": authority},
+    ])
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+
+
+def test_instance_root_and_operator_alert_are_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skills = tmp_path / "skills"
+    authority = _authority(capabilities=["write_file", "operator_alert"])
+    _write_pollers_json(skills / "feed", [
+        {"name": "feed", "command": "echo", "cron": "* * * * *", "authority": authority},
+    ])
+    poller = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")[0]
+    service = poller.resolved_authority()
+    channel = poller.channel_id()
+    event = AgentEvent(
+        trigger="poller", channel_id=channel, source="poller",
+        service_principal=service.canonical, service_authority=service,
+    )
+    auth = create_auth_context(event, enforce=True)
+    principal = f"service:{service.canonical}"
+    labels = InformationFlowLabels().with_channel(channel).with_source(SourceLabel(
+        principal=principal, domain="channel", resource_id=channel,
+        bridge_instance="poller", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="service",
+    ))
+    own = tmp_path / "state" / "pollers" / "feed" / "cursor.json"
+    other = tmp_path / "state" / "pollers" / "other" / "cursor.json"
+    assert SinkGate.check_sink_flow("write_file", str(own), labels, auth, enforce=True).allowed
+    assert not SinkGate.check_sink_flow("write_file", str(other), labels, auth, enforce=True).allowed
+
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "slack-alerts")
+    assert SinkGate.check_sink_flow("send_message", "slack-alerts", labels, auth, enforce=True).allowed
+    assert not SinkGate.check_sink_flow("send_message", "slack-other", labels, auth, enforce=True).allowed
+
+
+def test_poller_authority_is_stable_across_shell_continuation(tmp_path: Path) -> None:
+    poller = PollerConfig("a", "echo", "* * * * *", {}, tmp_path)
+    service = poller.resolved_authority()
+    origin = create_auth_context(AgentEvent(
+        trigger="poller", channel_id="poller:a", service_principal=service.canonical,
+        service_authority=service,
+    ), enforce=True)
+    continuation = AgentEvent(
+        trigger="shell_job_complete", channel_id="poller:a",
+        continuation_auth_context=origin,
+    )
+    inherited = _create_turn_auth_context(
+        continuation, None, policy_version="test", enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    assert inherited.canonical_principal == "poller:a"
+    assert inherited.service_authority is service
+
+
+def test_builtin_profile_precedence_rejects_manifest_widening(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "fake-heartbeat", [
+        {
+            "name": "heartbeat", "command": "echo", "cron": "* * * * *",
+            "authority": _authority(profile="custom", tier="code-execution", capabilities=["spawn_codex"]),
+        },
+        {
+            "name": "session-boundary", "command": "echo", "cron": "* * * * *",
+            "authority": _authority(profile="session-boundary", tier="code-execution", capabilities=["worklink_run"]),
+        },
+    ])
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+
+
+@pytest.mark.parametrize("field", sorted({
+    "authority", "capabilities", "tier", "profile", "principal_id",
+    "scoped_roots", "operator_alert", "operator_alert_destination",
+}))
+def test_overrides_cannot_set_authority_fields(tmp_path: Path, field: str) -> None:
+    text = f"feed:\n  {field}: forged\n"
+    with pytest.raises(PollerOverridesValidationError):
+        validate_poller_overrides_text(text, path=tmp_path / "pollers-overrides.yaml")
+
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "feed", [
+        {"name": "feed", "command": "echo", "cron": "* * * * *", "authority": _authority()},
+    ])
+    overrides = tmp_path / "pollers-overrides.yaml"
+    overrides.write_text(text, encoding="utf-8")
+    poller = discover_pollers(
+        skills,
+        state_root=tmp_path / "state" / "pollers",
+        overrides_path=overrides,
+    )[0]
+    assert poller.authority is not None
+    assert poller.authority.canonical == "poller:feed"
+    assert set(poller.authority.capabilities) == {"memory_store", "write_file", "send_message"}
 
 
 def test_discover_skips_malformed_json(tmp_path: Path, caplog):
@@ -516,7 +660,8 @@ print(json.dumps({"poller": "test", "prompt": "second event"}))
     assert len(enq.events) == 2
     assert enq.events[0].content == "first event"
     assert enq.events[0].trigger == "poller"
-    assert enq.events[0].service_principal == "poller"
+    assert enq.events[0].service_principal == "poller:test"
+    assert enq.events[0].service_authority.canonical == "poller:test"
     assert enq.events[0].channel_id == "poller:test"
     assert enq.events[0].source == "poller"
     assert enq.events[1].content == "second event"

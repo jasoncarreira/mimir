@@ -716,18 +716,33 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
     agent._config.access_control_enforced = True
 
+    service_authority = None
+    event_principal = {
+        "scheduled_tick": "scheduler",
+        "poller": "poller:production-path",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }[trigger]
+    if trigger == "poller":
+        from mimir.access_control import CapabilityTier, build_trigger_service_principal
+        service_authority = build_trigger_service_principal(
+            canonical=event_principal,
+            trigger="poller",
+            profile="github",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("worklink_run",),
+            creation_path="test",
+        )
+        principal = event_principal
+
     record = await agent.run_turn(
         AgentEvent(
             trigger=trigger,
             channel_id=f"{trigger}:production-path",
             content="probe",
             source="system" if trigger == "upgrade" else None,
-            service_principal={
-                "scheduled_tick": "scheduler",
-                "poller": "poller",
-                "saga_session_end": "synthesis",
-                "upgrade": "system",
-            }[trigger],
+            service_principal=event_principal,
+            service_authority=service_authority,
             extra=(
                 {"saga_session_id": "saga-production-path"}
                 if trigger == "saga_session_end"

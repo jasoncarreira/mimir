@@ -144,6 +144,9 @@ def _save_state(persist_dir: Path, state: dict) -> None:
 def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
     """Return a JSON-native event payload without stringifying IFC sets."""
     payload = asdict(event)
+    # Authority is never persisted in the poller-writable recovery file. The
+    # live scheduler reattaches its immutable manifest grant on re-enqueue.
+    payload.pop("service_authority", None)
     labels = event.ifc_labels
     if isinstance(labels, InformationFlowLabels):
         payload["ifc_labels"] = {
@@ -348,6 +351,8 @@ async def reconcile_failed_turns(
     persist_dir: Path,
     events_path: Path,
     enqueue: EnqueueFn,
+    service_principal: str | None = None,
+    service_authority: Any = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
     stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
 ) -> dict:
@@ -446,6 +451,21 @@ async def reconcile_failed_turns(
                         event.channel_id = channel_id
                         event.trigger = "poller"
                         event.source = "poller"
+                        event.service_principal = service_principal
+                        event.service_authority = service_authority
+                        if service_authority is not None and service_principal:
+                            source_principal = f"service:{service_principal}"
+                            event.ifc_labels = InformationFlowLabels().with_channel(
+                                channel_id
+                            ).with_source(SourceLabel(
+                                principal=source_principal,
+                                domain="channel",
+                                resource_id=channel_id,
+                                bridge_instance="poller",
+                                sensitivity="internal",
+                                authorized_principals=frozenset({source_principal}),
+                                source_kind="service",
+                            ))
                         if isinstance(event.extra, dict):
                             event.extra["poller_name"] = poller_name
                         try:
