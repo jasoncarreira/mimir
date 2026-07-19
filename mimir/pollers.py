@@ -76,6 +76,9 @@ import logging
 import os
 import signal
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -128,6 +131,7 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # heavy publish hours) opt into ``batch_size > 1`` to coalesce items
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
+_POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
 # Circuit-breaker: after this many consecutive failures the poller is
 # suspended for ``POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS``. "Failure"
 # means a non-zero exit, timeout, or subprocess launch error — clean
@@ -279,6 +283,81 @@ def _redact_poller_env_values(
             continue
         out = out.replace(value, "[REDACTED]")
     return out
+
+
+def _github_api_attestation(
+    endpoint: str,
+    token: str,
+    *,
+    timeout: float = 10.0,
+) -> tuple[int, Any] | None:
+    """Read one GitHub API endpoint from the server process, failing closed."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "mimir-integrity-attestation",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"https://api.github.com/{endpoint.lstrip('/')}", headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            raw = response.read()
+            payload = json.loads(raw) if raw else None
+            return response.status, payload
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read()
+            payload = json.loads(raw) if raw else None
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        return exc.code, payload
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return None
+
+
+def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
+    """Resolve collaborator/org trust from GitHub, never from poller claims."""
+    if not isinstance(repo, str) or not isinstance(author, str):
+        return False
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if any(set(value) - allowed for value in (*parts, author)):
+        return False
+    escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
+    escaped_author = urllib.parse.quote(author, safe="")
+    permission = _github_api_attestation(
+        f"repos/{escaped_repo}/collaborators/{escaped_author}/permission", token,
+    )
+    if permission is None:
+        return False
+    if permission[0] == 200:
+        if not isinstance(permission[1], dict):
+            return False
+        resolved_permission = permission[1].get("permission")
+        if resolved_permission in {
+            "read", "triage", "write", "maintain", "admin",
+        }:
+            return True
+        if resolved_permission != "none":
+            return False
+    elif permission[0] != 404:
+        return False
+
+    membership = _github_api_attestation(
+        f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
+        token,
+    )
+    return bool(
+        membership is not None
+        and membership[0] == 200
+        and isinstance(membership[1], dict)
+        and membership[1].get("state") == "active"
+    )
 
 # Pollers manifest schema version history:
 #
@@ -442,6 +521,9 @@ class PollerConfig:
     #: recovery — no events are lost, only delayed.
     priority: str = "normal"
     pass_env: tuple[str, ...] = ()
+    # Server-owned trust derivation selected from operator-reviewed manifest
+    # configuration. Poller stdout cannot override this value.
+    trust_source: str = "external"
     #: ``env_required`` (chainlink #108): env var names the poller
     #: **must** have in its subprocess env to function correctly.
     #: Checked at the start of each ``run_poller`` invocation — after
@@ -1020,6 +1102,19 @@ def discover_pollers(
                 source=pollers_file,
                 poller_name=name,
             )
+            raw_trust_source = entry.get("trust_source", "external")
+            trust_source = (
+                raw_trust_source.strip()
+                if isinstance(raw_trust_source, str)
+                else "external"
+            )
+            if trust_source not in _POLLER_TRUST_SOURCES:
+                log.warning(
+                    "poller_invalid_trust_source: %s name=%r value=%r; "
+                    "using fail-closed external",
+                    pollers_file, name, raw_trust_source,
+                )
+                trust_source = "external"
             seen_names[name] = pollers_file
             pollers.append(
                 PollerConfig(
@@ -1033,6 +1128,7 @@ def discover_pollers(
                     recover_failed_turns=recover_failed_turns,
                     priority=priority,
                     pass_env=tuple(pass_env_clean),
+                    trust_source=trust_source,
                     env_required=tuple(env_required_clean),
                     manifest_path=pollers_file,
                     deliver=deliver,
@@ -1655,7 +1751,7 @@ async def run_poller(
         # etc.) without colliding with the AgentEvent dataclass shape.
         extras = {
             k: v for k, v in parsed.items()
-            if k not in ("prompt", "poller")
+            if k not in ("prompt", "poller", "integrity", "integrity_effect")
         }
         items.append({"prompt": prompt, "extras": extras})
 
@@ -1688,6 +1784,7 @@ async def run_poller(
     # enough for any realistic fire cadence; no risk of collision in
     # practice.
     fire_ts_ms = int(time.time() * 1000)
+    github_trust_cache: dict[tuple[str, str], bool] = {}
 
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
@@ -1725,6 +1822,36 @@ async def run_poller(
             extra["deliver"] = poller.deliver
         channel_id = poller.channel_id()
         service_principal = "service:poller"
+        item_labels = InformationFlowLabels()
+        for item in batch:
+            item_extras = item["extras"]
+            trusted = poller.trust_source == "trusted_system"
+            if poller.trust_source == "github":
+                repo = item_extras.get("repo")
+                author = item_extras.get("author")
+                cache_key = (
+                    repo if isinstance(repo, str) else "",
+                    author if isinstance(author, str) else "",
+                )
+                if cache_key not in github_trust_cache:
+                    github_trust_cache[cache_key] = await asyncio.to_thread(
+                        _github_author_is_trusted,
+                        repo,
+                        author,
+                        env.get("GITHUB_TOKEN", ""),
+                    )
+                trusted = github_trust_cache[cache_key]
+            item_labels = item_labels.with_source(SourceLabel(
+                principal=service_principal,
+                domain="channel",
+                resource_id=channel_id,
+                bridge_instance="poller",
+                sensitivity="internal",
+                authorized_principals=frozenset({service_principal}),
+                source_kind="service",
+                integrity="trusted" if trusted else "untrusted",
+                integrity_effect="active_ingest",
+            ))
         event = AgentEvent(
             trigger="poller",
             channel_id=channel_id,
@@ -1736,15 +1863,7 @@ async def run_poller(
             # Stamp provenance before recovery stashes the event. Retries now
             # round-trip the exact service label instead of rebuilding it from
             # ambient state after a failed turn.
-            ifc_labels=InformationFlowLabels().with_source(SourceLabel(
-                principal=service_principal,
-                domain="channel",
-                resource_id=channel_id,
-                bridge_instance="poller",
-                sensitivity="internal",
-                authorized_principals=frozenset({service_principal}),
-                source_kind="service",
-            )),
+            ifc_labels=item_labels,
         )
         try:
             accepted = await enqueue(event)

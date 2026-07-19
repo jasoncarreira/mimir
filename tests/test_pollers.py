@@ -33,6 +33,7 @@ from mimir.pollers import (
     PollerOverridesValidationError,
     _CircuitBreakerState,
     _circuit_breakers,
+    _github_author_is_trusted,
     discover_pollers,
     run_poller,
     validate_poller_overrides_text,
@@ -111,6 +112,7 @@ def test_discover_parses_valid_pollers_json(tmp_path: Path):
     assert p.command == "python poller.py"
     assert p.cron == "*/15 * * * *"
     assert p.env == {"GITHUB_REPOS": "owner/repo"}
+    assert p.trust_source == "external"
     assert p.skill_dir == skill_dir
     assert p.channel_id() == "poller:github-activity"
 
@@ -656,6 +658,104 @@ print(json.dumps({
     # framework-required keys, not metadata.
     assert "prompt" not in item
     assert "poller" not in item
+
+
+@pytest.mark.parametrize(
+    ("permission", "membership", "expected"),
+    [
+        ((200, {"permission": "read"}), None, True),
+        ((200, {"permission": "write"}), None, True),
+        ((200, {"permission": "none"}), (200, {"state": "active"}), True),
+        ((200, {"permission": "none"}), (404, None), False),
+        (None, None, False),
+        (None, (200, {"state": "active"}), False),
+        ((403, {"message": "rate limited"}), (200, {"state": "active"}), False),
+    ],
+)
+def test_github_author_trust_is_server_attested_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    permission: object,
+    membership: object,
+    expected: bool,
+) -> None:
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, _token: str):
+        calls.append(endpoint)
+        return membership if endpoint.startswith("orgs/") else permission
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+
+    assert _github_author_is_trusted("acme/widget", "alice", "server-token") is expected
+    assert calls[0] == "repos/acme/widget/collaborators/alice/permission"
+
+
+@pytest.mark.asyncio
+async def test_github_poller_mixing_uses_least_server_attested_trust(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "trusted", "repo": "acme/widget", "author": "alice"}))
+print(json.dumps({"poller": "x", "prompt": "untrusted", "repo": "acme/widget", "author": "mallory"}))
+""")
+    seen: list[tuple[object, object, str]] = []
+
+    def fake_lookup(repo: object, author: object, token: str) -> bool:
+        seen.append((repo, author, token))
+        return author == "alice"
+
+    monkeypatch.setattr("mimir.pollers._github_author_is_trusted", fake_lookup)
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        batch_size=2, trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    labels = enq.events[0].ifc_labels
+    assert labels is not None
+    assert {source.integrity for source in labels.sources} == {"trusted", "untrusted"}
+    assert all(source.integrity_effect == "active_ingest" for source in labels.sources)
+    assert labels.has_untrusted_active_ingest is True
+    assert seen == [
+        ("acme/widget", "alice", "server-token"),
+        ("acme/widget", "mallory", "server-token"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trusted_system_is_config_anchored_and_payload_cannot_set_integrity(
+    tmp_path: Path,
+    home: Path,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({
+    "poller": "x", "prompt": "jira issue", "integrity": "untrusted",
+    "integrity_effect": "informational",
+}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={}, skill_dir=skill_dir, trust_source="trusted_system",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    event = enq.events[0]
+    source = next(iter(event.ifc_labels.sources))
+    assert source.integrity == "trusted"
+    assert source.integrity_effect == "active_ingest"
+    assert "integrity" not in event.extra["items"][0]
+    assert "integrity_effect" not in event.extra["items"][0]
 
 
 @pytest.mark.asyncio

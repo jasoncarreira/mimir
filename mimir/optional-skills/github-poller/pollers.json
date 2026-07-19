@@ -5,6 +5,7 @@
       "command": "python3 poller.py",
       "cron": "*/15 * * * *",
       "batch_size": 5,
+      "trust_source": "github",
       "env_required": [
         "GITHUB_REPOS"
       ],

@@ -659,6 +659,7 @@ class FeedbackLog:
                     sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
+                    integrity_effect="informational",
                 ))
         return PromptBlock(content=content, labels=labels)
 

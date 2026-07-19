@@ -29,6 +29,7 @@ from mimir.agent import (
     Agent,
     _initialize_ifc_labels,
     _merge_ifc_labels,
+    _prompt_source_labels,
     _propagate_ifc_labels,
 )
 from mimir.bridges._activity_panel import ActivityPanel
@@ -145,10 +146,11 @@ def test_labels_without_source_provenance_fail_closed():
 
 
 @pytest.mark.parametrize(
-    ("trigger", "service_principal", "channel_id", "source"),
+    ("trigger", "service_principal", "channel_id", "source", "integrity"),
     [
-        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None),
-        ("poller", "poller", "poller:github-activity", "poller"),
+        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None, "trusted"),
+        ("saga_session_end", "synthesis", "synthesis:session", "system", "trusted"),
+        ("poller", "poller", "poller:github-activity", "poller", "untrusted"),
     ],
 )
 def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enforce(
@@ -156,6 +158,7 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
     service_principal: str,
     channel_id: str,
     source: str | None,
+    integrity: str,
 ):
     event = AgentEvent(
         trigger=trigger,
@@ -175,6 +178,7 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
             sensitivity="internal",
             authorized_principals=frozenset({f"service:{service_principal}"}),
             source_kind="service",
+            integrity=integrity,
         )
     })
     decision = SinkGate.check_sink_flow(
@@ -226,6 +230,78 @@ def test_service_derived_source_intersects_input_acls():
         bridge_instance="saga", sensitivity="private",
     )
     assert derived.authorized_principals == frozenset({"alice"})
+
+
+def test_source_label_derived_propagates_least_trust_and_active_ingest():
+    trusted_info = SourceLabel(
+        principal="a", domain="memory", resource_id="a", bridge_instance="saga",
+        sensitivity="private", authorized_principals=frozenset({"alice"}),
+        integrity="trusted", integrity_effect="informational",
+    )
+    untrusted_active = SourceLabel(
+        principal="b", domain="web", resource_id="b", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"alice"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+
+    trusted_derived = SourceLabel.derived(
+        frozenset({trusted_info}), principal="service:test", domain="memory",
+        resource_id="trusted", bridge_instance="saga", sensitivity="private",
+    )
+    mixed_derived = SourceLabel.derived(
+        frozenset({trusted_info, untrusted_active}), principal="service:test",
+        domain="memory", resource_id="mixed", bridge_instance="saga",
+        sensitivity="private",
+    )
+
+    # The trusted-only assertion makes this regression non-masked by the
+    # SourceLabel fail-closed defaults if derived() drops the integrity fields.
+    assert (trusted_derived.integrity, trusted_derived.integrity_effect) == (
+        "trusted", "informational",
+    )
+    assert (mixed_derived.integrity, mixed_derived.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+
+
+def test_integrity_gate_helper_is_exact_and_least_trusted_on_mixing():
+    informational = SourceLabel(
+        principal="memory", domain="saga", resource_id="1", bridge_instance="saga",
+        sensitivity="private", integrity="untrusted", integrity_effect="informational",
+    )
+    active = SourceLabel(
+        principal="web", domain="web", resource_id="2", bridge_instance="web",
+        sensitivity="internal", integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(informational)
+    assert labels.has_untrusted_active_ingest is False
+    assert InformationFlowState(labels=labels).has_untrusted_active_ingest() is False
+
+    mixed = labels.with_source(active)
+    assert mixed.has_untrusted_active_ingest is True
+    assert InformationFlowState(labels=mixed).has_untrusted_active_ingest() is True
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (AgentEvent(trigger="user_message", channel_id="slack-C1", author="slack-U1", source="slack"), "trusted"),
+        (AgentEvent(trigger="user_message", channel_id="api", author="claimed", source="http"), "untrusted"),
+        (AgentEvent(trigger="unknown", channel_id="external", source="external"), "untrusted"),
+    ],
+)
+def test_ingress_integrity_derivation_defaults_fail_closed(event: AgentEvent, expected: str):
+    source = next(iter(_initialize_ifc_labels(event).sources))
+    assert source.integrity == expected
+    assert source.integrity_effect == "active_ingest"
+
+
+def test_protected_prompt_sources_are_informational():
+    source = next(iter(_prompt_source_labels(
+        _auth(), domain="saga", resource="auto-recall",
+    ).sources))
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "informational"
 
 
 def test_delegation_wires_service_derived_acl_intersection_into_carrier():

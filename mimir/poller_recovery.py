@@ -158,6 +158,8 @@ def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
                     "sensitivity": source.sensitivity,
                     "authorized_principals": sorted(source.authorized_principals),
                     "source_kind": source.source_kind,
+                    "integrity": source.integrity,
+                    "integrity_effect": source.integrity_effect,
                 }
                 for source in sorted(
                     labels.sources,
@@ -216,6 +218,8 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
                     sensitivity=source.get("sensitivity", ""),
                     authorized_principals=frozenset(source.get("authorized_principals") or ()),
                     source_kind=source.get("source_kind", "channel"),
+                    integrity=source.get("integrity", "untrusted"),
+                    integrity_effect=source.get("integrity_effect", "active_ingest"),
                 )
                 for source in raw_sources
                 if isinstance(source, dict)
