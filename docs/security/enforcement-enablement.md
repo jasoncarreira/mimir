@@ -173,9 +173,9 @@ Two **independent** inputs decide what a turn may do:
      untrusted issues to us (operator decision). Declared per trigger like any
      other trust source.
    - **`fetch_url` from an operator-approved URL** (heartbeat) → the allowlist is
-     **egress authorization only** (which hosts may be fetched); the fetched
-     **content stays untrusted** (§5.4). Approving a host is not vouching for its
-     bytes.
+     **egress authorization only** (which exact URLs may be fetched); the fetched
+     **content stays untrusted** (§5.4). Approving an exact URL is not vouching for
+     its bytes.
    - Everything else ingested from outside → **untrusted**.
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
@@ -242,6 +242,25 @@ heartbeat / session-boundary). Decisions:
   not from anything the poller (or its untrusted payload) can write.
 - This also fixes the "research pollers can't write memory" gap: memory-write
   becomes a declarable capability.
+- **Per-instance, not per-class:** each configured poller *instance* gets its own
+  principal id + capability set + roots (not a shared `poller` principal), so two
+  research pollers can't reach each other's state/memory and a grant is auditable
+  to that instance. The instance principal + caps are **stable across
+  continuations** — a job-complete/continuation turn resolves to the *same*
+  instance principal, never widened or downgraded to a generic one.
+- **One authoritative source, fail-closed, overrides can't widen:** `pollers.json`
+  (skill pollers) and the built-in profiles (heartbeat, session-boundary) are the
+  sole authority, with **deterministic precedence** — a manifest entry can only
+  *narrow* a built-in profile, never widen it. Unknown authority-bearing values
+  (capability name, tier, root) **fail closed**: the poller is rejected, not
+  silently defaulted (distinct from today's fail-*safe* tuning parse).
+  `pollers-overrides.yaml` stays **tuning-only** — authority-bearing fields are not
+  in `POLLER_OVERRIDE_KEYS` and cannot be set there, and a capability grant is
+  never `env`/`pass_env`-derived.
+- **`operator_alert` capability:** the bounded notify-only sink — a single
+  operator-configured alert destination that untrusted/notify-only triggers may
+  send to (and nothing else), exempt from the `#906` block for that one
+  destination only (§5.2).
 
 **Scoped roots must be narrow and argument-level, not the global file-tool
 roots** (mimir blocking finding). The existing `spawn_workspace` /
@@ -265,6 +284,12 @@ Scoped-with-provenance tier sink, and (c) the requested destination satisfies
 the sink's containment policy (verified, not asserted). Unbounded-tier sinks
 stay hard-blocked. This keeps the `#906` guarantee for the sinks that matter
 while unblocking contained work.
+
+Notify-only work (untrusted code, unknown-author GitHub) routes to the bounded
+`operator_alert` destination (§5.1) — the **single** exception to the Unbounded
+hard-block, scoped to that one fixed destination; every other cross-channel
+destination stays blocked, and the exemption is a specific destination, not a
+class of destinations.
 
 ### 5.3 Scoped memory writes, provenance-tagged (and why **not** a quarantine namespace)
 
@@ -334,7 +359,7 @@ future move is *turn-type-scoped* gating (keep user turns exempt; gate recalled
 untrusted-origin content on autonomous turns, which have no human backstop). This
 is a known limitation, not a closed hole.
 
-### 5.4 Network egress: `fetch_url` and the uniform egress boundary
+### 5.4 Network egress: `fetch_url` and the application egress boundary
 
 `fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are where "let the agent
 act" and "let data leak out" are the same action.
@@ -408,7 +433,7 @@ The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
   their own subprocess; the capability is simply not in their set).
 - **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist** —
   authorization to reach those destinations, **not** a trust signal for the
-  response (mimir: approving a host authorizes the request, not the bytes).
+  response (mimir: approving an exact URL authorizes the request, not the bytes).
   **Fetched content stays untrusted** — it can drive scoped sinks (save state /
   wiki / memory, provenance-tagged) but not code/shell. The heartbeat fetches its
   approved URLs freely.
@@ -419,18 +444,28 @@ The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
     send arbitrary data to." Exact URLs make taint-independent egress
     unconditionally safe; a genuinely-needed wildcard host would additionally
     require the request to carry no turn-derived data.
-- **User / operator turns:** **ask-on-first-use per host** (mimir rec) — the agent
-  asks the first time it wants a destination, the operator approves it (adding it
-  to the session allowlist), then it's remembered for that scope. Not a blanket
-  standing grant, and not an ask on every call.
+- **User / operator turns:** **ask-on-first-use per exact URL** — the agent asks
+  the first time it wants a destination, the operator approves it (adding that
+  **exact URL** to the session allowlist), then it's remembered for that scope. A
+  later different path/query on the same host is a fresh ask. Exact-URL throughout
+  (fetch, redirects, ask-on-first-use) — **no host wildcards anywhere**; not a
+  blanket standing grant, and not an ask on every call.
 
-**One uniform egress boundary, including child processes** (mimir finding).
-`fetch_url` is not the only way data leaves the box — **spawned agents and
-poller subprocesses have their own network access**. Gating only the agent's
-`fetch_url` tool is incomplete. The design must define a single egress boundary
-(the approved-host allowlist + one-use declassification semantics) that applies
-to child processes too, not a special case for one tool. (This ties to the
-`spawn_*` isolation contract in §5.5, which must include egress confinement.)
+**Two layers, split by scope** (mimir finding + re-review). `fetch_url` is not the
+only way data leaves the box — **spawned agents and poller subprocesses have their
+own network access**, which the *application-level* gate (the agent's
+`fetch_url`/`web_search`/`webhook`/MCP tools) does not close. But confining a
+child process's own sockets is a **task/OS-level** control, not something the
+application gate can enforce — so this enablement scopes the two separately:
+- **In scope now — the application egress gate** above (exact-URL allowlist +
+  payload-provenance / turn-taint) on the agent's own egress tools.
+- **Deferred with the isolated-compute substrate — child-process / task-level
+  network confinement** (Fargate security groups / a no-egress-or-proxy task
+  network; `--network` under docker; §5.5/§6). This is acceptable at enablement
+  because the only code that runs in a child process is **trusted** (untrusted
+  code work is notify-only, §5.5), so there is no untrusted child-process egress
+  to confine yet. When untrusted code work is enabled, the substrate must bring
+  the task-level egress control with it.
 
 ### 5.5 GitHub poller code work → Worklink only; the `spawn_*` isolation contract
 
@@ -454,7 +489,11 @@ command can still write outside cwd or reach the network), and a `shell.sandbox:
 "strict"` key is **not confirmed** in the opencode docs we can see. So opencode's
 config hardens the file-tool surface but is not, by itself, a real sandbox; treat
 it as one layer, verify `shell.sandbox` against the opencode version we actually
-run, and restrict the `bash` permission.
+run, and set `permission.bash` to a **deny-by-default operator-configurable
+allowlist** of the build/test/git commands worklink needs — **not** `ask`
+(headless worklink would wedge on the prompt). This is defense-in-depth for
+**trusted** code work only: an allowed command's arguments are still an escape
+hatch, acceptable solely because worklink is trusted-code-only.
 
 **Decision: untrusted code work is notify-only for now.** We do **not** build an
 isolated compute substrate as part of this enablement. Unknown-author GitHub
@@ -519,8 +558,11 @@ is allowed.
   (`web_search` query, `webhook` body, MCP args, child-process requests): fixed
   approved endpoint + model-controlled payload → **config/server-derived payload
   allowed, model-emitted payload → turn-taint gate**. Pollers have no `fetch_url`;
-  user turns ask-on-first-use; one **uniform egress boundary including child
-  processes**. Accepted residual: low-bandwidth covert channels not chased.
+  user turns **ask-on-first-use per exact URL** (no host wildcards). The
+  **application** egress gate is in scope now; **child-process / task-level network
+  confinement is deferred** with the isolated-compute substrate (§5.5/§6) — nothing
+  untrusted runs in a child process yet. Accepted residual: low-bandwidth covert
+  channels not chased.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
@@ -546,7 +588,7 @@ future isolated `ComputeBackend` (`shared_filesystem=False, network_isolated=Tru
 the registry's `unsafe_by_caps` gate then admits it) would instead layer, in
 descending portability:
 - **Application-level file confinement:** opencode `external_directory` deny +
-  restricted `bash` permission (works anywhere; no kernel deps).
+  deny-by-default `bash` allowlist (works anywhere; no kernel deps).
 - **Task-level network egress control:** Fargate security groups / a no-egress or
   proxy-only task network (docker: `--network` limits). Confines the *whole task*
   — including any shell `curl` — without a per-process netns, which is the
@@ -595,10 +637,14 @@ masked-check-verified):
 
 ## 8. Proposed work breakdown (design is settled — §6)
 
-1. **Per-trigger capability config** (§5.1): manifest schema + a built-in profile
-   for heartbeat/session-boundary; named capabilities validated against the tier
-   table; narrow per-trigger roots from immutable operator config (not the global
-   file-tool roots); manifest cannot self-grant/mutate its authority.
+1. **Per-trigger capability config** (§5.1): one authoritative schema (`pollers.json`
+   + built-in profiles) with deterministic manifest-vs-built-in precedence and
+   **fail-closed** handling of unknown authority-bearing values; named capabilities
+   validated against the tier table; **per-instance** principals + narrow
+   per-instance roots from immutable operator config (not the global file-tool
+   roots); the `operator_alert` bounded sink; manifest/overrides cannot
+   self-grant/mutate/widen authority (authority-bearing fields stay out of
+   `POLLER_OVERRIDE_KEYS`).
 2. **Integrity axis + trust derivation** (§4): add **two** fields to `SourceLabel`,
    both server-set at ingest — `integrity: trusted | untrusted` (from source
    identity: GitHub permission graph, pointed-at JIRA instance, internal triggers →
@@ -617,15 +663,20 @@ masked-check-verified):
 4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
-5. **Network egress boundary** (§5.4): destination allowlist of **exact URLs**;
-   URL-is-destination is taint-independent **only under trusted-deterministic
-   dispatch** (config-fixed set/order) with **per-hop redirect checks** —
-   model-chosen fetches fall to the integrity gate; **payload-bearing sinks**
-   (`web_search`/`webhook`/MCP/child-process) allow config/server-derived payloads
-   and integrity-gate model-emitted ones; pollers no `fetch_url`; user
-   ask-on-first-use; one boundary covering child processes (task-level egress).
+5. **Application network-egress boundary** (§5.4): destination allowlist of
+   **exact URLs** (no host wildcards anywhere — fetch, redirects, ask); URL-is-
+   destination is taint-independent **only under trusted-deterministic dispatch**
+   (config-fixed set/order) with **per-hop redirect checks** — model-chosen fetches
+   fall to the integrity gate; **payload-bearing sinks** (`web_search`/`webhook`/
+   MCP) allow config/server-derived payloads and integrity-gate model-emitted ones;
+   pollers no `fetch_url`; user **ask-on-first-use per exact URL**. Child-process /
+   task-level network confinement is **deferred** with the isolated-compute
+   substrate (§5.5/§6) — trusted-only child code today means nothing untrusted to
+   confine yet.
 6. **opencode file-permission** for worklink (§5.5): set `external_directory` deny
-   + restrict `bash`; verify `shell.sandbox` against our opencode version.
+   + `permission.bash` to a **deny-by-default operator-configurable allowlist**
+   (not `ask` — headless wedges); verify `shell.sandbox` against our opencode
+   version. Defense-in-depth for trusted code work only, not a confinement proof.
 6a. **Enforcement-aware prompt guidance** (§5.6): a flag-gated prompt block +
    heartbeat/poller profile guidance describing the trust/taint model — ergonomics
    only, never a boundary.
