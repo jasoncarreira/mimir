@@ -1,6 +1,10 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT design proposal — seeking review (mimir + operator).
+**Status:** DRAFT — revision 2. Incorporates mimir review round 1 (spawn is not
+contained; the "scoped" file root is actually the whole home; the `SAGA` category
+is too broad; integrity is an enablement prerequisite) and the operator's
+per-trigger policy (GitHub known-contributor vs unknown; research pollers;
+heartbeats). Seeking another review round.
 **Date:** 2026-07-19.
 **Context:** written after a whole-`access_control` adversarial review (5 parallel
 reviewers, findings verified with runtime repros). It proposes the model that
@@ -81,15 +85,30 @@ The `#906` intuition ("don't let attacker-controlled payload drive a sink") is
 correct for **unbounded** sinks and wrong for **contained** ones. The examples
 you already rely on are contained-by-construction:
 
-- **GitHub poller code work** = `worklink_run` / `spawn_*` running in an
-  **isolated worktree**, whose output is a **PR a human reviews** before it's
-  real (plus the staged-diff secret-scan added in #1137). Untrusted issue
-  content driving that is safe *because the blast radius is a sandbox + a review
-  gate* — not because the content is trusted. This covers both greenfield and
+- **GitHub poller code work** = `worklink_run` running in an **isolated
+  worktree** (`create_isolated_checkout`), whose output is a **PR a human
+  reviews** before it's real, after `observe_evidence` validates the diff/tests
+  (plus the staged-diff secret-scan added in #1137). Untrusted issue content
+  driving *that* is safe *because the blast radius is a sandbox + a review gate*
+  — not because the content is trusted. This covers both greenfield and
   "update/test from an existing review."
 - **Research poller findings** = `write_file` to a **scoped state root** (core
   memory and system paths already un-writable) and a memory write to the normal
   recallable store **tagged with untrusted provenance** (see §5.3).
+
+> **Important correction (mimir review):** generic `spawn_*`
+> (`spawn_open_code` / `spawn_codex` / `spawn_claude_code`) is **not** contained
+> the way `worklink_run` is. It runs `opencode run --dir <cwd>` as an ordinary
+> subprocess; its only confinement is the `spawn_workspace` policy
+> (`_target_within_configured_write_roots`), which permits **all of
+> `MIMIR_HOME` plus configured RW roots** (e.g. `/workspace/mimir`) and does
+> **not** apply the file-tool read-only guard or any PR-only-output
+> postcondition. So `spawn_*` is an **unbounded host-write / code-execution
+> sink**, not a contained one. Only `worklink_run` has the
+> isolated-worktree + evidence + review shape. This doc's tiers reflect that:
+> **route all poller code work through `worklink_run`; keep generic `spawn_*`
+> blocked on untrusted-payload turns** until it has an executable isolation
+> contract (§5.5).
 
 So the rule becomes: **"untrusted-payload turn → allow sinks whose containment
 bounds the blast radius; hard-block only the unbounded / exfiltrating ones."**
@@ -102,49 +121,85 @@ The containment policies already exist on the principal — `#906` just needs to
 
 | Tier | Sinks | Why it's safe / not | Untrusted-payload turn |
 |---|---|---|---|
-| **Contained** | `worklink_run`, `spawn_*` (worktree), `write_file`/`edit_file` (scoped roots), read-only `shell` | sandboxed / scoped / human-reviewed / reversible; blast radius is bounded | **Allow** if the destination satisfies the containment policy |
+| **Contained** | `worklink_run` (isolated worktree + evidence + reviewed PR), `write_file`/`edit_file` (scoped roots), read-only `shell` | sandboxed / scoped / human-reviewed / reversible; blast radius is bounded | **Allow** if the destination satisfies the containment policy |
 | **Scoped-with-provenance** | `memory_store` / `saga_*` writes to the recallable store | usable later, but carries where it came from; can't reach core memory | **Allow** into the recallable store, **tagged untrusted** (never core memory) |
-| **Unbounded / exfiltrating** | `fetch_url` / `NETWORK`, webhooks, `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary or is irreversible/self-modifying | **Hard-block** (this is where `#906` still earns its keep) |
+| **Unbounded / exfiltrating** | generic `spawn_*` (ordinary subprocess, writes anywhere in the RW roots, no review gate); `fetch_url` / `NETWORK`, webhooks, `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary, executes attacker-influenced code with host write, or is irreversible/self-modifying | **Hard-block** (this is where `#906` still earns its keep). `spawn_*` moves to **Contained** only once it has the isolation contract in §5.5. |
 
 ---
 
-## 4. Turn model
+## 4. Trust model and per-trigger policy
 
-The tiers apply to every turn; who gets what differs by turn kind.
+Two **independent** inputs decide what a turn may do:
 
-| | **Contained actions** (worktree spawn/worklink, scoped file/edit, read-only shell) | **Memory/state write** | **`fetch_url` / network exfil** |
-|---|---|---|---|
-| **User / operator turn** | allowed (operator-trust) | allowed, provenance-tagged | **ask permission** (§5.4) |
-| **Poller turn** | allowed **per declared capability** | allowed **per declared capability**, provenance-tagged | **blocked** |
-| **Any turn** | core-memory / system-path / live-host write-`shell` → hard-blocked | — | hard-blocked |
+1. **Capability set** — declared per trigger type (a poller's manifest, or the
+   trigger's built-in profile) and validated against the tier table (§3). A
+   trigger can only ever use sinks in its declared set. This is the *ceiling*.
+2. **Content trust (integrity)** — derived from a source the content **cannot
+   forge**, *not* from the fact that a trusted party started the turn:
+   - **Internal trigger** (heartbeat, session-boundary, operator's own typed
+     input) → **trusted**.
+   - **GitHub content** → trusted iff the author is a **repo collaborator, org
+     member, or has write access** (GitHub's own permission graph — operator-
+     controlled, un-forgeable by a PR). Such a contributor's issue/PR is trusted
+     as a whole. Content from **anyone else — including *comments* on an
+     otherwise-trusted PR — is untrusted**.
+   - **`fetch_url` from an operator-approved URL** (heartbeat) → **trusted**
+     (§5.4 — an explicit, accepted trade-off).
+   - Everything else ingested from outside → **untrusted**.
 
-Rationale:
-- The **operator** on their own interactive turn is trusted to drive contained
-  actions (this matches the accepted single-operator shell posture; see the open
-  question in §6 about multi-user).
-- A **poller** ingesting untrusted content gets exactly the contained sinks its
-  manifest declares, and no exfil path (there is no human present to approve
-  one, and pollers fetch via their own subprocess anyway).
+The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
+any sink in the capability set; untrusted → Contained or Scoped-with-provenance
+only; untrusted → Unbounded is blocked* (or explicit one-use declassification).
+This is the integrity model **anchored on identity**. It replaces "trust the
+turn because a trusted party started it," which does **not** survive the
+confused-deputy case — untrusted content (an issue body, a web page, a comment)
+folded into a trusted turn and then driving an action.
+
+### Per-trigger policy
+
+| Trigger | Capability set (the ceiling) | Trust / gating |
+|---|---|---|
+| **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
+| **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org / write) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
+| **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted; approved-URL content is trusted (§5.4) |
+| **Session-boundary turn** | session-boundary writes | internal → trusted |
+| **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | trust source TBD (JIRA identity); declared like any other trigger |
+
+The config model must be **open to new trigger types** declaring their own
+capability profile + trust source — not hardcoded to the rows above.
 
 ---
 
 ## 5. Design
 
-### 5.1 Per-poller capabilities in the manifest
+### 5.1 Per-trigger capabilities in config (named, tier-validated, narrow roots)
 
-Replace the one-size-fits-all `poller` principal with **per-poller capability
-declarations in the poller's config** (`pollers.json` manifest). Each poller
-declares the capability set it needs; the set is validated against the tier
-table at discovery time (a manifest cannot grant itself an Unbounded-tier sink).
+Replace the one-size-fits-all `poller` principal with **per-trigger capability
+declarations** (a poller's `pollers.json` manifest; a built-in profile for
+heartbeat / session-boundary). Decisions:
 
-- GitHub poller → declares code-work (`worklink_run`, `spawn_*`, scoped
-  file/edit, read-only shell).
-- Research / RSS poller → declares `write_file` (scoped) + `memory_store`
-  (recallable, provenance-tagged).
-- A pure notifier poller → declares nothing beyond `send_message`.
+- **Named capabilities, not roles** (mimir rec): the manifest lists exact
+  capability names, validated against the tier table (§3) at discovery time, so
+  it cannot self-grant an Unbounded-tier sink.
+- The manifest **cannot mutate or self-grant its own authority declaration** —
+  the capability set and its roots come from immutable operator configuration,
+  not from anything the poller (or its untrusted payload) can write.
+- This also fixes the "research pollers can't write memory" gap: memory-write
+  becomes a declarable capability.
 
-This also fixes the "research pollers can't write memory" gap: memory-write
-becomes a declarable capability, not an ungranted one.
+**Scoped roots must be narrow and argument-level, not the global file-tool
+roots** (mimir blocking finding). The existing `spawn_workspace` /
+`configured_file_roots` policies (`_target_within_configured_write_roots`) accept
+**all of `MIMIR_HOME` plus every configured `:rw` root** (e.g. `/workspace/mimir`).
+That is an operator-wide *reachability* check, not a per-trigger *scoped-state*
+capability — under it a research poller could overwrite **another poller's
+`skills/<name>/pollers.json` or scripts** (persistence across ticks), edit the
+**live source checkout**, or modify **non-core injected memory**. So a poller's
+file/state capability must resolve to a **specific, per-trigger root derived from
+operator config** — e.g. `state/pollers/<name>/…` and/or explicitly named
+knowledge roots — **not** reuse of the global writable roots, and it must not be
+able to write another trigger's authority/config.
 
 ### 5.2 `#906` becomes tier-based (defer to containment)
 
@@ -156,7 +211,18 @@ the sink's containment policy (verified, not asserted). Unbounded-tier sinks
 stay hard-blocked. This keeps the `#906` guarantee for the sinks that matter
 while unblocking contained work.
 
-### 5.3 Provenance tags on untrusted-derived writes (and why **not** a quarantine namespace)
+### 5.3 Scoped memory writes, provenance-tagged (and why **not** a quarantine namespace)
+
+**Scope the operations, not the whole `SAGA` category** (mimir finding). The
+`SAGA` sink category today lumps in destructive/governance operations —
+`saga_forget`, session-boundary writes (`saga_end_session`), commitment state
+changes — with plain atom creation. The research-poller memory capability is
+**create/append a provenance-tagged recallable atom, plus feedback/credit**
+(`saga_feedback` / `saga_mark_contributions`) — **not** `saga_forget`, **not**
+session boundaries (those are created by session-boundary turns). The exact
+write ops that carry immutable origin/integrity metadata, and the storage schema
+for that metadata, are defined as part of this work rather than inherited from
+the coarse category.
 
 Untrusted-derived writes (poller findings) are **usable** memory, tagged with
 their origin (which poller, which source, untrusted). We deliberately do **not**
@@ -175,59 +241,90 @@ already (mostly) exists:
 - **the action gate** — a poisoned finding that gets recalled still cannot
   *drive* a privileged action without passing this same sink classification.
 
-### 5.4 `fetch_url`: blocked on pollers; permission-ask on user turns
+### 5.4 Network egress: `fetch_url` and the uniform egress boundary
 
-`fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are the one place where
-"let the agent act" and "let data leak out" are the same action, so they stay
-Unbounded-tier:
+`fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are where "let the agent
+act" and "let data leak out" are the same action. By trigger:
 
-- **Poller turns:** hard-blocked. Pollers fetch via their own subprocess, so the
-  agent's `fetch_url` is never needed for their work.
-- **User turns:** instead of blanket-allow, the agent **asks permission** — a
-  small human-in-the-loop escalation (agent requests the fetch, operator
-  approves, then it egresses). See open question §6.2 for the exact flow.
+- **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
+  their own subprocess; the capability is simply not in their set).
+- **Heartbeat:** `fetch_url` allowed against an **operator-approved URL/host
+  list**, and content from an approved URL is treated as **trusted** (not
+  tainted). This is an explicit trade-off: tainting approved-URL content would
+  make the heartbeat unable to do its work, so approving a URL *is* vouching for
+  it. Accepted residual: a compromised approved site could feed the heartbeat.
+- **User / operator turns:** **exact-host/URL grant with ask-on-first-use**
+  (mimir rec) — the agent asks the first time it wants a host, the operator
+  approves that host/URL, and it's remembered for that scope. Not a blanket
+  standing network grant, and not an ask on literally every call.
 
-### 5.5 GitHub poller: greenfield **and** review/update/test
+**One uniform egress boundary, including child processes** (mimir finding).
+`fetch_url` is not the only way data leaves the box — **spawned agents and
+poller subprocesses have their own network access**. Gating only the agent's
+`fetch_url` tool is incomplete. The design must define a single egress boundary
+(the approved-host allowlist + one-use declassification semantics) that applies
+to child processes too, not a special case for one tool. (This ties to the
+`spawn_*` isolation contract in §5.5, which must include egress confinement.)
 
-Both "develop new code" and "update/test from an existing code review" run in an
-isolated worktree with a reviewed PR as the only durable output. `worklink_run`
-/ `spawn_*` cover acting on an existing review, not just greenfield — so no
-separate mechanism is needed; the review path is the same contained shape.
+### 5.5 GitHub poller code work → Worklink only; the `spawn_*` isolation contract
+
+All GitHub-poller code work — greenfield **and** "update/test from an existing
+review" — routes through **`worklink_run`** (isolated worktree, `observe_evidence`
+diff/test validation, reviewed-PR-only durable output). Generic `spawn_*` is
+**not** used for poller code work, because it is not contained (§2/§3).
+
+A known contributor's PR is trusted, so its code work runs; an unknown author's
+issue/PR, or a non-contributor comment, is untrusted → **notify-only** (§4). So
+even the trusted path is contained by Worklink, and the untrusted path does not
+autonomously touch code at all.
+
+`spawn_*` moves out of the Unbounded tier only once it has an **executable
+isolation contract**: a freshly-created isolated worktree, enforced path
+confinement of *all* writable outputs (not the operator-wide RW roots),
+secret/environment minimization, egress confinement (§5.4), diff validation, and
+PR/review-only publication of durable effects — i.e. it must earn the same
+postconditions `worklink_run` already has, verifiably, before untrusted-payload
+turns may drive it.
 
 ---
 
-## 6. Open questions (for reviewers — mimir and operator)
+## 6. Decisions and remaining questions
 
-1. **Capability config schema.** Should a poller manifest declare **named
-   capabilities** (e.g. `["worklink_run", "write_file", "memory_store"]`,
-   validated against the tier table) or coarse **roles** (e.g. `code-work`,
-   `research-save`)? Preference: named capabilities validated against tiers, so
-   a manifest can't self-grant outside its tier — but roles are simpler to
-   author. Which?
+**Settled in review (operator + mimir):**
 
-2. **The `fetch_url` "ask permission" flow.** Two shapes: (a) a **mid-turn
-   prompt back to the operator** in the channel ("I need to fetch `<url>`, ok?")
-   that blocks until answered — most secure, per-call; or (b) a **standing /
-   allowlist grant** the operator pre-approves (host or URL patterns) — less
-   interrupting, coarser. Which, or a hybrid (ask once per host, remember)?
+- **Capability schema → named capabilities**, validated against the tier table;
+  a manifest cannot self-grant or mutate its own authority (§5.1).
+- **Content trust → derived from source identity, not turn ownership** (§4).
+  This is the integrity model and it supersedes the earlier "operator-trust"
+  framing. Anchors: the GitHub permission graph (collaborator / org / write),
+  the operator-approved URL list, and internal triggers. mimir's position — that
+  integrity is an *enablement prerequisite*, not a multi-user-someday concern —
+  is adopted: the confused-deputy case is closed **now**, single-operator
+  included.
+- **Network egress → §5.4**: pollers have no `fetch_url`; heartbeat uses the
+  approved-URL list (approved content trusted); user turns ask-on-first-use per
+  host; one **uniform egress boundary including child processes**, not a per-tool
+  special case.
+- **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
+  feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
+- **Provenance → rendered structurally, never an enforcement boundary** (mimir
+  rec): the tag informs; the action gate enforces.
 
-3. **Operator-trust scope for user turns (single- vs multi-user).** The model
-   above trusts the operator's own interactive turns to drive contained actions.
-   That is right for single-operator mimirbot. Its residual gap: untrusted
-   content pulled into an operator turn (a shared-channel message, a forwarded
-   payload) could drive a contained action, because an ACL encodes *who may
-   see*, not *is trusted to act*. Before mimir ever faces untrusted multi-user
-   chat, this wants a genuine **integrity dimension** on source labels
-   (trusted = operator direct input; untrusted = external/inbound) that gates
-   action sinks regardless of visibility. Do we accept operator-trust now and
-   track the integrity-label work as the multi-user prerequisite, or build the
-   integrity dimension up front?
+**Remaining open:**
 
-4. **Provenance surfacing on recall.** How should untrusted-source provenance be
-   rendered when a finding is recalled into the prompt — an inline tag per
-   memory, a grouped "from untrusted sources" section, or a structured field the
-   agent is prompted to weigh? (Affects whether the tag actually changes
-   behavior vs. being decorative.)
+1. **Mixed / embedded content inside a trusted PR.** Top-level comments are
+   handled (a non-contributor comment is untrusted → notify). But a known
+   contributor's PR built on an unknown fork, or quoting external material —
+   where exactly is the taint boundary inside an otherwise-trusted item?
+2. **Provenance schema + recall rendering.** The exact immutable origin/integrity
+   metadata stored on a write, and how it surfaces on recall (inline per-atom vs
+   grouped) so it actually informs weighting rather than being decorative.
+3. **Future trigger trust sources (e.g. JIRA).** How a JIRA ticket's author trust
+   is derived (project role? reporter identity?) — needed before that poller
+   lands, not now.
+4. **`spawn_*` isolation contract — build it, or Worklink-only indefinitely?**
+   §5.5 specifies what it would take; the call is whether to invest in a
+   contained `spawn_*` or keep all untrusted code work on `worklink_run`.
 
 ---
 
