@@ -72,6 +72,7 @@ from .models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     PromptBlock,
     SourceLabel,
     TurnInteractivity,
@@ -293,6 +294,7 @@ def _initialize_ifc_labels(
         source_channel=event.channel_id,
     )
 
+    continuation_auth = _shell_continuation_auth_context(event)
     canonical_principal = event.author
     source_kind = "channel"
     registered_service = get_service_principal(event.trigger)
@@ -308,14 +310,28 @@ def _initialize_ifc_labels(
         canonical_principal = f"service:{registered_service.canonical}"
         source_kind = "service"
     canonical_resource = event.channel_id
-    if resolver is not None:
+    if continuation_auth is not None:
+        canonical_principal = (
+            continuation_auth.canonical_principal or continuation_auth.principal
+        )
+        if continuation_auth.is_service and canonical_principal:
+            canonical_principal = f"service:{canonical_principal}"
+        canonical_resource = continuation_auth.resource_id or event.channel_id
+        source_kind = "service" if continuation_auth.is_service else "channel"
+    elif resolver is not None:
         if event.author:
             canonical_principal = resolver.resolve(event.author)
         canonical_resource = resolver.resolve_channel(event.channel_id)
     extra = event.extra if isinstance(event.extra, dict) else {}
     visibility = extra.get("channel_visibility")
-    domain = f"channel:{visibility}" if isinstance(visibility, str) and visibility else "channel"
+    domain = (
+        continuation_auth.domain
+        if continuation_auth is not None
+        else f"channel:{visibility}" if isinstance(visibility, str) and visibility else "channel"
+    )
     bridge_instance = extra.get("bridge_instance")
+    if continuation_auth is not None:
+        bridge_instance = continuation_auth.bridge_instance
     if not isinstance(bridge_instance, str) or not bridge_instance:
         bridge_instance = event.source
     if (
@@ -352,6 +368,44 @@ def _initialize_ifc_labels(
         labels = labels.with_label("internal")
 
     return labels
+
+
+def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
+    """Return a trusted shell continuation carrier only for its origin channel."""
+    inherited = event.continuation_auth_context
+    if (
+        event.trigger == "shell_job_complete"
+        and isinstance(inherited, AuthContext)
+        and inherited.channel_id == event.channel_id
+    ):
+        return inherited
+    return None
+
+
+def _create_turn_auth_context(
+    event: AgentEvent,
+    resolver: Any,
+    *,
+    policy_version: str | None,
+    enforce: bool,
+    ifc_labels: InformationFlowLabels,
+) -> AuthContext:
+    inherited = _shell_continuation_auth_context(event)
+    if inherited is None:
+        return create_auth_context(
+            event,
+            resolver,
+            policy_version=policy_version,
+            enforce=enforce,
+            ifc_labels=ifc_labels,
+        )
+    return replace(
+        inherited,
+        policy_version=policy_version,
+        enforcement_enabled=enforce,
+        ifc_labels=ifc_labels,
+        ifc_state=InformationFlowState(labels=ifc_labels),
+    )
 
 
 def _is_private_attachment(filename: str) -> bool:
@@ -1539,7 +1593,7 @@ class Agent:
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
         )
-        initial_auth_context = create_auth_context(
+        initial_auth_context = _create_turn_auth_context(
             event,
             getattr(self, "_identity_resolver", None),
             policy_version=getattr(self._config, "policy_version", None),
@@ -3284,6 +3338,7 @@ class Agent:
             ifc_labels=_propagate_ifc_labels(
                 getattr(job, "ifc_labels", None), job.channel_id,
             ),
+            continuation_auth_context=getattr(job, "auth_context", None),
         )
         try:
             accepted = await self._dispatcher.enqueue(event)

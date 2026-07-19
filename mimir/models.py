@@ -324,6 +324,9 @@ class AgentEvent:
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
     ifc_labels: "InformationFlowLabels | None" = None
+    # Frozen authority inherited by a trusted server-created continuation.
+    # Generic ingress constructors must not copy this field from client input.
+    continuation_auth_context: "AuthContext | None" = None
     # ACL accumulated from the authoritative turns in a completed channel
     # session. Only the server-owned synthesis constructor sets this carrier.
     source_session_acl: "SessionACL | None" = None
