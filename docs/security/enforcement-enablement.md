@@ -85,45 +85,56 @@ The `#906` intuition ("don't let attacker-controlled payload drive a sink") is
 correct for **unbounded** sinks and wrong for **contained** ones. The examples
 you already rely on are contained-by-construction:
 
-- **GitHub poller code work** = `worklink_run` running in an **isolated
-  worktree** (`create_isolated_checkout`), whose output is a **PR a human
-  reviews** before it's real, after `observe_evidence` validates the diff/tests
-  (plus the staged-diff secret-scan added in #1137). Untrusted issue content
-  driving *that* is safe *because the blast radius is a sandbox + a review gate*
-  — not because the content is trusted. This covers both greenfield and
-  "update/test from an existing review."
-- **Research poller findings** = `write_file` to a **scoped state root** (core
-  memory and system paths already un-writable) and a memory write to the normal
-  recallable store **tagged with untrusted provenance** (see §5.3).
+- **Contained by scope** (safe regardless of content trust): a scoped
+  `write_file` to a **narrow per-trigger state root** (core memory and system
+  paths un-writable; see §5.1 on why the root must be narrow), a read-only
+  `shell`, or a provenance-tagged **memory write** to the recallable store
+  (§5.3). These are bounded because the *destination* is bounded — the content
+  driving them can't reach beyond it.
+- **Code work** = `worklink_run`. It has an isolated Git worktree
+  (`create_isolated_checkout`), `observe_evidence` diff/test validation, and a
+  reviewed-PR-only durable output — so its **git/review blast radius** is
+  bounded. This is safe for **trusted** code work (a known contributor's PR,
+  your own request, a heartbeat).
 
-> **Important correction (mimir review):** generic `spawn_*`
-> (`spawn_open_code` / `spawn_codex` / `spawn_claude_code`) is **not** contained
-> the way `worklink_run` is. It runs `opencode run --dir <cwd>` as an ordinary
-> subprocess; its only confinement is the `spawn_workspace` policy
-> (`_target_within_configured_write_roots`), which permits **all of
-> `MIMIR_HOME` plus configured RW roots** (e.g. `/workspace/mimir`) and does
-> **not** apply the file-tool read-only guard or any PR-only-output
-> postcondition. So `spawn_*` is an **unbounded host-write / code-execution
-> sink**, not a contained one. Only `worklink_run` has the
-> isolated-worktree + evidence + review shape. This doc's tiers reflect that:
-> **route all poller code work through `worklink_run`; keep generic `spawn_*`
-> blocked on untrusted-payload turns** until it has an executable isolation
-> contract (§5.5).
+> **Important correction (mimir review, rounds 1–2):** "code work" is **not
+> process-confined**, so it is safe only for **trusted** content — not for
+> untrusted payloads.
+> - Generic `spawn_*` (`spawn_open_code` / `spawn_codex` / `spawn_claude_code`)
+>   isn't even git/review-contained: it runs the CLI as an ordinary subprocess
+>   whose only confinement is `spawn_workspace`
+>   (`_target_within_configured_write_roots` = **all of `MIMIR_HOME` + configured
+>   RW roots**), with no read-only guard and no PR postcondition.
+> - `worklink_run`'s worktree is only a **`cwd`**, not a sandbox. Its compute
+>   (`LocalSubprocessComputeBackend`) reports `shared_filesystem=True,
+>   network_isolated=False` and launches the CLI with `HOME` + provider creds —
+>   so the child can **write outside the worktree and reach the network freely**;
+>   the diff-review only inspects the *worktree's* git diff, not process side
+>   effects. (The registry already flags this "unsafe by caps.")
+>
+> So **neither `worklink_run` nor `spawn_*` may run untrusted code.** Untrusted
+> code work is **notify-only** (§4). Autonomous untrusted code work would require
+> a genuinely isolated compute substrate (`ComputeCaps` with
+> `not shared_filesystem and network_isolated`) — **which nothing currently
+> provides** (docker was removed). That's a prerequisite, not present today
+> (§5.5, §6).
 
-So the rule becomes: **"untrusted-payload turn → allow sinks whose containment
-bounds the blast radius; hard-block only the unbounded / exfiltrating ones."**
-The containment policies already exist on the principal — `#906` just needs to
-*defer to them* instead of pre-empting them.
+So the rule is two-dimensional (§4): **trust of the content × blast-radius of the
+sink.** Untrusted content may drive only scope-contained sinks (narrow file/state
+writes, read-only shell, provenance-tagged memory) — never code execution or
+network egress. Trusted content may drive code work (`worklink_run`) and, per
+capability, the rest.
 
 ---
 
 ## 3. Sink tiers
 
-| Tier | Sinks | Why it's safe / not | Untrusted-payload turn |
-|---|---|---|---|
-| **Contained** | `worklink_run` (isolated worktree + evidence + reviewed PR), `write_file`/`edit_file` (scoped roots), read-only `shell` | sandboxed / scoped / human-reviewed / reversible; blast radius is bounded | **Allow** if the destination satisfies the containment policy |
-| **Scoped-with-provenance** | `memory_store` / `saga_*` writes to the recallable store | usable later, but carries where it came from; can't reach core memory | **Allow** into the recallable store, **tagged untrusted** (never core memory) |
-| **Unbounded / exfiltrating** | generic `spawn_*` (ordinary subprocess, writes anywhere in the RW roots, no review gate); `fetch_url` / `NETWORK`, webhooks, `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary, executes attacker-influenced code with host write, or is irreversible/self-modifying | **Hard-block** (this is where `#906` still earns its keep). `spawn_*` moves to **Contained** only once it has the isolation contract in §5.5. |
+| Tier | Sinks | Why | Untrusted content | Trusted content |
+|---|---|---|---|---|
+| **Scope-contained** | `write_file`/`edit_file` to **narrow per-trigger roots**, read-only `shell` | the destination is bounded, so the content can't reach past it | **Allow** (per capability) | Allow |
+| **Scoped-with-provenance** | `memory_store` / `saga_*` **create-atom + feedback/credit** to the recallable store | usable later, tagged with origin; can't reach core memory | **Allow**, tagged untrusted | Allow |
+| **Code execution** | `worklink_run` (git/review-contained, **not** process-confined); generic `spawn_*` (not even git-contained) | runs a coding CLI with full filesystem + network + creds; only trusted code is safe to run this way today | **Block → notify-only** (needs an isolated compute substrate to ever run untrusted code — §5.5) | Allow (`worklink_run`; `spawn_*` only with the §5.5 isolation contract) |
+| **Unbounded / exfiltrating** | `fetch_url` / `NETWORK`, webhooks, `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary or is irreversible/self-modifying | **Hard-block** (`#906`) | Allow only via the egress boundary (heartbeat approved-URL list; user ask-on-first-use) — §5.4 |
 
 ---
 
@@ -278,13 +289,22 @@ issue/PR, or a non-contributor comment, is untrusted → **notify-only** (§4). 
 even the trusted path is contained by Worklink, and the untrusted path does not
 autonomously touch code at all.
 
-`spawn_*` moves out of the Unbounded tier only once it has an **executable
-isolation contract**: a freshly-created isolated worktree, enforced path
-confinement of *all* writable outputs (not the operator-wide RW roots),
-secret/environment minimization, egress confinement (§5.4), diff validation, and
-PR/review-only publication of durable effects — i.e. it must earn the same
-postconditions `worklink_run` already has, verifiably, before untrusted-payload
-turns may drive it.
+**Decision: untrusted code work is notify-only for now.** We do **not** build an
+isolated compute substrate as part of this enablement. Unknown-author GitHub
+issues/PRs (and non-contributor comments) are surfaced to the operator, who
+decides. This keeps the flag flippable without new sandbox work.
+
+**If we later want autonomous untrusted code work**, the requirement is a
+`ComputeBackend` whose `capabilities()` reports `shared_filesystem=False,
+network_isolated=True` (the registry's existing `unsafe_by_caps` gate then admits
+it). Since we are **not** returning to docker/container-per-run, the substrate
+would use OS-level sandboxing of the coding-CLI subprocess (see the "How would we
+isolate it" note in §6): filesystem confinement (Landlock or a bind-mount
+namespace so only the worktree is writable), network confinement (a network
+namespace / seccomp block, or an allowlist egress proxy), and credential/env
+minimization. This is a new backend behind the existing `ComputeBackend`
+abstraction, not a design change to the tiers above — and it is **out of scope**
+for the current enablement.
 
 ---
 
@@ -309,8 +329,31 @@ turns may drive it.
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance → rendered structurally, never an enforcement boundary** (mimir
   rec): the tag informs; the action gate enforces.
+- **Untrusted code work → notify-only** (operator decision). We do not build an
+  isolated compute substrate for this enablement; unknown-author code work is
+  surfaced to the operator (§5.5).
 
-**Remaining open:**
+**How would we isolate code execution later (non-docker)** — recorded because the
+question was raised; **out of scope** for this enablement. We are not returning
+to docker/container-per-run. A future isolated `ComputeBackend`
+(`shared_filesystem=False, network_isolated=True`) would sandbox the coding-CLI
+subprocess with OS-level primitives instead:
+- **Filesystem:** **Landlock** (kernel ≥5.13 LSM — the launcher self-restricts
+  writes to the worktree before `exec`, rootless, no namespaces) or a
+  **bubblewrap** mount namespace bind-mounting only the worktree writable over a
+  read-only root.
+- **Network:** a **network namespace** (`unshare -n`) with no route, a **seccomp**
+  block on socket syscalls, or an **allowlist egress proxy** (this is also the
+  uniform egress boundary from §5.4).
+- **Credentials/env:** minimal env, no `HOME`/provider creds passed to the child.
+- It slots behind the existing `ComputeBackend` abstraction; the registry's
+  `unsafe_by_caps` gate already flips such a backend to "safe for untrusted."
+- **Caveat:** mimirbot runs *inside* a container, so nested sandboxing depends on
+  the host permitting the needed syscalls/user-namespaces (cf.
+  `docs/internal/seccomp-userns.json`). Landlock+seccomp is the most portable
+  path if user namespaces are blocked; bubblewrap is more complete if they aren't.
+
+**Remaining open (for tomorrow's design session):**
 
 1. **Mixed / embedded content inside a trusted PR.** Top-level comments are
    handled (a non-contributor comment is untrusted → notify). But a known
@@ -322,9 +365,6 @@ turns may drive it.
 3. **Future trigger trust sources (e.g. JIRA).** How a JIRA ticket's author trust
    is derived (project role? reporter identity?) — needed before that poller
    lands, not now.
-4. **`spawn_*` isolation contract — build it, or Worklink-only indefinitely?**
-   §5.5 specifies what it would take; the call is whether to invest in a
-   contained `spawn_*` or keep all untrusted code work on `worklink_run`.
 
 ---
 
