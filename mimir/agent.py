@@ -1725,6 +1725,7 @@ class Agent:
             # Session attach — same as the SDK path.
             session_id = event.channel_id or "default"
             saga_session_id: str | None = None
+            session_egress_state = initial_auth_context.egress_state
             if event.trigger == "saga_session_end":
                 saga_session_id = (event.extra or {}).get("saga_session_id")
             elif self._sessions is not None:
@@ -1740,6 +1741,9 @@ class Agent:
                     visibility=channel_visibility,
                 )
                 saga_session_id = sess.saga_session_id
+                session_egress_state = getattr(
+                    sess, "egress_state", session_egress_state,
+                )
                 self._sessions.increment_turn_count(event.channel_id)
 
             event_ingress = None
@@ -1805,6 +1809,7 @@ class Agent:
                     auth_ctx,
                     interactivity=turn_interactivity,
                     saga_session_id=saga_session_id,
+                    egress_state=session_egress_state,
                 )
             # IFC exists before any model call or harness panel egress. A resumed
             # event's trusted carrier is unioned with ingress-derived labels; a

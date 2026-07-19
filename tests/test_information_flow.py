@@ -489,8 +489,8 @@ def test_unknown_labels_or_destinations_fail_closed(
 @pytest.mark.parametrize(
     ("tool_name", "expected_reason"),
     [
-        ("fetch_url", "ifc_label_blocked:network"),
-        ("web_search", "ifc_label_blocked:network"),
+        ("fetch_url", "egress_destination_not_approved"),
+        ("web_search", "egress_destination_not_approved"),
     ],
 )
 def test_private_turn_is_blocked_from_external_egress_tools(
@@ -522,7 +522,7 @@ def test_spoofed_service_trigger_cannot_bypass_open_network_sink_gate(
     )
 
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:network"
+    assert decision.reason == "egress_destination_not_approved"
 
 
 def test_resolved_service_keeps_network_sink_policy_behavior():
@@ -551,7 +551,7 @@ def test_resolved_service_keeps_network_sink_policy_behavior():
     )
 
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:network"
+    assert decision.reason == "egress_destination_not_approved"
 
 
 def test_unknown_sink_category_reaches_fail_closed_gate_from_authorization():
@@ -642,7 +642,12 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category}"
+    expected_reason = (
+        "egress_destination_not_approved"
+        if tool_name == "fetch_url"
+        else f"ifc_label_blocked:{sink_category}"
+    )
+    assert decision.reason == expected_reason
 
 
 def _trigger_service_context(
@@ -743,7 +748,7 @@ def test_generic_spawn_is_blocked_even_for_trusted_trigger(
     assert decision.reason == "ifc_label_blocked:spawn"
 
 
-def test_poller_unbounded_sink_requires_trusted_content(
+def test_poller_destination_safe_fetch_is_taint_independent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = "https://approved.example/fixed"
@@ -769,7 +774,188 @@ def test_poller_unbounded_sink_requires_trusted_content(
     )
 
     assert trusted.allowed is True
-    assert untrusted.allowed is False
+    assert untrusted.allowed is True
+
+
+def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = "https://approved.example/fixed?check=1"
+    second_destination = "https://approved.example/other?check=2"
+    monkeypatch.setenv(
+        "MIMIR_HEARTBEAT_APPROVED_URLS",
+        f"{destination},{second_destination}",
+    )
+    service = ServicePrincipal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        capabilities=("fetch_url",),
+        readable_domains=("configured_inputs",),
+        sink_policies=(ServiceSinkPolicy(
+            "fetch_url", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS",
+        ),),
+        capability_tier=CapabilityTier.UNBOUNDED,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+
+    first = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+    second = SinkGate.check_sink_flow(
+        "fetch_url", second_destination, labels, auth, enforce=True,
+    )
+    other_path = SinkGate.check_sink_flow(
+        "fetch_url", "https://approved.example/unlisted", labels, auth, enforce=True,
+    )
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert other_path.reason == "egress_destination_not_approved"
+
+
+def test_web_search_is_allowed_after_untrusted_active_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://api.tavily.com/search"
+    monkeypatch.setenv("MIMIR_TEST_SEARCH_URLS", target)
+    service = ServicePrincipal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        capabilities=("web_search",),
+        readable_domains=("configured_inputs",),
+        sink_policies=(ServiceSinkPolicy(
+            "web_search", "approved_urls", "MIMIR_TEST_SEARCH_URLS",
+        ),),
+        capability_tier=CapabilityTier.UNBOUNDED,
+    )
+    auth, labels = _trigger_service_context(service, integrity="untrusted")
+    decision = SinkGate.check_sink_flow(
+        "web_search", target, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "target", "sink_category", "expected_reason"),
+    [
+        (
+            "webhook",
+            "https://audience.example/hook",
+            None,
+            "ifc_label_blocked:http_webhook",
+        ),
+        (
+            "http_request",
+            "https://audience.example/hook",
+            None,
+            "ifc_label_blocked:http_webhook",
+        ),
+        (
+            "mcp_external_tool",
+            "external-server/tool",
+            SinkCategory.EXTERNAL_MCP,
+            "ifc_label_blocked:external_mcp",
+        ),
+    ],
+)
+def test_audience_egress_and_mcp_remain_blocked_after_untrusted_active_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    target: str,
+    sink_category: SinkCategory | None,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://audience.example/hook")
+    source = SourceLabel(
+        principal="external-source",
+        domain="tool",
+        resource_id="untrusted-result",
+        bridge_instance="web",
+        sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = _labels().with_source(source)
+
+    decision = SinkGate.check_sink_flow(
+        tool_name,
+        target,
+        labels,
+        _auth(roles=("admin",)),
+        enforce=True,
+        sink_category=sink_category,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == expected_reason
+
+
+def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    source = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_channel("slack-C1").with_source(source)
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    exact = "https://example.test/report?day=1"
+    init_logger(tmp_path / "events.jsonl", session_id="egress-approval-test")
+    try:
+        assert SinkGate.check_sink_flow(
+            "fetch_url", exact, labels, auth, enforce=True,
+        ).reason == "egress_destination_not_approved"
+        assert approve_live_declassification(
+            auth, sink_category="network", destination=exact,
+            reason="operator approved this exact fetch URL",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+
+    assert SinkGate.check_sink_flow(
+        "fetch_url", exact, labels, auth, enforce=True,
+    ).allowed is True
+    assert SinkGate.check_sink_flow(
+        "fetch_url", "https://example.test/report?day=2", labels, auth, enforce=True,
+    ).reason == "egress_destination_not_approved"
+    assert SinkGate.check_sink_flow(
+        "fetch_url", "https://example.test/other?day=1", labels, auth, enforce=True,
+    ).reason == "egress_destination_not_approved"
+
+
+def test_approved_fetch_destination_remains_taint_independent(
+    tmp_path: Path,
+) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    destination = "https://example.test/fixed"
+    labels = _labels()
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    init_logger(tmp_path / "events.jsonl", session_id="egress-payload-test")
+    try:
+        assert approve_live_declassification(
+            auth, sink_category="network", destination=destination,
+            reason="approve this exact fetch URL for the session",
+        ) == (True, "approved")
+    finally:
+        _reset_logger_for_tests()
+
+    first = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+    later = SinkGate.check_sink_flow(
+        "fetch_url", destination, labels, auth, enforce=True,
+    )
+
+    assert first.allowed is True
+    assert first.reason == "ifc_allowed"
+    assert later.allowed is True
+    assert later.reason == "ifc_allowed"
 
 
 def test_trigger_sink_must_be_exact_declared_capability() -> None:

@@ -344,6 +344,26 @@ class DeclassificationCapability:
 
 
 @dataclass
+class EgressSessionState:
+    """Server-owned exact-URL approvals shared by turns in one session."""
+
+    _approved_urls: set[str] = field(default_factory=set, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def approve_url(self, url: str) -> None:
+        with self._lock:
+            self._approved_urls.add(url)
+
+    def is_url_approved(self, url: str) -> bool:
+        with self._lock:
+            return url in self._approved_urls
+
+    def approved_urls(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._approved_urls)
+
+
+@dataclass
 class AgentEvent:
     """Inbound event from a bridge, scheduler tick, or HTTP injection.
 
@@ -499,6 +519,9 @@ class AuthContext:
     # making identity, roles, or any authority field mutable.
     ifc_state: InformationFlowState = field(
         default_factory=InformationFlowState, repr=False, compare=False,
+    )
+    egress_state: EgressSessionState = field(
+        default_factory=EgressSessionState, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.

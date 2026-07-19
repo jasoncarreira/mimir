@@ -4,9 +4,9 @@
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
 prerequisite; approved-URL authorizes the request, not the response bytes;
-destination-allowlisting alone is insufficient for payload-bearing network sinks;
-even exact-URL fetch leaks via invocation-pattern/redirects unless dispatch is
-trusted-deterministic; integrity is a distinct axis needing its own executable
+destination-allowlisting alone is insufficient for audience-bearing network sinks;
+exact-URL fetches re-check redirects and accept the low-bandwidth invocation-pattern
+residual; integrity is a distinct axis needing its own executable
 representation, not the confidentiality `ifc_state`; the gate must distinguish
 active-ingest from informational-recall sources that share the accumulator) and
 the operator's decisions
@@ -146,7 +146,7 @@ capability, the rest.
 | **Scope-contained** | `write_file`/`edit_file` to **narrow per-trigger roots**, read-only `shell` | the destination is bounded, so the content can't reach past it | **Allow** (per capability) | Allow |
 | **Scoped-with-provenance** | `memory_store` / `saga_*` **create-atom + feedback/credit** to the recallable store | usable later, tagged with origin; can't reach core memory | **Allow**, tagged untrusted | Allow |
 | **Code execution** | `worklink_run` (git/review-contained, **not** process-confined); generic `spawn_*` (not even git-contained) | runs a coding CLI with full filesystem + network + creds; only trusted code is safe to run this way today | **Block → notify-only** (needs an isolated compute substrate to ever run untrusted code — §5.5) | Allow (`worklink_run`; `spawn_*` only with the §5.5 isolation contract) |
-| **Unbounded / exfiltrating** | `fetch_url` / `NETWORK`, webhooks, `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary or is irreversible/self-modifying | **Hard-block** (`#906`) | Allow only via the egress boundary (heartbeat approved-URL list; user ask-on-first-use) — §5.4 |
+| **Unbounded / exfiltrating** | destination-safe `fetch_url` / `web_search`; audience-bearing webhooks / `http_request`; `EXTERNAL_MCP`; write-`shell` on the live host; writes to core memory / prompts / system paths | leaves the trust boundary or is irreversible/self-modifying | **Destination-safe egress:** allow only through exact-URL / fixed-service controls (§5.4). **Audience-bearing / MCP / other unbounded sinks:** hard-block (`#906`) | Allow only via the egress boundary (heartbeat approved-URL list; fixed search service; user ask-on-first-use) — §5.4 |
 
 ---
 
@@ -180,7 +180,9 @@ Two **independent** inputs decide what a turn may do:
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
 any sink in the capability set; untrusted → Contained or Scoped-with-provenance
-only; untrusted → Unbounded is blocked* (or explicit one-use declassification).
+only; untrusted → audience-bearing or otherwise Unbounded sinks are blocked*
+(or explicit one-use declassification). Destination-safe `fetch_url` / `web_search`
+are the narrow exception: exact-URL / fixed-service reachability is their control (§5.4).
 This is the integrity model **anchored on identity**. It replaces "trust the
 turn because a trusted party started it," which does **not** survive the
 confused-deputy case — untrusted content (an issue body, a web page, a comment)
@@ -217,7 +219,7 @@ confidentiality emptiness and never an informational recall.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from a **config-fixed approved-URL set** | internally triggered → trusted. A **deterministic** fetch of its config-fixed exact-URL set (any subset, repeatedly) is taint-independent — a prior fetch's untrusted content doesn't lock it out; **model-chosen** fetches instead fall under the turn-taint gate. Fetched **content stays untrusted**: drives scoped sinks (save state / wiki / memory) but not code/shell; non-approved destinations blocked; redirects re-checked per hop. Allowlist = exact URLs, not host wildcards (§5.4) |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent — a prior fetch's untrusted content doesn't lock out later approved exact-URL fetches/searches. Fetched **content stays untrusted**: drives scoped sinks (save state / wiki / memory) but not code/shell; non-approved destinations blocked; redirects re-checked per hop. Allowlist = exact URLs, not host wildcards (§5.4) |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
@@ -364,68 +366,33 @@ is a known limitation, not a closed hole.
 `fetch_url` / `web_search` / webhooks / `EXTERNAL_MCP` are where "let the agent
 act" and "let data leak out" are the same action.
 
-Network egress needs the destination allowlist **plus**, for some sinks, a check
-on the request payload. Two sink shapes (mimir round 4):
+Network egress is split by **destination reachability**, not merely by whether
+some request field looks like a payload:
 
-- **URL-is-the-destination** — `fetch_url` against an **exact-URL** allowlist.
-  Exact URLs keep data out of the URL *text*, but taint-independence needs more:
-  the **choice** of which approved URLs to fetch, and their order/count/timing, is
-  itself model-controllable and observable in the endpoints' logs — a low-bandwidth
-  **covert channel** if the model picks fetches based on untrusted/sensitive
-  content — and **redirects** can escape the exact URL. So:
-  - **Trusted deterministic dispatch → taint-independent.** When the fetch set and
-    order are fixed by config/trusted logic (a heartbeat monitoring a configured
-    URL list each tick — its normal pattern), there is no model *choice* to encode
-    data and no data in the URLs → fetch freely, repeatedly, regardless of turn
-    taint. This satisfies "fetch approved URLs freely."
-  - **Model-chosen fetches → model-controlled invocation → turn-taint gate.** If
-    the model dynamically decides which/whether/order to fetch, that choice is
-    treated like a model-emitted payload (rule below): allowed on a clean turn,
-    gated once untrusted content has been ingested.
-  - **Redirects constrained per hop** — an approved URL that 3xx-redirects must
-    have each hop re-checked against the allowlist (or redirect-following
-    disabled), else a redirect escapes the exact-URL bound.
+- **Destination-safe egress is taint-independent.** `fetch_url` carries no
+  model-controlled data out: the destination must match an exact approved URL,
+  the request is GET-only, there is no model-supplied body or arbitrary header,
+  and every redirect hop is re-checked against the same allowlist. `web_search`
+  reaches one fixed, operator-pre-approved search service; approving that tool
+  includes accepting that its query is visible to that trusted provider. These
+  tools remain usable after untrusted active ingest. The choice/order/timing of
+  approved fetches is a low-bandwidth invocation-pattern channel that this
+  single-operator threat model explicitly accepts.
+- **Audience-bearing egress stays behind the turn-taint gate.** `webhook` and
+  `http_request` can send a free-form model body to an approved URL that may be
+  a human or multi-party audience, so exact destination approval is necessary
+  but not sufficient. External MCP (`mcp_*`) stays fail-closed as both a sink
+  and an untrusted result source until each server/tool has an explicit trust
+  posture. Child-process egress remains governed by the code/process boundary,
+  not by destination-safe application egress.
 
-  **Accepted residual:** covert channels are a bottomless well (timing, count,
-  cache-state, resource usage, …). We take the cheap *structural* closes
-  (deterministic dispatch + per-hop redirect check) and **consciously accept
-  residual low-bandwidth covert channels** for the single-operator threat model
-  rather than chase them indefinitely.
-- **Payload-bearing** — `web_search` (query), `webhook` (body), external MCP
-  (args), any child-process request. The destination is a *fixed/approved
-  endpoint* (`_extract_sink_target` returns the Tavily URL, not the query; the
-  webhook URL, not the body; the MCP tool name, not the args), while the payload
-  is separate content that can carry data out to that approved destination — so
-  destination-allowlisting is necessary but **not sufficient**.
-
-  **Mechanism — payload-provenance, then turn-taint fallback.** Precise
-  per-argument provenance is *not* achievable through an LLM: the model reads
-  trusted and untrusted content together and emits a new string, so there is no
-  reliable data-flow from an untrusted input to a specific query. Do not pretend
-  to per-string taint tracking. Instead:
-  1. **Trusted-by-construction payload → allowed** (regardless of turn taint). If
-     the payload is server-supplied / config-derived — a heartbeat's configured
-     search query, a fixed template — it is trusted by construction. Prefer this
-     for autonomous payload-bearing egress: fill the payload from trusted config,
-     don't let the trigger emit it free-form. (This is *why* exact-URL `fetch_url`
-     removes the data-in-URL vector — the payload **is** the config-fixed URL;
-     exact URLs still need trusted-deterministic dispatch + per-hop redirect checks
-     for the invocation-pattern channel, per the URL-is-destination bullet above.)
-  2. **Model-emitted payload → the integrity gate.** A free-form model-composed
-     payload can't be proven clean, so it conservatively inherits the turn's
-     **integrity** state: allowed only if the turn has ingested **no
-     untrusted-integrity source** this turn (per §4 — *not* "IFC empty", which is
-     never true), else blocked / one-use declassify. This is the **same
-     integrity gate the action sinks use** — payload-bearing sinks join the action
-     tier for model-emitted payloads; there is no separate per-payload machinery.
-
-  So the only thing gated is a *model-composed* payload on a turn that has
-  *already ingested* untrusted content — exactly the confused-deputy exfil. A
-  heartbeat's config-driven searches and its exact-URL fetches are unaffected.
-  (Coarse at turn granularity: it can over-block a genuinely-fine model-composed
-  egress after an untrusted ingest — escape is the declassify, and doing trusted
-  egress before ingesting untrusted content avoids it. Optional substring-matching
-  against ingested bytes is defense-in-depth, never the control.)
+Precise per-argument provenance is not achievable through an LLM: the model
+reads trusted and untrusted content together and emits new strings. For the
+remaining audience-bearing sinks, conservatively use the turn's integrity
+state: a model-composed body/args is allowed only before any untrusted
+active-ingest source, otherwise blocked or one-use declassified. This does not
+apply to `fetch_url` or `web_search`; their destination controls are the
+security boundary.
 
 The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
 
@@ -563,20 +530,15 @@ is allowed.
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
-- **Network egress → §5.4**: two sink shapes, one rule — *trusted-by-construction
-  is free; model-controlled falls to the turn-taint gate.* **URL-is-destination**
-  (`fetch_url`, exact-URL allowlist): a **config-deterministic** fetch set is
-  taint-independent (heartbeat fetches its fixed URLs freely); **model-chosen**
-  fetches are model-controlled invocation → turn-taint gated (covert-channel via
-  fetch choice), and redirects are re-checked per hop. **Payload-bearing**
-  (`web_search` query, `webhook` body, MCP args, child-process requests): fixed
-  approved endpoint + model-controlled payload → **config/server-derived payload
-  allowed, model-emitted payload → turn-taint gate**. Pollers have no `fetch_url`;
-  user turns **ask-on-first-use per exact URL** (no host wildcards). The
-  **application** egress gate is in scope now; **child-process / task-level network
-  confinement is deferred** with the isolated-compute substrate (§5.5/§6) — nothing
-  untrusted runs in a child process yet. Accepted residual: low-bandwidth covert
-  channels not chased.
+- **Network egress → §5.4**: the line is **destination reachability**.
+  `fetch_url` (exact-URL allowlist + per-hop redirect re-check) and `web_search`
+  (fixed pre-approved provider) are taint-independent; the low-bandwidth fetch
+  invocation-pattern channel and search-provider query logs are accepted residuals.
+  Audience-bearing `webhook` / `http_request` bodies remain turn-taint gated, and
+  external MCP stays fail-closed pending per-server/tool trust posture. User turns
+  **ask-on-first-use per exact fetch URL** (no host wildcards). Child-process /
+  task-level network confinement is deferred with the isolated-compute substrate
+  (§5.5/§6) — nothing untrusted runs in a child process yet.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
@@ -678,15 +640,14 @@ masked-check-verified):
    `origin_ref` immutable columns; render provenance on recall (grouped by trust)
    **without** tainting; enforcement taint from active ingests only.
 5. **Application network-egress boundary** (§5.4): destination allowlist of
-   **exact URLs** (no host wildcards anywhere — fetch, redirects, ask); URL-is-
-   destination is taint-independent **only under trusted-deterministic dispatch**
-   (config-fixed set/order) with **per-hop redirect checks** — model-chosen fetches
-   fall to the integrity gate; **payload-bearing sinks** (`web_search`/`webhook`/
-   MCP) allow config/server-derived payloads and integrity-gate model-emitted ones;
-   pollers no `fetch_url`; user **ask-on-first-use per exact URL**. Child-process /
-   task-level network confinement is **deferred** with the isolated-compute
-   substrate (§5.5/§6) — trusted-only child code today means nothing untrusted to
-   confine yet.
+   **exact URLs** (no host wildcards anywhere — fetch, redirects, ask); `fetch_url`
+   is taint-independent with **per-hop redirect checks**; `web_search` is likewise
+   taint-independent through its fixed pre-approved service. Audience-bearing
+   `webhook` / `http_request` payloads remain integrity-gated; external MCP remains
+   fail-closed pending per-tool posture. User fetches **ask-on-first-use per exact
+   URL**. Child-process / task-level network confinement is **deferred** with the
+   isolated-compute substrate (§5.5/§6) — trusted-only child code today means
+   nothing untrusted to confine yet.
 6. **opencode file-permission** for worklink (§5.5): set `external_directory` deny
    + `permission.bash` to a **deny-by-default operator-configurable allowlist**
    (not `ask` — headless wedges); verify `shell.sandbox` against our opencode

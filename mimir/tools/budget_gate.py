@@ -52,6 +52,7 @@ from ..access_control import (
     OperationDecision,
     ToolAuthorization,
     approve_live_declassification,
+    approved_fetch_urls,
     classify_protected_result,
     get_tool_registry,
     get_trusted_service_from_auth_context,
@@ -880,6 +881,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
 
         capture_token = begin_protected_result_capture()
+        fetch_token = None
+        if tool_name == "fetch_url":
+            from .web import begin_authorized_fetch
+
+            fetch_token = begin_authorized_fetch(approved_fetch_urls(auth_context))
         try:
             result = handler(execution_request)
         except Exception as exc:
@@ -895,6 +901,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        finally:
+            if fetch_token is not None:
+                from .web import end_authorized_fetch
+
+                end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         result_labels = _result_labels_for_call(
@@ -1017,6 +1028,11 @@ class BudgetGateMiddleware(AgentMiddleware):
         )
 
         capture_token = begin_protected_result_capture()
+        fetch_token = None
+        if tool_name == "fetch_url":
+            from .web import begin_authorized_fetch
+
+            fetch_token = begin_authorized_fetch(approved_fetch_urls(auth_context))
         try:
             result = await handler(execution_request)
         except Exception as exc:
@@ -1032,6 +1048,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 error=str(exc),
             )
             raise
+        finally:
+            if fetch_token is not None:
+                from .web import end_authorized_fetch
+
+                end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         result_labels = _result_labels_for_call(

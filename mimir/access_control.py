@@ -751,8 +751,30 @@ def _target_matches_operator_alert(target: str, destination: str) -> bool:
 
 def _target_matches_approved_url(target: str, destination: str) -> bool:
     """Match one exact URL from an operator-fixed comma-separated set."""
-    approved = {item.strip() for item in os.environ.get(destination, "").split(",") if item.strip()}
-    return target in approved
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    return normalized is not None and normalized in _configured_exact_urls(destination)
+
+
+def _configured_exact_urls(variable: str) -> frozenset[str]:
+    urls: set[str] = set()
+    for item in os.environ.get(variable, "").split(","):
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, item.strip())
+        if normalized is not None:
+            urls.add(normalized)
+    return frozenset(urls)
+
+
+def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
+    """Return exact fetch destinations authorized by config or this session."""
+    approved = set(_configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS"))
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if policy is not None and policy.adapter == "approved_urls":
+        approved.update(_configured_exact_urls(policy.destination))
+    state = getattr(auth_context, "egress_state", None)
+    if state is not None and callable(getattr(state, "approved_urls", None)):
+        approved.update(state.approved_urls())
+    return frozenset(approved)
 
 
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
@@ -774,6 +796,17 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
     SinkCategory.NETWORK: "network",
     SinkCategory.EXTERNAL_MCP: "external_mcp",
 }
+
+
+_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
+_DEFAULT_WEB_SEARCH_URL = "https://api.tavily.com/search"
+
+
+def _fixed_web_search_url() -> str | None:
+    return normalize_sink_destination(
+        SinkCategory.NETWORK,
+        os.environ.get("TAVILY_SEARCH_URL", _DEFAULT_WEB_SEARCH_URL),
+    )
 
 
 class SinkGate:
@@ -819,7 +852,10 @@ class SinkGate:
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return tool_name == "worklink_run" and not has_untrusted_active_ingest
         if capability_tier is CapabilityTier.UNBOUNDED:
-            return not has_untrusted_active_ingest
+            return (
+                tool_name in _TAINT_INDEPENDENT_EGRESS_TOOLS
+                or not has_untrusted_active_ingest
+            )
         return True
 
     @classmethod
@@ -882,6 +918,99 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
 
+        is_application_egress = sink_category in {
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+        }
+        normalized_target = normalize_sink_destination(sink_category, target)
+        if is_application_egress and ifc_labels.labels and not ifc_labels.sources:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = (
+            state.has_untrusted_active_ingest(ifc_labels)
+            if state is not None
+            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        )
+        if (
+            is_application_egress
+            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and has_untrusted_active_ingest
+        ):
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            if (
+                enforce
+                and normalized_target is not None
+                and isinstance(canonical_principal, str)
+                and state is not None
+                and state.consume_sink_approval(
+                    current=ifc_labels,
+                    sink_category=sink_category.value,
+                    destination=normalized_target,
+                    canonical_principal=canonical_principal,
+                )
+            ):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    reason="ifc_declassification_approved",
+                    enforcement_enabled=enforce,
+                )
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+        if tool_name == "web_search" and normalized_target != _fixed_web_search_url():
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+        if tool_name == "fetch_url" and (
+            normalized_target is None
+            or normalized_target not in approved_fetch_urls(auth_context)
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+        if tool_name in {"webhook", "http_request"} and (
+            normalized_target is None
+            or normalized_target not in _configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS")
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
         service_policy: ServiceSinkPolicy | None = None
         if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
             candidate = service.sink_policy_for(tool_name)
@@ -1066,6 +1195,12 @@ class SinkGate:
                 return frozenset({target})
             return frozenset()
 
+        if category in {
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+        } and target is not None:
+            return frozenset({target})
         if category != SinkCategory.SAME_CHANNEL:
             return frozenset()
 
@@ -1261,6 +1396,10 @@ def approve_live_declassification(
         lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
         durable_audit=durable_audit,
     )
+    if approved and category is SinkCategory.NETWORK:
+        # Destination approval persists for this server-owned session, while
+        # the declassification capability remains one-use and turn-bound.
+        auth_context.egress_state.approve_url(normalized)
     return (True, "approved") if approved else (False, "approval_failed")
 
 
