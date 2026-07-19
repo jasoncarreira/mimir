@@ -17,7 +17,7 @@ from .base import ToolBackend
 from .claude_cli import ClaudeCliBackend
 from .codex import CodexBackend
 from .feature_factory import FeatureFactoryBackend
-from .opencode import OpenCodeBackend
+from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend
 
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
@@ -68,7 +68,7 @@ class WorklinkDefaults:
     backend: str = "codex"
     timeout_s: int = 1800
     priority: str = "normal"
-    test_command: str = "env -u MIMIR_MODEL_SPEC uv run pytest -q"
+    test_command: str = "uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
     # Branch that attempt worktrees are cut from and that leaf PRs target. Point
@@ -538,7 +538,18 @@ class BackendRegistry:
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink opencode args must be a list of strings")
-        return OpenCodeBackend(bin=bin_name, extra_args=tuple(args))
+        bash_allowlist = settings.get("bash_allowlist", list(DEFAULT_BASH_ALLOWLIST))
+        if not isinstance(bash_allowlist, list) or not all(
+            isinstance(pattern, str) and pattern for pattern in bash_allowlist
+        ):
+            raise ValueError("worklink opencode bash_allowlist must be a list of non-empty strings")
+        if "*" in bash_allowlist:
+            raise ValueError("worklink opencode bash_allowlist cannot contain the catch-all '*'")
+        return OpenCodeBackend(
+            bin=bin_name,
+            extra_args=tuple(args),
+            bash_allowlist=tuple(bash_allowlist),
+        )
 
     @staticmethod
     def _build_claude_cli(settings: Mapping[str, Any]) -> ClaudeCliBackend:
