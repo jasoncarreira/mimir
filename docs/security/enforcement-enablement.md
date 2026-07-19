@@ -1,15 +1,18 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 6. Incorporates mimir review rounds 1–4 (spawn and
+**Status:** DRAFT — revision 7. Incorporates mimir review rounds 1–5 (spawn and
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
 prerequisite; approved-URL authorizes the request, not the response bytes;
-destination-allowlisting alone is insufficient for payload-bearing network sinks)
-and the operator's decisions (per-trigger policy; approved-URL = egress-only;
-trust the contributor / JIRA instance wholesale; provenance schema; auto-recall
-must never handcuff a user turn; a heartbeat may fetch its approved URLs freely;
-future isolation must run in docker **and** AWS ECS/Fargate → no bubblewrap). The
-open design questions from rev 3 are resolved (§6).
+destination-allowlisting alone is insufficient for payload-bearing network sinks;
+even exact-URL fetch leaks via invocation-pattern/redirects unless dispatch is
+trusted-deterministic) and the operator's decisions (per-trigger policy;
+approved-URL = egress-only; trust the contributor / JIRA instance wholesale;
+provenance schema; auto-recall must never handcuff a user turn; a heartbeat may
+fetch its config-fixed approved URLs freely; enforcement-aware prompt guidance is
+ergonomics-only; future isolation must run in docker **and** AWS ECS/Fargate → no
+bubblewrap; low-bandwidth covert channels are an accepted residual). The open
+design questions from rev 3 are resolved (§6).
 **Date:** 2026-07-19.
 **Context:** written after a whole-`access_control` adversarial review (5 parallel
 reviewers, findings verified with runtime repros). It proposes the model that
@@ -186,7 +189,7 @@ folded into a trusted turn and then driving an action.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org / write) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted. `fetch_url` is gated by the **destination allowlist**, so it may fetch **any approved URL, repeatedly and in any order** — a prior fetch's untrusted content does not lock it out of further approved fetches. Fetched **content stays untrusted**: it can drive scoped sinks (save state / wiki / memory) but not code/shell, and egress to a **non-approved** destination stays blocked. Allowlist should be **exact URLs / fixed templates, not host wildcards** (§5.4) |
+| **Heartbeat** | near-full incl. `fetch_url` from a **config-fixed approved-URL set** | internally triggered → trusted. A **deterministic** fetch of its config-fixed exact-URL set (any subset, repeatedly) is taint-independent — a prior fetch's untrusted content doesn't lock it out; **model-chosen** fetches instead fall under the turn-taint gate. Fetched **content stays untrusted**: drives scoped sinks (save state / wiki / memory) but not code/shell; non-approved destinations blocked; redirects re-checked per hop. Allowlist = exact URLs, not host wildcards (§5.4) |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
@@ -294,11 +297,30 @@ act" and "let data leak out" are the same action.
 Network egress needs the destination allowlist **plus**, for some sinks, a check
 on the request payload. Two sink shapes (mimir round 4):
 
-- **URL-is-the-destination** — `fetch_url` with an **exact-URL** allowlist. The
-  destination *is* the payload-carrier, so allowlisting exact URLs both authorizes
-  and bounds it: egress is **destination-gated and taint-independent**. A heartbeat
-  fetches **all** its approved URLs, repeatedly and in any order, without a prior
-  fetch's untrusted content locking it out (intended, not a hole).
+- **URL-is-the-destination** — `fetch_url` against an **exact-URL** allowlist.
+  Exact URLs keep data out of the URL *text*, but taint-independence needs more:
+  the **choice** of which approved URLs to fetch, and their order/count/timing, is
+  itself model-controllable and observable in the endpoints' logs — a low-bandwidth
+  **covert channel** if the model picks fetches based on untrusted/sensitive
+  content — and **redirects** can escape the exact URL. So:
+  - **Trusted deterministic dispatch → taint-independent.** When the fetch set and
+    order are fixed by config/trusted logic (a heartbeat monitoring a configured
+    URL list each tick — its normal pattern), there is no model *choice* to encode
+    data and no data in the URLs → fetch freely, repeatedly, regardless of turn
+    taint. This satisfies "fetch approved URLs freely."
+  - **Model-chosen fetches → model-controlled invocation → turn-taint gate.** If
+    the model dynamically decides which/whether/order to fetch, that choice is
+    treated like a model-emitted payload (rule below): allowed on a clean turn,
+    gated once untrusted content has been ingested.
+  - **Redirects constrained per hop** — an approved URL that 3xx-redirects must
+    have each hop re-checked against the allowlist (or redirect-following
+    disabled), else a redirect escapes the exact-URL bound.
+
+  **Accepted residual:** covert channels are a bottomless well (timing, count,
+  cache-state, resource usage, …). We take the cheap *structural* closes
+  (deterministic dispatch + per-hop redirect check) and **consciously accept
+  residual low-bandwidth covert channels** for the single-operator threat model
+  rather than chase them indefinitely.
 - **Payload-bearing** — `web_search` (query), `webhook` (body), external MCP
   (args), any child-process request. The destination is a *fixed/approved
   endpoint* (`_extract_sink_target` returns the Tavily URL, not the query; the
@@ -441,15 +463,17 @@ is allowed.
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
-- **Network egress → §5.4**: two sink shapes. **URL-is-destination** (`fetch_url`
-  with an **exact-URL** allowlist) is destination-gated and taint-independent — a
-  heartbeat fetches all its approved URLs freely. **Payload-bearing** sinks
-  (`web_search` query, `webhook` body, external MCP args, child-process requests)
-  send model-controlled content to a fixed approved endpoint, so they need
-  destination-allowlisting **plus a payload-integrity gate** (trusted payload
-  allowed; untrusted-derived payload blocked/declassify). Pollers have no
-  `fetch_url`; user turns ask-on-first-use; one **uniform egress boundary
-  including child processes**.
+- **Network egress → §5.4**: two sink shapes, one rule — *trusted-by-construction
+  is free; model-controlled falls to the turn-taint gate.* **URL-is-destination**
+  (`fetch_url`, exact-URL allowlist): a **config-deterministic** fetch set is
+  taint-independent (heartbeat fetches its fixed URLs freely); **model-chosen**
+  fetches are model-controlled invocation → turn-taint gated (covert-channel via
+  fetch choice), and redirects are re-checked per hop. **Payload-bearing**
+  (`web_search` query, `webhook` body, MCP args, child-process requests): fixed
+  approved endpoint + model-controlled payload → **config/server-derived payload
+  allowed, model-emitted payload → turn-taint gate**. Pollers have no `fetch_url`;
+  user turns ask-on-first-use; one **uniform egress boundary including child
+  processes**. Accepted residual: low-bandwidth covert channels not chased.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
 - **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
