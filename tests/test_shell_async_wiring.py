@@ -22,6 +22,7 @@ the wiring without taking on subprocess flakiness in CI.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -61,7 +62,10 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
     reg = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
     spawned: list[dict] = []
 
-    def _fake_spawn(command: str, *, argv: list[str], channel_id: str | None, on_complete=None) -> _FakeJob:
+    def _fake_spawn(
+        command: str, *, argv: list[str], channel_id: str | None,
+        on_complete=None, auth_context=None,
+    ) -> _FakeJob:
         spawned.append({"command": command, "argv": argv, "channel_id": channel_id})
         return _FakeJob(command=command, channel_id=channel_id)
 
@@ -101,6 +105,131 @@ async def test_bash_async_no_registry_returns_error(monkeypatch: pytest.MonkeyPa
     shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
     out = await shell_async.bash_async.ainvoke({"command": "echo hi"})
     assert "no shell-job registry" in out
+
+
+@pytest.mark.asyncio
+async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import agent as agent_module
+    from mimir.access_control import SinkGate
+    from mimir.agent import Agent, _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import (
+        AuthContext,
+        InformationFlowLabels,
+        InformationFlowState,
+        SourceLabel,
+        TurnInteractivity,
+    )
+
+    channel_id = "slack-C1"
+    source = SourceLabel(
+        principal="alice",
+        domain="channel:private",
+        resource_id=channel_id,
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    )
+    origin_labels = InformationFlowLabels().with_source(source)
+    origin_auth = AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        ifc_labels=origin_labels,
+        ifc_state=InformationFlowState(labels=origin_labels),
+        domain="channel:private",
+        resource_id=channel_id,
+        bridge_instance="slack",
+    )
+    job = _FakeJob(channel_id=channel_id, status="exited_ok", exit_code=0)
+    job.ifc_labels = origin_labels
+    job.auth_context = origin_auth
+    enqueued: list[Any] = []
+
+    async def _enqueue(event: Any) -> bool:
+        enqueued.append(event)
+        return True
+
+    async def _log_event(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "log_event", _log_event)
+    agent = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(
+            read_output=lambda *args, **kwargs: {"stdout_tail": "ok", "stderr_tail": ""}
+        ),
+        _dispatcher=SimpleNamespace(enqueue=_enqueue),
+    )
+
+    await Agent._on_shell_job_complete(agent, job)
+
+    event = enqueued[0]
+    labels = _initialize_ifc_labels(event)
+    auth = _create_turn_auth_context(
+        event,
+        None,
+        policy_version="test",
+        enforce=True,
+        ifc_labels=labels,
+    )
+    same_channel = SinkGate.check_sink_flow(
+        "send_message", channel_id, labels, auth, enforce=True,
+    )
+    cross_channel = SinkGate.check_sink_flow(
+        "send_message", "slack-C2", labels, auth, enforce=True,
+    )
+
+    assert auth.principal == origin_auth.principal
+    assert auth.canonical_principal == origin_auth.canonical_principal
+    assert auth.roles == origin_auth.roles
+    assert same_channel.allowed is True
+    assert same_channel.reason != "ifc_label_blocked:same_channel"
+    assert cross_channel.allowed is False
+
+
+def test_job_complete_preserves_registered_service_provenance() -> None:
+    from mimir.access_control import SinkGate
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import AgentEvent, AuthContext, TurnInteractivity
+
+    channel_id = "scheduler:heartbeat"
+    origin_auth = AuthContext(
+        principal=None,
+        canonical_principal="scheduler",
+        roles=(),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance="service:scheduler",
+    )
+    event = AgentEvent(
+        trigger="shell_job_complete",
+        channel_id=channel_id,
+        source="system",
+        continuation_auth_context=origin_auth,
+    )
+
+    labels = _initialize_ifc_labels(event)
+    auth = _create_turn_auth_context(
+        event, None, policy_version="test", enforce=True, ifc_labels=labels,
+    )
+    decision = SinkGate.check_sink_flow(
+        "send_message", channel_id, labels, auth, enforce=True,
+    )
+
+    assert auth.trigger == "scheduled_tick"
+    assert decision.allowed is True
 
 
 # ─── bash_jobs_list ────────────────────────────────────────────────
@@ -426,7 +555,10 @@ def fake_registry_with_channel(
     reg = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
     spawned: list[dict] = []
 
-    def _fake_spawn(command: str, *, argv: list[str], channel_id: str | None, on_complete=None) -> _FakeJob:
+    def _fake_spawn(
+        command: str, *, argv: list[str], channel_id: str | None,
+        on_complete=None, auth_context=None,
+    ) -> _FakeJob:
         spawned.append({"command": command, "argv": argv, "channel_id": channel_id})
         return _FakeJob(command=command, channel_id=channel_id, job_id="j_new")
 
@@ -523,7 +655,10 @@ async def test_bash_async_allows_different_channel(
 
     reg = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
 
-    def _fake_spawn(command: str, *, argv: list[str], channel_id: str | None, on_complete=None) -> _FakeJob:
+    def _fake_spawn(
+        command: str, *, argv: list[str], channel_id: str | None,
+        on_complete=None, auth_context=None,
+    ) -> _FakeJob:
         return _FakeJob(command=command, channel_id=channel_id)
 
     monkeypatch.setattr(reg, "spawn", _fake_spawn)

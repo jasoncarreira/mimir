@@ -80,6 +80,7 @@ class ShellJob:
     finished_at: Optional[float] = None
     channel_id: Optional[str] = None
     ifc_labels: object | None = None
+    auth_context: object | None = None
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -177,6 +178,7 @@ class ShellJobRegistry:
         argv: list[str],
         channel_id: Optional[str] = None,
         on_complete: Optional[Callable[["ShellJob"], None]] = None,
+        auth_context: object | None = None,
         env_overlay: Optional[dict[str, Optional[str]]] = None,
         cwd: Optional[os.PathLike] = None,
     ) -> ShellJob:
@@ -193,6 +195,9 @@ class ShellJobRegistry:
         subprocess exits and ``exit_code`` / ``finished_at`` are set.
         Exceptions raised by the callback are caught and dropped so
         the registry stays intact even if the bridge breaks.
+
+        ``auth_context`` is the frozen authority of the spawning turn. It is
+        carried only to the trusted completion callback and never serialized.
 
         ``env_overlay`` merges into the inherited env after defaults
         are applied; keys map to None to *unset* an inherited var.
@@ -268,6 +273,7 @@ class ShellJobRegistry:
             stderr_path=stderr_path,
             last_live_signal=started_at,
             channel_id=channel_id,
+            auth_context=auth_context,
             _process=proc,
         )
 

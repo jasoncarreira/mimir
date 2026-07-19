@@ -19,8 +19,10 @@ import logging
 import re
 from typing import Annotated, Any, Callable, Optional
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, tool
 
+from ..models import AuthContext
 from ..shell_jobs import (
     SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
     ShellJobRegistry,
@@ -215,6 +217,7 @@ async def bash_async(
     command: str,
     session_id: Optional[str] = None,
     mimir_direct_argv: Annotated[Optional[list[str]], InjectedToolArg] = None,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Args:
         command: The shell command to spawn. Runs via ``bash -lc`` so
@@ -250,6 +253,14 @@ async def bash_async(
         # Live per-task channel id (set by the dispatcher), replacing the dead
         # _STATE key.
         channel_id = (_current_channel_id_var.get() or "").strip() or None
+
+    auth_context = (
+        runtime.context
+        if runtime is not None and isinstance(runtime.context, AuthContext)
+        else getattr(ctx, "auth_context", None)
+    )
+    if not isinstance(auth_context, AuthContext) or auth_context.channel_id != channel_id:
+        auth_context = None
 
     # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent
     # job is already running on this channel.  Prevents the retry-escalation
@@ -316,6 +327,7 @@ async def bash_async(
             "argv": argv,
             "channel_id": channel_id,
             "on_complete": _ON_COMPLETE,
+            "auth_context": auth_context,
         }
         if mimir_direct_argv is not None:
             spawn_kwargs["env_overlay"] = direct_exec_env()
@@ -323,7 +335,11 @@ async def bash_async(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,
         )
-        job.ifc_labels = getattr(ctx, "ifc_labels", None)
+        job.ifc_labels = (
+            auth_context.ifc_state.current(auth_context.ifc_labels)
+            if auth_context is not None
+            else getattr(ctx, "ifc_labels", None)
+        )
     except Exception as exc:  # noqa: BLE001
         return f"bash_async failed: {exc}"
 
