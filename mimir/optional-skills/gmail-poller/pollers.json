@@ -5,6 +5,12 @@
       "command": "python3 poller.py",
       "cron": "*/5 * * * *",
       "batch_size": 5,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "operator_alert"],
+        "scoped_roots": ["state"]
+      },
       "pass_env": [
         "GOG_ACCOUNT",
         "MIMIR_GMAIL_QUERY",

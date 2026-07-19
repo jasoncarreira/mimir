@@ -342,10 +342,10 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
     system = get_service_principal("upgrade")
 
     assert scheduler is not None and scheduler.canonical == "scheduler"
-    assert poller is not None and poller.canonical == "poller"
+    assert poller is None  # pollers exist only as per-instance carried grants
     assert synthesis is not None and synthesis.canonical == "synthesis"
     assert system is not None and system.canonical == "system"
-    assert len({scheduler.canonical, poller.canonical, synthesis.canonical, system.canonical}) == 4
+    assert len({scheduler.canonical, synthesis.canonical, system.canonical}) == 3
     with pytest.raises(FrozenInstanceError):
         scheduler.trigger = "forged"
 
@@ -355,8 +355,6 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
     [
         ("scheduled_tick", "shell_exec", "request_mimir_update", True),
         ("scheduled_tick", "read_file", "request_mimir_update", True),
-        ("poller", "worklink_run", "remove_schedule", False),
-        ("poller", "write_file", "remove_schedule", False),
         ("upgrade", "submit_proposal", "spawn_codex", True),
         ("upgrade", "read_file", "spawn_codex", True),
         ("saga_session_end", "saga_end_session", "spawn_codex", True),
@@ -380,7 +378,6 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
 
     service_principals = {
         "scheduled_tick": "scheduler",
-        "poller": "poller",
         "saga_session_end": "synthesis",
         "upgrade": "system",
     }
@@ -842,7 +839,7 @@ def test_capability_matrix_report_generates_complete_report() -> None:
     report = get_capability_matrix_report()
 
     assert "scheduled_tick" in report
-    assert "poller" in report
+    assert "poller" not in report
     assert "saga_session_end" in report
     assert "upgrade" in report
 
@@ -887,33 +884,8 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
 
 
 def test_poller_principal_has_required_capabilities() -> None:
-    """Verify poller principal has all capabilities needed for poller workflow.
-
-    Based on poller production:
-    - Reads poller payloads (read_file, ls, glob)
-    - Uses shell for analysis (shell_exec, bash_async)
-    - Writes results (write_file, edit_file)
-    - Sends messages to channels (send_message)
-    - Resolves configured channel and DM destinations (list_channels)
-    """
-    poller = get_service_principal("poller")
-    assert poller is not None
-
-    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
-    write_ops = {"write_file", "edit_file"}
-    shell_ops = {"shell_exec", "bash_async"}
-    spawn_ops = {"spawn_claude_code", "spawn_codex"}
-    proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
-    message_ops = {"send_message", "list_channels"}
-    worklink_ops = {"worklink_run"}
-
-    all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | message_ops | worklink_ops
-    for cap in all_expected:
-        assert poller.has_capability(cap), f"poller missing {cap}"
-
-    forbidden = {"remove_schedule", "reload_pollers", "add_schedule", "set_schedule_priority"}
-    for cap in forbidden:
-        assert not poller.has_capability(cap), f"poller should NOT have {cap}"
+    """There is no class-wide poller grant to inherit or widen."""
+    assert get_service_principal("poller") is None
 
 
 def test_synthesis_principal_has_required_capabilities_for_session_end() -> None:
@@ -922,8 +894,7 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     Based on saga_session_end.md production prompt:
     - Gets turn content (mimir_get_turn, get_turn)
     - Reads files for memory capture (read_file, ls, glob)
-    - Writes/edits memory files (write_file, edit_file)
-    - Uses shell for file ops (shell_exec)
+    - Cannot write arbitrary files or invoke shell
     - Stores atoms (memory_store)
     - Gets atoms by ID (memory_get)
     - Records feedback (saga_feedback)
@@ -936,13 +907,14 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
 
     turn_ops = {"mimir_get_turn", "get_turn"}
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
-    write_ops = {"write_file", "edit_file"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
 
-    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops
+    all_expected = turn_ops | read_ops | memory_ops | saga_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
+    assert not synthesis.has_capability("write_file")
+    assert not synthesis.has_capability("edit_file")
 
     forbidden = {
         "shell_exec",
@@ -1000,8 +972,6 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
         ("scheduled_tick", "shell_exec", True),
         ("scheduled_tick", "remove_schedule", False),
         ("scheduled_tick", "reload_pollers", False),
-        ("poller", "send_message", True),
-        ("poller", "add_schedule", False),
         ("saga_session_end", "saga_end_session", True),
         ("saga_session_end", "spawn_claude_code", False),
         ("saga_session_end", "add_schedule", False),
@@ -1015,7 +985,6 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
 
     service_principals = {
         "scheduled_tick": "scheduler",
-        "poller": "poller",
         "saga_session_end": "synthesis",
         "upgrade": "system",
     }

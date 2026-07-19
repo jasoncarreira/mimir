@@ -267,6 +267,8 @@ async def test_protected_metadata_reads_authorize_before_rendering(
             ),
             enforce=True,
         )
+        if service_trigger == "poller":
+            should_render = False  # the removed generic poller principal grants nothing
     elif caller == "missing":
         auth_context = None
     else:

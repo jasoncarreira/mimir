@@ -36,6 +36,7 @@ from .http_ingress import strip_bridge_authority_extra
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
+from .access_control import builtin_trigger_service_principal
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
@@ -305,10 +306,12 @@ class _PairingNotifier:
 
 def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
     """Build the server-owned session synthesis event."""
+    authority = builtin_trigger_service_principal("session-boundary", Path("."))
     return AgentEvent(
         trigger="saga_session_end",
         channel_id=session.channel_id,
         service_principal="synthesis",
+        service_authority=authority,
         content="",
         extra={"saga_session_id": session.saga_session_id},
         source_session_acl=session.source_acl,

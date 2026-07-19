@@ -45,6 +45,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .access_control import builtin_trigger_service_principal
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event
 from ._context import active_turn_snapshots
@@ -959,10 +960,18 @@ class Scheduler:
                     job.name, job.prompt_file,
                 )
 
+        authority = None
+        service_principal = "scheduler"
+        if job.name == "heartbeat":
+            heartbeat_root = self._home / "state" / "triggers" / "heartbeat"
+            heartbeat_root.mkdir(parents=True, exist_ok=True)
+            authority = builtin_trigger_service_principal("heartbeat", self._home)
+            service_principal = authority.canonical
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),
-            service_principal="scheduler",
+            service_principal=service_principal,
+            service_authority=authority,
             content=content,
             extra={
                 "schedule_name": job.name,
