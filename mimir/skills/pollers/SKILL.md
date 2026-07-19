@@ -167,6 +167,12 @@ if __name__ == "__main__":
       "name": "my-service-check",
       "command": "python poller.py",
       "cron": "*/5 * * * *",
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "saga_feedback", "write_file", "send_message"],
+        "scoped_roots": ["state"]
+      },
       "env": {
         "SERVICE_URL": "https://example.com/api"
       }
@@ -182,6 +188,7 @@ if __name__ == "__main__":
 | `name` | yes | Unique identifier. Used in logs and event routing. |
 | `command` | yes | Shell command, relative to the skill directory. |
 | `cron` | yes | Cron expression (5-field, UTC). |
+| `authority` | no | The sole authority declaration for this instance. It must contain exactly `profile`, `tier`, `capabilities`, and `scoped_roots`. Missing authority means an empty capability set. Profiles are `research`, `github`, or `custom`; tiers are `scope-contained`, `scoped-with-provenance`, or `code-execution`. Capability names are checked against the executable tier table. Skill pollers cannot declare unbounded capabilities. `state` resolves only to `state/pollers/<name>`; `wiki:<name>` resolves only to an existing direct child of `state/wiki`. Unknown values, missing/extra authority fields, tier violations, missing roots, and path escapes reject the whole poller. `operator_alert` grants `send_message` only to the single `MIMIR_OPERATOR_ALERT_CHANNEL` destination. Each event carries the resulting immutable `poller:<name>` principal through continuations. |
 | `env` | no | Additional environment variables for the script. Values are literal — no shell expansion. Use this for fixed config (URLs, feature flags) declared in pollers.json itself. **Do not put secrets here** — `env` is a static config surface (values are literal strings, no shell expansion), not a secret-forwarding path. If a key's name matches a deny-list pattern (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `MIMIR_*`), the framework emits a `poller_env_secret_reintroduced` algedonic warning. Use `pass_env` to forward live secrets from `os.environ`. |
 | `pass_env` | no | List of env var names to pass through from mimir's process environment to the subprocess, **bypassing the deny-suffix/deny-prefix filter** (see [security.md](security.md)). This is the supported path for getting secrets (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`) and `MIMIR_*`-prefixed knobs into a poller subprocess — the global allowlist `MIMIR_POLLER_ENV_ALLOWLIST` does NOT bypass the deny filter, so it can't be used for `*_TOKEN` keys. Keys not set in `os.environ` are silently skipped; keys whose names match a deny pattern emit a `poller_env_passthrough_named_secret` event (visibility, not blocking). |
 | `batch_size` | no | Coalesce up to N items per emitted AgentEvent (= per turn the agent sees). Default `1` (per-item-per-turn, matches open-strix). Use `>1` for bursty pollers (github-poller, RSS) so the agent sees one turn per cron tick instead of one per item. Items beyond `batch_size` overflow into additional batches with `batch_index` / `batch_count` set in `extra` so the agent can tell it's seeing part of a multi-batch fire. |
@@ -208,13 +215,22 @@ some-feed:
 ```
 
 Overridable fields: `cron`, `priority`, `batch_size`, `recover_failed_turns`,
-`env`, `pass_env` — the same set treated as deployment tuning elsewhere.
+`env`, `pass_env`, `deliver`, `budget` — tuning only. Authority fields including
+`authority`, `capabilities`, `tier`, `profile`, `principal_id`, `scoped_roots`,
+and `operator_alert` are rejected by the strict write path and dropped during
+discovery. Environment values never add capabilities.
 Anything else (notably `command`) is refused with a warning: overrides tune
 behavior, they don't redefine what runs. Field-level fail-safety: an invalid
 value (typo'd cron, unknown priority) warns and keeps the manifest value —
 an override mistake degrades to shipped behavior, never to a dead poller.
 Unknown poller names warn so a rename/uninstall can't silently orphan tuning.
 Applied at discovery time (startup + `reload_pollers`).
+
+Built-in `heartbeat` and `session-boundary` triggers use server-owned profiles,
+not skill manifests. Those profiles are authoritative; a manifest declaration
+using a built-in profile is validated only as a narrowing subset and cannot add
+capabilities or destinations. Resolution is deterministic: built-in profile,
+then optional narrowing; skill pollers resolve only from their manifest.
 
 **On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework collects all items, then emits `ceil(N/batch_size)` AgentEvents, each carrying a rendered prompt summarizing up to `batch_size` items + per-item metadata in `extra.items`. Single-item batches (default) render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts.
 

@@ -5,6 +5,12 @@
       "command": "python3 poller.py",
       "cron": "*/15 * * * *",
       "batch_size": 5,
+      "authority": {
+        "profile": "github",
+        "tier": "code-execution",
+        "capabilities": ["worklink_run", "write_file", "edit_file", "shell_exec", "send_message", "operator_alert"],
+        "scoped_roots": ["state"]
+      },
       "env_required": [
         "GITHUB_REPOS"
       ],

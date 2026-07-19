@@ -5,6 +5,12 @@
       "command": "python3 poller.py",
       "cron": "*/15 * * * *",
       "batch_size": 3,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
+        "scoped_roots": ["state"]
+      },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_LIMIT",
@@ -19,6 +25,12 @@
       "command": "python3 feed_poller.py",
       "cron": "0 */2 * * *",
       "batch_size": 10,
+      "authority": {
+        "profile": "research",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
+        "scoped_roots": ["state"]
+      },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_FEED_LIMIT",

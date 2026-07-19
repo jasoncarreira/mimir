@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shlex
 from contextvars import ContextVar, Token
@@ -36,7 +37,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent, AuthContext, InformationFlowLabels
+    from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,15 @@ class SinkCategory(StrEnum):
     SCHEDULER = "scheduler"
     PROPOSAL = "proposal"
     UNKNOWN = "unknown"
+
+
+class CapabilityTier(StrEnum):
+    """Blast-radius ceiling for authority declared by autonomous triggers."""
+
+    SCOPE_CONTAINED = "scope-contained"
+    SCOPED_WITH_PROVENANCE = "scoped-with-provenance"
+    CODE_EXECUTION = "code-execution"
+    UNBOUNDED = "unbounded"
 
 
 class ToolFlowDirection(StrEnum):
@@ -299,6 +309,8 @@ class ServicePrincipal:
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     creation_path: str | None = None
+    authority_profile: str | None = None
+    capability_tier: CapabilityTier | None = None
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -314,6 +326,165 @@ class ServicePrincipal:
             (policy for policy in self.sink_policies if policy.operation == operation),
             None,
         )
+
+
+# This catalog is the executable tier table for trigger authority. Manifest
+# parsing imports it rather than maintaining a second list of grantable names.
+TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
+    "write_file": CapabilityTier.SCOPE_CONTAINED,
+    "edit_file": CapabilityTier.SCOPE_CONTAINED,
+    "shell_exec": CapabilityTier.SCOPE_CONTAINED,
+    "bash_async": CapabilityTier.SCOPE_CONTAINED,
+    "bash_jobs_list": CapabilityTier.SCOPE_CONTAINED,
+    "bash_job_output": CapabilityTier.SCOPE_CONTAINED,
+    "read_file": CapabilityTier.SCOPE_CONTAINED,
+    "aread": CapabilityTier.SCOPE_CONTAINED,
+    "ls": CapabilityTier.SCOPE_CONTAINED,
+    "als": CapabilityTier.SCOPE_CONTAINED,
+    "glob": CapabilityTier.SCOPE_CONTAINED,
+    "aglob": CapabilityTier.SCOPE_CONTAINED,
+    "grep": CapabilityTier.SCOPE_CONTAINED,
+    "agrep": CapabilityTier.SCOPE_CONTAINED,
+    "file_search": CapabilityTier.SCOPE_CONTAINED,
+    "get_turn": CapabilityTier.SCOPE_CONTAINED,
+    "mimir_get_turn": CapabilityTier.SCOPE_CONTAINED,
+    "memory_get": CapabilityTier.SCOPE_CONTAINED,
+    "send_message": CapabilityTier.SCOPE_CONTAINED,
+    "operator_alert": CapabilityTier.SCOPE_CONTAINED,
+    "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "saga_feedback": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "saga_mark_contributions": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "saga_record_skill_learning": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "worklink_run": CapabilityTier.CODE_EXECUTION,
+    "spawn_claude_code": CapabilityTier.CODE_EXECUTION,
+    "spawn_codex": CapabilityTier.CODE_EXECUTION,
+    "spawn_open_code": CapabilityTier.CODE_EXECUTION,
+    "fetch_url": CapabilityTier.UNBOUNDED,
+    "web_search": CapabilityTier.UNBOUNDED,
+    "webhook": CapabilityTier.UNBOUNDED,
+    "http_request": CapabilityTier.UNBOUNDED,
+    "ntfy_send": CapabilityTier.UNBOUNDED,
+}
+
+TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
+    "research": frozenset({
+        "write_file", "edit_file", "read_file", "aread", "ls", "als",
+        "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
+        "saga_feedback", "saga_mark_contributions", "send_message",
+        "operator_alert",
+    }),
+    "github": frozenset({
+        "worklink_run", "write_file", "edit_file", "shell_exec",
+        "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
+        "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
+        "file_search", "get_turn", "mimir_get_turn", "send_message",
+        "operator_alert",
+    }),
+    # Custom profiles remain tier-validated and cannot request unbounded sinks.
+    "custom": frozenset(TRIGGER_CAPABILITY_TIERS),
+    "heartbeat": frozenset({
+        "write_file", "edit_file", "shell_exec", "bash_async",
+        "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
+        "als", "glob", "aglob", "grep", "agrep", "file_search",
+        "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
+        "saga_mark_contributions", "worklink_run", "send_message",
+        "operator_alert", "fetch_url",
+    }),
+    "session-boundary": frozenset({
+        "memory_store", "saga_feedback", "saga_mark_contributions",
+        "saga_end_session", "saga_record_skill_learning",
+        "memory_get",
+        "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
+        "agrep", "get_turn", "mimir_get_turn",
+    }),
+}
+
+_CAPABILITY_TIER_RANK = {
+    CapabilityTier.SCOPE_CONTAINED: 0,
+    CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
+    CapabilityTier.CODE_EXECUTION: 2,
+    CapabilityTier.UNBOUNDED: 3,
+}
+
+
+def build_trigger_service_principal(
+    *,
+    canonical: str,
+    trigger: str,
+    profile: str,
+    tier: CapabilityTier,
+    capabilities: tuple[str, ...],
+    roots: tuple[Path, ...] = (),
+    creation_path: str,
+) -> ServicePrincipal:
+    """Build one immutable instance principal from already-validated authority."""
+    operations = tuple(dict.fromkeys(
+        "send_message" if capability == "operator_alert" else capability
+        for capability in capabilities
+    ))
+    readable_domains = {
+        "poller_payload" if trigger == "poller"
+        else "session" if trigger == "saga_session_end"
+        else "configured_inputs"
+    }
+    sink_destinations: set[str] = set()
+    policies: list[ServiceSinkPolicy] = []
+    for operation in operations:
+        domain = _OPERATION_READABLE_DOMAIN.get(operation)
+        if domain:
+            readable_domains.add(domain)
+        destination = _OPERATION_SINK_DESTINATION.get(operation)
+        if destination:
+            sink_destinations.add(destination)
+        if operation in {"write_file", "edit_file"}:
+            policies.append(ServiceSinkPolicy(
+                operation, "exact_roots", json.dumps([str(root) for root in roots]),
+            ))
+        elif operation in {"shell_exec", "bash_async"}:
+            policies.append(ServiceSinkPolicy(operation, "shell_profile", "scheduler_read_only"))
+        elif operation == "worklink_run":
+            policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
+        elif operation == "fetch_url" and profile == "heartbeat":
+            policies.append(ServiceSinkPolicy(operation, "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"))
+    if "operator_alert" in capabilities:
+        policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
+    return ServicePrincipal(
+        canonical=canonical,
+        trigger=trigger,
+        capabilities=operations,
+        readable_domains=tuple(sorted(readable_domains)),
+        sink_destinations=tuple(sorted(sink_destinations)),
+        sink_policies=tuple(policies),
+        creation_path=creation_path,
+        authority_profile=profile,
+        capability_tier=tier,
+    )
+
+
+def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrincipal:
+    """Return the authoritative built-in grant; manifests cannot replace it."""
+    if profile == "heartbeat":
+        root = (home / "state" / "triggers" / "heartbeat").resolve()
+        return build_trigger_service_principal(
+            canonical="heartbeat",
+            trigger="scheduled_tick",
+            profile=profile,
+            tier=CapabilityTier.UNBOUNDED,
+            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+            roots=(root,),
+            creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
+        )
+    if profile == "session-boundary":
+        return build_trigger_service_principal(
+            canonical="synthesis",
+            trigger="saga_session_end",
+            profile=profile,
+            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+            creation_path="mimir.server._on_session_idle",
+        )
+    raise ValueError(f"unknown built-in authority profile: {profile!r}")
 
 
 def _configured_file_roots() -> list[Path]:
@@ -549,11 +720,40 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
         return False
 
 
+def _target_within_exact_roots(target: str, destination: str) -> bool:
+    """Confine a service write to the absolute roots frozen in its grant."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        raw = json.loads(destination)
+        if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
+            return False
+        resolve_within_roots([Path(p) for p in raw], target)
+    except (json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError):
+        return False
+    return True
+
+
+def _target_matches_operator_alert(target: str, destination: str) -> bool:
+    """Bind notify-only authority to one operator-selected destination."""
+    configured = os.environ.get(destination, "").strip()
+    return bool(configured) and target == configured
+
+
+def _target_matches_approved_url(target: str, destination: str) -> bool:
+    """Match one exact URL from an operator-fixed comma-separated set."""
+    approved = {item.strip() for item in os.environ.get(destination, "").split(",") if item.strip()}
+    return target in approved
+
+
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
+    "exact_roots": _target_within_exact_roots,
+    "operator_alert": _target_matches_operator_alert,
+    "approved_urls": _target_matches_approved_url,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -647,6 +847,24 @@ class SinkGate:
             )
 
         service_policy: ServiceSinkPolicy | None = None
+        if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
+            candidate = service.sink_policy_for(tool_name)
+            if candidate is not None:
+                adapter = _SERVICE_SINK_ADAPTERS.get(candidate.adapter)
+                triggering = getattr(auth_context, "channel_id", None)
+                if target != triggering:
+                    if adapter is None or not adapter(target, candidate.destination):
+                        return ToolAuthorization(
+                            tool_name=tool_name,
+                            decision=OperationDecision.ADMIN_REQUIRED,
+                            allowed=not enforce,
+                            reason="service_sink_destination_denied",
+                            service_principal=service,
+                            required_tier=AccessTier.ADMIN,
+                            enforcement_enabled=enforce,
+                            is_shadow_decision=not enforce,
+                        )
+                    service_policy = candidate
         if service is not None and sink_category in {
             SinkCategory.SHELL_PROCESS,
             SinkCategory.SPAWN,
@@ -656,17 +874,14 @@ class SinkGate:
             SinkCategory.NETWORK,
             SinkCategory.EXTERNAL_MCP,
         }:
-            # Preserve #906's fail-closed treatment and decision reason before
-            # considering any concrete poller destination.
-            if "poller_payload" in service.readable_domains and sink_category in {
-                SinkCategory.SHELL_PROCESS,
-                SinkCategory.SPAWN,
-                SinkCategory.FILE,
-                SinkCategory.NOTIFICATION,
-                SinkCategory.HTTP_WEBHOOK,
-                SinkCategory.NETWORK,
-                SinkCategory.EXTERNAL_MCP,
-            }:
+            capability_tier = TRIGGER_CAPABILITY_TIERS.get(tool_name)
+            # Poller authority can use contained sinks after exact argument-level
+            # validation. Code execution and unbounded egress remain blocked here;
+            # integrity-aware widening is owned by the gate chainlink.
+            if (
+                "poller_payload" in service.readable_domains
+                and capability_tier in {CapabilityTier.CODE_EXECUTION, CapabilityTier.UNBOUNDED}
+            ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
@@ -786,10 +1001,16 @@ class SinkGate:
             SinkCategory.SCHEDULER,
             SinkCategory.PROPOSAL,
         }:
-            # Poller payloads are attacker-controlled external content (#906).
-            # Persistent mutation categories must fail closed too, especially
-            # proposal operations that are otherwise available to pollers.
-            if "poller_payload" in service.readable_domains:
+            capability_tier = TRIGGER_CAPABILITY_TIERS.get(
+                next((op for op in service.capabilities if get_sink_category(op) == category), "")
+            )
+            if (
+                "poller_payload" in service.readable_domains
+                and capability_tier not in {
+                    CapabilityTier.SCOPE_CONTAINED,
+                    CapabilityTier.SCOPED_WITH_PROVENANCE,
+                }
+            ):
                 return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
@@ -801,17 +1022,6 @@ class SinkGate:
                 return frozenset({target})
             return frozenset()
         if service is not None and service_policy is not None and target is not None:
-            # Poller payloads remain attacker-controlled external content (#906).
-            if "poller_payload" in service.readable_domains and category in {
-                SinkCategory.SHELL_PROCESS,
-                SinkCategory.SPAWN,
-                SinkCategory.FILE,
-                SinkCategory.NOTIFICATION,
-                SinkCategory.HTTP_WEBHOOK,
-                SinkCategory.NETWORK,
-                SinkCategory.EXTERNAL_MCP,
-            }:
-                return frozenset()
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
             if (
@@ -934,7 +1144,7 @@ def approve_live_declassification(
     reason: Any,
 ) -> tuple[bool, str]:
     """Approve one exact sink on the exact live admin request carrier."""
-    from .models import AuthContext, InformationFlowLabels, InformationFlowState
+    from .models import AuthContext, InformationFlowState
 
     if not isinstance(auth_context, AuthContext):
         return False, "missing_auth_context"
@@ -2335,63 +2545,6 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
         ServicePrincipal(
-            canonical="poller",
-            trigger="poller",
-            capabilities=(
-                "shell_exec",
-                "bash_async",
-                "spawn_claude_code",
-                "spawn_codex",
-                "spawn_open_code",
-                "task",
-                "write_file",
-                "edit_file",
-                "open_proposal",
-                "submit_proposal",
-                "abandon_proposal",
-                "worklink_run",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "file_search",
-                "get_turn",
-                "mimir_get_turn",
-                "send_message",
-                "list_channels",
-            ),
-            readable_domains=(
-                "poller_payload",
-                "filesystem",
-                "turn_history",
-                "channel_metadata",
-            ),
-            sink_destinations=(
-                "configured_channel",
-                "filesystem",
-                "shell_process",
-                "spawn_process",
-                "proposal",
-                "worklink",
-                "message",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
-            ),
-            creation_path="mimir.pollers.run_poller",
-        ),
-        ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
             capabilities=(
@@ -2411,16 +2564,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "aglob",
                 "grep",
                 "agrep",
-                "write_file",
-                "edit_file",
             ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
-            sink_destinations=("session_boundary", "saga", "filesystem"),
-            sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-            ),
+            sink_destinations=("session_boundary", "saga"),
             creation_path="mimir.server._on_session_idle",
+            authority_profile="session-boundary",
+            capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
         ),
         ServicePrincipal(
             canonical="system",
@@ -2479,7 +2628,6 @@ def register_service_principal(service: ServicePrincipal) -> None:
 
 _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
     "scheduled_tick",
-    "poller",
     "saga_session_end",
     "upgrade",
 })
@@ -2846,6 +2994,18 @@ def get_service_principal(trigger: str) -> ServicePrincipal | None:
     return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
 
 
+def get_event_service_principal(event: Any) -> ServicePrincipal | None:
+    """Resolve static built-ins or an exact per-instance event authority."""
+    carried = getattr(event, "service_authority", None)
+    if (
+        isinstance(carried, ServicePrincipal)
+        and carried.trigger == getattr(event, "trigger", None)
+        and carried.canonical == getattr(event, "service_principal", None)
+    ):
+        return carried
+    return _TRUSTED_SERVICE_PRINCIPALS.get(getattr(event, "trigger", None))
+
+
 def is_admin(auth_context: Any) -> bool:
     """Check if the auth context has admin role."""
     if auth_context is None:
@@ -2869,10 +3029,12 @@ def get_trusted_service_from_auth_context(
         return None
     if not getattr(auth_context, "is_service", False):
         return None
-    trigger = getattr(auth_context, "trigger", None)
-    if not isinstance(trigger, str):
-        return None
-    service = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    service = getattr(auth_context, "service_authority", None)
+    if not isinstance(service, ServicePrincipal):
+        trigger = getattr(auth_context, "trigger", None)
+        if not isinstance(trigger, str):
+            return None
+        service = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
     if service is None or getattr(auth_context, "canonical_principal", None) != service.canonical:
         return None
     return service
@@ -3103,7 +3265,7 @@ def create_auth_context(
         roles = access.roles
         is_service = access.is_service
 
-    registered_service = _TRUSTED_SERVICE_PRINCIPALS.get(event.trigger)
+    registered_service = get_event_service_principal(event)
     if (
         registered_service is not None
         and event.service_principal == registered_service.canonical
@@ -3150,6 +3312,7 @@ def create_auth_context(
         interactivity=TurnInteractivity.NON_INTERACTIVE,
         policy_version=policy_version,
         is_service=is_service,
+        service_authority=registered_service if is_service else None,
         enforcement_enabled=enforce,
         source_session_acl=(
             event.source_session_acl

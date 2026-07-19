@@ -18,7 +18,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from langchain.tools import ToolRuntime
 import pytest
@@ -78,6 +78,7 @@ def _auth_runtime(
     trigger: str = "user_message",
     event_ingress: str | None = "discord",
     is_service: bool = False,
+    service_authority: Any = None,
 ) -> ToolRuntime[AuthContext]:
     context = AuthContext(
         principal=principal,
@@ -88,6 +89,7 @@ def _auth_runtime(
         channel_id="chan-1",
         interactivity=TurnInteractivity.INTERACTIVE,
         is_service=is_service,
+        service_authority=service_authority,
         enforcement_enabled=True,
     )
     return ToolRuntime(
@@ -1113,7 +1115,7 @@ async def test_commitment_list_service_filters_protected_text_before_rendering(
     store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
     await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id=None,
-        text="poller-visible-text", owner_principal="service:poller",
+        text="poller-visible-text", owner_principal="service:poller:feed",
         visibility=CommitmentVisibility.SERVICE.value,
     ))
     await store.add(CommitmentRecord(
@@ -1133,8 +1135,14 @@ async def test_commitment_list_service_filters_protected_text_before_rendering(
     ))
     set_commitments_store(store)
 
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+    authority = build_trigger_service_principal(
+        canonical="poller:feed", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=(), creation_path="test",
+    )
     runtime = _auth_runtime(
-        "poller", trigger="poller", event_ingress=None, is_service=True,
+        "poller:feed", trigger="poller", event_ingress=None, is_service=True,
+        service_authority=authority,
     )
     out = await commitment_list.ainvoke({
         "runtime": runtime, "due_within_days": 0,

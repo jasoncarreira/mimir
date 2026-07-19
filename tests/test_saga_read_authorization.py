@@ -287,7 +287,6 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
     ("trigger", "principal"),
     [
         ("scheduled_tick", "scheduler"),
-        ("poller", "poller"),
         ("saga_session_end", "synthesis"),
         ("upgrade", "system"),
     ],

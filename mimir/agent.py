@@ -78,7 +78,7 @@ from .models import (
     TurnInteractivity,
     TurnRecord,
 )
-from .access_control import SinkGate, create_auth_context, get_service_principal
+from .access_control import SinkGate, create_auth_context, get_event_service_principal
 from .prompts import build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
@@ -297,7 +297,7 @@ def _initialize_ifc_labels(
     continuation_auth = _shell_continuation_auth_context(event)
     canonical_principal = event.author
     source_kind = "channel"
-    registered_service = get_service_principal(event.trigger)
+    registered_service = get_event_service_principal(event)
     if (
         canonical_principal is None
         and registered_service is not None
