@@ -713,6 +713,12 @@ backends:
     args: ["exec", "--json", "--sandbox", "danger-full-access"]
   claude_cli:
     bin: claude
+  opencode:
+    bin: opencode
+    # Replaces the built-in Mimir-repo list: ["git *", "uv *", "env *"].
+    # OpenCode evaluates the last matching pattern. Worklink always installs a
+    # leading "*": deny rule, then these grants; "*" itself is rejected.
+    bash_allowlist: ["git *", "uv *", "env *"]
     args: ["-p", "--output-format", "json"]
 ```
 
@@ -888,6 +894,22 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
 
 Invalid or unknown compute-backend fields fail closed during config load
 instead of falling back to local execution.
+
+Worklink's OpenCode backend passes a per-run `OPENCODE_PERMISSION` override with
+`external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
+This is deliberately `deny`, never `ask`: Worklink runs headlessly, so an
+approval request would wait forever. A denied tool call is returned by OpenCode
+as a permission error and recorded in the Worklink transcript rather than
+opening an interactive prompt. Configure `backends.opencode.bash_allowlist` with
+the command patterns required by the selected repository's test runner, package
+manager/build, and Git workflow. The list replaces the defaults; an empty list
+denies every shell command.
+
+This policy is defense-in-depth for **trusted code work only**, not process
+confinement. OpenCode's file/path checks and shell command matcher run inside the
+OpenCode process. An allowed command and its arguments still have the host
+user's filesystem and network authority, so untrusted code work remains
+notify-only until Worklink has an isolated compute substrate.
 
 `tiered_review` and the inert `epic_branch_prefix`/`reviewer_backend` settings
 live under `defaults`. Since #830 removed the integrated-epic runner these are

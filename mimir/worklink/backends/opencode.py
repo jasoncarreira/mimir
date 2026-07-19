@@ -13,6 +13,9 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, RawResult, WorkOrder, blocked_reason_from_output
 
 
+DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *", "env *")
+
+
 @dataclass(frozen=True)
 class OpenCodeBackend:
     """Adapter for ``opencode run`` Worklink jobs.
@@ -25,6 +28,7 @@ class OpenCodeBackend:
 
     bin: str = "opencode"
     extra_args: Sequence[str] = field(default_factory=tuple)
+    bash_allowlist: Sequence[str] = field(default_factory=lambda: DEFAULT_BASH_ALLOWLIST)
     name: str = "opencode"
 
     def capabilities(self) -> Caps:
@@ -49,6 +53,8 @@ class OpenCodeBackend:
     ) -> WorkSpec:
         prompt = _prompt_for_order(order)
         args = list(self.extra_args)
+        env = dict(order.env)
+        env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -60,8 +66,12 @@ class OpenCodeBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=order.env,
-            backend_config={"bin": self.bin, "args": args},
+            env=env,
+            backend_config={
+                "bin": self.bin,
+                "args": args,
+                "bash_allowlist": list(self.bash_allowlist),
+            },
             local_worktree=order.worktree,
             local_argv=_local_argv(self.bin, args, order.worktree, prompt),
         )
@@ -123,6 +133,17 @@ def _prompt_for_order(order: WorkOrder) -> str:
 def _local_argv(bin_name: str, args: Sequence[str], worktree: Path, prompt: str) -> tuple[str, ...]:
     # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
     return (bin_name, "run", "--dir", str(worktree), *args, "--", prompt)
+
+
+def _permission_override(bash_allowlist: Sequence[str]) -> str:
+    # OpenCode evaluates the last matching rule. Keep the deny first and append
+    # only explicit operator grants so unmatched commands cannot prompt or run.
+    bash = {"*": "deny"}
+    bash.update((pattern, "allow") for pattern in bash_allowlist)
+    return json.dumps({
+        "external_directory": {"/**": "deny"},
+        "bash": bash,
+    }, separators=(",", ":"))
 
 
 def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:

@@ -956,6 +956,11 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert calls[0]["args"] == (
         "opencode", "run", "--dir", str(order.worktree), "--", "-starts with dash"
     )
+    permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
+    assert permission == {
+        "external_directory": {"/**": "deny"},
+        "bash": {"*": "deny", "git *": "allow", "uv *": "allow", "env *": "allow"},
+    }
     assert result.transcript_path is not None
     assert result.transcript_path.parent == transcript_root
     transcript = json.loads(result.transcript_path.read_text())
@@ -1049,10 +1054,22 @@ async def test_opencode_backend_transcript_filename_contract(
 
 
 def test_registry_builds_opencode_backend_with_settings() -> None:
-    config = WorklinkConfig(backend_settings={"opencode": {"bin": "/usr/local/bin/opencode", "args": ["--model", "openai/gpt-5.5"]}})
+    config = WorklinkConfig(backend_settings={"opencode": {
+        "bin": "/usr/local/bin/opencode",
+        "args": ["--model", "openai/gpt-5.5"],
+        "bash_allowlist": ["git *", "npm *"],
+    }})
     backend = BackendRegistry(config).get("opencode")
     assert backend.bin == "/usr/local/bin/opencode"
     assert backend.extra_args == ("--model", "openai/gpt-5.5")
+    assert backend.bash_allowlist == ("git *", "npm *")
+
+
+@pytest.mark.parametrize("allowlist", ["git *", [""], ["*"]])
+def test_registry_rejects_invalid_opencode_bash_allowlist(allowlist: object) -> None:
+    config = WorklinkConfig(backend_settings={"opencode": {"bash_allowlist": allowlist}})
+    with pytest.raises(ValueError, match="bash_allowlist"):
+        BackendRegistry(config)
 
 
 @pytest.mark.asyncio
