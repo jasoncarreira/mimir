@@ -314,11 +314,25 @@ and PR-gated — pre-existing and universal, for every principal, not
 poller-specific** — so untrusted content never becomes an always-loaded trusted
 instruction; (2) **provenance visibility** on recall so the agent down-weights
 untrusted-origin facts; (3) **the action gate** on anything the turn actively
-ingests. Accepted residual: an auto-recalled poisoned fact can *mislead the
-agent's reasoning* (it just can't gate-bypass); tainting recall would close that
-but break user turns, which is ruled out — on user turns the operator is the
-backstop, and on autonomous turns the tight per-trigger capability set bounds
-the blast radius.
+ingests.
+
+**Accepted residual — cross-turn integrity laundering (decided: accept, revisit
+later).** Because recall is `informational` and informational never gates, there
+is a laundering chain: untrusted content stored on one turn → auto-recalled on a
+*later* turn as `informational` → shapes a *trusted* turn's reasoning → that
+trusted turn takes a privileged action it is itself authorized for. The recalled
+fact never trips the gate (that's the point — it can't handcuff a user turn), but
+it can still *influence* an authorized action. Provenance/down-weighting is not
+an executable boundary here, so this path stays open. We **accept it** for the
+initial enablement rather than gating recalled untrusted-origin content, which
+would break the user-turn ergonomics that are a hard requirement. It is bounded
+by: (1) core memory always blocked + PR-gated (untrusted content never becomes an
+always-loaded instruction); (2) provenance visibility on recall; (3) the operator
+as backstop on user turns; (4) tight per-trigger capability sets bounding
+autonomous blast radius. **Revisit later** if it proves exploitable — the natural
+future move is *turn-type-scoped* gating (keep user turns exempt; gate recalled
+untrusted-origin content on autonomous turns, which have no human backstop). This
+is a known limitation, not a closed hole.
 
 ### 5.4 Network egress: `fetch_url` and the uniform egress boundary
 
