@@ -1,10 +1,14 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 2. Incorporates mimir review round 1 (spawn is not
-contained; the "scoped" file root is actually the whole home; the `SAGA` category
-is too broad; integrity is an enablement prerequisite) and the operator's
-per-trigger policy (GitHub known-contributor vs unknown; research pollers;
-heartbeats). Seeking another review round.
+**Status:** DRAFT — revision 4. Incorporates mimir review rounds 1–3 (spawn and
+`worklink_run` are not process-confined; the "scoped" file root is actually the
+whole home; the `SAGA` category is too broad; integrity is an enablement
+prerequisite; approved-URL authorizes the request, not the response bytes) and
+the operator's decisions (per-trigger policy; approved-URL = egress-only;
+trust the contributor / JIRA instance wholesale; provenance schema; auto-recall
+must never handcuff a user turn; future isolation must run in docker **and** AWS
+ECS/Fargate → no bubblewrap). The open design questions from rev 3 are now
+resolved (§6).
 **Date:** 2026-07-19.
 **Context:** written after a whole-`access_control` adversarial review (5 parallel
 reviewers, findings verified with runtime repros). It proposes the model that
@@ -152,10 +156,18 @@ Two **independent** inputs decide what a turn may do:
    - **GitHub content** → trusted iff the author is a **repo collaborator, org
      member, or has write access** (GitHub's own permission graph — operator-
      controlled, un-forgeable by a PR). Such a contributor's issue/PR is trusted
-     as a whole. Content from **anyone else — including *comments* on an
-     otherwise-trusted PR — is untrusted**.
-   - **`fetch_url` from an operator-approved URL** (heartbeat) → **trusted**
-     (§5.4 — an explicit, accepted trade-off).
+     **as a whole**, including material it embeds/quotes or is built on top of —
+     we trust the contributor not to introduce malicious content (operator
+     decision). The only untrusted github content is from **non-contributors**
+     (unknown authors, comments by non-contributors) → untrusted.
+   - **A trusted external system we point at** (e.g. a JIRA instance) → trusted,
+     on the basis that its admins gate who can file/assign and won't route
+     untrusted issues to us (operator decision). Declared per trigger like any
+     other trust source.
+   - **`fetch_url` from an operator-approved URL** (heartbeat) → the allowlist is
+     **egress authorization only** (which hosts may be fetched); the fetched
+     **content stays untrusted** (§5.4). Approving a host is not vouching for its
+     bytes.
    - Everything else ingested from outside → **untrusted**.
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
@@ -172,10 +184,10 @@ folded into a trusted turn and then driving an action.
 |---|---|---|
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org / write) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
-| **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted; approved-URL content is trusted (§5.4) |
+| **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved-URL list** | internally triggered → trusted. `fetch_url` limited to the approved-URL list (**egress authorization only**); fetched **content stays untrusted** but can still drive scoped sinks — it can save state / wiki / memory; only fetch → code/shell/further-egress needs a one-use declassify (§5.4) |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
-| **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | trust source TBD (JIRA identity); declared like any other trigger |
+| **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
 The config model must be **open to new trigger types** declaring their own
 capability profile + trust source — not hardcoded to the rows above.
@@ -236,21 +248,42 @@ for that metadata, are defined as part of this work rather than inherited from
 the coarse category.
 
 Untrusted-derived writes (poller findings) are **usable** memory, tagged with
-their origin (which poller, which source, untrusted). We deliberately do **not**
-route them to a separate "quarantine" namespace, because a quarantine only has
-value if something downstream reads it differently — and in mimir, recalled
-memory just flows into the prompt as context. A quarantine namespace without a
-down-weighting consumer is either recalled (exactly as dangerous as
-un-quarantined) or never recalled (wasted). The real defense is the pairing that
-already (mostly) exists:
+their origin. We deliberately do **not** route them to a separate "quarantine"
+namespace, because a quarantine only has value if something downstream reads it
+differently — and recalled memory just flows into the prompt as context. A
+quarantine without a down-weighting consumer is either recalled (as dangerous as
+un-quarantined) or never recalled (wasted).
 
-- **core memory stays un-writable by pollers** (already enforced) — untrusted
-  content never reaches the always-loaded, always-trusted set;
-- **provenance rides on the write** — on recall, "from an untrusted web fetch
-  via research-poller X" is visible in context for the agent (and operator) to
-  weigh;
-- **the action gate** — a poisoned finding that gets recalled still cannot
-  *drive* a privileged action without passing this same sink classification.
+**Provenance schema (immutable, server-set on each recallable write).** Rides on
+the existing SAGA ownership columns; add:
+- `integrity`: `trusted` | `untrusted` (from the trust model, §4, at write time)
+- `origin_trigger`: e.g. `research-poller:hn-ai`, `github-poller`, `operator`
+- `origin_ref`: the concrete source — URL / issue# / msg-id
+- (+ existing `owner_principal`, `origin_channel`, `captured_at`)
+
+None of these are editable by the content or the model.
+
+**Recall is informational, not enforcing** (mimir's "provenance informs, the gate
+enforces", applied to recall — and required so an incidental auto-recall never
+handcuffs a user turn):
+- **Auto-recall** (relevance-based injection at prompt assembly) renders the
+  provenance tag so the agent (and operator) can weigh an untrusted-origin fact,
+  but it does **not** taint the turn or gate actions. A user turn stays fully
+  able to work even if an untrusted memory is recalled into context.
+- **Enforcement taint comes only from what the turn actively ingests** — the
+  trigger's own content (poller payload, unknown-author issue) and live tool
+  reads/fetches this turn — never from ambient recalled memory.
+
+The memory-poisoning defense is therefore: (1) **core memory is always blocked
+and PR-gated — pre-existing and universal, for every principal, not
+poller-specific** — so untrusted content never becomes an always-loaded trusted
+instruction; (2) **provenance visibility** on recall so the agent down-weights
+untrusted-origin facts; (3) **the action gate** on anything the turn actively
+ingests. Accepted residual: an auto-recalled poisoned fact can *mislead the
+agent's reasoning* (it just can't gate-bypass); tainting recall would close that
+but break user turns, which is ruled out — on user turns the operator is the
+backstop, and on autonomous turns the tight per-trigger capability set bounds
+the blast radius.
 
 ### 5.4 Network egress: `fetch_url` and the uniform egress boundary
 
@@ -260,10 +293,12 @@ act" and "let data leak out" are the same action. By trigger:
 - **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
   their own subprocess; the capability is simply not in their set).
 - **Heartbeat:** `fetch_url` allowed against an **operator-approved URL/host
-  list**, and content from an approved URL is treated as **trusted** (not
-  tainted). This is an explicit trade-off: tainting approved-URL content would
-  make the heartbeat unable to do its work, so approving a URL *is* vouching for
-  it. Accepted residual: a compromised approved site could feed the heartbeat.
+  list** — but the allowlist is **egress authorization only** (which hosts may be
+  fetched), **not** a trust signal for the response (mimir: approving a host
+  authorizes the request, not the bytes). **Fetched content stays untrusted.**
+  The heartbeat still does its work because untrusted fetched content can drive
+  the scoped sinks — it can **save state / wiki / memory** (provenance-tagged);
+  only fetch → code/shell/further-egress needs a one-use declassify.
 - **User / operator turns:** **exact-host/URL grant with ask-on-first-use**
   (mimir rec) — the agent asks the first time it wants a host, the operator
   approves that host/URL, and it's remembered for that scope. Not a blanket
@@ -289,21 +324,33 @@ issue/PR, or a non-contributor comment, is untrusted → **notify-only** (§4). 
 even the trusted path is contained by Worklink, and the untrusted path does not
 autonomously touch code at all.
 
+**Defense-in-depth now (cheap, worth setting regardless):** run worklink's
+opencode with `permission.external_directory: {"/**": "deny"}`, which confines
+opencode's **file tools** (read/write/edit/ls/glob/grep) to the working
+directory. Note the limits: opencode's permission model is **approval-based**
+(`bash`/`edit`/`webfetch` → allow/ask/deny), **not** an OS sandbox — the **shell
+is the escape hatch** `external_directory` doesn't close (an allowed `bash`
+command can still write outside cwd or reach the network), and a `shell.sandbox:
+"strict"` key is **not confirmed** in the opencode docs we can see. So opencode's
+config hardens the file-tool surface but is not, by itself, a real sandbox; treat
+it as one layer, verify `shell.sandbox` against the opencode version we actually
+run, and restrict the `bash` permission.
+
 **Decision: untrusted code work is notify-only for now.** We do **not** build an
 isolated compute substrate as part of this enablement. Unknown-author GitHub
-issues/PRs (and non-contributor comments) are surfaced to the operator, who
-decides. This keeps the flag flippable without new sandbox work.
+issues/PRs (and non-contributor comments) are surfaced to the operator.
 
 **If we later want autonomous untrusted code work**, the requirement is a
 `ComputeBackend` whose `capabilities()` reports `shared_filesystem=False,
 network_isolated=True` (the registry's existing `unsafe_by_caps` gate then admits
-it). Since we are **not** returning to docker/container-per-run, the substrate
-would use OS-level sandboxing of the coding-CLI subprocess (see the "How would we
-isolate it" note in §6): filesystem confinement (Landlock or a bind-mount
-namespace so only the worktree is writable), network confinement (a network
-namespace / seccomp block, or an allowlist egress proxy), and credential/env
-minimization. This is a new backend behind the existing `ComputeBackend`
-abstraction, not a design change to the tiers above — and it is **out of scope**
+it). **Constraint: it must run in both a docker container and AWS ECS/Fargate —
+so no bubblewrap / user-namespace sandboxes** (Fargate grants neither). The
+Fargate-compatible substrate (§6) layers: opencode file-permission confinement +
+**task-level network egress control** (Fargate security groups / a no-egress or
+proxy-only network; `--network` limits under docker) which confines the *whole
+task* including any shell `curl` with no per-process netns + optional
+**unprivileged, no-namespace** seccomp / Landlock where the kernel supports it.
+A new backend behind the existing `ComputeBackend` abstraction; **out of scope**
 for the current enablement.
 
 ---
@@ -321,96 +368,106 @@ for the current enablement.
   integrity is an *enablement prerequisite*, not a multi-user-someday concern —
   is adopted: the confused-deputy case is closed **now**, single-operator
   included.
-- **Network egress → §5.4**: pollers have no `fetch_url`; heartbeat uses the
-  approved-URL list (approved content trusted); user turns ask-on-first-use per
-  host; one **uniform egress boundary including child processes**, not a per-tool
-  special case.
+- **Network egress → §5.4**: pollers have no `fetch_url`; heartbeat's approved-URL
+  list is **egress authorization only** (fetched content stays untrusted — it can
+  still save state/wiki/memory); user turns ask-on-first-use per host; one
+  **uniform egress boundary including child processes**, not a per-tool special
+  case.
 - **Memory tier → scoped ops, not the whole category** (§5.3): create-atom +
   feedback/credit, provenance-tagged; no `saga_forget` / session-boundary.
-- **Provenance → rendered structurally, never an enforcement boundary** (mimir
-  rec): the tag informs; the action gate enforces.
+- **Provenance schema + recall → §5.3**: `integrity`/`origin_trigger`/`origin_ref`
+  stamped immutably server-side. **Auto-recall is informational only — it renders
+  provenance but never taints/gates**, so an incidental recall can't handcuff a
+  user turn; enforcement taint comes only from what the turn actively ingests.
+- **Trust wholesale for trusted sources → §4**: a known GitHub contributor's PR
+  is trusted as a whole (embedded/quoted material included); a pointed-at JIRA
+  instance is trusted (we trust its admins). Only non-contributor content is
+  untrusted.
+- **Core memory → always blocked, PR-gated, universal** (pre-existing) — untrusted
+  content can never reach the always-loaded set.
 - **Untrusted code work → notify-only** (operator decision). We do not build an
   isolated compute substrate for this enablement; unknown-author code work is
   surfaced to the operator (§5.5).
 
-**How would we isolate code execution later (non-docker)** — recorded because the
-question was raised; **out of scope** for this enablement. We are not returning
-to docker/container-per-run. A future isolated `ComputeBackend`
-(`shared_filesystem=False, network_isolated=True`) would sandbox the coding-CLI
-subprocess with OS-level primitives instead:
-- **Filesystem:** **Landlock** (kernel ≥5.13 LSM — the launcher self-restricts
-  writes to the worktree before `exec`, rootless, no namespaces) or a
-  **bubblewrap** mount namespace bind-mounting only the worktree writable over a
-  read-only root.
-- **Network:** a **network namespace** (`unshare -n`) with no route, a **seccomp**
-  block on socket syscalls, or an **allowlist egress proxy** (this is also the
-  uniform egress boundary from §5.4).
-- **Credentials/env:** minimal env, no `HOME`/provider creds passed to the child.
-- It slots behind the existing `ComputeBackend` abstraction; the registry's
-  `unsafe_by_caps` gate already flips such a backend to "safe for untrusted."
-- **Caveat:** mimirbot runs *inside* a container, so nested sandboxing depends on
-  the host permitting the needed syscalls/user-namespaces (cf.
-  `docs/internal/seccomp-userns.json`). Landlock+seccomp is the most portable
-  path if user namespaces are blocked; bubblewrap is more complete if they aren't.
+**How would we isolate code execution later** — recorded because the question was
+raised; **out of scope** for this enablement, and only relevant if we ever move
+untrusted code work off notify-only. Hard constraint: the substrate must run in a
+**docker container AND AWS ECS/Fargate**, which grant no user namespaces / no
+privileged caps — so **bubblewrap and namespace-based sandboxes are out**. A
+future isolated `ComputeBackend` (`shared_filesystem=False, network_isolated=True`;
+the registry's `unsafe_by_caps` gate then admits it) would instead layer, in
+descending portability:
+- **Application-level file confinement:** opencode `external_directory` deny +
+  restricted `bash` permission (works anywhere; no kernel deps).
+- **Task-level network egress control:** Fargate security groups / a no-egress or
+  proxy-only task network (docker: `--network` limits). Confines the *whole task*
+  — including any shell `curl` — without a per-process netns, which is the
+  Fargate-native way to close the network dimension.
+- **Optional, where the kernel allows (unprivileged, no namespaces):** a
+  process-installed **seccomp** filter (block socket syscalls) and/or **Landlock**
+  (self-restrict writes to the worktree). Kernel-support-dependent under Fargate,
+  so defense-in-depth, not the primary control.
+- **Credential/env minimization:** no `HOME`/provider creds to the child.
 
-**Remaining open (for tomorrow's design session):**
-
-1. **Mixed / embedded content inside a trusted PR.** Top-level comments are
-   handled (a non-contributor comment is untrusted → notify). But a known
-   contributor's PR built on an unknown fork, or quoting external material —
-   where exactly is the taint boundary inside an otherwise-trusted item?
-2. **Provenance schema + recall rendering.** The exact immutable origin/integrity
-   metadata stored on a write, and how it surfaces on recall (inline per-atom vs
-   grouped) so it actually informs weighting rather than being decorative.
-3. **Future trigger trust sources (e.g. JIRA).** How a JIRA ticket's author trust
-   is derived (project role? reporter identity?) — needed before that poller
-   lands, not now.
+**Remaining open:** none — the rev-3 questions are resolved. Trust is wholesale
+for trusted sources (§4); the provenance schema + informational recall are set
+(§5.3); JIRA trust is by instance (§4). What's left before flipping the flag is
+the implementation work (§8) plus the §7 blockers, not open design questions.
 
 ---
 
-## 7. Other enablement blockers (from the review — on the path, tracked separately)
+## 7. Other enablement blockers (from the review — on the path)
 
-These are not part of the sink-classification design but are on the critical
-path to flipping the flag; captured here so the enablement picture is complete:
+The standalone review findings are **fixed and merged** (2026-07-19, each
+masked-check-verified):
 
-- **`attempted_service` fail-open (security bug).** A non-admin who POSTs
-  `/event` with `trigger="poller"` skips the IFC sink gate for OPEN tools
-  (`fetch_url`/`web_search` become allowed). Verified deny→allow. Fix: run the
-  sink gate for OPEN operations regardless of `attempted_service`, and/or reject
-  service triggers from non-service identities at ingress.
-- **`shell_job_complete` continuation lockout.** The continuation event is built
-  with `author=None`, `source="system"`, and no `service_principal`, so under
-  enforce it is denied *every* tool including its own same-channel reply. The
-  `bash_async` notify/continue workflow breaks. Fix: give the continuation a
-  registered service principal (or inherit the originating turn's context).
-- **#922** — trusted-service autonomous maintenance off raw write-shell (the
-  scheduler/poller shell profile is read-only; write-shell maintenance turns
-  break on enable). Overlaps with §5: those turns should move to
-  contained/scoped sinks.
-- **#923** — the test suite is not enforcement-clean: with the flag on,
+- ✅ **`attempted_service` fail-open** → #1140 (sink gate now runs for OPEN tools
+  regardless of a spoofed service trigger).
+- ✅ **`shell_job_complete` continuation lockout** → #1141 (continuation inherits
+  the origin turn's frozen auth, same-channel-guarded, not client-settable).
+- ✅ **R1 `protected_prompt` channel-binding** → #1142 (bound to the triggering
+  channel; producers stamp the content's origin channel).
+- ✅ **R2 `InformationFlowState.merge` monotonicity** → #1143 (regression locking
+  taint accumulation).
+- ✅ **Enablement hardening batch** → #1144 (inventory assertion covers deepagents
+  built-ins + registered MCP; `_env_access_control_enforced` no longer raises in
+  `wrap_tool_call`).
+
+**Still open before the flag can flip** (chainlinks #922, #923):
+- **#922** — migrate trusted-service autonomous maintenance off raw write-shell
+  (the scheduler/poller shell profile is read-only; a write-shell maintenance turn
+  breaks on enable). Overlaps with §5 — those turns should move to contained/scoped
+  sinks per the tier model.
+- **#923** — make the test suite enforcement-clean: with the flag on,
   `test_dispatcher` fails and the broad suites hang, so CI cannot validate
   enable-time regressions. Must be green under `MIMIR_ACCESS_CONTROL_ENFORCED=1`
   before enabling.
-- **R1** — `protected_prompt` sources are not channel-bound in `_get_allowed_sinks`
-  (only ACL-checked), a potential cross-channel egress; bind them like the other
-  source kinds.
-- **R2** — `InformationFlowState.merge` label-monotonicity has a masked-test gap
-  (reverting the union to keep only `added` fails 0 tests); add a regression that
-  merges a tainted `current` with a clean `added` and asserts taint survives.
 
 ---
 
-## 8. Proposed work breakdown (once the design is settled)
+## 8. Proposed work breakdown (design is settled — §6)
 
-1. Poller capability config: manifest schema + parsing/validation against the
-   tier table (§5.1).
-2. `_get_allowed_sinks`: `#906` → tier-based deferral to containment policy
-   (§5.2); add memory-write as a Scoped-with-provenance tier sink.
-3. Provenance tags on untrusted-derived writes + recall surfacing (§5.3, Q4).
-4. User-turn operator-trust allowance for Contained/Scoped sinks (§4).
-5. `fetch_url` permission-ask flow (§5.4, Q2).
-6. Fixes for §7 (fail-open, continuation lockout, R1, R2) + make the suite
-   enforcement-clean (#923).
-7. Enable-time verification: run the full suite under
+1. **Per-trigger capability config** (§5.1): manifest schema + a built-in profile
+   for heartbeat/session-boundary; named capabilities validated against the tier
+   table; narrow per-trigger roots from immutable operator config (not the global
+   file-tool roots); manifest cannot self-grant/mutate its authority.
+2. **Trust derivation** (§4): resolve content integrity from source identity —
+   GitHub permission graph (collaborator/org/write), pointed-at JIRA instance,
+   internal triggers — everything else untrusted; wholesale for trusted sources.
+3. **`_get_allowed_sinks` → tier + trust gate** (§3, §5.2): replace the `#906`
+   blanket poller block with the 2×2 (trust × blast-radius) deferring to
+   containment policy; keep unbounded/exfil hard-blocked; add the Code-execution
+   tier (worklink_run trusted-only; spawn_* blocked pending an isolation contract).
+4. **Provenance schema + informational recall** (§5.3): `integrity`/`origin_trigger`/
+   `origin_ref` immutable columns; render provenance on recall (grouped by trust)
+   **without** tainting; enforcement taint from active ingests only.
+5. **Network egress boundary** (§5.4): pollers no `fetch_url`; heartbeat
+   approved-URL = egress-only (content untrusted); user ask-on-first-use per host;
+   one boundary covering child processes (task-level egress control).
+6. **opencode file-permission** for worklink (§5.5): set `external_directory` deny
+   + restrict `bash`; verify `shell.sandbox` against our opencode version.
+7. **Enable-time verification**: land the §7 blockers still open (#922 write-shell
+   migration; #923 enforcement-clean suite), run the full suite under
    `MIMIR_ACCESS_CONTROL_ENFORCED=1` green, then the runbook in
-   [`../authorization.md`](../authorization.md).
+   [`../authorization.md`](../authorization.md). (The other §7 review items —
+   #1140–1144 — are already merged.)
