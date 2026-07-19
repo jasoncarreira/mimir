@@ -37,7 +37,7 @@ HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver
-    from .models import AgentEvent, AuthContext, InformationFlowLabels
+    from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
 
@@ -470,7 +470,7 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
             canonical="heartbeat",
             trigger="scheduled_tick",
             profile=profile,
-            tier=CapabilityTier.CODE_EXECUTION,
+            tier=CapabilityTier.UNBOUNDED,
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
             roots=(root,),
             creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
@@ -714,6 +714,10 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
     configured = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     if not configured:
         return False
+    try:
+        return Path(target).expanduser().resolve() == Path(configured).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _target_within_exact_roots(target: str, destination: str) -> bool:
@@ -740,10 +744,6 @@ def _target_matches_approved_url(target: str, destination: str) -> bool:
     """Match one exact URL from an operator-fixed comma-separated set."""
     approved = {item.strip() for item in os.environ.get(destination, "").split(",") if item.strip()}
     return target in approved
-    try:
-        return Path(target).expanduser().resolve() == Path(configured).expanduser().resolve()
-    except (OSError, RuntimeError):
-        return False
 
 
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
@@ -1144,7 +1144,7 @@ def approve_live_declassification(
     reason: Any,
 ) -> tuple[bool, str]:
     """Approve one exact sink on the exact live admin request carrier."""
-    from .models import AuthContext, InformationFlowLabels, InformationFlowState
+    from .models import AuthContext, InformationFlowState
 
     if not isinstance(auth_context, AuthContext):
         return False, "missing_auth_context"

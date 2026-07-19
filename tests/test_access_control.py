@@ -48,6 +48,35 @@ def _event(author: str | None) -> AgentEvent:
     )
 
 
+def test_worklink_repo_sink_adapter_matches_configured_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import mimir.access_control as access_control
+
+    configured = tmp_path / "repo"
+    configured.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    assert access_control._target_matches_worklink_repo(str(configured), "unused") is False
+
+    monkeypatch.setenv("WORKLINK_REPO", str(configured))
+    assert access_control._target_matches_worklink_repo(str(configured), "unused") is True
+    assert access_control._target_matches_worklink_repo(str(other), "unused") is False
+
+
+def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> None:
+    import mimir.access_control as access_control
+
+    principal = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+
+    assert principal.capability_tier is access_control.CapabilityTier.UNBOUNDED
+    assert "fetch_url" in principal.capabilities
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
