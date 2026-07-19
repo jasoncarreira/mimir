@@ -117,13 +117,6 @@ class ToolFlowDirection(StrEnum):
     UNKNOWN = "unknown"
 
 
-class EgressOrigin(StrEnum):
-    """Server-attested origin of an egress invocation or request payload."""
-
-    MODEL = "model"
-    TRUSTED_CONFIG = "trusted_config"
-
-
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
     "react": SinkCategory.SAME_CHANNEL,
@@ -805,6 +798,17 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 }
 
 
+_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
+_DEFAULT_WEB_SEARCH_URL = "https://api.tavily.com/search"
+
+
+def _fixed_web_search_url() -> str | None:
+    return normalize_sink_destination(
+        SinkCategory.NETWORK,
+        os.environ.get("TAVILY_SEARCH_URL", _DEFAULT_WEB_SEARCH_URL),
+    )
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -830,7 +834,6 @@ class SinkGate:
         ifc_labels: Any,
         auth_context: Any,
         service: ServicePrincipal,
-        egress_origin: EgressOrigin = EgressOrigin.MODEL,
     ) -> bool:
         """Apply the integrity axis to one exact declared service capability."""
         if not service.has_capability(tool_name):
@@ -849,16 +852,10 @@ class SinkGate:
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return tool_name == "worklink_run" and not has_untrusted_active_ingest
         if capability_tier is CapabilityTier.UNBOUNDED:
-            if (
-                egress_origin is EgressOrigin.TRUSTED_CONFIG
-                and get_sink_category(tool_name) in {
-                    SinkCategory.NETWORK,
-                    SinkCategory.HTTP_WEBHOOK,
-                    SinkCategory.EXTERNAL_MCP,
-                }
-            ):
-                return True
-            return not has_untrusted_active_ingest
+            return (
+                tool_name in _TAINT_INDEPENDENT_EGRESS_TOOLS
+                or not has_untrusted_active_ingest
+            )
         return True
 
     @classmethod
@@ -871,7 +868,6 @@ class SinkGate:
         *,
         enforce: bool = False,
         sink_category: SinkCategory | None = None,
-        egress_origin: EgressOrigin = EgressOrigin.MODEL,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -947,7 +943,7 @@ class SinkGate:
         )
         if (
             is_application_egress
-            and egress_origin is EgressOrigin.MODEL
+            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
             and has_untrusted_active_ingest
         ):
             canonical_principal = getattr(auth_context, "canonical_principal", None)
@@ -975,6 +971,16 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason=f"ifc_label_blocked:{sink_category.value}",
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=enforce,
+                is_shadow_decision=not enforce,
+            )
+        if tool_name == "web_search" and normalized_target != _fixed_web_search_url():
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=not enforce,
+                reason="egress_destination_not_approved",
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1034,7 +1040,7 @@ class SinkGate:
             SinkCategory.EXTERNAL_MCP,
         }:
             if not cls._service_tier_allows(
-                tool_name, ifc_labels, auth_context, service, egress_origin,
+                tool_name, ifc_labels, auth_context, service,
             ):
                 return ToolAuthorization(
                     tool_name=tool_name,
@@ -1080,7 +1086,6 @@ class SinkGate:
             ifc_labels=ifc_labels,
             service_policy=service_policy,
             target=target,
-            egress_origin=egress_origin,
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
@@ -1143,7 +1148,6 @@ class SinkGate:
         ifc_labels: Any,
         service_policy: ServiceSinkPolicy | None = None,
         target: str | None = None,
-        egress_origin: EgressOrigin = EgressOrigin.MODEL,
     ) -> frozenset[str]:
         """Return concrete destinations compatible with every current label.
 
@@ -1161,7 +1165,7 @@ class SinkGate:
         )
         if service is not None and not is_triggering_channel_reply:
             if not cls._service_tier_allows(
-                tool_name, ifc_labels, auth_context, service, egress_origin,
+                tool_name, ifc_labels, auth_context, service,
             ):
                 return frozenset()
 
@@ -1849,7 +1853,6 @@ class MCPResourceAdapter:
         *,
         enforce: bool,
         ifc_labels: Any = None,
-        egress_origin: EgressOrigin = EgressOrigin.MODEL,
     ) -> "ToolAuthorization":
         """Execute the provenance-bound adapter and IFC gate on one invocation."""
         from .mcp_client import (
@@ -1936,7 +1939,6 @@ class MCPResourceAdapter:
                                     context,
                                     enforce=enforce,
                                     sink_category=SinkCategory.EXTERNAL_MCP,
-                                    egress_origin=egress_origin,
                                 )
                             if sink_check is not None and not sink_check.allowed:
                                 return sink_check
@@ -2268,7 +2270,6 @@ class ToolRegistry:
         ifc_labels: Any = None,
         mcp_tool: Any = None,
         arguments: dict[str, Any] | None = None,
-        egress_origin: EgressOrigin = EgressOrigin.MODEL,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -2291,7 +2292,6 @@ class ToolRegistry:
                 auth_context,
                 enforce=enforce,
                 ifc_labels=ifc_labels,
-                egress_origin=egress_origin,
             )
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(auth)
@@ -2363,7 +2363,6 @@ class ToolRegistry:
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
-                egress_origin=egress_origin,
             )
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return sink_check

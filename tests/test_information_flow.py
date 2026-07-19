@@ -16,7 +16,6 @@ from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     CapabilityTier,
-    EgressOrigin,
     ServicePrincipal,
     ServiceSinkPolicy,
     SinkCategory,
@@ -490,8 +489,8 @@ def test_unknown_labels_or_destinations_fail_closed(
 @pytest.mark.parametrize(
     ("tool_name", "expected_reason"),
     [
-        ("fetch_url", "ifc_label_blocked:network"),
-        ("web_search", "ifc_label_blocked:network"),
+        ("fetch_url", "egress_destination_not_approved"),
+        ("web_search", "egress_destination_not_approved"),
     ],
 )
 def test_private_turn_is_blocked_from_external_egress_tools(
@@ -523,7 +522,7 @@ def test_spoofed_service_trigger_cannot_bypass_open_network_sink_gate(
     )
 
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:network"
+    assert decision.reason == "egress_destination_not_approved"
 
 
 def test_resolved_service_keeps_network_sink_policy_behavior():
@@ -552,7 +551,7 @@ def test_resolved_service_keeps_network_sink_policy_behavior():
     )
 
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:network"
+    assert decision.reason == "egress_destination_not_approved"
 
 
 def test_unknown_sink_category_reaches_fail_closed_gate_from_authorization():
@@ -643,7 +642,12 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     )
 
     assert decision.allowed is False
-    assert decision.reason == f"ifc_label_blocked:{sink_category}"
+    expected_reason = (
+        "egress_destination_not_approved"
+        if tool_name == "fetch_url"
+        else f"ifc_label_blocked:{sink_category}"
+    )
+    assert decision.reason == expected_reason
 
 
 def _trigger_service_context(
@@ -744,7 +748,7 @@ def test_generic_spawn_is_blocked_even_for_trusted_trigger(
     assert decision.reason == "ifc_label_blocked:spawn"
 
 
-def test_poller_unbounded_sink_requires_trusted_content(
+def test_poller_destination_safe_fetch_is_taint_independent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = "https://approved.example/fixed"
@@ -770,14 +774,18 @@ def test_poller_unbounded_sink_requires_trusted_content(
     )
 
     assert trusted.allowed is True
-    assert untrusted.allowed is False
+    assert untrusted.allowed is True
 
 
-def test_deterministic_heartbeat_fetch_is_taint_independent_but_model_choice_is_not(
+def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     destination = "https://approved.example/fixed?check=1"
-    monkeypatch.setenv("MIMIR_HEARTBEAT_APPROVED_URLS", destination)
+    second_destination = "https://approved.example/other?check=2"
+    monkeypatch.setenv(
+        "MIMIR_HEARTBEAT_APPROVED_URLS",
+        f"{destination},{second_destination}",
+    )
     service = ServicePrincipal(
         canonical="heartbeat",
         trigger="scheduled_tick",
@@ -790,24 +798,22 @@ def test_deterministic_heartbeat_fetch_is_taint_independent_but_model_choice_is_
     )
     auth, labels = _trigger_service_context(service, integrity="untrusted")
 
-    deterministic = SinkGate.check_sink_flow(
+    first = SinkGate.check_sink_flow(
         "fetch_url", destination, labels, auth, enforce=True,
-        egress_origin=EgressOrigin.TRUSTED_CONFIG,
     )
-    model_chosen = SinkGate.check_sink_flow(
-        "fetch_url", destination, labels, auth, enforce=True,
+    second = SinkGate.check_sink_flow(
+        "fetch_url", second_destination, labels, auth, enforce=True,
     )
     other_path = SinkGate.check_sink_flow(
-        "fetch_url", "https://approved.example/other", labels, auth, enforce=True,
-        egress_origin=EgressOrigin.TRUSTED_CONFIG,
+        "fetch_url", "https://approved.example/unlisted", labels, auth, enforce=True,
     )
 
-    assert deterministic.allowed is True
-    assert model_chosen.reason == "ifc_label_blocked:network"
+    assert first.allowed is True
+    assert second.allowed is True
     assert other_path.reason == "egress_destination_not_approved"
 
 
-def test_model_payload_is_gated_after_active_ingest_but_config_payload_is_not(
+def test_web_search_is_allowed_after_untrusted_active_ingest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = "https://api.tavily.com/search"
@@ -823,16 +829,68 @@ def test_model_payload_is_gated_after_active_ingest_but_config_payload_is_not(
         capability_tier=CapabilityTier.UNBOUNDED,
     )
     auth, labels = _trigger_service_context(service, integrity="untrusted")
-    model_payload = SinkGate.check_sink_flow(
+    decision = SinkGate.check_sink_flow(
         "web_search", target, labels, auth, enforce=True,
-    )
-    config_payload = SinkGate.check_sink_flow(
-        "web_search", target, labels, auth, enforce=True,
-        egress_origin=EgressOrigin.TRUSTED_CONFIG,
     )
 
-    assert model_payload.reason == "ifc_label_blocked:network"
-    assert config_payload.allowed is True
+    assert decision.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "target", "sink_category", "expected_reason"),
+    [
+        (
+            "webhook",
+            "https://audience.example/hook",
+            None,
+            "ifc_label_blocked:http_webhook",
+        ),
+        (
+            "http_request",
+            "https://audience.example/hook",
+            None,
+            "ifc_label_blocked:http_webhook",
+        ),
+        (
+            "mcp_external_tool",
+            "external-server/tool",
+            SinkCategory.EXTERNAL_MCP,
+            "ifc_label_blocked:external_mcp",
+        ),
+    ],
+)
+def test_audience_egress_and_mcp_remain_blocked_after_untrusted_active_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    target: str,
+    sink_category: SinkCategory | None,
+    expected_reason: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://audience.example/hook")
+    source = SourceLabel(
+        principal="external-source",
+        domain="tool",
+        resource_id="untrusted-result",
+        bridge_instance="web",
+        sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = _labels().with_source(source)
+
+    decision = SinkGate.check_sink_flow(
+        tool_name,
+        target,
+        labels,
+        _auth(roles=("admin",)),
+        enforce=True,
+        sink_category=sink_category,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == expected_reason
 
 
 def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
@@ -870,7 +928,7 @@ def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> Non
     ).reason == "egress_destination_not_approved"
 
 
-def test_approved_fetch_destination_does_not_trust_later_model_invocations(
+def test_approved_fetch_destination_remains_taint_independent(
     tmp_path: Path,
 ) -> None:
     from mimir.event_logger import _reset_logger_for_tests, init_logger
@@ -882,7 +940,7 @@ def test_approved_fetch_destination_does_not_trust_later_model_invocations(
     try:
         assert approve_live_declassification(
             auth, sink_category="network", destination=destination,
-            reason="approve this exact URL and one tainted invocation",
+            reason="approve this exact fetch URL for the session",
         ) == (True, "approved")
     finally:
         _reset_logger_for_tests()
@@ -894,8 +952,10 @@ def test_approved_fetch_destination_does_not_trust_later_model_invocations(
         "fetch_url", destination, labels, auth, enforce=True,
     )
 
-    assert first.reason == "ifc_declassification_approved"
-    assert later.reason == "ifc_label_blocked:network"
+    assert first.allowed is True
+    assert first.reason == "ifc_allowed"
+    assert later.allowed is True
+    assert later.reason == "ifc_allowed"
 
 
 def test_trigger_sink_must_be_exact_declared_capability() -> None:
