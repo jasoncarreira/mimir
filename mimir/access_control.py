@@ -769,6 +769,12 @@ def _configured_exact_urls(variable: str) -> frozenset[str]:
             return frozenset()
         items = parsed
     else:
+        if "," in configured:
+            log.warning(
+                "%s contains a comma but is not a JSON array; it will be treated "
+                "as one exact URL. Configure multiple URLs as a JSON array.",
+                variable,
+            )
         items = [configured]
 
     urls: set[str] = set()

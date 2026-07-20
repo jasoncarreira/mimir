@@ -651,6 +651,11 @@ def _check_pr_pushes(
                 if isinstance(compare, dict):
                     commits = compare.get("commits") or []
                     total_commits = compare.get("ahead_by") or len(commits)
+                head_commit = commits[-1] if commits else {}
+                push_author = (
+                    (head_commit.get("author") or {}).get("login")
+                    or (head_commit.get("committer") or {}).get("login")
+                )
                 if total_commits and commits:
                     subjects = [
                         (c.get("commit") or {}).get("message", "")
@@ -669,7 +674,7 @@ def _check_pr_pushes(
                     commit_block = "(commit details unavailable)"
                 prompt = (
                     f"PR #{number} updated on {repo}: {title} "
-                    f"(by @{pr_author or 'unknown'})\n"
+                    f"(by @{push_author or 'unknown'})\n"
                     f"{commit_block}\n"
                     f"Previous head: {prev_sha[:8]}, new head: "
                     f"{current_sha[:8]}\n{url}"
@@ -683,7 +688,7 @@ def _check_pr_pushes(
                     previous_head=prev_sha,
                     new_head=current_sha,
                     head_sha=current_sha,
-                    author=pr_author,
+                    author=push_author,
                 )
                 count += 1
                 new_heads[key] = current_sha

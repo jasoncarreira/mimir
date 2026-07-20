@@ -272,6 +272,42 @@ class TestApplyPendingMigrations:
             "SELECT version FROM schema_version"
         ).fetchall() == [(m.CURRENT_SCHEMA_VERSION,)]
 
+    def test_detected_v8_incomplete_world_ownership_fails_after_migrations(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        ownership = """
+            owner_principal TEXT, origin_channel TEXT, origin_domain TEXT,
+            visibility TEXT, provenance TEXT
+        """
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+            );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
+                tombstoned INTEGER DEFAULT 0, {ownership}
+            );
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE observations_metadata (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE triples (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE world_state (
+                id TEXT PRIMARY KEY, owner_principal TEXT,
+                origin_channel TEXT, visibility TEXT
+            );
+            """
+        )
+
+        assert m.detect_schema_version(conn) == 8
+        with pytest.raises(
+            RuntimeError,
+            match=r"world_state\.origin_domain.*world_state\.provenance",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+
     def test_add_column_migration_identifies_missing_table(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute(
@@ -654,6 +690,47 @@ class TestV7OwnershipMigration:
         assert "idx_triples_visibility" in indexes
         assert "idx_triples_owner" in indexes
 
+    def test_v6_without_observations_metadata_migrates_to_v7(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (id TEXT PRIMARY KEY);
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, channel_id TEXT);
+            CREATE TABLE triples (id TEXT PRIMARY KEY);
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (6, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        m.apply_pending_migrations(
+            conn,
+            fresh=False,
+            target_version=7,
+            migrations={7: m.MIGRATIONS[7]},
+        )
+
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(observations_metadata)")
+        }
+        assert {
+            "atom_id",
+            "evidence_count",
+            "trend",
+            "last_evidence_at",
+            "consolidated_at",
+            "consolidation_session",
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= columns
+
     def test_v7_preserves_existing_data(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript(
@@ -928,6 +1005,22 @@ class TestV7OwnershipMigration:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (subject, predicate, valid_from)
             );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE observations_metadata (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
             CREATE TABLE schema_version (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -980,7 +1073,47 @@ class TestV7OwnershipMigration:
             );
             CREATE UNIQUE INDEX idx_atoms_dedup
                 ON atoms(content_hash, agent_id) WHERE tombstoned = 0;
-            CREATE TABLE triples (id TEXT PRIMARY KEY);
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                channel_id TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                summary TEXT,
+                reflected_at TEXT,
+                topics_discussed TEXT NOT NULL DEFAULT '[]',
+                decisions_made TEXT NOT NULL DEFAULT '[]',
+                unfinished TEXT NOT NULL DEFAULT '[]',
+                emotional_state TEXT,
+                closed_since TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                embedding_dim INTEGER,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE observations_metadata (
+                atom_id TEXT PRIMARY KEY,
+                evidence_count INTEGER DEFAULT 0,
+                trend TEXT,
+                last_evidence_at TEXT,
+                consolidated_at TEXT NOT NULL,
+                consolidation_session TEXT,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE schema_version (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -998,6 +1131,10 @@ class TestV7OwnershipMigration:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(world_state)")
         }
+        observations_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(observations_metadata)")
+        }
         indexes = {
             row[0]
             for row in conn.execute(
@@ -1013,6 +1150,13 @@ class TestV7OwnershipMigration:
             "visibility",
             "provenance",
         } <= columns
+        assert {
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= observations_columns
         assert {
             "idx_world_current",
             "idx_world_subject",
