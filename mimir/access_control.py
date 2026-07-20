@@ -750,14 +750,29 @@ def _target_matches_operator_alert(target: str, destination: str) -> bool:
 
 
 def _target_matches_approved_url(target: str, destination: str) -> bool:
-    """Match one exact URL from an operator-fixed comma-separated set."""
+    """Match one exact URL from an operator-fixed URL or JSON list."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     return normalized is not None and normalized in _configured_exact_urls(destination)
 
 
 def _configured_exact_urls(variable: str) -> frozenset[str]:
+    """Read one exact URL or a JSON array of exact URLs from an environment variable."""
+    configured = os.environ.get(variable, "").strip()
+    if not configured:
+        return frozenset()
+    if configured.startswith("["):
+        try:
+            parsed = json.loads(configured)
+        except json.JSONDecodeError:
+            return frozenset()
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            return frozenset()
+        items = parsed
+    else:
+        items = [configured]
+
     urls: set[str] = set()
-    for item in os.environ.get(variable, "").split(","):
+    for item in items:
         normalized = normalize_sink_destination(SinkCategory.NETWORK, item.strip())
         if normalized is not None:
             urls.add(normalized)
