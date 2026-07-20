@@ -430,6 +430,26 @@ WHERE a.source_type = 'session_boundary'
         ALTER TABLE sessions ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
         -- ── observations_metadata ─────────────────────────────────
+        -- observations_metadata was initially greenfield-only. A legacy DB
+        -- that predates the table must get its complete base shape before the
+        -- ownership ALTERs run; the ADD COLUMN executor makes this idempotent
+        -- when the CREATE already supplied the ownership columns.
+        CREATE TABLE IF NOT EXISTS observations_metadata (
+            atom_id TEXT PRIMARY KEY,
+            evidence_count INTEGER DEFAULT 0,
+            trend TEXT,
+            last_evidence_at TEXT,
+            consolidated_at TEXT NOT NULL,
+            consolidation_session TEXT,
+            owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+            origin_channel TEXT,
+            origin_domain TEXT,
+            visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+                CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+            provenance TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY (atom_id) REFERENCES atoms(id) ON DELETE CASCADE
+        );
+
         ALTER TABLE observations_metadata ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE observations_metadata ADD COLUMN origin_channel TEXT;
         ALTER TABLE observations_metadata ADD COLUMN origin_domain TEXT;
