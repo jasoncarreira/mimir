@@ -514,6 +514,28 @@ async def test_web_search_bad_time_range(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "time_range must be one of" in out
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_url", ["", "   "])
+async def test_web_search_empty_config_connects_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_url: str,
+) -> None:
+    captured_url = None
+
+    def fake_post_json(**kwargs: Any) -> dict[str, Any]:
+        nonlocal captured_url
+        captured_url = kwargs["url"]
+        return {"json": {"results": []}, "status": 200}
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.setenv("TAVILY_SEARCH_URL", configured_url)
+    monkeypatch.setattr(web_tools_mod, "_post_json", fake_post_json)
+
+    await web_tools_mod.web_search.ainvoke({"query": "mimir"})
+
+    assert captured_url == "https://api.tavily.com/search"
+
+
 # ─── Registry conditional inclusion ────────────────────────────────
 
 

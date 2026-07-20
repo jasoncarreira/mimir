@@ -799,13 +799,14 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 
 
 _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
-_DEFAULT_WEB_SEARCH_URL = "https://api.tavily.com/search"
 
 
 def _fixed_web_search_url() -> str | None:
+    from .tools.web_search_destination import web_search_url
+
     return normalize_sink_destination(
         SinkCategory.NETWORK,
-        os.environ.get("TAVILY_SEARCH_URL", _DEFAULT_WEB_SEARCH_URL),
+        web_search_url(),
     )
 
 
@@ -977,16 +978,18 @@ class SinkGate:
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
             )
-        if tool_name == "web_search" and normalized_target != _fixed_web_search_url():
-            return ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
-                reason="egress_destination_not_approved",
-                required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
-                is_shadow_decision=not enforce,
-            )
+        if tool_name == "web_search":
+            fixed_web_search_url = _fixed_web_search_url()
+            if fixed_web_search_url is None or normalized_target != fixed_web_search_url:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="egress_destination_not_approved",
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                )
         if tool_name == "fetch_url" and (
             normalized_target is None
             or normalized_target not in approved_fetch_urls(auth_context)

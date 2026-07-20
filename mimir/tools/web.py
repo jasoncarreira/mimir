@@ -44,9 +44,10 @@ from urllib.request import (
 import yaml
 from langchain_core.tools import tool
 
+from .web_search_destination import web_search_url
+
 log = logging.getLogger(__name__)
 
-DEFAULT_TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 FETCH_CHUNK_SIZE_BYTES = 64 * 1024
 UTC = timezone.utc
 
@@ -343,7 +344,7 @@ async def web_search(
     if not api_key:
         return "web_search is disabled (TAVILY_API_KEY not set)."
 
-    search_url = os.environ.get("TAVILY_SEARCH_URL", "").strip() or DEFAULT_TAVILY_SEARCH_URL
+    search_url = web_search_url()
 
     payload: dict[str, Any] = {
         "query": normalized_query,

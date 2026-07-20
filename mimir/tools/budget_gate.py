@@ -59,6 +59,7 @@ from ..access_control import (
     parse_service_shell_argv,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
+from .web_search_destination import web_search_url
 
 log = logging.getLogger(__name__)
 
@@ -289,9 +290,7 @@ def _extract_sink_target(
     elif tool_name in {"fetch_url", "http_request", "webhook"}:
         target = args.get("url")
     elif tool_name == "web_search":
-        from .web import DEFAULT_TAVILY_SEARCH_URL
-
-        target = os.environ.get("TAVILY_SEARCH_URL", "").strip() or DEFAULT_TAVILY_SEARCH_URL
+        target = web_search_url()
     elif tool_name in {"add_schedule", "set_schedule_priority", "remove_schedule"}:
         name = str(args.get("name") or "").strip()
         target = f"scheduler:job:{name}" if name else "scheduler:jobs"
@@ -333,6 +332,20 @@ def _extract_sink_targets(
     args = (getattr(request, "tool_call", None) or {}).get("args") or {}
     artifact_root = args.get("artifact_root")
     return [target, str(artifact_root)] if artifact_root else [target]
+
+
+def _authorized_fetch_urls_for_tool(
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> frozenset[str] | None:
+    if tool_name == "fetch_url":
+        return approved_fetch_urls(auth_context)
+    if tool_name == "web_search":
+        from ..access_control import _fixed_web_search_url
+
+        fixed_url = _fixed_web_search_url()
+        return frozenset({fixed_url}) if fixed_url is not None else frozenset()
+    return None
 
 
 # Compatibility alias for callers that only exercise channel operations.
@@ -881,10 +894,11 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         capture_token = begin_protected_result_capture()
         fetch_token = None
-        if tool_name == "fetch_url":
+        authorized_fetch_urls = _authorized_fetch_urls_for_tool(tool_name, auth_context)
+        if authorized_fetch_urls is not None:
             from .web import begin_authorized_fetch
 
-            fetch_token = begin_authorized_fetch(approved_fetch_urls(auth_context))
+            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
             result = handler(execution_request)
         except Exception as exc:
@@ -1027,10 +1041,11 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         capture_token = begin_protected_result_capture()
         fetch_token = None
-        if tool_name == "fetch_url":
+        authorized_fetch_urls = _authorized_fetch_urls_for_tool(tool_name, auth_context)
+        if authorized_fetch_urls is not None:
             from .web import begin_authorized_fetch
 
-            fetch_token = begin_authorized_fetch(approved_fetch_urls(auth_context))
+            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
             result = await handler(execution_request)
         except Exception as exc:
