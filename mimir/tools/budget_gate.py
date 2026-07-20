@@ -828,21 +828,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name, request, auth_context, authorization,
         )
 
-        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
-        # subagents execute under this same context; detached spawn/async tools
-        # preserve it for their continuation metadata.
-        active_ctx = _get_current_turn_context()
-        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
-            from ..agent import _propagate_ifc_labels
-
-            propagated = _propagate_ifc_labels(
-                active_ctx.ifc_labels,
-                getattr(auth_context, "channel_id", None),
-                auth_context,
-                derived_by=tool_name,
-            )
-            _merge_result_labels(auth_context, propagated)
-
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -871,6 +856,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+
+        # Delegation inherits the current turn's monotonic IFC carrier only
+        # after every pre-execution gate admits the call.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            propagated = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
+                derived_by=tool_name,
+            )
+            _merge_result_labels(auth_context, propagated)
         started = time.monotonic()
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
@@ -975,21 +974,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name, request, auth_context, authorization,
         )
 
-        # Delegation inherits the current turn's monotonic IFC carrier. Built-in
-        # subagents execute under this same context; detached spawn/async tools
-        # preserve it for their continuation metadata.
-        active_ctx = _get_current_turn_context()
-        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
-            from ..agent import _propagate_ifc_labels
-
-            propagated = _propagate_ifc_labels(
-                active_ctx.ifc_labels,
-                getattr(auth_context, "channel_id", None),
-                auth_context,
-                derived_by=tool_name,
-            )
-            _merge_result_labels(auth_context, propagated)
-
         # Destructive-action guardrail (chainlink #259): an accident
         # deterrent against force-push-to-main/master, NOT a security
         # boundary — the regex screens the command arg and is bypassable
@@ -1018,6 +1002,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+
+        # Delegation inherits the current turn's monotonic IFC carrier only
+        # after every pre-execution gate admits the call.
+        active_ctx = _get_current_turn_context()
+        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+            from ..agent import _propagate_ifc_labels
+
+            propagated = _propagate_ifc_labels(
+                active_ctx.ifc_labels,
+                getattr(auth_context, "channel_id", None),
+                auth_context,
+                derived_by=tool_name,
+            )
+            _merge_result_labels(auth_context, propagated)
         started = time.monotonic()
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,

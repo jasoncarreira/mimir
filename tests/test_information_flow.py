@@ -250,6 +250,16 @@ def test_source_label_derived_propagates_least_trust_and_active_ingest():
         sensitivity="internal", authorized_principals=frozenset({"alice"}),
         integrity="untrusted", integrity_effect="active_ingest",
     )
+    trusted_active = SourceLabel(
+        principal="c", domain="channel", resource_id="c", bridge_instance="slack",
+        sensitivity="private", authorized_principals=frozenset({"alice"}),
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    untrusted_info = SourceLabel(
+        principal="d", domain="memory", resource_id="d", bridge_instance="saga",
+        sensitivity="private", authorized_principals=frozenset({"alice"}),
+        integrity="untrusted", integrity_effect="informational",
+    )
 
     trusted_derived = SourceLabel.derived(
         frozenset({trusted_info}), principal="service:test", domain="memory",
@@ -260,6 +270,11 @@ def test_source_label_derived_propagates_least_trust_and_active_ingest():
         domain="memory", resource_id="mixed", bridge_instance="saga",
         sensitivity="private",
     )
+    recalled_derived = SourceLabel.derived(
+        frozenset({trusted_active, untrusted_info}), principal="service:test",
+        domain="memory", resource_id="recalled", bridge_instance="saga",
+        sensitivity="private",
+    )
 
     # The trusted-only assertion makes this regression non-masked by the
     # SourceLabel fail-closed defaults if derived() drops the integrity fields.
@@ -268,6 +283,11 @@ def test_source_label_derived_propagates_least_trust_and_active_ingest():
     )
     assert (mixed_derived.integrity, mixed_derived.integrity_effect) == (
         "untrusted", "active_ingest",
+    )
+    # Informational recall lowers derived trust but must not manufacture the
+    # untrusted+active pair used by the integrity gate.
+    assert (recalled_derived.integrity, recalled_derived.integrity_effect) == (
+        "untrusted", "informational",
     )
 
 
@@ -356,6 +376,29 @@ def test_delegation_wires_service_derived_acl_intersection_into_carrier():
     assert derived[0].principal == "service:task"
     assert derived[0].authorized_principals == frozenset({"alice"})
     assert parent.sources <= propagated.sources
+
+
+def test_delegation_does_not_retaint_informational_recall() -> None:
+    ingress = SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    recall = SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:1",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), integrity="untrusted",
+        integrity_effect="informational",
+    )
+    parent = InformationFlowLabels().with_source(ingress).with_source(recall)
+
+    propagated = _propagate_ifc_labels(
+        parent, "slack-C1", _auth(), derived_by="task",
+    )
+
+    assert parent.has_untrusted_active_ingest is False
+    assert propagated.has_untrusted_active_ingest is False
 
 
 def test_service_derived_source_can_flow_when_destination_principal_is_in_intersection():
