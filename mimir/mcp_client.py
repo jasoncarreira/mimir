@@ -113,6 +113,9 @@ def _canonical_config_digest(config: MCPServerConfig) -> str:
         "command": config.command,
         "env": env_identity,
         "name": config.name,
+        # Bind approvals to the immutable server identity, not only its
+        # operator-facing name and otherwise-identical launch configuration.
+        "server_config_id": config.server_config_id,
         "transport_type": "stdio",
     }
     content = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
@@ -158,6 +161,8 @@ class MCPProvenance:
     adapter_version: str = ""
     approval_version: str = ""
     policy_version: str = ""
+    result_integrity: str = "untrusted"
+    argument_egress: str = "taint_gated"
     is_tombstoned: bool = False
 
     @classmethod
@@ -218,6 +223,8 @@ class MCPProvenance:
             adapter_version=self.adapter_version,
             approval_version=self.approval_version,
             policy_version=self.policy_version,
+            result_integrity="untrusted",
+            argument_egress="taint_gated",
             is_tombstoned=name_changed or config_changed or schema_changed,
         )
 
@@ -243,7 +250,7 @@ def _expand_env_refs(value: str) -> str:
 
 @dataclass(frozen=True)
 class MCPToolPolicy:
-    """Operator approval bound to immutable discovery provenance."""
+    """Operator approval and IFC grants bound to discovery provenance."""
 
     tool_name: str
     classification: str
@@ -253,6 +260,8 @@ class MCPToolPolicy:
     policy_version: str
     config_digest: str
     schema_digest: str
+    result_integrity: str = "untrusted"
+    argument_egress: str = "taint_gated"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MCPToolPolicy":
@@ -271,11 +280,35 @@ class MCPToolPolicy:
             policy_version=value("policy_version", "policyVersion"),
             config_digest=value("config_digest", "configDigest"),
             schema_digest=value("schema_digest", "schemaDigest"),
+            result_integrity=(
+                value("result_integrity", "resultIntegrity") or "untrusted"
+            ).lower(),
+            argument_egress=(
+                value("argument_egress", "argumentEgress") or "taint_gated"
+            ).lower(),
         )
-        if not all(vars(policy).values()):
+        required = (
+            policy.tool_name,
+            policy.classification,
+            policy.adapter_name,
+            policy.adapter_version,
+            policy.approval_version,
+            policy.policy_version,
+            policy.config_digest,
+            policy.schema_digest,
+        )
+        if not all(required):
             raise ValueError("MCP tool policy requires all provenance and version fields")
         if policy.classification not in {"open", "resource_scoped", "admin_required"}:
             raise ValueError(f"invalid MCP classification: {policy.classification}")
+        if policy.result_integrity not in {"trusted", "untrusted"}:
+            raise ValueError(
+                f"invalid MCP result_integrity: {policy.result_integrity}"
+            )
+        if policy.argument_egress not in {"allowed", "taint_gated"}:
+            raise ValueError(
+                f"invalid MCP argument_egress: {policy.argument_egress}"
+            )
         return policy
 
 
@@ -399,11 +432,16 @@ class MCPServerConfig:
             for item in raw_adapters
             if isinstance(item, dict)
         ) if isinstance(raw_adapters, list) else ()
-        tool_policies = tuple(
-            MCPToolPolicy.from_dict(item)
-            for item in raw_policies
-            if isinstance(item, dict)
-        ) if isinstance(raw_policies, list) else ()
+        tool_policies: list[MCPToolPolicy] = []
+        if isinstance(raw_policies, list):
+            for item in raw_policies:
+                if not isinstance(item, dict):
+                    log.warning("Ignoring invalid non-object MCP tool policy for %s", name)
+                    continue
+                try:
+                    tool_policies.append(MCPToolPolicy.from_dict(item))
+                except (TypeError, ValueError) as exc:
+                    log.warning("Ignoring invalid MCP tool policy for %s: %s", name, exc)
         return cls(
             name=name,
             command=command,
@@ -412,7 +450,7 @@ class MCPServerConfig:
             server_config_id=server_config_id,
             policy_version=policy_version,
             adapters=adapters,
-            tool_policies=tool_policies,
+            tool_policies=tuple(tool_policies),
             env_identity=env_identity,
         )
 
@@ -473,6 +511,12 @@ class MCPConnection:
                     adapter_version=policy.adapter_version,
                     approval_version=policy.approval_version,
                     policy_version=policy.policy_version,
+                    result_integrity=(
+                        policy.result_integrity if identity_matches else "untrusted"
+                    ),
+                    argument_egress=(
+                        policy.argument_egress if identity_matches else "taint_gated"
+                    ),
                     is_tombstoned=not identity_matches,
                 )
             lc_tool = _bridge_mcp_tool(
@@ -535,6 +579,8 @@ def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[
         "adapter_version": provenance.adapter_version,
         "approval_version": provenance.approval_version,
         "policy_version": provenance.policy_version,
+        "result_integrity": provenance.result_integrity,
+        "argument_egress": provenance.argument_egress,
         "is_tombstoned": provenance.is_tombstoned,
     }
 

@@ -868,6 +868,7 @@ class SinkGate:
         *,
         enforce: bool = False,
         sink_category: SinkCategory | None = None,
+        allow_untrusted_active_ingest: bool = False,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -944,6 +945,7 @@ class SinkGate:
         if (
             is_application_egress
             and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and not allow_untrusted_active_ingest
             and has_untrusted_active_ingest
         ):
             canonical_principal = getattr(auth_context, "canonical_principal", None)
@@ -1939,6 +1941,9 @@ class MCPResourceAdapter:
                                     context,
                                     enforce=enforce,
                                     sink_category=SinkCategory.EXTERNAL_MCP,
+                                    allow_untrusted_active_ingest=(
+                                        provenance.argument_egress == "allowed"
+                                    ),
                                 )
                             if sink_check is not None and not sink_check.allowed:
                                 return sink_check
@@ -1960,6 +1965,8 @@ class MCPResourceAdapter:
                                     protected_source_resources=result.source_resources,
                                     protected_sink_resources=result.sink_resources,
                                     flow_direction=flow_direction,
+                                    result_integrity=provenance.result_integrity,
+                                    argument_egress=provenance.argument_egress,
                                 )
                             reason = "admin_required"
                         elif isinstance(result, MCPAuthorizationResult) and not result.allowed:
@@ -1990,6 +1997,12 @@ class MCPResourceAdapter:
                 validated_result.sink_resources if validated_result is not None else None
             ),
             flow_direction=flow_direction,
+            result_integrity=(
+                provenance.result_integrity if validated_result is not None else "untrusted"
+            ),
+            argument_egress=(
+                provenance.argument_egress if validated_result is not None else "taint_gated"
+            ),
         )
 
     @staticmethod
@@ -2121,6 +2134,10 @@ class ToolAuthorization:
     protected_source_resources: tuple[str, ...] | None = None
     protected_sink_resources: tuple[str, ...] | None = None
     flow_direction: ToolFlowDirection = ToolFlowDirection.UNKNOWN
+    # Resolved once from immutable MCP provenance. Non-MCP and error paths use
+    # the fail-closed posture and never perform a mutable policy lookup.
+    result_integrity: str = "untrusted"
+    argument_egress: str = "taint_gated"
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -2613,6 +2630,11 @@ def classify_protected_result(
             return None
         principal = getattr(auth_context, "canonical_principal", None)
         labels = InformationFlowLabels()
+        integrity = (
+            "trusted"
+            if not failed and authorization.result_integrity == "trusted"
+            else "untrusted"
+        )
         for resource in resources or ("unknown",):
             labels = labels.with_source(SourceLabel(
                 principal=principal if resources is not None else None,
@@ -2624,7 +2646,7 @@ def classify_protected_result(
                     frozenset({principal}) if principal and resources is not None else frozenset()
                 ),
                 source_kind="mcp",
-                integrity="untrusted",
+                integrity=integrity,
                 integrity_effect="active_ingest",
             ))
         return labels
