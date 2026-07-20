@@ -2023,10 +2023,10 @@ textarea {
   grid-template-columns: auto 1fr;
   align-items: start;
   padding: var(--mimir-space-xs, 8px) var(--mimir-space-sm, 12px);
-  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-warning, #9a6700);
+  border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-status-warning, #7a5b1d);
   border-radius: var(--mimir-radius-control, 6px);
-  color: var(--mimir-color-text, #17221c) !important;
-  background: color-mix(in srgb, var(--mimir-color-warning, #9a6700) 10%, transparent);
+  color: var(--mimir-color-status-warning, #7a5b1d);
+  background: var(--mimir-color-status-warning-background, #fbf1d8);
 }
 
 @media (max-width: 900px) {
