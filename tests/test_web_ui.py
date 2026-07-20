@@ -74,7 +74,55 @@ def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
     assert manifests["usage"]["requires_role"] == "admin"
     assert manifests["saga"]["requires_role"] == "admin"
     assert manifests["state-memory"]["requires_role"] == "admin"
+    assert manifests["admin-mcp"]["requires_role"] == "admin"
     assert manifests["chat"]["requires_role"] is None
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Path):
+    from mimir.mcp_client import MCPPolicyStore
+
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    store.upsert_server({
+        "server_config_id": "server-1", "name": "docs", "command": "docs-mcp",
+        "args": [], "env": {}, "policy_version": "ui-v1",
+        "adapters": [{"name": "mimir-ui-server-1", "version": "1", "policy_version": "ui-v1", "direction": "neither"}],
+    })
+    store.save({"tool-1": {
+        "tool_id": "tool-1", "server_config_id": "server-1",
+        "original_tool_name": "search", "display_name": "mcp_docs_search",
+        "config_digest": "config-a", "schema_digest": "schema-a",
+        "classification": "", "policy_version": "", "result_integrity": "untrusted",
+        "argument_egress": "taint_gated", "is_tombstoned": False,
+    }})
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        listed = await client.get("/api/v1/admin/mcp/servers")
+        assert listed.status == 200
+        assert (await listed.json())["data"]["servers"][0]["tools"][0]["classification"] == ""
+
+        updated = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
+            "classification": "open", "result_integrity": "trusted",
+            "argument_egress": "allowed", "config_digest": "config-a",
+            "schema_digest": "schema-a",
+        })
+        assert updated.status == 200
+        assert (await updated.json())["data"]["restart_required"] is True
+
+        conflict = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
+            "classification": "open", "result_integrity": "trusted",
+            "argument_egress": "allowed", "config_digest": "stale",
+            "schema_digest": "schema-a",
+        })
+        assert conflict.status == 409
+
+        removed = await client.delete("/api/v1/admin/mcp/servers/server-1")
+        assert removed.status == 200
+        assert store.load()["tool-1"]["is_tombstoned"] is True
 
 
 def test_dashboard_extension_registry_sorts_hides_and_validates_scope():

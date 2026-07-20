@@ -544,6 +544,40 @@ export interface AdminConfigData {
   };
 }
 
+export type MCPAuthorizationTier = "open" | "resource_scoped" | "admin_required";
+export type MCPResultIntegrity = "trusted" | "untrusted";
+export type MCPArgumentEgress = "allowed" | "taint_gated";
+
+export interface MCPToolRecord {
+  tool_id: string;
+  server_config_id: string;
+  original_tool_name: string;
+  display_name: string;
+  config_digest: string;
+  schema_digest: string;
+  classification: MCPAuthorizationTier | "";
+  result_integrity: MCPResultIntegrity;
+  argument_egress: MCPArgumentEgress;
+  policy_version: string;
+  is_tombstoned: boolean;
+}
+
+export interface MCPServerRecord {
+  server_config_id: string;
+  name: string;
+  transport: "stdio";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  policy_version: string;
+  tools: MCPToolRecord[];
+}
+
+export interface AdminMCPData {
+  servers: MCPServerRecord[];
+  restart_required: boolean;
+}
+
 export interface SchedulerRunSurface {
   id: string;
   name: string;

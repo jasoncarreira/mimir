@@ -22,6 +22,7 @@ import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
 import { UsersRoute } from "./routes/UsersRoute";
+import { McpServersRoute } from "./routes/McpServersRoute";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { AdminConfigRoute } from "./routes/AdminConfigRoute";
@@ -605,6 +606,8 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
                       ? <AdminConfigRoute />
                       : surface.id === "admin-users"
                         ? <UsersRoute />
+                        : surface.id === "admin-mcp"
+                          ? <McpServersRoute />
                         : surface.id === "scheduler"
                           ? <SchedulerRoute />
                           : surface.id === "wiki"

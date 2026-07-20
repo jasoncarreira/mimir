@@ -236,6 +236,15 @@ def first_party_dashboard_extensions(
                 api_namespace="admin-users",
                 requires_role="admin",
             ),
+            DashboardExtensionManifest(
+                id="admin-mcp",
+                route_path="/admin/mcp",
+                label="MCP Servers",
+                icon="server",
+                nav_position=62,
+                api_namespace="admin-mcp",
+                requires_role="admin",
+            ),
         )
     )
     return DashboardExtensionRegistry(manifests)

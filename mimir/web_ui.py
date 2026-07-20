@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1705,6 +1706,189 @@ def register_routes(
             {"canonical": canonical, "revoked": revoked}, headers=_no_store_headers()
         )
 
+    # MCP mutations are deliberately confined to this admin namespace. They
+    # persist operator intent and require restart; live immutable wrappers are
+    # never widened by an HTTP request.
+    def _mcp_store():
+        from .mcp_client import MCPPolicyStore
+
+        if home is None:
+            raise RuntimeError("MCP management requires a configured home")
+        return MCPPolicyStore(home / "state" / "mcp-policy.json")
+
+    def _mcp_payload() -> dict[str, Any]:
+        store = _mcp_store()
+        tools = store.load()
+        servers = []
+        for server_id, record in store.load_server_records().items():
+            server_tools = [
+                dict(tool) for tool in tools.values()
+                if tool.get("server_config_id") == server_id
+            ]
+            env = {
+                str(key): (
+                    str(value)
+                    if "${" in str(value) or not any(
+                        marker in str(key).lower()
+                        for marker in ("token", "secret", "password", "key", "auth", "credential")
+                    )
+                    else "[REDACTED]"
+                )
+                for key, value in dict(record.get("env", {})).items()
+            }
+            servers.append({
+                "server_config_id": server_id,
+                "name": str(record.get("name", "")),
+                "transport": "stdio",
+                "command": str(record.get("command", "")),
+                "args": list(record.get("args", [])),
+                "env": env,
+                "policy_version": str(record.get("policy_version", "")),
+                "tools": sorted(server_tools, key=lambda item: str(item.get("original_tool_name", ""))),
+            })
+        return {"servers": sorted(servers, key=lambda item: item["name"]), "restart_required": True}
+
+    def _validated_mcp_server(body: Any, server_id: str | None = None) -> dict[str, Any]:
+        from .mcp_client import UI_MCP_POLICY_VERSION
+
+        if not isinstance(body, dict):
+            raise ValueError("json object required")
+        name = str(body.get("name", "")).strip()
+        command = str(body.get("command", "")).strip()
+        transport = str(body.get("transport", "stdio")).strip().lower()
+        if not name or not command:
+            raise ValueError("name and command required")
+        if transport != "stdio":
+            raise ValueError("only stdio transport is supported")
+        raw_args = body.get("args", [])
+        raw_env = body.get("env", {})
+        if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
+            raise ValueError("args must be an array of strings")
+        if not isinstance(raw_env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in raw_env.items()
+        ):
+            raise ValueError("env must be an object of string values")
+        config_id = server_id or str(uuid.uuid4())
+        return {
+            "server_config_id": config_id,
+            "name": name,
+            "transport": "stdio",
+            "command": command,
+            "args": raw_args,
+            "env": raw_env,
+            "policy_version": UI_MCP_POLICY_VERSION,
+            "adapters": [{
+                "name": f"mimir-ui-{config_id}",
+                "version": "1",
+                "policy_version": UI_MCP_POLICY_VERSION,
+                "direction": "neither",
+            }],
+        }
+
+    async def _discover_mcp_server(record: dict[str, Any]) -> None:
+        from .mcp_client import MCPManager, MCPServerConfig, get_tool_provenance, _provenance_record
+
+        store = _mcp_store()
+        manager = MCPManager()
+        try:
+            tools = await manager.start_servers([MCPServerConfig.from_dict(record)])
+        finally:
+            await manager.shutdown()
+        records = store.load()
+        server_id = record["server_config_id"]
+        for existing in records.values():
+            if existing.get("server_config_id") == server_id:
+                existing.update({
+                    "classification": "",
+                    "result_integrity": "untrusted",
+                    "argument_egress": "taint_gated",
+                    "is_tombstoned": True,
+                })
+        for tool in tools:
+            provenance = get_tool_provenance(tool)
+            if provenance is not None:
+                discovered = _provenance_record(tool, provenance)
+                discovered.update({
+                    "classification": "admin_required",
+                    "adapter_name": f"mimir-ui-{server_id}",
+                    "adapter_version": "1",
+                    "approval_version": str(uuid.uuid4()),
+                    "policy_version": str(record["policy_version"]),
+                    "result_integrity": "untrusted",
+                    "argument_egress": "taint_gated",
+                    "is_tombstoned": False,
+                })
+                records[provenance.tool_id] = discovered
+        store.save(records)
+
+    async def admin_mcp_list_v1(_request: web.Request) -> web.Response:
+        try:
+            payload = await asyncio.to_thread(_mcp_payload)
+        except (RuntimeError, ValueError) as exc:
+            return json_error("mcp_store_unavailable", str(exc), status=503)
+        return json_success(payload, headers=_no_store_headers())
+
+    async def admin_mcp_upsert_v1(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            path_id = request.match_info.get("server_id", "").strip() or None
+            record = _validated_mcp_server(body, path_id)
+            store = _mcp_store()
+            existing_servers = store.load_server_records()
+            if path_id and path_id not in existing_servers:
+                return json_error("not_found", "MCP server not found", status=404)
+            if path_id:
+                prior_env = dict(existing_servers[path_id].get("env", {}))
+                record["env"] = {
+                    key: prior_env.get(key, value) if value == "[REDACTED]" else value
+                    for key, value in record["env"].items()
+                }
+            store.upsert_server(record)
+            await _discover_mcp_server(record)
+            payload = _mcp_payload()
+        except json.JSONDecodeError:
+            return json_error("bad_request", "invalid json", status=400)
+        except ValueError as exc:
+            return json_error("bad_request", str(exc), status=400)
+        except RuntimeError as exc:
+            return json_error("mcp_store_unavailable", str(exc), status=503)
+        return json_success(payload, headers=_no_store_headers())
+
+    async def admin_mcp_remove_v1(request: web.Request) -> web.Response:
+        server_id = request.match_info.get("server_id", "").strip()
+        try:
+            removed = await asyncio.to_thread(_mcp_store().remove_server, server_id)
+        except (RuntimeError, ValueError) as exc:
+            return json_error("mcp_store_unavailable", str(exc), status=503)
+        if not removed:
+            return json_error("not_found", "MCP server not found", status=404)
+        return json_success({"removed": True, "restart_required": True}, headers=_no_store_headers())
+
+    async def admin_mcp_policy_v1(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("json object required")
+            record = await asyncio.to_thread(
+                _mcp_store().update_tool_policy,
+                request.match_info.get("tool_id", ""),
+                classification=str(body.get("classification", "")),
+                result_integrity=str(body.get("result_integrity", "")),
+                argument_egress=str(body.get("argument_egress", "")),
+                expected_config_digest=str(body.get("config_digest", "")),
+                expected_schema_digest=str(body.get("schema_digest", "")),
+            )
+        except json.JSONDecodeError:
+            return json_error("bad_request", "invalid json", status=400)
+        except ValueError as exc:
+            return json_error("bad_request", str(exc), status=400)
+        except KeyError:
+            return json_error("not_found", "current MCP tool not found", status=404)
+        except RuntimeError as exc:
+            return json_error("provenance_conflict", str(exc), status=409)
+        return json_success({"tool": record, "restart_required": True}, headers=_no_store_headers())
+
     # ── /saga — saga DB viewer ───────────────────────────────────────
 
     # Resolve the DB path: use the explicit ``saga_db`` kwarg when
@@ -2019,6 +2203,15 @@ def register_routes(
             DashboardBackendRoute("POST", "/api/v1/admin/users/revoke", admin_users_revoke_key_v1),
         ]
 
+    def admin_mcp_backend_routes() -> list[DashboardBackendRoute]:
+        return [
+            DashboardBackendRoute("GET", "/api/v1/admin/mcp/servers", admin_mcp_list_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/mcp/servers", admin_mcp_upsert_v1),
+            DashboardBackendRoute("PUT", "/api/v1/admin/mcp/servers/{server_id}", admin_mcp_upsert_v1),
+            DashboardBackendRoute("DELETE", "/api/v1/admin/mcp/servers/{server_id}", admin_mcp_remove_v1),
+            DashboardBackendRoute("PUT", "/api/v1/admin/mcp/tools/{tool_id}/policy", admin_mcp_policy_v1),
+        ]
+
     add_backend_namespace_routes(
         app,
         registry=_dashboard_extensions,
@@ -2029,6 +2222,7 @@ def register_routes(
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
             "admin-users": admin_users_backend_routes,
+            "admin-mcp": admin_mcp_backend_routes,
         },
         existing=existing,
     )
