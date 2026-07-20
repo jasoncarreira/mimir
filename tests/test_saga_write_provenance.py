@@ -12,7 +12,7 @@ from langchain.tools import ToolRuntime
 from mimir.access_control import CapabilityTier, build_trigger_service_principal, create_auth_context
 from mimir.identities import IdentityResolver
 from mimir.models import (
-    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, Integrity,
     SessionACL, SourceLabel,
 )
 from mimir.saga.client import SagaStore
@@ -211,6 +211,27 @@ async def test_memory_store_ignores_untrusted_informational_recall_for_integrity
     assert "stored" in out
     assert labels.has_untrusted_active_ingest is False
     assert write_store.atom_calls[-1]["integrity"] == "trusted"
+
+
+@pytest.mark.asyncio
+async def test_memory_store_empty_labels_stamp_untrusted(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels()
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    out = await memory_store.coroutine(
+        content="missing provenance", stream="semantic",
+        runtime=_runtime(context, "empty-label-store"),
+    )
+
+    assert "stored" in out
+    assert write_store.atom_calls[-1]["integrity"] == Integrity.UNTRUSTED
 
 
 @pytest.mark.asyncio

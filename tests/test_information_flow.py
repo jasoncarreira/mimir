@@ -199,6 +199,30 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
     assert decision.reason == "ifc_allowed"
 
 
+@pytest.mark.parametrize(
+    ("trigger", "service_principal"),
+    [("scheduled_tick", "scheduler"), ("saga_session_end", "synthesis")],
+)
+def test_service_ingress_marker_prevents_trusted_integrity(
+    trigger: str,
+    service_principal: str,
+) -> None:
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:http",
+        service_principal=service_principal,
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
+    )
+
+    labels = _initialize_ifc_labels(event)
+    ingress = next(
+        source for source in labels.sources
+        if source.resource_id == event.channel_id
+    )
+
+    assert ingress.integrity == "untrusted"
+
+
 def test_unstamped_authorless_synthetic_event_still_fails_closed():
     event = AgentEvent(
         trigger="poller",
@@ -1209,6 +1233,28 @@ def test_metadata_only_result_does_not_taint_inline_result(tool_name: str) -> No
     assert classify_protected_result(
         tool_name, {}, _auth(), authorization, result="server metadata",
     ) is None
+
+
+@pytest.mark.parametrize("tool_name", ["svc__fetch_url", "svc__bash_async"])
+def test_namespaced_suffix_cannot_suppress_undomained_result_taint(
+    tool_name: str,
+) -> None:
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    labels = classify_protected_result(
+        tool_name, {}, _auth(), authorization, result="model-visible content",
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.domain == "unknown"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
 
 
 def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() -> None:
