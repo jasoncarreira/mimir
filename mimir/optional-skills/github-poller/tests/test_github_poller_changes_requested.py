@@ -186,6 +186,28 @@ def test_commits_after_review_are_not_stale(monkeypatch, captured_emits):
     assert captured_emits == []
 
 
+def test_offset_commit_date_is_compared_as_an_instant(
+    monkeypatch, captured_emits,
+):
+    """13:00 +02:00 predates 12:00 UTC despite sorting after it."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(644, "offset-head")],
+        reviews_by_pr={644: [
+            _review("jasoncarreira", "CHANGES_REQUESTED", "2026-06-11T12:00:00Z"),
+        ]},
+        commit_dates={"offset-head": "2026-06-11T13:00:00+02:00"},
+    )
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW,
+    )
+
+    assert count == 1
+    assert cursor == {"644": _entry("offset-head")}
+    assert len(captured_emits) == 1
+
+
 def test_content_free_rebase_keeps_cadence_across_head_movement(
     monkeypatch, captured_emits,
 ):
