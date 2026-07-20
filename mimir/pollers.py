@@ -1063,10 +1063,20 @@ def discover_pollers(
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            name = str(entry.get("name", "")).strip()
-            command = str(entry.get("command", "")).strip()
-            cron = str(entry.get("cron", "")).strip()
-            deliver = str(entry.get("deliver", "")).strip() or None  # chainlink #508
+            name_raw = entry.get("name")
+            command_raw = entry.get("command")
+            cron_raw = entry.get("cron")
+            deliver_raw = entry.get("deliver")
+            name = (name_raw.strip() or None) if isinstance(name_raw, str) else None
+            command = (
+                (command_raw.strip() or None)
+                if isinstance(command_raw, str) else None
+            )
+            cron = (cron_raw.strip() or None) if isinstance(cron_raw, str) else None
+            deliver = (
+                (deliver_raw.strip() or None)
+                if isinstance(deliver_raw, str) else None
+            )  # chainlink #508
             if not name or not command or not cron:
                 log.warning(
                     "poller_missing_fields: %s — entry %r",
