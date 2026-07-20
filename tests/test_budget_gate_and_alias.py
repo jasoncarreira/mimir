@@ -390,6 +390,128 @@ async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("argument_egress", "expected_allowed"),
+    [("allowed", True), ("taint_gated", False)],
+)
+async def test_mcp_argument_posture_controls_queries_after_active_ingest(
+    argument_egress: str, expected_allowed: bool,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.access_control import OperationDecision
+    from mimir.mcp_client import (
+        MCPAuthorizationResult,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_mcp_adapter,
+    )
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "argument_egress": {"type": "string"},
+        },
+        "required": ["query"],
+    }
+    config = MCPServerConfig(name="search", command="x", args=[])
+    provenance = replace(
+        MCPProvenance.create(config, "query", schema),
+        classification="open",
+        adapter_name="search-policy",
+        adapter_version="adapter-v1",
+        approval_version="approval-v1",
+        policy_version="policy-v1",
+        result_integrity="untrusted",
+        argument_egress=argument_egress,
+    )
+    tool = _bridge_mcp_tool(
+        server_name="search",
+        tool_name="query",
+        description="",
+        input_schema=schema,
+        session=object(),
+        provenance=provenance,
+    )
+    context = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress="bridge",
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    untrusted = SourceLabel(
+        principal="alice",
+        domain="tool",
+        resource_id="untrusted-page",
+        bridge_instance="web",
+        sensitivity="internal",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    tainted = InformationFlowLabels().with_source(untrusted)
+    context.ifc_state.merge(tainted)
+    turn = _make_ctx()
+    turn.auth_context = context
+    turn.ifc_labels = tainted
+    calls = 0
+
+    def classify(request):  # type: ignore[no-untyped-def]
+        assert request.arguments["query"] == "model-composed arbitrary query"
+        return MCPAuthorizationResult(
+            decision=OperationDecision.OPEN,
+            allowed=True,
+            sink_resources=("configured-search-service",),
+        )
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="results", tool_call_id=request.tool_call["id"])
+
+    request = ToolCallRequest(
+        tool_call={
+            "name": tool.name,
+            "args": {
+                "query": "model-composed arbitrary query",
+                # Model arguments cannot select the policy posture.
+                "argument_egress": "allowed",
+            },
+            "id": "query",
+            "type": "tool_call",
+        },
+        tool=tool,
+        state=None,
+        runtime=Runtime(context=context),
+    )
+
+    clear_mcp_adapter_registry()
+    register_mcp_adapter(
+        "search-policy", "adapter-v1", "policy-v1", classify,
+        flow_direction="sink",
+    )
+    token = set_current_turn(turn)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+        clear_mcp_adapter_registry()
+
+    assert (result.status != "error") is expected_allowed
+    assert calls == int(expected_allowed)
+    if not expected_allowed:
+        assert "ifc_label_blocked:external_mcp" in str(result.content)
+
+
+@pytest.mark.asyncio
 async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
     from dataclasses import replace
 

@@ -176,6 +176,11 @@ Two **independent** inputs decide what a turn may do:
      **egress authorization only** (which exact URLs may be fetched); the fetched
      **content stays untrusted** (§5.4). Approving an exact URL is not vouching for
      its bytes.
+   - **An operator-configured MCP tool** → use that exact tool policy's explicit
+     `result_integrity` grant. `trusted` vouches for successful returned content;
+     `untrusted` retains untrusted active ingest. Server locality, transport,
+     display name, operation labels such as “read-only,” model arguments, and MCP
+     response fields are not trust signals.
    - Everything else ingested from outside → **untrusted**.
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
@@ -381,10 +386,9 @@ some request field looks like a payload:
 - **Audience-bearing egress stays behind the turn-taint gate.** `webhook` and
   `http_request` can send a free-form model body to an approved URL that may be
   a human or multi-party audience, so exact destination approval is necessary
-  but not sufficient. External MCP (`mcp_*`) stays fail-closed as both a sink
-  and an untrusted result source until each server/tool has an explicit trust
-  posture. Child-process egress remains governed by the code/process boundary,
-  not by destination-safe application egress.
+  but not sufficient. External MCP (`mcp_*`) uses the explicit per-tool posture
+  described below. Child-process egress remains governed by the code/process
+  boundary, not by destination-safe application egress.
 
 Precise per-argument provenance is not achievable through an LLM: the model
 reads trusted and untrusted content together and emits new strings. For the
@@ -393,6 +397,55 @@ state: a model-composed body/args is allowed only before any untrusted
 active-ingest source, otherwise blocked or one-use declassified. This does not
 apply to `fetch_url` or `web_search`; their destination controls are the
 security boundary.
+
+#### Operator-owned MCP trust posture
+
+Configuring an MCP server authorizes Mimir to connect to that server. It does
+not implicitly widen every tool the server advertises. Each `tool_policies`
+entry has two independent IFC grants:
+
+- `result_integrity: trusted | untrusted` controls successful result ingestion.
+  `trusted` enters IFC as trusted content; `untrusted` enters as untrusted
+  `active_ingest`.
+- `argument_egress: allowed | taint_gated` controls model-composed arguments to
+  that exact tool. `allowed` keeps the tool callable after untrusted active
+  ingest, including operator-approved search/read query channels.
+  `taint_gated` preserves the external-MCP sink gate.
+
+For example:
+
+```json
+{
+  "name": "catalog",
+  "command": "catalog-mcp",
+  "server_config_id": "catalog-production",
+  "policy_version": "policy-v3",
+  "tool_policies": [{
+    "tool_name": "search",
+    "classification": "open",
+    "adapter_name": "catalog-policy",
+    "adapter_version": "adapter-v2",
+    "approval_version": "approval-v7",
+    "policy_version": "policy-v3",
+    "config_digest": "<digest of this immutable server configuration>",
+    "schema_digest": "<digest of the approved search input schema>",
+    "result_integrity": "untrusted",
+    "argument_egress": "allowed"
+  }]
+}
+```
+
+These values are operator grants and may deliberately trade isolation for
+capability. They are resolved during discovery and carried through the
+server-authored authorization decision; result classification and sink
+enforcement do not look them up again by mutable/display name. Widening remains
+bound to the immutable `server_config_id` and derived tool identity, canonical
+config digest, input-schema digest, and policy version. A new, renamed,
+undeclared, schema/config-drifted, tombstoned, or invalid tool cannot inherit a
+grant from another tool. Omitted posture fields use the bootstrap defaults
+`result_integrity=untrusted` and `argument_egress=taint_gated`; an invalid tool
+policy entry is ignored without disabling valid sibling entries on the same
+configured server.
 
 The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
 

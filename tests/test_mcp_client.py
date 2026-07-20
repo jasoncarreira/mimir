@@ -123,6 +123,43 @@ class TestMCPServerConfigFromDict:
         # And we log so the operator sees it instead of failing silently.
         assert any("MISSING" in r.message for r in caplog.records)
 
+    def test_invalid_tool_posture_does_not_drop_valid_sibling(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        common = {
+            "classification": "open",
+            "adapter_name": "adapter",
+            "adapter_version": "v1",
+            "approval_version": "approval-v1",
+            "policy_version": "policy-v1",
+            "config_digest": "config-digest",
+            "schema_digest": "schema-digest",
+        }
+        with caplog.at_level("WARNING"):
+            cfg = MCPServerConfig.from_dict({
+                "name": "search",
+                "command": "x",
+                "tool_policies": [
+                    {
+                        **common,
+                        "tool_name": "bad",
+                        "result_integrity": "from-response",
+                        "argument_egress": "allowed",
+                    },
+                    {
+                        **common,
+                        "tool_name": "good",
+                        "result_integrity": "trusted",
+                        "argument_egress": "allowed",
+                    },
+                ],
+            })
+
+        assert [policy.tool_name for policy in cfg.tool_policies] == ["good"]
+        assert cfg.tool_policies[0].result_integrity == "trusted"
+        assert cfg.tool_policies[0].argument_egress == "allowed"
+        assert "invalid MCP result_integrity" in caplog.text
+
 
 # ─── parse_mcp_server_configs ──────────────────────────────────────
 
@@ -1362,7 +1399,12 @@ class TestProductionMCPPolicyWiring:
     """Durable policy is applied by the same manager path production uses."""
 
     @staticmethod
-    def _config(*, schema: dict | None = None) -> MCPServerConfig:
+    def _config(
+        *,
+        schema: dict | None = None,
+        result_integrity: str = "untrusted",
+        argument_egress: str = "taint_gated",
+    ) -> MCPServerConfig:
         from mimir.mcp_client import _canonical_config_digest, _schema_digest
 
         schema = schema or {
@@ -1373,7 +1415,10 @@ class TestProductionMCPPolicyWiring:
             },
             "required": ["owner", "repository"],
         }
-        base = MCPServerConfig(name="github", command="x", args=[])
+        base = MCPServerConfig(
+            name="github", command="x", args=[],
+            server_config_id="github-production",
+        )
         return MCPServerConfig.from_dict({
             "name": "github",
             "command": "x",
@@ -1396,6 +1441,8 @@ class TestProductionMCPPolicyWiring:
                 "policy_version": "policy-v1",
                 "config_digest": _canonical_config_digest(base),
                 "schema_digest": _schema_digest(schema),
+                "result_integrity": result_integrity,
+                "argument_egress": argument_egress,
             }],
         })
 
@@ -1445,6 +1492,8 @@ class TestProductionMCPPolicyWiring:
         assert first_provenance.server_config_id == "github-production"
         assert second_provenance.server_config_id == first_provenance.server_config_id
         assert first_provenance.classification == "resource_scoped"
+        assert first_provenance.result_integrity == "untrusted"
+        assert first_provenance.argument_egress == "taint_gated"
         assert first_provenance.is_tombstoned is False
         assert getattr(first[0], "mcp_provenance") is first_provenance
 
@@ -1482,7 +1531,95 @@ class TestProductionMCPPolicyWiring:
         ).discover_tools()
         provenance = get_tool_provenance(tools[0])
         assert provenance is not None and provenance.is_tombstoned
+        assert provenance.result_integrity == "untrusted"
+        assert provenance.argument_egress == "taint_gated"
         assert validate_mcp_policy(tools)[0]["reason"] == "drift"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result_integrity", "argument_egress"),
+        [
+            ("trusted", "allowed"),
+            ("trusted", "taint_gated"),
+            ("untrusted", "allowed"),
+            ("untrusted", "taint_gated"),
+        ],
+    )
+    async def test_discovery_preserves_all_posture_combinations(
+        self, result_integrity: str, argument_egress: str,
+    ) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import MCPConnection, get_tool_provenance
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        tools = await MCPConnection(
+            self._config(
+                schema=schema,
+                result_integrity=result_integrity,
+                argument_egress=argument_egress,
+            ),
+            Session(),
+            AsyncExitStack(),
+        ).discover_tools()
+        provenance = get_tool_provenance(tools[0])
+
+        assert provenance is not None
+        assert provenance.is_tombstoned is False
+        assert provenance.result_integrity == result_integrity
+        assert provenance.argument_egress == argument_egress
+
+    @pytest.mark.asyncio
+    async def test_config_drift_cannot_reuse_widening_posture(self) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.mcp_client import MCPConnection, get_tool_provenance
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repository": {"type": "string"},
+            },
+            "required": ["owner", "repository"],
+        }
+        config = self._config(
+            schema=schema,
+            result_integrity="trusted",
+            argument_egress="allowed",
+        )
+        config.command = "drifted-command"
+
+        class Tool:
+            name = "get_repository"
+            description = ""
+            inputSchema = schema
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                return type("Result", (), {"tools": [Tool()]})()
+
+        tools = await MCPConnection(config, Session(), AsyncExitStack()).discover_tools()
+        provenance = get_tool_provenance(tools[0])
+
+        assert provenance is not None and provenance.is_tombstoned
+        assert provenance.result_integrity == "untrusted"
+        assert provenance.argument_egress == "taint_gated"
 
     @pytest.mark.parametrize(
         ("arguments", "allowed", "reason"),

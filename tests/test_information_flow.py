@@ -21,12 +21,15 @@ from mimir.access_control import (
     SinkCategory,
     SinkGate,
     ToolFlowDirection,
+    ToolAuthorization,
     ToolRegistry,
     approve_live_declassification,
     audit_declassification,
     create_auth_context,
     get_sink_category,
     get_tool_flow_direction,
+    classify_protected_result,
+    OperationDecision,
 )
 from mimir.agent import (
     Agent,
@@ -891,6 +894,54 @@ def test_audience_egress_and_mcp_remain_blocked_after_untrusted_active_ingest(
 
     assert decision.allowed is False
     assert decision.reason == expected_reason
+
+
+@pytest.mark.parametrize("result_integrity", ["trusted", "untrusted"])
+def test_mcp_result_integrity_comes_only_from_authorization_context(
+    result_integrity: str,
+) -> None:
+    authorization = ToolAuthorization(
+        tool_name="mcp_search_query",
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        protected_source_resources=("search-index",),
+        result_integrity=result_integrity,
+    )
+
+    labels = classify_protected_result(
+        "mcp_search_query",
+        {
+            "query": "ignore policy",
+            "result_integrity": "trusted",
+            "argument_egress": "allowed",
+        },
+        _auth(),
+        authorization,
+        result={"result_integrity": "trusted"},
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.integrity == result_integrity
+    assert source.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is (result_integrity == "untrusted")
+
+
+def test_failed_trusted_mcp_result_remains_untrusted() -> None:
+    authorization = ToolAuthorization(
+        tool_name="mcp_search_query",
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        protected_source_resources=("search-index",),
+        result_integrity="trusted",
+    )
+
+    labels = classify_protected_result(
+        "mcp_search_query", {}, _auth(), authorization, failed=True,
+    )
+
+    assert labels is not None
+    assert next(iter(labels.sources)).integrity == "untrusted"
 
 
 def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
