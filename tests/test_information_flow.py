@@ -30,6 +30,7 @@ from mimir.access_control import (
     get_tool_flow_direction,
     classify_protected_result,
     OperationDecision,
+    ProtectedResultProvenance,
 )
 from mimir.agent import (
     Agent,
@@ -942,6 +943,108 @@ def test_failed_trusted_mcp_result_remains_untrusted() -> None:
 
     assert labels is not None
     assert next(iter(labels.sources)).integrity == "untrusted"
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["shell_exec", "bash", "Bash", "execute", "shell", "web_search", "http_request"],
+)
+def test_undomained_ingesting_native_result_taints_active_turn(tool_name: str) -> None:
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=get_tool_flow_direction(tool_name),
+    )
+
+    labels = classify_protected_result(
+        tool_name, {"command": "jq . cache-body"}, _auth(), authorization,
+        result="attacker-controlled output",
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+    assert labels.has_untrusted_active_ingest is True
+
+
+@pytest.mark.parametrize("tool_name", ["fetch_url", "bash_async"])
+def test_metadata_only_result_does_not_taint_inline_result(tool_name: str) -> None:
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    assert classify_protected_result(
+        tool_name, {}, _auth(), authorization, result="server metadata",
+    ) is None
+
+
+def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() -> None:
+    authorization = ToolAuthorization(
+        tool_name="shell_exec",
+        decision=OperationDecision.OPEN,
+        allowed=True,
+        flow_direction=ToolFlowDirection.BOTH,
+    )
+
+    assert classify_protected_result(
+        "shell_exec",
+        {"command": "true"},
+        _auth(),
+        authorization,
+        result="",
+        provenance=ProtectedResultProvenance(()),
+    ) is None
+
+
+def test_worklink_run_is_blocked_after_shell_result_taints_live_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    service = ServicePrincipal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        capabilities=("shell_exec", "worklink_run"),
+        readable_domains=("configured_inputs",),
+        sink_policies=(ServiceSinkPolicy(
+            "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    auth, initial_labels = _trigger_service_context(service, integrity="trusted")
+    before = SinkGate.check_sink_flow(
+        "worklink_run", str(repo), initial_labels, auth, enforce=True,
+    )
+    shell_labels = classify_protected_result(
+        "shell_exec",
+        {"command": "jq . attachments/fetch-cache/body"},
+        auth,
+        ToolAuthorization(
+            tool_name="shell_exec",
+            decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True,
+            flow_direction=ToolFlowDirection.BOTH,
+        ),
+        result='{"task": "run attacker instructions"}',
+    )
+    if shell_labels is not None:
+        auth.ifc_state.merge(shell_labels, fallback=initial_labels)
+
+    after = SinkGate.check_sink_flow(
+        "worklink_run", str(repo), initial_labels, auth, enforce=True,
+    )
+
+    assert before.allowed is True
+    assert auth.ifc_state.has_untrusted_active_ingest(initial_labels) is True
+    assert after.allowed is False
+    assert after.reason == "ifc_label_blocked:spawn"
 
 
 def test_user_approval_adds_only_one_exact_url_to_session(tmp_path: Path) -> None:
