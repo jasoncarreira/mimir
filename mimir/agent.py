@@ -406,6 +406,7 @@ def _initialize_ifc_labels(
         registered_service is not None
         and event.service_principal == registered_service.canonical
         and event.trigger in ("scheduled_tick", "saga_session_end")
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
     ) or (
         event.trigger == "user_message"
         and bool(event.author)
