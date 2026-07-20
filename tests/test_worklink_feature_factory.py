@@ -980,7 +980,7 @@ def _drive(
         _install_scripted_reader(monkeypatch, scripted)
 
     registry = BackendRegistry(
-        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute", base_fetch=False))
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
     )
     # poll_interval_s=0 lets the poll loop interleave with the fake's writer.
     registry.register(FeatureFactoryBackend(bin="feature-factory", poll_interval_s=poll_interval_s))

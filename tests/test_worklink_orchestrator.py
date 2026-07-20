@@ -585,7 +585,7 @@ def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "release/2.0"
 
 
-def test_worklink_base_fetch_can_be_disabled_by_config(tmp_path: Path) -> None:
+def test_worklink_disabled_base_fetch_fails_before_backend_dispatch(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo / ".worklink" / "441-1"
     (tmp_path / "worklink.yaml").write_text("defaults:\n  base_fetch: false\n")
@@ -600,22 +600,16 @@ def test_worklink_base_fetch_can_be_disabled_by_config(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == "completed"
+    assert result.status == "failed"
+    assert result.reason == "base repo fetch is disabled; refusing to build on an unverified base"
+    assert backend.orders == []
     assert not any(
         isinstance(c, list) and c[:4] == ["git", "-C", str(repo), "fetch"] for c in calls
     )
-    assert [
-        "git",
-        "-C",
-        str(repo),
-        "worktree",
-        "add",
-        "--no-track",
-        "-b",
-        "issue/441-a1",
-        str(worktree),
-        "main",
-    ] in calls
+    assert not any(
+        isinstance(c, list) and c[:5] == ["git", "-C", str(repo), "worktree", "add"]
+        for c in calls
+    )
 
 
 
