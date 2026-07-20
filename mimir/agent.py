@@ -148,6 +148,10 @@ NON_USER_QUERY_TRIGGERS: frozenset[str] = frozenset(
     {"saga_session_end", "scheduled_tick", "poller", "upgrade"}
 )
 
+NON_OPERATOR_USER_MESSAGE_SOURCES: frozenset[str] = frozenset(
+    {"", "web", "api", "stdin", "http"}
+)
+
 # Autonomous-work triggers — cron-fired and poller-fired turns that
 # don't anchor a back-and-forth conversation. After one of these turns
 # completes, force-end the saga session immediately instead of letting
@@ -372,6 +376,9 @@ def _initialize_ifc_labels(
             canonical_principal = resolver.resolve(event.author)
         canonical_resource = resolver.resolve_channel(event.channel_id)
     extra = event.extra if isinstance(event.extra, dict) else {}
+    normalized_source = (
+        event.source.strip().lower() if isinstance(event.source, str) else ""
+    )
     visibility = extra.get("channel_visibility")
     domain = (
         continuation_auth.domain
@@ -402,7 +409,8 @@ def _initialize_ifc_labels(
     ) or (
         event.trigger == "user_message"
         and bool(event.author)
-        and event.source not in ("api", "http")
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+        and normalized_source not in NON_OPERATOR_USER_MESSAGE_SOURCES
     ):
         integrity = Integrity.TRUSTED
     elif event.trigger == "poller" and event.ifc_labels is not None:
