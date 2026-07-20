@@ -154,7 +154,7 @@ class InformationFlowLabels:
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
     sources: frozenset[SourceLabel] = frozenset()
-    created_at: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.monotonic, compare=False)
 
     def with_label(self, label: str) -> "InformationFlowLabels":
         """Return new instance with added label (monotonic - only adds)."""

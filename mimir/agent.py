@@ -413,7 +413,13 @@ def _initialize_ifc_labels(
         and normalized_source not in NON_OPERATOR_USER_MESSAGE_SOURCES
     ):
         integrity = Integrity.TRUSTED
-    elif event.trigger == "poller" and event.ifc_labels is not None:
+    elif (
+        event.trigger == "poller"
+        and event.ifc_labels is not None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and HTTP_EVENT_INGRESS_EXTRA_KEY not in extra
+    ):
         # Poller content is classified by the framework before enqueue. The
         # service stamp makes this carrier server-owned; public HTTP ingress
         # cannot provide either the stamp or ifc_labels.

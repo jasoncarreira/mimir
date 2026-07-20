@@ -214,6 +214,57 @@ def test_unstamped_authorless_synthetic_event_still_fails_closed():
     assert decision.allowed is False
 
 
+@pytest.mark.parametrize(
+    ("service_principal", "extra", "expected_integrity"),
+    [
+        ("poller:trusted", {}, "trusted"),
+        (None, {}, "untrusted"),
+        (
+            "poller:trusted",
+            {HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
+            "untrusted",
+        ),
+    ],
+)
+def test_poller_trust_requires_service_stamp_and_non_http_ingress(
+    service_principal: str | None,
+    extra: dict[str, str],
+    expected_integrity: str,
+) -> None:
+    service = ServicePrincipal(
+        canonical="poller:trusted",
+        trigger="poller",
+        capabilities=(),
+        readable_domains=("poller_payload",),
+    )
+    classified = InformationFlowLabels().with_source(SourceLabel(
+        principal="service:poller:trusted",
+        domain="poller_payload",
+        resource_id="classified-payload",
+        bridge_instance="poller",
+        sensitivity="internal",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    ))
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:trusted",
+        source="poller",
+        service_principal=service_principal,
+        service_authority=service,
+        ifc_labels=classified,
+        extra=extra,
+    )
+
+    labels = _initialize_ifc_labels(event)
+    ingress = next(
+        source for source in labels.sources
+        if source.resource_id == event.channel_id
+    )
+
+    assert ingress.integrity == expected_integrity
+
+
 def test_mixed_principal_sources_fail_closed_without_declassification():
     labels = _merge_ifc_labels(_labels(), _labels(principal="user-2"))
     decision = SinkGate.check_sink_flow(
@@ -866,7 +917,7 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     second_destination = "https://approved.example/other?check=2"
     monkeypatch.setenv(
         "MIMIR_HEARTBEAT_APPROVED_URLS",
-        f"{destination},{second_destination}",
+        json.dumps([destination, second_destination]),
     )
     service = ServicePrincipal(
         canonical="heartbeat",
@@ -893,6 +944,21 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     assert first.allowed is True
     assert second.allowed is True
     assert other_path.reason == "egress_destination_not_approved"
+
+
+def test_configured_exact_url_preserves_literal_comma_without_approving_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    destination = "https://approved.example/fixed?values=1,2"
+    truncated = "https://approved.example/fixed?values=1"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", destination)
+
+    approved = access_control._configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS")
+
+    assert destination in approved
+    assert truncated not in approved
 
 
 def test_web_search_is_allowed_after_untrusted_active_ingest(
@@ -1929,6 +1995,24 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path)
             sink_category="file",
             destination=destination,
             reason="source snapshot must remain exact",
+        ) == (True, "approved")
+        auth.ifc_state.merge(
+            InformationFlowLabels(
+                labels=labels.labels,
+                source_channels=labels.source_channels,
+                sources=labels.sources,
+            ),
+            fallback=labels,
+        )
+        assert SinkGate.check_sink_flow(
+            "write_file", destination, labels, auth, enforce=True,
+        ).reason == "ifc_declassification_approved"
+
+        assert approve_live_declassification(
+            auth,
+            sink_category="file",
+            destination=destination,
+            reason="new taint must invalidate approval",
         ) == (True, "approved")
     finally:
         _reset_logger_for_tests()
