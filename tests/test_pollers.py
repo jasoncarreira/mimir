@@ -120,6 +120,26 @@ def test_discover_parses_valid_pollers_json(tmp_path: Path):
     assert p.channel_id() == "poller:github-activity"
 
 
+def test_discover_treats_null_string_fields_as_missing(tmp_path: Path):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "null-fields", [
+        {
+            "name": "no-delivery",
+            "command": "echo",
+            "cron": "* * * * *",
+            "deliver": None,
+        },
+        {"name": None, "command": "echo", "cron": "* * * * *"},
+        {"name": "null-command", "command": None, "cron": "* * * * *"},
+        {"name": "null-cron", "command": "echo", "cron": None},
+    ])
+
+    pollers = discover_pollers(skills)
+
+    assert [poller.name for poller in pollers] == ["no-delivery"]
+    assert pollers[0].deliver is None
+
+
 def _authority(**updates: object) -> dict:
     value = {
         "profile": "research",

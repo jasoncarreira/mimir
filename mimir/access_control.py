@@ -2518,6 +2518,25 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
 # content remains behind a separately classified read boundary.
 _METADATA_ONLY_RESULT_TOOLS = frozenset({"bash_async", "fetch_url"})
 
+# Independent semantic inventory for tools whose results come from a read
+# backend. Startup rejects drift toward SINK/NEITHER before it can suppress
+# result taint. MCP reads have equivalent adapter/resource parity checks in
+# MCPResourceAdapter.authorize_call.
+_READ_BACKEND_RESULT_TOOLS = frozenset({
+    "Read",
+    "Glob",
+    "Grep",
+    "read_file",
+    "aread",
+    "ls",
+    "als",
+    "glob",
+    "aglob",
+    "grep",
+    "agrep",
+    "fetch_url",
+})
+
 
 @dataclass(frozen=True)
 class ProtectedResultProvenance:
@@ -2700,18 +2719,10 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS or any(
-            tool_name.endswith(f"__{candidate}")
-            for candidate in _METADATA_ONLY_RESULT_TOOLS
-        )
+        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS
         flow_direction = authorization.flow_direction
         if flow_direction is ToolFlowDirection.UNKNOWN:
             flow_direction = get_tool_flow_direction(tool_name)
-            if flow_direction is ToolFlowDirection.UNKNOWN:
-                for candidate, candidate_direction in _TOOL_FLOW_MAP.items():
-                    if tool_name.endswith(f"__{candidate}"):
-                        flow_direction = candidate_direction
-                        break
         if metadata_only or flow_direction not in {
             ToolFlowDirection.SOURCE,
             ToolFlowDirection.BOTH,
@@ -3183,6 +3194,12 @@ def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> N
             or tool_name not in _OPERATION_SINK_DESTINATION
         )
     })
+    misclassified_read_backends = sorted({
+        tool_name for tool_name in tool_names & _READ_BACKEND_RESULT_TOOLS
+        if get_tool_flow_direction(tool_name) not in {
+            ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
+        }
+    })
     errors: list[str] = []
     if unknown_tools:
         errors.append("UNKNOWN model-bound tools: " + ", ".join(unknown_tools))
@@ -3190,6 +3207,11 @@ def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> N
         errors.append("model-bound tools without explicit IFC flow metadata: " + ", ".join(unknown_flows))
     if incomplete_sinks:
         errors.append("model-bound IFC sinks without category/destination extraction: " + ", ".join(incomplete_sinks))
+    if misclassified_read_backends:
+        errors.append(
+            "read-backend tools must be IFC SOURCE/BOTH: "
+            + ", ".join(misclassified_read_backends)
+        )
     if errors:
         raise CapabilityMatrixError(
             "Access-control enforcement blocked by incomplete model tool inventory: "

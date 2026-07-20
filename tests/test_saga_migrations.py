@@ -998,6 +998,7 @@ class TestV7OwnershipMigration:
             target_version=8,
             migrations={8: m.MIGRATIONS[8]},
         )
+        m._execute_migration_script(conn, m.MIGRATIONS[8])
 
         row = conn.execute(
             "SELECT subject, predicate, value, owner_principal, visibility, provenance "
@@ -1013,6 +1014,63 @@ class TestV7OwnershipMigration:
                 "VALUES ('Bob', 'status', 'active', '2024-01-01', "
                 "'2024-01-01', 'unexpected')"
             )
+
+    def test_v7_without_world_state_migrates_to_current(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                agent_id TEXT DEFAULT 'default',
+                tombstoned INTEGER DEFAULT 0,
+                owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+                origin_channel TEXT,
+                origin_domain TEXT,
+                visibility TEXT NOT NULL DEFAULT 'legacy_admin',
+                provenance TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX idx_atoms_dedup
+                ON atoms(content_hash, agent_id) WHERE tombstoned = 0;
+            CREATE TABLE triples (id TEXT PRIMARY KEY);
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version VALUES
+                (7, '2000-01-01T00:00:00+00:00');
+            """
+        )
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        versions = {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(world_state)")
+        }
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND tbl_name = 'world_state'"
+            )
+        }
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 10
+        assert {
+            "owner_principal",
+            "origin_channel",
+            "origin_domain",
+            "visibility",
+            "provenance",
+        } <= columns
+        assert {
+            "idx_world_current",
+            "idx_world_subject",
+            "idx_world_visibility",
+            "idx_world_owner",
+        } <= indexes
 
 
 def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:

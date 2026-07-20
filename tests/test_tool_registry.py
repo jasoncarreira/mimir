@@ -804,6 +804,24 @@ def test_enforcement_enablement_rejects_cataloged_tool_without_flow_metadata(
         )
 
 
+def test_enforcement_enablement_rejects_read_backend_flow_misclassification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setitem(
+        access_control._TOOL_FLOW_MAP,
+        "read_file",
+        access_control.ToolFlowDirection.SINK,
+    )
+
+    with pytest.raises(
+        access_control.CapabilityMatrixError,
+        match="read-backend tools must be IFC SOURCE/BOTH: read_file",
+    ):
+        access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
+
+
 @pytest.mark.parametrize(
     ("tool_name", "args", "expected"),
     [

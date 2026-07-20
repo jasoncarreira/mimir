@@ -826,6 +826,17 @@ def _head_commit_date(repo: str, sha: str, token: str) -> str:
     return str(committer.get("date") or "")
 
 
+def _parse_utc_datetime(value: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp and normalize its instant to UTC."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _compare_data(
     repo: str,
     base_sha: str,
@@ -1038,7 +1049,13 @@ def _check_own_changes_requested(
             blocking.values(), key=lambda item: item[0],
         )
         head_date = _head_commit_date(repo, head_sha, token)
-        if head_date and head_date >= newest_block_ts:
+        head_datetime = _parse_utc_datetime(head_date)
+        review_datetime = _parse_utc_datetime(newest_block_ts)
+        if (
+            head_datetime is not None
+            and review_datetime is not None
+            and head_datetime >= review_datetime
+        ):
             changed = _head_changes_pr_diff_since_review(
                 repo, newest_block_sha, head_sha, base_sha, token,
             )

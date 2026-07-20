@@ -461,6 +461,27 @@ WHERE a.source_type = 'session_boundary'
         -- Add owner_principal, origin_channel, origin_domain, visibility,
         -- provenance to world_state for ACL inheritance from source triples.
 
+        -- world_state was initially greenfield-only, so DBs created before it
+        -- landed need the complete table before the ownership ALTERs run.
+        CREATE TABLE IF NOT EXISTS world_state (
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            value TEXT NOT NULL,
+            valid_from TEXT,
+            valid_until TEXT,
+            is_current INTEGER DEFAULT 1,
+            source_triple_id TEXT,
+            updated_at TEXT NOT NULL,
+            owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',
+            origin_channel TEXT,
+            origin_domain TEXT,
+            visibility TEXT NOT NULL DEFAULT 'legacy_admin'
+                CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin')),
+            provenance TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (subject, predicate, valid_from),
+            FOREIGN KEY (source_triple_id) REFERENCES triples(id)
+        );
+
         ALTER TABLE world_state ADD COLUMN owner_principal TEXT NOT NULL DEFAULT 'legacy_admin';
         ALTER TABLE world_state ADD COLUMN origin_channel TEXT;
         ALTER TABLE world_state ADD COLUMN origin_domain TEXT;
@@ -468,6 +489,9 @@ WHERE a.source_type = 'session_boundary'
             CHECK(visibility IN ('public', 'private', 'service', 'legacy_admin'));
         ALTER TABLE world_state ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';
 
+        CREATE INDEX IF NOT EXISTS idx_world_current
+            ON world_state(subject, predicate) WHERE is_current = 1;
+        CREATE INDEX IF NOT EXISTS idx_world_subject ON world_state(subject);
         CREATE INDEX IF NOT EXISTS idx_world_visibility ON world_state(visibility);
         CREATE INDEX IF NOT EXISTS idx_world_owner ON world_state(owner_principal);
     """,
