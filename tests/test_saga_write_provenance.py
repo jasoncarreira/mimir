@@ -12,7 +12,8 @@ from langchain.tools import ToolRuntime
 from mimir.access_control import CapabilityTier, build_trigger_service_principal, create_auth_context
 from mimir.identities import IdentityResolver
 from mimir.models import (
-    AgentEvent, AuthContext, InformationFlowLabels, SessionACL, SourceLabel,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
+    SessionACL, SourceLabel,
 )
 from mimir.saga.client import SagaStore
 from mimir.tools import saga_ops
@@ -178,6 +179,38 @@ async def test_synthesis_memory_store_preserves_service_provenance(
     assert call["owner_principal"] == "service:synthesis"
     assert call["origin_channel"] == f"{trigger}:owned"
     assert call["visibility"] == "service"
+
+
+@pytest.mark.asyncio
+async def test_memory_store_ignores_untrusted_informational_recall_for_integrity(
+    tmp_path: Path, write_store: _WriteStore,
+) -> None:
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="channel", resource_id="discord-private",
+        bridge_instance="discord", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )).with_source(SourceLabel(
+        principal="memory", domain="saga", resource_id="atom:recall",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), integrity="untrusted",
+        integrity_effect="informational",
+    ))
+    context = replace(
+        context,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    out = await memory_store.coroutine(
+        content="trusted operator fact", stream="semantic",
+        runtime=_runtime(context, "trusted-recall-store"),
+    )
+
+    assert "stored" in out
+    assert labels.has_untrusted_active_ingest is False
+    assert write_store.atom_calls[-1]["integrity"] == "trusted"
 
 
 @pytest.mark.asyncio

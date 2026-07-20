@@ -113,13 +113,13 @@ class SourceLabel:
             else Integrity.UNTRUSTED
         )
         integrity_effect = (
-            IntegrityEffect.INFORMATIONAL
-            if inputs
-            and all(
-                source.integrity_effect == IntegrityEffect.INFORMATIONAL
+            IntegrityEffect.ACTIVE_INGEST
+            if any(
+                source.integrity == Integrity.UNTRUSTED
+                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
                 for source in inputs
             )
-            else IntegrityEffect.ACTIVE_INGEST
+            else IntegrityEffect.INFORMATIONAL
         )
         return cls(
             principal=principal,

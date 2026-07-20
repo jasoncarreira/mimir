@@ -963,6 +963,74 @@ async def test_middleware_awrap_refuses_at_cap():
     assert len(handler_calls) == 2  # Third never ran.
 
 
+@pytest.mark.asyncio
+async def test_budget_denied_delegation_does_not_merge_propagated_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    ctx.tool_call_budget = 1
+    ctx.tool_call_count = 1
+    tainted = auth.ifc_labels.with_source(SourceLabel(
+        principal="service:task", domain="service", resource_id="task",
+        bridge_instance="task", sensitivity="private", integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    monkeypatch.setattr(
+        "mimir.agent._propagate_ifc_labels", lambda *args, **kwargs: tainted,
+    )
+
+    async def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _make_request("task", "denied-task", auth), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert "Tool-call budget exhausted" in str(result.content)
+    assert auth.ifc_state.current(auth.ifc_labels) == auth.ifc_labels
+    assert ctx.ifc_labels == auth.ifc_labels
+
+
+def test_prohibited_delegation_does_not_merge_propagated_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ifc_auth()
+    ctx = _ifc_turn(auth)
+    tainted = auth.ifc_labels.with_source(SourceLabel(
+        principal="service:bash_async", domain="service", resource_id="bash_async",
+        bridge_instance="bash_async", sensitivity="private", integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    monkeypatch.setattr(
+        "mimir.agent._propagate_ifc_labels", lambda *args, **kwargs: tainted,
+    )
+
+    def handler(req: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="should not run", tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = BudgetGateMiddleware().wrap_tool_call(
+            _make_request(
+                "bash_async", "prohibited-bash", auth,
+                {"command": "git push --force origin main"},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert auth.ifc_state.current(auth.ifc_labels) == auth.ifc_labels
+    assert ctx.ifc_labels == auth.ifc_labels
+
+
 def test_middleware_sync_wrap_passes_through_under_budget():
     """Symmetric to the async pass-through case — verifies the sync
     ``wrap_tool_call`` delegates to the handler when below the cap."""
