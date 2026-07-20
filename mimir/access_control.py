@@ -2490,6 +2490,10 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "commitment_list": "commitments",
 }
 
+# These BOTH tools return only server-created metadata inline. Their external
+# content remains behind a separately classified read boundary.
+_METADATA_ONLY_RESULT_TOOLS = frozenset({"bash_async", "fetch_url"})
+
 
 @dataclass(frozen=True)
 class ProtectedResultProvenance:
@@ -2651,6 +2655,10 @@ def classify_protected_result(
             ))
         return labels
 
+    artifact = getattr(result, "artifact", None)
+    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
+        provenance = artifact
+
     domain = _PROTECTED_RESULT_DOMAINS.get(tool_name)
     if domain is None:
         # Native aliases may be namespaced by a tool server. Do not apply this
@@ -2660,14 +2668,39 @@ def classify_protected_result(
                 domain = candidate_domain
                 break
     if domain is None:
-        return None
+        if provenance is not None:
+            if not provenance.sources:
+                return None
+            labels = InformationFlowLabels()
+            for source in provenance.sources:
+                labels = labels.with_source(source)
+            return labels
+
+        metadata_only = tool_name in _METADATA_ONLY_RESULT_TOOLS or any(
+            tool_name.endswith(f"__{candidate}")
+            for candidate in _METADATA_ONLY_RESULT_TOOLS
+        )
+        flow_direction = authorization.flow_direction
+        if flow_direction is ToolFlowDirection.UNKNOWN:
+            flow_direction = get_tool_flow_direction(tool_name)
+            if flow_direction is ToolFlowDirection.UNKNOWN:
+                for candidate, candidate_direction in _TOOL_FLOW_MAP.items():
+                    if tool_name.endswith(f"__{candidate}"):
+                        flow_direction = candidate_direction
+                        break
+        if metadata_only or flow_direction not in {
+            ToolFlowDirection.SOURCE,
+            ToolFlowDirection.BOTH,
+        }:
+            return None
+        # An ingesting native tool without a confidentiality domain still
+        # introduces model-visible content. Unknown provenance must taint the
+        # turn rather than silently laundering integrity through the tool.
+        domain = "unknown"
 
     if failed:
         return _incomplete_protected_result(domain, args)
 
-    artifact = getattr(result, "artifact", None)
-    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
-        provenance = artifact
     if provenance is not None:
         if not provenance.sources:
             return None
