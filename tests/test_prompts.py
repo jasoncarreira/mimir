@@ -33,6 +33,35 @@ def test_system_prompt_omits_operator_alert_channel_when_empty():
     assert "Operator alert channel" not in sp
 
 
+# ---- Enforcement-aware ergonomics (chainlink #951) -----------------------
+
+
+def test_system_prompt_omits_enforcement_guidance_in_shadow_mode():
+    sp = build_system_prompt(access_control_enforced=False)
+
+    assert "## Access-control enforcement" not in sp
+    assert "Trust/taint model:" not in sp
+
+
+def test_system_prompt_renders_accurate_enforcement_guidance():
+    sp = build_system_prompt(access_control_enforced=True)
+
+    assert "## Access-control enforcement" in sp
+    assert "ergonomic guidance, not a security boundary" in sp
+    assert "both untrusted and actively ingested this turn" in sp
+    assert "auto-recall is informational and never gates" in sp
+    assert "``fetch_url`` and ``web_search`` are destination-safe and taint-independent" in sp
+    assert "regardless of turn taint" in sp
+    assert "``webhook``, ``http_request``, and external MCP arguments are turn-taint gated" in sp
+    assert "External MCP posture is per tool" in sp
+    assert "``worklink_run``" in sp
+    assert "Generic ``spawn_*`` is blocked" in sp
+    assert "one-use declassification" in sp
+    assert "do not blindly retry the same call" in sp
+    assert "fill `web_search`" not in sp
+    assert "trusted egress before" not in sp
+
+
 # ---- Agent home ---------------------------------------------------------
 
 
@@ -130,7 +159,10 @@ def test_config_reads_operator_alert_channel_from_env(monkeypatch: pytest.Monkey
     assert cfg.operator_alert_channel == "dm-discord-99"
 
 
-def test_config_operator_alert_channel_default_empty(monkeypatch: pytest.MonkeyPatch):
+def test_config_operator_alert_channel_default_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
     cfg = Config.from_env()
     assert cfg.operator_alert_channel == ""
@@ -560,6 +592,31 @@ def test_turn_prompt_auto_skill_block_renders_labeled_section():
     prompt = build_turn_prompt(event, auto_skill_block=("social-cli", skill_body))
     assert "## Skill: social-cli" in prompt
     assert "outbox + dispatch loop" in prompt
+
+
+def test_turn_prompt_renders_exact_autonomous_trigger_authority():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="tick",
+    )
+    prompt = build_turn_prompt(
+        event,
+        trigger_authority_profile="heartbeat",
+        trigger_capability_tier="unbounded",
+        trigger_capabilities=("worklink_run", "fetch_url", "read_file"),
+    )
+
+    assert "## Autonomous trigger authority" in prompt
+    assert "profile: ``heartbeat``" in prompt
+    assert "``fetch_url`` may reach only this profile's approved exact-URL list" in prompt
+    assert "remains usable regardless of turn taint" in prompt
+    assert "fetched responses are untrusted active ingest" in prompt
+    assert "``web_search`` is not available to this trigger" in prompt
+    assert "``worklink_run`` is usable only before any untrusted active ingest" in prompt
 
 
 def test_turn_prompt_auto_skill_block_no_frontmatter(tmp_path):

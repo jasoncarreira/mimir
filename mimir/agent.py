@@ -80,8 +80,13 @@ from .models import (
     TurnInteractivity,
     TurnRecord,
 )
-from .access_control import SinkGate, create_auth_context, get_event_service_principal
-from .prompts import build_system_prompt, build_turn_prompt
+from .access_control import (
+    SinkGate,
+    create_auth_context,
+    get_event_service_principal,
+    get_trusted_service_from_auth_context,
+)
+from .prompts import ENFORCEMENT_GUIDANCE, build_system_prompt, build_turn_prompt
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
@@ -3496,9 +3501,12 @@ class Agent:
                 skill_block=None,
                 home_dir=str(self._config.home),
                 writable_dirs=self._config.writable_dirs,
+                access_control_enforced=self._config.access_control_enforced,
             )
         except Exception:
             log.exception("_build_system_prompt failed; using minimal default")
+            if self._config.access_control_enforced:
+                return f"{_DEFAULT_SYSTEM_PROMPT}\n\n{ENFORCEMENT_GUIDANCE}"
             return _DEFAULT_SYSTEM_PROMPT
 
     # NOTE: _assemble_skill_block was removed in the skills-middleware
@@ -4175,6 +4183,12 @@ class Agent:
             (event.extra or {}).get("deliver"),
             getattr(self._config, "operator_alert_channel", ""),
         )
+        trigger_authority = (
+            get_trusted_service_from_auth_context(auth_context)
+            if self._config.access_control_enforced
+            and event.trigger in {"scheduled_tick", "poller"}
+            else None
+        )
         turn_prompt = build_turn_prompt(
             event,
             recent_messages=recent,
@@ -4193,6 +4207,17 @@ class Agent:
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
             deliver_channel=deliver_channel,
+            trigger_authority_profile=(
+                trigger_authority.authority_profile if trigger_authority else None
+            ),
+            trigger_capability_tier=(
+                trigger_authority.capability_tier.value
+                if trigger_authority and trigger_authority.capability_tier
+                else None
+            ),
+            trigger_capabilities=(
+                trigger_authority.capabilities if trigger_authority else None
+            ),
         )
         ctx.ifc_labels = _merge_ifc_labels(
             ctx.ifc_labels, *(block.labels for block in source_blocks),

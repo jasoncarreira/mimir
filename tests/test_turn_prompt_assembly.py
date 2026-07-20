@@ -118,6 +118,107 @@ def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
     }
 
 
+def test_agent_system_prompt_guidance_tracks_enforcement_flag(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+
+    agent._config.access_control_enforced = False
+    assert "## Access-control enforcement" not in agent._build_system_prompt()
+
+    agent._config.access_control_enforced = True
+    prompt = agent._build_system_prompt()
+    assert "## Access-control enforcement" in prompt
+    assert "the gate enforces these rules regardless of model compliance" in prompt
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import builtin_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="tick",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+    )
+
+    agent._config.access_control_enforced = True
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, None, initial_auth_context=auth,
+    )
+    assert "## Autonomous trigger authority" in prompt
+    assert "profile: ``heartbeat``" in prompt
+    assert "``fetch_url`` may reach only this profile's approved exact-URL list" in prompt
+
+    agent._config.access_control_enforced = False
+    shadow_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, None, initial_auth_context=auth,
+    )
+    assert "## Autonomous trigger authority" not in shadow_prompt
+
+
+@pytest.mark.asyncio
+async def test_poller_authority_guidance_matches_granted_capabilities(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    agent = _make_agent(tmp_path)
+    agent._config.access_control_enforced = True
+    authority = build_trigger_service_principal(
+        canonical="github-poller",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("read_file", "worklink_run"),
+        creation_path="test",
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github",
+        content="new issue",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = AuthContext(
+        principal=authority.canonical,
+        canonical_principal=authority.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+    )
+
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, None, None, initial_auth_context=auth,
+    )
+
+    assert "profile: ``github``; tier ``code-execution``" in prompt
+    assert "Available capabilities: ``read_file``, ``worklink_run``" in prompt
+    assert "``fetch_url`` is not available to this trigger" in prompt
+    assert "``web_search`` is not available to this trigger" in prompt
+
+
 # ─── User-message branch ────────────────────────────────────────────
 
 
