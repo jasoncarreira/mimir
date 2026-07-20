@@ -78,6 +78,23 @@ def test_global_dashboard_extensions_are_admin_only_in_nav_payload():
     assert manifests["chat"]["requires_role"] is None
 
 
+def test_admin_subsurfaces_are_nav_hidden_but_still_registered():
+    # admin-users / admin-mcp render as sub-tabs of the consolidated "Admin"
+    # surface, so they are hidden from the top nav — but they keep their own
+    # api_namespace and stay enabled(), so add_backend_namespace_routes still
+    # registers their backend routes.
+    manifests = {
+        item["id"]: item
+        for item in first_party_dashboard_extensions().navigation_payload()
+    }
+    assert manifests["admin-config"]["nav_hidden"] is False
+    assert manifests["admin-users"]["nav_hidden"] is True
+    assert manifests["admin-mcp"]["nav_hidden"] is True
+    # nav_hidden does NOT drop them from enabled() (route registration source).
+    enabled_ids = {m.id for m in first_party_dashboard_extensions().enabled()}
+    assert {"admin-config", "admin-users", "admin-mcp"} <= enabled_ids
+
+
 @pytest.mark.asyncio
 async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Path):
     from mimir.mcp_client import MCPPolicyStore

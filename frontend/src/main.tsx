@@ -21,11 +21,9 @@ import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
-import { UsersRoute } from "./routes/UsersRoute";
-import { McpServersRoute } from "./routes/McpServersRoute";
+import { AdminRoute } from "./routes/AdminRoute";
 import { LiveEventsProvider, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
-import { AdminConfigRoute } from "./routes/AdminConfigRoute";
 import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
@@ -603,11 +601,7 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
                     : surface.id === "turns"
                     ? <TurnsRoute />
                     : surface.id === "admin-config"
-                      ? <AdminConfigRoute />
-                      : surface.id === "admin-users"
-                        ? <UsersRoute />
-                        : surface.id === "admin-mcp"
-                          ? <McpServersRoute />
+                      ? <AdminRoute />
                         : surface.id === "scheduler"
                           ? <SchedulerRoute />
                           : surface.id === "wiki"

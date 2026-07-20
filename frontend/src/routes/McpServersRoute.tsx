@@ -15,13 +15,25 @@ import type {
   MCPServerRecord,
   MCPToolRecord
 } from "../api/generated/contracts";
-import { Badge, Button, DashboardHeader, EmptyState, ErrorState, LoadingState, Panel, TextInput } from "../ui";
+import {
+  Badge,
+  Button,
+  DataTable,
+  Dialog,
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  Panel,
+  TextInput
+} from "../ui";
 
 const CLOSED_POLICY = {
   classification: "admin_required" as MCPAuthorizationTier,
   result_integrity: "untrusted" as MCPResultIntegrity,
   argument_egress: "taint_gated" as MCPArgumentEgress
 };
+
+type ToolPolicy = typeof CLOSED_POLICY;
 
 function parseEnv(value: string): Record<string, string> {
   return Object.fromEntries(value.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
@@ -34,9 +46,9 @@ function parseEnv(value: string): Record<string, string> {
 function ToolPolicyEditor({ tool, busy, onSave }: {
   tool: MCPToolRecord;
   busy: boolean;
-  onSave: (tool: MCPToolRecord, policy: typeof CLOSED_POLICY) => void;
+  onSave: (tool: MCPToolRecord, policy: ToolPolicy) => void;
 }) {
-  const [policy, setPolicy] = React.useState<typeof CLOSED_POLICY>({
+  const [policy, setPolicy] = React.useState<ToolPolicy>({
     classification: tool.classification || CLOSED_POLICY.classification,
     result_integrity: tool.result_integrity,
     argument_egress: tool.argument_egress
@@ -83,57 +95,157 @@ function ToolPolicyEditor({ tool, busy, onSave }: {
   );
 }
 
-export function McpServersRoute() {
+// Add / edit form as a modal. For an existing server the discovered tools and
+// their per-tool policy editors are shown below the config fields.
+function ServerFormDialog({ server, busy, error, onSubmit, onSavePolicy, onClose }: {
+  server: MCPServerRecord | null;
+  busy: boolean;
+  error: string | null;
+  onSubmit: (input: MCPServerInput) => void;
+  onSavePolicy: (tool: MCPToolRecord, policy: ToolPolicy) => void;
+  onClose: () => void;
+}) {
+  const editing = server !== null;
+  const [name, setName] = React.useState(server?.name ?? "");
+  const [command, setCommand] = React.useState(server?.command ?? "");
+  const [args, setArgs] = React.useState(server ? server.args.join("\n") : "");
+  const [env, setEnv] = React.useState(
+    server ? Object.entries(server.env).map(([key, value]) => `${key}=${value}`).join("\n") : ""
+  );
+  const [localError, setLocalError] = React.useState<string | null>(null);
+
+  return (
+    <Dialog open title={editing ? `Edit ${server!.name}` : "Add MCP server"} onClose={onClose}>
+      <form
+        className="mcp-server-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          try {
+            setLocalError(null);
+            onSubmit({
+              name: name.trim(),
+              command: command.trim(),
+              transport: "stdio",
+              args: args.split("\n").map((item) => item.trim()).filter(Boolean),
+              env: parseEnv(env)
+            });
+          } catch (err) {
+            setLocalError(err instanceof Error ? err.message : String(err));
+          }
+        }}
+      >
+        <label>Name<TextInput aria-label="Server name" required value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <div className="mcp-field">
+          <span className="mcp-field__label">Transport</span>
+          <span className="mcp-field__value">stdio</span>
+        </div>
+        <label>Command<TextInput aria-label="Command" required value={command} onChange={(event) => setCommand(event.target.value)} /></label>
+        <label>Arguments, one per line<textarea aria-label="Arguments" className="ui-input" rows={4} value={args} onChange={(event) => setArgs(event.target.value)} /></label>
+        <label>Environment, KEY=value<textarea aria-label="Environment" className="ui-input" rows={4} value={env} onChange={(event) => setEnv(event.target.value)} /></label>
+        <div className="route-state-form__actions">
+          <Button disabled={busy || !name.trim() || !command.trim()} type="submit" variant="primary">{editing ? "Rediscover and save" : "Add and discover"}</Button>
+          <Button onClick={onClose} type="button">Cancel</Button>
+        </div>
+      </form>
+      <p className="app-copy">Tools are enumerated immediately. New and changed tools remain admin-only, untrusted, and taint-gated until saved. Changes apply after restart.</p>
+      {localError || error ? <ErrorState title="Action failed">{localError || error}</ErrorState> : null}
+      {editing ? (
+        <div className="mcp-tools">
+          <h3>Discovered tools</h3>
+          {!server!.tools.length
+            ? <EmptyState title="No tools discovered" />
+            : server!.tools.map((tool) => <ToolPolicyEditor busy={busy} key={tool.tool_id} onSave={onSavePolicy} tool={tool} />)}
+        </div>
+      ) : null}
+    </Dialog>
+  );
+}
+
+// Content-only view: rendered inside the consolidated Admin surface's "MCP
+// Servers" sub-tab (AdminRoute owns the page header).
+export function McpServersView() {
   const client = useQueryClient();
   const query = useQuery({ queryKey: ["admin-mcp-servers"], queryFn: async () => (await listMCPServers()).data });
-  const [editing, setEditing] = React.useState<MCPServerRecord | null>(null);
-  const [name, setName] = React.useState("");
-  const [command, setCommand] = React.useState("");
-  const [args, setArgs] = React.useState("");
-  const [env, setEnv] = React.useState("");
+  const [dialogOpen, setDialogOpen] = React.useState(false);
+  const [dialogServerId, setDialogServerId] = React.useState<string | null>(null);
   const [actionError, setActionError] = React.useState<string | null>(null);
+
+  const servers = query.data?.servers ?? [];
+  const dialogServer = dialogServerId ? servers.find((server) => server.server_config_id === dialogServerId) ?? null : null;
+
   const refresh = () => client.invalidateQueries({ queryKey: ["admin-mcp-servers"] });
   const fail = (error: unknown) => setActionError(error instanceof Error ? error.message : String(error));
-  const saved = () => { setActionError(null); setEditing(null); setName(""); setCommand(""); setArgs(""); setEnv(""); void refresh(); };
-  const saveServer = useMutation({ mutationFn: (input: MCPServerInput) => saveMCPServer(input, editing?.server_config_id), onSuccess: saved, onError: fail });
-  const removeServer = useMutation({ mutationFn: (serverId: string) => removeMCPServer(serverId), onSuccess: saved, onError: fail });
-  const savePolicy = useMutation({ mutationFn: ({ tool, policy }: { tool: MCPToolRecord; policy: typeof CLOSED_POLICY }) => saveMCPToolPolicy(tool, policy), onSuccess: () => { setActionError(null); void refresh(); }, onError: fail });
+  const closeDialog = () => { setDialogOpen(false); setDialogServerId(null); setActionError(null); };
+
+  const saveServer = useMutation({
+    mutationFn: (input: MCPServerInput) => saveMCPServer(input, dialogServerId ?? undefined),
+    onSuccess: () => { setActionError(null); closeDialog(); void refresh(); },
+    onError: fail
+  });
+  const removeServer = useMutation({
+    mutationFn: (serverId: string) => removeMCPServer(serverId),
+    onSuccess: () => { setActionError(null); void refresh(); },
+    onError: fail
+  });
+  const savePolicy = useMutation({
+    mutationFn: ({ tool, policy }: { tool: MCPToolRecord; policy: ToolPolicy }) => saveMCPToolPolicy(tool, policy),
+    onSuccess: () => { setActionError(null); void refresh(); },
+    onError: fail
+  });
   const busy = saveServer.isPending || removeServer.isPending || savePolicy.isPending;
 
-  function beginEdit(server: MCPServerRecord) {
-    setEditing(server); setName(server.name); setCommand(server.command);
-    setArgs(server.args.join("\n")); setEnv(Object.entries(server.env).map(([key, value]) => `${key}=${value}`).join("\n"));
-  }
+  function openAdd() { setActionError(null); setDialogServerId(null); setDialogOpen(true); }
+  function openEdit(server: MCPServerRecord) { setActionError(null); setDialogServerId(server.server_config_id); setDialogOpen(true); }
 
   return (
     <div className="mcp-route">
-      <DashboardHeader eyebrow="Admin" title="MCP servers">
-        <p className="app-copy">Configure stdio servers and bind every discovered tool to an explicit authorization and IFC posture. Changes apply after restart.</p>
-      </DashboardHeader>
-      <Panel title={editing ? `Edit ${editing.name}` : "Add server"} subtitle="Tools are enumerated immediately. New and changed tools remain admin-only, untrusted, and taint-gated until saved.">
-        <form className="mcp-server-form" onSubmit={(event) => {
-          event.preventDefault();
-          try { saveServer.mutate({ name: name.trim(), command: command.trim(), transport: "stdio", args: args.split("\n").map((item) => item.trim()).filter(Boolean), env: parseEnv(env) }); }
-          catch (error) { fail(error); }
-        }}>
-          <label>Name<TextInput aria-label="Server name" required value={name} onChange={(event) => setName(event.target.value)} /></label>
-          <label>Transport<select aria-label="Transport" className="ui-input" disabled value="stdio"><option value="stdio">stdio</option></select></label>
-          <label>Command<TextInput aria-label="Command" required value={command} onChange={(event) => setCommand(event.target.value)} /></label>
-          <label>Arguments, one per line<textarea aria-label="Arguments" className="ui-input" rows={4} value={args} onChange={(event) => setArgs(event.target.value)} /></label>
-          <label>Environment, KEY=value<textarea aria-label="Environment" className="ui-input" rows={4} value={env} onChange={(event) => setEnv(event.target.value)} /></label>
-          <div className="route-state-form__actions"><Button disabled={busy || !name.trim() || !command.trim()} type="submit" variant="primary">{editing ? "Rediscover and save" : "Add and discover"}</Button>{editing ? <Button onClick={() => saved()} type="button">Cancel</Button> : null}</div>
-        </form>
+      <Panel
+        title="Servers"
+        subtitle="stdio MCP servers. Each discovered tool is bound to an explicit authorization tier and IFC posture. Changes apply after restart."
+        actions={<Button disabled={busy} onClick={openAdd} variant="primary">Add server</Button>}
+      >
+        {query.isLoading ? <LoadingState label="Loading MCP servers" /> : null}
+        {query.isError ? <ErrorState title="Failed to load MCP servers">{query.error instanceof Error ? query.error.message : String(query.error)}</ErrorState> : null}
+        {!query.isLoading && !query.isError && !servers.length ? <EmptyState title="No MCP servers configured" /> : null}
+        {servers.length ? (
+          <DataTable
+            caption="Configured MCP servers"
+            columns={[
+              { key: "name", header: "Name" },
+              { key: "command", header: "Command" },
+              { key: "transport", header: "Transport" },
+              { key: "tools", header: "Tools" },
+              { key: "policy", header: "Policy" },
+              { key: "actions", header: "Actions" }
+            ]}
+            rows={servers.map((server) => ({
+              name: <strong>{server.name}</strong>,
+              command: <code>{[server.command, ...server.args].join(" ")}</code>,
+              transport: "stdio",
+              tools: server.tools.length,
+              policy: server.policy_version,
+              actions: (
+                <span className="route-state-form__actions">
+                  <Button disabled={busy} onClick={() => openEdit(server)}>Edit</Button>
+                  <Button disabled={busy} onClick={() => { if (window.confirm(`Remove ${server.name}? Its tools will be tombstoned.`)) removeServer.mutate(server.server_config_id); }}>Remove</Button>
+                </span>
+              )
+            }))}
+          />
+        ) : null}
       </Panel>
-      {actionError ? <ErrorState title="Action failed">{actionError}</ErrorState> : null}
-      {query.isLoading ? <LoadingState label="Loading MCP servers" /> : null}
-      {query.isError ? <ErrorState title="Failed to load MCP servers">{query.error instanceof Error ? query.error.message : String(query.error)}</ErrorState> : null}
-      {!query.isLoading && !query.isError && !query.data?.servers.length ? <EmptyState title="No MCP servers configured" /> : null}
-      {query.data?.servers.map((server) => (
-        <Panel key={server.server_config_id} title={server.name} subtitle={`${server.command} ${server.args.join(" ")}`} actions={<><Badge tone="warning">restart required</Badge><Button disabled={busy} onClick={() => beginEdit(server)}>Edit</Button><Button disabled={busy} onClick={() => { if (window.confirm(`Remove ${server.name}? Its tools will be tombstoned.`)) removeServer.mutate(server.server_config_id); }}>Remove</Button></>}>
-          <div className="mcp-server-meta"><span><strong>Transport</strong> stdio</span><span><strong>Tools</strong> {server.tools.length}</span><span><strong>Policy</strong> {server.policy_version}</span></div>
-          {!server.tools.length ? <EmptyState title="No tools discovered" /> : server.tools.map((tool) => <ToolPolicyEditor busy={busy} key={tool.tool_id} onSave={(selected, policy) => savePolicy.mutate({ tool: selected, policy })} tool={tool} />)}
-        </Panel>
-      ))}
+      {actionError && !dialogOpen ? <ErrorState title="Action failed">{actionError}</ErrorState> : null}
+      {dialogOpen ? (
+        <ServerFormDialog
+          busy={busy}
+          error={actionError}
+          key={dialogServerId ?? "new"}
+          onClose={closeDialog}
+          onSavePolicy={(tool, policy) => savePolicy.mutate({ tool, policy })}
+          onSubmit={(input) => saveServer.mutate(input)}
+          server={dialogServer}
+        />
+      ) : null}
     </div>
   );
 }

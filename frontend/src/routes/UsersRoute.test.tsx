@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { UsersRoute } from "./UsersRoute";
+import { UsersView } from "./UsersRoute";
 
 const { api } = vi.hoisted(() => ({
   api: { listUsers: vi.fn(), issueUserKey: vi.fn(), revokeUserKey: vi.fn() }
@@ -21,7 +21,7 @@ function renderUsers() {
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter>
-        <UsersRoute />
+        <UsersView />
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -34,7 +34,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("UsersRoute (#563)", () => {
+describe("UsersView (#563)", () => {
   it("lists users with roles + key status", async () => {
     api.listUsers.mockResolvedValue(
       envelope({

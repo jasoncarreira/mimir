@@ -52,6 +52,12 @@ class DashboardExtensionManifest:
     #: boundary is the server-side ``/api/v1/admin/`` gate; this just keeps
     #: admin entries out of non-admin navigation.
     requires_role: str | None = None
+    #: Hide this manifest from the top-level nav while STILL registering its
+    #: backend routes (``add_backend_namespace_routes`` iterates ``enabled()``,
+    #: not the visible surfaces). Used when a surface is presented as a sub-tab
+    #: of another surface in the React app (e.g. admin-users / admin-mcp render
+    #: under the consolidated "Admin" surface) but keeps its own api_namespace.
+    nav_hidden: bool = False
 
     def validate(self) -> None:
         if not _ID_RE.fullmatch(self.id):
@@ -84,6 +90,7 @@ class DashboardExtensionManifest:
             "api_namespace": self.api_namespace,
             "trusted_first_party": self.trusted_first_party,
             "requires_role": self.requires_role,
+            "nav_hidden": self.nav_hidden,
         }
 
 
@@ -227,6 +234,9 @@ def first_party_dashboard_extensions(
                 api_namespace="admin-config",
                 requires_role="admin",
             ),
+            # admin-users / admin-mcp keep their own api_namespace (so their
+            # backend routes still register) but render as sub-tabs of the
+            # consolidated "Admin" surface, so they are hidden from the top nav.
             DashboardExtensionManifest(
                 id="admin-users",
                 route_path="/admin/users",
@@ -235,6 +245,7 @@ def first_party_dashboard_extensions(
                 nav_position=61,
                 api_namespace="admin-users",
                 requires_role="admin",
+                nav_hidden=True,
             ),
             DashboardExtensionManifest(
                 id="admin-mcp",
@@ -244,6 +255,7 @@ def first_party_dashboard_extensions(
                 nav_position=62,
                 api_namespace="admin-mcp",
                 requires_role="admin",
+                nav_hidden=True,
             ),
         )
     )

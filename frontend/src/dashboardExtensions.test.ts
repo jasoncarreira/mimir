@@ -64,6 +64,22 @@ describe("dashboard surface metadata", () => {
     });
   });
 
+  it("consolidates config, users, and MCP servers as sub-tabs of the Admin surface", () => {
+    const [admin] = getDashboardSurfaces([
+      { ...manifest("admin-config", "Admin"), route_path: "/admin", nav_position: 60 }
+    ]);
+    expect(admin.tabs).toEqual(["config", "users", "mcp"]);
+  });
+
+  it("drops nav_hidden manifests from the surfaces list (their backend routes still register)", () => {
+    const surfaces = getDashboardSurfaces([
+      { ...manifest("admin-config", "Admin"), route_path: "/admin", nav_position: 60 },
+      { ...manifest("admin-users", "Users"), route_path: "/admin/users", nav_position: 61, nav_hidden: true },
+      { ...manifest("admin-mcp", "MCP Servers"), route_path: "/admin/mcp", nav_position: 62, nav_hidden: true }
+    ]);
+    expect(surfaces.map((s) => s.id)).toEqual(["admin-config"]);
+  });
+
   it("rejects unsafe dashboard routes before rendering navigation", () => {
     expect(() => getDashboardSurfaces([
       { ...manifest("bad"), route_path: "javascript:alert(1)" }
