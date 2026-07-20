@@ -840,6 +840,90 @@ def test_web_search_is_allowed_after_untrusted_active_ingest(
     assert decision.allowed is True
 
 
+@pytest.mark.parametrize("configured_url", ["", "   "])
+def test_web_search_empty_config_uses_default_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_url: str,
+) -> None:
+    from mimir.tools.budget_gate import _extract_sink_target
+
+    monkeypatch.setenv("TAVILY_SEARCH_URL", configured_url)
+    request = SimpleNamespace(tool_call={"name": "web_search", "args": {"query": "mimir"}})
+    target = _extract_sink_target(request)
+
+    assert target == "https://api.tavily.com/search"
+    decision = SinkGate.check_sink_flow(
+        "web_search", target, InformationFlowLabels(), _auth(), enforce=True,
+    )
+    assert decision.allowed is True
+
+
+def test_web_search_unresolvable_fixed_destination_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels = InformationFlowLabels()
+    auth = _auth()
+
+    # The valid control proves that no other authorization branch masks the pin check.
+    monkeypatch.setenv("TAVILY_SEARCH_URL", "https://search.example/api")
+    valid = SinkGate.check_sink_flow(
+        "web_search", "https://search.example/api", labels, auth, enforce=True,
+    )
+    assert valid.allowed is True
+
+    monkeypatch.setenv("TAVILY_SEARCH_URL", "ftp://search.example/api")
+    invalid = SinkGate.check_sink_flow(
+        "web_search", "ftp://search.example/api", labels, auth, enforce=True,
+    )
+    assert invalid.allowed is False
+    assert invalid.reason == "egress_destination_not_approved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [307, 308])
+async def test_web_search_rejects_off_destination_post_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    from mimir.tools import web as web_tools_mod
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    pinned_url = "https://search.example/api"
+    monkeypatch.setenv("TAVILY_SEARCH_URL", pinned_url)
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    auth = replace(_auth(), ifc_labels=InformationFlowLabels())
+    request = ToolCallRequest(
+        tool_call={
+            "name": "web_search",
+            "args": {"query": "sensitive terms"},
+            "id": "ifc-web-search-redirect",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth),
+    )
+    handler_called = False
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_called
+        handler_called = True
+        redirect_handler = web_tools_mod._SSRFCheckingRedirectHandler()
+        redirect_handler.redirect_request(
+            web_tools_mod.Request(pinned_url, data=b"query", method="POST"),
+            None,
+            status,
+            "Temporary Redirect",
+            {},
+            "https://redirect.example/collect",
+        )
+        return ToolMessage(content="unexpected", tool_call_id="ifc-web-search-redirect")
+
+    with pytest.raises(web_tools_mod.SSRFBlocked, match="exact URL"):
+        await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    assert handler_called is True
+
+
 @pytest.mark.parametrize(
     ("tool_name", "target", "sink_category", "expected_reason"),
     [
