@@ -948,6 +948,7 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
 
 def test_configured_exact_url_preserves_literal_comma_without_approving_prefix(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     import mimir.access_control as access_control
 
@@ -959,6 +960,29 @@ def test_configured_exact_url_preserves_literal_comma_without_approving_prefix(
 
     assert destination in approved
     assert truncated not in approved
+    assert "MIMIR_EGRESS_APPROVED_URLS contains a comma" in caplog.text
+    assert "Configure multiple URLs as a JSON array" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["MIMIR_EGRESS_APPROVED_URLS", "MIMIR_HEARTBEAT_APPROVED_URLS"],
+)
+def test_non_json_comma_separated_exact_urls_warn(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    variable: str,
+) -> None:
+    import mimir.access_control as access_control
+
+    configured = "https://hooks.example/a,https://hooks.example/b"
+    monkeypatch.setenv(variable, configured)
+
+    approved = access_control._configured_exact_urls(variable)
+
+    assert approved == frozenset({configured})
+    assert variable in caplog.text
+    assert "Configure multiple URLs as a JSON array" in caplog.text
 
 
 def test_web_search_is_allowed_after_untrusted_active_ingest(

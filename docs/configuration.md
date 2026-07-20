@@ -233,6 +233,8 @@ authenticate transport only; they do not create a named requester.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Startup rejects this setting when `MIMIR_MODEL_SPEC` uses `claude-code:` because that subprocess provider cannot carry the server-created per-turn authorization context. Use `anthropic:`, `openai:`, or `codex-plus:`, or leave enforcement disabled. |
+| `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs approved for application network egress. Configure multiple URLs as a JSON array, for example `["https://hooks.example/a", "https://hooks.example/b"]`; comma-separated URL lists are not supported. |
+| `MIMIR_HEARTBEAT_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs the heartbeat service may fetch. Configure multiple URLs as a JSON array; comma-separated URL lists are not supported. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
 | `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Controls the extra `inbound_pairing_prompted` event for enforced public/shared-channel denials: `ignore` or `prompt-to-pair`. All enforced denials may still create a pending pairing and notify the operator; this setting sends no public reply. |
 | `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |

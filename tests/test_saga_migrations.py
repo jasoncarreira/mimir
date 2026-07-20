@@ -272,6 +272,42 @@ class TestApplyPendingMigrations:
             "SELECT version FROM schema_version"
         ).fetchall() == [(m.CURRENT_SCHEMA_VERSION,)]
 
+    def test_detected_v8_incomplete_world_ownership_fails_after_migrations(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        ownership = """
+            owner_principal TEXT, origin_channel TEXT, origin_domain TEXT,
+            visibility TEXT, provenance TEXT
+        """
+        conn.executescript(
+            f"""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+            );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, content_hash TEXT, agent_id TEXT,
+                tombstoned INTEGER DEFAULT 0, {ownership}
+            );
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE observations_metadata (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE triples (id TEXT PRIMARY KEY, {ownership});
+            CREATE TABLE world_state (
+                id TEXT PRIMARY KEY, owner_principal TEXT,
+                origin_channel TEXT, visibility TEXT
+            );
+            """
+        )
+
+        assert m.detect_schema_version(conn) == 8
+        with pytest.raises(
+            RuntimeError,
+            match=r"world_state\.origin_domain.*world_state\.provenance",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+
     def test_add_column_migration_identifies_missing_table(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute(
@@ -927,6 +963,22 @@ class TestV7OwnershipMigration:
                 source_triple_id TEXT,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (subject, predicate, valid_from)
+            );
+            CREATE TABLE atoms (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE observations_metadata (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY, owner_principal TEXT, origin_channel TEXT,
+                origin_domain TEXT, visibility TEXT, provenance TEXT
             );
             CREATE TABLE schema_version (
                 version INTEGER PRIMARY KEY,

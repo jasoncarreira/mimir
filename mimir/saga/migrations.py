@@ -881,8 +881,15 @@ def apply_pending_migrations(
                 (version, datetime.now(tz=timezone.utc).isoformat()),
             )
             conn.commit()
+            applied.add(version)
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
+
+    _validate_ownership_schema(
+        conn,
+        stamped_version=max(applied),
+        target_version=target_version,
+    )

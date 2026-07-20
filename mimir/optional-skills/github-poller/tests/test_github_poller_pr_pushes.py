@@ -864,8 +864,11 @@ def test_coerce_review_requests_migrates_and_validates():
 # ── commit-enrichment tests ───────────────────────────────────────────────────
 
 
-def _make_commit(message: str) -> dict:
-    return {"commit": {"message": message}, "sha": "aabbccdd"}
+def _make_commit(message: str, author: str | None = None) -> dict:
+    commit = {"commit": {"message": message}, "sha": "aabbccdd"}
+    if author is not None:
+        commit["author"] = {"login": author}
+    return commit
 
 
 def test_commit_subjects_included_in_prompt(monkeypatch, captured_emits):
@@ -891,6 +894,30 @@ def test_commit_subjects_included_in_prompt(monkeypatch, captured_emits):
     assert "Details here" not in prompt          # only first line of message
     assert "old_sha" in prompt                   # sha delta preserved
     assert "new_sha" in prompt
+
+
+def test_push_is_attributed_to_head_commit_author(monkeypatch, captured_emits):
+    """Trust classification must inspect who produced the pushed content."""
+    compare = {
+        "ahead_by": 2,
+        "commits": [
+            _make_commit("Earlier commit", author="trusted-collaborator"),
+            _make_commit("Untrusted head", author="outside-contributor"),
+        ],
+    }
+    _patch_api(
+        monkeypatch,
+        [_pr(113, "new_sha", login="trusted-pr-author")],
+        compare_response=compare,
+    )
+
+    poller._check_pr_pushes(
+        "o/r", token="t", me="", pr_heads={"113": "old_sha"},
+    )
+
+    event = captured_emits[0]
+    assert event["author"] == "outside-contributor"
+    assert "by @outside-contributor" in event["prompt"]
 
 
 def test_commit_subjects_truncated_at_three(monkeypatch, captured_emits):
