@@ -20,6 +20,8 @@ import pytest
 
 from mimir.access_control import OperationDecision
 from mimir.mcp_client import (
+    MCPManager,
+    MCPPolicyStore,
     MCPServerConfig,
     load_mcp_server_configs,
     parse_mcp_server_configs,
@@ -28,6 +30,58 @@ from mimir.tools.mcp import clear_mcp_tools, get_mcp_tools, set_mcp_tools
 
 
 # ─── MCPServerConfig.from_dict ──────────────────────────────────────
+
+
+def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "mcp-policy.json"
+    store = MCPPolicyStore(path)
+    server = {
+        "server_config_id": "server-1",
+        "name": "docs",
+        "command": "mcp-docs",
+        "args": [],
+        "env": {},
+        "policy_version": "ui-v1",
+        "adapters": [{
+            "name": "mimir-ui-server-1", "version": "1",
+            "policy_version": "ui-v1", "direction": "neither",
+        }],
+    }
+    store.upsert_server(server)
+    store.save({"tool-1": {
+        "tool_id": "tool-1", "server_config_id": "server-1",
+        "original_tool_name": "search", "config_digest": "config-a",
+        "schema_digest": "schema-a", "is_tombstoned": False,
+        "classification": "", "result_integrity": "untrusted",
+        "argument_egress": "taint_gated",
+    }})
+
+    approved = store.update_tool_policy(
+        "tool-1",
+        classification="open",
+        result_integrity="trusted",
+        argument_egress="allowed",
+        expected_config_digest="config-a",
+        expected_schema_digest="schema-a",
+    )
+    assert approved["policy_version"] == "ui-v1"
+    configs = MCPManager._apply_stored_policies(store.load_server_configs(), store.load())
+    assert configs[0].tool_policies[0].result_integrity == "trusted"
+
+    with pytest.raises(RuntimeError, match="provenance changed"):
+        store.update_tool_policy(
+            "tool-1",
+            classification="open",
+            result_integrity="trusted",
+            argument_egress="allowed",
+            expected_config_digest="stale",
+            expected_schema_digest="schema-a",
+        )
+    assert store.remove_server("server-1") is True
+    tombstone = store.load()["tool-1"]
+    assert tombstone["is_tombstoned"] is True
+    assert tombstone["result_integrity"] == "untrusted"
+    assert tombstone["argument_egress"] == "taint_gated"
 
 
 class TestMCPServerConfigFromDict:

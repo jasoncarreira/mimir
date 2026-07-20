@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
@@ -67,6 +68,8 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SERVER_CONFIG_NAMESPACE = uuid.UUID("4797522a-a5f1-47ef-9716-bfd7408b0b85")
 _TOOL_ID_NAMESPACE = uuid.UUID("4d87c6fe-7512-43f7-97b7-e1376f0b092a")
 MCP_POLICY_STORE_VERSION = 1
+UI_MCP_POLICY_VERSION = "ui-v1"
+_MCP_POLICY_STORE_LOCK = threading.RLock()
 
 _SECRET_KEYWORDS = frozenset({
     "token", "secret", "password", "key", "auth", "credential",
@@ -534,14 +537,14 @@ class MCPConnection:
 
 
 class MCPPolicyStore:
-    """Durable, non-secret inventory of discovered MCP tool identities."""
+    """Operator-owned server config and provenance-bound tool policy store."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def load(self) -> dict[str, dict[str, Any]]:
+    def _load_document(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {}
+            return {"version": MCP_POLICY_STORE_VERSION, "servers": {}, "tools": {}}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -555,13 +558,102 @@ class MCPPolicyStore:
         records = payload["tools"]
         if not all(isinstance(key, str) and isinstance(value, dict) for key, value in records.items()):
             raise ValueError(f"invalid MCP policy records: {self.path}")
-        return records
+        servers = payload.get("servers", {})
+        if not isinstance(servers, dict) or not all(
+            isinstance(key, str) and isinstance(value, dict)
+            for key, value in servers.items()
+        ):
+            raise ValueError(f"invalid MCP server records: {self.path}")
+        return {"version": MCP_POLICY_STORE_VERSION, "servers": servers, "tools": records}
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        with _MCP_POLICY_STORE_LOCK:
+            return dict(self._load_document()["tools"])
+
+    def load_server_records(self) -> dict[str, dict[str, Any]]:
+        with _MCP_POLICY_STORE_LOCK:
+            return dict(self._load_document()["servers"])
+
+    def load_server_configs(self) -> list[MCPServerConfig]:
+        configs: list[MCPServerConfig] = []
+        for record in self.load_server_records().values():
+            try:
+                configs.append(MCPServerConfig.from_dict(record))
+            except (TypeError, ValueError) as exc:
+                log.warning("Ignoring invalid UI-managed MCP server: %s", exc)
+        return configs
 
     def save(self, records: dict[str, dict[str, Any]]) -> None:
-        atomic_write_json(
-            self.path,
-            {"version": MCP_POLICY_STORE_VERSION, "tools": records},
-        )
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            document["tools"] = records
+            atomic_write_json(self.path, document)
+
+    def upsert_server(self, record: dict[str, Any]) -> None:
+        server_id = str(record.get("server_config_id", "")).strip()
+        if not server_id:
+            raise ValueError("server_config_id required")
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            document["servers"][server_id] = record
+            atomic_write_json(self.path, document)
+
+    def remove_server(self, server_id: str) -> bool:
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            removed = document["servers"].pop(server_id, None) is not None
+            for record in document["tools"].values():
+                if record.get("server_config_id") == server_id:
+                    record["is_tombstoned"] = True
+                    record["classification"] = ""
+                    record["result_integrity"] = "untrusted"
+                    record["argument_egress"] = "taint_gated"
+            atomic_write_json(self.path, document)
+            return removed
+
+    def update_tool_policy(
+        self,
+        tool_id: str,
+        *,
+        classification: str,
+        result_integrity: str,
+        argument_egress: str,
+        expected_config_digest: str,
+        expected_schema_digest: str,
+    ) -> dict[str, Any]:
+        if classification not in {"open", "resource_scoped", "admin_required"}:
+            raise ValueError("invalid authorization tier")
+        if result_integrity not in {"trusted", "untrusted"}:
+            raise ValueError("invalid result_integrity")
+        if argument_egress not in {"allowed", "taint_gated"}:
+            raise ValueError("invalid argument_egress")
+        with _MCP_POLICY_STORE_LOCK:
+            document = self._load_document()
+            record = document["tools"].get(tool_id)
+            if record is None or record.get("is_tombstoned"):
+                raise KeyError(tool_id)
+            if (
+                record.get("config_digest") != expected_config_digest
+                or record.get("schema_digest") != expected_schema_digest
+            ):
+                raise RuntimeError("tool provenance changed; rediscover before approving")
+            server_id = str(record.get("server_config_id", ""))
+            server = document["servers"].get(server_id)
+            if server is None:
+                raise KeyError(server_id)
+            policy_version = str(server.get("policy_version") or UI_MCP_POLICY_VERSION)
+            adapter_name = f"mimir-ui-{server_id}"
+            record.update({
+                "classification": classification,
+                "adapter_name": adapter_name,
+                "adapter_version": "1",
+                "approval_version": str(uuid.uuid4()),
+                "policy_version": policy_version,
+                "result_integrity": result_integrity,
+                "argument_egress": argument_egress,
+            })
+            atomic_write_json(self.path, document)
+            return dict(record)
 
 
 def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[str, Any]:
@@ -635,6 +727,31 @@ class MCPManager:
                     f"MCP server_config_id {config.server_config_id!r} endpoint mismatch"
                 )
 
+    @staticmethod
+    def _apply_stored_policies(
+        configs: list[MCPServerConfig],
+        records: dict[str, dict[str, Any]],
+    ) -> list[MCPServerConfig]:
+        """Attach only complete records belonging to the current immutable server."""
+        resolved: list[MCPServerConfig] = []
+        for config in configs:
+            policies = list(config.tool_policies)
+            configured_names = {policy.tool_name for policy in policies}
+            for record in records.values():
+                if (
+                    record.get("server_config_id") != config.server_config_id
+                    or record.get("is_tombstoned")
+                    or record.get("original_tool_name") in configured_names
+                ):
+                    continue
+                try:
+                    policies.append(MCPToolPolicy.from_dict(record))
+                except (TypeError, ValueError):
+                    # Discovery-only and partially approved records remain fail-closed.
+                    continue
+            resolved.append(replace(config, tool_policies=tuple(policies)))
+        return resolved
+
     async def start_servers(self, configs: list[MCPServerConfig]) -> list[StructuredTool]:
         """Start every configured server, bridge their tools, return flat list.
 
@@ -646,6 +763,7 @@ class MCPManager:
         tool names happen to produce the same namespaced string.
         """
         records = self._policy_store.load() if self._policy_store else {}
+        configs = self._apply_stored_policies(configs, records)
         self._validate_identities(configs, records)
         register_configured_mcp_adapters(configs)
         all_tools: list[StructuredTool] = []
@@ -1118,12 +1236,17 @@ def _configured_resource_classifier(
 
         decision = OperationDecision(request.provenance.classification)
         if decision is not OperationDecision.RESOURCE_SCOPED:
+            roles = getattr(request.auth_context, "roles", ()) or ()
+            allowed = (
+                decision is OperationDecision.OPEN
+                or (decision is OperationDecision.ADMIN_REQUIRED and "admin" in roles)
+            )
             return MCPAuthorizationResult(
                 decision=decision,
-                allowed=decision is OperationDecision.OPEN,
+                allowed=allowed,
                 reason=(
                     None
-                    if decision is OperationDecision.OPEN
+                    if allowed
                     else "admin_required"
                 ),
             )

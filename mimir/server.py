@@ -1434,8 +1434,18 @@ def build_app(config: Config) -> web.Application:
         from .tools import set_mcp_tools
 
         set_mcp_tools([])
-        if config.mcp_servers:
-            await _start_mcp_servers(app, config.mcp_servers, home=config.home)
+        from .mcp_client import MCPPolicyStore
+
+        try:
+            stored_mcp_configs = MCPPolicyStore(
+                config.home / "state" / "mcp-policy.json"
+            ).load_server_configs()
+        except ValueError as exc:
+            log.warning("UI-managed MCP configuration ignored: %s", exc)
+            stored_mcp_configs = []
+        mcp_configs = [*config.mcp_servers, *stored_mcp_configs]
+        if mcp_configs:
+            await _start_mcp_servers(app, mcp_configs, home=config.home)
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time

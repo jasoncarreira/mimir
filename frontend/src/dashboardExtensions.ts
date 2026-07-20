@@ -76,6 +76,11 @@ const firstPartySurfaceMetadata: Record<
     detail: "Per-user keys and roles",
     tabs: ["users"],
     filterLabel: "role"
+  },
+  "admin-mcp": {
+    detail: "Server tools, authorization, and IFC posture",
+    tabs: ["servers"],
+    filterLabel: "server"
   }
 };
 
