@@ -53,6 +53,7 @@ def test_create_worktree_uses_attempt_scoped_branch_and_path(tmp_path: Path) -> 
             "refs/remotes/origin/main",
         ],
         ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
+        ["git", "-C", str(tmp_path), "merge-base", "--is-ancestor", "FETCH_HEAD", "main"],
         [
             "git",
             "-C",
@@ -261,7 +262,7 @@ def test_attempt_base_fetch_uses_fresh_origin_without_mutating_source(
     assert lease.local_base in ("origin/main", fresh_sha)
 
 
-def test_base_fetch_failure_falls_back_to_local_base_and_logs_event(tmp_path: Path) -> None:
+def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> None:
     calls: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -274,32 +275,17 @@ def test_base_fetch_failure_falls_back_to_local_base_and_logs_event(tmp_path: Pa
     def event_logger(event_type: str, **payload: object) -> None:
         events.append((event_type, payload))
 
-    lease = create_worktree(
-        tmp_path,
-        issue_id=521,
-        attempt=2,
-        base="main",
-        runner=runner,
-        event_logger=event_logger,
-    )
+    with pytest.raises(RuntimeError, match="base repo fetch failed for origin/main"):
+        create_worktree(
+            tmp_path,
+            issue_id=521,
+            attempt=2,
+            base="main",
+            runner=runner,
+            event_logger=event_logger,
+        )
 
-    assert lease.local_base == "main"
-    assert calls[:3] == [
-        ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
-        ["git", "-C", str(tmp_path), "rev-parse", "--verify", "--quiet", "refs/heads/main"],
-        [
-            "git",
-            "-C",
-            str(tmp_path),
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            "issue/521-a2",
-            str(lease.path),
-            "main",
-        ],
-    ]
+    assert calls == [["git", "-C", str(tmp_path), "fetch", "origin", "main"]]
     assert events == [
         (
             "worklink_base_fetch_failed",
@@ -314,7 +300,7 @@ def test_base_fetch_failure_falls_back_to_local_base_and_logs_event(tmp_path: Pa
     ]
 
 
-def test_base_with_no_origin_counterpart_still_uses_local_branch(tmp_path: Path) -> None:
+def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     repo = tmp_path / "repo"
@@ -330,16 +316,65 @@ def test_base_with_no_origin_counterpart_still_uses_local_branch(tmp_path: Path)
     _git(repo, "commit", "-q", "-am", "local")
     local_sha = _git(repo, "rev-parse", "local-only")
 
-    lease = create_worktree(repo, issue_id=521, attempt=3, base="local-only")
+    with pytest.raises(RuntimeError, match="base repo fetch failed for origin/local-only"):
+        create_worktree(repo, issue_id=521, attempt=3, base="local-only")
 
-    assert lease.local_base == "local-only"
-    assert _git(lease.path, "rev-parse", "HEAD") == local_sha
+    assert _git(repo, "rev-parse", "local-only") == local_sha
     missing = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "origin/local-only"],
         capture_output=True,
         text=True,
     )
     assert missing.returncode != 0
+
+
+def test_dangling_alternates_are_backed_up_pruned_and_fetch_retried(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    live = tmp_path / "live-objects"
+    live.mkdir()
+    dead = tmp_path / "deleted-objects"
+    original = f"{live}\n{dead}\n"
+    alternates.write_text(original, encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    lease = create_worktree(repo, issue_id=967, attempt=1, runner=runner)
+
+    fetches = [call for call in calls if call[:4] == ["git", "-C", str(repo), "fetch"]]
+    assert len(fetches) == 2
+    assert alternates.read_text(encoding="utf-8") == f"{live}\n"
+    backups = list(alternates.parent.glob("alternates.worklink-backup*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == original
+    assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/main")
+
+
+def test_stale_remote_tracking_base_fails_with_shas_and_behind_count(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[-3:] == ["--is-ancestor", "FETCH_HEAD", "origin/main"]:
+            return completed(args, returncode=1)
+        if args[-2:] == ["--verify", "origin/main"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="local123\n", stderr="")
+        if args[-2:] == ["--verify", "FETCH_HEAD"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="origin456\n", stderr="")
+        if args[-2:] == ["--count", "origin/main..FETCH_HEAD"]:
+            return subprocess.CompletedProcess(list(args), 0, stdout="3\n", stderr="")
+        return completed(args)
+
+    with pytest.raises(
+        RuntimeError,
+        match="stale base local123, origin origin456, 3 commits behind",
+    ):
+        create_worktree(tmp_path, issue_id=967, attempt=2, runner=runner)
+
+    assert not any(call[3:5] == ["worktree", "add"] for call in calls)
 
 
 def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> None:
@@ -598,3 +633,17 @@ def test_self_containment_assert_accepts_sound_clone(tmp_path: Path) -> None:
     _assert_self_contained_checkout(lease.path, runner=lambda a: subprocess.run(
         list(a), capture_output=True, text=True, check=False))
     assert _git(lease.path, "rev-parse", "--show-toplevel") == str(lease.path)
+
+
+def test_self_containment_assert_rejects_alternates_dependency(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    checkout = tmp_path / "referenced-checkout"
+    subprocess.run(["git", "clone", "-q", "--shared", str(repo), str(checkout)], check=True)
+
+    with pytest.raises(RuntimeError, match="alternates=True"):
+        _assert_self_contained_checkout(
+            checkout,
+            runner=lambda args: subprocess.run(
+                list(args), capture_output=True, text=True, check=False
+            ),
+        )

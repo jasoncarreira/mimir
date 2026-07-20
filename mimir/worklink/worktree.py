@@ -83,12 +83,13 @@ def create_integration_branch(
     branch = f"{epic_branch_prefix}{epic_id}-{branch_slug}"
     path = repo / worklink_dir / "epics" / f"{epic_id}-{branch_slug}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fetch_ok = (
-        _fetch_base_from_origin(repo, base_ref, runner=runner, event_logger=event_logger)
-        if base_fetch
-        else False
+    start_point = _prepare_fresh_base(
+        repo,
+        base_ref,
+        base_fetch=base_fetch,
+        runner=runner,
+        event_logger=event_logger,
     )
-    start_point = _resolve_local_base(repo, base_ref, prefer_origin=fetch_ok, runner=runner)
     result = runner(
         [
             "git",
@@ -225,12 +226,13 @@ def create_worktree(
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fetch_ok = (
-        _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger)
-        if base_fetch
-        else False
+    start_point = _prepare_fresh_base(
+        repo,
+        base,
+        base_fetch=base_fetch,
+        runner=runner,
+        event_logger=event_logger,
     )
-    start_point = _resolve_local_base(repo, base, prefer_origin=fetch_ok, runner=runner)
     # ``--no-track`` + an explicit, locally-resolvable start point: without them
     # ``git worktree add -b <branch> <path> <base>`` DWIMs a remote-only base
     # name (e.g. a slash-named feature branch that exists only as
@@ -281,7 +283,9 @@ def create_isolated_checkout(
     parent checkout's common git dir; Codex has been observed to treat that
     parent as the active repository and edit it.  This checkout shape keeps the
     same branch/diff contract while giving the backend a real repository rooted
-    at the attempt path.
+    at the attempt path. ``git clone --local`` uses self-contained hardlinks, not
+    alternates; the post-clone assertion enforces that no factory checkout can
+    depend on an object directory under the scratch janitor's swept roots.
     """
 
     path = _isolated_checkout_path(repo, worklink_dir, issue_id, attempt)
@@ -290,12 +294,13 @@ def create_isolated_checkout(
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
-    fetch_ok = (
-        _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger)
-        if base_fetch
-        else False
+    start_point = _prepare_fresh_base(
+        repo,
+        base,
+        base_fetch=base_fetch,
+        runner=runner,
+        event_logger=event_logger,
     )
-    start_point = _resolve_local_base(repo, base, prefer_origin=fetch_ok, runner=runner)
     start_sha = runner(["git", "-C", str(repo), "rev-parse", "--verify", start_point])
     if start_sha.returncode != 0:
         raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
@@ -346,17 +351,27 @@ def _fetch_base_from_origin(
     runner: Runner,
     event_logger: EventLogger | None = None,
 ) -> bool:
-    """Best-effort refresh of ``origin/<base>`` without touching local branches."""
-    if base.startswith("origin/"):
-        return False
-    result = runner(["git", "-C", str(repo), "fetch", "origin", base])
-    if result.returncode == 0:
+    """Refresh the base, repairing dangling alternates once before failing closed."""
+    remote_base = base.removeprefix("origin/")
+    result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+    pruned, backup = _prune_dangling_alternates(repo)
+    if pruned:
+        if event_logger is not None:
+            event_logger(
+                "worklink_base_alternates_repaired",
+                repo=str(repo),
+                base=remote_base,
+                pruned=[str(path) for path in pruned],
+                backup=str(backup),
+            )
+        result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+    if result.returncode == 0 and not _dangling_alternates(repo):
         return True
     if event_logger is not None:
         event_logger(
             "worklink_base_fetch_failed",
             repo=str(repo),
-            base=base,
+            base=remote_base,
             returncode=result.returncode,
             stdout=_strip_for_event(result.stdout),
             stderr=_strip_for_event(result.stderr),
@@ -364,14 +379,124 @@ def _fetch_base_from_origin(
     return False
 
 
+def _prepare_fresh_base(
+    repo: Path,
+    base: str,
+    *,
+    base_fetch: bool,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> str:
+    """Return a fetched, locally resolvable base that contains origin's fetched tip."""
+    if not base_fetch:
+        raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
+    if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
+        raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
+
+    start_point = _resolve_local_base(repo, base.removeprefix("origin/"), prefer_origin=True, runner=runner)
+    fresh = runner(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", "FETCH_HEAD", start_point]
+    )
+    if fresh.returncode == 0:
+        return start_point
+
+    local_sha = _rev_parse_for_error(repo, start_point, runner=runner)
+    origin_sha = _rev_parse_for_error(repo, "FETCH_HEAD", runner=runner)
+    behind = runner(
+        ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..FETCH_HEAD"]
+    )
+    count = behind.stdout.strip() if behind.returncode == 0 and behind.stdout.strip() else "unknown"
+    raise RuntimeError(
+        f"stale base {local_sha}, origin {origin_sha}, {count} commits behind"
+    )
+
+
+def _rev_parse_for_error(repo: Path, ref: str, *, runner: Runner) -> str:
+    result = runner(["git", "-C", str(repo), "rev-parse", "--verify", ref])
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else ref
+
+
+def _git_objects_dir(repo: Path) -> Path | None:
+    dot_git = repo / ".git"
+    if dot_git.is_dir():
+        return dot_git / "objects"
+    if dot_git.is_file():
+        try:
+            marker = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if marker.startswith("gitdir:"):
+            git_dir = Path(marker.removeprefix("gitdir:").strip())
+            if not git_dir.is_absolute():
+                git_dir = repo / git_dir
+            return git_dir.resolve() / "objects"
+    if (repo / "objects").is_dir():
+        return repo / "objects"
+    return None
+
+
+def _alternate_entries(repo: Path) -> tuple[Path | None, list[tuple[str, Path]]]:
+    objects = _git_objects_dir(repo)
+    if objects is None:
+        return None, []
+    alternates = objects / "info" / "alternates"
+    if not alternates.is_file():
+        return alternates, []
+    try:
+        lines = alternates.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return alternates, []
+    entries: list[tuple[str, Path]] = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = objects / path
+        entries.append((line, path.resolve()))
+    return alternates, entries
+
+
+def _dangling_alternates(repo: Path) -> list[Path]:
+    _alternates, entries = _alternate_entries(repo)
+    return [path for _line, path in entries if not path.is_dir()]
+
+
+def _prune_dangling_alternates(repo: Path) -> tuple[list[Path], Path | None]:
+    alternates, entries = _alternate_entries(repo)
+    dead = [path for _line, path in entries if not path.is_dir()]
+    if alternates is None or not dead:
+        return [], None
+
+    backup = alternates.with_name(f"{alternates.name}.worklink-backup")
+    suffix = 1
+    while backup.exists():
+        backup = alternates.with_name(f"{alternates.name}.worklink-backup.{suffix}")
+        suffix += 1
+    shutil.copy2(alternates, backup)
+    objects = alternates.parent.parent
+    live_lines: list[str] = []
+    for line in alternates.read_text(encoding="utf-8").splitlines(keepends=True):
+        raw = line.strip()
+        if not raw:
+            live_lines.append(line)
+            continue
+        path = Path(raw)
+        if not path.is_absolute():
+            path = objects / path
+        if path.resolve().is_dir():
+            live_lines.append(line)
+    alternates.write_text("".join(live_lines), encoding="utf-8")
+    return dead, backup
+
+
 def _resolve_local_base(repo: Path, base: str, *, prefer_origin: bool = False, runner: Runner) -> str:
     """Resolve ``base`` to a locally-resolvable start point / diff floor.
 
     After a successful base fetch, prefer the freshly-updated remote-tracking
-    ``origin/<base>``. Otherwise keep the historical local-first behavior so a
-    failed/disabled fetch does not silently use a stale remote-tracking ref.
-    Returning an explicit ref defeats ``git worktree add``'s DWIM for remote-only
-    base names.
+    ``origin/<base>``. Returning an explicit ref defeats ``git worktree add``'s
+    DWIM for remote-only base names.
     """
     if base.startswith("origin/"):
         return base
@@ -477,10 +602,10 @@ def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attemp
 def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
     """Assert the checkout is a real repo rooted at ``path`` (cheap, deterministic).
 
-    A sound ``git clone`` resolves its own toplevel and keeps its git dir inside
-    the checkout. If either resolves elsewhere (e.g. back to the parent), a
-    metadata-inspecting backend like codex would operate on the wrong repository;
-    refuse the checkout instead of leaking edits into the repo root (#517).
+    A sound ``git clone --local`` resolves its own toplevel, keeps its git dir
+    inside the checkout, and has no alternates file. If any condition fails, a
+    backend could operate on the wrong repository or depend on janitor-swept
+    objects; refuse the checkout instead (#517, #967).
     """
     resolved = path.resolve()
     top = runner(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
@@ -490,11 +615,13 @@ def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
         gitdir.returncode == 0
         and Path(gitdir.stdout.strip()).resolve().is_relative_to(resolved)
     )
-    if not (top_ok and gitdir_ok):
+    alternates = _git_objects_dir(path)
+    has_alternates = alternates is not None and (alternates / "info" / "alternates").exists()
+    if not (top_ok and gitdir_ok) or has_alternates:
         raise RuntimeError(
             "isolated checkout failed self-containment check (#517): "
             f"toplevel={top.stdout.strip()!r} git-dir={gitdir.stdout.strip()!r} "
-            f"expected rooted at {resolved}"
+            f"expected rooted at {resolved}; alternates={has_alternates}"
         )
 
 
