@@ -813,6 +813,7 @@ export interface DashboardExtensionManifest {
   api_namespace: string | null;
   trusted_first_party: true;
   requires_role?: string | null;
+  nav_hidden?: boolean;
 }
 
 export interface WhoamiData {

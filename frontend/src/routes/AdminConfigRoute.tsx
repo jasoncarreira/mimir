@@ -5,7 +5,6 @@ import type { AdminConfigData, AdminConfigEnvItem } from "../api/generated/contr
 import {
   Badge,
   CodeBlock,
-  DashboardHeader,
   DataTable,
   EmptyState,
   ErrorState,
@@ -139,7 +138,9 @@ function SchedulesPanel({ data }: { data: AdminConfigData }) {
   );
 }
 
-export function AdminConfigRoute() {
+// Content-only view: rendered inside the consolidated Admin surface's "Config"
+// sub-tab (AdminRoute owns the page header).
+export function AdminConfigView() {
   const { data, error, isError, isLoading } = useQuery({
     queryKey: ["admin-config"],
     queryFn: async () => {
@@ -150,10 +151,6 @@ export function AdminConfigRoute() {
 
   return (
     <>
-      <DashboardHeader eyebrow="Admin" title="Config, Model, and Env">
-        <p>Read-only runtime inspection with redacted secret visibility.</p>
-      </DashboardHeader>
-
       {isLoading ? <LoadingState label="Loading admin config" /> : null}
       {isError ? (
         <ErrorState title="Admin config unavailable">

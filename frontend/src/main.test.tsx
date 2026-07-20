@@ -223,6 +223,28 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
   });
 
+  it("redirects the legacy /admin/users path to the Admin Users sub-tab (#1169)", async () => {
+    // admin-users is nav_hidden (a sub-tab of Admin), so it has no route of its
+    // own; the legacy path must redirect to /admin?tab=users, not fall through
+    // to the "*" wildcard (Chat).
+    const exts = [
+      protectedBootstrap.dashboard_extensions[0],
+      { ...protectedBootstrap.dashboard_extensions[1], nav_hidden: true },
+      protectedBootstrap.dashboard_extensions[2],
+      {
+        id: "admin-config", route_path: "/admin", label: "Admin", icon: null, nav_position: 60,
+        enabled: true, bundle: null, css: [] as string[], api_namespace: "admin-config",
+        trusted_first_party: true as const, requires_role: "admin", nav_hidden: false
+      }
+    ];
+    bootstrapOverride = { ...protectedBootstrap, dashboard_extensions: exts } as typeof protectedBootstrap;
+    window.localStorage.setItem(STORAGE_KEY, "admin-key-123");
+    renderApp(["/admin/users"]);
+
+    const usersTab = await screen.findByRole("tab", { name: "Users" });
+    expect(usersTab.getAttribute("aria-selected")).toBe("true");
+  });
+
   it("does not gate when the server allows unauthenticated access", async () => {
     bootstrapOverride = {
       ...protectedBootstrap,

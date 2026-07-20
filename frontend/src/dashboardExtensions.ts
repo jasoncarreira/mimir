@@ -67,20 +67,13 @@ const firstPartySurfaceMetadata: Record<
     tabs: ["pages", "links", "health"],
     filterLabel: "category"
   },
+  // The "Admin" surface consolidates config, users, and MCP servers as
+  // sub-tabs (admin-users / admin-mcp are nav_hidden manifests rendered by
+  // AdminRoute; their backend routes still register server-side).
   "admin-config": {
-    detail: "Config, model, and redacted env",
-    tabs: ["model", "config", "env"],
+    detail: "Config, users, and MCP servers",
+    tabs: ["config", "users", "mcp"],
     filterLabel: "section"
-  },
-  "admin-users": {
-    detail: "Per-user keys and roles",
-    tabs: ["users"],
-    filterLabel: "role"
-  },
-  "admin-mcp": {
-    detail: "Server tools, authorization, and IFC posture",
-    tabs: ["servers"],
-    filterLabel: "server"
   }
 };
 
@@ -106,7 +99,7 @@ export function getDashboardSurfaces(
 ): DashboardSurface[] {
   return manifests
     .map((manifest) => ({ ...manifest, ...overrides[manifest.id] }))
-    .filter((manifest) => manifest.enabled && manifest.trusted_first_party)
+    .filter((manifest) => manifest.enabled && manifest.trusted_first_party && !manifest.nav_hidden)
     .map((manifest) => {
       const metadata = firstPartySurfaceMetadata[manifest.id] ?? defaultMetadata(manifest);
       return {

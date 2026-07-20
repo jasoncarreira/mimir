@@ -7,7 +7,6 @@ import {
   Badge,
   Button,
   CodeBlock,
-  DashboardHeader,
   DataTable,
   EmptyState,
   ErrorState,
@@ -16,10 +15,12 @@ import {
   TextInput
 } from "../ui";
 
-// Admin Users page (github #563). Lists identities (never their keys), and
+// Admin Users view (github #563). Lists identities (never their keys), and
 // creates/rotates/revokes per-user web keys. A freshly minted key is shown
 // EXACTLY once for out-of-band hand-off; only its hash is stored server-side.
-export function UsersRoute() {
+// Rendered inside the consolidated Admin surface's "Users" sub-tab
+// (AdminRoute owns the page header).
+export function UsersView() {
   const queryClient = useQueryClient();
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["admin-users"],
@@ -59,13 +60,6 @@ export function UsersRoute() {
 
   return (
     <>
-      <DashboardHeader eyebrow="Admin" title="Users">
-        <p className="app-copy">
-          Per-user web keys and roles. A key is shown <strong>once</strong> at creation —
-          copy it and hand it to the user out of band; only a hash is stored.
-        </p>
-      </DashboardHeader>
-
       {mintedKey ? (
         <Panel
           actions={<Button onClick={() => setMintedKey(null)}>Dismiss</Button>}
