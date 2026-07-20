@@ -585,6 +585,15 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
   return (
     <Routes>
       <Route element={<Navigate replace to={firstRoute} />} path="/" />
+      {/*
+        Users / MCP servers now render as sub-tabs of the consolidated Admin
+        surface (their manifests are nav_hidden, so they are absent from
+        `surfaces` and get no route above). Keep their legacy paths working by
+        redirecting to the corresponding Admin sub-tab instead of falling
+        through to the "*" wildcard (which lands on Chat).
+      */}
+      <Route element={<Navigate replace to="/admin?tab=users" />} path="/admin/users" />
+      <Route element={<Navigate replace to="/admin?tab=mcp" />} path="/admin/mcp" />
       {surfaces.map((surface) => (
         <Route
           element={
