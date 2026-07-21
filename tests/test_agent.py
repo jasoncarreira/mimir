@@ -3692,8 +3692,8 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
 
     notices = [(c, t) for c, t in chans.sent if c == "rec-ops"]
     # The preloaded poller context is internal-labeled and the deliver target is
-    # cross-channel, so the harness failure notice is now correctly blocked.
-    assert notices == []
+    # cross-channel, but default shadow mode records the would-block and delivers.
+    assert notices == [("rec-ops", "⚠️ px failed: RuntimeError: early boom")]
 
 
 async def test_no_deliver_notice_when_unset_on_early_crash(

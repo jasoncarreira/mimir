@@ -275,6 +275,21 @@ def test_compute_stats_failure_detection_by_suffix(tmp_path: Path):
     assert "event_queued" not in fbk
 
 
+def test_compute_stats_surfaces_harness_sink_blocks():
+    payload = compute_stats([
+        {
+            "type": "sink_blocked",
+            "_ts": datetime.now(timezone.utc),
+            "sink": "harness_auto_deliver",
+            "reason": "ifc_label_blocked:same_channel",
+        },
+    ], days=7)
+
+    assert payload["by_event"]["sink_blocked"] == 1
+    assert payload["failures_by_kind"]["sink_blocked"] == 1
+    assert payload["recent_failures"][0]["detail"] == "ifc_label_blocked:same_channel"
+
+
 def test_compute_stats_recent_failures_capped_and_sorted(tmp_path: Path):
     """Recent failures list is sorted most-recent-first and capped at 30."""
     log = tmp_path / "events.jsonl"

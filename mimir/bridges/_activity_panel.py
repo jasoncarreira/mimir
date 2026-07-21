@@ -13,8 +13,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..access_control import SinkGate
 from ..channel_registry import ChannelRegistry
+from ..harness_egress import harness_sink_allowed
 from ..turn_event_bus import TurnEventBus
 from ..turn_event_redaction import scrub_detail as _shared_scrub_detail
 from .base import MessageUpdate
@@ -304,24 +304,12 @@ class ActivityPanel:
 
     @staticmethod
     def _sink_allowed(model: ActivityPanelModel, sink_name: str) -> bool:
-        ifc_labels = model.ifc_labels
-        if model.auth_context is not None:
-            ifc_labels = model.auth_context.ifc_state.current(ifc_labels)
-        decision = SinkGate.check_sink_flow(
+        return harness_sink_allowed(
             sink_name,
             model.channel_id,
-            ifc_labels,
+            model.ifc_labels,
             model.auth_context,
-            enforce=True,
         )
-        if decision.allowed:
-            return True
-        log.warning(
-            "activity panel IFC sink blocked: sink=%s reason=%s",
-            sink_name,
-            decision.reason,
-        )
-        return False
 
     async def _post(self, model: ActivityPanelModel) -> None:
         if not self._sink_allowed(model, "activity_panel_post"):
