@@ -134,6 +134,29 @@ class SourceLabel:
         )
 
 
+def _dedup_source_labels(sources: Any) -> tuple["SourceLabel", ...]:
+    """Coerce ``sources`` to a stable, de-duplicated tuple of ``SourceLabel``.
+
+    ``sources`` is a tuple, never a ``frozenset[SourceLabel]``: a set of models
+    crashes pydantic's generic serializer (unhashable dict) on the Any-typed
+    runtime path (chainlink #971). Dedup preserves the "unique + append-only"
+    contract for direct construction — ``with_source`` stays the incremental
+    fast path but callers may also build ``sources=`` directly.
+    """
+    seen: set[SourceLabel] = set()
+    unique: list[SourceLabel] = []
+    for source in sources:
+        if not isinstance(source, SourceLabel):
+            raise TypeError(
+                f"sources must contain SourceLabel, got {type(source).__name__}"
+            )
+        if source in seen:
+            continue
+        seen.add(source)
+        unique.append(source)
+    return tuple(unique)
+
+
 @dataclass(frozen=True)
 class InformationFlowLabels:
     """Immutable/monotonic information flow control labels (chainlink #871).
@@ -153,22 +176,25 @@ class InformationFlowLabels:
 
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
-    # A TUPLE, not a frozenset: pydantic's generic (Any-typed field) serializer —
-    # which the deepagents filesystem tools trigger when model_dump'ing their
-    # injected runtime — rebuilds a set from the serialized SourceLabel dicts and
-    # dies with ``TypeError: unhashable type: 'dict'``. That path ignores every
-    # type-level serializer (incl. AuthContext's), so only a non-set container is
-    # safe. Kept unique + append-only via ``with_source`` (chainlink #971).
+    # A TUPLE, not a frozenset: mimir tools (postponed annotations -> empty
+    # _injected_args_keys) include the injected runtime in the model_dump that
+    # langchain's _parse_input runs to enumerate fields. The langgraph agent state
+    # (TurnContext) carries ifc_labels, so runtime.state holds an
+    # InformationFlowLabels. #1173's AuthContext serializer makes runtime.context
+    # opaque but does NOT touch runtime.state, so a frozenset[SourceLabel] there
+    # serializes to a set of dicts and dies with ``TypeError: unhashable type:
+    # 'dict'``, panicking the turn (chainlink #971) — this is the crash that
+    # survived #1173 in production. A non-set container is serialization-safe on
+    # every path; ``_dedup_source_labels`` keeps it unique + append-only.
     sources: tuple[SourceLabel, ...] = ()
     created_at: float = field(default_factory=time.monotonic, compare=False)
 
     def __post_init__(self) -> None:
-        # Enforce the tuple invariant at construction: a frozenset[SourceLabel]
-        # anywhere on this carrier re-introduces the #971 turn-crash (pydantic's
-        # generic serializer rebuilds a set from the serialized dicts). Coerce so
-        # no construction site — present or future — can violate it.
-        if not isinstance(self.sources, tuple):
-            object.__setattr__(self, "sources", tuple(self.sources))
+        # Enforce the invariant at construction: a serialization-safe tuple (never
+        # a frozenset[SourceLabel], which re-introduces the #971 turn-crash) that
+        # is stably de-duplicated, so direct ``sources=`` construction honors the
+        # same unique+append-only contract as ``with_source``.
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
 
     def with_label(self, label: str) -> "InformationFlowLabels":
         """Return new instance with added label (monotonic - only adds)."""
@@ -357,8 +383,7 @@ class DeclassificationCapability:
     expires_at: float
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sources, tuple):
-            object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
 
 
 @dataclass
@@ -563,12 +588,13 @@ class AuthContext:
         schema so instances still validate; override only serialization to a
         stable opaque placeholder. Nothing consumes the serialized form.
 
-        This fires ONLY where AuthContext is a statically-typed field (mimir's own
-        tools). Tools that receive the runtime through an ``Any``-typed field (the
-        deepagents filesystem tools) bypass this serializer entirely — pydantic's
-        generic serializer ignores every type-level schema — so the ``sources``
-        container is a ``tuple`` (not a ``frozenset[SourceLabel]``) to stay
-        serialization-safe on that path too. See ``InformationFlowLabels.sources``.
+        This makes ``runtime.context`` opaque, but NOT ``runtime.state``: the
+        langgraph agent state (``TurnContext``) also carries an
+        ``InformationFlowLabels``, which is serialized normally during the same
+        ``model_dump``. So ``InformationFlowLabels.sources`` is a ``tuple`` (not a
+        ``frozenset[SourceLabel]``) to stay serialization-safe on the state path
+        this serializer does not reach — the crash that survived #1173 in
+        production. See ``InformationFlowLabels.sources``.
         """
         from pydantic_core import core_schema
 

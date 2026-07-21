@@ -2340,46 +2340,69 @@ def test_ifc_sources_is_append_only_deduped_tuple():
     grown = labels.with_source(replace(src, resource_id="other"))
     assert isinstance(grown.sources, tuple)
     assert len(grown.sources) == 2
+    # Direct construction is stably de-duplicated too (the "unique" contract is
+    # enforced in __post_init__, not only via with_source) — chainlink #971 P2.
+    other = replace(src, resource_id="other")
+    deduped = InformationFlowLabels(sources=(src, src, other, src))
+    assert deduped.sources == (src, other)
+    # And element types are validated at construction.
+    with pytest.raises(TypeError):
+        InformationFlowLabels(sources=("not-a-source-label",))
 
 
-def test_authcontext_with_ifc_sources_serializes_through_any_typed_field():
-    """Regression (chainlink #971): the injected runtime's ``AuthContext`` is
-    ``model_dump``'d during langchain tool input-parsing purely to enumerate
-    fields. Tools that receive the runtime through an ``Any``-typed field (the
-    deepagents filesystem tools: read_file/write_file/ls/glob/grep) hit
-    pydantic's GENERIC serializer, which ignores every type-level schema
-    (including ``AuthContext.__get_pydantic_core_schema__``). If ``sources`` is a
-    ``frozenset[SourceLabel]`` it rebuilds a set from the serialized dicts and
-    raises ``TypeError: unhashable type: 'dict'``, panicking the whole turn. A
-    tuple container is the only path-safe fix; #1173's serializer alone did not
-    cover this Any-typed path.
+def test_mimir_tool_parse_input_survives_ifc_labels_in_runtime_state():
+    """Regression for the real #971 turn-crash, through a production mimir tool.
+
+    mimir's own tools use ``from __future__ import annotations`` and type
+    ``runtime: ToolRuntime[AuthContext]``; under postponed annotations langchain
+    cannot resolve the ``InjectedToolArg`` so ``_injected_args_keys`` is EMPTY and
+    the injected runtime is included in the ``model_dump()`` that ``_parse_input``
+    runs at ``langchain_core/tools/base.py`` to enumerate fields. The langgraph
+    agent state (``TurnContext``) carries ``ifc_labels``, so ``runtime.state``
+    holds an ``InformationFlowLabels``. #1173's ``AuthContext`` serializer only
+    makes ``runtime.context`` opaque — it does NOT touch ``runtime.state`` — so a
+    ``frozenset[SourceLabel]`` there rebuilds a set of serialized dicts and raises
+    ``TypeError: unhashable type: 'dict'``, panicking every autonomous turn. This
+    is why the deployed #1173 build kept crashing; storing ``sources`` as a tuple
+    is the actual fix. (deepagents' own tools exclude runtime and never hit this.)
     """
-    import typing
+    from langchain.tools import ToolRuntime
+    from langchain_core.runnables import RunnableConfig
 
-    import pydantic
+    from mimir.tools.store import memory_store
 
     src = SourceLabel(
         principal="service:github", domain="channel",
         resource_id="poller:github-activity", bridge_instance=None,
         sensitivity="internal",
     )
+    labels = InformationFlowLabels().with_source(src)
     ctx = AuthContext(
-        principal="p", canonical_principal="c", roles=("user",),
-        event_ingress=None, trigger="user_message", channel_id="ch",
-        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
-        ifc_labels=InformationFlowLabels().with_source(src),
+        principal="service:github", canonical_principal="service:github", roles=(),
+        event_ingress=None, trigger="saga_session_end",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.NON_INTERACTIVE, is_service=True,
+        ifc_labels=labels,
     )
 
-    class _ArgsAnyRuntime(pydantic.BaseModel):
-        model_config = {"arbitrary_types_allowed": True}
-        runtime: typing.Any = None
+    def _parse(state_labels: InformationFlowLabels) -> dict:
+        runtime = ToolRuntime(
+            state={"messages": [], "ifc_labels": state_labels}, context=ctx,
+            config=RunnableConfig(), stream_writer=lambda *_a, **_k: None,
+            tool_call_id="tc-971", store=None,
+        )
+        return memory_store._parse_input(
+            {"content": "note", "stream": "semantic", "runtime": runtime}, "tc-971",
+        )
 
-    # The regression: must NOT raise (mirrors deepagents fs-tool _parse_input).
-    _ArgsAnyRuntime(runtime=ctx).model_dump()
+    # The fix: ifc_labels (tuple sources) in runtime.state parses without crashing.
+    parsed = _parse(labels)
+    assert parsed.get("runtime") is not None
 
-    # Masked check — prove the assertion is meaningful: the pre-fix frozenset-of-
-    # models container still dies exactly as production did on this same path.
+    # Masked check — this is the exact production crash, and it proves #1173's
+    # context serializer does not cover the state path: reverting sources to a
+    # frozenset[SourceLabel] in runtime.state dies just as the live turns did.
     bad = InformationFlowLabels()
     object.__setattr__(bad, "sources", frozenset({src}))
     with pytest.raises(TypeError, match="unhashable"):
-        _ArgsAnyRuntime(runtime=replace(ctx, ifc_labels=bad)).model_dump()
+        _parse(bad)
