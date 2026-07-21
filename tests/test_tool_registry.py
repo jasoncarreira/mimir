@@ -1178,3 +1178,62 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
     runtime_http_ingress = MockRuntime(ctx_http_ingress)
     actor_http_ingress = _commitment_actor(runtime_http_ingress)
     assert actor_http_ingress is None or actor_http_ingress[0] != "service:scheduler"
+
+
+@pytest.mark.asyncio
+async def test_injected_runtime_delivered_despite_ifc_labels_regression():
+    """Regression for #971: tool input-parsing must not crash on a bound runtime
+    carrying populated IFC labels — AND must still deliver the injected args.
+
+    langchain's `_parse_input` calls ``model_dump()`` on the parsed args (which
+    include the injected ``ToolRuntime[AuthContext]``) purely to compute the field
+    set; the delivered values come from ``getattr`` on the validated model. The
+    default AuthContext serializer recursed into ``ifc_labels`` (whose
+    ``sources: frozenset[SourceLabel]`` python-serializes to a set of dicts ->
+    ``TypeError: unhashable type: 'dict'``) and ``ifc_state``'s threading.Lock,
+    panicking the whole turn. AuthContext now serializes opaquely — the crash is
+    gone and the injected ``runtime`` (and the server-authorized
+    ``mimir_direct_argv``) still reach the function. Excluding the fields instead
+    would DROP them (these tools use postponed annotations, so langchain's
+    ``_injected_args_keys`` is empty and never reinserts them).
+    """
+    from langchain.tools import ToolRuntime
+
+    from mimir.models import TurnInteractivity
+    from mimir.tools.memory import memory_get
+
+    src = SourceLabel(
+        principal="service:github", domain="channel",
+        resource_id="poller:github-activity", bridge_instance=None,
+        sensitivity="internal",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"internal"}), source_channels=frozenset({"c"}),
+        sources=frozenset({src}),  # non-empty -> the crashing case
+    )
+    ctx = AuthContext(
+        principal="service:github", canonical_principal="service:github",
+        roles=("github",), event_ingress=None, trigger="poller",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.INTERACTIVE, ifc_labels=labels,
+    )
+    runtime = ToolRuntime(
+        state={}, context=ctx, config={}, stream_writer=lambda _: None,
+        tool_call_id="tc-971", store=None,
+    )
+
+    # The exact path that crashed (`_parse_input`, which model_dump()s the args
+    # whose `runtime` field is typed ToolRuntime[AuthContext]) succeeds AND
+    # delivers the real runtime object to the tool's parsed kwargs.
+    parsed = memory_get._parse_input({"atom_ids": ["a1"], "runtime": runtime}, "tc-971")
+    assert parsed["runtime"] is runtime
+    assert parsed["runtime"].context is ctx
+
+    # The server-authorized direct argv injected by BudgetGateMiddleware must
+    # survive parsing (else trusted-service shell falls back to `bash -lc`).
+    parsed_shell = bash_async._parse_input(
+        {"command": "orig", "mimir_direct_argv": ["git", "status"], "runtime": runtime},
+        "tc-971",
+    )
+    assert parsed_shell["mimir_direct_argv"] == ["git", "status"]
+    assert parsed_shell["runtime"] is runtime
