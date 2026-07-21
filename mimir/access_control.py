@@ -32,10 +32,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
-from .read_policy import (
-    READ_RESOURCE_OPERATIONS,
-    read_target_from_arguments,
-)
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
@@ -432,6 +428,9 @@ def build_trigger_service_principal(
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    write_roots = tuple(dict.fromkeys(
+        root.resolve() for root in (*roots, *_configured_repo_write_roots())
+    ))
     operations = tuple(dict.fromkeys(
         "send_message" if capability == "operator_alert" else capability
         for capability in capabilities
@@ -452,7 +451,7 @@ def build_trigger_service_principal(
             sink_destinations.add(destination)
         if operation in {"write_file", "edit_file"}:
             policies.append(ServiceSinkPolicy(
-                operation, "exact_roots", json.dumps([str(root) for root in roots]),
+                operation, "exact_roots", json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
             policies.append(ServiceSinkPolicy(operation, "shell_profile", "scheduler_read_only"))
@@ -529,6 +528,20 @@ def _configured_file_write_roots() -> list[Path]:
     return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
 
 
+def _configured_repo_write_roots() -> list[Path]:
+    """Return only explicit external RW roots, excluding home and implicit /tmp."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+    )
+    return [Path(path) for path, mode in extra_roots if mode == "rw"]
+
+
 def _target_within_configured_roots(target: str, _destination: str) -> bool:
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -545,6 +558,18 @@ def _target_within_configured_write_roots(target: str, _destination: str) -> boo
     try:
         resolve_configured_write_target(target)
     except (OSError, PathOutsideHomeError):
+        return False
+    return True
+
+
+def _target_within_configured_repo_write_roots(target: str, _destination: str) -> bool:
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    if not Path(target).is_absolute():
+        return False
+    try:
+        resolve_within_roots(_configured_repo_write_roots(), target)
+    except (OSError, PathOutsideHomeError, RuntimeError):
         return False
     return True
 
@@ -737,6 +762,8 @@ def _target_within_exact_roots(target: str, destination: str) -> bool:
     """Confine a service write to the absolute roots frozen in its grant."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
+    if not Path(target).is_absolute():
+        return False
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
@@ -804,6 +831,7 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
 
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
+    "configured_repo_write_roots": _target_within_configured_repo_write_roots,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
@@ -1588,6 +1616,108 @@ class ChannelResourceAdapter:
         return channel_id
 
 
+class WriteResourceAdapter:
+    """Scope write/code operations by the server-authenticated caller axis."""
+
+    _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
+    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run"}
+    _PROTECTED_NAMES: frozenset[str] = frozenset({
+        ".env", "compose.env", "rate_limits.json",
+        "config", "credentials", "identities", "secrets", "secret",
+        "core-memory", "core_memory", "corememory", "prompts",
+    })
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        if tool_name in cls._RESOURCE_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
+        return None
+
+    @classmethod
+    def _is_protected_path(cls, path: Path) -> bool:
+        parts = tuple(part.lower() for part in path.parts)
+        for part in parts:
+            stem = Path(part).stem
+            if (
+                part in cls._PROTECTED_NAMES
+                or stem.split(".", 1)[0] in {
+                    "config", "credentials", "identities", "secret", "secrets",
+                }
+                or part.startswith(".env.")
+                or part.startswith("oauth_") and part.endswith(".json")
+                or Path(part).suffix in {".key", ".pem"}
+            ):
+                return True
+        return any(
+            parts[index:index + 2] == ("memory", "core")
+            for index in range(len(parts) - 1)
+        )
+
+    @classmethod
+    def _human_target_is_allowed(cls, target: str | None) -> bool:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not home or not isinstance(target, str) or not target.strip() or "\x00" in target:
+            return False
+        from ._paths import PathOutsideHomeError, resolve_within_roots
+
+        try:
+            home_root = Path(home).resolve()
+            state_root = (Path(home) / "state").resolve()
+            resolved = resolve_within_roots([home_root], target)
+            resolved.relative_to(state_root)
+        except (OSError, PathOutsideHomeError, RuntimeError, ValueError):
+            return False
+        return not cls._is_protected_path(resolved.relative_to(state_root))
+
+    @classmethod
+    def authorize_operation(
+        cls,
+        tool_name: str,
+        target: str | None,
+        auth_context: "AuthContext | None",
+        *,
+        enforce: bool,
+        service_allowed: bool,
+    ) -> ToolAuthorization:
+        roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+        if "admin" in roles or service_allowed:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                service_principal=(
+                    get_trusted_service_from_auth_context(auth_context)
+                    if service_allowed else None
+                ),
+                enforcement_enabled=enforce,
+            )
+
+        from .models import TurnInteractivity
+
+        in_scope = (
+            tool_name in cls._WRITE_OPERATIONS
+            and auth_context is not None
+            and getattr(auth_context, "interactivity", None) == TurnInteractivity.INTERACTIVE
+            and cls._human_target_is_allowed(target)
+        )
+        reason = None if in_scope else (
+            "admin_required" if tool_name == "worklink_run" else "write_scope"
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=in_scope or not enforce,
+            reason=reason,
+            required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not in_scope,
+        )
+
+
 class OperationCatalog:
     """Catalog of tool/operation authorization decisions (chainlink #865).
 
@@ -1611,7 +1741,9 @@ class OperationCatalog:
         "commitment_dismiss",
     })
 
-    _RESOURCE_SCOPED_OPERATIONS = READ_RESOURCE_OPERATIONS
+    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = (
+        READ_RESOURCE_OPERATIONS | WriteResourceAdapter._RESOURCE_OPERATIONS
+    )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
         "approve_declassification",
@@ -1625,7 +1757,6 @@ class OperationCatalog:
         "submit_proposal",
         "abandon_proposal",
         "request_mimir_update",
-        "worklink_run",
         "shell_exec",
         "bash_async",
         "bash_jobs_list",
@@ -1640,8 +1771,6 @@ class OperationCatalog:
         "saga_end_session",
         "saga_record_skill_learning",
         "saga_forget",
-        "write_file",
-        "edit_file",
         "set_poller_overrides",
         "download_files",
         "adownload_files",
@@ -1685,8 +1814,14 @@ class OperationCatalog:
     ) -> None:
         """Register a custom decision for an operation."""
         saga_mutations = globals().get("_SAGA_MUTATION_OPERATIONS", frozenset())
-        is_admin_catalogued = (
+        protected_decision = (
+            OperationDecision.RESOURCE_SCOPED
+            if name in self._RESOURCE_SCOPED_OPERATIONS
+            else OperationDecision.ADMIN_REQUIRED
+        )
+        is_protected_catalogued = (
             name in self._ADMIN_REQUIRED_OPERATIONS
+            or name in self._RESOURCE_SCOPED_OPERATIONS
             or name in self._ADMIN_BUILTIN_TOOL_NAMES
             or any(
                 name.endswith(f"__{catalogued}")
@@ -1694,11 +1829,12 @@ class OperationCatalog:
                 for catalogued in self._ADMIN_REQUIRED_OPERATIONS
             )
         )
-        if (
-            is_admin_catalogued or name in saga_mutations
-        ) and decision != OperationDecision.ADMIN_REQUIRED:
+        if name in saga_mutations:
+            protected_decision = OperationDecision.ADMIN_REQUIRED
+        if (is_protected_catalogued or name in saga_mutations) and decision != protected_decision:
             raise ValueError(
-                f"cannot downgrade protected operation {name!r} from ADMIN_REQUIRED"
+                f"cannot downgrade protected operation {name!r} "
+                f"from {protected_decision.value}"
             )
         self._custom_decisions[name] = decision
         if decision == OperationDecision.RESOURCE_SCOPED and scopes:
@@ -1774,6 +1910,9 @@ _global_operation_catalog = OperationCatalog()
 
 _global_operation_catalog.register_adapter_hook(
     ChannelResourceAdapter.get_decision,
+)
+_global_operation_catalog.register_adapter_hook(
+    WriteResourceAdapter.get_decision,
 )
 
 
@@ -2446,6 +2585,18 @@ class ToolRegistry:
                 )
                 channel_auth.flow_direction = flow_direction
                 return channel_auth
+            if tool_name in WriteResourceAdapter._RESOURCE_OPERATIONS:
+                write_auth = WriteResourceAdapter.authorize_operation(
+                    tool_name,
+                    sink_target,
+                    auth_context,
+                    enforce=enforce,
+                    service_allowed=service_allowed,
+                )
+                write_auth.flow_direction = flow_direction
+                if write_auth.is_shadow_decision:
+                    self._emit_shadow_decision(write_auth)
+                return write_auth
             if tool_name in READ_RESOURCE_OPERATIONS:
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                     allowed = True
@@ -2462,14 +2613,13 @@ class ToolRegistry:
                     if not enforce:
                         allowed = True
                         is_shadow = True
+            required_tier = AccessTier.ADMIN
+            if enforce:
+                allowed = False
+                reason = "resource_scoped"
             else:
-                required_tier = AccessTier.ADMIN
-                if enforce:
-                    allowed = False
-                    reason = "resource_scoped"
-                else:
-                    allowed = True
-                    is_shadow = True
+                allowed = True
+                is_shadow = True
         else:
             # Explicit service capabilities are authoritative even if a newly
             # added operation has not reached the catalog yet. This is a narrow
@@ -2792,18 +2942,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "file_search",
-                "get_turn",
-                "mimir_get_turn",
-            ),
+                                                                                                    ),
             readable_domains=(
                 "configured_inputs",
                 "filesystem",
@@ -2820,8 +2959,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "worklink",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
@@ -2841,17 +2980,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "saga_record_skill_learning",
                 "memory_get",
                 "memory_store",
-                "mimir_get_turn",
-                "get_turn",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-            ),
+                                                                                            ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga"),
             creation_path="mimir.server._on_session_idle",
@@ -2872,15 +3001,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "add_schedule",
                 "set_schedule_priority",
                 "list_schedules",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "send_message",
+                                                                                "send_message",
             ),
             readable_domains=(
                 "defaults",
@@ -2897,8 +3018,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "message",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_file_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("write_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy("edit_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
             ),
