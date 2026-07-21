@@ -13,6 +13,7 @@ from mimir.access_control import (
     AccessStatus,
     DenialReason,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
+    OperationCatalog,
     OperationDecision,
     ToolRegistry,
     authorize_action,
@@ -46,6 +47,162 @@ def _event(author: str | None) -> AgentEvent:
         author=author,
         content="hello",
     )
+
+
+READ_RESOURCE_TOOLS = (
+    "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
+    "file_search", "get_turn", "mimir_get_turn",
+)
+
+
+def _read_auth(*, admin: bool = False) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user", "admin") if admin else ("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+
+@pytest.mark.parametrize("tool_name", READ_RESOURCE_TOOLS)
+def test_read_operations_are_cataloged_resource_scoped(tool_name: str) -> None:
+    assert OperationCatalog().get_decision(tool_name) == OperationDecision.RESOURCE_SCOPED
+
+
+@pytest.mark.parametrize("root_kind", ["repo", "tmp", "state"])
+def test_non_admin_read_allows_configured_scopes(
+    root_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    repo = tmp_path / "repo"
+    state.mkdir(parents=True)
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+    roots = {"repo": repo, "tmp": Path("/tmp"), "state": state}
+    target = roots[root_kind] / f"mimir-read-scope-{tmp_path.name}.txt"
+    target.write_text("safe\n", encoding="utf-8")
+    try:
+        result = ToolRegistry().authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": str(target)},
+        )
+    finally:
+        if root_kind == "tmp":
+            target.unlink(missing_ok=True)
+
+    assert result.allowed is True
+    assert result.decision == OperationDecision.RESOURCE_SCOPED
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [".", ".env", "compose.env", "config/settings.toml", ".mimir/saga.db", "state/identities.yaml"],
+)
+def test_non_admin_read_denies_home_and_protected_surfaces(
+    relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    target = home / relative
+    if relative != ".":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("sensitive\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(target)},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
+def test_non_admin_direct_read_denies_secret_content_and_operator_secret_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    (home / "state").mkdir(parents=True)
+    repo.mkdir()
+    content_secret = repo / "notes.txt"
+    content_secret.write_text("ghp_" + "a" * 30, encoding="utf-8")
+    declared_secret = repo / "servers.json"
+    declared_secret.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(declared_secret))
+
+    registry = ToolRegistry()
+    for target in (content_secret, declared_secret):
+        result = registry.authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert result.allowed is False
+
+
+def test_non_admin_collection_auth_resolves_only_root_without_walking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    (home / "state").mkdir(parents=True)
+    repo.mkdir()
+    (repo / "secret.txt").write_text("ghp_" + "a" * 30, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+    monkeypatch.setattr(Path, "iterdir", lambda _self: pytest.fail("authz walked tree"))
+    monkeypatch.setattr(Path, "rglob", lambda _self, _pattern: pytest.fail("authz walked tree"))
+
+    result = ToolRegistry().authorize_tool(
+        "grep", _read_auth(), enforce=True,
+        arguments={"path": str(repo), "pattern": "needle"},
+    )
+
+    assert result.allowed is True
+
+
+def test_read_scope_denies_relative_missing_and_symlink_escape_but_admin_is_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    repo.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("outside", encoding="utf-8")
+    (repo / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    registry = ToolRegistry()
+    targets = (
+        "relative.txt",
+        repo / "missing.txt",
+        repo / ".." / "outside" / "secret.txt",
+        repo / "escape" / "secret.txt",
+    )
+    for target in targets:
+        denied = registry.authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert denied.allowed is False
+
+    admin = registry.authorize_tool(
+        "read_file", _read_auth(admin=True), enforce=True,
+        arguments={"file_path": str(secret)},
+    )
+    assert admin.allowed is True
 
 
 def test_worklink_repo_sink_adapter_matches_configured_repo(

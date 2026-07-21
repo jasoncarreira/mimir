@@ -32,6 +32,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
+from .read_policy import (
+    READ_RESOURCE_OPERATIONS,
+    read_target_from_arguments,
+)
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
@@ -1607,6 +1611,8 @@ class OperationCatalog:
         "commitment_dismiss",
     })
 
+    _RESOURCE_SCOPED_OPERATIONS = READ_RESOURCE_OPERATIONS
+
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
         "approve_declassification",
         "list_channels",
@@ -1637,20 +1643,9 @@ class OperationCatalog:
         "write_file",
         "edit_file",
         "set_poller_overrides",
-        "read_file",
-        "aread",
-        "ls",
-        "als",
-        "glob",
-        "aglob",
-        "grep",
-        "agrep",
         "download_files",
         "adownload_files",
-        "file_search",
         "rebuild_index",
-        "get_turn",
-        "mimir_get_turn",
     })
 
     # Global rows from these operations contain protected identities,
@@ -1745,6 +1740,9 @@ class OperationCatalog:
 
         if tool_name in self._OPEN_OPERATIONS:
             return OperationDecision.OPEN
+
+        if tool_name in self._RESOURCE_SCOPED_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
 
         if tool_name in self._ADMIN_REQUIRED_OPERATIONS:
             return OperationDecision.ADMIN_REQUIRED
@@ -2448,13 +2446,30 @@ class ToolRegistry:
                 )
                 channel_auth.flow_direction = flow_direction
                 return channel_auth
-            required_tier = AccessTier.ADMIN
-            if enforce:
-                allowed = False
-                reason = "resource_scoped"
+            if tool_name in READ_RESOURCE_OPERATIONS:
+                if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
+                    allowed = True
+                elif service_allowed:
+                    allowed = True
+                else:
+                    allowed = (
+                        auth_context is not None
+                        and read_target_from_arguments(tool_name, arguments) is not None
+                    )
+                required_tier = AccessTier.USER if allowed else AccessTier.ADMIN
+                if not allowed:
+                    reason = "read_scope"
+                    if not enforce:
+                        allowed = True
+                        is_shadow = True
             else:
-                allowed = True
-                is_shadow = True
+                required_tier = AccessTier.ADMIN
+                if enforce:
+                    allowed = False
+                    reason = "resource_scoped"
+                else:
+                    allowed = True
+                    is_shadow = True
         else:
             # Explicit service capabilities are authoritative even if a newly
             # added operation has not reached the catalog yet. This is a narrow

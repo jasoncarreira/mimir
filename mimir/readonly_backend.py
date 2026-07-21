@@ -71,15 +71,6 @@ def _log_truncation(op: str, reason: str) -> None:
     log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
 
 
-def _walk_files_bounded(root: Path, excludes: frozenset[str]) -> Iterator[Path]:
-    """Yield files under ``root`` without descending into excluded directories."""
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in excludes)
-        base = Path(dirpath)
-        for filename in sorted(filenames):
-            yield base / filename
-
-
 def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
     """Return the resolved real path iff ``key`` names an EXISTING file/dir
     whose real location is outside ``cwd``.
@@ -159,12 +150,33 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
         except (OSError, RuntimeError, ValueError):
             rel_parts = path.parts
-        return any(part in self._traversal_excludes for part in rel_parts)
+        if any(part in self._traversal_excludes for part in rel_parts):
+            return True
+        from .read_policy import is_protected_read_path, non_admin_read_filter_enabled
+
+        return non_admin_read_filter_enabled() and is_protected_read_path(path)
+
+    def _walk_files(self, root: Path) -> Iterator[Path]:
+        for dirpath, dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            dirnames[:] = sorted(
+                name for name in dirnames if not self._is_excluded(base / name)
+            )
+            for filename in sorted(filenames):
+                candidate = base / filename
+                if not self._is_excluded(candidate):
+                    yield candidate
 
     def _ripgrep_search(
         self, pattern: str, base_full: Path, include_glob: str | None,
     ) -> tuple[dict[str, list[tuple[int, str]]], str | None] | None:
         """Search with ripgrep while excluding expensive dirs and bounding time."""
+        from .read_policy import non_admin_read_filter_enabled
+
+        # The Python path checks each file's content once before returning any
+        # match. Ripgrep cannot provide that guarantee for secret-bearing files.
+        if non_admin_read_filter_enabled():
+            return None
         cmd = ["rg", "--json", "-F"]
         for name in sorted(self._traversal_excludes):
             cmd.extend(["--glob", f"!{name}/**"])
@@ -235,7 +247,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if base_full.is_file():
             candidates = iter([base_full])
         else:
-            candidates = _walk_files_bounded(root, self._traversal_excludes)
+            candidates = self._walk_files(root)
         scanned = 0
         matches = 0
         truncated: str | None = None
@@ -259,6 +271,10 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             try:
                 content = fp.read_text()
             except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
+                continue
+            from .read_policy import non_admin_read_filter_enabled, result_is_protected
+
+            if non_admin_read_filter_enabled() and result_is_protected(fp, text=content):
                 continue
             for line_num, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
@@ -337,7 +353,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if search_path.is_file():
             candidates = iter([search_path])
         else:
-            candidates = _walk_files_bounded(search_path, self._traversal_excludes)
+            candidates = self._walk_files(search_path)
         try:
             for candidate in candidates:
                 scanned += 1
@@ -347,6 +363,10 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 if not candidate.match(pattern):
                     continue
                 matched_path = candidate
+                from .read_policy import non_admin_read_filter_enabled, result_is_protected
+
+                if non_admin_read_filter_enabled() and result_is_protected(matched_path):
+                    continue
                 try:
                     is_file = matched_path.is_file()
                 except (PermissionError, OSError, RuntimeError):
@@ -400,6 +420,18 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             entry for entry in entries
             if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
         ]
+        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+
+        if non_admin_read_filter_enabled():
+            safe = []
+            for entry in filtered:
+                try:
+                    resolved = self._resolve_path(str(entry.get("path", "")).rstrip("/"))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not result_is_protected(resolved):
+                    safe.append(entry)
+            filtered = safe
         return LsResult(error=result.error, entries=filtered)
 
 
@@ -468,6 +500,14 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
+        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+
+        if non_admin_read_filter_enabled():
+            try:
+                if result_is_protected(self._resolve_path(file_path)):
+                    return ReadResult(error="Read denied: protected file")
+            except (OSError, RuntimeError, ValueError):
+                return ReadResult(error="Read denied: unresolved path")
         try:
             result = super().read(file_path, offset, limit)
         except ValueError as e:
@@ -479,6 +519,14 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
+        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+
+        if non_admin_read_filter_enabled():
+            try:
+                if result_is_protected(self._resolve_path(file_path)):
+                    return ReadResult(error="Read denied: protected file")
+            except (OSError, RuntimeError, ValueError):
+                return ReadResult(error="Read denied: unresolved path")
         result = await super().aread(file_path, offset, limit)
         if result.error is None:
             self._publish_read_provenance(file_path)
