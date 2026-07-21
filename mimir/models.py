@@ -530,6 +530,31 @@ class AuthContext:
     # session IDs are only selectors and must match this immutable value.
     saga_session_id: str | None = None
 
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        """Serialize opaquely wherever pydantic dumps an AuthContext.
+
+        AuthContext is injected into tools as ``ToolRuntime[AuthContext]``.
+        langchain's tool input-parsing (`_parse_input`) calls ``model_dump()`` on
+        the parsed args purely to compute the field set; the delivered values are
+        taken from ``getattr`` on the validated model, so the real runtime object
+        still reaches the tool regardless of what this serializer emits. But the
+        default dataclass serializer would recurse into fields pydantic cannot
+        python-serialize — ``ifc_labels``'s ``frozenset[SourceLabel]`` (pydantic
+        rebuilds a set of the serialized dicts → ``TypeError: unhashable type:
+        'dict'``) and ``ifc_state``'s ``threading.Lock`` — which raised and
+        panicked the ENTIRE turn (chainlink #971). Keep the default *validation*
+        schema so instances still validate; override only serialization to a
+        stable opaque placeholder. Nothing consumes the serialized form.
+        """
+        from pydantic_core import core_schema
+
+        schema = handler(source)
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            lambda _value: None,
+        )
+        return schema
+
 
 @dataclass(frozen=True)
 class PromptBlock:
