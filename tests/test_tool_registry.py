@@ -31,7 +31,6 @@ _OLD_ADMIN_TOOLS = {
     "submit_proposal",
     "abandon_proposal",
     "request_mimir_update",
-    "worklink_run",
     "shell_exec",
     "bash_async",
     "spawn_claude_code",
@@ -39,8 +38,6 @@ _OLD_ADMIN_TOOLS = {
     "spawn_open_code",
     "task",
     "saga_forget",
-    "write_file",
-    "edit_file",
 }
 
 _NEWLY_CATALOGED_TOOLS = {
@@ -109,6 +106,10 @@ def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     catalog = OperationCatalog()
 
     assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert {
+        catalog.get_decision(name)
+        for name in ("write_file", "edit_file", "worklink_run")
+    } == {OperationDecision.RESOURCE_SCOPED}
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
 
@@ -287,6 +288,18 @@ def test_register_operation_refuses_protected_downgrade(operation: str) -> None:
         catalog.register_operation(operation, OperationDecision.OPEN)
 
     assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+
+
+@pytest.mark.parametrize("operation", ["write_file", "edit_file", "worklink_run"])
+def test_register_operation_refuses_resource_scope_reclassification(
+    operation: str,
+) -> None:
+    catalog = OperationCatalog()
+
+    with pytest.raises(ValueError, match="cannot reclassify protected operation"):
+        catalog.register_operation(operation, OperationDecision.OPEN)
+
+    assert catalog.get_decision(operation) == OperationDecision.RESOURCE_SCOPED
 
 
 def test_runtime_inventory_replaced_from_final_model_surface() -> None:
@@ -1036,7 +1049,9 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
             assert result.allowed is True, f"{trigger} should allow {operation}"
         else:
             assert result.allowed is False, f"{trigger} should deny {operation}"
-            assert result.reason in ("admin_required", "unknown_operation"), f"{trigger} {operation} denied for wrong reason: {result.reason}"
+            assert result.reason in (
+                "admin_required", "unknown_operation", "ifc_label_blocked:spawn",
+            ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
 
 
 def test_service_authorization_requires_two_factor_validation() -> None:

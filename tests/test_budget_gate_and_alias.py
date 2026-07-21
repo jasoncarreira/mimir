@@ -1554,7 +1554,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
     assert admin_event["tool"] == "worklink_run"
     assert admin_event["canonical_author"] == "alice"
-    assert admin_event["denial_reason"] == "admin_required"
+    assert admin_event["denial_reason"] == "resource_scope_denied"
 
 
 @pytest.mark.asyncio

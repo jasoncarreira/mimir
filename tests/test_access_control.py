@@ -24,9 +24,12 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    Integrity,
+    IntegrityEffect,
     SessionACL,
     SourceLabel,
     TurnContext,
+    TurnInteractivity,
 )
 
 
@@ -66,6 +69,195 @@ def test_worklink_repo_sink_adapter_matches_configured_repo(
     monkeypatch.setenv("WORKLINK_REPO", str(configured))
     assert access_control._target_matches_worklink_repo(str(configured), "unused") is True
     assert access_control._target_matches_worklink_repo(str(other), "unused") is False
+
+
+def _interactive_user_auth(*, admin: bool = False) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user", "admin") if admin else ("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+    )
+
+
+def _integrity_labels(*, trusted: bool) -> InformationFlowLabels:
+    source = SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity=Integrity.TRUSTED if trusted else Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    return InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=frozenset({source}),
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_non_admin_file_write_is_limited_to_configured_repo_rw_roots(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    readonly = tmp_path / "readonly"
+    outside = tmp_path / "outside"
+    for directory in (home, repo, readonly, outside):
+        directory.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw,{readonly}:ro",
+    )
+    labels = _integrity_labels(trusted=False)
+    auth = _interactive_user_auth()
+
+    destinations = {
+        "repo": (repo / "src" / "change.py", True),
+        "home": (home / "notes.txt", False),
+        "config": (home / ".mimir" / "config.json", False),
+        "secret": (home / ".env", False),
+        "core-memory": (home / "memory" / "core" / "policy.md", False),
+        "prompt": (home / "prompts" / "system.md", False),
+        "read-only": (readonly / "reference.txt", False),
+        "outside": (outside / "file.txt", False),
+        "system": (Path("/etc/passwd"), False),
+    }
+
+    for name, (destination, expected) in destinations.items():
+        decision = ToolRegistry().authorize_tool(
+            tool_name,
+            auth,
+            enforce=True,
+            target_channel=str(destination),
+            ifc_labels=labels,
+        )
+        assert decision.allowed is expected, name
+        assert decision.decision is OperationDecision.RESOURCE_SCOPED, name
+
+
+@pytest.mark.parametrize("escape", ["traversal", "symlink"])
+def test_non_admin_file_write_denies_repo_root_escape(
+    escape: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    for directory in (home, repo, outside):
+        directory.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    if escape == "symlink":
+        (repo / "escape").symlink_to(outside, target_is_directory=True)
+        target = repo / "escape" / "file.txt"
+    else:
+        target = repo / ".." / "outside" / "file.txt"
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        _interactive_user_auth(),
+        enforce=True,
+        target_channel=str(target),
+        ifc_labels=_integrity_labels(trusted=False),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "resource_scope_denied"
+
+
+def test_non_admin_worklink_run_requires_trusted_turn_and_configured_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    repo.mkdir()
+    other.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    auth = _interactive_user_auth()
+
+    trusted = ToolRegistry().authorize_tool(
+        "worklink_run",
+        auth,
+        enforce=True,
+        target_channel=str(repo),
+        ifc_labels=_integrity_labels(trusted=True),
+    )
+    untrusted = ToolRegistry().authorize_tool(
+        "worklink_run",
+        auth,
+        enforce=True,
+        target_channel=str(repo),
+        ifc_labels=_integrity_labels(trusted=False),
+    )
+    wrong_repo = ToolRegistry().authorize_tool(
+        "worklink_run",
+        auth,
+        enforce=True,
+        target_channel=str(other),
+        ifc_labels=_integrity_labels(trusted=True),
+    )
+
+    assert trusted.allowed is True
+    assert trusted.decision is OperationDecision.RESOURCE_SCOPED
+    assert untrusted.allowed is False
+    assert untrusted.reason == "ifc_label_blocked:spawn"
+    assert wrong_repo.allowed is False
+    assert wrong_repo.reason == "resource_scope_denied"
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["spawn_claude_code", "spawn_codex", "spawn_open_code"],
+)
+def test_non_admin_spawn_remains_admin_required(
+    tool_name: str,
+    tmp_path: Path,
+) -> None:
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _interactive_user_auth(),
+        enforce=True,
+        target_channel=str(tmp_path),
+        ifc_labels=InformationFlowLabels(),
+    )
+
+    assert decision.allowed is False
+    assert decision.decision is OperationDecision.ADMIN_REQUIRED
+    assert decision.reason == "admin_required"
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "worklink_run"])
+def test_admin_is_unaffected_by_regular_user_resource_scope(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    target = repo if tool_name == "worklink_run" else tmp_path / "outside.txt"
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _interactive_user_auth(admin=True),
+        enforce=True,
+        target_channel=str(target),
+        ifc_labels=InformationFlowLabels(),
+    )
+
+    assert decision.allowed is True
+    assert decision.decision is OperationDecision.RESOURCE_SCOPED
 
 
 def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> None:

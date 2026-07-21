@@ -496,33 +496,57 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
     raise ValueError(f"unknown built-in authority profile: {profile!r}")
 
 
+def _configured_external_file_roots(*, include_implicit: bool) -> list[tuple[Path, str]]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""),
+        Path(home),
+        always_rw=None if include_implicit else (),
+    )
+    return [(Path(path), mode) for path, mode in extra_roots]
+
+
 def _configured_file_roots() -> list[Path]:
     """Return the same roots exposed by the live file-tool backend."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return []
+    return [
+        Path(home),
+        *(path for path, _mode in _configured_external_file_roots(include_implicit=True)),
+    ]
 
-    # Import lazily: config imports this module while defining Config. Reuse its
-    # parser rather than maintaining a second env syntax/validation policy here.
-    from .config import _parse_file_tool_roots
 
-    extra_roots = _parse_file_tool_roots(
-        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
-    )
-    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
+def _configured_repo_write_roots() -> list[Path]:
+    """Return external source/repository roots exposed read-write to file tools."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    return [
+        path
+        for path, mode in _configured_external_file_roots(include_implicit=False)
+        if mode == "rw"
+    ]
 
 
 def _configured_file_write_roots() -> list[Path]:
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return []
-
-    from .config import _parse_file_tool_roots
-
-    extra_roots = _parse_file_tool_roots(
-        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
-    )
-    return [Path(home), *(Path(path) for path, mode in extra_roots if mode == "rw")]
+    return [
+        Path(home),
+        *(
+            path
+            for path, mode in _configured_external_file_roots(include_implicit=True)
+            if mode == "rw"
+        ),
+    ]
 
 
 def _target_within_configured_roots(target: str, _destination: str) -> bool:
@@ -808,6 +832,47 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "approved_urls": _target_matches_approved_url,
 }
 
+
+def _interactive_resource_policy(
+    tool_name: str,
+    auth_context: Any,
+) -> ServiceSinkPolicy | None:
+    """Bind an authenticated regular-user call to its narrow resource scope."""
+    if auth_context is None:
+        return None
+    roles = getattr(auth_context, "roles", ()) or ()
+    interactivity = getattr(auth_context, "interactivity", None)
+    if (
+        "user" not in roles
+        or "admin" in roles
+        or not isinstance(getattr(auth_context, "canonical_principal", None), str)
+        or getattr(interactivity, "value", interactivity) != "interactive"
+    ):
+        return None
+    if tool_name in {"write_file", "edit_file"}:
+        roots = _configured_repo_write_roots()
+        if not roots:
+            return None
+        return ServiceSinkPolicy(
+            tool_name,
+            "exact_roots",
+            json.dumps([str(root.resolve()) for root in roots]),
+        )
+    if tool_name == "worklink_run":
+        return ServiceSinkPolicy(
+            tool_name, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
+        )
+    return None
+
+
+def _has_untrusted_active_ingest(ifc_labels: Any, auth_context: Any) -> bool:
+    state = getattr(auth_context, "ifc_state", None)
+    if state is not None and callable(
+        getattr(state, "has_untrusted_active_ingest", None)
+    ):
+        return state.has_untrusted_active_ingest(ifc_labels)
+    return bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
     SinkCategory.SHELL_PROCESS: "shell_process",
     SinkCategory.SPAWN: "spawn_process",
@@ -864,12 +929,8 @@ class SinkGate:
             tool_name,
             _LEGACY_SERVICE_SINK_TIERS.get(tool_name, CapabilityTier.UNBOUNDED),
         )
-        state = getattr(auth_context, "ifc_state", None)
-        has_untrusted_active_ingest = (
-            state.has_untrusted_active_ingest(ifc_labels)
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            ifc_labels, auth_context,
         )
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return tool_name == "worklink_run" and not has_untrusted_active_ingest
@@ -958,11 +1019,8 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
         state = getattr(auth_context, "ifc_state", None)
-        has_untrusted_active_ingest = (
-            state.has_untrusted_active_ingest(ifc_labels)
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            ifc_labels, auth_context,
         )
         if (
             is_application_egress
@@ -1038,6 +1096,28 @@ class SinkGate:
                 is_shadow_decision=not enforce,
             )
         service_policy: ServiceSinkPolicy | None = None
+        if service is None:
+            service_policy = _interactive_resource_policy(tool_name, auth_context)
+            if service_policy is not None:
+                adapter = _SERVICE_SINK_ADAPTERS.get(service_policy.adapter)
+                if adapter is None or not adapter(target, service_policy.destination):
+                    return ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.RESOURCE_SCOPED,
+                        allowed=not enforce,
+                        reason="resource_scope_denied",
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                    )
+                if tool_name == "worklink_run" and has_untrusted_active_ingest:
+                    return ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.RESOURCE_SCOPED,
+                        allowed=not enforce,
+                        reason=f"ifc_label_blocked:{sink_category.value}",
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                    )
         if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
             candidate = service.sink_policy_for(tool_name)
             if candidate is not None:
@@ -1209,6 +1289,8 @@ class SinkGate:
             ):
                 return frozenset({target})
             return frozenset()
+        if service is None and service_policy is not None and target is not None:
+            return frozenset({target})
         if service is not None and service_policy is not None and target is not None:
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
@@ -1619,11 +1701,12 @@ class OperationCatalog:
         "submit_proposal",
         "abandon_proposal",
         "request_mimir_update",
-        "worklink_run",
         "shell_exec",
         "bash_async",
         "bash_jobs_list",
         "bash_job_output",
+        # A repository cwd does not confine a subprocess. Keep these admin-only
+        # until a Landlock/bwrap/container isolation substrate exists.
         "spawn_claude_code",
         "spawn_codex",
         "spawn_open_code",
@@ -1634,8 +1717,6 @@ class OperationCatalog:
         "saga_end_session",
         "saga_record_skill_learning",
         "saga_forget",
-        "write_file",
-        "edit_file",
         "set_poller_overrides",
         "read_file",
         "aread",
@@ -1651,6 +1732,12 @@ class OperationCatalog:
         "rebuild_index",
         "get_turn",
         "mimir_get_turn",
+    })
+
+    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = frozenset({
+        "write_file",
+        "edit_file",
+        "worklink_run",
     })
 
     # Global rows from these operations contain protected identities,
@@ -1699,11 +1786,16 @@ class OperationCatalog:
                 for catalogued in self._ADMIN_REQUIRED_OPERATIONS
             )
         )
+        is_resource_catalogued = name in self._RESOURCE_SCOPED_OPERATIONS
         if (
             is_admin_catalogued or name in saga_mutations
         ) and decision != OperationDecision.ADMIN_REQUIRED:
             raise ValueError(
                 f"cannot downgrade protected operation {name!r} from ADMIN_REQUIRED"
+            )
+        if is_resource_catalogued and decision != OperationDecision.RESOURCE_SCOPED:
+            raise ValueError(
+                f"cannot reclassify protected operation {name!r} from RESOURCE_SCOPED"
             )
         self._custom_decisions[name] = decision
         if decision == OperationDecision.RESOURCE_SCOPED and scopes:
@@ -1731,9 +1823,10 @@ class OperationCatalog:
         1. Custom registered decisions
         2. Adapter hook results
         3. Built-in OPEN operations
-        4. Built-in ADMIN_REQUIRED operations
-        5. MCP name variations (admin required)
-        6. Unknown operations -> UNKNOWN (fail closed when enforcement on)
+        4. Built-in RESOURCE_SCOPED operations
+        5. Built-in ADMIN_REQUIRED operations
+        6. MCP name variations (admin required)
+        7. Unknown operations -> UNKNOWN (fail closed when enforcement on)
         """
         if tool_name in self._custom_decisions:
             return self._custom_decisions[tool_name]
@@ -1745,6 +1838,9 @@ class OperationCatalog:
 
         if tool_name in self._OPEN_OPERATIONS:
             return OperationDecision.OPEN
+
+        if tool_name in self._RESOURCE_SCOPED_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
 
         if tool_name in self._ADMIN_REQUIRED_OPERATIONS:
             return OperationDecision.ADMIN_REQUIRED
@@ -2448,13 +2544,34 @@ class ToolRegistry:
                 )
                 channel_auth.flow_direction = flow_direction
                 return channel_auth
-            required_tier = AccessTier.ADMIN
-            if enforce:
-                allowed = False
-                reason = "resource_scoped"
-            else:
+            roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+            if "admin" in roles or service_allowed:
                 allowed = True
-                is_shadow = True
+            else:
+                policy = _interactive_resource_policy(tool_name, auth_context)
+                adapter = (
+                    _SERVICE_SINK_ADAPTERS.get(policy.adapter)
+                    if policy is not None
+                    else None
+                )
+                resource_allowed = bool(
+                    policy is not None
+                    and adapter is not None
+                    and sink_target is not None
+                    and adapter(sink_target, policy.destination)
+                    and (
+                        tool_name != "worklink_run"
+                        or not _has_untrusted_active_ingest(ifc_labels, auth_context)
+                    )
+                )
+                if resource_allowed:
+                    allowed = True
+                elif enforce:
+                    allowed = False
+                    reason = "resource_scope_denied"
+                else:
+                    allowed = True
+                    is_shadow = True
         else:
             # Explicit service capabilities are authoritative even if a newly
             # added operation has not reached the catalog yet. This is a narrow
