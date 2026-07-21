@@ -22,6 +22,7 @@ from mimir.access_control import (
     authorize_inbound,
     build_trigger_service_principal,
     create_auth_context,
+    get_service_principal,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -163,6 +164,125 @@ def _service_auth(
         enforcement_enabled=True,
         ifc_labels=labels,
     )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "canonical"),
+    [("scheduled_tick", "scheduler"), ("upgrade", "system")],
+)
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
+    trigger: str,
+    canonical: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = get_service_principal(trigger)
+    assert service is not None and service.canonical == canonical
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        home / "state" / "journal" / "entry.md",
+        home / "memory" / "issues" / "970.md",
+        home / "memory" / "core" / "service-axis.md",
+        repo / "source.py",
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, target
+
+    for target in (
+        home / "root.txt",
+        outside / "data.txt",
+        Path("/tmp/unscoped.txt"),
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_denies_protected_home_paths(
+    trigger: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    protected = (
+        home / "state" / ".env",
+        home / "state" / "config.yaml",
+        home / "state" / "credentials.json",
+        home / "state" / "identities.yaml",
+        home / "state" / "secrets" / "token.txt",
+        home / "state" / "prompts" / "system.md",
+        home / "state" / ".mimir" / "pending-update.flag",
+        home / "memory" / "config" / "runtime.yaml",
+        home / "memory" / "credentials.json",
+        home / "memory" / "identities.yaml",
+        home / "memory" / "secrets.md",
+        home / "memory" / "prompts" / "system.md",
+        home / "memory" / ".mimir" / "state.json",
+    )
+    for target in protected:
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+def test_static_service_write_allows_home_when_file_tool_roots_unset(
+    trigger: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        home / "state" / "journal" / "entry.md",
+        home / "memory" / "issues" / "970.md",
+        home / "memory" / "core" / "service-axis.md",
+        Path("state/journal/relative.md"),
+        Path("memory/issues/relative.md"),
+    ):
+        decision = registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, target
 
 
 def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(

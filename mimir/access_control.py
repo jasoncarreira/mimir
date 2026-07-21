@@ -574,6 +574,57 @@ def _target_within_configured_repo_write_roots(target: str, _destination: str) -
     return True
 
 
+_STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
+    ".env", ".mimir", "config", "credentials", "identities", "prompts",
+    "secret", "secrets",
+})
+
+
+def _is_static_service_protected_write_path(path: Path) -> bool:
+    """Keep live scheduler/system writes away from operator-controlled data."""
+    for part in (part.lower() for part in path.parts):
+        stem = Path(part).stem
+        if (
+            part in _STATIC_SERVICE_PROTECTED_WRITE_NAMES
+            or stem.split(".", 1)[0] in {
+                "config", "credentials", "identities", "secret", "secrets",
+            }
+            or part.startswith(".env.")
+            or part.startswith("oauth_") and part.endswith(".json")
+            or Path(part).suffix in {".key", ".pem"}
+        ):
+            return True
+    return False
+
+
+def _target_within_static_service_write_roots(target: str, _destination: str) -> bool:
+    """Authorize static service writes to repo RW roots and safe home data."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return False
+    home_root = Path(home).resolve()
+    roots = [
+        *(root.resolve() for root in _configured_repo_write_roots()),
+        (home_root / "state").resolve(),
+        (home_root / "memory").resolve(),
+    ]
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = home_root / candidate
+    try:
+        resolved = resolve_within_roots(roots, str(candidate))
+        relative = next(
+            resolved.relative_to(root)
+            for root in roots
+            if resolved == root or resolved.is_relative_to(root)
+        )
+    except (OSError, PathOutsideHomeError, RuntimeError, StopIteration):
+        return False
+    return not _is_static_service_protected_write_path(relative)
+
+
 def resolve_configured_write_target(target: str) -> Path:
     """Resolve a write sink exactly as the configured-roots adapter does."""
     from ._paths import resolve_within_roots
@@ -832,6 +883,7 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "configured_repo_write_roots": _target_within_configured_repo_write_roots,
+    "static_service_write_roots": _target_within_static_service_write_roots,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
@@ -2959,8 +3011,14 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "worklink",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy(
+                    "write_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+                ServiceSinkPolicy(
+                    "edit_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
@@ -3018,8 +3076,14 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "message",
             ),
             sink_policies=(
-                ServiceSinkPolicy("write_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("edit_file", "configured_repo_write_roots", "MIMIR_FILE_TOOL_ROOTS"),
+                ServiceSinkPolicy(
+                    "write_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+                ServiceSinkPolicy(
+                    "edit_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
             ),
