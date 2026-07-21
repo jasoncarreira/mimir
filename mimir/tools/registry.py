@@ -2510,6 +2510,61 @@ async def worklink_run(
     return " ".join(parts)
 
 
+def _is_injected_arg_field(field_info: Any) -> bool:
+    """True if a tool arg is runtime-injected (ToolRuntime / InjectedToolArg).
+
+    Injected args are supplied by the runtime at call time, never by the model,
+    and their value is not read back from the parsed input.
+    """
+    import typing
+
+    annotation = getattr(field_info, "annotation", None)
+    candidates = [annotation]
+    if typing.get_origin(annotation) is typing.Union:
+        candidates.extend(typing.get_args(annotation))
+    for candidate in candidates:
+        origin = typing.get_origin(candidate) or candidate
+        try:
+            if origin is ToolRuntime or (isinstance(origin, type) and issubclass(origin, ToolRuntime)):
+                return True
+        except TypeError:  # pragma: no cover - non-class origins
+            pass
+    for meta in getattr(field_info, "metadata", None) or ():
+        if isinstance(meta, InjectedToolArg) or (isinstance(meta, type) and issubclass(meta, InjectedToolArg)):
+            return True
+    return False
+
+
+def _harden_injected_arg_serialization(tools: list) -> None:
+    """Exclude runtime-injected args from each tool's args-schema *serialization*.
+
+    langchain's tool input-parsing calls ``model_dump()`` on the validated args,
+    which includes the injected ``runtime`` (a ``ToolRuntime[AuthContext]``).
+    Dumping a bound ``AuthContext`` recurses into its per-turn IFC labels, whose
+    ``sources: frozenset[SourceLabel]`` cannot be python-serialized — pydantic
+    rebuilds a set of the serialized dicts and raises ``TypeError: unhashable
+    type: 'dict'``, which panics the ENTIRE turn (langgraph re-raises the tool
+    error). The injected value is re-supplied by the runtime at call time and is
+    never read from the parsed dump, so excluding it from serialization is safe
+    and leaves IFC semantics untouched (chainlink #971).
+    """
+    for tool in tools:
+        schema = getattr(tool, "args_schema", None)
+        fields = getattr(schema, "model_fields", None)
+        if not isinstance(fields, dict):
+            continue
+        changed = False
+        for field_info in fields.values():
+            if not getattr(field_info, "exclude", False) and _is_injected_arg_field(field_info):
+                field_info.exclude = True
+                changed = True
+        if changed:
+            try:
+                schema.model_rebuild(force=True)
+            except Exception:  # pragma: no cover - defensive; never fail tool assembly
+                log.exception("failed to rebuild args_schema after excluding injected args")
+
+
 def all_mimir_tools(model_spec: str | None = None) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
@@ -2617,6 +2672,11 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools
     tools.extend(get_mcp_tools())
+    # Exclude runtime-injected args (ToolRuntime / InjectedToolArg) from tool
+    # args serialization: langchain model_dump()s the parsed input, and dumping
+    # a bound AuthContext -> per-turn IFC labels (frozenset[SourceLabel]) raises
+    # ``unhashable type: 'dict'`` and panics the turn (chainlink #971).
+    _harden_injected_arg_serialization(tools)
     # Per-turn tool-call budget gating moved to ``BudgetGateMiddleware``
     # (mimir/tools/budget_gate.py) and wired via ``create_deep_agent
     # (middleware=...)`` in agent.py. The middleware intercepts every

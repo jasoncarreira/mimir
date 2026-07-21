@@ -1178,3 +1178,50 @@ def test_commitment_actor_requires_two_factor_validation() -> None:
     runtime_http_ingress = MockRuntime(ctx_http_ingress)
     actor_http_ingress = _commitment_actor(runtime_http_ingress)
     assert actor_http_ingress is None or actor_http_ingress[0] != "service:scheduler"
+
+
+def test_injected_runtime_arg_excluded_from_tool_arg_serialization():
+    """Regression for #971: the injected ``runtime`` arg must not be serialized.
+
+    langchain's tool input-parsing calls ``model_dump()`` on the validated args,
+    which includes the injected ``ToolRuntime[AuthContext]``. Dumping a bound
+    AuthContext recurses into its per-turn IFC labels, whose
+    ``sources: frozenset[SourceLabel]`` cannot be python-serialized (pydantic
+    rebuilds a set of the serialized dicts -> ``TypeError: unhashable type:
+    'dict'``), which panicked the ENTIRE turn. all_mimir_tools() must exclude the
+    injected args from serialization.
+    """
+    import typing as _t
+
+    import pydantic as _pyd
+
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent
+    from mimir.tools.registry import all_mimir_tools
+
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity", service_principal="github"
+    )
+    labels = _service_labels(event)  # populated sources: frozenset[SourceLabel]
+
+    # The underlying value genuinely fails python-mode model_dump — this is the
+    # crash the exclusion sidesteps.
+    class _Holder(_pyd.BaseModel):
+        model_config = {"arbitrary_types_allowed": True}
+        x: _t.Any = None
+
+    with pytest.raises(TypeError):
+        _Holder(x=labels).model_dump()
+
+    ctx = create_auth_context(event, ifc_labels=labels)
+    tools = {t.name: t for t in all_mimir_tools()}
+    for name in ("memory_get", "bash_async", "saga_end_session"):
+        tool = tools[name]
+        fields = tool.args_schema.model_fields
+        assert "runtime" in fields, name
+        assert fields["runtime"].exclude is True, name
+        # Binding a populated-IFC AuthContext as the runtime must NOT crash the
+        # dump now that the field is excluded, and runtime is omitted from output.
+        model = tool.args_schema.model_construct(runtime=ctx)
+        dumped = model.model_dump()
+        assert "runtime" not in dumped, name
