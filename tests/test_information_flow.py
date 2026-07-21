@@ -2350,59 +2350,123 @@ def test_ifc_sources_is_append_only_deduped_tuple():
         InformationFlowLabels(sources=("not-a-source-label",))
 
 
-def test_mimir_tool_parse_input_survives_ifc_labels_in_runtime_state():
-    """Regression for the real #971 turn-crash, through a production mimir tool.
-
-    mimir's own tools use ``from __future__ import annotations`` and type
-    ``runtime: ToolRuntime[AuthContext]``; under postponed annotations langchain
-    cannot resolve the ``InjectedToolArg`` so ``_injected_args_keys`` is EMPTY and
-    the injected runtime is included in the ``model_dump()`` that ``_parse_input``
-    runs at ``langchain_core/tools/base.py`` to enumerate fields. The langgraph
-    agent state (``TurnContext``) carries ``ifc_labels``, so ``runtime.state``
-    holds an ``InformationFlowLabels``. #1173's ``AuthContext`` serializer only
-    makes ``runtime.context`` opaque — it does NOT touch ``runtime.state`` — so a
-    ``frozenset[SourceLabel]`` there rebuilds a set of serialized dicts and raises
-    ``TypeError: unhashable type: 'dict'``, panicking every autonomous turn. This
-    is why the deployed #1173 build kept crashing; storing ``sources`` as a tuple
-    is the actual fix. (deepagents' own tools exclude runtime and never hit this.)
-    """
-    from langchain.tools import ToolRuntime
-    from langchain_core.runnables import RunnableConfig
-
-    from mimir.tools.store import memory_store
-
+def _service_turn_auth_context() -> AuthContext:
     src = SourceLabel(
         principal="service:github", domain="channel",
         resource_id="poller:github-activity", bridge_instance=None,
         sensitivity="internal",
     )
-    labels = InformationFlowLabels().with_source(src)
-    ctx = AuthContext(
+    return AuthContext(
         principal="service:github", canonical_principal="service:github", roles=(),
         event_ingress=None, trigger="saga_session_end",
         channel_id="poller:github-activity",
         interactivity=TurnInteractivity.NON_INTERACTIVE, is_service=True,
-        ifc_labels=labels,
+        ifc_labels=InformationFlowLabels().with_source(src),
     )
 
-    def _parse(state_labels: InformationFlowLabels) -> dict:
+
+def test_tool_parse_input_survives_pregel_runtime_in_config():
+    """Regression for the exact #971 turn-crash carrier (verified on the live box).
+
+    mimir tools use postponed annotations, so ``_injected_args_keys`` is empty
+    and langchain's ``_parse_input`` includes the injected ``runtime`` in the
+    ``model_dump()`` it runs to enumerate fields. During a real graph run the
+    ToolNode's runtime carries ``config["configurable"]["__pregel_runtime"]`` — a
+    ``langgraph.runtime.Runtime`` holding ``context=AuthContext``. Dict values
+    serialize DUCK-TYPED, bypassing type-level serializers, so #1173's opaque
+    ``AuthContext`` serializer never fires on that path: the
+    ``frozenset[SourceLabel]`` in ``ifc_labels.sources`` rebuilds a set of
+    serialized dicts and raises ``TypeError: unhashable type: 'dict'``, panicking
+    the turn. (The typed ``runtime.context`` field itself IS covered by #1173 —
+    the same runtime with an empty config parses fine.) Storing ``sources`` as a
+    tuple fixes the data itself, so the duck-typed path is safe too.
+    """
+    from langchain.tools import ToolRuntime
+    from langgraph.runtime import Runtime
+
+    from mimir.tools.store import memory_store
+
+    ctx = _service_turn_auth_context()
+
+    def _parse(auth_context: AuthContext) -> dict:
         runtime = ToolRuntime(
-            state={"messages": [], "ifc_labels": state_labels}, context=ctx,
-            config=RunnableConfig(), stream_writer=lambda *_a, **_k: None,
-            tool_call_id="tc-971", store=None,
+            state={"messages": [], "files": {}}, context=auth_context,
+            config={"configurable": {
+                "__pregel_runtime": Runtime(
+                    context=auth_context, store=None,
+                    stream_writer=lambda *_a, **_k: None, previous=None,
+                ),
+            }},
+            stream_writer=lambda *_a, **_k: None, tool_call_id="tc-971", store=None,
         )
         return memory_store._parse_input(
             {"content": "note", "stream": "semantic", "runtime": runtime}, "tc-971",
         )
 
-    # The fix: ifc_labels (tuple sources) in runtime.state parses without crashing.
-    parsed = _parse(labels)
+    # The fix: tuple sources survive the duck-typed config serialization.
+    parsed = _parse(ctx)
     assert parsed.get("runtime") is not None
 
-    # Masked check — this is the exact production crash, and it proves #1173's
-    # context serializer does not cover the state path: reverting sources to a
-    # frozenset[SourceLabel] in runtime.state dies just as the live turns did.
+    # Masked check — the pre-fix production failure: frozenset[SourceLabel]
+    # reached through the config dict dies exactly as the live turns did,
+    # proving #1173's context serializer does not cover this path.
     bad = InformationFlowLabels()
-    object.__setattr__(bad, "sources", frozenset({src}))
+    object.__setattr__(
+        bad, "sources", frozenset(ctx.ifc_labels.sources),
+    )
     with pytest.raises(TypeError, match="unhashable"):
-        _parse(bad)
+        _parse(replace(ctx, ifc_labels=bad))
+
+
+async def test_agent_graph_tool_call_survives_populated_auth_context():
+    """End-to-end #971 regression through the production assembly.
+
+    Builds the real ``create_deep_agent`` graph with a production mimir tool and
+    invokes it exactly like ``Agent._run_turn_body`` (agent.py): messages-only
+    input state, ``context=AuthContext``. Before the tuple fix this crashed in
+    ``_parse_input`` on the first tool call of every autonomous turn (the
+    ``__pregel_runtime`` config path above); with the fix the turn completes.
+    """
+    from langchain_core.language_models.fake_chat_models import (
+        GenericFakeChatModel,
+    )
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from deepagents import create_deep_agent
+
+    from mimir.tools.store import memory_store
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - fake binds nothing
+            return self
+
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "memory_store",
+            "args": {"content": "note", "stream": "semantic"},
+            "id": "tc-971", "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    agent = create_deep_agent(
+        model=model, tools=[memory_store], system_prompt="test",
+        context_schema=AuthContext,
+    )
+
+    final_state: dict = {}
+    async for item in agent.astream(
+        {"messages": [HumanMessage(content="go")]},
+        context=_service_turn_auth_context(),
+        stream_mode=["values"],
+    ):
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "values":
+            final_state = item[1]
+        elif isinstance(item, dict):
+            final_state = item
+
+    tool_messages = [
+        message for message in final_state.get("messages", [])
+        if isinstance(message, ToolMessage)
+    ]
+    assert tool_messages, "tool call never executed"
+    assert "unhashable" not in str(tool_messages[-1].content)

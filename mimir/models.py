@@ -176,16 +176,18 @@ class InformationFlowLabels:
 
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
-    # A TUPLE, not a frozenset: mimir tools (postponed annotations -> empty
-    # _injected_args_keys) include the injected runtime in the model_dump that
-    # langchain's _parse_input runs to enumerate fields. The langgraph agent state
-    # (TurnContext) carries ifc_labels, so runtime.state holds an
-    # InformationFlowLabels. #1173's AuthContext serializer makes runtime.context
-    # opaque but does NOT touch runtime.state, so a frozenset[SourceLabel] there
-    # serializes to a set of dicts and dies with ``TypeError: unhashable type:
-    # 'dict'``, panicking the turn (chainlink #971) — this is the crash that
-    # survived #1173 in production. A non-set container is serialization-safe on
-    # every path; ``_dedup_source_labels`` keeps it unique + append-only.
+    # A TUPLE, not a frozenset (chainlink #971): mimir tools use postponed
+    # annotations, so langchain's ``_injected_args_keys`` is empty and the
+    # injected ToolRuntime is included in the model_dump that ``_parse_input``
+    # runs to enumerate fields. In a real graph run that runtime's
+    # ``config["configurable"]["__pregel_runtime"]`` (a langgraph Runtime) carries
+    # ``context=AuthContext``; dict values serialize DUCK-TYPED, bypassing
+    # type-level serializers, so #1173's opaque AuthContext serializer never
+    # fires on that path and a frozenset[SourceLabel] rebuilds a set of
+    # serialized dicts -> ``TypeError: unhashable type: 'dict'`` -> the whole
+    # turn panics. This is the crash that survived #1173 in production. A tuple
+    # fixes the data itself, so every serialization path is safe;
+    # ``_dedup_source_labels`` keeps it unique + append-only.
     sources: tuple[SourceLabel, ...] = ()
     created_at: float = field(default_factory=time.monotonic, compare=False)
 
@@ -588,13 +590,15 @@ class AuthContext:
         schema so instances still validate; override only serialization to a
         stable opaque placeholder. Nothing consumes the serialized form.
 
-        This makes ``runtime.context`` opaque, but NOT ``runtime.state``: the
-        langgraph agent state (``TurnContext``) also carries an
-        ``InformationFlowLabels``, which is serialized normally during the same
-        ``model_dump``. So ``InformationFlowLabels.sources`` is a ``tuple`` (not a
-        ``frozenset[SourceLabel]``) to stay serialization-safe on the state path
-        this serializer does not reach — the crash that survived #1173 in
-        production. See ``InformationFlowLabels.sources``.
+        This covers only paths where pydantic consults the AuthContext schema
+        (the typed ``runtime.context`` field). It is BYPASSED wherever the
+        AuthContext is reached through duck-typed traversal — notably
+        ``runtime.config["configurable"]["__pregel_runtime"]`` (a langgraph
+        Runtime holding ``context=AuthContext``) during real graph runs — so
+        ``InformationFlowLabels.sources`` is a ``tuple`` (not a
+        ``frozenset[SourceLabel]``) to make the data itself serialization-safe.
+        That tuple is the fix for the crash that survived #1173 in production.
+        See ``InformationFlowLabels.sources``.
         """
         from pydantic_core import core_schema
 
