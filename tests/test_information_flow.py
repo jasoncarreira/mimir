@@ -2135,8 +2135,15 @@ class _Channels:
 
 
 @pytest.mark.asyncio
-async def test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call():
+async def test_preloaded_private_context_blocked_at_incompatible_auto_delivery_without_tool_call(
+    monkeypatch,
+):
     channels = _Channels()
+    sink_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
     auth = _auth("slack-C-public")
     ctx = SimpleNamespace(
         ifc_labels=_labels("slack-C-public"),
@@ -2169,6 +2176,89 @@ async def test_preloaded_private_context_blocked_at_incompatible_auto_delivery_w
 
     assert channels.sent == []
     assert ctx.delivered_channel_ids == set()
+    assert sink_events == [(
+        "sink_blocked",
+        {
+            "sink": "harness_auto_deliver",
+            "reason": "ifc_label_blocked:same_channel",
+            "sink_category": "same_channel",
+            "target_channel": "slack-C-public",
+            "allowed": False,
+            "status": "denied",
+            "enforcement_enabled": True,
+            "is_shadow_decision": False,
+        },
+    )]
+
+
+@pytest.mark.asyncio
+async def test_shadow_harness_sink_emits_would_block_and_still_delivers(monkeypatch):
+    channels = _Channels()
+    sink_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+    auth = replace(_auth("slack-C-public"), enforcement_enabled=False)
+    ctx = SimpleNamespace(
+        ifc_labels=_labels("slack-C-public"),
+        auth_context=auth,
+        delivered_channel_ids=set(),
+        send_message_count=0,
+        turn_event_emitter=None,
+        last_assistant_message_id=None,
+    )
+    auth.ifc_state.merge(_labels(sources=frozenset({"slack-C-private"})))
+    agent = SimpleNamespace(
+        _config=SimpleNamespace(auto_deliver_final_text_channels=("slack-",)),
+        _channels=channels,
+        _buffer=SimpleNamespace(),
+        _substantive_final_text=Agent._substantive_final_text,
+        _harness_sink_allowed=Agent._harness_sink_allowed,
+    )
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C-public", source="slack",
+    )
+
+    await Agent._maybe_auto_deliver_final_text(
+        agent,
+        ctx,
+        event,
+        turn_id="t1",
+        turn_is_interactive=True,
+        output="This is a substantive final reply for the user.",
+    )
+
+    assert len(channels.sent) == 1
+    assert ctx.delivered_channel_ids == {"slack-C-public"}
+    assert sink_events == [(
+        "sink_blocked",
+        {
+            "sink": "harness_auto_deliver",
+            "reason": "ifc_label_blocked:same_channel",
+            "sink_category": "same_channel",
+            "target_channel": "slack-C-public",
+            "allowed": True,
+            "status": "would_block",
+            "enforcement_enabled": False,
+            "is_shadow_decision": True,
+        },
+    )]
+
+
+def test_allowed_harness_sink_emits_no_denial_event(monkeypatch):
+    sink_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+    auth = _auth("slack-C1")
+    ctx = SimpleNamespace(ifc_labels=_labels("slack-C1"), auth_context=auth)
+
+    assert Agent._harness_sink_allowed(
+        ctx, "slack-C1", "harness_auto_deliver",
+    ) is True
+    assert sink_events == []
 
 
 @pytest.mark.asyncio

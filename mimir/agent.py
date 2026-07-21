@@ -64,6 +64,7 @@ from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
 from .history import Message, MessageBuffer
+from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._jsonl_tail import tail_jsonl_records
@@ -81,7 +82,6 @@ from .models import (
     TurnRecord,
 )
 from .access_control import (
-    SinkGate,
     create_auth_context,
     get_event_service_principal,
     get_trusted_service_from_auth_context,
@@ -2203,26 +2203,15 @@ class Agent:
 
     @staticmethod
     def _harness_sink_allowed(ctx: Any, target: str | None, sink_name: str) -> bool:
-        """Apply enforced IFC to a harness-owned final egress boundary."""
+        """Apply IFC to a harness-owned final egress boundary."""
         auth_context = getattr(ctx, "auth_context", None)
         ifc_labels = getattr(ctx, "ifc_labels", None)
-        if auth_context is not None:
-            ifc_labels = auth_context.ifc_state.current(ifc_labels)
-        decision = SinkGate.check_sink_flow(
+        return harness_sink_allowed(
             sink_name,
             target,
             ifc_labels,
             auth_context,
-            enforce=True,
         )
-        if decision.allowed:
-            return True
-        log.warning(
-            "harness IFC sink blocked: sink=%s reason=%s",
-            sink_name,
-            decision.reason,
-        )
-        return False
 
     async def _maybe_resend_nudge(
         self,
