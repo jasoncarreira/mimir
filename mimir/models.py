@@ -91,7 +91,7 @@ class SourceLabel:
     @classmethod
     def derived(
         cls,
-        inputs: frozenset["SourceLabel"],
+        inputs: tuple["SourceLabel", ...],
         *,
         principal: str,
         domain: str,
@@ -153,8 +153,22 @@ class InformationFlowLabels:
 
     labels: frozenset[str] = frozenset()
     source_channels: frozenset[str] = frozenset()
-    sources: frozenset[SourceLabel] = frozenset()
+    # A TUPLE, not a frozenset: pydantic's generic (Any-typed field) serializer —
+    # which the deepagents filesystem tools trigger when model_dump'ing their
+    # injected runtime — rebuilds a set from the serialized SourceLabel dicts and
+    # dies with ``TypeError: unhashable type: 'dict'``. That path ignores every
+    # type-level serializer (incl. AuthContext's), so only a non-set container is
+    # safe. Kept unique + append-only via ``with_source`` (chainlink #971).
+    sources: tuple[SourceLabel, ...] = ()
     created_at: float = field(default_factory=time.monotonic, compare=False)
+
+    def __post_init__(self) -> None:
+        # Enforce the tuple invariant at construction: a frozenset[SourceLabel]
+        # anywhere on this carrier re-introduces the #971 turn-crash (pydantic's
+        # generic serializer rebuilds a set from the serialized dicts). Coerce so
+        # no construction site — present or future — can violate it.
+        if not isinstance(self.sources, tuple):
+            object.__setattr__(self, "sources", tuple(self.sources))
 
     def with_label(self, label: str) -> "InformationFlowLabels":
         """Return new instance with added label (monotonic - only adds)."""
@@ -188,7 +202,7 @@ class InformationFlowLabels:
         return InformationFlowLabels(
             labels=self.labels | frozenset({source.sensitivity}),
             source_channels=channels,
-            sources=self.sources | frozenset({source}),
+            sources=(*self.sources, source),
             created_at=self.created_at,
         )
 
@@ -338,9 +352,13 @@ class DeclassificationCapability:
     canonical_principal: str
     labels: frozenset[str]
     source_channels: frozenset[str]
-    sources: frozenset[SourceLabel]
+    sources: tuple[SourceLabel, ...]
     issued_at: float
     expires_at: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sources, tuple):
+            object.__setattr__(self, "sources", tuple(self.sources))
 
 
 @dataclass
@@ -540,12 +558,17 @@ class AuthContext:
         taken from ``getattr`` on the validated model, so the real runtime object
         still reaches the tool regardless of what this serializer emits. But the
         default dataclass serializer would recurse into fields pydantic cannot
-        python-serialize — ``ifc_labels``'s ``frozenset[SourceLabel]`` (pydantic
-        rebuilds a set of the serialized dicts → ``TypeError: unhashable type:
-        'dict'``) and ``ifc_state``'s ``threading.Lock`` — which raised and
+        python-serialize (``ifc_state``'s ``threading.Lock``), which raised and
         panicked the ENTIRE turn (chainlink #971). Keep the default *validation*
         schema so instances still validate; override only serialization to a
         stable opaque placeholder. Nothing consumes the serialized form.
+
+        This fires ONLY where AuthContext is a statically-typed field (mimir's own
+        tools). Tools that receive the runtime through an ``Any``-typed field (the
+        deepagents filesystem tools) bypass this serializer entirely — pydantic's
+        generic serializer ignores every type-level schema — so the ``sources``
+        container is a ``tuple`` (not a ``frozenset[SourceLabel]``) to stay
+        serialization-safe on that path too. See ``InformationFlowLabels.sources``.
         """
         from pydantic_core import core_schema
 

@@ -89,7 +89,7 @@ def _labels(
     return InformationFlowLabels(
         labels=labels,
         source_channels=channels,
-        sources=frozenset(
+        sources=tuple(
             SourceLabel(
                 principal=principal,
                 domain="channel",
@@ -180,7 +180,7 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
     labels = _initialize_ifc_labels(event)
     auth = create_auth_context(event, enforce=True, ifc_labels=labels)
 
-    assert labels.sources == frozenset({
+    assert frozenset(labels.sources) == frozenset({
         SourceLabel(
             principal=f"service:{service_principal}",
             domain="channel",
@@ -471,7 +471,7 @@ def test_delegation_wires_service_derived_acl_intersection_into_carrier():
     parent = InformationFlowLabels(
         labels=frozenset({"private"}),
         source_channels=frozenset({"slack-C1"}),
-        sources=frozenset({alice_and_ops, alice_and_bob}),
+        sources=(alice_and_ops, alice_and_bob),
     )
 
     propagated = _propagate_ifc_labels(
@@ -485,7 +485,7 @@ def test_delegation_wires_service_derived_acl_intersection_into_carrier():
     assert len(derived) == 1
     assert derived[0].principal == "service:task"
     assert derived[0].authorized_principals == frozenset({"alice"})
-    assert parent.sources <= propagated.sources
+    assert all(source in propagated.sources for source in parent.sources)
 
 
 def test_delegation_does_not_retaint_informational_recall() -> None:
@@ -2322,3 +2322,64 @@ def test_turn_event_emitter_carries_ifc_to_panel_but_not_as_public_content():
     assert event["_ifc_labels"] is labels
     assert event["_auth_context"] is auth
     assert "private" not in str(event.get("trigger"))
+
+
+def test_ifc_sources_is_append_only_deduped_tuple():
+    """``sources`` accumulates as a unique, append-only tuple (chainlink #971)."""
+    src = SourceLabel(
+        principal="service:github", domain="channel",
+        resource_id="poller:github-activity", bridge_instance=None,
+        sensitivity="internal",
+    )
+    labels = InformationFlowLabels().with_source(src)
+    assert isinstance(labels.sources, tuple)
+    assert labels.sources == (src,)
+    # Re-adding the same source is a no-op (dedup preserved from the frozenset era).
+    assert labels.with_source(src) is labels
+    # A distinct source appends.
+    grown = labels.with_source(replace(src, resource_id="other"))
+    assert isinstance(grown.sources, tuple)
+    assert len(grown.sources) == 2
+
+
+def test_authcontext_with_ifc_sources_serializes_through_any_typed_field():
+    """Regression (chainlink #971): the injected runtime's ``AuthContext`` is
+    ``model_dump``'d during langchain tool input-parsing purely to enumerate
+    fields. Tools that receive the runtime through an ``Any``-typed field (the
+    deepagents filesystem tools: read_file/write_file/ls/glob/grep) hit
+    pydantic's GENERIC serializer, which ignores every type-level schema
+    (including ``AuthContext.__get_pydantic_core_schema__``). If ``sources`` is a
+    ``frozenset[SourceLabel]`` it rebuilds a set from the serialized dicts and
+    raises ``TypeError: unhashable type: 'dict'``, panicking the whole turn. A
+    tuple container is the only path-safe fix; #1173's serializer alone did not
+    cover this Any-typed path.
+    """
+    import typing
+
+    import pydantic
+
+    src = SourceLabel(
+        principal="service:github", domain="channel",
+        resource_id="poller:github-activity", bridge_instance=None,
+        sensitivity="internal",
+    )
+    ctx = AuthContext(
+        principal="p", canonical_principal="c", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="ch",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels().with_source(src),
+    )
+
+    class _ArgsAnyRuntime(pydantic.BaseModel):
+        model_config = {"arbitrary_types_allowed": True}
+        runtime: typing.Any = None
+
+    # The regression: must NOT raise (mirrors deepagents fs-tool _parse_input).
+    _ArgsAnyRuntime(runtime=ctx).model_dump()
+
+    # Masked check — prove the assertion is meaningful: the pre-fix frozenset-of-
+    # models container still dies exactly as production did on this same path.
+    bad = InformationFlowLabels()
+    object.__setattr__(bad, "sources", frozenset({src}))
+    with pytest.raises(TypeError, match="unhashable"):
+        _ArgsAnyRuntime(runtime=replace(ctx, ifc_labels=bad)).model_dump()
