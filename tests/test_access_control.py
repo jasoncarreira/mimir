@@ -13,6 +13,7 @@ from mimir.access_control import (
     AccessStatus,
     DenialReason,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
+    OperationCatalog,
     OperationDecision,
     ToolRegistry,
     authorize_action,
@@ -46,6 +47,173 @@ def _event(author: str | None) -> AgentEvent:
         author=author,
         content="hello",
     )
+
+
+READ_RESOURCE_TOOLS = (
+    "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
+    "file_search", "get_turn", "mimir_get_turn",
+)
+
+
+def _read_auth(*, admin: bool = False) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user", "admin") if admin else ("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+
+@pytest.mark.parametrize("tool_name", READ_RESOURCE_TOOLS)
+def test_read_operations_are_cataloged_resource_scoped(tool_name: str) -> None:
+    assert OperationCatalog().get_decision(tool_name) == OperationDecision.RESOURCE_SCOPED
+
+
+@pytest.mark.parametrize("tool_name", READ_RESOURCE_TOOLS)
+def test_non_admin_read_tools_allow_scoped_targets(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.tools.extra as extra
+
+    home = tmp_path / "home"
+    state = home / "state"
+    repo = tmp_path / "repo"
+    state.mkdir(parents=True)
+    repo.mkdir()
+    state_file = state / "note.md"
+    state_file.write_text("safe state", encoding="utf-8")
+    repo_file = repo / "README.md"
+    repo_file.write_text("safe repo", encoding="utf-8")
+    turns = state / "turns.jsonl"
+    turns.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+    monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", turns)
+
+    if tool_name in {"read_file", "aread"}:
+        arguments = {"file_path": str(repo_file)}
+    elif tool_name in {"ls", "als"}:
+        arguments = {"path": str(repo)}
+    elif tool_name in {"glob", "aglob"}:
+        arguments = {"path": str(repo), "pattern": "*.md"}
+    elif tool_name in {"grep", "agrep"}:
+        arguments = {"path": str(repo), "pattern": "safe", "glob": "*.md"}
+    elif tool_name == "file_search":
+        arguments = {"scope": "state", "path_prefix": "state"}
+    else:
+        arguments = {"turn_id": "turn-1"}
+
+    result = ToolRegistry().authorize_tool(
+        tool_name, _read_auth(), enforce=True, arguments=arguments,
+    )
+
+    assert result.allowed is True
+    assert result.decision == OperationDecision.RESOURCE_SCOPED
+
+
+@pytest.mark.parametrize(
+    "path_factory",
+    [
+        lambda home, repo: home,
+        lambda home, repo: home / ".env",
+        lambda home, repo: home / "compose.env",
+        lambda home, repo: home / "config.yaml",
+        lambda home, repo: home / ".mimir" / "saga.db",
+        lambda home, repo: home / "state" / "identities.yaml",
+        lambda home, repo: repo / "operator.key",
+        lambda home, repo: repo / "secret.txt",
+    ],
+    ids=["home", "env", "compose-env", "config", "saga", "identities", "secret-name", "secret-content"],
+)
+def test_non_admin_read_denies_sensitive_and_out_of_scope_paths(
+    path_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    (home / "state").mkdir(parents=True)
+    (home / ".mimir").mkdir()
+    repo.mkdir()
+    target = path_factory(home, repo)
+    if target != home:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = "ghp_" + "a" * 30 if target.name == "secret.txt" else "sensitive"
+        target.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(target)},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
+def test_non_admin_read_fails_closed_for_relative_unresolved_and_escaped_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    repo.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("outside", encoding="utf-8")
+    (repo / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    targets = (
+        "README.md",
+        str(repo / "missing.md"),
+        str(repo / ".." / "outside" / "secret.txt"),
+        str(repo / "escape" / "secret.txt"),
+    )
+    for target in targets:
+        result = ToolRegistry().authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": target},
+        )
+        assert result.allowed is False, target
+
+
+def test_admin_read_anywhere_and_service_capability_are_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("sensitive", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    admin = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(admin=True), enforce=True,
+        arguments={"file_path": str(outside)},
+    )
+    service_event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    service = ToolRegistry().authorize_tool(
+        "read_file", create_auth_context(service_event, enforce=True), enforce=True,
+        arguments={},
+    )
+
+    assert admin.allowed is True
+    assert service.allowed is True
 
 
 def test_worklink_repo_sink_adapter_matches_configured_repo(

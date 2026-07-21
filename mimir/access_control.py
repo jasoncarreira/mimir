@@ -1584,6 +1584,203 @@ class ChannelResourceAdapter:
         return channel_id
 
 
+class ReadResourceAdapter:
+    """Confine non-admin read tools to operator-approved, non-secret paths."""
+
+    _READ_OPERATIONS: frozenset[str] = frozenset({
+        "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
+        "file_search", "get_turn", "mimir_get_turn",
+    })
+    _SECRET_BASENAMES: frozenset[str] = frozenset({
+        ".env", "compose.env", "rate_limits.json", "identities.yaml",
+        "identities.yml", "credentials.json", "credentials.yaml", "credentials.yml",
+    })
+
+    @classmethod
+    def get_decision(
+        cls,
+        tool_name: str,
+        context: Any | None,
+    ) -> OperationDecision | None:
+        if tool_name in cls._READ_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
+        return None
+
+    @staticmethod
+    def _allowed_roots() -> tuple[Path, ...]:
+        home_value = os.environ.get("MIMIR_HOME", "").strip()
+        if not home_value:
+            return ()
+        home = Path(home_value).resolve()
+        # _configured_file_roots includes the whole home for trusted services.
+        # Ordinary callers receive only state plus the external file-tool roots.
+        configured = _configured_file_roots()
+        return (home / "state", *(root for root in configured if root.resolve() != home))
+
+    @classmethod
+    def _is_protected_path(cls, path: Path) -> bool:
+        name = path.name.lower()
+        if (
+            name in cls._SECRET_BASENAMES
+            or name.startswith(".env.")
+            or name.startswith("oauth_") and name.endswith(".json")
+            or path.suffix.lower() in {".key", ".pem"}
+        ):
+            return True
+
+        home_value = os.environ.get("MIMIR_HOME", "").strip()
+        if home_value:
+            home = Path(home_value).resolve()
+            protected = (
+                home / ".mimir",
+                home / "prompts",
+                home / "memory" / "core",
+            )
+            if any(path == root or path.is_relative_to(root) for root in protected):
+                return True
+
+        if path.is_file():
+            try:
+                from .secret_scan import contains_secret
+
+                return contains_secret(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                return True
+        return False
+
+    @classmethod
+    def _resolve_target(cls, raw_path: Any) -> Path | None:
+        if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+            return None
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            return None
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        roots: list[Path] = []
+        for root in cls._allowed_roots():
+            try:
+                roots.append(root.resolve(strict=True))
+            except (OSError, RuntimeError):
+                continue
+        if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+            return None
+        return None if cls._is_protected_path(resolved) else resolved
+
+    @classmethod
+    def _collection_is_safe(cls, target: Path, candidates: Any) -> bool:
+        """Ensure a collection read cannot smuggle in a protected child."""
+        try:
+            for candidate in candidates:
+                resolved = cls._resolve_target(str(candidate))
+                if resolved is None:
+                    return False
+        except (OSError, RuntimeError):
+            return False
+        return True
+
+    @classmethod
+    def _target_from_arguments(
+        cls,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+    ) -> Path | None:
+        args = arguments if isinstance(arguments, dict) else {}
+        if tool_name in {"read_file", "aread"}:
+            return cls._resolve_target(args.get("file_path") or args.get("path"))
+        if tool_name in {"ls", "als", "glob", "aglob", "grep", "agrep"}:
+            target = cls._resolve_target(args.get("path"))
+            if target is None:
+                return None
+            pattern_keys = (
+                ("pattern",) if tool_name in {"glob", "aglob"} else ("glob",)
+            )
+            for key in pattern_keys:
+                pattern = args.get(key)
+                if pattern is None:
+                    continue
+                if not isinstance(pattern, str) or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                    return None
+                if cls._is_protected_path(target / Path(pattern).name):
+                    return None
+            if tool_name in {"ls", "als"}:
+                candidates = target.iterdir() if target.is_dir() else (target,)
+            elif tool_name in {"glob", "aglob"}:
+                pattern = args.get("pattern")
+                if not isinstance(pattern, str) or not pattern:
+                    return None
+                candidates = target.glob(pattern)
+            elif target.is_dir():
+                glob_pattern = args.get("glob") or "*"
+                candidates = target.rglob(glob_pattern)
+            else:
+                candidates = (target,)
+            if not cls._collection_is_safe(target, candidates):
+                return None
+            return target
+        if tool_name == "file_search":
+            if str(args.get("scope") or "all").strip().lower() != "state":
+                return None
+            prefix = args.get("path_prefix")
+            if prefix is not None:
+                if not isinstance(prefix, str) or Path(prefix).is_absolute() or ".." in Path(prefix).parts:
+                    return None
+                prefix_path = Path(prefix)
+                if prefix_path.parts[:1] == ("state",):
+                    prefix_path = Path(*prefix_path.parts[1:])
+            else:
+                prefix_path = Path()
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            target = cls._resolve_target(str(Path(home) / "state" / prefix_path)) if home else None
+            if target is None or not cls._collection_is_safe(target, target.rglob("*.md")):
+                return None
+            return target
+        if tool_name in {"get_turn", "mimir_get_turn"}:
+            if not isinstance(args.get("turn_id"), str) or not args["turn_id"].strip():
+                return None
+            from .tools.extra import _TURN_STATE
+
+            path = _TURN_STATE.get("turns_log_path")
+            return cls._resolve_target(str(path)) if path is not None else None
+        return None
+
+    @classmethod
+    def authorize_read_operation(
+        cls,
+        tool_name: str,
+        auth_context: "AuthContext | None",
+        arguments: dict[str, Any] | None,
+        *,
+        enforce: bool,
+        service_allowed: bool,
+    ) -> ToolAuthorization:
+        roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+        if "admin" in roles or service_allowed:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True,
+                service_principal=(
+                    get_trusted_service_from_auth_context(auth_context)
+                    if service_allowed else None
+                ),
+                enforcement_enabled=enforce,
+            )
+
+        in_scope = auth_context is not None and cls._target_from_arguments(tool_name, arguments) is not None
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=in_scope or not enforce,
+            reason=None if in_scope else "read_scope",
+            required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not in_scope,
+        )
+
+
 class OperationCatalog:
     """Catalog of tool/operation authorization decisions (chainlink #865).
 
@@ -1606,6 +1803,8 @@ class OperationCatalog:
         "commitment_snooze",
         "commitment_dismiss",
     })
+
+    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = ReadResourceAdapter._READ_OPERATIONS
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
         "approve_declassification",
@@ -1637,20 +1836,9 @@ class OperationCatalog:
         "write_file",
         "edit_file",
         "set_poller_overrides",
-        "read_file",
-        "aread",
-        "ls",
-        "als",
-        "glob",
-        "aglob",
-        "grep",
-        "agrep",
         "download_files",
         "adownload_files",
-        "file_search",
         "rebuild_index",
-        "get_turn",
-        "mimir_get_turn",
     })
 
     # Global rows from these operations contain protected identities,
@@ -1746,6 +1934,9 @@ class OperationCatalog:
         if tool_name in self._OPEN_OPERATIONS:
             return OperationDecision.OPEN
 
+        if tool_name in self._RESOURCE_SCOPED_OPERATIONS:
+            return OperationDecision.RESOURCE_SCOPED
+
         if tool_name in self._ADMIN_REQUIRED_OPERATIONS:
             return OperationDecision.ADMIN_REQUIRED
 
@@ -1776,6 +1967,9 @@ _global_operation_catalog = OperationCatalog()
 
 _global_operation_catalog.register_adapter_hook(
     ChannelResourceAdapter.get_decision,
+)
+_global_operation_catalog.register_adapter_hook(
+    ReadResourceAdapter.get_decision,
 )
 
 
@@ -2448,6 +2642,18 @@ class ToolRegistry:
                 )
                 channel_auth.flow_direction = flow_direction
                 return channel_auth
+            if tool_name in ReadResourceAdapter._READ_OPERATIONS:
+                read_auth = ReadResourceAdapter.authorize_read_operation(
+                    tool_name,
+                    auth_context,
+                    arguments,
+                    enforce=enforce,
+                    service_allowed=service_allowed,
+                )
+                read_auth.flow_direction = flow_direction
+                if read_auth.is_shadow_decision:
+                    self._emit_shadow_decision(read_auth)
+                return read_auth
             required_tier = AccessTier.ADMIN
             if enforce:
                 allowed = False
