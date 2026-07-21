@@ -148,6 +148,72 @@ def test_non_admin_direct_read_denies_secret_content_and_operator_secret_file(
         assert result.allowed is False
 
 
+@pytest.mark.parametrize("root_kind", ["repo", "tmp"])
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    [
+        ("secrets.yaml", "value: placeholder\n"),
+        ("secrets.yml", "value: placeholder\n"),
+        ("secrets.json", "{}\n"),
+        ("id_rsa", "placeholder\n"),
+        ("id_ed25519", "placeholder\n"),
+        ("id_ecdsa", "placeholder\n"),
+        ("id_dsa", "placeholder\n"),
+        (".netrc", "machine example.invalid\n"),
+        (".pypirc", "[distutils]\n"),
+        (".npmrc", "registry=https://example.invalid/\n"),
+        ("notes.txt", "-----BEGIN OPENSSH PRIVATE KEY-----\nplaceholder\n"),
+        (".git/config", "url = https://alice:placeholder@example.invalid/repo.git\n"),
+    ],
+)
+def test_non_admin_read_denies_additional_secret_shapes_in_repo_and_tmp(
+    root_kind: str,
+    relative: str,
+    content: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    tmp_root = tmp_path / "tmp-read-root"
+    (home / "state").mkdir(parents=True)
+    repo.mkdir()
+    tmp_root.mkdir()
+    target = (repo if root_kind == "repo" else tmp_root) / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(target)},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
+def test_non_admin_read_allows_git_config_without_basic_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    (home / "state").mkdir(parents=True)
+    config = repo / ".git" / "config"
+    config.parent.mkdir(parents=True)
+    config.write_text("url = https://example.invalid/repo.git\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(config)},
+    )
+
+    assert result.allowed is True
+
+
 def test_non_admin_collection_auth_resolves_only_root_without_walking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

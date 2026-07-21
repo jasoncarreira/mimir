@@ -152,9 +152,17 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             rel_parts = path.parts
         if any(part in self._traversal_excludes for part in rel_parts):
             return True
-        from .read_policy import is_protected_read_path, non_admin_read_filter_enabled
+        from .read_policy import (
+            is_mimir_home_root,
+            is_protected_read_path,
+            non_admin_read_filter_enabled,
+        )
 
-        return non_admin_read_filter_enabled() and is_protected_read_path(path)
+        return (
+            non_admin_read_filter_enabled()
+            and not is_mimir_home_root(path)
+            and is_protected_read_path(path)
+        )
 
     def _walk_files(self, root: Path) -> Iterator[Path]:
         for dirpath, dirnames, filenames in os.walk(root):

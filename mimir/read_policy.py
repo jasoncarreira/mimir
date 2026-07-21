@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from .secret_scan import contains_secret
+
+
+_PEM_PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE,
+)
+_BASIC_AUTH_URL_PATTERN = re.compile(
+    r"\b[a-z][a-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@", re.IGNORECASE,
+)
 
 
 READ_RESOURCE_OPERATIONS = frozenset({
@@ -23,6 +32,16 @@ _PROTECTED_BASENAMES = frozenset({
     "identities.json",
     "identities.yaml",
     "identities.yml",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+    ".netrc",
+    ".pypirc",
+    ".npmrc",
 })
 _PROTECTED_DIR_NAMES = frozenset({"credentials", "identities"})
 _PROTECTED_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx"})
@@ -53,6 +72,27 @@ def _operator_secret_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def _resolved_mimir_home() -> Path | None:
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return None
+    try:
+        return Path(home_raw).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def is_mimir_home_root(path: Path) -> bool:
+    """Return whether ``path`` is the home node traversed to reach ``state``."""
+    home = _resolved_mimir_home()
+    if home is None:
+        return False
+    try:
+        return path.resolve() == home
+    except (OSError, RuntimeError):
+        return False
+
+
 def is_protected_read_path(path: Path) -> bool:
     """Cheap path-only check shared by authz and collection backends."""
     try:
@@ -71,28 +111,33 @@ def is_protected_read_path(path: Path) -> bool:
     if any(resolved == secret for secret in _operator_secret_paths()):
         return True
 
-    home_raw = os.environ.get("MIMIR_HOME", "").strip()
-    if home_raw:
-        try:
-            home = Path(home_raw).resolve()
-        except (OSError, RuntimeError):
-            return True
-        protected_roots = (home / ".mimir", home / "prompts", home / "memory" / "core")
-        if any(resolved == root or resolved.is_relative_to(root) for root in protected_roots):
+    home = _resolved_mimir_home()
+    if home is not None and (resolved == home or resolved.is_relative_to(home)):
+        state = home / "state"
+        if not (resolved == state or resolved.is_relative_to(state)):
             return True
     return False
 
 
-def text_contains_secret(text: str) -> bool:
-    return contains_secret(text)
+def text_contains_secret(text: str, *, path: Path | None = None) -> bool:
+    """Detect protected credential bodies, including path-specific config forms."""
+    if contains_secret(text) or _PEM_PRIVATE_KEY_PATTERN.search(text):
+        return True
+    return (
+        path is not None
+        and path.name.lower() == "config"
+        and path.parent.name.lower() == ".git"
+        and _BASIC_AUTH_URL_PATTERN.search(text) is not None
+    )
 
 
 def file_contains_secret(path: Path) -> bool:
     """Scan one file, failing closed when it cannot be inspected."""
     try:
-        return contains_secret(path.read_text(encoding="utf-8", errors="replace"))
+        text = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, RuntimeError):
         return True
+    return text_contains_secret(text, path=path)
 
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
@@ -100,7 +145,7 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     if is_protected_read_path(path):
         return True
     if text is not None:
-        return text_contains_secret(text)
+        return text_contains_secret(text, path=path)
     return path.is_file() and file_contains_secret(path)
 
 
