@@ -171,8 +171,19 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def resolve_non_admin_read_target(raw_path: Any, *, scan_file: bool = False) -> Path | None:
-    """Resolve one absolute target within the non-admin read roots."""
+def resolve_non_admin_read_target(
+    raw_path: Any,
+    *,
+    scan_file: bool = False,
+    allow_home_root: bool = False,
+) -> Path | None:
+    """Resolve one absolute target within the non-admin read roots.
+
+    ``allow_home_root`` is only for collection operations.  The home directory
+    may be traversed as a routing node so the backend can expose ``state/``, but
+    every non-state descendant remains protected.  Single-file reads never set
+    it and therefore cannot read the home directory itself.
+    """
     if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
         return None
     candidate = Path(raw_path)
@@ -189,9 +200,14 @@ def resolve_non_admin_read_target(raw_path: Any, *, scan_file: bool = False) -> 
         state = (home / "state").resolve(strict=True)
     except (OSError, RuntimeError):
         return None
+    if allow_home_root and home not in roots:
+        roots = (*roots, home)
     # /tmp commonly contains MIMIR_HOME in tests and local deployments. The
     # narrower home carve-out wins so /tmp never accidentally exposes all home.
-    if (resolved == home or resolved.is_relative_to(home)) and not (
+    if resolved == home:
+        if not allow_home_root:
+            return None
+    elif resolved.is_relative_to(home) and not (
         resolved == state or resolved.is_relative_to(state)
     ):
         return None
@@ -206,7 +222,9 @@ def resolve_non_admin_read_target(raw_path: Any, *, scan_file: bool = False) -> 
     selected_root = max(lexical_roots, key=lambda root: len(root.parts))
     if not (resolved == selected_root or resolved.is_relative_to(selected_root)):
         return None
-    if is_protected_read_path(resolved):
+    if is_protected_read_path(resolved) and not (
+        allow_home_root and resolved == home
+    ):
         return None
     if scan_file and (not resolved.is_file() or file_contains_secret(resolved)):
         return None
@@ -221,7 +239,9 @@ def read_target_from_arguments(tool_name: str, arguments: dict[str, Any] | None)
             args.get("file_path") or args.get("path"), scan_file=True
         )
     if tool_name in {"ls", "als", "glob", "aglob", "grep", "agrep"}:
-        return resolve_non_admin_read_target(args.get("path"))
+        return resolve_non_admin_read_target(
+            args.get("path"), allow_home_root=True,
+        )
     if tool_name == "file_search":
         if str(args.get("scope") or "all").strip().lower() != "state":
             return None

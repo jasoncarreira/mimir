@@ -27,16 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import math
 import sqlite3
 import struct
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from .core_blocks import describe_file
 from .index_skip import is_index_skipped
@@ -780,7 +779,10 @@ class Indexer:
                     rows = conn.execute(
                         "SELECT content FROM chunks WHERE path = ?", (path,)
                     ).fetchall()
-                    if any(text_contains_secret(str(row[0])) for row in rows):
+                    if any(
+                        text_contains_secret(str(row[0]), path=self._home / path)
+                        for row in rows
+                    ):
                         protected_paths.add(path)
             candidates = {
                 key: row for key, row in candidates.items()

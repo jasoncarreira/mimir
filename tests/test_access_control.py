@@ -214,6 +214,23 @@ def test_non_admin_read_allows_git_config_without_basic_auth(
     assert result.allowed is True
 
 
+@pytest.mark.parametrize("tool_name", ["ls", "glob", "grep"])
+def test_non_admin_collection_auth_allows_home_root_as_state_routing_node(
+    tool_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    result = ToolRegistry().authorize_tool(
+        tool_name, _read_auth(), enforce=True,
+        arguments={"path": str(home), "pattern": "needle"},
+    )
+
+    assert result.allowed is True
+    assert result.decision == OperationDecision.RESOURCE_SCOPED
+
+
 def test_non_admin_collection_auth_resolves_only_root_without_walking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
