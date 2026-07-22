@@ -29,6 +29,21 @@ def _write_outcome(events_path: Path, *, type_: str, channel_id: str,
         f.write(json.dumps(rec) + "\n")
 
 
+def _write_unclean_restart(events_path: Path, *, ts: str) -> None:
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    with events_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "type": "liveness_unclean_restart",
+            "timestamp": ts,
+        }) + "\n")
+
+
+def _set_enqueued_at(persist_dir: Path, source_id: str, ts: str) -> None:
+    state = poller_recovery._load_state(persist_dir)
+    state["inflight"][source_id]["enqueued_at"] = ts
+    poller_recovery._save_state(persist_dir, state)
+
+
 def _make_event(source_id: str, *, channel_id: str = "poller:gmail",
                 items: list | None = None) -> AgentEvent:
     return AgentEvent(
@@ -132,6 +147,95 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
     # Still in-flight, attempt incremented (awaiting the retry's outcome).
     st = poller_recovery._load_state(tmp_path)
     assert st["inflight"]["sid-1"]["attempts"] == 1
+
+
+async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path):
+    """At-least-once contract: an accepted enqueue with no durable outcome
+    before a later unclean-restart marker is replayed once. If the turn really
+    completed but its outcome record died in the crash, this may duplicate it."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-lost"))
+    _set_enqueued_at(tmp_path, "sid-lost", _ts(20))
+    _write_unclean_restart(events, ts=_ts(10))
+    enq = _FakeEnqueue()
+    common = dict(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+        recover_failed_turns=False,
+    )
+
+    first = await poller_recovery.reconcile_failed_turns(**common)
+    second = await poller_recovery.reconcile_failed_turns(**common)
+
+    assert first["unclean_reenqueued"] == 1
+    assert second["unclean_reenqueued"] == 0
+    assert [event.source_id for event in enq.calls] == ["sid-lost"]
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-lost"]
+    assert entry["attempts"] == 1
+    assert entry["unclean_replayed_at"] != ""
+
+
+async def test_unclean_restart_completed_outcome_is_not_reenqueued(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-done"))
+    _set_enqueued_at(tmp_path, "sid-done", _ts(30))
+    _write_outcome(
+        events, type_="turn_completed", channel_id="poller:gmail",
+        source_id="sid-done", ts=_ts(20),
+    )
+    _write_unclean_restart(events, ts=_ts(10))
+    enq = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+        recover_failed_turns=False,
+    )
+
+    assert summary["completed"] == 1
+    assert summary["unclean_reenqueued"] == 0
+    assert enq.calls == []
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+async def test_unclean_restart_leaves_current_epoch_enqueue_alone(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_unclean_restart(events, ts=_ts(20))
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-current"))
+    enq = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=events, enqueue=enq,
+        recover_failed_turns=False,
+    )
+
+    assert summary["unclean_reenqueued"] == 0
+    assert enq.calls == []
+
+
+async def test_unclean_restart_replay_respects_attempt_cap(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(events, session_id="test")
+    try:
+        poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-capped"))
+        _set_enqueued_at(tmp_path, "sid-capped", _ts(20))
+        _write_unclean_restart(events, ts=_ts(10))
+        enq = _FakeEnqueue()
+
+        summary = await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail", channel_id="poller:gmail",
+            persist_dir=tmp_path, events_path=events, enqueue=enq,
+            recover_failed_turns=False, max_attempts=0,
+        )
+
+        assert summary["gave_up"] == 1
+        assert summary["unclean_reenqueued"] == 0
+        assert enq.calls == []
+        assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+    finally:
+        event_logger._reset_logger_for_tests()
 
 
 async def test_reconcile_gives_up_at_cap(tmp_path: Path):

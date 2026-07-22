@@ -1048,12 +1048,11 @@ def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_run_poller_stashes_accepted_events_when_recovery_enabled(
+async def test_run_poller_stashes_accepted_events_by_default(
     tmp_path: Path, home: Path,
 ) -> None:
-    """The run_poller integration path must stash accepted AgentEvents
-    when recover_failed_turns=True; unit tests for poller_recovery alone
-    don't prove the framework actually calls stash_enqueued_event()."""
+    """Every accepted poller event is stashed even when failed-turn retry is
+    disabled, so an unclean restart cannot erase the dispatcher handoff."""
     skill_dir = tmp_path / "skill"
     persist_dir = tmp_path / "persist" / "x"
     _install_script(skill_dir, "poller.py", """
@@ -1063,7 +1062,7 @@ print(json.dumps({"poller": "x", "prompt": "needs review", "id": "evt-1"}))
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
-        persist_dir=persist_dir, recover_failed_turns=True,
+        persist_dir=persist_dir,
     )
     enq = _CapturingEnqueue()
     n = await run_poller(cfg, enqueue=enq)
@@ -1079,7 +1078,7 @@ print(json.dumps({"poller": "x", "prompt": "needs review", "id": "evt-1"}))
 
 
 @pytest.mark.asyncio
-async def test_run_poller_does_not_stash_rejected_events_when_recovery_enabled(
+async def test_run_poller_does_not_stash_rejected_events_by_default(
     tmp_path: Path, home: Path,
 ) -> None:
     """A dispatcher rejection is back-pressure, not an in-flight turn;
@@ -1093,7 +1092,7 @@ print(json.dumps({"poller": "x", "prompt": "queue full"}))
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
-        persist_dir=persist_dir, recover_failed_turns=True,
+        persist_dir=persist_dir,
     )
     n = await run_poller(cfg, enqueue=_CapturingEnqueue(accept=False))
 

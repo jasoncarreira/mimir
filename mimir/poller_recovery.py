@@ -1,5 +1,4 @@
-"""Framework-side recovery for poller turns whose triggered turn failed
-(chainlink #262).
+"""Framework-side recovery for poller turns lost or failed after enqueue.
 
 A poller fires events; each becomes an ``AgentEvent`` → an async turn.
 The poller advances its cursor at poll time, decoupled from the turn it
@@ -12,7 +11,7 @@ with **no live state to reconcile against** (gmail, github
 issue/comment turns) this module closes it generically via the event
 log:
 
-* At enqueue, the framework stashes the ``AgentEvent`` keyed by its
+* At every accepted enqueue, the framework stashes the ``AgentEvent`` keyed by its
   ``source_id`` (the poller batch's stable per-fire id).
 * Turn outcomes are logged with that ``source_id``
   (``turn_failed`` / ``turn_completed``, #517). Each poll cycle the
@@ -22,9 +21,9 @@ log:
   signal — negative algedonic via ``feedback.classify``'s ``*_gave_up``
   rule (#515) — once the cap is hit.
 
-Opt-in per poller via ``recover_failed_turns`` in ``pollers.json`` —
-**off by default**, and OFF for github-poller (it already recovers via
-#516; framework re-enqueue on top would double-fire review turns).
+Stashing and unclean-restart replay are enabled for every poller. Re-enqueueing
+an explicitly failed turn remains opt-in per poller via
+``recover_failed_turns`` in ``pollers.json``.
 
 State lives at ``<persist_dir>/.recovery.json`` so it survives container
 restarts (unlike the in-memory circuit-breaker state).
@@ -74,6 +73,7 @@ DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
 DEFAULT_STASH_TTL_HOURS = 48.0
 
 _TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
+_UNCLEAN_RESTART_TYPE = "liveness_unclean_restart"
 
 # chainlink #316: writers stamp the event timestamp BEFORE acquiring the
 # append lock, so a record can land slightly out of append order relative to
@@ -195,6 +195,9 @@ def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
         "attempts": 0,
         # First-seen timestamp drives the GC TTL (#310).
         "stashed_at": _utc_now_iso(),
+        # Updated after every accepted retry. This identifies the particular
+        # enqueue whose in-memory queue may have been lost in a crash.
+        "enqueued_at": _utc_now_iso(),
         "event": _event_to_stash(event),
     }
     _save_state(persist_dir, state)
@@ -320,6 +323,55 @@ def _read_outcomes_since(
     return out
 
 
+def _read_last_unclean_restart(events_path: Path) -> str:
+    """Return the newest durable unclean-restart marker timestamp."""
+    if not events_path.exists():
+        return ""
+    try:
+        for rec in tail_jsonl_records(events_path):
+            if rec.get("type") == _UNCLEAN_RESTART_TYPE:
+                ts = rec.get("timestamp")
+                return ts if isinstance(ts, str) and _parse_iso(ts) is not None else ""
+    except OSError as exc:
+        log.warning("poller recovery: restart marker read failed for %s: %s", events_path, exc)
+    return ""
+
+
+def _restore_event(
+    entry: dict,
+    *,
+    poller_name: str,
+    channel_id: str,
+    service_principal: str | None,
+    service_authority: Any,
+) -> AgentEvent | None:
+    """Rebuild a stashed event and reapply scheduler-owned identity fields."""
+    event = _event_from_stash(entry.get("event"))
+    if event is None:
+        return None
+    event.channel_id = channel_id
+    event.trigger = "poller"
+    event.source = "poller"
+    event.service_principal = service_principal
+    event.service_authority = service_authority
+    if service_authority is not None and service_principal:
+        source_principal = f"service:{service_principal}"
+        event.ifc_labels = InformationFlowLabels().with_channel(
+            channel_id
+        ).with_source(SourceLabel(
+            principal=source_principal,
+            domain="channel",
+            resource_id=channel_id,
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=frozenset({source_principal}),
+            source_kind="service",
+        ))
+    if isinstance(event.extra, dict):
+        event.extra["poller_name"] = poller_name
+    return event
+
+
 async def _emit_gave_up(poller_name: str, channel_id: str, entry: dict, source_id: str) -> None:
     """Emit the one-shot wedge-guard signal. ``poller_turn_gave_up`` ends
     in ``_gave_up`` so ``feedback.classify`` (#515) maps it to a negative
@@ -353,6 +405,7 @@ async def reconcile_failed_turns(
     enqueue: EnqueueFn,
     service_principal: str | None = None,
     service_authority: Any = None,
+    recover_failed_turns: bool = True,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
     stash_ttl_hours: float = DEFAULT_STASH_TTL_HOURS,
 ) -> dict:
@@ -381,7 +434,7 @@ async def reconcile_failed_turns(
     """
     summary = {
         "reenqueued": 0, "completed": 0, "gave_up": 0,
-        "deferred": 0, "expired": 0,
+        "deferred": 0, "expired": 0, "unclean_reenqueued": 0,
     }
     state = _load_state(persist_dir)
     inflight: dict = state["inflight"]
@@ -414,10 +467,16 @@ async def reconcile_failed_turns(
         otype = rec.get("type")
         if isinstance(source_id, str) and source_id in inflight:
             entry = inflight[source_id]
+            if isinstance(ts, str):
+                entry["last_outcome_at"] = ts
             if otype == "turn_completed":
                 del inflight[source_id]
                 summary["completed"] += 1
             elif otype == "turn_failed":
+                if not recover_failed_turns:
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 attempts = int(entry.get("attempts", 0)) + 1
                 if attempts > max_attempts:
                     # Wedge guard hit. Emit best-effort (#318): a log
@@ -432,42 +491,18 @@ async def reconcile_failed_turns(
                     del inflight[source_id]
                     summary["gave_up"] += 1
                 else:
-                    event = _event_from_stash(entry.get("event"))
+                    event = _restore_event(
+                        entry,
+                        poller_name=poller_name,
+                        channel_id=channel_id,
+                        service_principal=service_principal,
+                        service_authority=service_authority,
+                    )
                     if event is None:
                         # Unreconstructable stash (older schema) — drop so we
                         # don't loop on it forever.
                         del inflight[source_id]
                     else:
-                        # chainlink #422: never trust the stash verbatim.
-                        # ``.recovery.json`` lives in the poller-writable
-                        # persist_dir, so a malicious skill could rewrite a
-                        # stashed event's channel/trigger/source to make
-                        # the re-fire impersonate a user message on an
-                        # arbitrary channel. Re-stamp the fields the hot
-                        # path forces on every emitted event (the
-                        # AgentEvent assembly in ``run_poller``): whatever
-                        # the file says, this fires on THIS poller's
-                        # channel, as a poller event.
-                        event.channel_id = channel_id
-                        event.trigger = "poller"
-                        event.source = "poller"
-                        event.service_principal = service_principal
-                        event.service_authority = service_authority
-                        if service_authority is not None and service_principal:
-                            source_principal = f"service:{service_principal}"
-                            event.ifc_labels = InformationFlowLabels().with_channel(
-                                channel_id
-                            ).with_source(SourceLabel(
-                                principal=source_principal,
-                                domain="channel",
-                                resource_id=channel_id,
-                                bridge_instance="poller",
-                                sensitivity="internal",
-                                authorized_principals=frozenset({source_principal}),
-                                source_kind="service",
-                            ))
-                        if isinstance(event.extra, dict):
-                            event.extra["poller_name"] = poller_name
                         try:
                             accepted = await enqueue(event)
                         except Exception as exc:  # noqa: BLE001
@@ -480,6 +515,7 @@ async def reconcile_failed_turns(
                             # Burn the wedge-guard attempt only on a real
                             # re-fire (#305).
                             entry["attempts"] = attempts
+                            entry["enqueued_at"] = _utc_now_iso()
                             summary["reenqueued"] += 1
                         else:
                             # Queue full / raised: defer. Stop WITHOUT
@@ -498,6 +534,68 @@ async def reconcile_failed_turns(
             # ``isoformat()`` strings, so lexicographic ``max`` orders
             # them chronologically.
             watermark = max(watermark, ts)
+
+    # An accepted event whose latest enqueue predates the durable startup
+    # marker, with no outcome after that enqueue, was consumed from the poller
+    # but lost with the previous process's in-memory dispatcher queue. Replay it
+    # once for this marker. This is deliberately at-least-once: if the outcome
+    # record itself was lost in the same crash, a duplicate turn is preferable
+    # to silently losing a one-shot notification.
+    restart_iso = _read_last_unclean_restart(events_path)
+    restart_dt = _parse_iso(restart_iso)
+    if restart_dt is not None and not summary["deferred"]:
+        for source_id in list(inflight):
+            entry = inflight.get(source_id)
+            if not isinstance(entry, dict):
+                continue
+            enqueued_iso = entry.get("enqueued_at") or entry.get("stashed_at")
+            enqueued_dt = _parse_iso(enqueued_iso)
+            outcome_dt = _parse_iso(entry.get("last_outcome_at"))
+            if (
+                enqueued_dt is None
+                or enqueued_dt >= restart_dt
+                or (outcome_dt is not None and outcome_dt >= enqueued_dt)
+                or entry.get("unclean_replayed_at") == restart_iso
+            ):
+                continue
+            attempts = int(entry.get("attempts", 0)) + 1
+            if attempts > max_attempts:
+                try:
+                    await _emit_gave_up(poller_name, channel_id, entry, source_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "poller recovery: gave_up emit failed for %s: %s",
+                        source_id, exc,
+                    )
+                del inflight[source_id]
+                summary["gave_up"] += 1
+                continue
+            event = _restore_event(
+                entry,
+                poller_name=poller_name,
+                channel_id=channel_id,
+                service_principal=service_principal,
+                service_authority=service_authority,
+            )
+            if event is None:
+                del inflight[source_id]
+                continue
+            try:
+                accepted = await enqueue(event)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "poller recovery: unclean re-enqueue raised for %s: %s",
+                    source_id, exc,
+                )
+                accepted = False
+            if not accepted:
+                summary["deferred"] += 1
+                break
+            entry["attempts"] = attempts
+            entry["enqueued_at"] = _utc_now_iso()
+            entry["unclean_replayed_at"] = restart_iso
+            summary["reenqueued"] += 1
+            summary["unclean_reenqueued"] += 1
 
     if summary["deferred"]:
         # We stopped on back-pressure. Persist the watermark exactly where
