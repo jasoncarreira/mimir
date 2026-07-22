@@ -15,7 +15,12 @@ from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     OperationCatalog,
     OperationDecision,
+    CapabilityTier,
+    ServicePrincipal,
+    ServiceSinkPolicy,
     ToolRegistry,
+    build_trigger_service_principal,
+    get_service_principal,
     authorize_action,
     authorize_inbound,
     create_auth_context,
@@ -28,6 +33,7 @@ from mimir.models import (
     SessionACL,
     SourceLabel,
     TurnContext,
+    TurnInteractivity,
 )
 
 
@@ -1719,3 +1725,385 @@ async def test_same_scope_private_egress_succeeds_through_live_middleware(
     assert result.status != "error"
     assert result.content == "sent"
     assert handler_calls == 1
+
+
+def _write_auth(*, admin: bool = False) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="alice",
+        roles=("user", "admin") if admin else ("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_non_admin_human_write_is_confined_to_unprotected_state(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    state.mkdir(parents=True)
+    repo.mkdir()
+    outside.mkdir()
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    registry = ToolRegistry()
+
+    allowed = registry.authorize_tool(
+        tool_name,
+        _write_auth(),
+        enforce=True,
+        target_channel=str(state / "notes" / "result.md"),
+    )
+    relative_state = registry.authorize_tool(
+        tool_name,
+        _write_auth(),
+        enforce=True,
+        target_channel="state/notes/result.md",
+    )
+    denied = (
+        home / "root.txt",
+        repo / "source.py",
+        state / ".env",
+        state / "config.yaml",
+        state / "credentials.json",
+        state / "identities.yaml",
+        state / "memory" / "core" / "identity.md",
+        state / "prompts" / "system.md",
+        state / ".." / "repo-escape.txt",
+        state / "escape" / "symlink-escape.txt",
+    )
+
+    assert allowed.allowed is True
+    assert relative_state.allowed is True
+    assert allowed.decision == OperationDecision.RESOURCE_SCOPED
+    assert registry.authorize_tool(
+        tool_name,
+        _write_auth(),
+        enforce=True,
+        target_channel="result-at-home.md",
+    ).allowed is False
+    for target in denied:
+        decision = registry.authorize_tool(
+            tool_name,
+            _write_auth(),
+            enforce=True,
+            target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "write_scope"
+
+
+def test_non_admin_human_cannot_run_code_tools(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    for operation in (
+        "worklink_run", "spawn_claude_code", "spawn_codex", "spawn_open_code",
+    ):
+        decision = registry.authorize_tool(
+            operation,
+            _write_auth(),
+            enforce=True,
+            target_channel=str(tmp_path),
+        )
+        assert decision.allowed is False, operation
+        if operation == "worklink_run":
+            assert decision.reason == "admin_required"
+
+
+def _service_auth(
+    service: ServicePrincipal,
+    labels: InformationFlowLabels,
+) -> AuthContext:
+    return AuthContext(
+        principal=f"service:{service.canonical}",
+        canonical_principal=service.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=service.trigger,
+        channel_id="poller:test",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+    )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "canonical"),
+    [("scheduled_tick", "scheduler"), ("upgrade", "system")],
+)
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
+    trigger: str,
+    canonical: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = get_service_principal(trigger)
+    assert service is not None and service.canonical == canonical
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        home / "state" / "journal" / "entry.md",
+        home / "memory" / "issues" / "970.md",
+        repo / "source.py",
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, target
+
+    for target in (
+        home / "root.txt",
+        outside / "data.txt",
+        Path("/tmp/unscoped.txt"),
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_denies_protected_home_paths(
+    trigger: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    protected = (
+        home / "state" / ".env",
+        home / "state" / "config.yaml",
+        home / "state" / "credentials.json",
+        home / "state" / "identities.yaml",
+        home / "state" / "secrets" / "token.txt",
+        home / "state" / "prompts" / "system.md",
+        home / "state" / ".mimir" / "pending-update.flag",
+        home / "memory" / "config" / "runtime.yaml",
+        home / "memory" / "credentials.json",
+        home / "memory" / "identities.yaml",
+        home / "memory" / "secrets.md",
+        home / "memory" / "prompts" / "system.md",
+        home / "memory" / ".mimir" / "state.json",
+        home / "memory" / "core" / "service-axis.md",
+    )
+    for target in protected:
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
+    trigger: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    memory = home / "memory"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    state.mkdir(parents=True)
+    memory.mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    (state / "credentials").symlink_to(repo, target_is_directory=True)
+    (memory / "core").symlink_to(repo, target_is_directory=True)
+    (repo / "prompts").symlink_to(repo / "safe", target_is_directory=True)
+    (repo / "safe").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        state / "escape" / "escaped.md",
+        state / "credentials" / "token.txt",
+        memory / "core" / "symlinked.md",
+        repo / "prompts" / "system.md",
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+def test_static_service_write_allows_home_when_file_tool_roots_unset(
+    trigger: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        home / "state" / "journal" / "entry.md",
+        home / "memory" / "issues" / "970.md",
+        Path("state/journal/relative.md"),
+        Path("memory/issues/relative.md"),
+    ):
+        decision = registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, target
+
+
+def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    trigger_state = home / "state" / "triggers" / "poller"
+    repo = tmp_path / "repo"
+    readonly = tmp_path / "readonly"
+    outside = tmp_path / "outside"
+    trigger_state.mkdir(parents=True)
+    repo.mkdir()
+    readonly.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw,{readonly}:ro")
+    service = build_trigger_service_principal(
+        canonical="poller:writer",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("write_file", "edit_file"),
+        roots=(trigger_state,),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (repo / "source.py", trigger_state / "cursor.json"):
+        assert registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(target),
+        ).allowed is True
+    for target in (home / "root.txt", readonly / "data.txt", outside / "data.txt", Path("/tmp/unscoped.txt")):
+        decision = registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+    assert registry.authorize_tool(
+        "write_file", auth, enforce=True, target_channel="cursor.json",
+    ).allowed is False
+
+
+def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    service = ServicePrincipal(
+        canonical="poller:factory",
+        trigger="poller",
+        capabilities=("worklink_run", "spawn_open_code"),
+        readable_domains=("poller_payload",),
+        sink_destinations=("worklink", "spawn_process"),
+        sink_policies=(
+            ServiceSinkPolicy(
+                "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
+            ),
+            ServiceSinkPolicy("spawn_open_code", "exact_roots", f'["{repo}"]'),
+        ),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    trusted_source = SourceLabel(
+        principal="service:poller:factory",
+        domain="channel",
+        resource_id="poller:test",
+        bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:factory"}),
+        source_kind="service",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    untrusted_source = replace(trusted_source, integrity="untrusted")
+    trusted = InformationFlowLabels().with_channel("poller:test").with_source(trusted_source)
+    untrusted = InformationFlowLabels().with_channel("poller:test").with_source(untrusted_source)
+    registry = ToolRegistry()
+
+    admitted = registry.authorize_tool(
+        "worklink_run", _service_auth(service, trusted), enforce=True,
+        target_channel=str(repo),
+    )
+    tainted = registry.authorize_tool(
+        "worklink_run", _service_auth(service, untrusted), enforce=True,
+        target_channel=str(repo),
+    )
+    spawn = registry.authorize_tool(
+        "spawn_open_code", _service_auth(service, trusted), enforce=True,
+        target_channel=str(repo),
+    )
+
+    assert admitted.allowed is True
+    assert tainted.allowed is False
+    assert tainted.reason == "ifc_label_blocked:spawn"
+    assert spawn.allowed is False
+    assert spawn.reason == "ifc_label_blocked:spawn"
+
+
+def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    for operation in ("write_file", "edit_file", "worklink_run", "spawn_open_code"):
+        assert registry.authorize_tool(
+            operation,
+            _write_auth(admin=True),
+            enforce=True,
+            target_channel=str(tmp_path / "outside"),
+        ).allowed is True
