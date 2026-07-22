@@ -22,7 +22,7 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink import autonomy
-from mimir.worklink.claims import CLAIM_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -1312,8 +1312,10 @@ class FakeChainlinkForReview:
         self,
         review_ids: list[int] = None,
         comments: dict[int, list[str]] | None = None,
+        open_ids: list[int] | None = None,
     ) -> None:
         self.review_ids = review_ids or []
+        self.open_ids = list(self.review_ids) if open_ids is None else open_ids
         self.comments = comments or {}
         self.calls: list[list[str]] = []
 
@@ -1323,12 +1325,17 @@ class FakeChainlinkForReview:
         tail = args[1:]
         if tail[:2] == ["issue", "list"]:
             label = tail[tail.index("--label") + 1] if "--label" in tail else ""
+            if not label:
+                return cp(stdout=json.dumps([{"id": i} for i in self.open_ids]))
             if label == "worklink:review":
                 return cp(stdout=json.dumps([{"id": i} for i in self.review_ids]))
             return cp(stdout=json.dumps([]))
         if tail[:2] == ["issue", "show"]:
             issue_id = int(tail[2])
             return cp(stdout=json.dumps({"id": issue_id, "comments": self.comments.get(issue_id, [])}))
+        if tail[:2] == ["issue", "close"]:
+            self.review_ids = [issue_id for issue_id in self.review_ids if issue_id != int(tail[2])]
+            return cp()
         return cp()
 
     def names(self) -> list[str]:
@@ -1365,6 +1372,7 @@ def test_close_merged_chainlinks_dry_run(tmp_path: Path) -> None:
     assert results[0].issue_id == 740
     assert results[0].pr_url == "https://github.com/owner/repo/pull/1029"
     assert results[0].merge_commit_sha == "912e48d6"
+    assert "issue close 740" not in fake_cl.names()
 
 
 def test_close_merged_chainlinks_actually_closes(tmp_path: Path) -> None:
@@ -1390,13 +1398,66 @@ def test_close_merged_chainlinks_actually_closes(tmp_path: Path) -> None:
 
     try:
         results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
+        rerun_results = autonomy.close_merged_chainlinks_for_home(home, dry_run=False, gh_runner=fake_gh)
     finally:
         aut.make_claims = orig_make_claims
 
     assert len(results) == 1
     assert results[0].issue_id == 841
     assert "issue unlabel 841" in fake_cl.names()
+    assert "issue close 841" in fake_cl.names()
     assert any("PR merged" in " ".join(c) for c in fake_cl.calls)
+    assert rerun_results == []
+
+
+def test_close_merged_chainlinks_leaves_reopened_non_review_issue_untouched(
+    tmp_path: Path,
+) -> None:
+    """Merged-PR reconciliation must not re-close an operator-reopened issue."""
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "849-1.json").write_text(
+        json.dumps(
+            {
+                "issue": 849,
+                "attempt": 1,
+                "status": "completed",
+                "pr_url": "https://github.com/owner/repo/pull/1046",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh(
+        {
+            "owner/repo#1046": {
+                "state": "MERGED",
+                "mergedAt": "2026-07-22T11:00:00Z",
+                "mergeCommit": "abc8490",
+            }
+        }
+    )
+    # The unfiltered open scan sees 849, but the worklink:review query does not.
+    fake_cl = FakeChainlinkForReview(review_ids=[], open_ids=[849])
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(
+            home, dry_run=False, gh_runner=fake_gh
+        )
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    mutating_actions = {"unlabel", "comment", "close"}
+    assert not [
+        call
+        for call in fake_cl.calls
+        if call[1:2] == ["issue"] and len(call) > 2 and call[2] in mutating_actions
+    ]
 
 
 def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
@@ -1406,7 +1467,7 @@ def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
     evidence_dir = home / "state" / "worklink" / "evidence"
     evidence_dir.mkdir(parents=True)
     (evidence_dir / "842-1.json").write_text(
-        json.dumps({"issue": 842, "attempt": 1, "pr_url": "https://github.com/owner/repo/pull/1040"}),
+        json.dumps({"issue": 842, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1040"}),
         encoding="utf-8",
     )
 
@@ -1426,21 +1487,32 @@ def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
         aut.make_claims = orig_make_claims
 
     assert results == []
+    claims = ChainlinkClaims(agent_id="test", runner=fake_cl, home_path=home)
+    claim = claims.claim_issue(842, labels=["worklink:ready"])
+    assert claim.claimed is False
+    assert claim.reason == "review_ready_evidence_exists"
 
 
-def test_close_merged_chainlinks_skips_closed_unmerged(tmp_path: Path) -> None:
-    """Chainlinks with closed-but-not-merged PRs are left untouched."""
+def test_close_merged_chainlinks_archives_closed_unmerged_evidence(tmp_path: Path) -> None:
+    """A closed-unmerged attempt is archived and becomes claimable again."""
     home = tmp_path / "home"
     home.mkdir()
     evidence_dir = home / "state" / "worklink" / "evidence"
     evidence_dir.mkdir(parents=True)
-    (evidence_dir / "843-1.json").write_text(
-        json.dumps({"issue": 843, "attempt": 1, "pr_url": "https://github.com/owner/repo/pull/1041"}),
+    evidence_path = evidence_dir / "843-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 843, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1041"}),
         encoding="utf-8",
     )
 
     fake_gh = FakeGh({"owner/repo#1041": {"state": "CLOSED", "mergedAt": "null", "mergeCommit": "null"}})
-    fake_cl = FakeChainlinkForReview(review_ids=[843])
+    fake_cl = FakeChainlinkForReview(
+        review_ids=[843],
+        comments={843: [
+            'WORKLINK_CLAIM {"issue_id": 843, "attempt": 1, "agent_id": "old", '
+            '"claimed_at": "2026-07-21T10:00:00+00:00", "heartbeat_at": null}'
+        ]},
+    )
 
     def make_claims_runner(home):
         return ChainlinkClaims(agent_id="test", runner=fake_cl)
@@ -1455,6 +1527,70 @@ def test_close_merged_chainlinks_skips_closed_unmerged(tmp_path: Path) -> None:
         aut.make_claims = orig_make_claims
 
     assert results == []
+    assert not evidence_path.exists()
+    assert evidence_path.with_suffix(".json.closed-unmerged").exists()
+
+    claims = ChainlinkClaims(agent_id="test", runner=fake_cl, home_path=home)
+    claim = claims.claim_issue(
+        843,
+        comments=fake_cl.comments[843],
+        labels=["worklink:ready"],
+    )
+    assert claim.claimed is True
+    assert claim.record is not None
+    assert claim.record.attempt == 2
+
+
+def test_close_merged_chainlinks_closed_unmerged_dry_run_keeps_evidence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_path = evidence_dir / "847-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 847, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1044"}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGh({"owner/repo#1044": {"state": "CLOSED"}})
+    fake_cl = FakeChainlinkForReview(review_ids=[847])
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(home, dry_run=True, gh_runner=fake_gh)
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert evidence_path.exists()
+    assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
+
+
+def test_close_merged_chainlinks_gh_failure_keeps_evidence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence_path = evidence_dir / "848-1.json"
+    evidence_path.write_text(
+        json.dumps({"issue": 848, "attempt": 1, "status": "completed", "pr_url": "https://github.com/owner/repo/pull/1045"}),
+        encoding="utf-8",
+    )
+    fake_cl = FakeChainlinkForReview(review_ids=[848])
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(
+            home,
+            gh_runner=lambda args: cp(returncode=1, stderr="network failure"),
+        )
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    assert evidence_path.exists()
+    assert not [call for call in fake_cl.calls if call[1:3] in (["issue", "unlabel"], ["issue", "comment"], ["issue", "close"])]
 
 
 def test_close_merged_chainlinks_closes_epic_from_mirror_comment(tmp_path: Path) -> None:

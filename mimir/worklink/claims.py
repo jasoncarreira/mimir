@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
+import logging
 from pathlib import Path
 import subprocess
 from typing import Any, Callable, Iterable, Sequence
@@ -19,6 +20,8 @@ CLAIM_PREFIX = "WORKLINK_CLAIM "
 REAPER_PREFIX = "WORKLINK_REAPER "
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+log = logging.getLogger(__name__)
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -173,13 +176,21 @@ class ChainlinkClaims:
 
         effective_home = Path(home_path) if home_path is not None else self.home_path
         if effective_home is not None:
-            from .autonomy import _find_latest_evidence_for_issue
-            evidence = _find_latest_evidence_for_issue(effective_home, issue_id)
+            from .autonomy import _find_latest_evidence_file_for_issue
+            evidence_file = _find_latest_evidence_file_for_issue(effective_home, issue_id)
+            evidence_path, evidence = evidence_file if evidence_file is not None else (None, None)
             if (
                 evidence is not None
                 and evidence.get("status") == "completed"
                 and evidence.get("pr_url")
             ):
+                log.info(
+                    "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
+                    "evidence_path=%s pr_url=%s",
+                    issue_id,
+                    evidence_path,
+                    evidence.get("pr_url"),
+                )
                 return ClaimResult(False, reason="review_ready_evidence_exists")
 
         lock = self._run("locks", "claim", str(issue_id), check=False)
@@ -442,26 +453,27 @@ class ChainlinkClaims:
 
     # ---- Discovery / concurrency (slice-3 autonomy) ------------------
 
-    def _list_issue_ids(self, label: str, *, status: str = "open") -> list[int]:
-        """Query issue ids carrying ``label``; RAISE on a failed/garbled query.
+    def _list_issue_ids(self, label: str | None, *, status: str = "open") -> list[int]:
+        """Query issue ids, optionally carrying ``label``; raise on failure.
 
         The strict path behind the safety cap: it must distinguish "no active
         claims" from "couldn't read active claims" so the cap can fail closed.
         """
-        result = self._run(
-            "issue", "list", "--label", label, "--status", status, "--json",
-            check=False,
-        )
+        args = ["issue", "list"]
+        if label is not None:
+            args.extend(["--label", label])
+        args.extend(["--status", status, "--json"])
+        result = self._run(*args, check=False)
         if result.returncode != 0:
             raise RuntimeError(
                 (result.stderr or result.stdout).strip()
-                or f"chainlink issue list --label {label} failed (rc={result.returncode})"
+                or f"chainlink issue list failed (rc={result.returncode})"
             )
         try:
             data = json.loads(result.stdout or "[]")
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f"chainlink issue list --label {label} returned invalid JSON"
+                "chainlink issue list returned invalid JSON"
             ) from exc
         issues = data if isinstance(data, list) else data.get("issues", [])
         ids: list[int] = []
@@ -486,6 +498,13 @@ class ChainlinkClaims:
         """
         try:
             return self._list_issue_ids(label, status=status)
+        except RuntimeError:
+            return []
+
+    def issue_ids(self, *, status: str = "open") -> list[int]:
+        """Best-effort issue id list without a label filter."""
+        try:
+            return self._list_issue_ids(None, status=status)
         except RuntimeError:
             return []
 
