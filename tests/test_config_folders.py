@@ -18,6 +18,9 @@ class TestParseFolders:
         gitignored, so it never pollutes tracked state)."""
         assert DEFAULT_FOLDERS.get("scratch") == "rw"
 
+    def test_conversation_history_is_a_default_writable_dir(self) -> None:
+        assert DEFAULT_FOLDERS.get("conversation_history") == "rw"
+
     def test_only_invalid_pairs_returns_default(self) -> None:
         # No `:` separator, nothing parseable → fall through to defaults
         # rather than handing the agent an empty folders dict (which
@@ -105,8 +108,14 @@ def test_from_env_default_folders(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIMIR_FOLDERS", raising=False)
     cfg = Config.from_env()
     assert cfg.folders == DEFAULT_FOLDERS
-    # state, memory, attachments, scratch, skills are the rw defaults
+    # conversation_history joins the agent-authored roots; logs/messages/prompts
+    # remain read-only.
     # (scratch added in chainlink #299 — the blessed ephemeral workspace).
     assert set(cfg.writable_dirs) == {
-        "state", "memory", "attachments", "scratch", "skills",
+        "state",
+        "memory",
+        "conversation_history",
+        "attachments",
+        "scratch",
+        "skills",
     }
