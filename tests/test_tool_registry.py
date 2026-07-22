@@ -31,6 +31,7 @@ _OLD_ADMIN_TOOLS = {
     "submit_proposal",
     "abandon_proposal",
     "request_mimir_update",
+    "worklink_run",
     "shell_exec",
     "bash_async",
     "spawn_claude_code",
@@ -38,6 +39,8 @@ _OLD_ADMIN_TOOLS = {
     "spawn_open_code",
     "task",
     "saga_forget",
+    "write_file",
+    "edit_file",
 }
 
 _NEWLY_CATALOGED_TOOLS = {
@@ -104,15 +107,12 @@ def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     catalog = OperationCatalog()
+    resource_scoped = {"write_file", "edit_file", "worklink_run"}
 
-    assert _OLD_ADMIN_TOOLS <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert _OLD_ADMIN_TOOLS - resource_scoped <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert resource_scoped <= catalog._RESOURCE_SCOPED_OPERATIONS
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
-
-
-@pytest.mark.parametrize("operation", ["write_file", "edit_file", "worklink_run"])
-def test_caller_scoped_operations_are_resource_scoped(operation: str) -> None:
-    assert OperationCatalog().get_decision(operation) == OperationDecision.RESOURCE_SCOPED
 
 
 def test_open_catalog_excludes_protected_global_metadata() -> None:
@@ -1039,7 +1039,10 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
         else:
             assert result.allowed is False, f"{trigger} should deny {operation}"
             assert result.reason in (
-                "admin_required", "unknown_operation", "ifc_label_blocked:spawn",
+                "admin_required",
+                "unknown_operation",
+                "service_capability_denied",
+                "ifc_label_blocked:spawn",
             ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
 
 

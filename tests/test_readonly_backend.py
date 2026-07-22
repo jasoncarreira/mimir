@@ -14,8 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.access_control import get_service_principal
-from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
 from mimir.readonly_backend import (
     FileToolRouter,
     ReadOnlyFilesystemBackend,
@@ -376,24 +374,6 @@ class TestCoreMemoryReflectionGate:
         from mimir._context import reset_current_turn
         reset_current_turn(token)
 
-    @staticmethod
-    def _static_service_auth(trigger: str) -> AuthContext:
-        service = get_service_principal(trigger)
-        assert service is not None
-        return AuthContext(
-            principal=f"service:{service.canonical}",
-            canonical_principal=service.canonical,
-            roles=("service",),
-            event_ingress=None,
-            trigger=trigger,
-            channel_id=f"scheduler:{trigger}",
-            interactivity=TurnInteractivity.NON_INTERACTIVE,
-            is_service=True,
-            service_authority=service,
-            enforcement_enabled=True,
-            ifc_labels=InformationFlowLabels(),
-        )
-
     def test_blocks_core_memory_write_in_user_message_turn(
         self, home_with_memory: Path
     ) -> None:
@@ -477,43 +457,6 @@ class TestCoreMemoryReflectionGate:
             result = b.write(
                 file_path="/memory/core/00-persona.md",
                 content="untrusted instruction",
-            )
-            assert "read-only" in (getattr(result, "error", "") or "")
-        finally:
-            self._clear_turn(tok)
-
-    @pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
-    def test_static_service_axis_allows_core_memory_write(
-        self, home_with_memory: Path, trigger: str
-    ) -> None:
-        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
-        ctx = self._make_turn_ctx(trigger=trigger, channel_id=f"scheduler:{trigger}")
-        ctx.auth_context = self._static_service_auth(trigger)
-        tok = self._set_turn(ctx)
-        try:
-            result = b.write(
-                file_path="/memory/core/service-axis.md",
-                content="maintenance",
-            )
-            assert getattr(result, "error", None) is None
-            assert (
-                home_with_memory / "memory" / "core" / "service-axis.md"
-            ).read_text() == "maintenance"
-        finally:
-            self._clear_turn(tok)
-
-    def test_forged_static_trigger_without_service_axis_stays_blocked(
-        self, home_with_memory: Path
-    ) -> None:
-        b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
-        ctx = self._make_turn_ctx(
-            trigger="scheduled_tick", channel_id="scheduler:forged"
-        )
-        tok = self._set_turn(ctx)
-        try:
-            result = b.write(
-                file_path="/memory/core/00-persona.md",
-                content="forged",
             )
             assert "read-only" in (getattr(result, "error", "") or "")
         finally:

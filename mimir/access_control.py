@@ -32,6 +32,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from .identities import AccessMetadata
+from .read_policy import (
+    READ_RESOURCE_OPERATIONS,
+    read_target_from_arguments,
+)
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 
@@ -580,8 +584,16 @@ _STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
 })
 
 
-def _is_static_service_protected_write_path(path: Path) -> bool:
+def _is_static_service_protected_write_path(
+    path: Path,
+    *,
+    under_memory_root: bool = False,
+) -> bool:
     """Keep live scheduler/system writes away from operator-controlled data."""
+    if under_memory_root and (
+        path == Path("core") or path.is_relative_to(Path("core"))
+    ):
+        return True
     for part in (part.lower() for part in path.parts):
         stem = Path(part).stem
         if (
@@ -605,10 +617,11 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
     if not home:
         return False
     home_root = Path(home).resolve()
+    memory_root = (home_root / "memory").resolve()
     roots = [
         *(root.resolve() for root in _configured_repo_write_roots()),
         (home_root / "state").resolve(),
-        (home_root / "memory").resolve(),
+        memory_root,
     ]
     candidate = Path(target)
     if not candidate.is_absolute():
@@ -619,24 +632,30 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
         # ``state/credentials -> <repo>/data``) from laundering its name by
         # resolving into another otherwise-safe configured root.
         lexical_relatives = tuple(
-            candidate.relative_to(root)
+            (root, candidate.relative_to(root))
             for root in roots
             if candidate == root or candidate.is_relative_to(root)
         )
         if any(
-            _is_static_service_protected_write_path(relative)
-            for relative in lexical_relatives
+            _is_static_service_protected_write_path(
+                relative,
+                under_memory_root=root == memory_root,
+            )
+            for root, relative in lexical_relatives
         ):
             return False
         resolved = resolve_within_roots(roots, str(candidate))
-        relative = next(
-            resolved.relative_to(root)
+        root, relative = next(
+            (root, resolved.relative_to(root))
             for root in roots
             if resolved == root or resolved.is_relative_to(root)
         )
     except (OSError, PathOutsideHomeError, RuntimeError, StopIteration, ValueError):
         return False
-    return not _is_static_service_protected_write_path(relative)
+    return not _is_static_service_protected_write_path(
+        relative,
+        under_memory_root=root == memory_root,
+    )
 
 
 def resolve_configured_write_target(target: str) -> Path:
@@ -2679,13 +2698,14 @@ class ToolRegistry:
                     if not enforce:
                         allowed = True
                         is_shadow = True
-            required_tier = AccessTier.ADMIN
-            if enforce:
-                allowed = False
-                reason = "resource_scoped"
             else:
-                allowed = True
-                is_shadow = True
+                required_tier = AccessTier.ADMIN
+                if enforce:
+                    allowed = False
+                    reason = "resource_scoped"
+                else:
+                    allowed = True
+                    is_shadow = True
         else:
             # Explicit service capabilities are authoritative even if a newly
             # added operation has not reached the catalog yet. This is a narrow
@@ -3008,7 +3028,18 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "submit_proposal",
                 "abandon_proposal",
                 "worklink_run",
-                                                                                                    ),
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "file_search",
+                "get_turn",
+                "mimir_get_turn",
+            ),
             readable_domains=(
                 "configured_inputs",
                 "filesystem",
@@ -3052,7 +3083,17 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "saga_record_skill_learning",
                 "memory_get",
                 "memory_store",
-                                                                                            ),
+                "mimir_get_turn",
+                "get_turn",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+            ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga"),
             creation_path="mimir.server._on_session_idle",
@@ -3073,7 +3114,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "add_schedule",
                 "set_schedule_priority",
                 "list_schedules",
-                                                                                "send_message",
+                "read_file",
+                "aread",
+                "ls",
+                "als",
+                "glob",
+                "aglob",
+                "grep",
+                "agrep",
+                "send_message",
             ),
             readable_domains=(
                 "defaults",
