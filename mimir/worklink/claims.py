@@ -69,6 +69,12 @@ class ClaimResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ReviewReadyEvidence:
+    path: Path
+    payload: dict[str, Any]
+
+
 def _parse_dt(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -174,24 +180,16 @@ class ChainlinkClaims:
         if "worklink:review" in label_set:
             return ClaimResult(False, reason="lifecycle_state_incompatible")
 
-        effective_home = Path(home_path) if home_path is not None else self.home_path
-        if effective_home is not None:
-            from .autonomy import _find_latest_evidence_file_for_issue
-            evidence_file = _find_latest_evidence_file_for_issue(effective_home, issue_id)
-            evidence_path, evidence = evidence_file if evidence_file is not None else (None, None)
-            if (
-                evidence is not None
-                and evidence.get("status") == "completed"
-                and evidence.get("pr_url")
-            ):
-                log.info(
-                    "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
-                    "evidence_path=%s pr_url=%s",
-                    issue_id,
-                    evidence_path,
-                    evidence.get("pr_url"),
-                )
-                return ClaimResult(False, reason="review_ready_evidence_exists")
+        review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
+        if review_ready is not None:
+            log.info(
+                "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
+                "evidence_path=%s pr_url=%s",
+                issue_id,
+                review_ready.path,
+                review_ready.payload.get("pr_url"),
+            )
+            return ClaimResult(False, reason="review_ready_evidence_exists")
 
         lock = self._run("locks", "claim", str(issue_id), check=False)
         if lock.returncode != 0:
@@ -266,6 +264,31 @@ class ChainlinkClaims:
             self.release_issue(issue_id)
             raise
         return ClaimResult(True, record=record)
+
+    def review_ready_evidence(
+        self,
+        issue_id: int,
+        *,
+        home_path: str | Path | None = None,
+    ) -> ReviewReadyEvidence | None:
+        """Return the latest active completed evidence associated with a PR.
+
+        Archived ``.json.closed-unmerged`` evidence is intentionally excluded by
+        the shared finder, so operator-approved re-attempts remain admissible.
+        """
+        effective_home = Path(home_path) if home_path is not None else self.home_path
+        if effective_home is None:
+            return None
+
+        from .autonomy import _find_latest_evidence_file_for_issue
+
+        found = _find_latest_evidence_file_for_issue(effective_home, issue_id)
+        if found is None:
+            return None
+        path, payload = found
+        if payload.get("status") != "completed" or not payload.get("pr_url"):
+            return None
+        return ReviewReadyEvidence(path=path, payload=payload)
 
     def release_issue(self, issue_id: int) -> None:
         """Release the Chainlink lock for ``issue_id`` best-effort."""
