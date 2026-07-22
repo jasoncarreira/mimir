@@ -850,10 +850,25 @@ class TestBuildFileToolRoutes:
         else:
             route_root = tmp_path / "route"
         home = route_root / "home"
-        for dirname in ("state", "logs", "messages", "attachments", "scratch", "memory"):
+        for dirname in (
+            "state",
+            "logs",
+            "messages",
+            "attachments",
+            "scratch",
+            "memory",
+            "conversation_history",
+        ):
             (home / dirname).mkdir(parents=True)
         (home / "state" / "visible.txt").write_text("needle visible\n", encoding="utf-8")
-        for dirname in ("logs", "messages", "attachments", "scratch", "memory"):
+        for dirname in (
+            "logs",
+            "messages",
+            "attachments",
+            "scratch",
+            "memory",
+            "conversation_history",
+        ):
             (home / dirname / "hidden.txt").write_text(
                 f"needle hidden {dirname}\n", encoding="utf-8",
             )

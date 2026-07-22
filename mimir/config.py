@@ -104,6 +104,7 @@ _EVENTS_CAP_MAX = _TURNS_CAP_MAX * _EVENTS_PER_TURN_RATIO
 DEFAULT_FOLDERS: dict[str, str] = {
     "state": "rw",       # Agent state files (commitments, sessions, etc.)
     "memory": "rw",      # Long-form text journal
+    "conversation_history": "rw",  # DeepAgents summarization offload
     "attachments": "rw", # Agent-generated artifacts
     "scratch": "rw",     # Ephemeral working area (drafts, throwaway clones,
                          # scratch notes). Gitignored — not tracked state. The

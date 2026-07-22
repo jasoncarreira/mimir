@@ -67,6 +67,7 @@ from .history import Message, MessageBuffer
 from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
+from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
 from .jsonl_snapshot import JsonlSnapshot
 from .models import (
@@ -108,6 +109,9 @@ _lcc_patches.strip_deepagents_base_prompt()
 # otherwise summarization middleware can rebuild Pydantic tool schemas on
 # the asyncio loop at every model boundary (chainlink #600).
 _lcc_patches.patch_deepagents_token_counter_tool_schema_cache()
+# DeepAgents deliberately treats history-offload failures as non-fatal. Keep
+# summarization progressing, but retain the swallowed exception's traceback.
+install_offload_traceback_logging_patch()
 # Register PreToolUse/PostToolUse/PostToolUseFailure SDK hooks so every
 # tool invocation (built-in Bash/Read/Edit/etc, bridged langchain tools,
 # MCP tools) is captured into ``generation_info["tool_events"]`` as an
