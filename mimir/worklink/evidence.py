@@ -49,6 +49,9 @@ class WorklinkEvidence:
     # chainlink #817: in-attempt gate-repair rounds this evidence reflects
     # (0 = the gate passed/failed without repair).
     repair_rounds: int = 0
+    # Commit pushed for this completed attempt. Recovery uses it to detect PR
+    # branch updates made after Worklink finished.
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True)

@@ -659,6 +659,7 @@ class WorklinkRunner:
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
+                validation = _with_head_sha(validation, lease.path, runner=runner)
             evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             # chainlink #518: push from the checkout that OWNS the attempt
@@ -761,6 +762,57 @@ class WorklinkRunner:
             runner=_list_runner(runner),
             home_path=self.home,
         )
+        review_ready = claims.review_ready_evidence(issue_id)
+        if review_ready is not None:
+            try:
+                pr_url = str(review_ready.payload["pr_url"])
+                pr_state, remote_head = _reattach_pr_state(pr_url, runner=runner)
+                expected_head = review_ready.payload.get("head_sha")
+                if not expected_head or not remote_head or remote_head != expected_head:
+                    _log_event(
+                        "worklink_reattach_branch_mismatch",
+                        level="warning",
+                        issue_id=issue_id,
+                        attempt=state.attempt,
+                        branch=state.branch,
+                        expected_head=expected_head,
+                        remote_head=remote_head,
+                        reason=(
+                            "final_state_not_recorded"
+                            if not expected_head
+                            else "remote_head_mismatch"
+                        ),
+                    )
+                restored_review = pr_state == "OPEN"
+                if restored_review:
+                    claims.transition_issue(
+                        issue_id,
+                        status="completed",
+                        review_ready=True,
+                        attempt=state.attempt,
+                    )
+                _log_event(
+                    "worklink_reattach_reconciled",
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                    evidence_path=str(review_ready.path),
+                    pr_url=pr_url,
+                    pr_state=pr_state,
+                    review_label_restored=restored_review,
+                )
+                return WorklinkRunResult(
+                    issue_id,
+                    state.attempt,
+                    "completed",
+                    review_ready=restored_review,
+                    pr_url=pr_url,
+                    evidence_path=review_ready.path,
+                    branch=state.branch,
+                    reason="reattach: reconciled completed evidence",
+                )
+            finally:
+                claims.release_issue(issue_id)
+                clear_run_state(self.home, issue_id)
         # Only resume a leaf still in-progress. If the reaper already recovered it
         # (or a prior run transitioned it) the work is no longer ours to finish —
         # drop the stale state and stop. ``_issue_has_label`` fails open (assume
@@ -2216,6 +2268,36 @@ def _repo_slug_from_url(url: str | None) -> str | None:
 def _with_pr_url(validation: EvidenceValidation, pr_url: str) -> EvidenceValidation:
     evidence = replace(validation.evidence, pr_url=pr_url)
     return replace(validation, evidence=evidence)
+
+
+def _with_head_sha(
+    validation: EvidenceValidation,
+    worktree: Path,
+    *,
+    runner: Runner,
+) -> EvidenceValidation:
+    result = runner(["git", "-C", str(worktree), "rev-parse", "HEAD"])
+    head_sha = result.stdout.strip() if result.returncode == 0 else ""
+    if not head_sha:
+        return validation
+    return replace(validation, evidence=replace(validation.evidence, head_sha=head_sha))
+
+
+def _reattach_pr_state(pr_url: str, *, runner: Runner) -> tuple[str | None, str | None]:
+    """Read PR state and head only on the cold restart-reconciliation path."""
+    try:
+        result = runner(["gh", "pr", "view", pr_url, "--json", "state,headRefOid"])
+    except Exception:  # noqa: BLE001 - reconciliation must still release the claim.
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    state = str(payload.get("state") or "").upper() or None
+    head = str(payload.get("headRefOid") or "") or None
+    return state, head
 
 
 def _failed_validation(validation: EvidenceValidation, reason: str) -> EvidenceValidation:

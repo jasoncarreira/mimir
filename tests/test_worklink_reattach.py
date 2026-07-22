@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -271,6 +272,145 @@ def _save_inflight_state(home: Path, repo: Path, *, issue_id: int, job: str) -> 
             started_at="2026-06-18T16:00:00+00:00",
         ),
     )
+
+
+def _write_completed_evidence(
+    home: Path,
+    *,
+    issue_id: int,
+    head_sha: str | None = "abc123",
+    archived: bool = False,
+) -> Path:
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".json.closed-unmerged" if archived else ".json"
+    path = evidence_dir / f"{issue_id}-1{suffix}"
+    path.write_text(
+        json.dumps(
+            {
+                "issue": issue_id,
+                "attempt": 1,
+                "status": "completed",
+                "branch": f"issue/{issue_id}-a1",
+                "pr_url": "https://github.com/jasoncarreira/mimir/pull/777",
+                "head_sha": head_sha,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_reattach_completed_evidence_reconciles_without_worker_or_push(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 564
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-stale")
+    evidence_path = _write_completed_evidence(tmp_path, issue_id=issue_id)
+    calls: list = []
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
+
+    def runner(args, *, cwd=None):
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
+            calls.append(args)
+            return cp(args, stdout='{"state":"OPEN","headRefOid":"abc123"}')
+        return base_runner(args, cwd=cwd)
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator._log_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    compute = FakeRemoteCompute()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    )
+
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.evidence_path == evidence_path
+    assert compute.waited == []
+    assert not any(isinstance(a, list) and "push" in a for a in calls)
+    assert ["chainlink", "issue", "label", str(issue_id), "worklink:review"] in calls
+    assert ["chainlink", "locks", "release", str(issue_id)] in calls
+    assert any(event == "worklink_reattach_reconciled" for event, _ in events)
+    assert not any(event == "worklink_reattach_branch_mismatch" for event, _ in events)
+    assert load_run_state(tmp_path, issue_id) is None
+
+
+def test_reattach_completed_evidence_remote_head_mismatch_warns_without_push(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 565
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-stale")
+    _write_completed_evidence(tmp_path, issue_id=issue_id, head_sha="attempt-final")
+    calls: list = []
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
+
+    def runner(args, *, cwd=None):
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
+            calls.append(args)
+            return cp(args, stdout='{"state":"OPEN","headRefOid":"reviewer-fix"}')
+        return base_runner(args, cwd=cwd)
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator._log_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    compute = FakeRemoteCompute()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    )
+
+    assert result.status == "completed"
+    assert compute.waited == []
+    assert not any(isinstance(a, list) and "push" in a for a in calls)
+    warning = next(payload for event, payload in events if event == "worklink_reattach_branch_mismatch")
+    assert warning["level"] == "warning"
+    assert warning["expected_head"] == "attempt-final"
+    assert warning["remote_head"] == "reviewer-fix"
+    assert ["chainlink", "locks", "release", str(issue_id)] in calls
+
+
+def test_reattach_ignores_archived_completed_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 566
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-live")
+    _write_completed_evidence(tmp_path, issue_id=issue_id, archived=True)
+    calls: list = []
+    runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
+    compute = FakeRemoteCompute(
+        wait_result=ComputeResult(
+            exit_code=-1,
+            stdout="",
+            stderr="broker gone",
+            launch_error="broker wait failed",
+        )
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    )
+
+    assert result.reason == "reattach: worker lost"
+    assert compute.waited == [LaunchHandle("fake_remote", "job-live")]
 
 
 def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None:
