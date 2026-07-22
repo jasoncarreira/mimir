@@ -10,6 +10,7 @@ working against the full home tree.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ from mimir.readonly_backend import (
     _RootAwareFilesystemBackend,
     build_file_tool_routes,
 )
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.models import AuthContext
 
 
 @pytest.fixture
@@ -806,6 +809,79 @@ class TestBuildFileToolRoutes:
         assert "src" in names
         assert ".worktrees" not in names
         assert "node_modules" not in names
+
+    def test_non_admin_grep_and_ls_skip_secret_bearing_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "safe.txt").write_text("needle safe\n", encoding="utf-8")
+        (repo / "private.txt").write_text(
+            "needle private\nghp_" + "a" * 30 + "\n", encoding="utf-8",
+        )
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="read-filter", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+            grep_paths = {m["path"] for m in backend.grep("needle", path="/").matches or []}
+            ls_names = {
+                Path(e["path"].rstrip("/")).name for e in backend.ls("/").entries or []
+            }
+        finally:
+            reset_current_turn(token)
+
+        assert grep_paths == {"/safe.txt"}
+        assert ls_names == {"safe.txt"}
+
+    @pytest.mark.parametrize("home_location", ["route", "tmp"])
+    def test_non_admin_home_collections_only_surface_state(
+        self,
+        home_location: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if home_location == "tmp":
+            route_root = Path("/tmp") / f"mimir-home-collection-{tmp_path.name}"
+        else:
+            route_root = tmp_path / "route"
+        home = route_root / "home"
+        for dirname in ("state", "logs", "messages", "attachments", "scratch", "memory"):
+            (home / dirname).mkdir(parents=True)
+        (home / "state" / "visible.txt").write_text("needle visible\n", encoding="utf-8")
+        for dirname in ("logs", "messages", "attachments", "scratch", "memory"):
+            (home / dirname / "hidden.txt").write_text(
+                f"needle hidden {dirname}\n", encoding="utf-8",
+            )
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="home-filter", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=route_root, virtual_mode=True)
+            grep_paths = {m["path"] for m in backend.grep("needle", path="/").matches or []}
+            glob_paths = {m["path"] for m in backend.glob("**/*.txt", path="/").matches or []}
+            ls_names = {
+                Path(e["path"].rstrip("/")).name
+                for e in backend.ls("/home").entries or []
+            }
+        finally:
+            reset_current_turn(token)
+            if home_location == "tmp":
+                import shutil
+
+                shutil.rmtree(home, ignore_errors=True)
+
+        assert grep_paths == {"/home/state/visible.txt"}
+        assert glob_paths == {"/home/state/visible.txt"}
+        assert ls_names == {"state"}
 
 
 class TestFileToolRouter:

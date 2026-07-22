@@ -96,12 +96,15 @@ async def file_search(
     except (TypeError, ValueError):
         k_clean = 5
     try:
+        from ..read_policy import non_admin_read_filter_enabled
+
         results = await indexer.search(
             query, scope=scope_clean, k=k_clean,
             path_prefix=path_prefix,
             semantic_weight=semantic_weight,
             keyword_weight=keyword_weight,
             recency_weight=recency_weight,
+            include_protected=not non_admin_read_filter_enabled(),
         )
     except ValueError as exc:
         # Negative-weight rejection from the indexer surfaces as a
@@ -228,6 +231,12 @@ def _read_turn_record(turn_id: str) -> str:
             except json.JSONDecodeError:
                 continue
             if row.get("turn_id") == target:
+                from ..read_policy import non_admin_read_filter_enabled
+
+                if non_admin_read_filter_enabled():
+                    from ..redaction import redact_payload
+
+                    row = redact_payload(row)
                 # Strip large/derived fields to preserve context budget. NOTE:
                 # ``injected_inputs`` (chainlink #376 mid-turn folds) is small and
                 # deliberately kept — it's the only place the synthesis-visible

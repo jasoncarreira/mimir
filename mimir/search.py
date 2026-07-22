@@ -27,16 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import math
 import sqlite3
 import struct
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from .core_blocks import describe_file
 from .index_skip import is_index_skipped
@@ -478,6 +477,7 @@ class Indexer:
         semantic_weight: float | None = None,
         keyword_weight: float | None = None,
         recency_weight: float | None = None,
+        include_protected: bool = True,
     ) -> list[SearchResult]:
         if not query.strip():
             return []
@@ -498,7 +498,7 @@ class Indexer:
         return await asyncio.to_thread(
             self._search_sync, query, list(query_vec_t),
             scope, k, candidate_pool,
-            path_prefix, w_cos, w_bm25, w_rec,
+            path_prefix, w_cos, w_bm25, w_rec, include_protected,
         )
 
     def _embed_query_uncached(self, text: str) -> tuple[float, ...]:
@@ -669,6 +669,7 @@ class Indexer:
         w_cos: float = W_COSINE,
         w_bm25: float = W_BM25,
         w_rec: float = W_RECENCY,
+        include_protected: bool = True,
     ) -> list[SearchResult]:
         # Weight resolve + validate happens in ``search()`` — by the
         # time we reach this method the floats are already finalized.
@@ -764,6 +765,29 @@ class Indexer:
                         "scope": row[5],
                         "description": row[6],
                     }
+
+        if not include_protected and candidates:
+            from .read_policy import is_protected_read_path, text_contains_secret
+
+            candidate_paths = {row["path"] for row in candidates.values()}
+            protected_paths = {
+                path for path in candidate_paths
+                if is_protected_read_path(self._home / path)
+            }
+            with self._db_lock, self._connect() as conn:
+                for path in candidate_paths - protected_paths:
+                    rows = conn.execute(
+                        "SELECT content FROM chunks WHERE path = ?", (path,)
+                    ).fetchall()
+                    if any(
+                        text_contains_secret(str(row[0]), path=self._home / path)
+                        for row in rows
+                    ):
+                        protected_paths.add(path)
+            candidates = {
+                key: row for key, row in candidates.items()
+                if row["path"] not in protected_paths
+            }
 
         if not candidates:
             return []

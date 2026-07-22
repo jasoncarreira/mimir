@@ -19,7 +19,7 @@ import pytest
 from mimir.search import (
     HashEmbedder,
     Indexer,
-    SearchResult,
+    _pack_vec,
     chunk_text,
     _classify_scope,
     _to_fts_query,
@@ -807,6 +807,59 @@ async def test_no_warning_when_dims_match(tmp_path: Path, caplog):
         await idx_b.start(run_initial_sweep=False, sweep_loop=False)
     matching = [r for r in caplog.records if "dim mismatch" in r.message]
     assert matching == []
+
+
+@pytest.mark.asyncio
+async def test_non_admin_filter_rejects_basic_auth_git_config(tmp_path: Path):
+    safe = tmp_path / "state" / "config.md"
+    safe.parent.mkdir(parents=True)
+    safe.write_text(
+        "url = https://alice:placeholder@example.invalid/repo.git\n",
+        encoding="utf-8",
+    )
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=True, sweep_loop=False)
+
+    # The indexer only sweeps Markdown files, so insert a synthetic .git/config
+    # row directly. This exercises path-aware result filtering without relying
+    # on a file type that the ordinary sweep intentionally ignores.
+    protected_path = "state/repo/.git/config"
+    protected_content = (
+        "[remote \"origin\"]\n"
+        "\turl = https://alice:placeholder@example.invalid/repo.git\n"
+    )
+    protected_embedding = idx._embedder.embed([protected_content])[0]
+    with idx._db_lock, idx._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO files(path, scope, mtime, size, chunk_count, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (protected_path, "state", time.time(), len(protected_content), 1, None),
+        )
+        conn.execute(
+            "INSERT INTO chunks(path, chunk_index, content, embedding) VALUES (?, ?, ?, ?)",
+            (
+                protected_path,
+                0,
+                protected_content,
+                sqlite3.Binary(_pack_vec(protected_embedding)),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO chunks_fts(path, chunk_index, content) VALUES (?, ?, ?)",
+            (protected_path, 0, protected_content),
+        )
+
+    unfiltered = await idx.search(
+        "example.invalid", scope="state", k=10, include_protected=True,
+    )
+    assert protected_path in {result.path for result in unfiltered}
+
+    filtered = await idx.search(
+        "example.invalid", scope="state", k=10, include_protected=False,
+    )
+    assert {result.path for result in filtered} == {"state/config.md"}
 
 
 # ---- path_prefix + dynamic weights (file_search enhancements) ----------
