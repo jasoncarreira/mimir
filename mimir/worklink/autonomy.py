@@ -218,6 +218,7 @@ class PrMergeState:
     """Result of checking a PR's merge state."""
 
     pr_url: str
+    state: str
     merged: bool
     merged_at: str | None = None
     merge_commit_sha: str | None = None
@@ -275,7 +276,7 @@ def _check_pr_merged_via_gh_runner(
     except (json.JSONDecodeError, TypeError):
         return None
 
-    state = data.get("state", "OPEN")
+    state = str(data.get("state", "OPEN")).upper()
     merged = state == "MERGED"
 
     merged_at = data.get("mergedAt")
@@ -291,24 +292,25 @@ def _check_pr_merged_via_gh_runner(
 
     return PrMergeState(
         pr_url=normalized,
+        state=state,
         merged=merged,
         merged_at=merged_at,
         merge_commit_sha=merge_commit_sha,
     )
 
 
-def _find_latest_evidence_for_issue(home: Path, issue_id: int) -> dict | None:
+def _find_latest_evidence_file_for_issue(home: Path, issue_id: int) -> tuple[Path, dict] | None:
     """Find the latest evidence file for an issue.
 
     Scans evidence directory for files matching <issue_id>-*.json and returns
-    the content of the one with the highest attempt number.
+    the path and content of the one with the highest attempt number.
     """
     evidence_dir = home / "state" / "worklink" / "evidence"
     if not evidence_dir.exists():
         return None
 
     prefix = f"{issue_id}-"
-    latest_evidence: dict | None = None
+    latest_evidence: tuple[Path, dict] | None = None
     latest_attempt = -1
 
     for file in evidence_dir.iterdir():
@@ -320,12 +322,18 @@ def _find_latest_evidence_for_issue(home: Path, issue_id: int) -> dict | None:
             continue
         if attempt > latest_attempt:
             try:
-                latest_evidence = json.loads(file.read_text(encoding="utf-8"))
+                latest_evidence = (file, json.loads(file.read_text(encoding="utf-8")))
                 latest_attempt = attempt
             except (json.JSONDecodeError, OSError):
                 continue
 
     return latest_evidence
+
+
+def _find_latest_evidence_for_issue(home: Path, issue_id: int) -> dict | None:
+    """Return the latest active evidence payload for an issue."""
+    found = _find_latest_evidence_file_for_issue(home, issue_id)
+    return found[1] if found is not None else None
 
 
 def _find_pr_url_from_comments(comments: list[str]) -> str | None:
@@ -440,19 +448,29 @@ def close_merged_chainlinks_for_home(
 
     cl = make_claims(home)
 
-    review_issue_ids = cl.issue_ids_with_label("worklink:review", status="open")
-    if not review_issue_ids:
+    open_issue_ids = cl.issue_ids(status="open")
+    if not open_issue_ids:
         return []
 
     closed_results: list[MergedChainlinkResult] = []
 
-    for issue_id in review_issue_ids:
+    for issue_id in open_issue_ids:
         pr_url = get_pr_url_for_review_issue(home, issue_id, chainlink_runner=cl.runner)
         if not pr_url:
             continue
 
         merge_state = _check_pr_merged_via_gh_runner(pr_url, runner=gh_runner)
-        if merge_state is None or not merge_state.merged:
+        if merge_state is None:
+            continue
+
+        if merge_state.state == "CLOSED" and not merge_state.merged:
+            evidence = _find_latest_evidence_file_for_issue(home, issue_id)
+            if evidence is not None and evidence[1].get("status") == "completed" and not dry_run:
+                evidence_path, _evidence_payload = evidence
+                evidence_path.rename(evidence_path.with_suffix(".json.closed-unmerged"))
+            continue
+
+        if not merge_state.merged:
             continue
 
         if dry_run:
@@ -474,6 +492,7 @@ def close_merged_chainlinks_for_home(
 
         cl._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
         cl._run("issue", "comment", str(issue_id), comment, check=False)
+        cl._run("issue", "close", str(issue_id), check=False)
 
         closed_results.append(MergedChainlinkResult(
             issue_id=issue_id,

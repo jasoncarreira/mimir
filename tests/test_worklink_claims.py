@@ -398,7 +398,7 @@ def test_claim_issue_accepts_worklink_in_progress_label() -> None:
     assert result.record is not None
 
 
-def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path) -> None:
+def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     calls: list[list[str]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -426,11 +426,15 @@ def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path) -
 
     claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, home_path=tmp_path)
 
-    result = claims.claim_issue(200, labels=["worklink:ready"])
+    with caplog.at_level("INFO", logger="mimir.worklink.claims"):
+        result = claims.claim_issue(200, labels=["worklink:ready"])
 
     assert result.claimed is False
     assert result.reason == "review_ready_evidence_exists"
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+    assert "issue_id=200 reason=review_ready_evidence_exists" in caplog.text
+    assert str(tmp_path / "state" / "worklink" / "evidence" / "200-1.json") in caplog.text
+    assert "pr_url=https://github.com/owner/repo/pull/123" in caplog.text
 
 
 def test_claim_issue_allows_without_evidence_when_worklink_ready(tmp_path: Path) -> None:
