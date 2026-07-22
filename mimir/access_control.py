@@ -614,13 +614,27 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
     if not candidate.is_absolute():
         candidate = home_root / candidate
     try:
+        # Check both the lexical spelling and resolved destination.  The former
+        # prevents a protected component that is itself a symlink (for example
+        # ``state/credentials -> <repo>/data``) from laundering its name by
+        # resolving into another otherwise-safe configured root.
+        lexical_relatives = tuple(
+            candidate.relative_to(root)
+            for root in roots
+            if candidate == root or candidate.is_relative_to(root)
+        )
+        if any(
+            _is_static_service_protected_write_path(relative)
+            for relative in lexical_relatives
+        ):
+            return False
         resolved = resolve_within_roots(roots, str(candidate))
         relative = next(
             resolved.relative_to(root)
             for root in roots
             if resolved == root or resolved.is_relative_to(root)
         )
-    except (OSError, PathOutsideHomeError, RuntimeError, StopIteration):
+    except (OSError, PathOutsideHomeError, RuntimeError, StopIteration, ValueError):
         return False
     return not _is_static_service_protected_write_path(relative)
 

@@ -257,6 +257,46 @@ def test_static_service_write_denies_protected_home_paths(
 
 
 @pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
+    trigger: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    memory = home / "memory"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    state.mkdir(parents=True)
+    memory.mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    (state / "credentials").symlink_to(repo, target_is_directory=True)
+    (repo / "prompts").symlink_to(repo / "safe", target_is_directory=True)
+    (repo / "safe").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        state / "escape" / "escaped.md",
+        state / "credentials" / "token.txt",
+        repo / "prompts" / "system.md",
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
 def test_static_service_write_allows_home_when_file_tool_roots_unset(
     trigger: str,
     tmp_path: Path,

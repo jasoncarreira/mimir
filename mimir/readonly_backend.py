@@ -764,13 +764,14 @@ class WriteGuardBackend:
         self._writable_labels: list[str] = ["/" + d for d in cleaned]
         # Pre-resolved memory/core/ root for the runtime read-only gate.
         # When ``enforce_core_memory_readonly`` is True, writes under this
-        # path are blocked during ANY active turn (chainlink #342): core
-        # memory is the agent's constitution, and changes go through the PR
-        # proposal flow (open_proposal) for operator review — not
-        # an in-turn write, reflection included. Turns with no TurnContext
-        # (the scaffold genesis seed, ``mimir setup``, tests, non-turn
-        # callables) are unaffected, so the initial seed still works. Policy:
-        # ``memory/core/30-reflection-policy.md``.
+        # path are blocked during active human and dynamic-service turns
+        # (chainlink #342): core memory is the agent's constitution, and those
+        # changes go through the PR proposal flow. The server-owned static
+        # scheduler/system service axes are the narrow exception: their sink
+        # policy separately authorizes memory/core for maintenance work.
+        # Turns with no TurnContext (the scaffold genesis seed, ``mimir setup``,
+        # tests, non-turn callables) are unaffected, so the initial seed still
+        # works. Policy: ``memory/core/30-reflection-policy.md``.
         self._memory_core_root: Path = (self._root / "memory" / "core").resolve()
         # Pre-resolved prompts/ root. prompts is operator-managed and (by
         # default) not a writable dir, so live writes are already blocked by the
@@ -908,14 +909,15 @@ class WriteGuardBackend:
           1. ``enforce_core_memory_readonly`` is True (default)
           2. the resolved target is under ``memory/core/``
           3. there is an active ``TurnContext``
+          4. that turn is not one of the static scheduler/system service axes
 
         No active turn (the scaffold genesis seed, ``mimir setup``, backend
         tests, non-turn cron callables) → False, so the initial core seed and
-        tooling are unaffected. There is no reflection exception and no
-        onboarding bypass: every in-turn core change — reflection included —
-        goes through the PR proposal flow (open_proposal). The
-        first check (writable-root membership) is done by ``_is_write_allowed``;
-        this gate stacks on top.
+        tooling are unaffected. Dynamic services remain blocked; only the
+        server-authenticated static services whose sink policy independently
+        grants this target bypass this backend-level gate. The first check
+        (writable-root membership) is done by ``_is_write_allowed``; this gate
+        stacks on top.
         """
         if not self._enforce_core_memory_readonly:
             return False
@@ -928,10 +930,22 @@ class WriteGuardBackend:
         )
         if not under_core:
             return False
-        # Lazy import to avoid a module cycle (mimir._context → models →
-        # potentially back into the agent layer that constructs the backend).
+        # Lazy imports avoid module cycles (mimir._context → models → the agent
+        # layer constructing this backend; access_control also imports paths).
         from ._context import get_current_turn
-        return get_current_turn() is not None
+        from .access_control import get_trusted_service_from_auth_context
+
+        turn = get_current_turn()
+        if turn is None:
+            return False
+        service = get_trusted_service_from_auth_context(
+            getattr(turn, "auth_context", None)
+        )
+        if service is not None and service.trigger in {"scheduled_tick", "upgrade"}:
+            policy = service.sink_policy_for("write_file")
+            if policy is not None and policy.adapter == "static_service_write_roots":
+                return False
+        return True
 
     def _is_identities_write_blocked(self, file_path: str) -> bool:
         """True iff this write targets ``state/identities.yaml`` — the auth
