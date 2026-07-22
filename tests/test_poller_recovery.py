@@ -91,7 +91,7 @@ def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: 
     ]
     assert restored is not None
     assert restored.ifc_labels is not None
-    assert restored.ifc_labels.sources == frozenset({source})
+    assert frozenset(restored.ifc_labels.sources) == frozenset({source})
 
 
 # ── reconcile ────────────────────────────────────────────────────────

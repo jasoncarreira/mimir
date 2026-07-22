@@ -212,7 +212,7 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         raw_labels = payload.get("ifc_labels")
         if isinstance(raw_labels, dict):
             raw_sources = raw_labels.get("sources") or ()
-            sources = frozenset(
+            sources = tuple(
                 SourceLabel(
                     principal=source.get("principal"),
                     domain=source.get("domain"),

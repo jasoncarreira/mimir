@@ -1249,7 +1249,7 @@ class SinkGate:
         effective_principal = service_source_principal or canonical_principal
         if not all((effective_principal, domain, resource_id, bridge_instance)):
             return frozenset()
-        if not isinstance(sources, frozenset) or not sources:
+        if not isinstance(sources, tuple) or not sources:
             return frozenset()
 
         for source in sources:
