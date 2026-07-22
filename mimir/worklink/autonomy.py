@@ -29,7 +29,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 from typing import Callable, Sequence
 
@@ -451,6 +450,7 @@ def close_merged_chainlinks_for_home(
     open_issue_ids = cl.issue_ids(status="open")
     if not open_issue_ids:
         return []
+    review_issue_ids = set(cl.issue_ids_with_label("worklink:review", status="open"))
 
     closed_results: list[MergedChainlinkResult] = []
 
@@ -471,6 +471,13 @@ def close_merged_chainlinks_for_home(
             continue
 
         if not merge_state.merged:
+            continue
+
+        # The widened open-issue scan exists only so closed-unmerged evidence
+        # can be archived after an operator re-queues an issue. Preserve the
+        # original merged-PR close population: never fight an operator who
+        # deliberately re-opened a completed issue without worklink:review.
+        if issue_id not in review_issue_ids:
             continue
 
         if dry_run:

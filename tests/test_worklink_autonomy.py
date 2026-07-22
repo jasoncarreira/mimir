@@ -22,7 +22,7 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink import autonomy
-from mimir.worklink.claims import CLAIM_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -1312,8 +1312,10 @@ class FakeChainlinkForReview:
         self,
         review_ids: list[int] = None,
         comments: dict[int, list[str]] | None = None,
+        open_ids: list[int] | None = None,
     ) -> None:
         self.review_ids = review_ids or []
+        self.open_ids = list(self.review_ids) if open_ids is None else open_ids
         self.comments = comments or {}
         self.calls: list[list[str]] = []
 
@@ -1323,7 +1325,9 @@ class FakeChainlinkForReview:
         tail = args[1:]
         if tail[:2] == ["issue", "list"]:
             label = tail[tail.index("--label") + 1] if "--label" in tail else ""
-            if not label or label == "worklink:review":
+            if not label:
+                return cp(stdout=json.dumps([{"id": i} for i in self.open_ids]))
+            if label == "worklink:review":
                 return cp(stdout=json.dumps([{"id": i} for i in self.review_ids]))
             return cp(stdout=json.dumps([]))
         if tail[:2] == ["issue", "show"]:
@@ -1404,6 +1408,56 @@ def test_close_merged_chainlinks_actually_closes(tmp_path: Path) -> None:
     assert "issue close 841" in fake_cl.names()
     assert any("PR merged" in " ".join(c) for c in fake_cl.calls)
     assert rerun_results == []
+
+
+def test_close_merged_chainlinks_leaves_reopened_non_review_issue_untouched(
+    tmp_path: Path,
+) -> None:
+    """Merged-PR reconciliation must not re-close an operator-reopened issue."""
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / "849-1.json").write_text(
+        json.dumps(
+            {
+                "issue": 849,
+                "attempt": 1,
+                "status": "completed",
+                "pr_url": "https://github.com/owner/repo/pull/1046",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGh(
+        {
+            "owner/repo#1046": {
+                "state": "MERGED",
+                "mergedAt": "2026-07-22T11:00:00Z",
+                "mergeCommit": "abc8490",
+            }
+        }
+    )
+    # The unfiltered open scan sees 849, but the worklink:review query does not.
+    fake_cl = FakeChainlinkForReview(review_ids=[], open_ids=[849])
+
+    import mimir.worklink.autonomy as aut
+    orig_make_claims = aut.make_claims
+    aut.make_claims = lambda home: ChainlinkClaims(agent_id="test", runner=fake_cl)
+    try:
+        results = autonomy.close_merged_chainlinks_for_home(
+            home, dry_run=False, gh_runner=fake_gh
+        )
+    finally:
+        aut.make_claims = orig_make_claims
+
+    assert results == []
+    mutating_actions = {"unlabel", "comment", "close"}
+    assert not [
+        call
+        for call in fake_cl.calls
+        if call[1:2] == ["issue"] and len(call) > 2 and call[2] in mutating_actions
+    ]
 
 
 def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
