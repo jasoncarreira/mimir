@@ -225,6 +225,7 @@ def _prompt_source_labels(
     bridge: str | None = None,
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
+    self_authored: bool = True,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -245,7 +246,9 @@ def _prompt_source_labels(
         sensitivity="private",
         authorized_principals=acl,
         source_kind=source_kind,
-        integrity=Integrity.UNTRUSTED,
+        # These blocks are loaded by the framework from its own memory/state by
+        # default. Callers injecting externally authored history opt out below.
+        integrity=Integrity.TRUSTED if self_authored else Integrity.UNTRUSTED,
         integrity_effect=IntegrityEffect.INFORMATIONAL,
     ))
 
@@ -4159,6 +4162,7 @@ class Agent:
                     channel_id=message.channel_id,
                     principal=message_principal,
                     bridge=message.source,
+                    self_authored=message.kind in {"assistant_message", "system_note"},
                 ),
             ))
         if saga_block:

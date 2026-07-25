@@ -34,12 +34,13 @@ from mimir.pollers import (
     _CircuitBreakerState,
     _circuit_breakers,
     _github_author_is_trusted,
+    _github_content_author,
     discover_pollers,
     run_poller,
     validate_poller_overrides_text,
 )
 from mimir.access_control import CapabilityTier, SinkGate, create_auth_context
-from mimir.agent import _create_turn_auth_context
+from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
 from mimir.models import InformationFlowLabels, SourceLabel
 
 
@@ -893,8 +894,8 @@ async def test_github_poller_mixing_uses_least_server_attested_trust(
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json
-print(json.dumps({"poller": "x", "prompt": "trusted", "repo": "acme/widget", "author": "alice"}))
-print(json.dumps({"poller": "x", "prompt": "untrusted", "repo": "acme/widget", "author": "mallory"}))
+print(json.dumps({"poller": "x", "prompt": "trusted", "event_type": "issue_opened", "repo": "acme/widget", "url": "https://github.com/acme/widget/issues/1", "author": "mallory"}))
+print(json.dumps({"poller": "x", "prompt": "untrusted", "event_type": "issue_opened", "repo": "acme/widget", "url": "https://github.com/acme/widget/issues/2", "author": "alice"}))
 """)
     seen: list[tuple[object, object, str]] = []
 
@@ -902,6 +903,13 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "repo": "acme/widget", "
         seen.append((repo, author, token))
         return author == "alice"
 
+    def fake_content_author(repo: object, extras: object, token: str) -> str:
+        assert repo == "acme/widget"
+        assert token == "server-token"
+        assert isinstance(extras, dict)
+        return "alice" if extras["url"].endswith("/1") else "mallory"
+
+    monkeypatch.setattr("mimir.pollers._github_content_author", fake_content_author)
     monkeypatch.setattr("mimir.pollers._github_author_is_trusted", fake_lookup)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
@@ -917,10 +925,77 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "repo": "acme/widget", "
     assert {source.integrity for source in labels.sources} == {"trusted", "untrusted"}
     assert all(source.integrity_effect == "active_ingest" for source in labels.sources)
     assert labels.has_untrusted_active_ingest is True
+    initialized = _initialize_ifc_labels(enq.events[0])
+    auth = _create_turn_auth_context(
+        enq.events[0], None, policy_version=None, enforce=True,
+        ifc_labels=initialized,
+    )
+    blocked = SinkGate.check_sink_flow(
+        "shell_exec", "pwd", initialized, auth, enforce=True,
+    )
+    assert blocked.reason == "ifc_label_blocked:shell_process"
     assert seen == [
         ("acme/widget", "alice", "server-token"),
         ("acme/widget", "mallory", "server-token"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_contributor_github_content_is_trusted_from_server_checks(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "contributor PR", "event_type": "pr_opened", "repo": "acme/widget", "url": "https://github.com/acme/widget/pull/9", "author": "payload-impostor"}))
+""")
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "api-contributor",
+    )
+    monkeypatch.setattr(
+        "mimir.pollers._github_author_is_trusted",
+        lambda repo, author, token: (
+            repo == "acme/widget"
+            and author == "api-contributor"
+            and token == "server-token"
+        ),
+    )
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == ("trusted", "active_ingest")
+
+
+def test_github_content_author_uses_api_and_ignores_payload_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, token: str):
+        calls.append(endpoint)
+        assert token == "server-token"
+        return 200, {"user": {"login": "api-attested-author"}}
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+    author = _github_content_author("acme/widget", {
+        "event_type": "issue_comment",
+        "url": "https://github.com/acme/widget/issues/7#issuecomment-123",
+        "author": "payload-claimed-contributor",
+        "integrity": "trusted",
+    }, "server-token")
+
+    assert author == "api-attested-author"
+    assert calls == ["repos/acme/widget/issues/comments/123"]
 
 
 @pytest.mark.asyncio

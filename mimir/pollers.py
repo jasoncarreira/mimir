@@ -361,6 +361,51 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
         and membership[1].get("state") == "active"
     )
 
+
+def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
+    """Resolve a GitHub body/comment author from GitHub, never poller output."""
+    if not isinstance(repo, str) or not isinstance(extras, dict):
+        return None
+    event_type = extras.get("event_type")
+    url = extras.get("url")
+    if not isinstance(event_type, str) or not isinstance(url, str):
+        return None
+    parts = repo.split("/")
+    parsed = urllib.parse.urlsplit(url)
+    path = [urllib.parse.unquote(value) for value in parsed.path.split("/") if value]
+    if len(parts) != 2 or parsed.hostname not in {"github.com", "www.github.com"}:
+        return None
+    if len(path) < 4 or path[:2] != parts or path[2] not in {"issues", "pull"}:
+        return None
+    number = path[3]
+    if not number.isdigit():
+        return None
+
+    endpoint: str | None = None
+    fragment = parsed.fragment
+    if event_type in {"issue_opened", "pr_opened"} and not fragment:
+        endpoint = f"repos/{repo}/issues/{number}"
+    elif event_type == "issue_comment" and fragment.startswith("issuecomment-"):
+        comment_id = fragment.removeprefix("issuecomment-")
+        if comment_id.isdigit():
+            endpoint = f"repos/{repo}/issues/comments/{comment_id}"
+    elif event_type == "pr_review_comment" and fragment.startswith("discussion_r"):
+        comment_id = fragment.removeprefix("discussion_r")
+        if comment_id.isdigit():
+            endpoint = f"repos/{repo}/pulls/comments/{comment_id}"
+    elif event_type == "pr_review" and fragment.startswith("pullrequestreview-"):
+        review_id = fragment.removeprefix("pullrequestreview-")
+        if review_id.isdigit():
+            endpoint = f"repos/{repo}/pulls/{number}/reviews/{review_id}"
+    if endpoint is None:
+        return None
+    attestation = _github_api_attestation(endpoint, token)
+    if attestation is None or attestation[0] != 200 or not isinstance(attestation[1], dict):
+        return None
+    user = attestation[1].get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    return author if isinstance(author, str) and author else None
+
 # Pollers manifest schema version history:
 #
 #   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
@@ -2002,7 +2047,12 @@ async def run_poller(
             trusted = poller.trust_source == "trusted_system"
             if poller.trust_source == "github":
                 repo = item_extras.get("repo")
-                author = item_extras.get("author")
+                author = await asyncio.to_thread(
+                    _github_content_author,
+                    repo,
+                    item_extras,
+                    env.get("GITHUB_TOKEN", ""),
+                )
                 cache_key = (
                     repo if isinstance(repo, str) else "",
                     author if isinstance(author, str) else "",

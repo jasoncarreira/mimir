@@ -1,6 +1,6 @@
 # Enforcement enablement: sink classification and poller capabilities
 
-**Status:** DRAFT — revision 9. Incorporates mimir review rounds 1–7 (spawn and
+**Status:** DRAFT — revision 10. Incorporates mimir review rounds 1–7 (spawn and
 `worklink_run` are not process-confined; the "scoped" file root is actually the
 whole home; the `SAGA` category is too broad; integrity is an enablement
 prerequisite; approved-URL authorizes the request, not the response bytes;
@@ -17,7 +17,7 @@ fetch its config-fixed approved URLs freely; enforcement-aware prompt guidance i
 ergonomics-only; future isolation must run in docker **and** AWS ECS/Fargate → no
 bubblewrap; low-bandwidth covert channels are an accepted residual). The open
 design questions from rev 3 are resolved (§6).
-**Date:** 2026-07-19.
+**Date:** 2026-07-25.
 **Context:** written after a whole-`access_control` adversarial review (5 parallel
 reviewers, findings verified with runtime repros). It proposes the model that
 lets `MIMIR_ACCESS_CONTROL_ENFORCED` be turned on **without making the agent
@@ -161,9 +161,10 @@ Two **independent** inputs decide what a turn may do:
    forge**, *not* from the fact that a trusted party started the turn:
    - **Internal trigger** (heartbeat, session-boundary, operator's own typed
      input) → **trusted**.
-   - **GitHub content** → trusted iff the author is a **repo collaborator or org
-     member** (GitHub's own relationship graph — operator-
-     controlled, un-forgeable by a PR). Such a contributor's issue/PR is trusted
+   - **GitHub content** → trusted iff GitHub's content API identifies the author
+      and that login is a **repo collaborator or active org member** according to
+      the server-side permission API (GitHub's own relationship graph — operator-
+      controlled, un-forgeable by a PR or poller payload). Such a contributor's issue/PR is trusted
      **as a whole**, including material it embeds/quotes or is built on top of —
      we trust the contributor not to introduce malicious content (operator
      decision). The only untrusted github content is from **non-contributors**
@@ -172,10 +173,15 @@ Two **independent** inputs decide what a turn may do:
      on the basis that its admins gate who can file/assign and won't route
      untrusted issues to us (operator decision). Declared per trigger like any
      other trust source.
-   - **`fetch_url` from an operator-approved URL** (heartbeat) → the allowlist is
-     **egress authorization only** (which exact URLs may be fetched); the fetched
-     **content stays untrusted** (§5.4). Approving an exact URL is not vouching for
-     its bytes.
+   - **`fetch_url` from an operator-approved URL** → trusted. The evidence is the
+      exact normalized URL in the server-side `approved_fetch_urls()` result
+      (`MIMIR_EGRESS_APPROVED_URLS`, trigger policy, or an audited session approval),
+      plus the framework-written fetch-cache sidecar tying those bytes to that URL.
+      Non-allow-listed pages remain untrusted active ingest.
+   - **Mimir's own context** (`<home>/memory/**`, `<home>/state/**`, prior assistant
+      turn history, and framework-preloaded prompt blocks) → trusted informational.
+      Evidence is the resolved path under the configured home, or the framework's
+      own history/prompt constructor; caller metadata and model claims are ignored.
    - **An operator-configured MCP tool** → use that exact tool policy's explicit
      `result_integrity` grant. `trusted` vouches for successful returned content;
      `untrusted` retains untrusted active ingest. Server locality, transport,
@@ -204,7 +210,7 @@ integrity signal (mimir round 6). Represent integrity with **two fields on
   gate actions**. `active_ingest` = the turn's own trigger content and live tool
   reads/fetches *this turn* (a fetched page, an unknown-author issue, an MCP
   result). `informational` = sources injected at prompt assembly that must inform
-  but not gate — **auto-recalled memory (§5.3) and protected-prompt blocks**
+  but not gate — **auto-recalled memory (§5.3) and framework-authored protected-prompt blocks**
   (recent-activity, identities, …).
 
 Both `active_ingest` and `informational` sources ride the same `ifc_state`
@@ -224,7 +230,7 @@ confidentiality emptiness and never an informational recall.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent — a prior fetch's untrusted content doesn't lock out later approved exact-URL fetches/searches. Fetched **content stays untrusted**: drives scoped sinks (save state / wiki / memory) but not code/shell; non-approved destinations blocked; redirects re-checked per hop. Allowlist = exact URLs, not host wildcards (§5.4) |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent. Content from an approved exact URL is trusted from the operator allow-list; non-approved destinations are blocked and any non-allow-listed content remains untrusted active ingest. Redirects are re-checked per hop; allowlist = exact URLs, not host wildcards (§5.4). |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
@@ -451,12 +457,11 @@ The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
 
 - **GitHub / research pollers:** no `fetch_url` capability at all (they fetch via
   their own subprocess; the capability is simply not in their set).
-- **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist** —
-  authorization to reach those destinations, **not** a trust signal for the
-  response (mimir: approving an exact URL authorizes the request, not the bytes).
-  **Fetched content stays untrusted** — it can drive scoped sinks (save state /
-  wiki / memory, provenance-tagged) but not code/shell. The heartbeat fetches its
-  approved URLs freely.
+- **Heartbeat:** `fetch_url` allowed against an **operator-approved allowlist**.
+  The exact URL is both reachability authorization and the operator's trust signal
+  for the response bytes. The framework-written cache sidecar binds a subsequent
+  file read to that URL; content without this evidence stays untrusted active
+  ingest. The heartbeat fetches its approved URLs freely.
   - **The allowlist must be exact URLs / fixed templates, not host wildcards.**
     Otherwise untrusted fetched content could steer the agent to a *new*
     data-carrying URL on an approved host (`https://approved/?leak=<secret>`) and
