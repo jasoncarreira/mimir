@@ -940,7 +940,7 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     Based on saga_session_end.md production prompt:
     - Gets turn content (mimir_get_turn, get_turn)
     - Reads files for memory capture (read_file, ls, glob)
-    - Uses the read-only shell profile and inspects shell jobs
+    - Inspects shell jobs started earlier in the session
     - Stores atoms (memory_store)
     - Gets atoms by ID (memory_get)
     - Records feedback (saga_feedback)
@@ -955,15 +955,19 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
-    shell_ops = {"shell_exec", "bash_jobs_list", "bash_job_output"}
+    shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
 
-    all_expected = turn_ops | read_ops | memory_ops | saga_ops | shell_ops
+    all_expected = turn_ops | read_ops | memory_ops | saga_ops | shell_inspection_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
     assert not synthesis.has_capability("write_file")
     assert not synthesis.has_capability("edit_file")
+    assert synthesis.can_read_domain("shell_jobs")
+    assert not synthesis.can_write_sink("shell_process")
+    assert synthesis.sink_policy_for("shell_exec") is None
 
     forbidden = {
+        "shell_exec",
         "bash_async",
         "spawn_claude_code",
         "spawn_codex",
@@ -1067,7 +1071,6 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
     [
         ("scheduled_tick", "bash_jobs_list", None),
         ("scheduled_tick", "bash_job_output", None),
-        ("saga_session_end", "shell_exec", "git status --short"),
         ("saga_session_end", "bash_jobs_list", None),
         ("saga_session_end", "bash_job_output", None),
         ("upgrade", "bash_jobs_list", None),
