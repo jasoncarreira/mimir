@@ -190,7 +190,6 @@ def resolve_non_admin_read_target(
     if not candidate.is_absolute():
         return None
     try:
-        resolved = candidate.resolve(strict=True)
         roots = tuple(root.resolve(strict=True) for root in configured_non_admin_read_roots())
     except (OSError, RuntimeError):
         return None
@@ -202,6 +201,29 @@ def resolve_non_admin_read_target(
         return None
     if allow_home_root and home not in roots:
         roots = (*roots, home)
+    lexical_roots = [
+        root for root in roots
+        if candidate == root or candidate.is_relative_to(root)
+    ]
+    if not lexical_roots:
+        try:
+            from .readonly_backend import _RootAwareFilesystemBackend
+
+            candidate = _RootAwareFilesystemBackend(
+                root_dir=home, virtual_mode=True,
+            )._resolve_path(raw_path)
+            lexical_roots = [
+                root for root in roots
+                if candidate == root or candidate.is_relative_to(root)
+            ]
+        except (OSError, RuntimeError, ValueError):
+            return None
+    if not lexical_roots:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
     # /tmp commonly contains MIMIR_HOME in tests and local deployments. The
     # narrower home carve-out wins so /tmp never accidentally exposes all home.
     if resolved == home:
@@ -210,12 +232,6 @@ def resolve_non_admin_read_target(
     elif resolved.is_relative_to(home) and not (
         resolved == state or resolved.is_relative_to(state)
     ):
-        return None
-    lexical_roots = [
-        root for root in roots
-        if candidate == root or candidate.is_relative_to(root)
-    ]
-    if not lexical_roots:
         return None
     # Bind the call to the most specific root named by the caller. A repo path
     # cannot escape into the broader /tmp allowance through ``..`` or a symlink.

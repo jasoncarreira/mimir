@@ -106,6 +106,95 @@ def test_non_admin_read_allows_configured_scopes(
     assert result.decision == OperationDecision.RESOURCE_SCOPED
 
 
+def test_non_admin_virtual_and_real_state_paths_resolve_identically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "state" / "liveness.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"alive": true}\n', encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    registry = ToolRegistry()
+    decisions = [
+        registry.authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": path},
+        )
+        for path in ("/state/liveness.json", str(target))
+    ]
+
+    assert [decision.allowed for decision in decisions] == [True, True]
+    assert [decision.decision for decision in decisions] == [
+        OperationDecision.RESOURCE_SCOPED,
+        OperationDecision.RESOURCE_SCOPED,
+    ]
+
+
+@pytest.mark.parametrize("path", ["/memory/core/profile.md", "/logs/agent.log"])
+def test_non_admin_virtual_non_state_home_paths_remain_denied(
+    path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / path.lstrip("/")
+    target.parent.mkdir(parents=True)
+    target.write_text("private\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": path},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
+def test_non_admin_virtual_state_protected_and_symlink_targets_remain_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    outside = tmp_path / "outside"
+    state.mkdir(parents=True)
+    outside.mkdir()
+    (state / "secrets.json").write_text("{}\n", encoding="utf-8")
+    (outside / "safe.txt").write_text("outside\n", encoding="utf-8")
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    registry = ToolRegistry()
+    for path in ("/state/secrets.json", "/state/escape/safe.txt"):
+        result = registry.authorize_tool(
+            "read_file", _read_auth(), enforce=True,
+            arguments={"file_path": path},
+        )
+        assert result.allowed is False
+        assert result.reason == "read_scope"
+
+
+def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    service = ServicePrincipal(
+        canonical="poller:test",
+        trigger="poller",
+        capabilities=("read_file",),
+        readable_domains=("filesystem",),
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", auth, enforce=True,
+        arguments={"file_path": str(repo / "not-yet-created.txt")},
+    )
+
+    assert result.allowed is True
+    assert result.service_principal is service
+
+
 @pytest.mark.parametrize(
     "relative",
     [".", ".env", "compose.env", "config/settings.toml", ".mimir/saga.db", "state/identities.yaml"],

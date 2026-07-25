@@ -7,7 +7,7 @@
       "authority": {
         "profile": "github",
         "tier": "code-execution",
-        "capabilities": ["worklink_run", "write_file", "edit_file", "shell_exec", "send_message", "operator_alert"],
+        "capabilities": ["worklink_run", "write_file", "edit_file", "shell_exec", "send_message", "operator_alert", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search"],
         "scoped_roots": ["state"]
       },
       "pass_env": [
