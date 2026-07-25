@@ -226,6 +226,7 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
         state_root=tmp_path / "state" / "pollers",
         manifest_path=manifest_path,
     )
+    assert service.sink_policy_for("shell_exec").destination == "repo_review"
     event = AgentEvent(
         trigger="poller",
         channel_id="poller:github-activity",
