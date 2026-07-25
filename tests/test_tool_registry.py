@@ -14,9 +14,10 @@ from mimir.access_control import (
     ResourceScope,
     ServicePrincipal,
     ToolRegistry,
+    create_auth_context,
     get_service_principal,
 )
-from mimir.models import AuthContext, InformationFlowLabels, SourceLabel
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
 from mimir.tools import budget_gate
 from mimir.tools.extra import shell_exec
 from mimir.tools.shell_async import bash_async
@@ -518,6 +519,16 @@ def test_capability_matrix_preflight_check_passes_with_complete_matrix() -> None
     assert errors == []
 
 
+def test_static_shell_service_principals_have_job_inspection_companions() -> None:
+    from mimir.access_control import _TRUSTED_SERVICE_PRINCIPALS
+
+    companions = {"bash_jobs_list", "bash_job_output"}
+    for principal in _TRUSTED_SERVICE_PRINCIPALS.values():
+        capabilities = set(principal.capabilities)
+        if capabilities & {"shell_exec", "bash_async"}:
+            assert companions <= capabilities, principal.canonical
+
+
 def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
     from mimir.access_control import (
         ServicePrincipal,
@@ -929,7 +940,7 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     Based on saga_session_end.md production prompt:
     - Gets turn content (mimir_get_turn, get_turn)
     - Reads files for memory capture (read_file, ls, glob)
-    - Cannot write arbitrary files or invoke shell
+    - Inspects shell jobs started earlier in the session
     - Stores atoms (memory_store)
     - Gets atoms by ID (memory_get)
     - Records feedback (saga_feedback)
@@ -944,12 +955,16 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
+    shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
 
-    all_expected = turn_ops | read_ops | memory_ops | saga_ops
+    all_expected = turn_ops | read_ops | memory_ops | saga_ops | shell_inspection_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
     assert not synthesis.has_capability("write_file")
     assert not synthesis.has_capability("edit_file")
+    assert synthesis.can_read_domain("shell_jobs")
+    assert not synthesis.can_write_sink("shell_process")
+    assert synthesis.sink_policy_for("shell_exec") is None
 
     forbidden = {
         "shell_exec",
@@ -981,7 +996,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
 
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
     write_ops = {"write_file", "edit_file"}
-    shell_ops = {"shell_exec", "bash_async"}
+    shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     schedule_ops = {"add_schedule", "set_schedule_priority", "list_schedules"}
     message_ops = {"send_message"}
@@ -1049,6 +1064,42 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
                 "service_capability_denied",
                 "ifc_label_blocked:spawn",
             ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
+
+
+@pytest.mark.parametrize(
+    ("trigger", "operation", "target"),
+    [
+        ("scheduled_tick", "bash_jobs_list", None),
+        ("scheduled_tick", "bash_job_output", None),
+        ("saga_session_end", "bash_jobs_list", None),
+        ("saga_session_end", "bash_job_output", None),
+        ("upgrade", "bash_jobs_list", None),
+        ("upgrade", "bash_job_output", None),
+    ],
+)
+def test_service_shell_companions_are_admitted_when_enforced(
+    trigger: str,
+    operation: str,
+    target: str | None,
+) -> None:
+    service_principals = {
+        "scheduled_tick": "scheduler",
+        "saga_session_end": "synthesis",
+        "upgrade": "system",
+    }
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:test",
+        service_principal=service_principals[trigger],
+        source=trigger,
+    )
+    context = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
+
+    result = ToolRegistry().authorize_tool(
+        operation, context, enforce=True, target_channel=target,
+    )
+
+    assert result.allowed is True
 
 
 def test_service_authorization_requires_two_factor_validation() -> None:

@@ -53,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
-        npm install -g @anthropic-ai/claude-code@2.1.206 ; \
+        npm install -g @anthropic-ai/claude-code@2.1.220 ; \
     fi \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
         npm install -g opencode-ai@1.17.15 ; \

@@ -370,7 +370,11 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "webhook": CapabilityTier.UNBOUNDED,
     "http_request": CapabilityTier.UNBOUNDED,
     "ntfy_send": CapabilityTier.UNBOUNDED,
+    "task": CapabilityTier.SCOPE_CONTAINED,
 }
+
+_SHELL_JOB_START_CAPABILITIES = frozenset({"shell_exec", "bash_async"})
+_SHELL_JOB_INSPECTION_CAPABILITIES = frozenset({"bash_jobs_list", "bash_job_output"})
 
 # Built-in services predate manifest-declarable trigger authority. Keep their
 # explicitly declared, review-bounded proposal workflow classified without
@@ -393,7 +397,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
         "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
         "file_search", "get_turn", "mimir_get_turn", "send_message",
-        "operator_alert",
+        "operator_alert", "task", "memory_store", "saga_mark_contributions",
+        "saga_end_session", "saga_record_skill_learning",
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS),
@@ -409,6 +414,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "memory_store", "saga_feedback", "saga_mark_contributions",
         "saga_end_session", "saga_record_skill_learning",
         "memory_get",
+        "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
         "agrep", "get_turn", "mimir_get_turn",
     }),
@@ -433,6 +439,14 @@ def build_trigger_service_principal(
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    capability_set = set(capabilities)
+    if capability_set & _SHELL_JOB_START_CAPABILITIES:
+        missing = _SHELL_JOB_INSPECTION_CAPABILITIES - capability_set
+        if missing:
+            raise ValueError(
+                "shell capabilities require job-inspection companions: "
+                f"{', '.join(sorted(missing))}"
+            )
     write_roots = tuple(dict.fromkeys(
         root.resolve() for root in (*roots, *_configured_repo_write_roots())
     ))
@@ -3210,8 +3224,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "aglob",
                 "grep",
                 "agrep",
+                "bash_jobs_list",
+                "bash_job_output",
             ),
-            readable_domains=("session", "saga", "filesystem", "turn_history"),
+            readable_domains=(
+                "session", "saga", "filesystem", "turn_history", "shell_jobs",
+            ),
             sink_destinations=("session_boundary", "saga"),
             creation_path="mimir.server._on_session_idle",
             authority_profile="session-boundary",
@@ -3223,6 +3241,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             capabilities=(
                 "shell_exec",
                 "bash_async",
+                "bash_jobs_list",
+                "bash_job_output",
                 "write_file",
                 "edit_file",
                 "open_proposal",
@@ -3246,6 +3266,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal",
                 "filesystem",
                 "schedule_metadata",
+                "shell_jobs",
             ),
             sink_destinations=(
                 "operator_alert",
@@ -3432,6 +3453,15 @@ def _capability_matrix_errors() -> list[str]:
                 f"Service principal '{principal.canonical}' ({trigger}) "
                 "has no sink destinations defined"
             )
+
+        capability_set = set(principal.capabilities)
+        if capability_set & _SHELL_JOB_START_CAPABILITIES:
+            missing = _SHELL_JOB_INSPECTION_CAPABILITIES - capability_set
+            if missing:
+                errors.append(
+                    f"Service principal '{principal.canonical}' ({trigger}) has shell "
+                    f"capabilities without companions: {', '.join(sorted(missing))}"
+                )
 
         readable_domains = set(principal.readable_domains)
         sink_destinations = set(principal.sink_destinations)

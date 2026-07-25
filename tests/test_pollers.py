@@ -35,11 +35,12 @@ from mimir.pollers import (
     _circuit_breakers,
     _github_author_is_trusted,
     _github_content_author,
+    _parse_poller_authority,
     discover_pollers,
     run_poller,
     validate_poller_overrides_text,
 )
-from mimir.access_control import CapabilityTier, SinkGate, create_auth_context
+from mimir.access_control import CapabilityTier, SinkGate, ToolRegistry, create_auth_context
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
 from mimir.models import InformationFlowLabels, SourceLabel
 
@@ -158,6 +159,115 @@ def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
     profile = TRIGGER_AUTHORITY_PROFILES["research"]
     assert {"memory_store", "saga_feedback", "saga_mark_contributions"} <= profile
     assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+
+
+def test_shipped_poller_shell_authorities_have_job_inspection_companions(
+    tmp_path: Path,
+) -> None:
+    manifests = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    companions = {"bash_jobs_list", "bash_job_output"}
+
+    for manifest_path in manifests.glob("*/pollers.json"):
+        entries = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+        for entry in entries:
+            if "authority" not in entry:
+                continue
+            persist_dir = tmp_path / entry["name"]
+            persist_dir.mkdir()
+            principal = _parse_poller_authority(
+                entry["authority"],
+                name=entry["name"],
+                persist_dir=persist_dir,
+                state_root=tmp_path / "state" / "pollers",
+                manifest_path=manifest_path,
+            )
+            capabilities = set(principal.capabilities)
+            if capabilities & {"shell_exec", "bash_async"}:
+                assert companions <= capabilities, entry["name"]
+
+
+def test_manifest_rejects_shell_authority_without_job_inspection_companions(
+    tmp_path: Path,
+) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "incomplete-shell"
+    persist_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="job-inspection companions"):
+        _parse_poller_authority(
+            _authority(
+                profile="github",
+                tier="code-execution",
+                capabilities=["shell_exec", "write_file"],
+            ),
+            name="incomplete-shell",
+            persist_dir=persist_dir,
+            state_root=tmp_path / "state" / "pollers",
+            manifest_path=tmp_path / "pollers.json",
+        )
+
+
+def test_github_activity_observed_operations_are_admitted_when_enforced(
+    tmp_path: Path,
+) -> None:
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "mimir"
+        / "optional-skills"
+        / "github-poller"
+        / "pollers.json"
+    )
+    entry = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"][0]
+    persist_dir = tmp_path / "state" / "pollers" / entry["name"]
+    persist_dir.mkdir(parents=True)
+    service = _parse_poller_authority(
+        entry["authority"],
+        name=entry["name"],
+        persist_dir=persist_dir,
+        state_root=tmp_path / "state" / "pollers",
+        manifest_path=manifest_path,
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        service_principal=service.canonical,
+        service_authority=service,
+    )
+    principal = f"service:{service.canonical}"
+    labels = InformationFlowLabels().with_channel(event.channel_id).with_source(
+        SourceLabel(
+            principal=principal,
+            domain="channel",
+            resource_id=event.channel_id,
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}),
+            source_kind="service",
+            integrity="trusted",
+        )
+    )
+    context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    registry = ToolRegistry()
+    observed = {
+        "bash_job_output",
+        "bash_async",
+        "bash_jobs_list",
+        "task",
+        "saga_end_session",
+        "saga_record_skill_learning",
+        "memory_store",
+        "saga_mark_contributions",
+    }
+
+    for operation in observed:
+        target = "git status --short" if operation == "bash_async" else None
+        decision = registry.authorize_tool(
+            operation, context, enforce=True, target_channel=target,
+        )
+        assert decision.allowed is True, (operation, decision.reason)
+
+    denied = registry.authorize_tool("saga_forget", context, enforce=True)
+    assert denied.allowed is False
+    assert denied.reason == "admin_required"
 
 
 def test_authority_is_strict_and_per_instance(tmp_path: Path) -> None:
