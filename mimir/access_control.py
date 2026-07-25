@@ -1053,6 +1053,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason="unknown_sink_destination",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1070,6 +1071,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1105,6 +1107,7 @@ class SinkGate:
                     decision=OperationDecision.OPEN,
                     allowed=True,
                     reason="ifc_declassification_approved",
+                    service_principal=service,
                     enforcement_enabled=enforce,
                 )
             return ToolAuthorization(
@@ -1112,6 +1115,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1124,6 +1128,7 @@ class SinkGate:
                     decision=OperationDecision.ADMIN_REQUIRED,
                     allowed=not enforce,
                     reason="egress_destination_not_approved",
+                    service_principal=service,
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
@@ -1137,6 +1142,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason="egress_destination_not_approved",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1150,6 +1156,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason="egress_destination_not_approved",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
@@ -1219,6 +1226,7 @@ class SinkGate:
                 decision=OperationDecision.OPEN,
                 allowed=True,
                 reason="no_labels",
+                service_principal=service,
                 enforcement_enabled=enforce,
             )
 
@@ -1259,6 +1267,7 @@ class SinkGate:
                     decision=OperationDecision.OPEN,
                     allowed=True,
                     reason="ifc_declassification_approved",
+                    service_principal=service,
                     enforcement_enabled=enforce,
                 )
             reason = f"ifc_label_blocked:{sink_category.value}"
@@ -1268,6 +1277,7 @@ class SinkGate:
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason=reason,
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=is_shadow,
@@ -1278,6 +1288,7 @@ class SinkGate:
             decision=OperationDecision.OPEN,
             allowed=True,
             reason="ifc_allowed",
+            service_principal=service,
             enforcement_enabled=enforce,
         )
 
@@ -2508,6 +2519,9 @@ class ToolRegistry:
     def _emit_shadow_decision(
         self,
         auth: ToolAuthorization,
+        *,
+        auth_context: "AuthContext | None" = None,
+        target: str | None = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -2515,9 +2529,27 @@ class ToolRegistry:
         try:
             from .event_logger import log_event
             import asyncio
+            fields = auth.as_log_fields()
+            service = auth.service_principal
+            if service is None and auth_context is not None:
+                service = get_trusted_service_from_auth_context(auth_context)
+            if target is None and auth.protected_sink_resources:
+                target = ",".join(auth.protected_sink_resources)
+            fields.update({
+                # Shadow decisions cover both compatibility bypasses and trusted
+                # service-capability grants. Bypasses carry the denial reason
+                # that enforcement would apply; capability grants do not.
+                "would_block": auth.reason is not None,
+                "target": target,
+                "trigger": (
+                    getattr(auth_context, "origin_trigger", None)
+                    or getattr(auth_context, "trigger", None)
+                ),
+                "service_principal": service.canonical if service else None,
+            })
             loop = asyncio.get_running_loop()
             task = loop.create_task(
-                log_event("shadow_tool_decision", **auth.as_log_fields())
+                log_event("shadow_tool_decision", **fields)
             )
             task.add_done_callback(_consume_task_exception)
         except RuntimeError:
@@ -2557,7 +2589,9 @@ class ToolRegistry:
                 ifc_labels=ifc_labels,
             )
             if auth.is_shadow_decision:
-                self._emit_shadow_decision(auth)
+                self._emit_shadow_decision(
+                    auth, auth_context=auth_context, target=target_channel,
+                )
             return auth
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
             auth = ToolAuthorization(
@@ -2570,7 +2604,9 @@ class ToolRegistry:
                 is_shadow_decision=not enforce,
             )
             if auth.is_shadow_decision:
-                self._emit_shadow_decision(auth)
+                self._emit_shadow_decision(
+                    auth, auth_context=auth_context, target=target_channel,
+                )
             return auth
 
         flow_direction = get_tool_flow_direction(tool_name)
@@ -2630,7 +2666,9 @@ class ToolRegistry:
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return sink_check
             if sink_check.is_shadow_decision:
-                self._emit_shadow_decision(sink_check)
+                self._emit_shadow_decision(
+                    sink_check, auth_context=auth_context, target=sink_target,
+                )
 
         decision = preliminary_decision
         service_principal = None
@@ -2659,6 +2697,7 @@ class ToolRegistry:
                 reason = "admin_required"
             else:
                 allowed = True
+                reason = "admin_required"
                 is_shadow = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
             if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
@@ -2680,7 +2719,9 @@ class ToolRegistry:
                 )
                 write_auth.flow_direction = flow_direction
                 if write_auth.is_shadow_decision:
-                    self._emit_shadow_decision(write_auth)
+                    self._emit_shadow_decision(
+                        write_auth, auth_context=auth_context, target=sink_target,
+                    )
                 return write_auth
             if tool_name in READ_RESOURCE_OPERATIONS:
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
@@ -2705,6 +2746,7 @@ class ToolRegistry:
                     reason = "resource_scoped"
                 else:
                     allowed = True
+                    reason = "resource_scoped"
                     is_shadow = True
         else:
             # Explicit service capabilities are authoritative even if a newly
@@ -2719,6 +2761,7 @@ class ToolRegistry:
                 reason = "unknown_operation"
             else:
                 allowed = True
+                reason = "unknown_operation"
                 is_shadow = True
 
         auth = ToolAuthorization(
@@ -2734,7 +2777,9 @@ class ToolRegistry:
         )
 
         if is_shadow:
-            self._emit_shadow_decision(auth)
+            self._emit_shadow_decision(
+                auth, auth_context=auth_context, target=sink_target,
+            )
 
         return auth
 
