@@ -1841,7 +1841,7 @@ def _service_auth(
 
 
 @pytest.mark.asyncio
-async def test_service_capability_allowed_admin_operation_emits_no_would_block() -> None:
+async def test_service_capability_allowed_admin_operation_emits_non_blocking_audit() -> None:
     service = get_service_principal("saga_session_end")
     assert service is not None
     registry = ToolRegistry()
@@ -1858,8 +1858,18 @@ async def test_service_capability_allowed_admin_operation_emits_no_would_block()
         await asyncio.sleep(0)
 
     assert decision.allowed is True
-    assert decision.is_shadow_decision is False
-    assert captured == []
+    assert decision.is_shadow_decision is True
+    assert captured == [(
+        "shadow_tool_decision",
+        {
+            **decision.as_log_fields(),
+            "would_block": False,
+            "target": "saga",
+            "trigger": "saga_session_end",
+        },
+    )]
+    assert captured[0][1]["reason"] is None
+    assert captured[0][1]["service_principal"] == service.canonical
 
 
 @pytest.mark.asyncio

@@ -2536,7 +2536,10 @@ class ToolRegistry:
             if target is None and auth.protected_sink_resources:
                 target = ",".join(auth.protected_sink_resources)
             fields.update({
-                "would_block": True,
+                # Shadow decisions cover both compatibility bypasses and trusted
+                # service-capability grants. Bypasses carry the denial reason
+                # that enforcement would apply; capability grants do not.
+                "would_block": auth.reason is not None,
                 "target": target,
                 "trigger": (
                     getattr(auth_context, "origin_trigger", None)
@@ -2688,6 +2691,7 @@ class ToolRegistry:
                 allowed = True
             elif service_allowed:
                 allowed = True
+                is_shadow = not enforce
             elif enforce:
                 allowed = False
                 reason = "admin_required"

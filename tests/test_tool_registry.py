@@ -1110,7 +1110,7 @@ def test_service_authorization_requires_two_factor_validation() -> None:
     assert result_http_ingress.reason == "admin_required"
 
 
-def test_service_authorization_shadow_mode_is_not_a_would_block() -> None:
+def test_service_authorization_shadow_mode_emits_non_blocking_audit() -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
 
@@ -1127,7 +1127,8 @@ def test_service_authorization_shadow_mode_is_not_a_would_block() -> None:
     ctx = create_auth_context(event, enforce=False, ifc_labels=_service_labels(event))
     result = registry.authorize_tool("shell_exec", ctx, enforce=False)
     assert result.allowed is True
-    assert result.is_shadow_decision is False
+    assert result.is_shadow_decision is True
+    assert result.reason is None
 
 
 def test_commitment_actor_requires_two_factor_validation() -> None:
