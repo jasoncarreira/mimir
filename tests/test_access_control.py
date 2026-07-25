@@ -18,6 +18,7 @@ from mimir.access_control import (
     CapabilityTier,
     ServicePrincipal,
     ServiceSinkPolicy,
+    SinkGate,
     ToolRegistry,
     build_trigger_service_principal,
     get_service_principal,
@@ -1837,6 +1838,78 @@ def _service_auth(
         enforcement_enabled=True,
         ifc_labels=labels,
     )
+
+
+@pytest.mark.asyncio
+async def test_service_capability_allowed_admin_operation_emits_no_would_block() -> None:
+    service = get_service_principal("saga_session_end")
+    assert service is not None
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    auth = _service_auth(service, InformationFlowLabels())
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        decision = registry.authorize_tool("saga_feedback", auth, enforce=False)
+        await asyncio.sleep(0)
+
+    assert decision.allowed is True
+    assert decision.is_shadow_decision is False
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_denial_event_is_self_classifying() -> None:
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    auth = _service_auth(service, InformationFlowLabels())
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        decision = registry.authorize_tool("remove_schedule", auth, enforce=False)
+        await asyncio.sleep(0)
+
+    assert decision.allowed is True
+    assert captured == [(
+        "shadow_tool_decision",
+        {
+            **decision.as_log_fields(),
+            "would_block": True,
+            "target": "scheduler",
+            "trigger": "scheduled_tick",
+        },
+    )]
+    assert captured[0][1]["reason"] == "admin_required"
+    assert captured[0][1]["service_principal"] == "scheduler"
+
+
+def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+    labels = InformationFlowLabels(labels=frozenset({"private"}))
+    auth = _service_auth(service, labels)
+
+    decision = SinkGate.check_sink_flow(
+        "http_request",
+        "https://example.invalid/hook",
+        labels,
+        auth,
+        enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:http_webhook"
+    assert decision.service_principal is service
 
 
 @pytest.mark.parametrize(
