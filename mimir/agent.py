@@ -225,6 +225,7 @@ def _prompt_source_labels(
     bridge: str | None = None,
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
+    self_authored: bool = False,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -245,7 +246,9 @@ def _prompt_source_labels(
         sensitivity="private",
         authorized_principals=acl,
         source_kind=source_kind,
-        integrity=Integrity.UNTRUSTED,
+        # These blocks are loaded by the framework from its own memory/state by
+        # default. Callers injecting externally authored history opt out below.
+        integrity=Integrity.TRUSTED if self_authored else Integrity.UNTRUSTED,
         integrity_effect=IntegrityEffect.INFORMATIONAL,
     ))
 
@@ -3638,7 +3641,7 @@ class Agent:
             result.body,
             _prompt_source_labels(
                 auth_context, domain="usage", resource="global:usage",
-                principal="service:mimir",
+                principal="service:mimir", self_authored=True,
             ),
         ), deferred
 
@@ -3659,7 +3662,7 @@ class Agent:
                 content,
                 _prompt_source_labels(
                     auth_context, domain="schedules", resource="global:upcoming",
-                    principal="service:mimir",
+                    principal="service:mimir", self_authored=True,
                 ),
             )
         except Exception:  # noqa: BLE001
@@ -3707,6 +3710,7 @@ class Agent:
                         authorized_principals=_protected_owner_acl(
                             auth_context, owner,
                         ),
+                        self_authored=True,
                     ),
                 )
             return PromptBlock(content, labels)
@@ -3746,7 +3750,7 @@ class Agent:
             "\n".join(parts),
             _prompt_source_labels(
                 auth_context, domain="self_state", resource="global:self_state",
-                principal="service:mimir",
+                principal="service:mimir", self_authored=True,
             ),
         )
 
@@ -3863,6 +3867,7 @@ class Agent:
                         owner,
                         requester_visible=visibility == "public",
                     ),
+                    self_authored=True,
                 ),
             )
         return PromptBlock(content, labels)
@@ -3968,6 +3973,7 @@ class Agent:
                     resource=f"memory/channels/{event.channel_id or ''}",
                     channel_id=event.channel_id,
                     bridge=event.source,
+                    self_authored=True,
                 ),
             ) if channel_memory_content and channel_memory_owner else None
         )
@@ -3992,7 +3998,7 @@ class Agent:
                     proposal_content,
                     _prompt_source_labels(
                         auth_context, domain="proposals", resource="global:proposals",
-                        principal="service:mimir",
+                        principal="service:mimir", self_authored=True,
                     ),
                 ) if proposal_content else None
             )
@@ -4133,6 +4139,7 @@ class Agent:
         if identity_principals:
             identity_labels = _prompt_source_labels(
                 auth_context, domain="identities", resource="state/identities.yaml",
+                self_authored=True,
             )
             for principal in identity_principals:
                 identity_labels = _merge_ifc_labels(
@@ -4143,6 +4150,7 @@ class Agent:
                         resource=f"identity:{principal}",
                         principal=principal,
                         authorized_principals=frozenset({effective_principal}) if effective_principal else frozenset(),
+                        self_authored=True,
                     ),
                 )
             source_blocks.append(PromptBlock("known identities", identity_labels))
@@ -4159,6 +4167,7 @@ class Agent:
                     channel_id=message.channel_id,
                     principal=message_principal,
                     bridge=message.source,
+                    self_authored=message.kind in {"assistant_message", "system_note"},
                 ),
             ))
         if saga_block:
@@ -4167,6 +4176,7 @@ class Agent:
                 saga_labels if saga_labels and saga_labels.sources else _prompt_source_labels(
                     auth_context, domain="saga", resource="query",
                     channel_id=event.channel_id, principal=effective_principal,
+                    self_authored=True,
                 ),
             ))
         if subagent_block:
@@ -4175,6 +4185,7 @@ class Agent:
                 _prompt_source_labels(
                     auth_context, domain="subagents", resource="channel_inbox",
                     channel_id=event.channel_id, principal=effective_principal,
+                    self_authored=True,
                 ),
             ))
         if auto_skill_block is not None:
@@ -4182,7 +4193,7 @@ class Agent:
                 auto_skill_block[1],
                 _prompt_source_labels(
                     auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
-                    principal=effective_principal,
+                    principal=effective_principal, self_authored=True,
                 ),
             ))
         # chainlink #508: resolve an optional deliver: channel (poller / tick),

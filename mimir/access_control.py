@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 import os
 import shlex
@@ -2903,6 +2904,12 @@ def protected_result_source(
     acl = {principal} if principal else set()
     if requester:
         acl.add(requester)
+    integrity = "untrusted"
+    integrity_effect = "active_ingest"
+    if domain == "filesystem" and isinstance(resource_id, str):
+        integrity, integrity_effect = _filesystem_result_integrity(
+            auth_context, resource_id,
+        )
     return SourceLabel(
         principal=principal,
         domain=domain,
@@ -2911,9 +2918,74 @@ def protected_result_source(
         sensitivity=sensitivity,
         authorized_principals=frozenset(acl),
         source_kind="protected_tool",
-        integrity="untrusted",
-        integrity_effect="active_ingest",
+        integrity=integrity,
+        integrity_effect=integrity_effect,
     )
+
+
+def _filesystem_result_integrity(
+    auth_context: "AuthContext | None",
+    resource_id: str,
+) -> tuple[str, str]:
+    """Derive file trust only from resolved framework-owned paths and metadata."""
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return "untrusted", "active_ingest"
+    try:
+        home = Path(home_value).resolve(strict=True)
+        resource = Path(resource_id).resolve(strict=True)
+        relative = resource.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return "untrusted", "active_ingest"
+
+    if relative.parts and relative.parts[0] in {"memory", "state"}:
+        # Poller recovery is framework-written but stores complete external
+        # AgentEvents. Treating it as self-authored state would launder the
+        # stashed payload on a later filesystem read. Poller persist dirs are
+        # fixed under state/pollers by the scheduler, so fail this class closed.
+        if (
+            len(relative.parts) >= 4
+            and relative.parts[0:2] == ("state", "pollers")
+            and relative.name == ".recovery.json"
+        ):
+            return "untrusted", "active_ingest"
+        return "trusted", "informational"
+
+    cache_root = home / "attachments" / "fetch-cache"
+    try:
+        resource.relative_to(cache_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return "untrusted", "active_ingest"
+
+    sidecar = resource.with_name(f"{resource.name}.meta.json")
+    try:
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "untrusted", "active_ingest"
+    url = metadata.get("url") if isinstance(metadata, dict) else None
+    file_path = metadata.get("file_path") if isinstance(metadata, dict) else None
+    if not isinstance(url, str) or not isinstance(file_path, str):
+        return "untrusted", "active_ingest"
+    expected_digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    if not resource.name.startswith(f"{expected_digest}-"):
+        return "untrusted", "active_ingest"
+    try:
+        recorded_resource = (home / file_path.lstrip("/")).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "untrusted", "active_ingest"
+    if recorded_resource != resource:
+        return "untrusted", "active_ingest"
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, url)
+    final_url = metadata.get("final_url")
+    normalized_final = (
+        normalize_sink_destination(SinkCategory.NETWORK, final_url)
+        if isinstance(final_url, str)
+        else normalized
+    )
+    approved = approved_fetch_urls(auth_context)
+    if normalized is not None and normalized in approved and normalized_final in approved:
+        return "trusted", "active_ingest"
+    return "untrusted", "active_ingest"
 
 
 def _incomplete_protected_result(

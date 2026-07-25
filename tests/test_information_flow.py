@@ -29,8 +29,10 @@ from mimir.access_control import (
     get_sink_category,
     get_tool_flow_direction,
     classify_protected_result,
+    builtin_trigger_service_principal,
     OperationDecision,
     ProtectedResultProvenance,
+    protected_result_source,
 )
 from mimir.agent import (
     Agent,
@@ -435,10 +437,126 @@ def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_s
 
 def test_protected_prompt_sources_are_informational():
     source = next(iter(_prompt_source_labels(
-        _auth(), domain="saga", resource="auto-recall",
+        _auth(), domain="saga", resource="auto-recall", self_authored=True,
+    ).sources))
+    assert source.integrity == "trusted"
+    assert source.integrity_effect == "informational"
+
+
+def test_protected_prompt_source_defaults_fail_closed():
+    source = next(iter(_prompt_source_labels(
+        _auth(), domain="saga", resource="future-caller",
     ).sources))
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "informational"
+
+
+def test_turn_history_result_is_untrusted_active_ingest():
+    source = protected_result_source(
+        _auth(), principal="mimir:turn-log", domain="turn_history",
+        resource_id="turn:prior", bridge_instance="mimir",
+    )
+
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
+def test_self_authored_heartbeat_context_admits_autonomous_sinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    memory = tmp_path / "memory" / "heartbeat.md"
+    memory.parent.mkdir()
+    memory.write_text("agent-authored notes", encoding="utf-8")
+    heartbeat_state = tmp_path / "state" / "triggers" / "heartbeat"
+    heartbeat_state.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "scheduler:heartbeat")
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    base = _initialize_ifc_labels(event)
+    auth = create_auth_context(event, enforce=True, ifc_labels=base)
+    self_context = InformationFlowLabels().with_source(protected_result_source(
+        auth,
+        principal="filesystem",
+        domain="filesystem",
+        resource_id=str(memory.resolve()),
+        bridge_instance="filesystem",
+    ))
+    labels = _merge_ifc_labels(base, self_context)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+
+    source = next(source for source in labels.sources if source.resource_id == str(memory))
+    assert (source.integrity, source.integrity_effect) == ("trusted", "informational")
+    assert labels.has_untrusted_active_ingest is False
+    for tool, target in (
+        ("shell_exec", "pwd"),
+        ("write_file", str(heartbeat_state / "heartbeat.json")),
+        ("send_message", event.channel_id),
+    ):
+        decision = SinkGate.check_sink_flow(tool, target, labels, auth, enforce=True)
+        assert decision.allowed is True, (tool, decision.reason)
+
+
+def test_poller_recovery_stash_is_untrusted_active_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    recovery = tmp_path / "state" / "pollers" / "github" / ".recovery.json"
+    recovery.parent.mkdir(parents=True)
+    recovery.write_text('{"inflight":{"event":{"content":"external"}}}', encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(recovery.resolve()), bridge_instance="filesystem",
+    )
+
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
+@pytest.mark.parametrize(
+    ("approved", "expected_integrity"),
+    [(True, "trusted"), (False, "untrusted")],
+)
+def test_fetched_page_integrity_comes_from_exact_operator_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approved: bool,
+    expected_integrity: str,
+) -> None:
+    import hashlib
+
+    url = "https://docs.example.test/agent-input"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    if approved:
+        monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", url)
+    else:
+        monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    cache = tmp_path / "attachments" / "fetch-cache"
+    cache.mkdir(parents=True)
+    digest = hashlib.sha256(url.encode()).hexdigest()[:12]
+    body = cache / f"{digest}-agent-input"
+    body.write_text("page bytes", encoding="utf-8")
+    (cache / f"{body.name}.meta.json").write_text(json.dumps({
+        "url": url,
+        "final_url": url,
+        "file_path": f"/attachments/fetch-cache/{body.name}",
+    }), encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(body.resolve()), bridge_instance="filesystem",
+    )
+
+    assert source.integrity == expected_integrity
+    assert source.integrity_effect == "active_ingest"
 
 
 def test_auto_recalled_untrusted_atom_is_visible_but_never_active_ingest():
