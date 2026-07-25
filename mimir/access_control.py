@@ -409,7 +409,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "saga_end_session", "saga_record_skill_learning",
         "memory_get",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
-        "agrep", "file_search", "get_turn", "mimir_get_turn",
+        "agrep", "get_turn", "mimir_get_turn",
     }),
 }
 
@@ -3093,7 +3093,6 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "aglob",
                 "grep",
                 "agrep",
-                "file_search",
             ),
             readable_domains=("session", "saga", "filesystem", "turn_history"),
             sink_destinations=("session_boundary", "saga"),
@@ -3123,7 +3122,6 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "aglob",
                 "grep",
                 "agrep",
-                "file_search",
                 "send_message",
             ),
             readable_domains=(
