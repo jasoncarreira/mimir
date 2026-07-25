@@ -2892,11 +2892,7 @@ def protected_result_source(
         acl.add(requester)
     integrity = "untrusted"
     integrity_effect = "active_ingest"
-    if domain == "turn_history":
-        # Turn records are written by Mimir, not supplied by the model/caller.
-        integrity = "trusted"
-        integrity_effect = "informational"
-    elif domain == "filesystem" and isinstance(resource_id, str):
+    if domain == "filesystem" and isinstance(resource_id, str):
         integrity, integrity_effect = _filesystem_result_integrity(
             auth_context, resource_id,
         )
@@ -2929,6 +2925,16 @@ def _filesystem_result_integrity(
         return "untrusted", "active_ingest"
 
     if relative.parts and relative.parts[0] in {"memory", "state"}:
+        # Poller recovery is framework-written but stores complete external
+        # AgentEvents. Treating it as self-authored state would launder the
+        # stashed payload on a later filesystem read. Poller persist dirs are
+        # fixed under state/pollers by the scheduler, so fail this class closed.
+        if (
+            len(relative.parts) >= 4
+            and relative.parts[0:2] == ("state", "pollers")
+            and relative.name == ".recovery.json"
+        ):
+            return "untrusted", "active_ingest"
         return "trusted", "informational"
 
     cache_root = home / "attachments" / "fetch-cache"

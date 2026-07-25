@@ -178,10 +178,15 @@ Two **independent** inputs decide what a turn may do:
       (`MIMIR_EGRESS_APPROVED_URLS`, trigger policy, or an audited session approval),
       plus the framework-written fetch-cache sidecar tying those bytes to that URL.
       Non-allow-listed pages remain untrusted active ingest.
-   - **Mimir's own context** (`<home>/memory/**`, `<home>/state/**`, prior assistant
-      turn history, and framework-preloaded prompt blocks) → trusted informational.
-      Evidence is the resolved path under the configured home, or the framework's
-      own history/prompt constructor; caller metadata and model claims are ignored.
+   - **Mimir's own context** (`<home>/memory/**`, `<home>/state/**`, and
+      framework-preloaded self-authored prompt blocks) → trusted informational,
+      except framework payload stores such as
+      `<home>/state/pollers/*/.recovery.json`, which embed external events and
+      remain untrusted active ingest. Prior turn records also remain untrusted
+      active ingest because their events and injected inputs can embed external
+      content. Evidence is the resolved path under the configured home or an
+      explicit framework constructor classification; caller metadata and model
+      claims are ignored, and unknown prompt constructors fail closed.
    - **An operator-configured MCP tool** → use that exact tool policy's explicit
      `result_integrity` grant. `trusted` vouches for successful returned content;
      `untrusted` retains untrusted active ingest. Server locality, transport,

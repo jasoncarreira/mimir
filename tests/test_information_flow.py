@@ -437,10 +437,28 @@ def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_s
 
 def test_protected_prompt_sources_are_informational():
     source = next(iter(_prompt_source_labels(
-        _auth(), domain="saga", resource="auto-recall",
+        _auth(), domain="saga", resource="auto-recall", self_authored=True,
     ).sources))
     assert source.integrity == "trusted"
     assert source.integrity_effect == "informational"
+
+
+def test_protected_prompt_source_defaults_fail_closed():
+    source = next(iter(_prompt_source_labels(
+        _auth(), domain="saga", resource="future-caller",
+    ).sources))
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "informational"
+
+
+def test_turn_history_result_is_untrusted_active_ingest():
+    source = protected_result_source(
+        _auth(), principal="mimir:turn-log", domain="turn_history",
+        resource_id="turn:prior", bridge_instance="mimir",
+    )
+
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
 
 
 def test_self_authored_heartbeat_context_admits_autonomous_sinks(
@@ -483,6 +501,24 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     ):
         decision = SinkGate.check_sink_flow(tool, target, labels, auth, enforce=True)
         assert decision.allowed is True, (tool, decision.reason)
+
+
+def test_poller_recovery_stash_is_untrusted_active_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    recovery = tmp_path / "state" / "pollers" / "github" / ".recovery.json"
+    recovery.parent.mkdir(parents=True)
+    recovery.write_text('{"inflight":{"event":{"content":"external"}}}', encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(recovery.resolve()), bridge_instance="filesystem",
+    )
+
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
 
 
 @pytest.mark.parametrize(

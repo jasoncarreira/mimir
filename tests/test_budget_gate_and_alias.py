@@ -1143,7 +1143,6 @@ async def test_real_commitment_list_with_ownerless_record_allows_same_channel_re
         ("memory_query", "saga", {"query": "project"}),
         ("memory_get", "saga", {"atom_ids": ["a-1"]}),
         ("file_search", "filesystem", {"query": "project"}),
-        ("get_turn", "turn_history", {"turn_id": "t-1"}),
         ("commitment_list", "commitments", {}),
         ("bash_jobs_list", "shell_jobs", {}),
         ("list_schedules", "schedule_metadata", {}),
