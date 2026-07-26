@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -2289,6 +2290,10 @@ def test_static_service_write_denies_protected_home_paths(
         home / "memory" / "core" / "service-axis.md",
         repo / ".git" / "hooks" / "pre-commit",
         repo / ".git" / "config",
+        repo / ".venv" / "bin" / "gh",
+        repo / ".venv" / "bin" / "pytest",
+        repo / ".venv" / "bin" / "python",
+        repo / ".venv" / "bin" / "uv",
         home / "state" / "repo" / ".git" / "hooks" / "post-merge",
         home / "memory" / "repo" / ".git" / "objects" / "payload",
         repo / ".GIT" / "hooks" / "post-checkout",
@@ -2485,6 +2490,10 @@ def test_autonomous_repo_write_denies_protected_paths(
         memory / "secrets" / "token.txt",
         repo / ".git" / "hooks" / "pre-commit",
         repo / ".git" / "config",
+        repo / ".venv" / "bin" / "gh",
+        repo / ".venv" / "bin" / "pytest",
+        repo / ".venv" / "bin" / "python",
+        repo / ".venv" / "bin" / "uv",
         home / "state" / "repo" / ".git" / "hooks" / "post-merge",
         memory / "repo" / ".git" / "objects" / "payload",
         repo / ".GIT" / "hooks" / "post-checkout",
@@ -2586,6 +2595,136 @@ def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
         "shell_exec", "shell_profile", "repo_review",
     )
     assert decision.allowed is True, decision.reason
+
+
+def test_every_service_shell_profile_returns_absolute_executables(
+    maintenance_git_home: Path,
+) -> None:
+    samples = {
+        "scheduler_read_only": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short",
+        ),
+        "repo_review": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short", "gh pr view 979 --json title",
+            "npm ci --ignore-scripts", "pytest -q tests",
+            "uv run pytest -q tests",
+        ),
+        "maintenance": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            f"git -C {maintenance_git_home} status --short",
+            "gh pr list --state open",
+            "/usr/local/bin/chainlink issue ready --json",
+        ),
+        "upgrade_workspace": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short", "uv lock",
+        ),
+    }
+
+    for profile, commands in samples.items():
+        for command in commands:
+            argv = parse_service_shell_argv(command, profile)
+            assert argv is not None, (profile, command)
+            assert Path(argv[0]).is_absolute(), (profile, command, argv)
+
+
+def test_repo_review_npm_uses_pinned_interpreter_and_script(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) == [
+        str(maintenance_pinned_executables["node"]),
+        str(maintenance_pinned_executables["npm"]),
+        "ci",
+        "--ignore-scripts",
+    ]
+
+
+def test_repo_review_pytest_uses_pinned_interpreter_module(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    assert parse_service_shell_argv("pytest -q tests", "repo_review") == [
+        str(maintenance_pinned_executables["pytest"]), "-m", "pytest", "-q", "tests",
+    ]
+
+
+def test_every_production_service_shell_pin_targets_outside_write_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+
+    monkeypatch.setattr(
+        access_control,
+        "_MAINTENANCE_PINNED_EXECUTABLES",
+        access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS,
+    )
+    write_roots = access_control._configured_repo_write_roots()
+    for command, expected in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.items():
+        resolved = expected.resolve(strict=False)
+        assert all(
+            resolved != root and not resolved.is_relative_to(root)
+            for root in write_roots
+        ), command
+        # Optional tools such as npm and gh are not installed in every test
+        # environment. When a production pin is present, also exercise the
+        # runtime validator; absent pins fail closed when the command is used.
+        if expected.exists():
+            assert access_control._maintenance_resolved_pin(command) == expected
+
+
+def test_service_shell_pin_inside_configured_write_root_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    planted = repo / ".venv" / "bin" / "pytest"
+    home.mkdir()
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "pytest", planted)
+
+    with caplog.at_level("ERROR", logger="mimir.access_control"):
+        assert parse_service_shell_argv("pytest -q tests", "repo_review") is None
+
+    assert "pin resolves within a configured service-writable root" in caplog.text
+
+
+def test_pinned_script_without_pinned_interpreter_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "node")
+
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) is None
+
+
+def test_admitted_service_shell_command_without_pin_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm")
+
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) is None
 
 
 @pytest.mark.parametrize(

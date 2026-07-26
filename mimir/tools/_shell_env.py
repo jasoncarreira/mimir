@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shlex
 import sys
+from pathlib import Path
 
 
 def login_shell_command(command: str) -> str:
@@ -22,7 +23,14 @@ def login_shell_command(command: str) -> str:
 
 def _is_pytest_argv(argv: list[str] | None) -> bool:
     """Return whether *argv* invokes the profile's admitted pytest shapes."""
-    return bool(argv) and (argv[0] == "pytest" or argv[:3] == ["uv", "run", "pytest"])
+    if not argv:
+        return False
+    command = Path(argv[0]).name
+    return (
+        command == "pytest"
+        or argv[1:3] == ["-m", "pytest"]
+        or command == "uv" and argv[1:3] == ["run", "pytest"]
+    )
 
 
 def _is_git_argv(argv: list[str] | None) -> bool:

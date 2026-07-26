@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -623,8 +624,8 @@ def _target_within_configured_repo_write_roots(target: str, _destination: str) -
 
 
 _STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
-    ".env", ".git", ".mimir", "config", "credentials", "identities", "prompts",
-    "secret", "secrets",
+    ".env", ".git", ".mimir", ".venv", "config", "credentials", "identities",
+    "prompts", "secret", "secrets",
 })
 
 
@@ -983,9 +984,15 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     return False
 
 
-_MAINTENANCE_PINNED_EXECUTABLES = {
+_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "git": Path("/usr/bin/git"),
     "gh": Path("/usr/bin/gh"),
+    "npm": Path("/usr/lib/node_modules/npm/bin/npm-cli.js"),
+    "node": Path("/usr/bin/node"),
+    # Invoke pytest as a module through the already-running, resolved Python
+    # interpreter.  Its old .venv entry-point was itself service-writable.
+    "pytest": Path(sys.executable).resolve(),
+    "uv": Path("/usr/local/bin/uv"),
     "ls": Path("/usr/bin/ls"),
     "grep": Path("/usr/bin/grep"),
     "wc": Path("/usr/bin/wc"),
@@ -993,6 +1000,10 @@ _MAINTENANCE_PINNED_EXECUTABLES = {
     "jq": Path("/usr/bin/jq"),
     "rg": Path("/usr/bin/rg"),
     "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
+}
+_MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
+_MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
+    "npm": "node",
 }
 _MAINTENANCE_GIT_BASE_OVERRIDES = (
     "-c", "core.fsmonitor=",
@@ -1186,31 +1197,63 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     return execution_argv
 
 
-def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
-    """Replace an admitted maintenance command with a trusted absolute binary.
+def _maintenance_pin_is_service_writable(expected: Path) -> bool:
+    """Return whether a configured service-writable root contains *expected*."""
+    try:
+        resolved = expected.resolve(strict=True)
+        return any(
+            resolved == root or resolved.is_relative_to(root)
+            for root in (path.resolve(strict=True) for path in _configured_repo_write_roots())
+        )
+    except (OSError, RuntimeError):
+        return True
 
-    Maintenance commands execute with ``shell=False``, but a bare ``argv[0]``
-    would still be selected through PATH. The runtime PATH begins with the
-    project virtualenv, which can sit under a service-writable root, so bind
-    every admitted executable to a fixed regular file before authorization.
-    Missing, symlinked, or replaced binaries are environment drift and fail
-    closed with a distinct log fingerprint rather than falling back to PATH.
-    """
-    if not argv:
-        return None
-    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(argv[0])
+
+def _maintenance_resolved_pin(command: str) -> Path | None:
+    """Validate one pin as a trusted executable outside service-writable roots."""
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(command)
     if expected is None:
         return None
     try:
         resolved = expected.resolve(strict=True)
-        if resolved != expected or not expected.is_file() or not os.access(expected, os.X_OK):
-            raise OSError("expected an executable non-symlink regular file")
+        if resolved != expected:
+            raise OSError("expected a non-symlink executable")
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise OSError("expected an executable regular file")
+        if _maintenance_pin_is_service_writable(resolved):
+            raise OSError("pin resolves within a configured service-writable root")
     except (OSError, RuntimeError) as exc:
         log.error(
             "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
-            argv[0], expected, exc,
+            command, expected, exc,
         )
         return None
+    return resolved
+
+
+def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+    """Replace an admitted service command with a trusted absolute program.
+
+    Service commands execute with ``shell=False``, but a bare ``argv[0]``
+    would still be selected through PATH. Bind every admitted executable to a
+    fixed regular file outside every configured service-writable root. Script
+    pins also name their pinned interpreter explicitly, so their shebang cannot
+    reintroduce PATH resolution below the authorized argv.
+    """
+    if not argv:
+        return None
+    command = argv[0]
+    expected = _maintenance_resolved_pin(command)
+    if expected is None:
+        return None
+    interpreter_command = _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS.get(command)
+    if interpreter_command is not None:
+        interpreter = _maintenance_resolved_pin(interpreter_command)
+        if interpreter is None:
+            return None
+        return [str(interpreter), str(expected), *argv[1:]]
+    if command == "pytest":
+        return [str(expected), "-m", "pytest", *argv[1:]]
     return [str(expected), *argv[1:]]
 
 
@@ -1301,7 +1344,7 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])
         )
-    return argv if allowed else None
+    return _maintenance_pinned_execution_argv(argv) if allowed else None
 
 
 def _target_matches_shell_profile(target: str, destination: str) -> bool:
