@@ -1684,6 +1684,7 @@ async def test_service_shell_bypass_denied_through_live_middleware(
 async def test_service_shell_executes_the_exact_authorized_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     """The shell profile's parsed argv, not the model string, reaches the handler."""
     from langchain_core.messages import ToolMessage
@@ -1733,7 +1734,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
     assert result.status != "error"
     assert seen_args["command"] == f"git -C {home} log --oneline"
     assert seen_args["mimir_direct_argv"] == [
-        "/usr/bin/git", "-C", str(home.resolve()),
+        str(maintenance_pinned_executables["git"]), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
         "--no-pager", "--no-optional-locks",
@@ -2743,6 +2744,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
 def test_maintenance_git_resolves_c_within_configured_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
@@ -2757,7 +2759,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
     assert parse_service_shell_argv(
         f"git -C {nested} log --oneline -5", "maintenance",
     ) == [
-        "/usr/bin/git", "-C", str(nested.resolve()),
+        str(maintenance_pinned_executables["git"]), "-C", str(nested.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
         "--no-pager", "--no-optional-locks",
@@ -2768,7 +2770,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
     assert parse_service_shell_argv(
         "git -C state status --short", "maintenance",
     ) == [
-        "/usr/bin/git", "-C", str(state.resolve()),
+        str(maintenance_pinned_executables["git"]), "-C", str(state.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
         "--no-pager", "--no-optional-locks", "status", "--short",

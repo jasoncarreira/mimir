@@ -464,6 +464,7 @@ def test_turn_history_result_is_untrusted_active_ingest():
 def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     memory = tmp_path / "memory" / "heartbeat.md"
