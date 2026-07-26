@@ -3594,11 +3594,12 @@ async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
 
 
 def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
-    """claude-code stays unavailable unless its adapter can install the
-    PreToolUse budget/prohibited-action enforcement hook."""
+    """claude-code stays unavailable when its adapter cannot be imported."""
+    import sys
+
+    from mimir import providers
     from mimir.agent import _resolve_model
     from mimir.providers import ClaudeCodeAuthStatus
-    import mimir.providers as providers
 
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     monkeypatch.setattr(
@@ -3606,9 +3607,12 @@ def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
         "claude_code_auth_status",
         lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
     )
-    with pytest.raises((ImportError, RuntimeError)) as excinfo:
+    monkeypatch.setitem(sys.modules, "langchain_claude_code", None)
+    with pytest.raises(ImportError) as excinfo:
         _resolve_model("claude-code:claude-sonnet-4-6")
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
     msg = str(excinfo.value)
+    assert "requires the 'claude-code' extra" in msg
     assert "mimir-agent[claude-code]" in msg
     assert "claude setup-token" in msg
     assert "claude -p 'ping'" in msg
@@ -3620,10 +3624,13 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
 ):
     """Config.from_env can still select claude-code, but model resolution
     remains fail-closed until the enforcement hook is active."""
+    import sys
+    import types
+
+    from mimir import providers
     from mimir.agent import resolve_model_from_config
     from mimir.config import Config
     from mimir.providers import ClaudeCodeAuthStatus
-    import mimir.providers as providers
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
@@ -3633,13 +3640,32 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
         "claude_code_auth_status",
         lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
     )
+
+    fake_lcc = types.ModuleType("langchain_claude_code")
+    fake_lcc.ChatClaudeCode = lambda **_kwargs: "SHOULD_NOT_CONSTRUCT"
+    monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
+    monkeypatch.setattr(
+        "mimir._langchain_claude_code_patches.assert_supported_langchain_claude_code_adapter",
+        lambda *_args, **_kwargs: None,
+    )
+
+    enforcement_error = RuntimeError("test enforcement hook unavailable")
+
+    def _fail_enforcement(*_args, **_kwargs):
+        raise enforcement_error
+
+    monkeypatch.setattr(
+        "mimir._langchain_claude_code_patches.ensure_tool_enforcement_hooks_installed",
+        _fail_enforcement,
+    )
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
         encoding="utf-8",
     )
     cfg = Config.from_env()
-    with pytest.raises((ImportError, RuntimeError)):
+    with pytest.raises(RuntimeError) as excinfo:
         resolve_model_from_config(cfg)
+    assert excinfo.value is enforcement_error
 
 
 # ─── chainlink #508: deliver: failure notice on EARLY-phase crash ────
