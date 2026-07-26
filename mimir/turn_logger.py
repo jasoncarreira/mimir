@@ -427,7 +427,9 @@ def extract_turn_events(
     return events, "\n".join(output_parts)
 
 
-def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
+def derive_result_fields(
+    messages: list[Any], *, context: Any | None = None,
+) -> dict[str, Any]:
     """Pull SDK-equivalent ResultMessage fields from LangChain messages.
 
     LangChain stores stop_reason in response_metadata, usage in
@@ -441,10 +443,16 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
         if isinstance(msg, AIMessage):
             final_ai = msg
 
+    budget_exhausted = bool(
+        context is not None
+        and getattr(context, "tool_call_budget_exhausted", False)
+        and getattr(context, "tool_call_budget_denied_count", 0)
+    )
+
     if final_ai is None:
         return {
-            "result_subtype": None,
-            "result_is_error": None,
+            "result_subtype": "tool_budget_exhausted" if budget_exhausted else None,
+            "result_is_error": True if budget_exhausted else None,
             "stop_reason": None,
             "num_turns": None,
             "total_cost_usd": None,
@@ -533,6 +541,16 @@ def derive_result_fields(messages: list[Any]) -> dict[str, Any]:
     # the response is truncated."
     if stop_reason in ("max_turns", "max_tokens", "length"):
         result_subtype = "error_max_turns"
+        result_is_error = True
+    elif stop_reason == "model_context_window_exceeded":
+        result_subtype = "model_context_window_exceeded"
+        result_is_error = True
+
+    # A denied non-exempt call is authoritative even if the model subsequently
+    # emits a normal end_turn while wrapping up. A soft warning alone never sets
+    # these context fields and therefore remains a successful result.
+    if budget_exhausted:
+        result_subtype = "tool_budget_exhausted"
         result_is_error = True
 
     return {

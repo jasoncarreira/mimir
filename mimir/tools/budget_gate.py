@@ -228,6 +228,7 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
             tool=tool_name,
             count=count,
             budget=budget,
+            turn_id=getattr(ctx, "turn_id", None),
         )
         return _budget_denied_message(tool_name, count, budget)
     new_count = count + 1
@@ -243,6 +244,7 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
             count=new_count,
             budget=budget,
             soft_threshold=soft,
+            turn_id=getattr(ctx, "turn_id", None),
         )
     return None
 
