@@ -1201,8 +1201,8 @@ def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
         return None
     try:
         resolved = expected.resolve(strict=True)
-        if resolved != expected or not expected.is_file():
-            raise OSError("expected a non-symlink regular file")
+        if resolved != expected or not expected.is_file() or not os.access(expected, os.X_OK):
+            raise OSError("expected an executable non-symlink regular file")
     except (OSError, RuntimeError) as exc:
         log.error(
             "maintenance_pinned_executable_missing command=%s expected=%s error=%s",

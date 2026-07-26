@@ -385,6 +385,7 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     allowed_operation: str,
     denied_operation: str,
     ifc_allows: bool,
+    maintenance_git_home,
 ) -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
@@ -433,7 +434,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     assert denied.service_principal is get_service_principal(trigger)
 
 
-def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width() -> None:
+def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width(
+    maintenance_git_home,
+) -> None:
     from mimir.access_control import create_auth_context
     from mimir.models import AgentEvent
 
@@ -1010,7 +1013,9 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
         assert not system.has_capability(cap), f"system should NOT have {cap}"
 
 
-def test_adjacent_unauthorized_operations_deny_for_each_principal() -> None:
+def test_adjacent_unauthorized_operations_deny_for_each_principal(
+    maintenance_git_home,
+) -> None:
     """Verify that unauthorized operations are denied for each service principal.
 
     Tests boundary: each principal should only be able to use its defined
@@ -1102,7 +1107,9 @@ def test_service_shell_companions_are_admitted_when_enforced(
     assert result.allowed is True
 
 
-def test_service_authorization_requires_two_factor_validation() -> None:
+def test_service_authorization_requires_two_factor_validation(
+    maintenance_git_home,
+) -> None:
     """Verify that service authorization requires both is_service=True AND canonical_principal match.
 
     This tests the fix for the security issue where authorize_tool granted service

@@ -1911,6 +1911,7 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
     trigger: str,
     canonical: str,
     admitted_command: str,
+    maintenance_git_home: Path,
 ):
     channel = f"{trigger}:configured"
     service = AuthContext(

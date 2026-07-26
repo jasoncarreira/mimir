@@ -1742,6 +1742,64 @@ async def test_service_shell_executes_the_exact_authorized_argv(
 
 
 @pytest.mark.asyncio
+async def test_service_shell_executes_pinned_non_git_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writable PATH entry cannot replace an admitted maintenance command."""
+    from langchain_core.messages import ToolMessage
+
+    import mimir.access_control as access_control
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    pinned_gh = tmp_path / "trusted-gh"
+    pinned_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    pinned_gh.chmod(0o755)
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "gh", pinned_gh)
+
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={
+                    "command": "gh pr list --state open",
+                    "mimir_direct_argv": ["sh", "-c", "touch /tmp/forged"],
+                },
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["command"] == "gh pr list --state open"
+    assert seen_args["mimir_direct_argv"] == [
+        str(pinned_gh), "pr", "list", "--state", "open",
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("args_factory", "expected_reason"),
     [
@@ -2519,7 +2577,8 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         import mimir.access_control as access_control
 
         chainlink = tmp_path / "chainlink"
-        chainlink.write_text("", encoding="utf-8")
+        chainlink.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        chainlink.chmod(0o755)
         monkeypatch.setitem(
             access_control._MAINTENANCE_PINNED_EXECUTABLES,
             "/usr/local/bin/chainlink",
@@ -2567,7 +2626,8 @@ def test_maintenance_shell_returns_pinned_execution_argv(
     import mimir.access_control as access_control
 
     executable = tmp_path / command_key.rsplit("/", 1)[-1]
-    executable.write_text("", encoding="utf-8")
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
     monkeypatch.setitem(
         access_control._MAINTENANCE_PINNED_EXECUTABLES,
         command_key,
@@ -2581,20 +2641,33 @@ def test_maintenance_shell_returns_pinned_execution_argv(
     assert Path(argv[0]).is_absolute()
 
 
-def test_maintenance_shell_fails_loudly_when_pinned_executable_is_missing(
+@pytest.mark.parametrize("failure", ["missing", "symlink", "non_executable"])
+def test_maintenance_shell_fails_loudly_when_pinned_executable_is_invalid(
+    failure: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import mimir.access_control as access_control
 
-    missing = Path("/definitely-missing/gh")
-    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "gh", missing)
+    expected = tmp_path / "gh"
+    if failure == "missing":
+        expected = Path("/definitely-missing/gh")
+    elif failure == "symlink":
+        target = tmp_path / "real-gh"
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        expected.symlink_to(target)
+    else:
+        expected.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "gh", expected)
 
     with caplog.at_level("ERROR", logger="mimir.access_control"):
         assert parse_service_shell_argv("gh pr list --state open", "maintenance") is None
 
     assert "maintenance_pinned_executable_missing" in caplog.text
-    assert str(missing) in caplog.text
+    assert str(expected) in caplog.text
 
 
 @pytest.mark.parametrize(
