@@ -411,6 +411,9 @@ def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> No
 
     assert principal.capability_tier is access_control.CapabilityTier.UNBOUNDED
     assert "fetch_url" in principal.capabilities
+    assert principal.sink_policy_for("shell_exec") == access_control.ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "maintenance",
+    )
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
@@ -1604,7 +1607,7 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
         "git diff --no-ext-diff --no-textconv --no-index /etc/passwd /tmp/copy",
         "rg --no-config --pre=touch /tmp/pwned pattern .",
         "rg pattern .",
-        "git log --oneline",
+        "git log --format=format:pwned",
         "git diff --no-ext-diff --no-textconv {--output=/tmp/OUT,HEAD} {--format=format:ATTACKER_%H,HEAD}",
         "git diff --no-ext-diff --no-textconv *",
         "git diff --no-ext-diff --no-textconv ?",
@@ -2450,6 +2453,95 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
 
     assert decision.allowed is False
     assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # issues-audit.md:48 confirms landed fixes with this Git log shape.
+        "git -C /workspace/mimir log --oneline --grep=fix-164",
+        "git status --porcelain",
+        "git diff --stat HEAD~1",
+        "git show --name-only 5444bb55",
+        # Maintenance turns use these read-only GitHub and Chainlink lookups.
+        "gh pr list --state open --limit 20",
+        "gh pr view 979 --json title,state,reviews",
+        "gh issue list --state open --label security",
+        "gh issue view 922 --comments",
+        "chainlink issue list --status all --label worklink:ready --json",
+        "chainlink issue show 922 --json",
+    ],
+)
+def test_maintenance_shell_profile_admits_prompt_inspection_commands(command: str) -> None:
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", _service_auth(service, InformationFlowLabels()),
+        enforce=True, target_channel=command,
+    )
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "maintenance",
+    )
+    assert service.sink_policy_for("bash_async") == ServiceSinkPolicy(
+        "bash_async", "shell_profile", "maintenance",
+    )
+    assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf .",
+        "git push --force origin HEAD",
+        "git reset --hard HEAD~1",
+        "git rebase -i HEAD~2",
+        "git config credential.helper store",
+        "gh auth login",
+        "gh pr create --title mutation",
+        "gh issue comment 922 --body mutation",
+        "chainlink issue create mutation",
+        "chainlink issue comment 922 mutation",
+        "npm ci",
+        "npm install left-pad",
+        "pip install requests",
+        "uv add requests",
+        "python -c 'print(1)'",
+        "python -m pytest",
+        "pytest -q",
+        "spawn_open_code task",
+        "sh -c 'git status'",
+    ],
+)
+def test_maintenance_shell_profile_denies_mutating_or_unbounded_commands(
+    command: str,
+) -> None:
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", _service_auth(service, InformationFlowLabels()),
+        enforce=True, target_channel=command,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status; rm -rf .",
+        "git status\nrm -rf .",
+        "git status ~/repo",
+        "gh pr view 'unterminated",
+    ],
+)
+def test_maintenance_shell_profile_preserves_shared_argv_guards(command: str) -> None:
+    import mimir.access_control as access_control
+
+    assert access_control.parse_service_shell_argv(command, "maintenance") is None
 
 
 def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:

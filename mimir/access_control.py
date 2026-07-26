@@ -480,7 +480,11 @@ def build_trigger_service_principal(
                 json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
-            shell_profile = "repo_review" if profile == "github" else "scheduler_read_only"
+            shell_profile = (
+                "repo_review" if profile == "github"
+                else "maintenance" if profile == "heartbeat"
+                else "scheduler_read_only"
+            )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
         elif operation == "worklink_run":
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
@@ -961,6 +965,88 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     return False
 
 
+def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
+    """Validate read/inspection commands used by scheduled maintenance."""
+    if _target_matches_read_only_shell_command(argv):
+        return True
+    if not argv:
+        return False
+
+    if argv[0] == "git":
+        arguments = argv[1:]
+        if arguments[:1] == ["-C"]:
+            if len(arguments) < 3 or arguments[1].startswith("-"):
+                return False
+            arguments = arguments[2:]
+        if not arguments:
+            return False
+        subcommand = arguments[0]
+        subcommand_arguments = arguments[1:]
+        if subcommand == "status":
+            return _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch", "--ignore-submodules",
+                    "--long", "--no-ahead-behind", "--porcelain", "--short",
+                    "--show-stash", "--untracked-files", "--verbose",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        if subcommand in {"diff", "log", "show"}:
+            return _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                    "--exit-code", "--full-index", "--grep", "--name-only",
+                    "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                    "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                    "--stat", "--staged",
+                }),
+                option_prefixes=(
+                    "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
+                ),
+            )
+        return False
+
+    if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
+        resource = argv[1]
+        subcommand = argv[2]
+        options = {
+            ("pr", "list"): frozenset({
+                "--app", "--assignee", "--author", "--base", "--draft", "--head",
+                "--json", "--jq", "--label", "--limit", "--repo", "--search",
+                "--state", "--template",
+            }),
+            ("pr", "view"): frozenset({
+                "--comments", "--json", "--jq", "--repo", "--template",
+            }),
+            ("issue", "list"): frozenset({
+                "--app", "--assignee", "--author", "--json", "--jq", "--label",
+                "--limit", "--mention", "--milestone", "--repo", "--search",
+                "--state", "--template",
+            }),
+            ("issue", "view"): frozenset({
+                "--comments", "--json", "--jq", "--repo", "--template",
+            }),
+        }.get((resource, subcommand))
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options,
+        )
+
+    if argv[:2] == ["chainlink", "issue"] and len(argv) >= 3:
+        subcommand = argv[2]
+        options = {
+            "list": frozenset({"--json", "--label", "--priority", "--status"}),
+            "show": frozenset({"--json"}),
+        }.get(subcommand)
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options,
+        )
+    return False
+
+
 def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
     """Return the exact argv admitted by a trusted service shell profile.
 
@@ -987,6 +1073,8 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
         allowed = _target_matches_repo_review_shell_command(argv)
+    elif destination == "maintenance":
+        allowed = _target_matches_maintenance_shell_command(argv)
     elif destination == "upgrade_workspace":
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
@@ -3381,8 +3469,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                     "edit_file", "static_service_write_roots",
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),

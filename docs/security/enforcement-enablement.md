@@ -311,6 +311,30 @@ commands. `npm ci --ignore-scripts` is the one declared dependency-materializati
 command because a clean install is part of the repository test contract; lifecycle
 scripts and other network-installing package operations remain denied.
 
+**Scheduled-maintenance execution profile.** Static `scheduled_tick` services and
+the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers
+remain on `repo_review`, research/custom pollers remain on
+`scheduler_read_only`, and upgrades remain on `upgrade_workspace`. The profile
+adds only command-shape allow-lists for maintenance inspection: Git
+`status`/`log`/`diff`/`show` (including the workspace-scoped landed-fix check in
+`mimir/prompt_templates/issues-audit.md:48`), GitHub PR/issue `list` and `view`,
+and Chainlink issue `list` and `show`. These support the read/inspect work called
+for by heartbeat's backlog and state-management workflow
+(`mimir/prompt_templates/heartbeat.md:121-179`), reflection's repository and
+issue follow-up review (`mimir/prompt_templates/reflect.md:97-153`), memory
+hygiene's bounded follow-up triage
+(`mimir/prompt_templates/memory-hygiene.md:62-84`), and the issues audit's fix
+verification (`mimir/prompt_templates/issues-audit.md:38-64`).
+
+`maintenance` deliberately does not authorize the mutating examples in those
+prompts. Chainlink create/comment, file deletion, Git commit/push/history/config
+mutation, GitHub mutation or authentication, package installation, test runners,
+arbitrary interpreters, shell launchers, and `spawn_*` remain denied. Like every
+shell profile, it inherits control-character rejection, `shlex` parsing,
+leading-tilde rejection, and the requirement that the admitted argv itself is
+the execution artifact. File-write scope for dynamic principals is a separate
+policy concern and is not widened by this profile.
+
 Repo-working principals freeze the explicit `:rw` entries from
 `MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside the trigger's state
 root. The exact-root adapter still rejects paths outside those roots, read-only
