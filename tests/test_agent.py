@@ -3679,6 +3679,7 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     monkeypatch.setattr(
         providers,
@@ -3703,11 +3704,18 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
         "mimir._langchain_claude_code_patches.ensure_tool_enforcement_hooks_installed",
         _fail_enforcement,
     )
+    # Isolate the downstream model-resolution fail-closed contract from #910's
+    # earlier Config startup gate while keeping enforcement requested on cfg.
+    monkeypatch.setattr(
+        "mimir.config.resolve_access_control_enforcement",
+        lambda requested, **_kwargs: requested,
+    )
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
         encoding="utf-8",
     )
     cfg = Config.from_env()
+    assert cfg.access_control_enforced is True
     with pytest.raises(RuntimeError) as excinfo:
         resolve_model_from_config(cfg)
     assert excinfo.value is enforcement_error
@@ -3752,19 +3760,33 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
 
     monkeypatch.setattr(agent_mod, "build_turn_prompt", _boom)
 
+    from mimir.access_control import (
+        CapabilityTier,
+        build_trigger_service_principal,
+    )
+
+    authority = build_trigger_service_principal(
+        canonical="poller:px",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("send_message",),
+        creation_path="tests.test_agent",
+    )
     event = AgentEvent(
         trigger="poller",
         channel_id="poller:px",
         content="stuff",
-        extra={"deliver": "rec-ops", "poller_name": "px"},
+        source="poller",
+        service_principal=authority.canonical,
+        service_authority=authority,
+        extra={"deliver": "poller:px", "poller_name": "px"},
     )
     with pytest.raises(RuntimeError):
         await agent.run_turn(event)
 
-    notices = [(c, t) for c, t in chans.sent if c == "rec-ops"]
-    # The preloaded poller context is internal-labeled and the deliver target is
-    # cross-channel, but default shadow mode records the would-block and delivers.
-    assert notices == [("rec-ops", "⚠️ px failed: RuntimeError: early boom")]
+    notices = [(c, t) for c, t in chans.sent if c == "poller:px"]
+    assert notices == [("poller:px", "⚠️ px failed: RuntimeError: early boom")]
 
 
 async def test_no_deliver_notice_when_unset_on_early_crash(

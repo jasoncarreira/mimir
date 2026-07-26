@@ -459,13 +459,13 @@ class TestConfigFromEnv:
     ) -> None:
         monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
         monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
-        monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+        monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-sonnet-4-6")
         assert not (tmp_path / ".env").exists()
 
         from mimir.config import Config
         cfg = Config.from_env()
 
-        assert cfg.model_spec == "claude-code:claude-sonnet-4-6"
+        assert cfg.model_spec == "anthropic:claude-sonnet-4-6"
         assert not (tmp_path / ".env").exists()
 
 
