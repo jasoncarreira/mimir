@@ -316,7 +316,9 @@ the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers
 remain on `repo_review`, research/custom pollers remain on
 `scheduler_read_only`, and upgrades remain on `upgrade_workspace`. The profile
 adds only command-shape allow-lists for maintenance inspection: Git
-`status`/`branch --show-current`/`log`/`diff`/`show` (including the
+`status`/`branch --show-current`/`log`/`diff`/`show`, each requiring
+`git -C <configured-root> ...` so the repository target is explicit in the
+authorized argv (bare Git commands are deliberately denied), including the
 workspace-scoped landed-fix check in
 `mimir/prompt_templates/issues-audit.md:48` and the prompt-common `git log
 --oneline -<n>` shorthand), GitHub PR/issue `list` and `view`, and Chainlink

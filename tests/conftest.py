@@ -16,6 +16,8 @@ case for "all tests pass on every PR" (memory/core/40-learned-behaviors
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -23,10 +25,16 @@ import pytest
 
 @pytest.fixture
 def maintenance_git_home(tmp_path, monkeypatch):
-    """Give maintenance-shell authorization a real default Git root."""
+    """Give maintenance-shell authorization an explicit real Git root."""
+    import mimir.access_control as access_control
+
     home = tmp_path / "maintenance-home"
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
+    git_executable = Path(shutil.which("git") or "git").resolve(strict=True)
+    monkeypatch.setitem(
+        access_control._MAINTENANCE_PINNED_EXECUTABLES, "git", git_executable,
+    )
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     return home

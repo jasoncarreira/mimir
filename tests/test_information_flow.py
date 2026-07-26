@@ -1903,7 +1903,7 @@ def test_service_file_policy_rejects_read_only_file_tool_root(
 @pytest.mark.parametrize(
     ("trigger", "canonical", "admitted_command"),
     [
-        ("scheduled_tick", "scheduler", "git status --short"),
+        ("scheduled_tick", "scheduler", "status --short"),
         ("upgrade", "system", "uv sync"),
     ],
 )
@@ -1926,6 +1926,8 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
         enforcement_enabled=True,
     )
     labels = _labels(channel, sources=frozenset({channel}))
+    if trigger == "scheduled_tick":
+        admitted_command = f"git -C {maintenance_git_home} {admitted_command}"
 
     admitted = SinkGate.check_sink_flow(
         "shell_exec", admitted_command, labels, service, enforce=True,

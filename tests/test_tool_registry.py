@@ -417,7 +417,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         ctx,
         enforce=True,
         target_channel=(
-            "git status" if allowed_operation == "shell_exec" else f"{trigger}:target"
+            f"git -C {maintenance_git_home} status"
+            if allowed_operation == "shell_exec"
+            else f"{trigger}:target"
         ),
     )
     denied = registry.authorize_tool(denied_operation, ctx, enforce=True)
@@ -449,13 +451,19 @@ def test_service_authorization_is_stable_under_inventory_mutation_and_surface_wi
     scheduler = create_auth_context(event, enforce=True, ifc_labels=_service_labels(event))
 
     before = registry.authorize_tool(
-        "shell_exec", scheduler, enforce=True, target_channel="git status"
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
     )
     registry.register_runtime_tools(
         [SimpleNamespace(name=name, description=name) for name in sorted(_OLD_ADMIN_TOOLS)]
     )
     with_full_surface = registry.authorize_tool(
-        "shell_exec", scheduler, enforce=True, target_channel="git status"
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
     )
     denied_with_full_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
@@ -463,7 +471,10 @@ def test_service_authorization_is_stable_under_inventory_mutation_and_surface_wi
     registry.clear()
     registry.register_runtime_tools([SimpleNamespace(name="send_message")])
     with_narrow_surface = registry.authorize_tool(
-        "shell_exec", scheduler, enforce=True, target_channel="git status"
+        "shell_exec",
+        scheduler,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
     )
     denied_with_narrow_surface = registry.authorize_tool(
         "request_mimir_update", scheduler, enforce=True
@@ -1056,7 +1067,11 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
             operation,
             ctx,
             enforce=True,
-            target_channel="git status" if operation == "shell_exec" else None,
+            target_channel=(
+                f"git -C {maintenance_git_home} status"
+                if operation == "shell_exec"
+                else None
+            ),
         )
 
         if should_allow:
@@ -1131,7 +1146,10 @@ def test_service_authorization_requires_two_factor_validation(
     )
     ctx_correct = create_auth_context(event_correct, enforce=True, ifc_labels=_service_labels(event_correct))
     result_correct = registry.authorize_tool(
-        "shell_exec", ctx_correct, enforce=True, target_channel="git status"
+        "shell_exec",
+        ctx_correct,
+        enforce=True,
+        target_channel=f"git -C {maintenance_git_home} status",
     )
     assert result_correct.allowed is True, "Correctly-stamped service should get capabilities"
     assert result_correct.service_principal is not None

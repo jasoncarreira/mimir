@@ -1721,7 +1721,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
                 auth_context,
                 tool_name="shell_exec",
                 args={
-                    "command": "git log --oneline",
+                    "command": f"git -C {home} log --oneline",
                     "mimir_direct_argv": ["sh", "-c", "touch /tmp/forged"],
                 },
             ),
@@ -1731,7 +1731,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
         reset_current_turn(token)
 
     assert result.status != "error"
-    assert seen_args["command"] == "git log --oneline"
+    assert seen_args["command"] == f"git -C {home} log --oneline"
     assert seen_args["mimir_direct_argv"] == [
         "/usr/bin/git", "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
@@ -2546,44 +2546,57 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "command_key"),
     [
-        "git status --porcelain",
-        "git diff --stat HEAD~1",
-        "git show --name-only 5444bb55",
-        "git log --oneline -5",
-        "git branch --show-current",
+        ("git status --porcelain", "git"),
+        ("git diff --stat HEAD~1", "git"),
+        ("git show --name-only 5444bb55", "git"),
+        ("git log --oneline -5", "git"),
+        ("git branch --show-current", "git"),
         # Maintenance turns use these read-only GitHub and Chainlink lookups.
-        "gh pr list --state open --limit 20",
-        "gh pr view 979 --json title,state,reviews",
-        "gh issue list --state open --label security",
-        "gh issue view 922 --comments",
-        "/usr/local/bin/chainlink issue list --status all --label worklink:ready --json",
-        "/usr/local/bin/chainlink issue ready --json",
-        "/usr/local/bin/chainlink issue show 922 --json",
-        "/usr/local/bin/chainlink issue list --status open",
+        ("gh pr list --state open --limit 20", "gh"),
+        ("gh pr view 979 --json title,state,reviews", "gh"),
+        ("gh issue list --state open --label security", "gh"),
+        ("gh issue view 922 --comments", "gh"),
+        ("ls -la", "ls"),
+        ("grep -n needle sample.txt", "grep"),
+        ("wc -l sample.txt", "wc"),
+        ("pwd -P", "pwd"),
+        ("jq -r .name sample.json", "jq"),
+        ("rg --no-config -n needle .", "rg"),
+        (
+            "/usr/local/bin/chainlink issue list --status all "
+            "--label worklink:ready --json",
+            "/usr/local/bin/chainlink",
+        ),
+        ("/usr/local/bin/chainlink issue ready --json", "/usr/local/bin/chainlink"),
+        ("/usr/local/bin/chainlink issue show 922 --json", "/usr/local/bin/chainlink"),
+        (
+            "/usr/local/bin/chainlink issue list --status open",
+            "/usr/local/bin/chainlink",
+        ),
     ],
 )
 def test_maintenance_shell_profile_admits_prompt_inspection_commands(
     command: str,
+    command_key: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mimir.access_control as access_control
+
     home = tmp_path / "home"
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    if command.startswith("/usr/local/bin/chainlink"):
-        import mimir.access_control as access_control
-
-        chainlink = tmp_path / "chainlink"
-        chainlink.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        chainlink.chmod(0o755)
-        monkeypatch.setitem(
-            access_control._MAINTENANCE_PINNED_EXECUTABLES,
-            "/usr/local/bin/chainlink",
-            chainlink,
-        )
+    executable = tmp_path / command_key.rsplit("/", 1)[-1]
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setitem(
+        access_control._MAINTENANCE_PINNED_EXECUTABLES, command_key, executable,
+    )
+    if command_key == "git":
+        command = command.replace("git ", f"git -C {home} ", 1)
     service = get_service_principal("scheduled_tick")
     assert service is not None
 
@@ -2670,6 +2683,17 @@ def test_maintenance_shell_fails_loudly_when_pinned_executable_is_invalid(
     assert str(expected) in caplog.text
 
 
+def test_maintenance_git_denies_bare_commands(
+    maintenance_git_home: Path,
+) -> None:
+    for command in (
+        "git status --short",
+        "git log --oneline -5",
+        "git diff --stat HEAD~1",
+    ):
+        assert parse_service_shell_argv(command, "maintenance") is None
+
+
 @pytest.mark.parametrize(
     ("command", "subcommand", "arguments"),
     [
@@ -2688,14 +2712,23 @@ def test_maintenance_git_returns_hardened_execution_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mimir.access_control as access_control
+
     home = tmp_path / "home"
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    pinned_git = tmp_path / "git"
+    pinned_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    pinned_git.chmod(0o755)
+    monkeypatch.setitem(
+        access_control._MAINTENANCE_PINNED_EXECUTABLES, "git", pinned_git,
+    )
 
+    command = command.replace("git ", f"git -C {home} ", 1)
     assert parse_service_shell_argv(command, "maintenance") == [
-        "/usr/bin/git", "-C", str(home.resolve()),
+        str(pinned_git), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
         "--no-pager", "--no-optional-locks", subcommand, *arguments,
@@ -2794,6 +2827,7 @@ def test_maintenance_git_execution_argv_suppresses_configured_helpers(
     )
 
     for command in ("git status --short", "git diff", "git log -p -1"):
+        command = command.replace("git ", f"git -C {repo} ", 1)
         argv = parse_service_shell_argv(command, "maintenance")
         assert argv is not None
         filter_index = argv.index("filter.owned.clean=")

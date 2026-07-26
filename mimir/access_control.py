@@ -993,7 +993,6 @@ _MAINTENANCE_PINNED_EXECUTABLES = {
     "rg": Path("/usr/bin/rg"),
     "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
 }
-_MAINTENANCE_GIT_EXECUTABLE = str(_MAINTENANCE_PINNED_EXECUTABLES["git"])
 _MAINTENANCE_GIT_BASE_OVERRIDES = (
     "-c", "core.fsmonitor=",
     "-c", "core.hooksPath=/dev/null",
@@ -1036,7 +1035,9 @@ def _maintenance_git_probe_env() -> dict[str, str]:
     return env
 
 
-def _maintenance_git_filter_overrides(root: Path) -> list[str] | None:
+def _maintenance_git_filter_overrides(
+    root: Path, git_executable: str,
+) -> list[str] | None:
     """Return argv overrides that disable configured content filter drivers.
 
     Git has no generic "disable all filters" switch. A checkout-controlled
@@ -1047,7 +1048,7 @@ def _maintenance_git_filter_overrides(root: Path) -> list[str] | None:
     names, then shadow each command with an empty command in the final argv.
     """
     command = [
-        _MAINTENANCE_GIT_EXECUTABLE, "-C", str(root),
+        git_executable, "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
         "--no-pager", "config", "--local", "--null", "--name-only",
         "--get-regexp", r"^filter\..*\.(clean|smudge|process)$",
@@ -1094,18 +1095,18 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     """
     if not argv or argv[0] != "git":
         return None
-    if _maintenance_pinned_execution_argv(["git"]) is None:
+    pinned_git = _maintenance_pinned_execution_argv(["git"])
+    if pinned_git is None:
         return None
 
+    # The authorized command must name its repository in argv. Relying on the
+    # service process cwd would leave the actual target outside the audited
+    # authorization artifact.
     arguments = argv[1:]
-    requested_root: str | None = None
-    if arguments[:1] == ["-C"]:
-        if len(arguments) < 3 or arguments[1].startswith("-"):
-            return None
-        requested_root = arguments[1]
-        arguments = arguments[2:]
-    if not arguments:
+    if arguments[:1] != ["-C"] or len(arguments) < 3 or arguments[1].startswith("-"):
         return None
+    requested_root = arguments[1]
+    arguments = arguments[2:]
 
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -1170,11 +1171,11 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     if not allowed:
         return None
 
-    filter_overrides = _maintenance_git_filter_overrides(root)
+    filter_overrides = _maintenance_git_filter_overrides(root, pinned_git[0])
     if filter_overrides is None:
         return None
     execution_argv = [
-        _MAINTENANCE_GIT_EXECUTABLE, "-C", str(root),
+        pinned_git[0], "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
         *filter_overrides, "--no-pager", "--no-optional-locks",
         subcommand, *subcommand_arguments,
