@@ -42,6 +42,7 @@ def test_heartbeat_prompt_template_has_required_sections():
     # Core sections of the cadence.
     for header in (
         "Mode: autonomous",
+        "Tooling boundary",
         "Librarian Protocol",
         "Backlog protocol",
         "End silently",
@@ -49,6 +50,8 @@ def test_heartbeat_prompt_template_has_required_sections():
         assert header in body, (
             f"heartbeat prompt template missing section: {header!r}"
         )
+    assert "jq pipelines over events.jsonl" not in body
+    assert "git-commit any uncommitted memory work" not in body
 
 
 # ---- setup_home additions -----------------------------------------------

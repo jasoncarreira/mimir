@@ -384,7 +384,15 @@ def _request_for_authorized_execution(
         return sanitized_request
     argv = parse_service_shell_argv(target, policy.destination)
     if argv is None:
-        return sanitized_request
+        # The authorization adapter already admitted this call. Failing to bind
+        # a direct argv here must not fall back to the original ``bash -lc``
+        # surface if a config probe races, times out, or otherwise changes.
+        args["mimir_direct_argv"] = [
+            "/usr/bin/false",
+            "trusted-service shell argv binding failed closed",
+        ]
+        tool_call = {**request.tool_call, "args": args}
+        return request.override(tool_call=tool_call)
     args["mimir_direct_argv"] = argv
     tool_call = {**request.tool_call, "args": args}
     return request.override(tool_call=tool_call)

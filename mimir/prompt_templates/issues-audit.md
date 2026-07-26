@@ -18,11 +18,10 @@ turn doing both would blow the per-turn tool-call budget.
 
 ## Step 1 — Scope this run (budget-aware)
 
-List the layer, oldest-first:
-
-```bash
-ls -tr "$MIMIR_HOME"/memory/issues/*.md
-```
+List the layer with the `ls` file tool, then use `read_file` for the cursor and
+selected entries. Do not send a glob, pipeline, redirect, or `&&` to
+`shell_exec`; the scheduled-maintenance profile rejects shell composition.
+Order the returned entries oldest-first when metadata is available.
 
 There are usually dozens of files; one turn can't read + verify all of
 them inside the tool-call budget. Work a **batch of ~25–30 files per
@@ -45,15 +44,21 @@ failure mode and its runbook). Pick exactly one verb:
 - **retire** — superseded, resolved, or no longer fingerprint-shaped.
   - *Autonomous* only when the entry already says RESOLVED / FIXED in
     its desc or body, **or** names a specific PR/commit you can confirm
-    landed (`git -C "$MIMIR_WORKSPACE" log --oneline --grep=...` or by
-    reading the now-fixed code). Then delete the file.
+    landed (`git -C <configured-repo-root> log --oneline --grep=...` or by
+    reading the now-fixed code). Pass a literal root from `MIMIR_HOME` or
+    `MIMIR_FILE_TOOL_ROOTS`; do not rely on shell variable expansion. Deletion is
+    still escalate-first under the runtime action boundaries: record the verified
+    retirement candidate for an authorized interactive follow-up rather than
+    deleting it from this scheduled turn.
   - *Escalate* (do **not** delete) when it's ambiguous — maybe-still-
     relevant, or you can't confirm the fix. Add it to the operator
     digest as a retire candidate.
 - **raise-as-chainlink-bug** — the gotcha describes a real, current,
   code-level bug worth tracking and fixing (not just working around).
-  File it (you run inside the container, so `chainlink` is on PATH —
-  call it directly, not via docker):
+  File it with the Chainlink tool/CLI in an authorized interactive follow-up.
+  Scheduled maintenance does not receive tracker-mutation shell authority; leave
+  a durable candidate in the audit cursor/digest when no structured Chainlink
+  mutation tool is available. The interactive command shape is:
   ```bash
   chainlink issue create "<short title>" \
       -d "<failure mode + the source memory/issues/<file> + repro/fix sketch>" \
@@ -74,7 +79,9 @@ the `rebuild_index` tool (`scope="memory"`).
 
 ## Step 4 — Log + escalate
 
-1. Log the run to chainlink #164 for an audit trail:
+1. Log the run to chainlink #164 for an audit trail when a structured
+   Chainlink mutation tool is available; otherwise record the pending log text in
+   the audit cursor/digest for an authorized interactive follow-up. The CLI shape is:
    ```bash
    chainlink issue comment --kind result 164 "Audit <date>: batch of N (oldest X .. Y). kept K / retired R (<files>) / raised B bugs (#…) / escalated E. Cursor now at <last-file>."
    ```

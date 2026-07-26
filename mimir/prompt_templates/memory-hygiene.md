@@ -17,27 +17,24 @@ entry for operator review.
 
 ## Step 1 — Gather deterministic candidates
 
+The scheduled-maintenance shell profile does not admit arbitrary interpreters,
+pipelines, redirects, `&&`, or globs. Use `ls`, `glob`, `grep`, `read_file`, and
+`file_search` for this scan rather than translating it to `shell_exec`.
+
 Run cheap scans first; avoid reading the whole tree unless a candidate
 actually needs inspection.
 
 Suggested shape:
 
-```bash
-python - <<'PY'
-import os
-from pathlib import Path
-home = Path(os.environ["MIMIR_HOME"])
-for root in [home / "memory" / "channels", home / "memory" / "issues", home / "state" / "wiki"]:
-    print(f"## {root}")
-    for p in sorted(root.rglob("*")) if root.exists() else []:
-        if p.is_file():
-            stat = p.stat()
-            with p.open("r", encoding="utf-8", errors="replace") as fh:
-                first = fh.readline().rstrip("\n")
-            desc = first if first.startswith("<!-- desc:") else "NO_DESC"
-            print(stat.st_size, int(stat.st_mtime), p, desc)
-PY
-```
+1. `glob` each of `memory/channels/**/*`, `memory/issues/**/*`, and
+   `state/wiki/**/*`.
+2. Use `ls` on candidate directories when size/mtime ordering matters.
+3. Use `grep` for `<!-- desc:`, `RESOLVED`, and `FIXED`; then `read_file` only
+   for the bounded candidate set that needs semantic classification.
+
+This is intentionally a structured-tool workflow, not the former Python
+heredoc: arbitrary interpreter invocation is outside the maintenance shell
+profile.
 
 Candidate buckets:
 

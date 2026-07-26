@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from textwrap import dedent
@@ -10,21 +12,22 @@ import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
-    AccessStatus,
-    DenialReason,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
+    AccessStatus,
+    CapabilityTier,
+    DenialReason,
     OperationCatalog,
     OperationDecision,
-    CapabilityTier,
     ServicePrincipal,
     ServiceSinkPolicy,
     SinkGate,
     ToolRegistry,
-    build_trigger_service_principal,
-    get_service_principal,
     authorize_action,
     authorize_inbound,
+    build_trigger_service_principal,
     create_auth_context,
+    get_service_principal,
+    parse_service_shell_argv,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -645,6 +648,7 @@ async def test_protected_metadata_reads_authorize_before_rendering(
     should_render: bool,
 ) -> None:
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
@@ -1001,6 +1005,7 @@ def test_malformed_runtime_carrier_fails_closed_under_process_enforcement(
 ) -> None:
     """Only an actual AuthContext may carry authority for a tool request."""
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
@@ -1023,7 +1028,9 @@ def test_malformed_runtime_carrier_fails_closed_under_process_enforcement(
 def test_forged_session_id_cannot_select_concurrent_admin_turn(tmp_path: Path) -> None:
     """Both principals are live; the request carrier, not model args, wins."""
     import asyncio
+
     from langchain_core.messages import ToolMessage
+
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -1136,6 +1143,7 @@ def test_auth_context_ignores_mutated_resolver_and_event(tmp_path: Path) -> None
 def test_detached_request_uses_explicit_carrier_not_inherited_context(tmp_path: Path) -> None:
     """A detached task with an inherited admin turn still honors its user carrier."""
     import asyncio
+
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.tools.budget_gate import _auth_context_from_request
 
@@ -1175,7 +1183,9 @@ def test_detached_request_uses_explicit_carrier_not_inherited_context(tmp_path: 
 
 def test_missing_request_carrier_denies_admin_tool_under_enforcement(monkeypatch) -> None:
     import asyncio
+
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
@@ -1211,7 +1221,9 @@ def test_http_event_ingress_denies_without_server_owned_principal_mapping(
 ) -> None:
     """Generic HTTP credentials authenticate transport only - no server-owned principal."""
     import asyncio
+
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     captured: list[tuple[str, dict]] = []
@@ -1280,7 +1292,9 @@ def test_enforcement_on_missing_context_denies(
 ) -> None:
     """Enforcement-on with missing auth context denies all non-open operations."""
     import asyncio
+
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
@@ -1468,6 +1482,7 @@ async def test_http_transport_principal_mapping_absence_denies_every_non_open_ca
 ) -> None:
     """A forged HTTP author/trigger cannot turn transport auth into authority."""
     from langchain_core.messages import ToolMessage
+
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     captured: list[tuple[str, dict[str, object]]] = []
@@ -1512,6 +1527,7 @@ async def test_concurrent_turns_keep_authority_and_ifc_scope_isolated(
 ) -> None:
     """Concurrent requests cannot borrow admin authority or another turn's labels."""
     from langchain_core.messages import ToolMessage
+
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -1622,6 +1638,7 @@ async def test_service_shell_bypass_denied_through_live_middleware(
 ) -> None:
     """Model args must reach the sink gate before a service shell handler runs."""
     from langchain_core.messages import ToolMessage
+
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -1664,12 +1681,21 @@ async def test_service_shell_bypass_denied_through_live_middleware(
 
 
 @pytest.mark.asyncio
-async def test_service_shell_executes_the_exact_authorized_argv() -> None:
+async def test_service_shell_executes_the_exact_authorized_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The shell profile's parsed argv, not the model string, reaches the handler."""
     from langchain_core.messages import ToolMessage
+
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     event = AgentEvent(
         trigger="scheduled_tick",
         channel_id="scheduler:test",
@@ -1695,7 +1721,7 @@ async def test_service_shell_executes_the_exact_authorized_argv() -> None:
                 auth_context,
                 tool_name="shell_exec",
                 args={
-                    "command": "git log --no-ext-diff --no-textconv --oneline",
+                    "command": "git log --oneline",
                     "mimir_direct_argv": ["sh", "-c", "touch /tmp/forged"],
                 },
             ),
@@ -1705,9 +1731,13 @@ async def test_service_shell_executes_the_exact_authorized_argv() -> None:
         reset_current_turn(token)
 
     assert result.status != "error"
-    assert seen_args["command"] == "git log --no-ext-diff --no-textconv --oneline"
+    assert seen_args["command"] == "git log --oneline"
     assert seen_args["mimir_direct_argv"] == [
-        "git", "log", "--no-ext-diff", "--no-textconv", "--oneline",
+        "/usr/bin/git", "-C", str(home.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks",
+        "log", "--oneline", "--no-ext-diff", "--no-textconv",
     ]
 
 
@@ -1740,6 +1770,7 @@ async def test_service_spawn_destinations_are_confined_to_write_roots(
     expected_reason: str,
 ) -> None:
     from langchain_core.messages import ToolMessage
+
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -1789,6 +1820,7 @@ async def test_same_scope_private_egress_succeeds_through_live_middleware(
 ) -> None:
     """The integrated middleware permits private data back to its source channel."""
     from langchain_core.messages import ToolMessage
+
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
@@ -2458,21 +2490,31 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
 @pytest.mark.parametrize(
     "command",
     [
-        # issues-audit.md:48 confirms landed fixes with this Git log shape.
-        "git -C /workspace/mimir log --oneline --grep=fix-164",
         "git status --porcelain",
         "git diff --stat HEAD~1",
         "git show --name-only 5444bb55",
+        "git log --oneline -5",
+        "git branch --show-current",
         # Maintenance turns use these read-only GitHub and Chainlink lookups.
         "gh pr list --state open --limit 20",
         "gh pr view 979 --json title,state,reviews",
         "gh issue list --state open --label security",
         "gh issue view 922 --comments",
-        "chainlink issue list --status all --label worklink:ready --json",
-        "chainlink issue show 922 --json",
+        "/usr/local/bin/chainlink issue list --status all --label worklink:ready --json",
+        "/usr/local/bin/chainlink issue ready --json",
+        "/usr/local/bin/chainlink issue show 922 --json",
+        "/usr/local/bin/chainlink issue list --status open",
     ],
 )
-def test_maintenance_shell_profile_admits_prompt_inspection_commands(command: str) -> None:
+def test_maintenance_shell_profile_admits_prompt_inspection_commands(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
     service = get_service_principal("scheduled_tick")
     assert service is not None
 
@@ -2491,6 +2533,172 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(command: st
 
 
 @pytest.mark.parametrize(
+    ("command", "subcommand", "arguments"),
+    [
+        ("git status --short", "status", ["--short"]),
+        ("git log --oneline -5", "log", ["--oneline", "-5"]),
+        ("git diff --stat HEAD~1", "diff", ["--stat", "HEAD~1"]),
+        ("git log -p", "log", ["-p"]),
+        ("git show --name-only 5444bb55", "show", ["--name-only", "5444bb55"]),
+        ("git branch --show-current", "branch", ["--show-current"]),
+    ],
+)
+def test_maintenance_git_returns_hardened_execution_argv(
+    command: str,
+    subcommand: str,
+    arguments: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    assert parse_service_shell_argv(command, "maintenance") == [
+        "/usr/bin/git", "-C", str(home.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks", subcommand, *arguments,
+        *(
+            ["--no-ext-diff", "--no-textconv"]
+            if subcommand in {"diff", "log", "show"}
+            else []
+        ),
+    ]
+
+
+def test_maintenance_git_resolves_c_within_configured_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    nested = repo / "nested"
+    home.mkdir()
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+
+    assert parse_service_shell_argv(
+        f"git -C {nested} log --oneline -5", "maintenance",
+    ) == [
+        "/usr/bin/git", "-C", str(nested.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks",
+        "log", "--oneline", "-5", "--no-ext-diff", "--no-textconv",
+    ]
+    state = home / "state"
+    state.mkdir()
+    assert parse_service_shell_argv(
+        "git -C state status --short", "maintenance",
+    ) == [
+        "/usr/bin/git", "-C", str(state.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks", "status", "--short",
+    ]
+
+
+def test_maintenance_git_execution_argv_suppresses_configured_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    source = repo / "sample.txt"
+    source.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "sample.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo),
+            "-c", "user.name=test", "-c", "user.email=test@example.com",
+            "commit", "-qm", "initial",
+        ],
+        check=True,
+    )
+    source.write_text("after\n", encoding="utf-8")
+
+    marker = tmp_path / "helper-fired"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(
+        f"#!/bin/sh\necho fired >> {marker}\nexit 0\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.fsmonitor", str(helper)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "diff.external", str(helper)],
+        check=True,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(repo))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "diff.owned.textconv", str(helper)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "filter.owned.clean", str(helper)],
+        check=True,
+    )
+    (repo / ".gitattributes").write_text(
+        "sample.txt diff=owned filter=owned\n",
+        encoding="utf-8",
+    )
+
+    for command in ("git status --short", "git diff", "git log -p -1"):
+        argv = parse_service_shell_argv(command, "maintenance")
+        assert argv is not None
+        filter_index = argv.index("filter.owned.clean=")
+        assert argv[filter_index - 1:filter_index + 1] == [
+            "-c", "filter.owned.clean=",
+        ]
+        subprocess.run(
+            argv,
+            check=True,
+            cwd=tmp_path,
+            env={**os.environ, "GIT_PAGER": "cat"},
+            capture_output=True,
+            text=True,
+        )
+
+    assert marker.exists() is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git -C /etc status --short",
+        "git -C ../outside status --short",
+        "git -C /tmp status --short",
+        "git -C --config status --short",
+        "git -c core.fsmonitor= status --short",
+        "git --config-env=core.fsmonitor=MALICIOUS status --short",
+    ],
+)
+def test_maintenance_git_denies_unconfigured_roots_and_model_git_globals(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    assert parse_service_shell_argv(command, "maintenance") is None
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "rm -rf .",
@@ -2498,11 +2706,21 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(command: st
         "git reset --hard HEAD~1",
         "git rebase -i HEAD~2",
         "git config credential.helper store",
+        "git status --no-ext-diff",
+        "git status --verbose",
+        "git status -v",
+        "git log --no-textconv --oneline",
+        "git branch --list",
+        "git diff -- sample.txt",
+        "git log -- --all",
+        "git show -- --format=raw",
         "gh auth login",
         "gh pr create --title mutation",
         "gh issue comment 922 --body mutation",
+        "chainlink issue list --status open",
         "chainlink issue create mutation",
         "chainlink issue comment 922 mutation",
+        "/tmp/chainlink issue list --status open",
         "npm ci",
         "npm install left-pad",
         "pip install requests",

@@ -3102,17 +3102,37 @@ def test_audit_prompt_templates_have_frontmatter():
         assert "description:" in frontmatter, fname
         assert "allowed-tools:" not in frontmatter, f"{fname} still has vestigial allowed-tools"
         if fname == "issues-audit.md":
-            # the audit's chainlink-log target id appears in the body
+            # the audit's chainlink-log target id and structured-tool migration
+            # appear in the body; do not regress to shell globs/pipelines.
             assert "#164" in text, fname
+            assert "with the `ls` file tool" in text
+            assert 'ls -tr "$MIMIR_HOME"/memory/issues/*.md' not in text
         elif fname == "commitments-review.md":
             assert "#283" in text, fname
         elif fname == "memory-hygiene.md":
             assert "reflection sub-pass" in text
             assert "flag, don't delete" in text
-            assert 'os.environ["MIMIR_HOME"]' in text
+            assert "structured-tool workflow" in text
+            assert "python - <<'PY'" not in text
             assert "Path.home()" not in text
             assert "state/proposed-changes.md" not in text
             assert "state/spec/<topic>-decision.md" in text
+
+
+def test_reflect_prompt_avoids_shell_composition_and_mutation_snippets():
+    import mimir.prompt_templates as pt
+
+    text = (Path(pt.__file__).parent / "reflect.md").read_text(encoding="utf-8")
+    for denied_snippet in (
+        "$(date",
+        "tail -n 50",
+        "tail | jq",
+        'wc -l "$MIMIR_HOME',
+        'mv "$MIMIR_HOME',
+    ):
+        assert denied_snippet not in text
+    assert "write_file" in text
+    assert "paginated `read_file`" in text
 
 
 def test_reflect_prompt_pending_learning_cross_reference_is_current():
