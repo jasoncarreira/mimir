@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — kept for back-compat re-exports
-from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 log = logging.getLogger(__name__)
 
@@ -292,7 +292,7 @@ def aggregate(
     # nominal baseline window.
     oldest_record_ts: datetime | None = None
 
-    for rec in iter_snapshot_or_tail(snapshot, turns_path):
+    for rec in iter_window_records(snapshot, turns_path):
         ts_str = rec.get("ts")
         if not isinstance(ts_str, str):
             continue
@@ -500,7 +500,7 @@ def event_recently_emitted(
         return False
     cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=cooldown_minutes)
     cutoff_iso = cutoff.isoformat()
-    for ev in iter_snapshot_or_tail(snapshot, events_path):
+    for ev in iter_window_records(snapshot, events_path):
         ts = ev.get("timestamp")
         if not isinstance(ts, str):
             continue

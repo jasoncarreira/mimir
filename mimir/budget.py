@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — re-export
-from .jsonl_snapshot import JsonlSnapshot, iter_snapshot_or_tail
+from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 from .billing import (
     BillingMode,
     QuotaProvider,
@@ -629,7 +629,7 @@ def _partition_turns(
     cutoff_24h = now - timedelta(hours=24)
     cutoff_7d = now - timedelta(days=7)
 
-    for rec in iter_snapshot_or_tail(snapshot, path):
+    for rec in iter_window_records(snapshot, path):
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             continue

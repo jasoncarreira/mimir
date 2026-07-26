@@ -574,6 +574,8 @@ class FeedbackLog:
         path: Path,
         auth_context: AuthContext,
     ) -> list[dict]:
+        # This scan has no time cutoff. Its sibling _authorized_snapshot
+        # preserves saturated window fallback through stream_filtered.
         return [
             record
             for record in iter_snapshot_or_tail(snapshot, path)
@@ -763,6 +765,8 @@ def pending_forget_candidates_count(
     latest_decay_ts: str | None = None
     latest_decay_count: int | None = None
     latest_forget_ts: str | None = None
+    # This needs only the most recent matching events, which the capped tail
+    # preserves by construction; it is intentionally not a windowed scan.
     for ev in iter_snapshot_or_tail(snapshot, events_path):
         evtype = ev.get("type")
         ts = ev.get("timestamp")

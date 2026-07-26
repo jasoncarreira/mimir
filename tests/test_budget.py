@@ -13,6 +13,7 @@ from mimir.budget import (
     HomeostaticArbiter,
     _partition_turns,
 )
+from mimir.jsonl_snapshot import JsonlSnapshot
 from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
 
 
@@ -125,6 +126,27 @@ def test_partition_early_break_on_7d_cutoff(tmp_path: Path):
     assert s3 == 2
     assert t24 == 500
     assert t7d == 500  # 99999 from the 30d-old record was excluded
+
+
+def test_partition_saturated_snapshot_matches_file_window(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    _write_turn(turns, ts=NOW - timedelta(days=8),
+                trigger="user_message", tokens=8000, tool_calls=8)
+    _write_turn(turns, ts=NOW - timedelta(days=6),
+                trigger="user_message", tokens=6000, tool_calls=6)
+    _write_turn(turns, ts=NOW - timedelta(days=4),
+                trigger="scheduled_tick", tokens=4000, tool_calls=4)
+    _write_turn(turns, ts=NOW - timedelta(days=2),
+                trigger="user_message", tokens=2000, tool_calls=2)
+    _write_turn(turns, ts=NOW - timedelta(hours=12),
+                trigger="scheduled_tick", tokens=1000, tool_calls=1)
+    snapshot = JsonlSnapshot(turns, max_records=2)
+
+    expected = _partition_turns(turns, now=NOW)
+    actual = _partition_turns(turns, now=NOW, snapshot=snapshot)
+
+    assert snapshot.saturated
+    assert actual == expected == (0, 1, 1000, 13000)
 
 
 # ─── should_fire: layered constraints ─────────────────────────

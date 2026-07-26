@@ -8,10 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from mimir.jsonl_snapshot import JsonlSnapshot
 from mimir.usage_stats import (
     UsageWindow,
     aggregate,
     context_window_for,
+    event_recently_emitted,
     render_usage_block,
 )
 
@@ -123,6 +125,25 @@ def test_short_circuit_stops_at_oldest_cutoff(tmp_path: Path):
     win_5h = next(w for w in rep.windows if w.label == "Last 5h")
     assert win_5h.turns == 1
     assert win_5h.total_cost_usd == 5.00
+
+
+def test_aggregate_saturated_snapshot_matches_file_window(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [
+        _turn(hours_ago=24 * 8, cost=80.0, input_tokens=8000),
+        _turn(hours_ago=24 * 6, cost=60.0, input_tokens=6000),
+        _turn(hours_ago=24 * 4, cost=40.0, input_tokens=4000),
+        _turn(hours_ago=24 * 2, cost=20.0, input_tokens=2000),
+        _turn(hours_ago=12, cost=10.0, input_tokens=1000),
+    ])
+    snapshot = JsonlSnapshot(path, max_records=2)
+
+    expected = aggregate(path)
+    actual = aggregate(path, snapshot=snapshot)
+
+    assert snapshot.saturated
+    assert actual == expected
+    assert actual.windows[-1].turns == 4
 
 
 def test_handles_records_without_usage(tmp_path: Path):
@@ -669,6 +690,29 @@ def test_cooldown_zero_disables(tmp_path: Path):
         json.dumps({"timestamp": _ts(0.001), "type": "cost_rate_alert"}) + "\n"
     )
     assert not cost_rate_alert_recently_emitted(events, cooldown_minutes=0)
+
+
+def test_cooldown_saturated_snapshot_matches_file_window(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "\n".join([
+            json.dumps({"timestamp": _ts(0.5), "type": "cost_rate_alert"}),
+            json.dumps({"timestamp": _ts(0.2), "type": "tool_call"}),
+            json.dumps({"timestamp": _ts(0.1), "type": "turn_started"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    snapshot = JsonlSnapshot(events, max_records=2)
+
+    expected = event_recently_emitted(
+        events, "cost_rate_alert", cooldown_minutes=60,
+    )
+    actual = event_recently_emitted(
+        events, "cost_rate_alert", cooldown_minutes=60, snapshot=snapshot,
+    )
+
+    assert snapshot.saturated
+    assert actual == expected is True
 
 
 def test_find_window_lookup_by_hours_not_label(tmp_path: Path):
