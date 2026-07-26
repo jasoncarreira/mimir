@@ -3512,6 +3512,83 @@ async def test_fire_poller_budget_under_limit_still_runs(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
+    tmp_path: Path, monkeypatch,
+):
+    import threading
+
+    async def noop(_e):
+        return True
+
+    arbiter = _StubArbiter(fire=True)
+    turns_snapshot = object()
+    arbiter.turns_snapshot = turns_snapshot
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=noop,
+        arbiter=arbiter,
+        home=tmp_path,
+    )
+    skills = tmp_path / "skills"
+    _drop_priority_poller(
+        skills,
+        "p1",
+        priority="normal",
+        budget={"windows": {"1h": {"max_agent_turns": 2}}},
+    )
+    sched.add_poller_jobs(skills)
+
+    releases = [threading.Event(), threading.Event()]
+    entered = threading.Event()
+    calls: list[dict] = []
+    completed = 0
+    loop_thread = threading.get_ident()
+
+    def slow_aggregate(*_args, **kwargs):
+        nonlocal completed
+        index = len(calls)
+        calls.append({
+            "snapshot": kwargs.get("snapshot"),
+            "thread": threading.get_ident(),
+        })
+        entered.set()
+        releases[index].wait(timeout=1)
+        completed += 1
+        return {}
+
+    ran: list[str] = []
+
+    async def fake_run_poller(poller, enqueue, home=None):
+        ran.append(poller.name)
+
+    monkeypatch.setattr("mimir.scheduler.aggregate_poller_turn_usage", slow_aggregate)
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+    timers = [
+        threading.Timer(0.1, releases[0].set),
+        threading.Timer(0.2, releases[1].set),
+    ]
+    for timer in timers:
+        timer.start()
+    try:
+        fire_task = asyncio.create_task(sched._fire_poller(poller_name="p1"))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        progressed_before_check_finished = completed == 0
+        await fire_task
+    finally:
+        for release in releases:
+            release.set()
+        for timer in timers:
+            timer.cancel()
+
+    assert progressed_before_check_finished
+    assert ran == ["p1"]
+    assert len(calls) == 2
+    assert all(call["thread"] != loop_thread for call in calls)
+    assert all(call["snapshot"] is turns_snapshot for call in calls)
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_budget_suppresses_on_external_usage(
     tmp_path: Path, monkeypatch,
 ):

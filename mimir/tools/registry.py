@@ -2451,8 +2451,9 @@ async def worklink_run(
     except Exception as exc:
         return f"worklink_run failed: {exc}"
 
-    # 1) Arbiter gate (cheap, in-process): shed autonomous dispatch under
-    #    pressure. The CLI path never injects an arbiter, so it bypasses this.
+    # 1) Arbiter gate: shed autonomous dispatch under pressure. ``should_fire``
+    #    may scan turns.jsonl, so keep it off the event loop. The CLI path never
+    #    injects an arbiter, so it bypasses this.
     arbiter = _STATE.get("arbiter")
     if arbiter is not None:
         try:
@@ -2460,7 +2461,12 @@ async def worklink_run(
         except Exception:
             priority = "normal"
         try:
-            decision = arbiter.should_fire(priority=priority)
+            loop = asyncio.get_running_loop()
+            decision = await asyncio.to_thread(
+                arbiter.should_fire,
+                priority=priority,
+                event_loop=loop,
+            )
         except Exception as exc:  # never let arbiter errors block dispatch silently
             log.warning("worklink_run arbiter check failed: %s", exc)
             decision = None

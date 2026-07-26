@@ -1837,6 +1837,7 @@ class Scheduler:
                 self._home / "logs" / "turns.jsonl",
                 events_path=get_events_path(),
                 now=now,
+                snapshot=getattr(self._arbiter, "turns_snapshot", None),
             ).get(poller.name)
         except Exception as exc:  # noqa: BLE001 - fail-open on accounting issues
             log.warning("poller budget check failed for %s: %s", poller.name, exc)
@@ -1932,7 +1933,9 @@ class Scheduler:
             )
             return
 
-        budget_exceeded = self._poller_budget_exceeded(poller)
+        budget_exceeded = await asyncio.to_thread(
+            self._poller_budget_exceeded, poller,
+        )
         if budget_exceeded is not None:
             await log_event("poller_budget_suppressed", **budget_exceeded)
             return
@@ -1979,7 +1982,9 @@ class Scheduler:
                     ),
                 )
                 return
-            budget_exceeded = self._poller_budget_exceeded(poller)
+            budget_exceeded = await asyncio.to_thread(
+                self._poller_budget_exceeded, poller,
+            )
             if budget_exceeded is not None:
                 budget_exceeded["stage"] = "post_acquire"
                 await log_event("poller_budget_suppressed", **budget_exceeded)
