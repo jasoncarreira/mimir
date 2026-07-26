@@ -9,6 +9,7 @@ unsupported.
 from __future__ import annotations
 
 import asyncio
+import os
 import types
 from typing import Any
 
@@ -23,6 +24,18 @@ from mimir._langchain_claude_code_patches import (
 )
 
 
+_ENFORCEMENT_ENABLED = os.environ.get(
+    "MIMIR_ACCESS_CONTROL_ENFORCED", "",
+).strip().lower() in {"1", "true", "yes", "on"}
+_CLAUDE_CODE_ENFORCEMENT_SKIP = pytest.mark.skipif(
+    _ENFORCEMENT_ENABLED,
+    reason=(
+        "not applicable under enforcement until #910 carries the server-created "
+        "per-turn AuthContext into Claude Code subprocess hooks"
+    ),
+)
+
+
 # ── install_tool_event_hooks ────────────────────────────────────────
 
 
@@ -32,6 +45,7 @@ def _clear_tool_event_marker(cls: type) -> None:
 
 
 @pytest.mark.asyncio
+@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_pre_post_hooks_record_events_with_tool_use_id():
     """The pre/post hook callbacks themselves should append correctly
     shaped event dicts to the active capture list. Verifies the
@@ -102,6 +116,7 @@ async def test_failure_hook_records_is_error_true():
 
 
 @pytest.mark.asyncio
+@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_noop_outside_active_context():
     """When no capture context is set (``_tool_events_var`` is None),
     the hook callbacks must silently no-op — they can't append to a
@@ -488,6 +503,7 @@ async def test_hooks_capture_built_in_bash_tool_integration():
 
 
 @pytest.mark.asyncio
+@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_capture_built_in_bash_tool_mocked():
     """Mocked companion to ``test_hooks_capture_built_in_bash_tool_integration``.
 
@@ -590,6 +606,7 @@ async def test_hooks_capture_built_in_bash_tool_mocked():
 
 
 @pytest.mark.asyncio
+@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_capture_failure_path_mocked():
     """Companion to the success-path mock above. When the SDK reports a
     tool failure (PostToolUseFailure path), the appended event must
