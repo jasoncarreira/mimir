@@ -111,7 +111,7 @@ def _patch_api(
 def test_stale_changes_requested_reemits_on_elapsed_boundary(
     monkeypatch, captured_emits,
 ):
-    """An unchanged head re-emits after the interval minus cron slack."""
+    """An unchanged head re-emits hourly despite small run-time jitter."""
     _patch_api(
         monkeypatch,
         prs=[_pr(638, "aaa111")],
@@ -133,26 +133,26 @@ def test_stale_changes_requested_reemits_on_elapsed_boundary(
     # Before the floor, repeated polls neither emit nor refresh the timestamp.
     count2, cursor2 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=44, seconds=59),
+        now=NOW + timedelta(minutes=58, seconds=59),
     )
     assert count2 == 0
     assert cursor2 == {"638": _entry("aaa111")}
     assert len(captured_emits) == 1
 
-    # Exactly at the slack-adjusted boundary, re-emit and advance once.
+    # Exactly at the one-minute jitter-adjusted boundary, re-emit once.
     count3, cursor3 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor2,
-        now=NOW + timedelta(minutes=45),
+        now=NOW + timedelta(minutes=59),
     )
     assert count3 == 1
     assert cursor3 == {
-        "638": _entry("aaa111", "2026-07-19T12:45:00Z", attempts=2),
+        "638": _entry("aaa111", "2026-07-19T12:59:00Z", attempts=2),
     }
     assert len(captured_emits) == 2
 
     count4, cursor4 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor3,
-        now=NOW + timedelta(minutes=45, seconds=1),
+        now=NOW + timedelta(minutes=59, seconds=1),
     )
     assert count4 == 0
     assert cursor4 == cursor3
@@ -417,18 +417,18 @@ def test_legacy_cursor_migrates_quietly(
 
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=44, seconds=59),
+        now=NOW + timedelta(minutes=58, seconds=59),
     )
     assert count == 0
     assert cursor == {"956": _entry("legacy-sha")}
 
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=45),
+        now=NOW + timedelta(minutes=59),
     )
     assert count == 1
     assert cursor == {
-        "956": _entry("legacy-sha", "2026-07-19T12:45:00Z", attempts=2),
+        "956": _entry("legacy-sha", "2026-07-19T12:59:00Z", attempts=2),
     }
 
 
@@ -459,7 +459,7 @@ def test_structured_legacy_cursor_migrates_quietly(
     assert captured_emits == []
 
 
-def test_attempt_cap_gives_up_once_then_stays_dormant(
+def test_attempt_cap_gives_up_once_then_rearms_after_backstop(
     monkeypatch, captured_emits,
 ):
     _patch_api(
@@ -478,7 +478,7 @@ def test_attempt_cap_gives_up_once_then_stays_dormant(
     )
     assert count == 1
     assert cursor == {
-        "638": _entry("aaa111", "2026-07-19T11:00:00Z", cap + 1),
+        "638": _entry("aaa111", "2026-07-19T12:00:00Z", cap + 1),
     }
     [gave_up] = captured_emits
     assert gave_up["signal"] == "pr_changes_requested_gave_up"
@@ -486,11 +486,26 @@ def test_attempt_cap_gives_up_once_then_stays_dormant(
 
     count, cursor2 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(days=1),
+        now=NOW + timedelta(hours=23, minutes=59, seconds=59),
     )
     assert count == 0
     assert cursor2 == cursor
     assert len(captured_emits) == 1
+
+    # Emissions can be stranded in the in-memory queue. A long backstop starts
+    # a new bounded series even when the head never changed, so give-up is not
+    # a permanent silent state for the exact PR that still needs remediation.
+    count, cursor3 = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor2,
+        now=NOW + timedelta(days=1),
+    )
+    assert count == 1
+    assert cursor3 == {
+        "638": _entry("aaa111", "2026-07-20T12:00:00Z", attempts=1),
+    }
+    assert len(captured_emits) == 2
+    assert captured_emits[-1]["event_type"] == "pr_changes_requested_stale"
+    assert captured_emits[-1]["attempt"] == 1
 
 
 def test_seconds_after_boundary_reemits_on_intended_cycle(

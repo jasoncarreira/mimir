@@ -90,10 +90,13 @@ BODY_PREVIEW_CHARS = 300
 REVIEW_REQUEST_MAX_ATTEMPTS = 3
 
 # Unresolved review feedback is re-reminded on elapsed time rather than poll
-# count. Leave one cron period of slack so a timestamp written seconds after a
-# cycle boundary is still eligible on the intended hourly cycle.
+# count. A one-minute jitter allowance absorbs small per-run timestamp drift
+# without changing the intended hourly cadence. After bounded attempts give up,
+# a daily backstop starts a fresh series so an unresolved PR cannot go silent
+# forever merely because its queued turns were never delivered.
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
-CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=15)
+CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
+CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
 
 
 def _utc_now_iso() -> str:
@@ -971,11 +974,14 @@ def _check_own_changes_requested(
     ``last_reminded_at``, and ``attempts``. As in the review-request path,
     an unchanged unresolved head re-emits up to
     ``REVIEW_REQUEST_MAX_ATTEMPTS``, then emits a one-shot ``*_gave_up``
-    signal and parks at ``cap + 1``. A head change starts a fresh attempt
-    budget. Legacy entries migrate quietly as one prior attempt with
-    ``last_reminded_at=now`` so deployment does not produce a reminder
-    storm. Cleanup remains rebuild-on-every-poll: closed, merged, fixed,
-    and no-longer-blocked PRs are not copied into the returned dict.
+    signal and parks at ``cap + 1``. Because emissions can remain queued
+    without a delivered turn, the parked state re-arms after a long backstop;
+    this preserves a bounded series without making queue loss permanently
+    silence an unresolved PR. A head change starts a fresh attempt budget.
+    Legacy entries migrate quietly as one prior attempt with
+    ``last_reminded_at=now`` so deployment does not produce a reminder storm.
+    Cleanup remains rebuild-on-every-poll: closed, merged, fixed, and
+    no-longer-blocked PRs are not copied into the returned dict.
 
     "No commits since the review" matters: right after the agent
     pushes fixes the PR's review decision STAYS CHANGES_REQUESTED
@@ -1153,12 +1159,22 @@ def _check_own_changes_requested(
                 )
                 count += 1
                 prior_attempts += 1
-            new[key] = {
-                "head_sha": head_sha,
-                "last_reminded_at": last_reminded_at,
-                "attempts": prior_attempts,
-            }
-            continue
+                last_reminded_at = observed_at_iso
+                last_reminded = observed_at
+            if (
+                last_reminded is None
+                or observed_at - last_reminded < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            ):
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": last_reminded_at,
+                    "attempts": prior_attempts,
+                }
+                continue
+            # Emission is not delivery: a whole bounded series may have sat in
+            # an in-memory queue without any turn running. Re-arm after a long
+            # backstop so the cap limits noise but cannot silence the PR forever.
+            prior_attempts = 0
 
         attempt = prior_attempts + 1
         reviewers = ", ".join(f"@{login}" for login in sorted(blocking))
