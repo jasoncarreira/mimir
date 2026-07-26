@@ -860,12 +860,15 @@ class TurnRecord:
     # SDK ResultMessage capture (Phase 8 — resume detection + cost). Populated
     # from the final ``ResultMessage`` the SDK emits per turn. ``None`` when
     # no ResultMessage was received (e.g. query() crashed mid-stream).
-    result_subtype: str | None = None      # "success" | "error_max_turns" | "error_during_execution"
+    result_subtype: str | None = None
     result_is_error: bool | None = None
     stop_reason: str | None = None
     num_turns: int | None = None           # SDK's internal model-turn count
     total_cost_usd: float | None = None    # None for non-Anthropic gateways
     usage: dict[str, Any] | None = None    # input/output/cache token counts
+    # Final allowed-call count from TurnContext. Kept outside ``events`` because
+    # that array is size-bounded and cannot support accurate budget sizing.
+    tool_call_count: int = 0
     permission_denials: list[Any] = field(default_factory=list)
     # Discriminator for synthetic, non-conversational records (chainlink #60).
     # ``None`` for ordinary agent turns (the existing case). Set to

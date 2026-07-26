@@ -308,6 +308,32 @@ def test_turn_records_without_error_are_ignored(tmp_path: Path):
     assert log.recent_block() is None
 
 
+def test_budget_exhaustion_does_not_duplicate_existing_budget_feedback(tmp_path: Path):
+    log = _make_log(
+        tmp_path,
+        events=[{
+            "timestamp": _ts(0.6),
+            "type": "tool_call_budget_soft_warning",
+            "turn_id": "budget-turn",
+            "count": 150,
+            "budget": 200,
+        }],
+        turns=[{
+            "ts": _ts(0.5),
+            "turn_id": "budget-turn",
+            "channel_id": "poller:github-activity",
+            "error": None,
+            "result_subtype": "tool_budget_exhausted",
+            "result_is_error": True,
+        }],
+    )
+
+    negatives, _ = log.recent()
+
+    assert len(negatives) == 1
+    assert negatives[0].kind == "tool_budget"
+
+
 def test_turn_errors_surface_when_cross_turn_loops_fill_negative_bucket(tmp_path: Path):
     """Always-surface cross-turn loop signals should bypass the display cap
     without preventing turns.jsonl crash/error records from surfacing."""
