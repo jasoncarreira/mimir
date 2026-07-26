@@ -673,7 +673,7 @@ def resolve_model_from_config(
     """
     model_spec = os.environ.get(
         "MIMIR_MODEL_SPEC",
-        getattr(config, "model_spec", "claude-code:claude-sonnet-4-6"),
+        getattr(config, "model_spec", "codex-plus:gpt-5.6-luna"),
     )
     return _resolve_model(
         model_spec,

@@ -59,7 +59,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `MIMIR_MODEL_SPEC` | str | `claude-code:claude-sonnet-4-6` | Active model selector, `provider:model`. `claude-code:*` = Max-OAuth subprocess; `anthropic:*` / `openai:*` = langchain `init_chat_model`. Anthropic-compat gateways (Minimax/Kimi) use `anthropic:` + `ANTHROPIC_BASE_URL`. |
+| `MIMIR_MODEL_SPEC` | str | `codex-plus:gpt-5.6-luna` | Active model selector, `provider:model`. `codex-plus:*` = Codex subscription OAuth; `claude-code:*` = Max-OAuth subprocess; `anthropic:*` / `openai:*` = langchain `init_chat_model`. Anthropic-compat gateways (Minimax/Kimi) use `anthropic:` + `ANTHROPIC_BASE_URL`. Each provider needs its extra installed (`pip install 'mimir-agent[codex-plus]'` for the default). |
 | `MIMIR_MODEL` | str | `claude-opus-4-7` | Legacy model-name field tagged onto records; the operative selector is `MIMIR_MODEL_SPEC`. |
 | `MIMIR_MODEL_MAX_RETRIES` | int | `6` | Per-call transient (429/5xx) retry budget for non-`claude-code` providers. The `claude-code` path ignores it. |
 | `MIMIR_MODEL_MAX_TOKENS` | int | `0` | Per-call **output** token cap for non-`claude-code` providers. `0` = provider default. Raise for thinking-via-Anthropic-compat models whose reasoning counts against output. |
@@ -232,7 +232,7 @@ authenticate transport only; they do not create a named requester.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Startup rejects this setting when `MIMIR_MODEL_SPEC` uses `claude-code:` because that subprocess provider cannot carry the server-created per-turn authorization context. Use `anthropic:`, `openai:`, or `codex-plus:`, or leave enforcement disabled. |
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Compatible with the default `MIMIR_MODEL_SPEC`. Startup rejects this setting only when `MIMIR_MODEL_SPEC` uses `claude-code:`, because that subprocess provider cannot carry the server-created per-turn authorization context. Use `anthropic:`, `openai:`, or `codex-plus:`, or leave enforcement disabled. |
 | `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs approved for application network egress. Configure multiple URLs as a JSON array, for example `["https://hooks.example/a", "https://hooks.example/b"]`; comma-separated URL lists are not supported. |
 | `MIMIR_HEARTBEAT_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs the heartbeat service may fetch. Configure multiple URLs as a JSON array; comma-separated URL lists are not supported. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |

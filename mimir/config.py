@@ -538,7 +538,8 @@ class Config:
     #   - ``<provider>:<model>``   → init_chat_model via langchain
     #
     # Common forms:
-    #   claude-code:claude-sonnet-4-6     (default; free under Max plan)
+    #   codex-plus:gpt-5.6-luna           (default; Codex subscription OAuth)
+    #   claude-code:claude-sonnet-4-6     (Max OAuth subprocess)
     #   anthropic:claude-haiku-4-5        (direct API, paid)
     #   openai:gpt-4.1-mini               (direct OpenAI)
     #
@@ -554,7 +555,11 @@ class Config:
     # path's inline ``<think>...</think>`` tags in content.
     #
     # See ``mimir.agent._resolve_model``. Defaults to
-    # ``claude-code:claude-sonnet-4-6`` (Max OAuth, no API-key billing).
+    # ``codex-plus:gpt-5.6-luna`` (Codex subscription OAuth, no API-key
+    # billing). The default is deliberately enforcement-compatible: a
+    # ``claude-code:`` default made ``MIMIR_ACCESS_CONTROL_ENFORCED=true``
+    # fail startup preflight until the operator also changed the provider
+    # (the subprocess hook cannot carry the per-turn AuthContext — #910).
     model_spec: str
 
     # Per-call retry budget for non-claude-code providers (anthropic,
@@ -1020,7 +1025,7 @@ class Config:
         _load_home_dotenv(home)
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
-        model_spec = _env("MIMIR_MODEL_SPEC", "claude-code:claude-sonnet-4-6")
+        model_spec = _env("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
         # itself). Computing it twice was redundant and could in theory

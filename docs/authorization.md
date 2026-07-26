@@ -359,7 +359,7 @@ boundary.
 | Setting | Default | Authorization effect |
 |---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open denial and harness egress checks remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
-| `MIMIR_MODEL_SPEC` | `claude-code:claude-sonnet-4-6` | Selects the provider and participates in the enforcement compatibility preflight. The default provider is incompatible with enforcement, so enabling authorization also requires changing this setting. |
+| `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the provider and participates in the enforcement compatibility preflight. The default provider is enforcement-compatible, so enabling authorization does not require changing it. Only `claude-code:*` fails the preflight, because that subprocess hook cannot carry the server-created per-turn authorization context (#910). |
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
 
@@ -563,13 +563,14 @@ enforcement is enabled.
 
 ### 3. Pass startup preflights
 
-Change `MIMIR_MODEL_SPEC` from the default `claude-code:` provider to a tested
-`anthropic:`, `openai:`, or `codex-plus:` model. In a staging process with the
-same environment and policy files, set:
+The shipped default (`codex-plus:gpt-5.6-luna`) already passes this preflight.
+Only a `claude-code:` provider fails it; if you have set one, change
+`MIMIR_MODEL_SPEC` to a tested `anthropic:`, `openai:`, or `codex-plus:` model.
+In a staging process with the same environment and policy files, set:
 
 ```dotenv
 MIMIR_ACCESS_CONTROL_ENFORCED=true
-MIMIR_MODEL_SPEC=anthropic:<tested-model>
+MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna
 ```
 
 Startup must complete without `ProviderEnforcementCompatibilityError` or

@@ -46,7 +46,8 @@ DEFAULT_ENV_TEMPLATE = dedent(
     # ---- Agent chat model ------------------------------------------------
     # MIMIR_MODEL_SPEC has the form ``<provider>:<model>``. Examples:
     #
-    #   anthropic:claude-sonnet-4-6       (default — direct Anthropic API)
+    #   codex-plus:gpt-5.6-luna           (default — Codex subscription OAuth)
+    #   anthropic:claude-sonnet-4-6       (direct Anthropic API)
     #   claude-code:claude-sonnet-4-6     (Max OAuth subprocess; opt in via
     #                                      ``mimir setup --subscription``)
     #   anthropic:MiniMax-M2.7            (Minimax via Anthropic-compat —
