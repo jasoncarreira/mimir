@@ -384,6 +384,77 @@ def test_read_scope_denies_relative_missing_and_symlink_escape_but_admin_is_unaf
     assert admin.allowed is True
 
 
+def test_non_admin_read_allows_child_of_symlinked_configured_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    real_root = tmp_path / "real-root"
+    linked_root = tmp_path / "linked-root"
+    (home / "state").mkdir(parents=True)
+    real_root.mkdir()
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    target = linked_root / "safe.txt"
+    target.write_text("safe\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{linked_root}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(target)},
+    )
+
+    assert result.allowed is True
+
+
+def test_non_admin_read_denies_escape_from_symlinked_configured_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    real_root = tmp_path / "real-root"
+    linked_root = tmp_path / "linked-root"
+    outside = tmp_path / "outside"
+    (home / "state").mkdir(parents=True)
+    real_root.mkdir()
+    outside.mkdir()
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    (real_root / "escape").symlink_to(outside, target_is_directory=True)
+    target = outside / "safe.txt"
+    target.write_text("safe\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{linked_root}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(linked_root / "escape" / target.name)},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
+def test_non_admin_read_denies_protected_path_under_symlinked_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    real_root = tmp_path / "real-root"
+    linked_root = tmp_path / "linked-root"
+    (home / "state").mkdir(parents=True)
+    real_root.mkdir()
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    target = linked_root / "secrets.json"
+    target.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{linked_root}:ro")
+
+    result = ToolRegistry().authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": str(target)},
+    )
+
+    assert result.allowed is False
+    assert result.reason == "read_scope"
+
+
 def test_worklink_repo_sink_adapter_matches_configured_repo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

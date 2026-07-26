@@ -161,10 +161,27 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
 
     from .config import _parse_file_tool_roots
 
-    configured = _parse_file_tool_roots(
-        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), home
-    )
-    roots = [home / "state", *(Path(path) for path, _mode in configured)]
+    raw_configured = os.environ.get("MIMIR_FILE_TOOL_ROOTS", "")
+    configured = _parse_file_tool_roots(raw_configured, home)
+    configured_paths = [Path(path) for path, _mode in configured]
+    configured_path_set = set(configured_paths)
+    roots = [home / "state", *configured_paths]
+
+    # The shared parser intentionally returns canonical paths. Retain any
+    # validated spelling supplied by the operator for lexical root selection.
+    for entry in raw_configured.split(","):
+        path_part, separator, mode_part = entry.strip().rpartition(":")
+        has_mode = separator and mode_part.strip().lower() in {"ro", "rw"}
+        raw_path = path_part if has_mode else entry
+        root = Path(raw_path.strip())
+        if not root.is_absolute():
+            continue
+        try:
+            accepted = root.resolve() in configured_path_set
+        except (OSError, RuntimeError):
+            accepted = False
+        if accepted and root not in roots:
+            roots.append(root)
     tmp = Path("/tmp")
     if tmp.is_dir() and tmp not in roots:
         roots.append(tmp)
@@ -189,20 +206,25 @@ def resolve_non_admin_read_target(
     candidate = Path(raw_path)
     if not candidate.is_absolute():
         return None
-    try:
-        roots = tuple(root.resolve(strict=True) for root in configured_non_admin_read_roots())
-    except (OSError, RuntimeError):
-        return None
+    root_pairs: list[tuple[Path, Path]] = []
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved_root = root
+        root_pairs.append((root, resolved_root))
     home_raw = os.environ.get("MIMIR_HOME", "").strip()
     try:
         home = Path(home_raw).resolve(strict=True)
         state = (home / "state").resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if allow_home_root and home not in roots:
-        roots = (*roots, home)
+    if allow_home_root and all(
+        resolved_root != home for _root, resolved_root in root_pairs
+    ):
+        root_pairs.append((home, home))
     lexical_roots = [
-        root for root in roots
+        (root, resolved_root) for root, resolved_root in root_pairs
         if candidate == root or candidate.is_relative_to(root)
     ]
     if not lexical_roots:
@@ -213,7 +235,7 @@ def resolve_non_admin_read_target(
                 root_dir=home, virtual_mode=True,
             )._resolve_path(raw_path)
             lexical_roots = [
-                root for root in roots
+                (root, resolved_root) for root, resolved_root in root_pairs
                 if candidate == root or candidate.is_relative_to(root)
             ]
         except (OSError, RuntimeError, ValueError):
@@ -235,7 +257,9 @@ def resolve_non_admin_read_target(
         return None
     # Bind the call to the most specific root named by the caller. A repo path
     # cannot escape into the broader /tmp allowance through ``..`` or a symlink.
-    selected_root = max(lexical_roots, key=lambda root: len(root.parts))
+    _selected_lexical_root, selected_root = max(
+        lexical_roots, key=lambda pair: len(pair[0].parts)
+    )
     if not (resolved == selected_root or resolved.is_relative_to(selected_root)):
         return None
     if is_protected_read_path(resolved) and not (
