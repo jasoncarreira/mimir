@@ -2228,9 +2228,12 @@ def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
     registry = ToolRegistry()
 
     for target in (
-        home / "state" / "journal" / "entry.md",
-        home / "memory" / "issues" / "970.md",
-        repo / "source.py",
+        home / "state" / "reports" / "x.md",
+        home / "memory" / "issues" / "x.md",
+        home / "memory" / "channels" / "C1" / "notes.md",
+        repo / "src" / "x.py",
+        repo / ".gitignore",
+        repo / ".gitattributes",
     ):
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
@@ -2258,10 +2261,12 @@ def test_static_service_write_denies_protected_home_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    repo = tmp_path / "repo"
     (home / "state").mkdir(parents=True)
     (home / "memory").mkdir()
+    repo.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     service = get_service_principal(trigger)
     assert service is not None
     auth = _service_auth(service, InformationFlowLabels())
@@ -2282,6 +2287,12 @@ def test_static_service_write_denies_protected_home_paths(
         home / "memory" / "prompts" / "system.md",
         home / "memory" / ".mimir" / "state.json",
         home / "memory" / "core" / "service-axis.md",
+        repo / ".git" / "hooks" / "pre-commit",
+        repo / ".git" / "config",
+        home / "state" / "repo" / ".git" / "hooks" / "post-merge",
+        home / "memory" / "repo" / ".git" / "objects" / "payload",
+        repo / ".GIT" / "hooks" / "post-checkout",
+        repo / ".git." / "hooks" / "pre-commit",
     )
     for target in protected:
         decision = registry.authorize_tool(
@@ -2313,6 +2324,12 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
     (memory / "core").symlink_to(repo, target_is_directory=True)
     (repo / "prompts").symlink_to(repo / "safe", target_is_directory=True)
     (repo / "safe").mkdir()
+    (repo / ".git").mkdir()
+    (repo / "git-metadata").symlink_to(repo / ".git", target_is_directory=True)
+    (state / "nested-repo").mkdir()
+    (state / "nested-repo" / ".git").symlink_to(
+        outside, target_is_directory=True,
+    )
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     service = get_service_principal(trigger)
@@ -2325,6 +2342,8 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
         state / "credentials" / "token.txt",
         memory / "core" / "symlinked.md",
         repo / "prompts" / "system.md",
+        repo / "git-metadata" / "hooks" / "pre-commit",
+        state / "nested-repo" / ".git" / "hooks" / "post-merge",
     ):
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
@@ -2389,10 +2408,13 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     registry = ToolRegistry()
 
     for target in (
-        repo / "source.py",
+        repo / "src" / "x.py",
         trigger_state / "cursor.json",
-        home / "state" / "reports" / "audit.md",
-        home / "memory" / "issues" / "982.md",
+        home / "state" / "reports" / "x.md",
+        home / "memory" / "issues" / "x.md",
+        home / "memory" / "channels" / "C1" / "notes.md",
+        repo / ".gitignore",
+        repo / ".gitattributes",
     ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
@@ -2461,6 +2483,12 @@ def test_autonomous_repo_write_denies_protected_paths(
         memory / "core" / "identity.md",
         memory / ".env",
         memory / "secrets" / "token.txt",
+        repo / ".git" / "hooks" / "pre-commit",
+        repo / ".git" / "config",
+        home / "state" / "repo" / ".git" / "hooks" / "post-merge",
+        memory / "repo" / ".git" / "objects" / "payload",
+        repo / ".GIT" / "hooks" / "post-checkout",
+        repo / ".git." / "hooks" / "pre-commit",
     ):
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
@@ -2480,13 +2508,21 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
     memory = home / "memory"
     trigger_root = state / "pollers" / "github-activity"
     repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
     trigger_root.mkdir(parents=True)
     memory.mkdir()
     (repo / "safe").mkdir(parents=True)
     (repo / "prompts").mkdir()
+    (repo / ".git").mkdir()
+    outside.mkdir()
     (state / "credentials").symlink_to(repo / "safe", target_is_directory=True)
     (state / "alias").symlink_to(repo / "prompts", target_is_directory=True)
     (memory / "core").symlink_to(repo / "safe", target_is_directory=True)
+    (repo / "git-metadata").symlink_to(repo / ".git", target_is_directory=True)
+    (state / "nested-repo").mkdir()
+    (state / "nested-repo" / ".git").symlink_to(
+        outside, target_is_directory=True,
+    )
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     service = build_trigger_service_principal(
@@ -2504,6 +2540,8 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
         state / "credentials" / "token.txt",
         state / "alias" / "system.md",
         memory / "core" / "identity.md",
+        repo / "git-metadata" / "hooks" / "pre-commit",
+        state / "nested-repo" / ".git" / "hooks" / "post-merge",
     ):
         decision = ToolRegistry().authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
@@ -3097,5 +3135,5 @@ def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> Non
             operation,
             _write_auth(admin=True),
             enforce=True,
-            target_channel=str(tmp_path / "outside"),
+            target_channel=str(tmp_path / ".git" / "hooks" / "pre-commit"),
         ).allowed is True
