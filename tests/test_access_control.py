@@ -413,6 +413,31 @@ def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> No
     assert "fetch_url" in principal.capabilities
 
 
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_heartbeat_write_allows_safe_home_memory_and_state(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal("heartbeat", home)
+    auth = _service_auth(principal, InformationFlowLabels())
+
+    for target in (
+        home / "memory" / "issues" / "x.md",
+        home / "state" / "reports" / "x.md",
+    ):
+        decision = ToolRegistry().authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, target
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2198,11 +2223,22 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
-    for target in (repo / "source.py", trigger_state / "cursor.json"):
+    for target in (
+        repo / "source.py",
+        trigger_state / "cursor.json",
+        home / "state" / "reports" / "audit.md",
+        home / "memory" / "issues" / "982.md",
+    ):
         assert registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
         ).allowed is True
-    for target in (home / "root.txt", readonly / "data.txt", outside / "data.txt", Path("/tmp/unscoped.txt")):
+    for target in (
+        home,
+        home / "root.txt",
+        readonly / "data.txt",
+        outside / "data.txt",
+        Path("/tmp/unscoped.txt"),
+    ):
         decision = registry.authorize_tool(
             "write_file", auth, enforce=True, target_channel=str(target),
         )
@@ -2221,8 +2257,10 @@ def test_autonomous_repo_write_denies_protected_paths(
 ) -> None:
     home = tmp_path / "home"
     state = home / "state" / "pollers" / "github-activity"
+    memory = home / "memory"
     repo = tmp_path / "repo"
     state.mkdir(parents=True)
+    memory.mkdir()
     repo.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
@@ -2247,8 +2285,62 @@ def test_autonomous_repo_write_denies_protected_paths(
         repo / "prompts" / "system.md",
         repo / "memory" / "core" / "identity.md",
         state / ".env.local",
+        home / "state" / "config" / "settings.toml",
+        home / "state" / "credentials.json",
+        home / "state" / "identities.yaml",
+        home / "state" / "prompts" / "system.md",
+        home / "state" / ".mimir" / "pending-update.flag",
+        home / "state" / "oauth_github.json",
+        home / "state" / "service.key",
+        home / "state" / "service.pem",
+        memory / "core" / "identity.md",
+        memory / ".env",
+        memory / "secrets" / "token.txt",
     ):
         decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_dynamic_trigger_write_denies_symlinked_protected_paths(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state"
+    memory = home / "memory"
+    trigger_root = state / "pollers" / "github-activity"
+    repo = tmp_path / "repo"
+    trigger_root.mkdir(parents=True)
+    memory.mkdir()
+    (repo / "safe").mkdir(parents=True)
+    (repo / "prompts").mkdir()
+    (state / "credentials").symlink_to(repo / "safe", target_is_directory=True)
+    (state / "alias").symlink_to(repo / "prompts", target_is_directory=True)
+    (memory / "core").symlink_to(repo / "safe", target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=(tool_name,),
+        roots=(trigger_root,),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+
+    for target in (
+        state / "credentials" / "token.txt",
+        state / "alias" / "system.md",
+        memory / "core" / "identity.md",
+    ):
+        decision = ToolRegistry().authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
         )
         assert decision.allowed is False, target
@@ -2390,6 +2482,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     repo = tmp_path / "repo"
     repo.mkdir()
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", str(repo))
     service = ServicePrincipal(
         canonical="poller:factory",
         trigger="poller",
@@ -2400,7 +2493,9 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
             ServiceSinkPolicy(
                 "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
             ),
-            ServiceSinkPolicy("spawn_open_code", "exact_roots", f'["{repo}"]'),
+            ServiceSinkPolicy(
+                "spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+            ),
         ),
         capability_tier=CapabilityTier.CODE_EXECUTION,
     )

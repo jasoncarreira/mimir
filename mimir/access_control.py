@@ -447,8 +447,13 @@ def build_trigger_service_principal(
                 "shell capabilities require job-inspection companions: "
                 f"{', '.join(sorted(missing))}"
             )
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    home_data_roots = (
+        (Path(home) / "state", Path(home) / "memory") if home else ()
+    )
     write_roots = tuple(dict.fromkeys(
-        root.resolve() for root in (*roots, *_configured_repo_write_roots())
+        root.resolve()
+        for root in (*roots, *_configured_repo_write_roots(), *home_data_roots)
     ))
     operations = tuple(dict.fromkeys(
         "send_message" if capability == "operator_alert" else capability
@@ -470,7 +475,9 @@ def build_trigger_service_principal(
             sink_destinations.add(destination)
         if operation in {"write_file", "edit_file"}:
             policies.append(ServiceSinkPolicy(
-                operation, "exact_roots", json.dumps([str(root) for root in write_roots]),
+                operation,
+                "trigger_service_write_roots",
+                json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
             shell_profile = "repo_review" if profile == "github" else "scheduler_read_only"
@@ -1004,37 +1011,52 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
         return False
 
 
-def _target_within_exact_roots(target: str, destination: str) -> bool:
-    """Confine a service write to safe paths under roots frozen in its grant."""
+def _target_within_trigger_service_write_roots(target: str, destination: str) -> bool:
+    """Confine dynamic trigger writes to frozen roots and safe home data paths."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
-    if not Path(target).is_absolute():
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    candidate = Path(target)
+    if not home or not candidate.is_absolute():
         return False
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
-        roots = [Path(p).resolve() for p in raw]
-        candidate = Path(target)
+        roots = [Path(path).resolve() for path in raw]
+        memory_root = (Path(home).resolve() / "memory").resolve()
         lexical_relatives = tuple(
-            candidate.relative_to(root)
+            (root, candidate.relative_to(root))
             for root in roots
             if candidate == root or candidate.is_relative_to(root)
         )
-        if any(WriteResourceAdapter._is_protected_path(path) for path in lexical_relatives):
+        if any(
+            WriteResourceAdapter._is_protected_path(relative)
+            or _is_static_service_protected_write_path(
+                relative,
+                under_memory_root=root == memory_root,
+            )
+            for root, relative in lexical_relatives
+        ):
             return False
         resolved = resolve_within_roots(roots, target)
-        relative = next(
-            resolved.relative_to(root)
+        resolved_relatives = tuple(
+            (root, resolved.relative_to(root))
             for root in roots
             if resolved == root or resolved.is_relative_to(root)
         )
     except (
-        json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError,
-        StopIteration, ValueError,
+        json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError, ValueError,
     ):
         return False
-    return not WriteResourceAdapter._is_protected_path(relative)
+    return bool(resolved_relatives) and not any(
+        WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(
+            relative,
+            under_memory_root=root == memory_root,
+        )
+        for root, relative in resolved_relatives
+    )
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
@@ -1099,7 +1121,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
-    "exact_roots": _target_within_exact_roots,
+    "trigger_service_write_roots": _target_within_trigger_service_write_roots,
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
 }
