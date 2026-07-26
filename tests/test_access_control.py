@@ -2655,22 +2655,34 @@ def test_repo_review_pytest_uses_pinned_interpreter_module(
     ]
 
 
-def test_every_production_service_shell_pin_resolves_outside_write_roots(
+def test_every_production_service_shell_pin_targets_outside_write_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    repo = tmp_path / "repo"
     home.mkdir()
+    repo.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "/workspace/mimir:rw")
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
 
     monkeypatch.setattr(
         access_control,
         "_MAINTENANCE_PINNED_EXECUTABLES",
         access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS,
     )
+    write_roots = access_control._configured_repo_write_roots()
     for command, expected in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.items():
-        assert access_control._maintenance_resolved_pin(command) == expected
+        resolved = expected.resolve(strict=False)
+        assert all(
+            resolved != root and not resolved.is_relative_to(root)
+            for root in write_roots
+        ), command
+        # Optional tools such as npm and gh are not installed in every test
+        # environment. When a production pin is present, also exercise the
+        # runtime validator; absent pins fail closed when the command is used.
+        if expected.exists():
+            assert access_control._maintenance_resolved_pin(command) == expected
 
 
 def test_service_shell_pin_inside_configured_write_root_fails_closed(
