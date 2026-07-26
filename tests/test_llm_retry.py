@@ -39,7 +39,76 @@ class _BadRequestError(Exception):
     status_code = 400
 
 
+class _HTTPError(Exception):
+    def __init__(self, status_code: int, message: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class TestIsRetryableError:
+    @pytest.mark.parametrize(
+        ("exc", "expected"),
+        [
+            (_HTTPError(429, "Rate limited. Please retry."), (True, "http_status_retryable:_HTTPError")),
+            (
+                _HTTPError(
+                    429,
+                    "This request would exceed your organization's rate limit of 80000 "
+                    "max tokens per minute. Please try again later.",
+                ),
+                (True, "http_status_retryable:_HTTPError"),
+            ),
+            (
+                _HTTPError(429, "rate_limit_error: request queue too long, retry shortly"),
+                (True, "http_status_retryable:_HTTPError"),
+            ),
+            (_HTTPError(529, "Overloaded"), (True, "http_status_retryable:_HTTPError")),
+            (_HTTPError(500, "internal server error"), (True, "http_status_retryable:_HTTPError")),
+            (
+                _HTTPError(400, "bad request: invalid schema"),
+                (False, "non_retryable_client_error:_HTTPError"),
+            ),
+            (
+                _HTTPError(400, "prompt is too long: 250000 tokens > 200000 maximum context"),
+                (False, "non_retryable_client_error:_HTTPError"),
+            ),
+            (
+                _HTTPError(400, "rate limit exceeded"),
+                (False, "non_retryable_client_error:_HTTPError"),
+            ),
+            (_HTTPError(401), (False, "non_retryable_client_error:_HTTPError")),
+            (_HTTPError(403), (False, "non_retryable_client_error:_HTTPError")),
+            (Exception("context length exceeded"), (False, "non_retryable_client_error:Exception")),
+            (Exception("content policy violation"), (False, "non_retryable_client_error:Exception")),
+            (Exception("rate limit exceeded"), (True, "generic_retryable:Exception")),
+            (Exception("internal server error"), (True, "generic_retryable:Exception")),
+            (Exception("provider rejected the request"), (False, "unknown_non_retryable:Exception")),
+        ],
+        ids=[
+            "429-rate-limit",
+            "429-max-tokens",
+            "429-queue-too-long",
+            "529-overloaded",
+            "500-server-error",
+            "400-invalid-schema",
+            "400-context-overflow",
+            "400-rate-limit-message",
+            "401-status-only",
+            "403-status-only",
+            "message-context-overflow",
+            "message-content-policy",
+            "message-rate-limit",
+            "message-server-error",
+            "no-signal",
+        ],
+    )
+    def test_classification_table(
+        self,
+        exc: BaseException,
+        expected: tuple[bool, str],
+    ) -> None:
+        assert _is_retryable_error(exc) == expected
+
     def test_connection_errors_retryable(self) -> None:
         exc = Exception("connection reset")
         is_retryable, reason = _is_retryable_error(exc)
@@ -228,6 +297,33 @@ async def test_retry_async_unknown_error_fails_without_retry(monkeypatch: pytest
     assert call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_retry_async_honors_explicit_zero_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[tuple[float, float]] = []
+    call_count = 0
+
+    def calculate_delay(attempt: int, base_delay: float, max_delay: float) -> float:
+        delays.append((base_delay, max_delay))
+        return 0
+
+    async def transient_then_succeed() -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _ServerError("internal server error")
+        return "ok"
+
+    monkeypatch.setattr("mimir._llm_retry._calculate_delay", calculate_delay)
+
+    assert await _retry_async(transient_then_succeed, max_attempts=2, base_delay=0, max_delay=0) == "ok"
+    assert delays == [(0, 0)]
+
+    call_count = 0
+    with pytest.raises(RuntimeError, match="unreachable retry loop exit"):
+        await _retry_async(transient_then_succeed, max_attempts=0)
+    assert call_count == 0
+
+
 def test_retry_sync_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_LLM_RETRY_MAX_ATTEMPTS", "3")
     monkeypatch.setenv("MIMIR_LLM_RETRY_BASE_DELAY", "0")
@@ -260,6 +356,32 @@ def test_retry_sync_transient_clears(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _retry_sync(transient_then_succeed, provider="test")
     assert result == "ok"
     assert call_count == 3
+
+
+def test_retry_sync_honors_explicit_zero_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays: list[tuple[float, float]] = []
+    call_count = 0
+
+    def calculate_delay(attempt: int, base_delay: float, max_delay: float) -> float:
+        delays.append((base_delay, max_delay))
+        return 0
+
+    def transient_then_succeed() -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise _ServerError("internal server error")
+        return "ok"
+
+    monkeypatch.setattr("mimir._llm_retry._calculate_delay", calculate_delay)
+
+    assert _retry_sync(transient_then_succeed, max_attempts=2, base_delay=0, max_delay=0) == "ok"
+    assert delays == [(0, 0)]
+
+    call_count = 0
+    with pytest.raises(RuntimeError, match="unreachable retry loop exit"):
+        _retry_sync(transient_then_succeed, max_attempts=0)
+    assert call_count == 0
 
 
 def test_retry_config(monkeypatch: pytest.MonkeyPatch) -> None:

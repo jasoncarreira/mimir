@@ -82,6 +82,14 @@ def _is_retryable_error(exc: BaseException, provider: str | None = None) -> tupl
     exc_type = type(exc)
     exc_name = exc_type.__name__
 
+    status = _http_status_code(exc)
+    if status is not None:
+        if status == 429 or 500 <= status < 600:
+            return True, f"http_status_retryable:{exc_name}"
+        if 400 <= status < 500:
+            return False, f"non_retryable_client_error:{exc_name}"
+        return False, f"unknown_non_retryable:{exc_name}"
+
     if _is_empty_structured_output_validation_error(exc):
         return True, f"empty_structured_output:{exc_name}"
 
@@ -268,12 +276,7 @@ def _is_generic_retryable(exc: BaseException) -> bool:
     """Check for generic retryable errors by status code."""
     status = _http_status_code(exc)
     if status is not None:
-        if status == 429:
-            return True
-        if 500 <= status < 600:
-            return True
-        if status >= 600:
-            return True
+        return status == 429 or 500 <= status < 600
 
     msg = str(exc).lower()
     if "rate limit" in msg or "too many requests" in msg:
@@ -289,15 +292,12 @@ def _is_non_retryable_client_error(exc: BaseException) -> bool:
     exc_name = exc.__class__.__name__
     msg = str(exc).lower()
 
-    if exc_name in {"AuthenticationError", "AuthorizationError", "PermissionError"}:
-        return True
-
     status = _http_status_code(exc)
     if status is not None:
-        if status == 400:
-            return True
-        if 400 < status < 500 and status not in (429,):
-            return True
+        return 400 <= status < 500 and status != 429
+
+    if exc_name in {"AuthenticationError", "AuthorizationError", "PermissionError"}:
+        return True
 
     if "unauthorized" in msg or "forbidden" in msg:
         return True
@@ -335,9 +335,9 @@ async def _retry_async(
 ) -> Any:
     """Async retry wrapper with exponential backoff and jitter."""
     config = _retry_config()
-    max_attempts = max_attempts or config["max_attempts"]
-    base_delay = base_delay or config["base_delay"]
-    max_delay = max_delay or config["max_delay"]
+    max_attempts = config["max_attempts"] if max_attempts is None else max_attempts
+    base_delay = config["base_delay"] if base_delay is None else base_delay
+    max_delay = config["max_delay"] if max_delay is None else max_delay
 
     last_exc: BaseException | None = None
 
@@ -389,9 +389,9 @@ def _retry_sync(
 ) -> Any:
     """Sync retry wrapper with exponential backoff and jitter."""
     config = _retry_config()
-    max_attempts = max_attempts or config["max_attempts"]
-    base_delay = base_delay or config["base_delay"]
-    max_delay = max_delay or config["max_delay"]
+    max_attempts = config["max_attempts"] if max_attempts is None else max_attempts
+    base_delay = config["base_delay"] if base_delay is None else base_delay
+    max_delay = config["max_delay"] if max_delay is None else max_delay
 
     last_exc: BaseException | None = None
 
