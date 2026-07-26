@@ -27,7 +27,7 @@ def _make_config(home: Path, **overrides) -> Config:
         max_channel_queue=overrides.get("max_channel_queue", 100),
         worker_idle_timeout_s=overrides.get("worker_idle_timeout_s", 1),
         access_control_enforced=overrides.get(
-            "access_control_enforced", cfg.access_control_enforced
+            "access_control_enforced", False
         ),
     )
 
@@ -429,6 +429,15 @@ class TestSchedulerTickSerialization:
         release_scheduler = asyncio.Event()
         user_started = asyncio.Event()
         completed: list[str] = []
+        resolver = _resolver(
+            tmp_path,
+            """
+            people:
+              - canonical: alice
+                aliases: [discord-1]
+                access: {roles: [user]}
+            """,
+        )
 
         async def runner(event: AgentEvent) -> None:
             if event.channel_id == "scheduler:reflect":
@@ -439,20 +448,30 @@ class TestSchedulerTickSerialization:
                 user_started.set()
                 completed.append("user")
 
-        disp = Dispatcher(cfg, runner)
-        await disp.enqueue(AgentEvent(
+        # Exercise concurrency after the real enforced ingress gate admits an
+        # allowlisted bridge principal. Authorization must not be bypassed just
+        # to keep scheduler ticks and user turns concurrent.
+        cfg = replace(cfg, access_control_enforced=True)
+        disp = Dispatcher(cfg, runner, resolver=resolver)
+        assert await disp.enqueue(AgentEvent(
             trigger="scheduled_tick", channel_id="scheduler:reflect", content=""
         ))
         await scheduler_started.wait()
-        await disp.enqueue(AgentEvent(
-            trigger="user_message", channel_id="discord-123", content="hi"
-        ))
-        # User turn proceeds even though scheduler is holding the
-        # scheduler-tick lock.
-        await asyncio.wait_for(user_started.wait(), timeout=1.0)
-        assert completed == ["user"]
-        release_scheduler.set()
-        await disp.drain()
+        try:
+            assert await disp.enqueue(AgentEvent(
+                trigger="user_message",
+                channel_id="discord-123",
+                content="hi",
+                author="discord-1",
+                source="discord",
+            ))
+            # User turn proceeds even though scheduler is holding the
+            # scheduler-tick lock.
+            await asyncio.wait_for(user_started.wait(), timeout=1.0)
+            assert completed == ["user"]
+        finally:
+            release_scheduler.set()
+            await disp.drain(timeout=1.0)
         assert "scheduler" in completed
 
     @pytest.mark.asyncio
@@ -510,7 +529,7 @@ class TestSchedulerTickSerialization:
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-1", content=""
         ))
-        await first_started.wait()
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-2", content=""
         ))
@@ -564,6 +583,7 @@ def _inj_config(home: Path, channels: tuple[str, ...]) -> Config:
         max_channel_queue=100,
         worker_idle_timeout_s=1,
         midturn_injection_channels=channels,
+        access_control_enforced=False,
     )
 
 
