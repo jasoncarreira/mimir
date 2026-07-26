@@ -388,10 +388,13 @@ def shell_exec(
         return "shell_exec failed: command is required"
     cwd = _effective_shell_cwd()
     try:
-        from ._shell_env import direct_exec_env, login_shell_command
+        from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
+        direct_argv = bound_direct_exec_argv()
+        if direct_argv is None:
+            direct_argv = mimir_direct_argv
         argv = (
-            mimir_direct_argv
-            if mimir_direct_argv is not None
+            direct_argv
+            if direct_argv is not None
             else ["bash", "-lc", login_shell_command(command)]
         )
         proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
@@ -399,12 +402,12 @@ def shell_exec(
             capture_output=True,
             timeout=_SHELL_STATE["timeout_s"],
             cwd=cwd,
-            env=direct_exec_env(argv) if mimir_direct_argv is not None else None,
+            env=direct_exec_env(argv) if direct_argv is not None else None,
         )
     except subprocess.TimeoutExpired:
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
     except FileNotFoundError as exc:
-        executable = mimir_direct_argv[0] if mimir_direct_argv else "bash"
+        executable = direct_argv[0] if direct_argv else "bash"
         return f"shell_exec failed: executable {executable!r} not found: {exc}"
 
     parts = [f"exit={proc.returncode}"]

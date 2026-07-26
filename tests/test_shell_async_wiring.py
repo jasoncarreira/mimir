@@ -21,6 +21,7 @@ the wiring without taking on subprocess flakiness in CI.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -792,3 +793,117 @@ async def test_bash_async_resolves_channel_from_live_contextvar(
     finally:
         tool_registry.reset_current_channel_id(token)
     assert fake_registry._spawned_log[0]["channel_id"] == "ch-live"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """Deepagents must carry the server-bound script argv to real Popen."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from mimir.access_control import (
+        CapabilityTier,
+        ToolRegistry,
+        build_trigger_service_principal,
+    )
+    from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
+    from mimir.tools._shell_env import direct_exec_env_overlay
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = build_trigger_service_principal(
+        canonical="poller:github-test",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("bash_async", "bash_jobs_list", "bash_job_output"),
+        roots=(repo,),
+        creation_path="test",
+    )
+    labels = InformationFlowLabels()
+    auth = AuthContext(
+        principal="service:poller:github-test",
+        canonical_principal=service.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger=service.trigger,
+        channel_id="poller:github-test",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+    )
+    command = "npm test --ignore-scripts"
+    decision = ToolRegistry().authorize_tool(
+        "bash_async", auth, enforce=True, target_channel=command,
+        ifc_labels=labels,
+    )
+    assert decision.allowed is True
+
+    popen_calls: list[tuple[list[str], dict[str, object]]] = []
+    real_popen = subprocess.Popen
+
+    def _popen(argv, **kwargs):
+        popen_calls.append((list(argv), kwargs))
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr("mimir.shell_jobs.subprocess.Popen", _popen)
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None,
+    )
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    shell_async.set_shell_job_registry(registry, on_complete=None)
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "bash_async",
+            "args": {
+                "command": command,
+                "mimir_direct_argv": ["/bin/sh", "-c", "touch /tmp/forged"],
+            },
+            "id": "tc-service-async", "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    agent = create_deep_agent(
+        model=model,
+        tools=[shell_async.bash_async],
+        system_prompt="test",
+        middleware=[BudgetGateMiddleware()],
+        context_schema=AuthContext,
+    )
+    try:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content="run tests")]}, context=auth,
+        )
+    finally:
+        shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+
+    executed_argv, kwargs = popen_calls[-1]
+    expected_argv = [
+        str(maintenance_pinned_executables["node"]),
+        str(maintenance_pinned_executables["npm"]),
+        "test",
+        "--ignore-scripts",
+    ]
+    assert executed_argv == expected_argv
+    assert executed_argv[:3] != ["/bin/sh", "-c", "touch /tmp/forged"]
+    assert all(Path(path).is_absolute() for path in executed_argv[:2])
+    assert all(not Path(path).is_relative_to(repo) for path in executed_argv[:2])
+    assert kwargs.get("shell", False) is False
+    expected_overlay = direct_exec_env_overlay(expected_argv)
+    assert all(kwargs["env"].get(key) == value for key, value in expected_overlay.items())

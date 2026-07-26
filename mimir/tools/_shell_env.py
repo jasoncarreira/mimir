@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shlex
 import sys
+from contextvars import ContextVar, Token
 from pathlib import Path
 
 _TRUSTED_PATH_DIRS = (
@@ -21,6 +22,23 @@ _TRUSTED_PATH_DIRS = (
     "/bin",
 )
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
+_DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "mimir_direct_exec_argv", default=None,
+)
+
+
+def bind_direct_exec_argv(argv: list[str]) -> Token[tuple[str, ...] | None]:
+    """Bind middleware-authorized argv across ToolNode's injected-arg scrub."""
+    return _DIRECT_EXEC_ARGV.set(tuple(argv))
+
+
+def reset_direct_exec_argv(token: Token[tuple[str, ...] | None]) -> None:
+    _DIRECT_EXEC_ARGV.reset(token)
+
+
+def bound_direct_exec_argv() -> list[str] | None:
+    argv = _DIRECT_EXEC_ARGV.get()
+    return list(argv) if argv is not None else None
 
 
 def login_shell_command(command: str) -> str:
@@ -106,4 +124,11 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     return overlay
 
 
-__all__ = ["direct_exec_env", "direct_exec_env_overlay", "login_shell_command"]
+__all__ = [
+    "bind_direct_exec_argv",
+    "bound_direct_exec_argv",
+    "direct_exec_env",
+    "direct_exec_env_overlay",
+    "login_shell_command",
+    "reset_direct_exec_argv",
+]

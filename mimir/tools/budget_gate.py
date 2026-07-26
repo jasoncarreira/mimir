@@ -897,6 +897,12 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
+        direct_argv_token = None
+        if isinstance(direct_argv, list):
+            from ._shell_env import bind_direct_exec_argv
+
+            direct_argv_token = bind_direct_exec_argv(direct_argv)
         from ..access_control import (
             begin_protected_result_capture,
             end_protected_result_capture,
@@ -925,6 +931,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             raise
         finally:
+            if direct_argv_token is not None:
+                from ._shell_env import reset_direct_exec_argv
+
+                reset_direct_exec_argv(direct_argv_token)
             if fetch_token is not None:
                 from .web import end_authorized_fetch
 
@@ -1044,6 +1054,12 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
+        direct_argv_token = None
+        if isinstance(direct_argv, list):
+            from ._shell_env import bind_direct_exec_argv
+
+            direct_argv_token = bind_direct_exec_argv(direct_argv)
         from ..access_control import (
             begin_protected_result_capture,
             end_protected_result_capture,
@@ -1072,6 +1088,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             raise
         finally:
+            if direct_argv_token is not None:
+                from ._shell_env import reset_direct_exec_argv
+
+                reset_direct_exec_argv(direct_argv_token)
             if fetch_token is not None:
                 from .web import end_authorized_fetch
 
