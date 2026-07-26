@@ -2289,6 +2289,10 @@ def test_static_service_write_denies_protected_home_paths(
         home / "memory" / "core" / "service-axis.md",
         repo / ".git" / "hooks" / "pre-commit",
         repo / ".git" / "config",
+        repo / ".venv" / "bin" / "gh",
+        repo / ".venv" / "bin" / "pytest",
+        repo / ".venv" / "bin" / "python",
+        repo / ".venv" / "bin" / "uv",
         home / "state" / "repo" / ".git" / "hooks" / "post-merge",
         home / "memory" / "repo" / ".git" / "objects" / "payload",
         repo / ".GIT" / "hooks" / "post-checkout",
@@ -2485,6 +2489,10 @@ def test_autonomous_repo_write_denies_protected_paths(
         memory / "secrets" / "token.txt",
         repo / ".git" / "hooks" / "pre-commit",
         repo / ".git" / "config",
+        repo / ".venv" / "bin" / "gh",
+        repo / ".venv" / "bin" / "pytest",
+        repo / ".venv" / "bin" / "python",
+        repo / ".venv" / "bin" / "uv",
         home / "state" / "repo" / ".git" / "hooks" / "post-merge",
         memory / "repo" / ".git" / "objects" / "payload",
         repo / ".GIT" / "hooks" / "post-checkout",
@@ -2586,6 +2594,55 @@ def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
         "shell_exec", "shell_profile", "repo_review",
     )
     assert decision.allowed is True, decision.reason
+
+
+def test_every_service_shell_profile_returns_absolute_executables(
+    maintenance_git_home: Path,
+) -> None:
+    samples = {
+        "scheduler_read_only": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short",
+        ),
+        "repo_review": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short", "gh pr view 979 --json title",
+            "npm ci --ignore-scripts", "pytest -q tests",
+            "uv run pytest -q tests",
+        ),
+        "maintenance": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            f"git -C {maintenance_git_home} status --short",
+            "gh pr list --state open",
+            "/usr/local/bin/chainlink issue ready --json",
+        ),
+        "upgrade_workspace": (
+            "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
+            "jq -r .name sample.json", "rg --no-config -n needle .",
+            "git status --short", "uv lock",
+        ),
+    }
+
+    for profile, commands in samples.items():
+        for command in commands:
+            argv = parse_service_shell_argv(command, profile)
+            assert argv is not None, (profile, command)
+            assert Path(argv[0]).is_absolute(), (profile, command, argv)
+
+
+def test_admitted_service_shell_command_without_pin_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm")
+
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) is None
 
 
 @pytest.mark.parametrize(

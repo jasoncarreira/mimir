@@ -623,8 +623,8 @@ def _target_within_configured_repo_write_roots(target: str, _destination: str) -
 
 
 _STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
-    ".env", ".git", ".mimir", "config", "credentials", "identities", "prompts",
-    "secret", "secrets",
+    ".env", ".git", ".mimir", ".venv", "config", "credentials", "identities",
+    "prompts", "secret", "secrets",
 })
 
 
@@ -986,6 +986,9 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
 _MAINTENANCE_PINNED_EXECUTABLES = {
     "git": Path("/usr/bin/git"),
     "gh": Path("/usr/bin/gh"),
+    "npm": Path("/usr/lib/node_modules/npm/bin/npm-cli.js"),
+    "pytest": Path("/workspace/mimir/.venv/bin/pytest"),
+    "uv": Path("/usr/local/bin/uv"),
     "ls": Path("/usr/bin/ls"),
     "grep": Path("/usr/bin/grep"),
     "wc": Path("/usr/bin/wc"),
@@ -1187,12 +1190,12 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
 
 
 def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
-    """Replace an admitted maintenance command with a trusted absolute binary.
+    """Replace an admitted service command with a trusted absolute binary.
 
-    Maintenance commands execute with ``shell=False``, but a bare ``argv[0]``
+    Service commands execute with ``shell=False``, but a bare ``argv[0]``
     would still be selected through PATH. The runtime PATH begins with the
-    project virtualenv, which can sit under a service-writable root, so bind
-    every admitted executable to a fixed regular file before authorization.
+    project virtualenv, so bind every admitted executable to a fixed regular
+    file before authorization. Service writes separately deny ``.venv`` paths.
     Missing, symlinked, or replaced binaries are environment drift and fail
     closed with a distinct log fingerprint rather than falling back to PATH.
     """
@@ -1301,7 +1304,7 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])
         )
-    return argv if allowed else None
+    return _maintenance_pinned_execution_argv(argv) if allowed else None
 
 
 def _target_matches_shell_profile(target: str, destination: str) -> bool:
