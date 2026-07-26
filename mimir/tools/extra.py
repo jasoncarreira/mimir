@@ -399,7 +399,7 @@ def shell_exec(
             capture_output=True,
             timeout=_SHELL_STATE["timeout_s"],
             cwd=cwd,
-            env=direct_exec_env() if mimir_direct_argv is not None else None,
+            env=direct_exec_env(argv) if mimir_direct_argv is not None else None,
         )
     except subprocess.TimeoutExpired:
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"

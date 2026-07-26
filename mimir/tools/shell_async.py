@@ -330,7 +330,7 @@ async def bash_async(
             "auth_context": auth_context,
         }
         if mimir_direct_argv is not None:
-            spawn_kwargs["env_overlay"] = direct_exec_env()
+            spawn_kwargs["env_overlay"] = direct_exec_env(argv)
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,

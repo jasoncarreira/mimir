@@ -299,13 +299,17 @@ authority profile is explicitly repo-working. Its `shell_exec` and `bash_async`
 sinks use `shell_profile=repo_review`, while research and custom pollers retain
 `scheduler_read_only`. `repo_review` is a command-shape allow-list for the
 operations observed in review turns: bounded `gh pr view/diff/checks`, Git
-status/log/diff/fetch/checkout, `npm ci`, `npm test`/`npm run test`, and pytest
-(directly or as `uv run pytest`). It does not admit shell launchers, arbitrary
-interpreters, `spawn_*`, `rm`, Git push/history/config mutation, GitHub credential
-mutation, or open-ended package install/update commands. `npm ci` is the one
-declared dependency-materialization command because a clean install is part of
-the repository test contract; other network-installing package operations remain
-denied.
+status/log/diff/fetch/checkout, `npm ci --ignore-scripts`, `npm test`/`npm run
+test`, and pytest (directly or as `uv run pytest`) with a narrow selection and
+reporting option allow-list plus relative collection paths. It excludes pytest
+plugin/config/debugger controls such as `-p`, `-c`, `-o`, `--rootdir`, and
+`--pdb`, rejects absolute/traversing collection paths, and scrubs
+`PYTEST_ADDOPTS`/`PYTEST_PLUGINS` for direct execution. It does not admit shell
+launchers, arbitrary interpreters, `spawn_*`, `rm`, Git push/history/config
+mutation, GitHub credential mutation, or open-ended package install/update
+commands. `npm ci --ignore-scripts` is the one declared dependency-materialization
+command because a clean install is part of the repository test contract; lifecycle
+scripts and other network-installing package operations remain denied.
 
 Repo-working principals freeze the explicit `:rw` entries from
 `MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside the trigger's state

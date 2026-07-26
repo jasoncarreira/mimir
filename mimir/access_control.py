@@ -814,6 +814,65 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     )
 
 
+def _target_matches_pytest_command(arguments: list[str]) -> bool:
+    """Admit bounded pytest selection/reporting options and relative test paths.
+
+    Pytest executes repository test code by design, but its wider option surface
+    can also import arbitrary plugins, redirect configuration, or open an
+    interactive debugger. Keep that control plane out of autonomous reviews.
+    """
+    flag_options = frozenset({
+        "-q", "-x", "-s", "-v", "-vv", "--collect-only",
+        "--disable-warnings", "--exitfirst", "--failed-first", "--last-failed",
+        "--no-header", "--no-summary", "--quiet", "--strict-config",
+        "--strict-markers", "--verbose",
+    })
+    value_options = frozenset({
+        "-k", "-m", "--capture", "--color", "--durations",
+        "--durations-min", "--maxfail", "--show-capture", "--tb",
+    })
+    option_prefixes = (
+        "--capture=", "--color=", "--durations=", "--durations-min=",
+        "--maxfail=", "--show-capture=", "--tb=",
+    )
+
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in flag_options or argument.startswith(option_prefixes):
+            index += 1
+            continue
+        if argument in value_options:
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if argument == "--" or argument.startswith("-"):
+            return False
+
+        # Collection operands may include a node id after ``::``. Keep their
+        # filesystem component lexical and relative so pytest cannot discover
+        # config/conftest/plugin code from an unrelated host tree.
+        path_text = argument.split("::", 1)[0]
+        path = Path(path_text)
+        if path.is_absolute() or ".." in path.parts:
+            return False
+        index += 1
+    return True
+
+
+def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
+    """Require a script-free clean install with no operands or option terminator."""
+    allowed_options = frozenset({
+        "--ignore-scripts", "--include=dev", "--no-audit", "--no-fund",
+        "--omit=optional", "--prefer-offline",
+    })
+    return (
+        arguments.count("--ignore-scripts") == 1
+        and all(argument in allowed_options for argument in arguments)
+    )
+
+
 def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     """Validate commands needed to inspect and test a trusted repository PR."""
     if _target_matches_read_only_shell_command(argv):
@@ -876,13 +935,7 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
 
     if argv[0] == "npm":
         if argv[1:2] == ["ci"]:
-            return _arguments_match_allowlist(
-                argv[2:],
-                exact_options=frozenset({
-                    "--ignore-scripts", "--include=dev", "--no-audit", "--no-fund",
-                    "--omit=optional", "--prefer-offline",
-                }),
-            )
+            return _target_matches_npm_ci_command(argv[2:])
         if argv[1:2] == ["test"] or argv[1:3] == ["run", "test"]:
             return _arguments_match_allowlist(
                 argv[2:] if argv[1] == "test" else argv[3:],
@@ -891,8 +944,10 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
         return False
 
     if argv[0] == "pytest":
-        return True
-    return argv[:3] == ["uv", "run", "pytest"]
+        return _target_matches_pytest_command(argv[1:])
+    if argv[:3] == ["uv", "run", "pytest"]:
+        return _target_matches_pytest_command(argv[3:])
+    return False
 
 
 def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
