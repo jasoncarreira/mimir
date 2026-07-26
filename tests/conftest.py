@@ -24,6 +24,16 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture
+def middleware_event_logger(tmp_path):
+    """Initialize logging for middleware fire-and-forget event tasks."""
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+
+    init_logger(tmp_path / "middleware-events.jsonl", session_id="middleware-test")
+    yield
+    _reset_logger_for_tests()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def maintenance_pinned_executables(tmp_path_factory):
     """Isolate maintenance authorization tests from host executable layout."""

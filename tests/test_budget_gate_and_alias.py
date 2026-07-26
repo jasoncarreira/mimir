@@ -41,17 +41,21 @@ from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     _check_and_increment_or_deny,
 )
+from tests.auth_helpers import attach_middleware_auth_context
+
+
+pytestmark = pytest.mark.usefixtures("middleware_event_logger")
 
 
 def _make_ctx(budget: int = 5) -> TurnContext:
-    return TurnContext(
+    return attach_middleware_auth_context(TurnContext(
         turn_id="t-budget",
         session_id="ch-1",
         trigger="user_message",
         channel_id="ch-1",
         started_at=time.monotonic(),
         tool_call_budget=budget,
-    )
+    ))
 
 
 def _make_request(
@@ -895,7 +899,7 @@ async def test_middleware_awrap_passes_through_under_budget():
     ctx = _make_ctx(budget=5)
     token = set_current_turn(ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("t1", "id-1"), handler)
+        out = await mw.awrap_tool_call(_make_request("write_todos", "id-1"), handler)
     finally:
         reset_current_turn(token)
     assert isinstance(out, ToolMessage)
@@ -1010,9 +1014,11 @@ async def test_middleware_awrap_refuses_at_cap():
     ctx = _make_ctx(budget=2)
     token = set_current_turn(ctx)
     try:
-        await mw.awrap_tool_call(_make_request("t1", "id-1"), handler)  # 1
-        await mw.awrap_tool_call(_make_request("t1", "id-2"), handler)  # 2
-        out = await mw.awrap_tool_call(_make_request("t1", "id-3"), handler)  # refused
+        await mw.awrap_tool_call(_make_request("write_todos", "id-1"), handler)  # 1
+        await mw.awrap_tool_call(_make_request("write_todos", "id-2"), handler)  # 2
+        out = await mw.awrap_tool_call(
+            _make_request("write_todos", "id-3"), handler,
+        )  # refused
     finally:
         reset_current_turn(token)
     assert isinstance(out, ToolMessage)
@@ -1103,7 +1109,7 @@ def test_middleware_sync_wrap_passes_through_under_budget():
     ctx = _make_ctx(budget=5)
     token = set_current_turn(ctx)
     try:
-        out = mw.wrap_tool_call(_make_request("t1", "id-1"), handler)
+        out = mw.wrap_tool_call(_make_request("write_todos", "id-1"), handler)
     finally:
         reset_current_turn(token)
     assert isinstance(out, ToolMessage)
@@ -1500,8 +1506,10 @@ def test_middleware_sync_wrap_refuses_at_cap():
     ctx = _make_ctx(budget=1)
     token = set_current_turn(ctx)
     try:
-        mw.wrap_tool_call(_make_request("t1", "id-1"), handler)  # passes
-        out = mw.wrap_tool_call(_make_request("t1", "id-2"), handler)  # refused
+        mw.wrap_tool_call(_make_request("write_todos", "id-1"), handler)  # passes
+        out = mw.wrap_tool_call(
+            _make_request("write_todos", "id-2"), handler,
+        )  # refused
     finally:
         reset_current_turn(token)
     assert isinstance(out, ToolMessage)
@@ -1528,10 +1536,12 @@ async def test_send_message_and_react_bypass_the_cap():
     token = set_current_turn(ctx)
     try:
         # Burn the budget with non-exempt calls.
-        await mw.awrap_tool_call(_make_request("shell_exec", "id-1"), handler)
-        await mw.awrap_tool_call(_make_request("shell_exec", "id-2"), handler)
+        await mw.awrap_tool_call(_make_request("write_todos", "id-1"), handler)
+        await mw.awrap_tool_call(_make_request("write_todos", "id-2"), handler)
         # Past the cap: a regular tool is refused...
-        denied = await mw.awrap_tool_call(_make_request("shell_exec", "id-3"), handler)
+        denied = await mw.awrap_tool_call(
+            _make_request("write_todos", "id-3"), handler,
+        )
         assert isinstance(denied, ToolMessage)
         assert "Tool-call budget exhausted" in str(denied.content)
         # ...but send_message and react MUST still pass through.
@@ -1541,7 +1551,7 @@ async def test_send_message_and_react_bypass_the_cap():
         reset_current_turn(token)
     assert sm.content == "ok"
     assert rx.content == "ok"
-    assert handler_calls == ["shell_exec", "shell_exec", "send_message", "react"]
+    assert handler_calls == ["write_todos", "write_todos", "send_message", "react"]
     # Exempt tools must NOT bump the count (otherwise heavy send_message
     # use would still tick toward... nothing useful, but for clarity
     # the spec is "free passage").
