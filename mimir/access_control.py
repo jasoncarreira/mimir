@@ -839,6 +839,10 @@ def _target_matches_pytest_command(arguments: list[str]) -> bool:
     index = 0
     while index < len(arguments):
         argument = arguments[index]
+        # Pytest expands ``@file`` response operands after authorization. A
+        # response file could therefore smuggle any denied option into argv.
+        if argument.startswith("@"):
+            return False
         if argument in flag_options or argument.startswith(option_prefixes):
             index += 1
             continue

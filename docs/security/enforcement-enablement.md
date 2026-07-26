@@ -303,7 +303,7 @@ status/log/diff/fetch/checkout, `npm ci --ignore-scripts`, `npm test`/`npm run
 test`, and pytest (directly or as `uv run pytest`) with a narrow selection and
 reporting option allow-list plus relative collection paths. It excludes pytest
 plugin/config/debugger controls such as `-p`, `-c`, `-o`, `--rootdir`, and
-`--pdb`, rejects absolute/traversing collection paths, and scrubs
+`--pdb`, rejects response files and absolute/traversing collection paths, and scrubs
 `PYTEST_ADDOPTS`/`PYTEST_PLUGINS` for direct execution. It does not admit shell
 launchers, arbitrary interpreters, `spawn_*`, `rm`, Git push/history/config
 mutation, GitHub credential mutation, or open-ended package install/update
