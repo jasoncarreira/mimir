@@ -623,7 +623,7 @@ def _target_within_configured_repo_write_roots(target: str, _destination: str) -
 
 
 _STATIC_SERVICE_PROTECTED_WRITE_NAMES: frozenset[str] = frozenset({
-    ".env", ".mimir", "config", "credentials", "identities", "prompts",
+    ".env", ".git", ".mimir", "config", "credentials", "identities", "prompts",
     "secret", "secrets",
 })
 
@@ -642,6 +642,7 @@ def _is_static_service_protected_write_path(
         stem = Path(part).stem
         if (
             part in _STATIC_SERVICE_PROTECTED_WRITE_NAMES
+            or part.rstrip(".") == ".git"
             or stem.split(".", 1)[0] in {
                 "config", "credentials", "identities", "secret", "secrets",
             }

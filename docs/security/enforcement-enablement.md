@@ -376,13 +376,19 @@ telemetry after prompt migration before treating the class as a regression.
 File-write scope for dynamic principals is likewise a separate policy concern and
 is not widened by this profile.
 
-Repo-working principals freeze the explicit `:rw` entries from
-`MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside the trigger's state
-root. The exact-root adapter still rejects paths outside those roots, read-only
-configured roots, relative targets, symlink escapes, and the protected write
-surfaces from #970 (`.env`, configuration, credentials, identities, secrets,
-prompts, and memory core). Thus repository access does not widen access to Mimir
-home or operator authority material.
+Service principals freeze the explicit `:rw` entries from
+`MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside their declared
+trigger roots and the safe portions of `<home>/state` and `<home>/memory`. The
+shared protected-path check rejects paths outside those roots, read-only
+configured roots, relative dynamic targets, symlink escapes, and the protected
+write surfaces from #970 (`.env`, configuration, credentials, identities,
+secrets, prompts, and memory core). It also rejects every `.git` path component,
+case-insensitively and with trailing-dot variants denied, on both the lexical and
+resolved path. This prevents service writes to hooks, repository configuration,
+and other executable Git metadata, including through a symlink into `.git` or a
+`.git` symlink out of an admitted root. `.gitignore` and `.gitattributes` remain
+admitted: neither is Git metadata, and attributes can select a diff driver but
+cannot define its executable command. Human/admin write authority is unchanged.
 
 ### 5.2 `#906` becomes tier-based (defer to containment)
 
