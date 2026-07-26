@@ -7,6 +7,7 @@ All notable changes will land here. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- Classify turns that hit an actual tool-call budget denial as `tool_budget_exhausted` failures while keeping deterministic budget exhaustion out of generic poller retry recovery; the failed outcome remains visible for telemetry, but an unchanged poller item is not replayed up to three times under the same limiting budget.
 - Mark `claude-code:*` as a supported provider route after the authenticated operator-container soak and deployment-helper reconciliation; the supported install path is `mimir-agent[claude-code]` / `uv sync --extra claude-code` plus an authenticated Claude Code CLI.
 - Include a compact, self-contained `mimir memory doctor` summary in the scheduled introspection report so memory health is visible alongside behavioral/tool health; scheduled reports now pass `home` into the aggregator, which also enables other home-gated sections such as skill health. The doctor run is read-only and expected to be acceptable for the daily report cadence; run `mimir memory doctor --json` separately when full diagnostic detail is needed.
 

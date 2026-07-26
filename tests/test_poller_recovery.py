@@ -21,10 +21,13 @@ def _ts(seconds_ago: float) -> str:
 
 
 def _write_outcome(events_path: Path, *, type_: str, channel_id: str,
-                   source_id: str, ts: str) -> None:
+                   source_id: str, ts: str,
+                   result_subtype: str | None = None) -> None:
     events_path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"type": type_, "timestamp": ts,
            "channel_id": channel_id, "source_id": source_id}
+    if result_subtype is not None:
+        rec["result_subtype"] = result_subtype
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
@@ -147,6 +150,40 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
     # Still in-flight, attempt incremented (awaiting the retry's outcome).
     st = poller_recovery._load_state(tmp_path)
     assert st["inflight"]["sid-1"]["attempts"] == 1
+
+
+async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Path):
+    """Budget exhaustion is a failed turn for telemetry, but replaying the
+    same poller item under the unchanged budget would deterministically fail
+    again and re-run any partial side effects."""
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-budget"))
+    _write_outcome(
+        events,
+        type_="turn_failed",
+        channel_id="poller:gmail",
+        source_id="sid-budget",
+        ts=_ts(5),
+        result_subtype="tool_budget_exhausted",
+    )
+    enq = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=enq,
+        recover_failed_turns=True,
+        max_attempts=3,
+    )
+
+    assert summary["reenqueued"] == 0
+    assert summary["gave_up"] == 0
+    assert enq.calls == []
+    state = poller_recovery._load_state(tmp_path)
+    assert state["inflight"] == {}
+    assert state["last_reconciled"] != ""
 
 
 async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path):
