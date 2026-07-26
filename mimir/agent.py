@@ -63,6 +63,7 @@ from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
+from . import _deepagents_patches
 from .history import Message, MessageBuffer
 from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
@@ -106,11 +107,11 @@ from .usage_stats import event_recently_emitted
 # generic framing competes with it. Match the SDK-era invariant of
 # "mimir's system_prompt is the only one." No-op when deepagents
 # isn't installed.
-_lcc_patches.strip_deepagents_base_prompt()
+_deepagents_patches.strip_deepagents_base_prompt()
 # Cache BaseTool->OpenAI schema conversion in DeepAgents token counting;
 # otherwise summarization middleware can rebuild Pydantic tool schemas on
 # the asyncio loop at every model boundary (chainlink #600).
-_lcc_patches.patch_deepagents_token_counter_tool_schema_cache()
+_deepagents_patches.patch_deepagents_token_counter_tool_schema_cache()
 # DeepAgents deliberately treats history-offload failures as non-fatal. Keep
 # summarization progressing, but retain the swallowed exception's traceback.
 install_offload_traceback_logging_patch()

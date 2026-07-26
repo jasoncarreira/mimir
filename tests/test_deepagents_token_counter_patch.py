@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool
 
-from mimir import _langchain_claude_code_patches as patches
+from mimir import _deepagents_patches as patches
 
 
 class FakeAnthropicChatModel(BaseChatModel):

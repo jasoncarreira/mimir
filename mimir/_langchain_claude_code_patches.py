@@ -1,15 +1,14 @@
-"""Runtime checks and tool-safety hooks for ``langchain_claude_code``.
+"""Adapter validation and Mimir safety-plane hooks for Claude Code.
 
 Upstream repo: https://github.com/thehumanworks/langchain-claude-code
 (transferred from agentmish/langchain-claude-code)
 
-The public PyPI distribution ``langchain-claude-code-mimir`` carries the
-adapter-level fixes Mimir used to monkeypatch locally (LangChain Core 1.x
-``_arun(config=...)``, injected-tool schema filtering, and streaming result
-metadata). This module keeps Mimir-side validation plus the safety-plane hooks
-that are deliberately *not* part of the adapter package: SDK PreToolUse /
-PostToolUse callbacks that capture every Claude Code tool invocation and keep
-pre-execution enforcement available for built-in, bridged, and MCP tools.
+This module validates that the installed adapter distribution is supported.
+It also installs the SDK PreToolUse/PostToolUse safety-plane hooks that capture
+every Claude Code tool invocation and enforce Mimir's budget and prohibited-
+action policies for built-in, bridged, and MCP tools. Those hooks deliberately
+remain here because they depend on Mimir's authorization model; they do not
+belong in the general-purpose adapter distribution.
 """
 
 from __future__ import annotations
@@ -24,8 +23,6 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-_PATCH_MARKER = "_mimir_arun_config_patched"
-
 CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code-mimir"
 UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code"
 
@@ -37,6 +34,8 @@ _REQUIRED_ADAPTER_FEATURES = frozenset(
         "sdk_tool_events",
     }
 )
+# Forward-compatibility path for a future adapter that advertises equivalent
+# support directly. The current controlled distribution does not exercise it.
 
 
 @dataclass(frozen=True)
@@ -48,9 +47,10 @@ class AdapterCompatibility:
 def _module_declares_compatibility(module: Any) -> bool:
     """Return True when the adapter package explicitly advertises fixes.
 
-    The controlled adapter can avoid all Mimir-side monkeypatches by exposing
-    either ``MIMIR_COMPATIBILITY`` or ``__mimir_compatibility__`` as a mapping
-    whose ``features`` iterable contains the required compatibility flags.
+    A future adapter can advertise support by exposing ``MIMIR_COMPATIBILITY``
+    or ``__mimir_compatibility__`` as a mapping whose ``features`` iterable
+    contains the required compatibility flags. This validates adapter features
+    only; Mimir's safety-plane hooks are still always required and installed.
     """
     for attr in ("MIMIR_COMPATIBILITY", "__mimir_compatibility__"):
         compat = getattr(module, attr, None)
@@ -135,14 +135,6 @@ def assert_supported_langchain_claude_code_adapter(module: Any | None = None) ->
     )
 
 
-def _adapter_has_native_mimir_compatibility() -> bool:
-    try:
-        import langchain_claude_code as lcc  # type: ignore[import-untyped]
-    except ImportError:
-        return False
-    return _module_declares_compatibility(lcc)
-
-
 # ContextVar carrying the per-call ``tool_events`` list. The hook
 # callbacks installed by ``install_tool_event_hooks`` look up this
 # value to know where to record events. ``None`` (the default) means
@@ -150,164 +142,6 @@ def _adapter_has_native_mimir_compatibility() -> bool:
 _tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
     contextvars.ContextVar("mimir_claude_code_tool_events", default=None)
 )
-
-
-
-
-_DEEPAGENTS_BASE_PROMPT_MARKER = "_mimir_base_prompt_stripped"
-
-
-_DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER = "_mimir_token_counter_tool_schema_cache"
-
-
-def patch_deepagents_token_counter_tool_schema_cache() -> None:
-    """Cache tool-schema conversion during DeepAgents token counting.
-
-    DeepAgents' summarization middleware calls LangChain's approximate token
-    counter with ``tools=request.tools`` on every model boundary. LangChain
-    converts each ``BaseTool`` to an OpenAI tool dict for that count; for
-    structured tools this walks ``tool_call_schema`` and builds Pydantic
-    subset models. On large tool surfaces that synchronous schema conversion
-    has shown up directly in scheduler event-loop lag stack captures.
-
-    The conversion is pure for a stable tool object, so cache the converted
-    dict per tool object (falling back to pass-through for already-converted
-    dict schemas) before the counter runs. The patch is deliberately narrow:
-    it wraps only the DeepAgents summarization module's imported
-    ``count_tokens_approximately`` name, leaving LangChain's public helper
-    unchanged for other callers/tests.
-    """
-    try:
-        import copy
-        import weakref
-
-        from langchain.agents.middleware import summarization as lc_summarization
-        from langchain_core.messages import utils as message_utils
-        from langchain_core.tools import BaseTool
-        import deepagents.middleware.summarization as summarization
-    except ImportError:
-        return
-
-    current = getattr(summarization, "count_tokens_approximately", None)
-    if getattr(current, _DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER, False):
-        return
-
-    original_counter = current or message_utils.count_tokens_approximately
-    original_lc_counter = lc_summarization.count_tokens_approximately
-    # Stock DeepAgents imports LangChain Core's helper into its module and
-    # passes that exact function object through to LangChain's summarization
-    # middleware. LangChain then uses object identity to detect the default and
-    # replace it with a model-tuned partial. Keep the patched DeepAgents default
-    # and LangChain module global as the SAME wrapper object so that identity
-    # branch still fires.
-    counter_to_wrap = (
-        original_lc_counter if original_counter is original_lc_counter else original_counter
-    )
-    cache: dict[int, tuple[weakref.ReferenceType[BaseTool], dict[str, Any]]] = {}
-
-    def _drop_cached_tool(tool_id: int) -> None:
-        cache.pop(tool_id, None)
-
-    def _cached_tools(tools: list[Any] | None) -> list[Any] | None:
-        if not tools:
-            return tools
-        converted: list[Any] = []
-        for tool in tools:
-            if isinstance(tool, dict):
-                converted.append(tool)
-                continue
-            if not isinstance(tool, BaseTool):
-                converted.append(tool)
-                continue
-            tool_id = id(tool)
-            cached = cache.get(tool_id)
-            schema = None
-            if cached is not None:
-                ref, cached_schema = cached
-                if ref() is tool:
-                    schema = cached_schema
-                else:
-                    cache.pop(tool_id, None)
-            if schema is None:
-                schema = message_utils.convert_to_openai_tool(tool)
-                try:
-                    ref = weakref.ref(
-                        tool,
-                        lambda _ref, tid=tool_id: _drop_cached_tool(tid),
-                    )
-                    cache[tool_id] = (ref, schema)
-                except TypeError:
-                    # Extremely defensive: BaseTool instances are weakrefable
-                    # in supported LangChain versions, but counting should still
-                    # work if a custom tool subclass refuses weakrefs.
-                    pass
-            # The approximate counter only reads/json-dumps schemas today,
-            # but return a defensive copy so downstream mutation cannot poison
-            # the cached canonical schema.
-            converted.append(copy.deepcopy(schema))
-        return converted
-
-    def _patched_count_tokens_approximately(  # type: ignore[no-untyped-def]
-        messages,
-        *args,
-        tools=None,
-        **kwargs,
-    ):
-        return counter_to_wrap(messages, *args, tools=_cached_tools(tools), **kwargs)
-
-    setattr(_patched_count_tokens_approximately, _DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER, True)
-    _patched_count_tokens_approximately.__wrapped__ = counter_to_wrap  # type: ignore[attr-defined]
-    summarization.count_tokens_approximately = _patched_count_tokens_approximately
-    lc_summarization.count_tokens_approximately = _patched_count_tokens_approximately
-
-    # ``SummarizationMiddleware.__init__`` captured the module-level helper as
-    # a keyword-only default when deepagents.middleware.summarization was
-    # imported, so replacing the module global alone is not enough for the
-    # stock ``create_summarization_middleware()`` factory. Update the default
-    # used by future middleware instances too.
-    kwdefaults = getattr(summarization.SummarizationMiddleware.__init__, "__kwdefaults__", None)
-    if isinstance(kwdefaults, dict) and "token_counter" in kwdefaults:
-        kwdefaults["token_counter"] = _patched_count_tokens_approximately
-    lc_kwdefaults = getattr(
-        lc_summarization.SummarizationMiddleware.__init__, "__kwdefaults__", None
-    )
-    if (
-        isinstance(lc_kwdefaults, dict)
-        and lc_kwdefaults.get("token_counter") is original_lc_counter
-    ):
-        lc_kwdefaults["token_counter"] = _patched_count_tokens_approximately
-
-    log.debug("patched DeepAgents token counter to cache BaseTool schema conversion")
-
-def strip_deepagents_base_prompt() -> None:
-    """Empty out ``deepagents.graph.BASE_AGENT_PROMPT`` so it is NOT
-    appended to mimir's system prompt.
-
-    ``create_deep_agent`` composes the final system prompt as
-    ``user_system_prompt + "\\n\\n" + BASE_AGENT_PROMPT`` (graph.py:754).
-    The base block is a generic "be concise, do tasks well" framing
-    that competes with mimir's own persona + filing-rules guidance.
-    For mimir the user-supplied prompt is the entire contract: core
-    memory blocks, memory-index, conventions, skill catalog, operator
-    config — there is no value to bolting a second agent-shape framing
-    onto the end of it. Match the SDK-era invariant where mimir's
-    system_prompt was the only system_prompt the model saw.
-
-    Idempotent + import-safe: a no-op when deepagents isn't installed
-    (operators on the anthropic-only extra path don't pull it in)."""
-    try:
-        from deepagents import graph as _dg_graph
-    except ImportError:
-        return
-    if getattr(_dg_graph, _DEEPAGENTS_BASE_PROMPT_MARKER, False):
-        return
-    _dg_graph.BASE_AGENT_PROMPT = ""
-    setattr(_dg_graph, _DEEPAGENTS_BASE_PROMPT_MARKER, True)
-    log.debug("stripped deepagents BASE_AGENT_PROMPT (mimir owns system prompt)")
-
-
-
-
 
 _TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
 
