@@ -90,9 +90,13 @@ BODY_PREVIEW_CHARS = 300
 REVIEW_REQUEST_MAX_ATTEMPTS = 3
 
 # Unresolved review feedback is re-reminded on elapsed time rather than poll
-# count. A dropped remediation turn can therefore delay, but not permanently
-# consume, the signal without making normal 15-minute polls noisy.
+# count. A one-minute jitter allowance absorbs small per-run timestamp drift
+# without changing the intended hourly cadence. After bounded attempts give up,
+# a daily backstop starts a fresh series so an unresolved PR cannot go silent
+# forever merely because its queued turns were never delivered.
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
+CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
+CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
 
 
 def _utc_now_iso() -> str:
@@ -966,15 +970,18 @@ def _check_own_changes_requested(
     that review) is the authoritative "fixes still owed" signal, so it
     is re-derived from the live snapshot each poll.
 
-    Reminder contract: ``prior`` maps each PR key to ``head_sha`` plus
-    ``last_reminded_at``. An unresolved stale state re-emits only after
-    ``reminder_interval`` has elapsed. The head is observational rather
-    than the resolution key: a content-free rebase carries the existing
-    reminder timestamp forward, while the reviewed-diff check below drops
-    a substantive fix. Legacy bare-sha entries migrate quietly with
-    ``last_reminded_at=now`` so deployment does not produce a reminder
-    storm. Cleanup remains rebuild-on-every-poll: closed, merged, fixed,
-    and no-longer-blocked PRs are not copied into the returned dict.
+    Reminder contract: ``prior`` maps each PR key to ``head_sha``,
+    ``last_reminded_at``, and ``attempts``. As in the review-request path,
+    an unchanged unresolved head re-emits up to
+    ``REVIEW_REQUEST_MAX_ATTEMPTS``, then emits a one-shot ``*_gave_up``
+    signal and parks at ``cap + 1``. Because emissions can remain queued
+    without a delivered turn, the parked state re-arms after a long backstop;
+    this preserves a bounded series without making queue loss permanently
+    silence an unresolved PR. A head change starts a fresh attempt budget.
+    Legacy entries migrate quietly as one prior attempt with
+    ``last_reminded_at=now`` so deployment does not produce a reminder storm.
+    Cleanup remains rebuild-on-every-poll: closed, merged, fixed, and
+    no-longer-blocked PRs are not copied into the returned dict.
 
     "No commits since the review" matters: right after the agent
     pushes fixes the PR's review decision STAYS CHANGES_REQUESTED
@@ -1064,19 +1071,48 @@ def _check_own_changes_requested(
 
         prior_entry = prior.get(key)
         if isinstance(prior_entry, str):
-            # Pre-cadence cursor. Treat its prior one-shot reminder as if it
-            # happened now; only a full interval after migration may re-fire.
+            # Pre-cadence cursor. Treat its prior one-shot reminder as attempt
+            # one now so migration cannot fan out across every tracked PR.
             new[key] = {
                 "head_sha": head_sha,
                 "last_reminded_at": observed_at_iso,
+                "attempts": 1,
             }
             continue
 
         last_reminded_at = ""
         last_reminded: datetime | None = None
+        prior_attempts = 0
+        head_changed = False
         if isinstance(prior_entry, dict):
+            prior_head = prior_entry.get("head_sha")
+            raw_attempts = prior_entry.get("attempts")
+            if "attempts" not in prior_entry:
+                # The previous structured cursor is also legacy. Quietly
+                # migrate it instead of interpreting every entry as attempt 0.
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": observed_at_iso,
+                    "attempts": 1,
+                }
+                continue
+            if not isinstance(raw_attempts, int) or raw_attempts < 1:
+                # Quiet repair for malformed structured state.
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": observed_at_iso,
+                    "attempts": 1,
+                }
+                continue
+            if prior_head != head_sha:
+                # A push is the observable outcome of the prior remediation.
+                # If a newer review still leaves this head stale, it is a new
+                # bounded attempt series rather than continuation of the old.
+                head_changed = True
+            else:
+                prior_attempts = raw_attempts
             value = prior_entry.get("last_reminded_at")
-            if isinstance(value, str):
+            if not head_changed and isinstance(value, str):
                 last_reminded_at = value
                 try:
                     last_reminded = datetime.fromisoformat(
@@ -1088,23 +1124,59 @@ def _check_own_changes_requested(
                 except ValueError:
                     last_reminded = None
 
-        if last_reminded is not None and observed_at - last_reminded < reminder_interval:
+        eligible_after = max(
+            timedelta(0),
+            reminder_interval - CHANGES_REQUESTED_REMINDER_SLACK,
+        )
+        if last_reminded is not None and observed_at - last_reminded < eligible_after:
             new[key] = {
                 "head_sha": head_sha,
                 "last_reminded_at": last_reminded_at,
+                "attempts": prior_attempts,
             }
             continue
-        if key in prior and last_reminded is None:
+        if key in prior and last_reminded is None and not head_changed:
             # Quietly repair malformed structured state just like a legacy
             # entry rather than turning cursor corruption into an emit storm.
             new[key] = {
                 "head_sha": head_sha,
                 "last_reminded_at": observed_at_iso,
+                "attempts": max(prior_attempts, 1),
             }
             continue
 
         title = pr.get("title", "")
         url = pr.get("html_url", "")
+        if prior_attempts >= REVIEW_REQUEST_MAX_ATTEMPTS:
+            if prior_attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
+                _emit_signal(
+                    "pr_changes_requested_gave_up",
+                    repo=repo,
+                    number=number,
+                    url=url,
+                    head_sha=head_sha,
+                    attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+                )
+                count += 1
+                prior_attempts += 1
+                last_reminded_at = observed_at_iso
+                last_reminded = observed_at
+            if (
+                last_reminded is None
+                or observed_at - last_reminded < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            ):
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": last_reminded_at,
+                    "attempts": prior_attempts,
+                }
+                continue
+            # Emission is not delivery: a whole bounded series may have sat in
+            # an in-memory queue without any turn running. Re-arm after a long
+            # backstop so the cap limits noise but cannot silence the PR forever.
+            prior_attempts = 0
+
+        attempt = prior_attempts + 1
         reviewers = ", ".join(f"@{login}" for login in sorted(blocking))
         prompt = (
             f"Your PR #{number} on {repo} is stuck at CHANGES_REQUESTED: "
@@ -1122,11 +1194,14 @@ def _check_own_changes_requested(
             head=head_sha,
             reviewers=sorted(blocking),
             author=(pr.get("user") or {}).get("login"),
+            attempt=attempt,
+            max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
         )
         count += 1
         new[key] = {
             "head_sha": head_sha,
             "last_reminded_at": observed_at_iso,
+            "attempts": attempt,
         }
     return count, new
 
@@ -1263,8 +1338,8 @@ def main() -> None:
     rr_all: dict = cursor.get("pr_review_requests", {}) or {}
     new_rr_all: dict[str, dict[str, int]] = {}
     # Changes-requested reconciliation cursor (chainlink #449):
-    # ``{repo: {pr_key: {head_sha, last_reminded_at}}}`` — unresolved
-    # own-PR states, rate-limited by elapsed time between reminders.
+    # ``{repo: {pr_key: {head_sha, last_reminded_at, attempts}}}`` — bounded
+    # unresolved own-PR remediation attempts, rate-limited by elapsed time.
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
     new_cr_all: dict[str, dict[str, object]] = {}
 

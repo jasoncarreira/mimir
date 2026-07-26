@@ -92,7 +92,9 @@ from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
     count_turns_since_many,
+    has_validatable_unfinished_work,
     render_session_summaries,
+    validate_unfinished_work,
 )
 from .subagent_inbox import SubagentInbox, render_subagent_updates
 from .templates import render_saga_session_end
@@ -3837,6 +3839,10 @@ class Agent:
                 channel_id=channel_id,
                 since_timestamps=boundary_timestamps,
                 snapshot_records=self._turns_snapshot.records,
+            )
+        if has_validatable_unfinished_work(boundaries):
+            boundaries = await asyncio.to_thread(
+                validate_unfinished_work, boundaries,
             )
         now = datetime.now(tz=timezone.utc)
         content = render_session_summaries(

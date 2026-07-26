@@ -160,15 +160,113 @@ def test_build_turn_prompt_omits_session_section_when_block_none():
 from datetime import datetime, timezone
 
 from mimir.session_boundary_log import (
+    GithubArtifact,
     _apply_closed_since,
     _format_relative_age,
     _format_turn_count,
     count_turns_since,
     count_turns_since_many,
+    validate_unfinished_work,
 )
 
 
 _NOW = datetime(2026, 5, 9, 18, 0, 0, tzinfo=timezone.utc)
+
+
+# ---- live unfinished-work validation -----------------------------------
+
+
+def _boundary(*items: str) -> list[dict]:
+    return [{"summary": "prior work", "unfinished": list(items)}]
+
+
+def test_validation_drops_merged_pr():
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1187 remains open"),
+        default_repo="octo/repo",
+        lookup=lambda refs: {refs[0]: "MERGED"},
+    )
+    assert boundaries[0]["unfinished"] == []
+
+
+def test_validation_keeps_open_pr_unchanged():
+    item = "PR #1188 still awaits review"
+    boundaries = validate_unfinished_work(
+        _boundary(item),
+        default_repo="octo/repo",
+        lookup=lambda refs: {refs[0]: "OPEN"},
+    )
+    assert boundaries[0]["unfinished"] == [item]
+
+
+def test_validation_drops_closed_issue():
+    boundaries = validate_unfinished_work(
+        _boundary("Chainlink issue #985 remains queued"),
+        default_repo="octo/repo",
+        lookup=lambda refs: {refs[0]: "CLOSED"},
+    )
+    assert boundaries[0]["unfinished"] == []
+
+
+def test_validation_failure_keeps_item_unverified_and_stale_hedge():
+    def failed_lookup(refs):
+        raise RuntimeError("GitHub unavailable")
+
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1189 awaits review"),
+        default_repo="octo/repo",
+        lookup=failed_lookup,
+    )
+    boundaries[0]["ts"] = "2026-05-09T14:00:00+00:00"
+    rendered = render_session_summaries(boundaries, now=_NOW)
+    assert "PR #1189 awaits review [unverified]" in rendered
+    assert "Unfinished [verify before quoting]" in rendered
+
+
+def test_validation_caps_artifacts_in_single_batch():
+    seen: list[GithubArtifact] = []
+
+    def lookup(refs):
+        seen.extend(refs)
+        return {ref: "OPEN" for ref in refs}
+
+    boundaries = validate_unfinished_work(
+        _boundary("PR #1 open", "PR #2 open", "PR #3 open"),
+        default_repo="octo/repo",
+        lookup=lookup,
+        max_lookups=2,
+    )
+    assert [ref.value for ref in seen] == ["1", "2"]
+    assert boundaries[0]["unfinished"] == [
+        "PR #1 open", "PR #2 open", "PR #3 open [unverified]",
+    ]
+
+
+def test_validation_drops_unpushed_claim_when_commit_is_remote():
+    item = (
+        "Commit 2f778518d on branch fix/test is locally committed "
+        "but not pushed"
+    )
+
+    def lookup(refs):
+        return {
+            ref: "REMOTE" if ref.kind == "commit" else None
+            for ref in refs
+        }
+
+    boundaries = validate_unfinished_work(
+        _boundary(item), default_repo="octo/repo", lookup=lookup,
+    )
+    assert boundaries[0]["unfinished"] == []
+
+
+def test_plain_rendering_does_not_validate_or_call_network(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("rendering must remain offline")
+
+    monkeypatch.setattr("mimir.session_boundary_log.subprocess.run", unexpected)
+    rendered = render_session_summaries(_boundary("PR #1188 still open"))
+    assert "PR #1188 still open" in rendered
 
 
 # ---- _format_relative_age ----------------------------------------------
