@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -2633,11 +2634,80 @@ def test_every_service_shell_profile_returns_absolute_executables(
             assert Path(argv[0]).is_absolute(), (profile, command, argv)
 
 
+def test_repo_review_npm_uses_pinned_interpreter_and_script(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) == [
+        str(maintenance_pinned_executables["node"]),
+        str(maintenance_pinned_executables["npm"]),
+        "ci",
+        "--ignore-scripts",
+    ]
+
+
+def test_repo_review_pytest_uses_pinned_interpreter_module(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    assert parse_service_shell_argv("pytest -q tests", "repo_review") == [
+        str(maintenance_pinned_executables["pytest"]), "-m", "pytest", "-q", "tests",
+    ]
+
+
+def test_every_production_service_shell_pin_resolves_outside_write_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "/workspace/mimir:rw")
+
+    monkeypatch.setattr(
+        access_control,
+        "_MAINTENANCE_PINNED_EXECUTABLES",
+        access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS,
+    )
+    for command, expected in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.items():
+        assert access_control._maintenance_resolved_pin(command) == expected
+
+
+def test_service_shell_pin_inside_configured_write_root_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    planted = repo / ".venv" / "bin" / "pytest"
+    home.mkdir()
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "pytest", planted)
+
+    with caplog.at_level("ERROR", logger="mimir.access_control"):
+        assert parse_service_shell_argv("pytest -q tests", "repo_review") is None
+
+    assert "pin resolves within a configured service-writable root" in caplog.text
+
+
+def test_pinned_script_without_pinned_interpreter_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "node")
+
+    assert parse_service_shell_argv(
+        "npm ci --ignore-scripts", "repo_review",
+    ) is None
+
+
 def test_admitted_service_shell_command_without_pin_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.access_control as access_control
-
     monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm")
 
     assert parse_service_shell_argv(

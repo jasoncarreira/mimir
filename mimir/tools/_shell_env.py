@@ -26,8 +26,10 @@ def _is_pytest_argv(argv: list[str] | None) -> bool:
     if not argv:
         return False
     command = Path(argv[0]).name
-    return command == "pytest" or (
-        command == "uv" and argv[1:3] == ["run", "pytest"]
+    return (
+        command == "pytest"
+        or argv[1:3] == ["-m", "pytest"]
+        or command == "uv" and argv[1:3] == ["run", "pytest"]
     )
 
 

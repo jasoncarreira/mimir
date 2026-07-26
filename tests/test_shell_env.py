@@ -12,6 +12,7 @@ def test_direct_exec_env_scrubs_pytest_argument_injection(monkeypatch) -> None:
     for argv in (
         ["pytest", "tests"],
         ["/workspace/mimir/.venv/bin/pytest", "tests"],
+        ["/usr/local/bin/python", "-m", "pytest", "tests"],
         ["uv", "run", "pytest", "tests"],
         ["/usr/local/bin/uv", "run", "pytest", "tests"],
     ):
@@ -27,6 +28,7 @@ def test_direct_exec_env_overlay_unsets_inherited_pytest_injection(monkeypatch) 
     for argv in (
         ["pytest", "tests"],
         ["/workspace/mimir/.venv/bin/pytest", "tests"],
+        ["/usr/local/bin/python", "-m", "pytest", "tests"],
         ["uv", "run", "pytest", "tests"],
         ["/usr/local/bin/uv", "run", "pytest", "tests"],
     ):
