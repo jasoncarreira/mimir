@@ -19,8 +19,16 @@ import poller
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
 
 
-def _entry(sha: str, reminded_at: str = "2026-07-19T12:00:00Z") -> dict:
-    return {"head_sha": sha, "last_reminded_at": reminded_at}
+def _entry(
+    sha: str,
+    reminded_at: str = "2026-07-19T12:00:00Z",
+    attempts: int = 1,
+) -> dict:
+    return {
+        "head_sha": sha,
+        "last_reminded_at": reminded_at,
+        "attempts": attempts,
+    }
 
 
 def _pr(
@@ -61,7 +69,11 @@ def captured_emits(monkeypatch):
     def fake_emit(prompt, **extras):
         events.append({"prompt": prompt, **extras})
 
+    def fake_emit_signal(signal, **extras):
+        events.append({"signal": signal, **extras})
+
     monkeypatch.setattr(poller, "_emit", fake_emit)
+    monkeypatch.setattr(poller, "_emit_signal", fake_emit_signal)
     return events
 
 
@@ -99,7 +111,7 @@ def _patch_api(
 def test_stale_changes_requested_reemits_on_elapsed_boundary(
     monkeypatch, captured_emits,
 ):
-    """The reminder is quiet before 60 minutes and eligible at 60."""
+    """An unchanged head re-emits after the interval minus cron slack."""
     _patch_api(
         monkeypatch,
         prs=[_pr(638, "aaa111")],
@@ -121,26 +133,26 @@ def test_stale_changes_requested_reemits_on_elapsed_boundary(
     # Before the floor, repeated polls neither emit nor refresh the timestamp.
     count2, cursor2 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=59, seconds=59),
+        now=NOW + timedelta(minutes=44, seconds=59),
     )
     assert count2 == 0
     assert cursor2 == {"638": _entry("aaa111")}
     assert len(captured_emits) == 1
 
-    # Exactly at the boundary, re-emit and advance once.
+    # Exactly at the slack-adjusted boundary, re-emit and advance once.
     count3, cursor3 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor2,
-        now=NOW + timedelta(minutes=60),
+        now=NOW + timedelta(minutes=45),
     )
     assert count3 == 1
     assert cursor3 == {
-        "638": _entry("aaa111", "2026-07-19T13:00:00Z"),
+        "638": _entry("aaa111", "2026-07-19T12:45:00Z", attempts=2),
     }
     assert len(captured_emits) == 2
 
     count4, cursor4 = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor3,
-        now=NOW + timedelta(minutes=60, seconds=1),
+        now=NOW + timedelta(minutes=45, seconds=1),
     )
     assert count4 == 0
     assert cursor4 == cursor3
@@ -163,7 +175,9 @@ def test_reminder_interval_is_configurable(monkeypatch, captured_emits):
         reminder_interval=timedelta(minutes=10),
     )
     assert count == 1
-    assert cursor == {"638": _entry("aaa111", "2026-07-19T12:10:00Z")}
+    assert cursor == {
+        "638": _entry("aaa111", "2026-07-19T12:10:00Z", attempts=2),
+    }
 
 
 def test_commits_after_review_are_not_stale(monkeypatch, captured_emits):
@@ -208,7 +222,7 @@ def test_offset_commit_date_is_compared_as_an_instant(
     assert len(captured_emits) == 1
 
 
-def test_content_free_rebase_keeps_cadence_across_head_movement(
+def test_content_free_rebase_resets_attempt_budget(
     monkeypatch, captured_emits,
 ):
     """A content-free rebase can make committer-date newer than the
@@ -260,17 +274,19 @@ def test_content_free_rebase_keeps_cadence_across_head_movement(
         "o/r", "tok", "mimir-bot", prior,
         now=NOW + timedelta(minutes=59, seconds=59),
     )
-    assert count == 0
-    assert cursor == {"642": _entry("rebased-head")}
-    assert captured_emits == []
+    assert count == 1
+    assert cursor == {
+        "642": _entry("rebased-head", "2026-07-19T12:59:59Z"),
+    }
+    assert captured_emits[0]["attempt"] == 1
 
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
         now=NOW + timedelta(minutes=60),
     )
-    assert count == 1
+    assert count == 0
     assert cursor == {
-        "642": _entry("rebased-head", "2026-07-19T13:00:00Z"),
+        "642": _entry("rebased-head", "2026-07-19T12:59:59Z"),
     }
     [ev] = captured_emits
     assert ev["event_type"] == "pr_changes_requested_stale"
@@ -381,7 +397,7 @@ def test_unknown_head_date_counts_as_stale_once(monkeypatch, captured_emits):
     assert cursor == {"641": _entry("eee555")}
 
 
-def test_legacy_cursor_migrates_quietly_for_a_full_interval(
+def test_legacy_cursor_migrates_quietly(
     monkeypatch, captured_emits,
 ):
     _patch_api(
@@ -401,19 +417,105 @@ def test_legacy_cursor_migrates_quietly_for_a_full_interval(
 
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=59, seconds=59),
+        now=NOW + timedelta(minutes=44, seconds=59),
     )
     assert count == 0
     assert cursor == {"956": _entry("legacy-sha")}
 
     count, cursor = poller._check_own_changes_requested(
         "o/r", "tok", "mimir-bot", cursor,
-        now=NOW + timedelta(minutes=60),
+        now=NOW + timedelta(minutes=45),
     )
     assert count == 1
     assert cursor == {
-        "956": _entry("legacy-sha", "2026-07-19T13:00:00Z"),
+        "956": _entry("legacy-sha", "2026-07-19T12:45:00Z", attempts=2),
     }
+
+
+def test_structured_legacy_cursor_migrates_quietly(
+    monkeypatch, captured_emits,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(956, "legacy-sha")],
+        reviews_by_pr={956: [
+            _review("reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z"),
+        ]},
+        commit_dates={"legacy-sha": "2026-07-19T10:00:00Z"},
+    )
+    legacy = {
+        "956": {
+            "head_sha": "legacy-sha",
+            "last_reminded_at": "2026-07-19T10:00:00Z",
+        },
+    }
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", legacy, now=NOW,
+    )
+
+    assert count == 0
+    assert cursor == {"956": _entry("legacy-sha")}
+    assert captured_emits == []
+
+
+def test_attempt_cap_gives_up_once_then_stays_dormant(
+    monkeypatch, captured_emits,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [
+            _review("reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z"),
+        ]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    prior = {"638": _entry("aaa111", "2026-07-19T11:00:00Z", cap)}
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW,
+    )
+    assert count == 1
+    assert cursor == {
+        "638": _entry("aaa111", "2026-07-19T11:00:00Z", cap + 1),
+    }
+    [gave_up] = captured_emits
+    assert gave_up["signal"] == "pr_changes_requested_gave_up"
+    assert gave_up["attempts"] == cap
+
+    count, cursor2 = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor,
+        now=NOW + timedelta(days=1),
+    )
+    assert count == 0
+    assert cursor2 == cursor
+    assert len(captured_emits) == 1
+
+
+def test_seconds_after_boundary_reemits_on_intended_cycle(
+    monkeypatch, captured_emits,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [
+            _review("reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z"),
+        ]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    prior = {"638": _entry("aaa111", "2026-07-19T12:00:04Z")}
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior,
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert count == 1
+    assert cursor == {
+        "638": _entry("aaa111", "2026-07-19T13:00:00Z", attempts=2),
+    }
+    assert captured_emits[0]["attempt"] == 2
 
 
 def test_other_authors_and_no_me_are_skipped(monkeypatch, captured_emits):
