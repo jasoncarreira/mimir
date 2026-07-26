@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -155,6 +156,81 @@ def test_ownerless_migration_uses_only_authoritative_session_acl(tmp_path: Path)
             interactivity=None,
         )
     ) == []
+
+
+def test_ownership_migration_is_atomic_preserves_malformed_and_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commitments_path = tmp_path / "commitments.jsonl"
+    record = CommitmentRecord(
+        id="c-legacy", channel_id="ch-1", text="Legacy task",
+        saga_session_id="missing-session",
+    )
+    malformed = b"{ malformed ownership event }\r\n"
+    event = {
+        "type": "commitment_added", "id": record.id, "record": record.to_dict(),
+    }
+    commitments_path.write_bytes(malformed + json.dumps(event).encode() + b"\n")
+    store = CommitmentsStore(
+        path=commitments_path,
+        provenance_db_path=tmp_path / "missing-saga.db",
+    )
+
+    fsync_calls: list[int] = []
+    replace_calls: list[tuple[Path, Path]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        real_fsync(fd)
+
+    def _replace(source: str | Path, destination: str | Path) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr("mimir.commitments.store.os.fsync", _fsync)
+    monkeypatch.setattr("mimir.commitments.store.os.replace", _replace)
+
+    assert store.migrate_ownership() == 1
+    migrated = commitments_path.read_bytes()
+    assert migrated.startswith(malformed)
+    assert fsync_calls
+    assert replace_calls == [(
+        commitments_path.with_suffix(".jsonl.ownership.tmp"), commitments_path,
+    )]
+    assert store.current_state()[record.id].owner_principal == "legacy_admin"
+
+    replace_calls.clear()
+    assert store.migrate_ownership() == 0
+    assert commitments_path.read_bytes() == migrated
+    assert replace_calls == []
+
+
+@pytest.mark.parametrize("provenance_kind", ["missing", "unreadable"])
+def test_ownership_migration_missing_or_unreadable_db_fails_closed(
+    tmp_path: Path, provenance_kind: str,
+) -> None:
+    commitments_path = tmp_path / "commitments.jsonl"
+    provenance_path = tmp_path / "saga.db"
+    if provenance_kind == "unreadable":
+        provenance_path.write_bytes(b"not a sqlite database")
+    record = CommitmentRecord(
+        id=f"c-{provenance_kind}", channel_id="public-channel",
+        text="Must remain admin-only", saga_session_id="session-alice",
+    )
+    commitments_path.write_text(json.dumps({
+        "type": "commitment_added", "id": record.id, "record": record.to_dict(),
+    }) + "\n")
+
+    store = CommitmentsStore(
+        path=commitments_path, provenance_db_path=provenance_path,
+    )
+    assert store.migrate_ownership() == 1
+    migrated = store.current_state()[record.id]
+    assert migrated.owner_principal == "legacy_admin"
+    assert migrated.visibility == CommitmentVisibility.SERVICE.value
+    assert migrated.originating_channel is None
 
 
 @pytest.mark.asyncio
@@ -1268,6 +1344,23 @@ async def test_authorization_allows_owner_mutation(tmp_path: Path):
     assert ok is True
     state = store.current_state()
     assert state[rec.id].status == CommitmentStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "deliver"])
+async def test_legacy_admin_literal_principal_cannot_mutate_legacy_owner(
+    tmp_path: Path, operation: str,
+) -> None:
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    record = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Migrated legacy task",
+        owner_principal="legacy_admin",
+        visibility=CommitmentVisibility.SERVICE.value,
+    ))
+
+    mutate = getattr(store, operation)
+    assert await mutate(record.id, actor_principal="legacy_admin") is False
+    assert store.current_state()[record.id].status == CommitmentStatus.PENDING.value
 
 
 @pytest.mark.asyncio

@@ -362,6 +362,23 @@ async def test_end_session_does_not_consult_active_registry(
 
 
 @pytest.mark.asyncio
+async def test_end_session_wrong_existing_and_nonexistent_ids_have_same_denial(
+    store: _StubStore, turn_with_session: TurnContext,
+) -> None:
+    runtime = _runtime(turn_with_session)
+    denials = [
+        await saga_ops.saga_end_session.ainvoke({
+            "runtime": runtime, "session_id": session_id, "summary": "done",
+        })
+        for session_id in ("sess-existing-but-not-bound", "sess-nonexistent")
+    ]
+
+    assert denials[0] == denials[1]
+    assert denials[0] == "saga_end_session failed: session write denied"
+    assert store.end_session_calls == []
+
+
+@pytest.mark.asyncio
 async def test_end_session_store_raises_surfaces_error(
     store: _StubStore, turn_with_session: TurnContext
 ) -> None:

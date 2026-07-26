@@ -203,14 +203,14 @@ class CommitmentsStore:
 
         changed = 0
         rewritten: list[str] = []
-        with self.path.open("r", encoding="utf-8") as source:
+        with self.path.open("r", encoding="utf-8", newline="") as source:
             for line in source:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    rewritten.append(line.rstrip("\n"))
+                    rewritten.append(line)
                     continue
-                if event.get("type") == "commitment_added":
+                if isinstance(event, dict) and event.get("type") == "commitment_added":
                     data = event.get("record")
                     if isinstance(data, dict) and not data.get("owner_principal"):
                         acl = session_acls.get(data.get("saga_session_id"))
@@ -234,11 +234,15 @@ class CommitmentsStore:
                             owner_principal=data["owner_principal"],
                         )
                         changed += 1
-                rewritten.append(json.dumps(event, ensure_ascii=True, default=str))
+                        ending = "\r\n" if line.endswith("\r\n") else (
+                            "\n" if line.endswith("\n") else ""
+                        )
+                        line = json.dumps(event, ensure_ascii=True, default=str) + ending
+                rewritten.append(line)
         if changed:
             tmp = self.path.with_suffix(self.path.suffix + ".ownership.tmp")
-            with tmp.open("w", encoding="utf-8") as target:
-                target.write("\n".join(rewritten) + "\n")
+            with tmp.open("w", encoding="utf-8", newline="") as target:
+                target.write("".join(rewritten))
                 target.flush()
                 os.fsync(target.fileno())
             os.replace(tmp, self.path)

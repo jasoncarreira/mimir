@@ -377,6 +377,54 @@ async def test_extracted_private_commitment_is_owner_scoped_end_to_end(
 
 
 @pytest.mark.asyncio
+async def test_public_channel_extraction_stamps_real_owner_and_remains_owner_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    from mimir.commitments.extractor import MIN_OUTPUT_LEN
+
+    async def _extract(*args: Any, **kwargs: Any) -> list[CommitmentRecord]:
+        return [_make_commitment_record(dedupe_key="public-owner")]
+
+    async def _ignore(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("mimir.commitments.extractor.extract_commitments", _extract)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", _ignore)
+    alice_auth = AuthContext(
+        principal="discord:alice", canonical_principal="user:alice", roles=("user",),
+        event_ingress="discord", trigger="user_message", channel_id="ch-public",
+        interactivity=None, enforcement_enabled=True,
+    )
+    source_acl = SessionACL.from_auth_context(
+        alice_auth, origin_domain="discord", visibility="public",
+    )
+    event = AgentEvent(
+        trigger="saga_session_end", channel_id="ch-public",
+        service_principal="synthesis", source_session_acl=source_acl,
+    )
+    ctx = _make_ctx(event, saga_session_id="session-public")
+    ctx.auth_context = create_auth_context(event, enforce=True)
+    await _fire_extraction(
+        agent, ctx, event, _make_record("x" * (MIN_OUTPUT_LEN + 10)),
+    )
+
+    record = next(iter(agent._commitments.current_state().values()))
+    assert record.owner_principal == "user:alice"
+    assert record.owner_principal not in {"", "legacy_admin"}
+    assert record.visibility == "public"
+    bob_auth = AuthContext(
+        principal="discord:bob", canonical_principal="user:bob", roles=("user",),
+        event_ingress="discord", trigger="user_message", channel_id="ch-public",
+        interactivity=None, enforcement_enabled=True,
+    )
+    assert [row.id for row in agent._commitments.list(auth_context=alice_auth)] == [
+        record.id,
+    ]
+    assert agent._commitments.list(auth_context=bob_auth) == []
+
+
+@pytest.mark.asyncio
 async def test_all_dedupe_skipped_emits_no_op_all_dedupe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
