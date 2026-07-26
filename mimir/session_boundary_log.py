@@ -25,8 +25,12 @@ substring match against the closed_since refs).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -41,6 +45,260 @@ log = logging.getLogger(__name__)
 # in any prose); two-character is the natural floor for things like
 # "#1" or short PR refs while still rejecting empty/single-char noise.
 _MIN_CLOSED_SINCE_REF_LEN = 2
+
+# A turn can carry several old boundaries, each with several artifacts. Keep
+# validation to one small GraphQL request rather than letting prompt assembly
+# grow with the size of SAGA history.
+MAX_UNFINISHED_LOOKUPS = 20
+
+_GITHUB_REF_RE = re.compile(
+    r"https?://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/(?:"
+    r"(?P<pr>pull)|(?P<issue>issues))/(?P<number>\d+)",
+    re.IGNORECASE,
+)
+_PR_REF_RE = re.compile(r"\b(?:PR|pull request)\s*#?(\d+)\b", re.IGNORECASE)
+_ISSUE_REF_RE = re.compile(r"\b(?:issue|chainlink)\s*#?(\d+)\b", re.IGNORECASE)
+_LOCAL_PUSH_CLAIM_RE = re.compile(
+    r"\b(?:not (?:yet )?pushed|unpushed|locally committed|"
+    r"local (?:branch|commit)|but not pushed)\b",
+    re.IGNORECASE,
+)
+_COMMIT_REF_RE = re.compile(
+    r"\b(?:commit|head)\s+([0-9a-f]{7,40})\b", re.IGNORECASE,
+)
+_BRANCH_REF_RE = re.compile(
+    r"\bbranch\s+[`'\"]?([A-Za-z0-9._/-]+)", re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class GithubArtifact:
+    """A GitHub object named by an unfinished-work item."""
+
+    repo: str
+    kind: str
+    value: str
+
+
+ArtifactLookup = Callable[[list[GithubArtifact]], dict[GithubArtifact, str | None]]
+
+
+def has_validatable_unfinished_work(boundaries: Iterable[dict[str, Any]]) -> bool:
+    """Return whether a boundary names an artifact worth a live lookup."""
+    return any(
+        _extract_artifacts(str(item), default_repo="placeholder/repo")
+        for boundary in boundaries
+        for item in (boundary.get("unfinished") or [])
+    )
+
+
+def validate_unfinished_work(
+    boundaries: list[dict[str, Any]],
+    *,
+    default_repo: str | None = None,
+    lookup: ArtifactLookup | None = None,
+    max_lookups: int = MAX_UNFINISHED_LOOKUPS,
+) -> list[dict[str, Any]]:
+    """Validate artifact claims and return copied, corrected boundaries.
+
+    Definite terminal states remove an item only when every artifact it names
+    is terminal. Open artifacts survive verbatim. Ambiguous, unavailable, and
+    over-cap results fail open with an explicit ``[unverified]`` marker.
+    ``lookup`` exists both for tests and alternate GitHub clients; the default
+    implementation performs one batched ``gh api graphql`` request.
+    """
+    if not boundaries:
+        return []
+    repo = default_repo or _default_github_repo()
+    item_artifacts: list[tuple[int, int, list[GithubArtifact]]] = []
+    unique: list[GithubArtifact] = []
+    seen: set[GithubArtifact] = set()
+    copied = [dict(boundary) for boundary in boundaries]
+
+    for boundary_index, boundary in enumerate(copied):
+        unfinished = list(boundary.get("unfinished") or [])
+        boundary["unfinished"] = unfinished
+        for item_index, item in enumerate(unfinished):
+            artifacts = _extract_artifacts(str(item), default_repo=repo)
+            if not artifacts:
+                continue
+            item_artifacts.append((boundary_index, item_index, artifacts))
+            for artifact in artifacts:
+                if artifact.repo and artifact not in seen:
+                    seen.add(artifact)
+                    unique.append(artifact)
+
+    selected = unique[:max(0, max_lookups)]
+    statuses: dict[GithubArtifact, str | None] = {}
+    if selected:
+        try:
+            statuses = (lookup or _lookup_github_artifacts)(selected)
+        except Exception:  # noqa: BLE001 - prompt assembly must fail open
+            log.exception("unfinished-work GitHub validation failed")
+
+    drops: dict[int, set[int]] = {}
+    for boundary_index, item_index, artifacts in item_artifacts:
+        values = [statuses.get(artifact) for artifact in artifacts]
+        if _item_is_terminal(artifacts, values):
+            drops.setdefault(boundary_index, set()).add(item_index)
+            log.debug(
+                "session_summary_unfinished_validated: dropped %r (%r)",
+                copied[boundary_index]["unfinished"][item_index], values,
+            )
+        elif any(status is None for status in values):
+            text = str(copied[boundary_index]["unfinished"][item_index]).strip()
+            if "[unverified]" not in text.lower():
+                copied[boundary_index]["unfinished"][item_index] = (
+                    f"{text} [unverified]"
+                )
+
+    for boundary_index, indexes in drops.items():
+        copied[boundary_index]["unfinished"] = [
+            item for index, item in enumerate(copied[boundary_index]["unfinished"])
+            if index not in indexes
+        ]
+    return copied
+
+
+def _extract_artifacts(text: str, default_repo: str | None) -> list[GithubArtifact]:
+    artifacts: list[GithubArtifact] = []
+    url_spans: list[tuple[int, int]] = []
+    for match in _GITHUB_REF_RE.finditer(text):
+        kind = "pr" if match.group("pr") else "issue"
+        artifacts.append(GithubArtifact(
+            match.group("repo").removesuffix(".git"), kind, match.group("number"),
+        ))
+        url_spans.append(match.span())
+
+    def outside_url(match: re.Match[str]) -> bool:
+        return not any(start <= match.start() < end for start, end in url_spans)
+
+    for regex, kind in ((_PR_REF_RE, "pr"), (_ISSUE_REF_RE, "issue")):
+        for match in regex.finditer(text):
+            if outside_url(match):
+                artifacts.append(GithubArtifact(default_repo or "", kind, match.group(1)))
+
+    # Branches and commits are only terminal evidence for claims that they are
+    # still local/unpushed. A generic "work on branch X" remains genuine work
+    # even after the branch reaches GitHub.
+    if _LOCAL_PUSH_CLAIM_RE.search(text):
+        for match in _COMMIT_REF_RE.finditer(text):
+            artifacts.append(GithubArtifact(default_repo or "", "commit", match.group(1)))
+        for match in _BRANCH_REF_RE.finditer(text):
+            artifacts.append(GithubArtifact(default_repo or "", "branch", match.group(1)))
+    return list(dict.fromkeys(artifacts))
+
+
+def _artifact_is_terminal(artifact: GithubArtifact, status: str | None) -> bool:
+    normalized = str(status or "").upper()
+    if artifact.kind == "pr":
+        return normalized in {"CLOSED", "MERGED"}
+    if artifact.kind == "issue":
+        return normalized == "CLOSED"
+    return normalized == "REMOTE"
+
+
+def _item_is_terminal(
+    artifacts: list[GithubArtifact], statuses: list[str | None],
+) -> bool:
+    """Require every work claim to be resolved, allowing push alternatives."""
+    ordinary = [
+        (artifact, status) for artifact, status in zip(artifacts, statuses)
+        if artifact.kind in {"pr", "issue"}
+    ]
+    local = [
+        status for artifact, status in zip(artifacts, statuses)
+        if artifact.kind in {"commit", "branch"}
+    ]
+    ordinary_done = all(
+        _artifact_is_terminal(artifact, status) for artifact, status in ordinary
+    )
+    # A remote commit OR its branch is conclusive evidence against one
+    # "committed but not pushed" claim. The other ref may have been deleted
+    # after merge and must not turn that definite evidence into ambiguity.
+    local_done = not local or any(str(status or "").upper() == "REMOTE" for status in local)
+    return ordinary_done and local_done
+
+
+def _default_github_repo() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(
+        r"(?:github\.com[/:])([^/\s:]+/[^/\s]+?)(?:\.git)?$",
+        result.stdout.strip(),
+    )
+    return match.group(1) if match else None
+
+
+def _lookup_github_artifacts(
+    artifacts: list[GithubArtifact],
+) -> dict[GithubArtifact, str | None]:
+    fields: list[str] = []
+    for index, artifact in enumerate(artifacts):
+        owner, name = artifact.repo.split("/", 1)
+        owner_arg, name_arg = json.dumps(owner), json.dumps(name)
+        if artifact.kind in {"pr", "issue"}:
+            fields.append(
+                f"a{index}:repository(owner:{owner_arg},name:{name_arg}){{"
+                f"issueOrPullRequest(number:{int(artifact.value)}){{__typename "
+                "... on PullRequest{state} ... on Issue{state}}}"
+            )
+        elif artifact.kind == "commit":
+            value_arg = json.dumps(artifact.value)
+            fields.append(
+                f"a{index}:repository(owner:{owner_arg},name:{name_arg}){{"
+                f"object(expression:{value_arg}){{__typename}}}}"
+            )
+        else:
+            ref_arg = json.dumps(f"refs/heads/{artifact.value}")
+            fields.append(
+                f"a{index}:repository(owner:{owner_arg},name:{name_arg}){{"
+                f"ref(qualifiedName:{ref_arg}){{name}}}}"
+            )
+    query = "query{" + " ".join(fields) + "}"
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+    result = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True, timeout=15, env=env,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr.strip() or "empty GitHub response")
+    payload = json.loads(result.stdout)
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("GitHub response had no data")
+
+    statuses: dict[GithubArtifact, str | None] = {}
+    for index, artifact in enumerate(artifacts):
+        repository = data.get(f"a{index}")
+        if not isinstance(repository, dict):
+            statuses[artifact] = None
+            continue
+        if artifact.kind in {"pr", "issue"}:
+            node = repository.get("issueOrPullRequest")
+            expected_type = "PullRequest" if artifact.kind == "pr" else "Issue"
+            statuses[artifact] = (
+                str(node.get("state"))
+                if isinstance(node, dict) and node.get("__typename") == expected_type
+                else None
+            )
+        elif artifact.kind == "commit":
+            node = repository.get("object")
+            statuses[artifact] = (
+                "REMOTE" if isinstance(node, dict)
+                and node.get("__typename") == "Commit" else None
+            )
+        else:
+            statuses[artifact] = "REMOTE" if repository.get("ref") else None
+    return statuses
 
 
 def render_session_summaries(
@@ -359,5 +617,3 @@ def count_turns_since_many(
             if rec_ts_s > cutoff:
                 counts[cutoff] += 1
     return counts
-
-
