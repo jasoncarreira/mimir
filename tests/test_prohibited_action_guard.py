@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from langgraph.runtime import Runtime
 
 from mimir._context import _active_turns, reset_current_turn, set_current_turn
 from mimir._langchain_claude_code_patches import (
@@ -25,6 +26,10 @@ from mimir.tools.prohibited_action_guard import (
     is_bash_tool,
 )
 from mimir.tools.budget_gate import BudgetGateMiddleware
+from tests.auth_helpers import attach_middleware_auth_context, middleware_auth_context
+
+
+pytestmark = pytest.mark.usefixtures("middleware_event_logger")
 
 
 # ─── check_prohibited_bash patterns ──────────────────────────────────────────
@@ -240,6 +245,7 @@ def _make_request(tool_name: str, command: str) -> Any:
         "id": "test-tool-call-id",
     }
     mock_request.tool = None
+    mock_request.runtime = Runtime(context=middleware_auth_context())
     return mock_request
 
 
@@ -349,14 +355,14 @@ class TestAdminSensitiveDeepagentsExecute:
 
 
 def _make_turn_ctx(*, budget: int = 5) -> TurnContext:
-    return TurnContext(
+    return attach_middleware_auth_context(TurnContext(
         turn_id="t-claude-code-guard",
         session_id="ch-claude-code-guard",
         trigger="user_message",
         channel_id="ch-claude-code-guard",
         started_at=time.monotonic(),
         tool_call_budget=budget,
-    )
+    ))
 
 
 def _permission_decision(result: dict[str, Any]) -> str | None:
@@ -409,8 +415,8 @@ class TestClaudeCodePreToolUseGuard:
             result = await _pre_tool_use_hook(
                 {
                     "session_id": ctx.turn_id,
-                    "tool_name": "Read",
-                    "tool_input": {"file_path": "/tmp/example.txt"},
+                    "tool_name": "write_todos",
+                    "tool_input": {"todos": []},
                 },
                 "toolu_budget",
                 None,
@@ -430,8 +436,8 @@ class TestClaudeCodePreToolUseGuard:
         try:
             result = await _pre_tool_use_hook(
                 {
-                    "tool_name": "Read",
-                    "tool_input": {"file_path": "/tmp/example.txt"},
+                    "tool_name": "write_todos",
+                    "tool_input": {"todos": []},
                 },
                 "toolu_read",
                 None,
