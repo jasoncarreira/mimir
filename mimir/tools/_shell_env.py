@@ -12,13 +12,30 @@ import shlex
 import sys
 from pathlib import Path
 
+_TRUSTED_PATH_DIRS = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+_TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
+
 
 def login_shell_command(command: str) -> str:
-    """Wrap an interactive/admin command so the venv bin survives login init."""
+    """Wrap an interactive/admin command with system tools before the venv bin.
+
+    The free-form login-shell path needs the environment's ``mimir`` console
+    script and Python interpreter. Append that directory after the fixed,
+    root-owned tool directories so it remains reachable without being able to
+    shadow system tools such as Git or GitHub CLI.
+    """
     venv_bin = os.path.dirname(sys.executable or "")
-    if not venv_bin:
-        return command
-    return f'export PATH={shlex.quote(venv_bin)}:"$PATH"\n{command}'
+    path = os.pathsep.join(
+        part for part in (_TRUSTED_PATH, venv_bin) if part
+    )
+    return f"export PATH={shlex.quote(path)}\n{command}"
 
 
 def _is_pytest_argv(argv: list[str] | None) -> bool:
@@ -41,13 +58,15 @@ def _is_git_argv(argv: list[str] | None) -> bool:
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
-    Service-shell execution deliberately avoids a login shell. Put the venv bin
-    on PATH through the subprocess environment instead, so environment setup
-    cannot change the validated argv. Pytest's explicit environment controls are
-    also an argument/plugin-injection surface, so remove them when the authorized
-    executable is direct pytest or ``uv run pytest``. Installed entry-point
-    plugins remain available because ordinary repository test suites depend on
-    them; they are operator-installed code rather than PR-selected argv.
+    Service-shell execution deliberately avoids a login shell. Its PATH contains
+    only root-owned deployment directories; in particular, it excludes the
+    workspace virtualenv. Pytest is bound by the authorization pin table to the
+    already-running Python interpreter, so it does not need the virtualenv bin on
+    PATH. Pytest's explicit environment controls are also an argument/plugin-
+    injection surface, so remove them when the authorized executable is direct
+    pytest or ``uv run pytest``. Installed entry-point plugins remain available
+    because ordinary repository test suites depend on them; they are operator-
+    installed code rather than PR-selected argv.
     """
     env = os.environ.copy()
     if _is_pytest_argv(argv):
@@ -65,10 +84,7 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
             "GIT_PAGER": "cat",
             "GIT_OPTIONAL_LOCKS": "0",
         })
-    venv_bin = os.path.dirname(sys.executable or "")
-    if venv_bin:
-        current_path = env.get("PATH", "")
-        env["PATH"] = os.pathsep.join(part for part in (venv_bin, current_path) if part)
+    env["PATH"] = _TRUSTED_PATH
     return env
 
 

@@ -169,36 +169,40 @@ def test_shell_exec_surfaces_bash_syntax_error():
     assert "shell-parse error" not in result  # the shlex path is gone
 
 
-# ─── venv-bin on PATH (login_shell_command) ──────────────────────────
+# ─── trusted system tools + venv-bin fallback on PATH ────────────────
 
 
-def test_login_shell_command_prepends_venv_bin():
-    """The agent's shell runs via ``bash -lc`` (login shell resets PATH).
-    login_shell_command prepends the venv bin — where ``mimir`` and the venv
-    ``python`` live — via an export that runs after the profile, so ``mimir``
-    is reachable regardless of how the server was launched."""
+def test_login_shell_command_puts_system_tools_before_venv_bin():
+    """The free-form login shell keeps ``mimir`` and venv Python reachable.
+
+    Root-owned system directories come first so an agent-writable virtualenv
+    cannot shadow tools such as Git or GitHub CLI.
+    """
     import os
     import sys
 
-    from mimir.tools._shell_env import login_shell_command
+    from mimir.tools._shell_env import _TRUSTED_PATH, login_shell_command
 
     cmd = "mimir reflection introspection-report --days 7"
     wrapped = login_shell_command(cmd)
     venv_bin = os.path.dirname(sys.executable)
+    expected_path = os.pathsep.join((_TRUSTED_PATH, venv_bin))
 
-    assert wrapped.startswith("export PATH=")
-    assert venv_bin in wrapped
+    assert wrapped.startswith(f"export PATH={expected_path}")
+    assert expected_path.split(os.pathsep)[-1] == venv_bin
     # The original command is preserved verbatim at the tail.
     assert wrapped.endswith("\n" + cmd)
 
 
-def test_shell_exec_puts_venv_bin_on_path():
-    """End-to-end: the venv bin (where the `mimir` console script lives) is on
-    PATH in the shell_exec subprocess, even though `bash -lc` resets PATH from
-    the login profile."""
+def test_shell_exec_puts_venv_bin_after_system_tools_on_path():
+    """End-to-end: login initialization cannot drop the venv fallback."""
     import os
     import sys
 
+    from mimir.tools._shell_env import _TRUSTED_PATH
+
     venv_bin = os.path.dirname(sys.executable)
+    expected_path = os.pathsep.join((_TRUSTED_PATH, venv_bin))
     out = shell_exec.invoke({"command": 'echo "PATHCHECK:$PATH"'})
-    assert venv_bin in out
+
+    assert f"PATHCHECK:{expected_path}" in out

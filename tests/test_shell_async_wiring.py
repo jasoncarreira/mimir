@@ -89,8 +89,8 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
     out = await shell_async.bash_async.ainvoke({"command": "sleep 5"})
     assert "Spawned job" in out
     assert "job-1" in out
-    # Routed via ``bash -lc`` with the venv-bin PATH export prepended so the
-    # job can find ``mimir`` / the venv ``python`` (login shell resets PATH).
+    # Routed via ``bash -lc`` with root-owned system directories first and the
+    # venv bin last, preserving console scripts without allowing tool shadowing.
     argv = fake_registry._spawned_log[0]["argv"]  # type: ignore[attr-defined]
     assert argv[:2] == ["bash", "-lc"]
     assert "export PATH=" in argv[2]
