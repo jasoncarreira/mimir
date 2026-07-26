@@ -387,6 +387,7 @@ class FeedbackLog:
         # under the same kind (e.g. spawn job_ids, tool_denied with
         # different reasons) keep their separate lines.
         seen_content: dict[str, set[str]] = {"negative": set(), "positive": set()}
+        tool_budget_turn_ids: set[str] = set()
 
         # 1) events.jsonl — known event-type rules.
         for ev in iter_window_records(event_snapshot, self.events_path):  # #498
@@ -398,6 +399,12 @@ class FeedbackLog:
                     break
                 continue
             evtype = ev.get("type")
+            if evtype in {
+                "tool_call_budget_warning",
+                "tool_call_budget_denied",
+                "tool_call_budget_soft_warning",
+            } and isinstance(ev.get("turn_id"), str):
+                tool_budget_turn_ids.add(ev["turn_id"])
             rule = classify(evtype)
             if rule is None:
                 continue
@@ -511,6 +518,14 @@ class FeedbackLog:
                     continue
                 has_error = rec.get("error") or rec.get("result_is_error")
                 if not has_error:
+                    continue
+                # Budget pressure already surfaces through the existing event
+                # rule. Do not add a second turn-level negative for the same
+                # exhausted turn merely because its result is now classified.
+                if (
+                    rec.get("result_subtype") == "tool_budget_exhausted"
+                    and rec.get("turn_id") in tool_budget_turn_ids
+                ):
                     continue
                 if bounded_negative_count >= limit:
                     break

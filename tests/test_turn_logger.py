@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -781,6 +782,39 @@ def test_derive_marks_anthropic_max_tokens_as_truncation():
     assert rf["result_subtype"] == "error_max_turns"
     assert rf["result_is_error"] is True
     assert rf["stop_reason"] == "max_tokens"
+
+
+def test_derive_marks_anthropic_context_window_exceeded_as_error():
+    msg = AIMessage(
+        content="",
+        response_metadata={"stop_reason": "model_context_window_exceeded"},
+    )
+
+    rf = derive_result_fields([msg])
+
+    assert rf["stop_reason"] == "model_context_window_exceeded"
+    assert rf["result_subtype"] == "model_context_window_exceeded"
+    assert rf["result_is_error"] is True
+
+
+def test_derive_uses_actual_budget_denial_not_soft_warning():
+    msg = AIMessage(content="wrapped up", response_metadata={"stop_reason": "end_turn"})
+    warned = SimpleNamespace(
+        tool_call_budget_exhausted=False,
+        tool_call_budget_denied_count=0,
+    )
+    exhausted = SimpleNamespace(
+        tool_call_budget_exhausted=True,
+        tool_call_budget_denied_count=1,
+    )
+
+    warned_result = derive_result_fields([msg], context=warned)
+    exhausted_result = derive_result_fields([msg], context=exhausted)
+
+    assert warned_result["result_subtype"] == "success"
+    assert warned_result["result_is_error"] is False
+    assert exhausted_result["result_subtype"] == "tool_budget_exhausted"
+    assert exhausted_result["result_is_error"] is True
 
 
 def test_derive_marks_openai_length_as_truncation():

@@ -2794,6 +2794,17 @@ class Agent:
                 event, getattr(ctx, "iteration_budget", 0), ctx,
             )
 
+        # Result fields drive both terminal events and the TurnRecord, so derive
+        # them before finalization and reuse the exact classification.
+        result_fields = derive_result_fields(messages, context=ctx)
+        outcome_is_error = bool(error or result_fields["result_is_error"])
+        outcome_fields = {
+            "result_subtype": result_fields["result_subtype"],
+            "result_is_error": result_fields["result_is_error"],
+            "stop_reason": result_fields["stop_reason"],
+            "tool_call_count": ctx.tool_call_count,
+        }
+
         # Algedonic: surface EVERY turn failure as an event so a dropped
         # turn — a transient model 503, a timeout, quota exhaustion, or a
         # plain bug — is operator-visible on the ops dashboard and
@@ -2803,13 +2814,14 @@ class Agent:
         # ``quota_exhausted`` events above remain as additional context.
         # A transient poller-review 503 used to vanish entirely here —
         # invisible AND (cursor-advanced) un-retried. (chainlink #299)
-        if error:
+        if outcome_is_error:
             await log_event(
                 "turn_failed",
                 channel_id=event.channel_id,
                 turn_id=turn_id,
                 trigger=event.trigger,
-                error=error[:240],
+                error=(error[:240] if error else result_fields["result_subtype"]),
+                **outcome_fields,
                 **(
                     {"traceback": exception_traceback[-4000:]}
                     if exception_traceback else {}
@@ -2820,14 +2832,15 @@ class Agent:
                 ),
                 **_turn_outcome_identity(event),
             )
-            await self._notify_chat_skill_failure(
-                event, error, ctx, phase="model_loop",
-            )
+            if error:
+                await self._notify_chat_skill_failure(
+                    event, error, ctx, phase="model_loop",
+                )
             # chainlink #508: a poller/tick turn that declared a deliver:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
-            await self._post_deliver_failure(event, error, ctx)
+                await self._post_deliver_failure(event, error, ctx)
         elif event.trigger == "poller":
             # Success counterpart to ``turn_failed`` for poller turns
             # (chainlink #262): records that this poller item's turn was
@@ -2842,6 +2855,7 @@ class Agent:
                 channel_id=event.channel_id,
                 turn_id=turn_id,
                 trigger=event.trigger,
+                **outcome_fields,
                 **_turn_outcome_identity(event),
             )
         # chainlink #306: the terminal outcome for this turn has now been
@@ -2849,9 +2863,6 @@ class Agent:
         # poller success). Mark it so run_turn's early-crash guard doesn't
         # double-emit if a LATER step in this body raises.
         ctx.outcome_emitted = True
-
-        # Result fields drive the TurnRecord, so compute once and reuse.
-        result_fields = derive_result_fields(messages)
 
         # Assemble this turn's cited-atom set for the TurnRecord. NO
         # automatic feedback (operator decision 2026-05-29): the old
@@ -3036,6 +3047,7 @@ class Agent:
             saga_calls=saga_calls,
             interactivity=getattr(ctx, "interactivity", None),
             kind=kind,
+            tool_call_count=ctx.tool_call_count,
             **result_fields,
         )
         await self._turn_logger.write(record)

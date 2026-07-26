@@ -19,7 +19,10 @@ log:
   event: **drops** it if its turn completed, **re-enqueues** it
   (capped) if its turn failed, and emits a ``poller_turn_gave_up``
   signal — negative algedonic via ``feedback.classify``'s ``*_gave_up``
-  rule (#515) — once the cap is hit.
+  rule (#515) — once the cap is hit. Deterministic tool-budget exhaustion
+  is classified as failed but is dropped without retry: replaying the same
+  item under the same budget would spend another full budget without
+  changing the limiting condition (#983; sizing/resumption live in #992/#994).
 
 Stashing and unclean-restart replay are enabled for every poller. Re-enqueueing
 an explicitly failed turn remains opt-in per poller via
@@ -414,7 +417,11 @@ async def reconcile_failed_turns(
     For each turn-outcome event (since the last reconcile) whose
     ``source_id`` is still in-flight:
       * ``turn_completed`` → drop it (the item was processed OK).
-      * ``turn_failed``    → re-enqueue the stashed event, up to
+      * ``turn_failed`` with ``result_subtype=tool_budget_exhausted`` →
+        drop it without retry. The failure is deterministic under an
+        unchanged budget, so replay would repeat partial work and spend
+        another full budget (#983; #992/#994 own sizing/resumption).
+      * other ``turn_failed`` → re-enqueue the stashed event, up to
         ``max_attempts`` successful re-fires; once the cap is exceeded
         emit ``poller_turn_gave_up`` and drop it (wedge guard).
 
@@ -473,6 +480,18 @@ async def reconcile_failed_turns(
                 del inflight[source_id]
                 summary["completed"] += 1
             elif otype == "turn_failed":
+                # A tool-budget denial is not transient: the same event under
+                # the same configured budget will deterministically exhaust
+                # again, re-run partial side effects, and consume another full
+                # turn budget. Keep the failed classification for telemetry,
+                # but do not feed this subtype into generic poller recovery.
+                # Per-trigger sizing and durable resumption are tracked by
+                # #992/#994 respectively.
+                if rec.get("result_subtype") == "tool_budget_exhausted":
+                    del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 if not recover_failed_turns:
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)

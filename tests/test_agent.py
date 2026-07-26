@@ -1092,6 +1092,16 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
     assert payload["association"]["repo"] == "acme/demo"
     assert payload["association"]["worktree"] == str(repo.resolve())
     assert payload["turns"][-1]["turn_id"] == record.turn_id
+    assert record.result_subtype == "tool_budget_exhausted"
+    assert record.result_is_error is True
+    assert record.tool_call_count == 7
+    failed = [
+        ev for ev in _read_events(tmp_path)
+        if ev.get("type") == "turn_failed" and ev.get("turn_id") == record.turn_id
+    ]
+    assert len(failed) == 1
+    assert failed[0]["result_subtype"] == "tool_budget_exhausted"
+    assert failed[0]["tool_call_count"] == 7
     assert any(
         ev.get("type") == "worklink_continuation_created"
         for ev in _read_events(tmp_path)
@@ -1853,6 +1863,35 @@ async def test_turn_completed_emitted_for_successful_poller_turn(tmp_path: Path)
     assert ev.get("items") == items
     # Success ⇒ no failure event.
     assert [e for e in evs if e.get("type") == "turn_failed"] == []
+
+
+async def test_context_window_exceeded_emits_failed_poller_outcome(tmp_path: Path):
+    fake_agent = _FakeAgent(response_messages=[AIMessage(
+        content="",
+        response_metadata={"stop_reason": "model_context_window_exceeded"},
+    )])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="review PR #983",
+        source_id="poller:github-activity:983",
+    ))
+
+    assert record.result_subtype == "model_context_window_exceeded"
+    assert record.result_is_error is True
+    outcomes = [
+        ev for ev in _read_events(tmp_path)
+        if ev.get("type") in {"turn_failed", "turn_completed"}
+    ]
+    assert len(outcomes) == 1
+    assert outcomes[0]["type"] == "turn_failed"
+    assert outcomes[0]["result_subtype"] == "model_context_window_exceeded"
+    assert outcomes[0]["stop_reason"] == "model_context_window_exceeded"
 
 
 async def test_turn_completed_not_emitted_for_non_poller_turn(tmp_path: Path):
