@@ -16,8 +16,10 @@ from mimir.worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
     _default_runner,
+    consume_worklink_budget_continuations,
     maybe_create_worklink_budget_continuation,
 )
+from mimir.worklink.orchestrator import _runner_for_home
 from mimir.worklink.run_state import WorklinkRunState, save_run_state
 
 
@@ -48,6 +50,34 @@ class SpyRunner:
     @property
     def issue_comments(self) -> list[str]:
         return [argv[-1] for argv, _cwd in self.calls if argv[:3] == ["chainlink", "issue", "comment"]]
+
+
+class ContinuationConsumerRunner(SpyRunner):
+    def __init__(self, *, status: str = "open", labels: list[str] | None = None) -> None:
+        super().__init__()
+        self.status = status
+        self.labels = labels or ["worklink:ready"]
+        self.comments: list[str] = []
+
+    def __call__(
+        self,
+        args: Sequence[str],
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        argv = list(args)
+        self.calls.append((argv, cwd))
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            payload = {
+                "id": int(argv[3]),
+                "status": self.status,
+                "labels": self.labels,
+                "comments": self.comments,
+            }
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+        if argv[:3] == ["chainlink", "issue", "comment"]:
+            self.comments.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -390,6 +420,144 @@ def test_idempotent_same_work_item_updates_existing_artifact(tmp_path: Path) -> 
     assert len(runner.issue_comments) == 1
     assert payload["external_comment"]["posted"] is True
     assert payload["external_comment"]["skipped_reason"] == "already_posted"
+
+
+def test_chainlink_comment_uses_home_not_worktree(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-cwd")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-cwd", test_command="pytest")
+    event = _make_event(extra={"schedule_name": "worklink-continuation"})
+    runner = SpyRunner()
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=runner,
+    )
+
+    assert result is not None
+    [comment_call] = [call for call in runner.calls if call[0][:3] == ["chainlink", "issue", "comment"]]
+    assert comment_call[1] == home
+
+
+def test_runner_for_home_overrides_explicit_cwd_only_for_chainlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    worktree = tmp_path / "worktree"
+    calls: list[tuple[list[str], Path | None]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs.get("cwd")))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("mimir.worklink.orchestrator.subprocess.run", fake_run)
+    runner = _runner_for_home(home, "chainlink")
+
+    runner(["chainlink", "issue", "show", "740"], worktree)
+    runner(["git", "status", "--short"], worktree)
+
+    assert calls == [
+        (["chainlink", "issue", "show", "740"], home),
+        (["git", "status", "--short"], worktree),
+    ]
+
+
+def test_consumer_posts_once_and_marks_sidecar_actioned(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-consume")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-consume", test_command="pytest")
+    event = _make_event(trigger="user_message", source="slack")
+    producer = SpyRunner()
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=producer,
+    )
+    assert created is not None
+    consumer = ContinuationConsumerRunner()
+
+    first = consume_worklink_budget_continuations(home, runner=consumer)
+    second = consume_worklink_budget_continuations(home, runner=consumer)
+
+    assert len(first) == 1
+    assert second == []
+    assert len(consumer.comments) == 1
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["actioned_at"]
+    assert payload["external_comment"]["posted"] is True
+    assert all(
+        cwd == home
+        for argv, cwd in consumer.calls
+        if argv and argv[0] == "chainlink"
+    )
+
+
+def test_consumer_resolves_closed_issue_without_reaction(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-closed")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-closed", test_command="pytest")
+    event = _make_event(trigger="user_message", source="slack")
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=SpyRunner(),
+    )
+    assert created is not None
+    consumer = ContinuationConsumerRunner(status="closed", labels=[])
+
+    assert consume_worklink_budget_continuations(home, runner=consumer) == []
+
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["resolved_at"]
+    assert payload["resolved_reason"] == "issue_closed"
+    assert consumer.comments == []
+
+
+def test_consumer_treats_completed_evidence_as_terminal(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="chainlink-740-completed")
+    _save_run_state(home, issue_id=740, branch="chainlink-740-completed", test_command="pytest")
+    event = _make_event(trigger="user_message", source="slack")
+    created = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        repo=repo,
+        current_worktree=repo,
+        runner=SpyRunner(),
+    )
+    assert created is not None
+    evidence = home / "state" / "worklink" / "evidence" / "740-1.json"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text(
+        json.dumps({"status": "completed", "pr_url": "https://github.com/acme/demo/pull/1"}),
+        encoding="utf-8",
+    )
+    consumer = ContinuationConsumerRunner()
+
+    assert consume_worklink_budget_continuations(home, runner=consumer) == []
+
+    payload = json.loads(created.sidecar_path.read_text(encoding="utf-8"))
+    assert payload["resolved_reason"] == "completed_evidence"
+    assert not any(argv[:3] == ["chainlink", "issue", "show"] for argv, _ in consumer.calls)
 
 
 def test_untrusted_hints_do_not_drive_comment_or_path_inspection(tmp_path: Path) -> None:
