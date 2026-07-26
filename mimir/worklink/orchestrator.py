@@ -2346,10 +2346,12 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
-    def run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(args: Sequence[str] | str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if isinstance(args, str):
             return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
-        command_cwd = cwd if cwd is not None else (home if args and args[0] == chainlink_bin else None)
+        # Chainlink discovers its repository from cwd. Its configured home is
+        # authoritative even when a caller also supplies a backend worktree.
+        command_cwd = home if args and args[0] == chainlink_bin else cwd
         return subprocess.run(list(args), cwd=command_cwd, capture_output=True, text=True, check=False)
 
     return run

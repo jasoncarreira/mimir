@@ -65,7 +65,11 @@ def _ensure_mimir_import_path() -> None:
 
     exe = Path(sys.executable).resolve()
     venv_root = exe.parent.parent
-    candidates = []
+    # When running directly from a source checkout, keep the script and imported
+    # package on that same revision even if MIMIR_SOURCE_DIR points at another
+    # checkout. Installed copies fail the __init__.py probe and fall through.
+    script_path = globals().get("__file__")
+    candidates = [Path(script_path).resolve().parents[3]] if script_path else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
@@ -79,8 +83,12 @@ def _ensure_mimir_import_path() -> None:
             # Source checkout first, so ``import mimir`` resolves to the checked-out
             # code even when the poller is installed under <home>/skills.
             path = str(candidate)
-            if path not in sys.path:
-                sys.path.insert(0, path)
+            # It may already be present later in sys.path (notably when tests run
+            # a worktree script beside the primary checkout). Move, don't merely
+            # add, so script and imported package always come from one checkout.
+            while path in sys.path:
+                sys.path.remove(path)
+            sys.path.insert(0, path)
 
             # Production poller commands may run under system ``python3`` rather
             # than the mimir venv interpreter. In editable-source deployments the
@@ -109,6 +117,7 @@ from mimir.worklink.backends.feature_factory import (
     read_factory_run_state,
 )
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+from mimir.worklink.continuation import consume_worklink_budget_continuations
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 LIFECYCLE_RECONCILIATION_NAME = "worklink-lifecycle-reconciliation"
@@ -963,6 +972,24 @@ def main() -> int:
     repo = os.environ.get("WORKLINK_REPO")
     state_dir = Path(os.environ.get("STATE_DIR") or (home / "state" / "pollers" / POLLER_NAME))
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        continuation_actions = consume_worklink_budget_continuations(home)
+        for action in continuation_actions:
+            _emit({
+                "signal": "worklink_continuation",
+                "source_id": f"continuation:{action.idempotency_key}",
+                "issue_id": action.issue_id,
+                "pr_url": action.pr_url,
+                "occurrences": action.occurrences,
+                "sidecar": str(action.sidecar_path),
+                "routing_instructions": (
+                    "Resume the unfinished Worklink item from its durable sidecar. "
+                    "Check current issue, PR, and evidence state before taking action."
+                ),
+            })
+    except Exception as exc:
+        _emit({"signal": "worklink_continuation_consumer_error", "reason": str(exc)})
 
     if repo:
         try:

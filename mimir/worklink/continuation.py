@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -36,6 +36,7 @@ _MAX_EXTERNAL_COMMAND_LEN = 160
 _MAX_LABEL_ACTIONS = 5
 _MAX_LABEL_ACTION_LEN = 80
 _EXTERNAL_COMMAND_TIMEOUT_SECONDS = 15
+_CONTINUATION_RETENTION = timedelta(days=30)
 
 _RUN_ID_RE = re.compile(r"\bchainlink-\d+\b", re.IGNORECASE)
 _PR_URL_RE = re.compile(r"https?://github\.com/[^\s)]+/pull/\d+", re.IGNORECASE)
@@ -123,6 +124,17 @@ class WorklinkContinuationResult:
     sidecar_path: Path
     idempotency_key: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WorklinkContinuationAction:
+    """One unresolved sidecar claimed by the deterministic Worklink poller."""
+
+    sidecar_path: Path
+    idempotency_key: str
+    issue_id: int | None
+    pr_url: str | None
+    occurrences: int
 
 
 def continuations_dir(home: Path) -> Path:
@@ -311,6 +323,10 @@ def maybe_create_worklink_budget_continuation(
 
     path = continuation_sidecar_path(home, idempotency_key)
     existing = _load_json_dict(path)
+    # A later exhaustion after work landed is a new occurrence window. Reuse the
+    # stable filename, but not the old window's comment/action dedupe state.
+    if existing and existing.get("resolved_at"):
+        existing = None
     created_at = _truncate_str(existing.get("created_at"), 64) if existing else None
     existing_turns = existing.get("turns") if isinstance(existing, dict) else None
     turns = _merge_turns(
@@ -365,6 +381,9 @@ def maybe_create_worklink_budget_continuation(
             "labels_or_status_changes_needed": label_actions,
         },
         "external_comment": _initial_external_comment(existing_comment),
+        "actioned_at": _truncate_str(existing.get("actioned_at"), 64) if existing else None,
+        "resolved_at": None,
+        "resolved_reason": None,
         "label_status_mutated": False,
     }
 
@@ -402,6 +421,94 @@ def maybe_create_worklink_budget_continuation(
     return WorklinkContinuationResult(sidecar_path=path, idempotency_key=idempotency_key, payload=payload)
 
 
+def consume_worklink_budget_continuations(
+    home: Path,
+    *,
+    chainlink_bin: str = "chainlink",
+    gh_bin: str = "gh",
+    runner: Runner | None = None,
+    now: datetime | None = None,
+    retention: timedelta = _CONTINUATION_RETENTION,
+) -> list[WorklinkContinuationAction]:
+    """Claim unresolved sidecars once and reap them after terminal resolution.
+
+    This is intentionally a deterministic Worklink process, not an agent tool:
+    it has only the fixed Chainlink comment/status operations below and does not
+    grant an admin capability to the service principal whose turn exhausted its
+    budget. Terminal-state reads fail closed, preventing a stale continuation
+    from re-running already completed work when Chainlink is unavailable.
+    """
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    run = runner or _runner_from_home(home, chainlink_bin)
+    actions: list[WorklinkContinuationAction] = []
+    root = continuations_dir(home)
+    if not root.is_dir():
+        return actions
+
+    for path in sorted(root.glob("*.json")):
+        payload = _load_json_dict(path)
+        if not payload or payload.get("kind") != CONTINUATION_KIND:
+            continue
+
+        resolved_at = _parse_datetime(payload.get("resolved_at"))
+        if resolved_at is not None:
+            if current - resolved_at >= retention:
+                _unlink_best_effort(path)
+            continue
+
+        terminal_reason, check_error, issue_payload = _continuation_terminal_state(
+            home=home,
+            payload=payload,
+            chainlink_bin=chainlink_bin,
+            gh_bin=gh_bin,
+            runner=run,
+        )
+        payload["last_checked_at"] = current.isoformat()
+        payload["consumer_error"] = _truncate_str(check_error, 300)
+        if terminal_reason is not None:
+            payload["resolved_at"] = current.isoformat()
+            payload["resolved_reason"] = terminal_reason
+            atomic_write_json(path, payload)
+            continue
+        if check_error is not None:
+            atomic_write_json(path, payload)
+            continue
+
+        actioned_at = _parse_datetime(payload.get("actioned_at"))
+        if actioned_at is not None:
+            if current - actioned_at >= retention:
+                payload["resolved_at"] = current.isoformat()
+                payload["resolved_reason"] = "manual_triage_timeout"
+            atomic_write_json(path, payload)
+            continue
+
+        payload["external_comment"] = _post_consumer_comment(
+            payload=payload,
+            existing_comment=payload.get("external_comment"),
+            issue_payload=issue_payload,
+            home=home,
+            chainlink_bin=chainlink_bin,
+            gh_bin=gh_bin,
+            runner=run,
+            posted_at=current.isoformat(),
+        )
+        payload["actioned_at"] = current.isoformat()
+        atomic_write_json(path, payload)
+
+        association = payload.get("association")
+        association = association if isinstance(association, Mapping) else {}
+        issue_id = association.get("issue_id")
+        actions.append(WorklinkContinuationAction(
+            sidecar_path=path,
+            idempotency_key=str(payload.get("idempotency_key") or path.stem),
+            issue_id=int(issue_id) if isinstance(issue_id, int) else None,
+            pr_url=_truncate_str(association.get("pr_url"), 400),
+            occurrences=_positive_int(payload.get("occurrences"), default=1),
+        ))
+    return actions
+
+
 def _default_runner(
     args: Sequence[str],
     cwd: Path | None = None,
@@ -422,6 +529,186 @@ def _default_runner(
         timeout_msg = f"command timed out after {_EXTERNAL_COMMAND_TIMEOUT_SECONDS}s"
         stderr = f"{stderr}\n{timeout_msg}" if stderr else timeout_msg
         return subprocess.CompletedProcess(argv, 124, stdout=stdout, stderr=stderr)
+
+
+def _runner_from_home(home: Path, chainlink_bin: str) -> Runner:
+    def run(args: Sequence[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        argv = list(args)
+        command_cwd = home if argv and argv[0] == chainlink_bin else cwd
+        return _default_runner(argv, command_cwd)
+
+    return run
+
+
+def _continuation_terminal_state(
+    *,
+    home: Path,
+    payload: Mapping[str, Any],
+    chainlink_bin: str,
+    gh_bin: str,
+    runner: Runner,
+) -> tuple[str | None, str | None, Mapping[str, Any] | None]:
+    association = payload.get("association")
+    association = association if isinstance(association, Mapping) else {}
+    issue_id = association.get("issue_id")
+    pr_url = _normalize_pr_url(association.get("pr_url"))
+
+    if isinstance(issue_id, int) and _has_completed_evidence(home, issue_id):
+        return "completed_evidence", None, None
+
+    issue_payload: Mapping[str, Any] | None = None
+    if isinstance(issue_id, int):
+        result = runner([chainlink_bin, "issue", "show", str(issue_id), "--json"], home)
+        if result.returncode != 0:
+            return None, (result.stderr or result.stdout).strip() or "issue_status_failed", None
+        try:
+            decoded = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return None, "issue_status_invalid_json", None
+        if not isinstance(decoded, Mapping):
+            return None, "issue_status_invalid_shape", None
+        issue_payload = decoded
+        status = str(decoded.get("status") or decoded.get("state") or "").strip().lower()
+        if status in {"closed", "done", "completed"} or decoded.get("closed_at"):
+            return "issue_closed", None, issue_payload
+        labels = {
+            str(item.get("name") if isinstance(item, Mapping) else item)
+            for item in decoded.get("labels") or ()
+        }
+        if "worklink:review" in labels:
+            return "work_landed_for_review", None, issue_payload
+        comments = decoded.get("comments") or ()
+        if any(
+            "WORKLINK_EVIDENCE" in _comment_text_value(comment)
+            and "status=completed" in _comment_text_value(comment)
+            and "review_ready=true" in _comment_text_value(comment)
+            for comment in comments
+        ):
+            return "completed_attempt", None, issue_payload
+
+    if pr_url is not None:
+        result = runner([gh_bin, "pr", "view", pr_url, "--json", "state"], home)
+        if result.returncode == 0:
+            try:
+                decoded = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError:
+                decoded = {}
+            state = str(decoded.get("state") or "").strip().upper() if isinstance(decoded, Mapping) else ""
+            if state == "MERGED":
+                return "pr_merged", None, issue_payload
+            if state == "CLOSED":
+                return "pr_closed", None, issue_payload
+        elif issue_payload is None:
+            return None, (result.stderr or result.stdout).strip() or "pr_status_failed", None
+
+    if issue_payload is None and pr_url is None:
+        return None, "no_validated_target", None
+    return None, None, issue_payload
+
+
+def _post_consumer_comment(
+    *,
+    payload: Mapping[str, Any],
+    existing_comment: Any,
+    issue_payload: Mapping[str, Any] | None,
+    home: Path,
+    chainlink_bin: str,
+    gh_bin: str,
+    runner: Runner,
+    posted_at: str,
+) -> dict[str, Any]:
+    state = _initial_external_comment(existing_comment)
+    if state.get("posted"):
+        return state
+    association = payload.get("association")
+    association = association if isinstance(association, Mapping) else {}
+    issue_id = association.get("issue_id")
+    pr_url = _normalize_pr_url(association.get("pr_url"))
+    idempotency_key = str(payload.get("idempotency_key") or "")
+    prior_comments = issue_payload.get("comments") or () if issue_payload else ()
+    if idempotency_key and any(idempotency_key in _comment_text_value(item) for item in prior_comments):
+        state.update({
+            "posted": True,
+            "attempted": True,
+            "posted_at": posted_at,
+            "skipped_reason": "already_posted",
+            "error": None,
+        })
+        return state
+
+    comment = _render_external_comment(payload)
+    if isinstance(issue_id, int):
+        argv = [chainlink_bin, "issue", "comment", str(issue_id), comment]
+        command = argv[:4]
+        target, target_ref = "issue", str(issue_id)
+    elif pr_url is not None:
+        argv = [gh_bin, "pr", "comment", pr_url, "--body", comment]
+        command = argv[:4]
+        target, target_ref = "pr", pr_url
+    else:
+        state["skipped_reason"] = "no_validated_target"
+        return state
+    result = runner(argv, home)
+    state.update({
+        "attempted": True,
+        "posted": result.returncode == 0,
+        "target": target,
+        "target_ref": target_ref,
+        "command": command,
+        "skipped_reason": None,
+        "error": None,
+    })
+    if result.returncode == 0:
+        state["posted_at"] = posted_at
+    else:
+        state["error"] = _truncate_str(
+            (result.stderr or result.stdout).strip() or "comment_failed", 300,
+        )
+    return state
+
+
+def _has_completed_evidence(home: Path, issue_id: int) -> bool:
+    root = home / "state" / "worklink" / "evidence"
+    for path in sorted(root.glob(f"{issue_id}-*.json")) if root.is_dir() else ():
+        evidence = _load_json_dict(path)
+        if evidence and evidence.get("status") == "completed" and evidence.get("pr_url"):
+            return True
+    return False
+
+
+def _comment_text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        return str(value.get("content") or value.get("text") or value.get("body") or "")
+    return ""
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _unlink_best_effort(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _resolve_existing_dir(path: Path | None) -> Path | None:
@@ -930,7 +1217,9 @@ def _handle_external_comment(
         if target == "issue"
         else [gh_bin, "pr", "comment", str(pr_url), "--body", comment]
     )
-    result = runner(argv, cwd or home)
+    # Chainlink discovers its tracker from cwd; GitHub CLI calls may continue to
+    # use the associated worktree for their normal repository context.
+    result = runner(argv, home if target == "issue" else (cwd or home))
     state["attempted"] = True
     state["target"] = target
     state["target_ref"] = target_ref
