@@ -174,6 +174,7 @@ def test_cache_hit_rate_excludes_output_from_denom():
 
 
 def test_context_window_known_models():
+    assert context_window_for("claude-opus-5") == 1_000_000
     assert context_window_for("claude-opus-4-7") == 200_000
     assert context_window_for("claude-opus-4-7[1m]") == 1_000_000
     assert context_window_for("claude-sonnet-4-6") == 200_000
