@@ -2482,6 +2482,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     repo = tmp_path / "repo"
     repo.mkdir()
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", str(repo))
     service = ServicePrincipal(
         canonical="poller:factory",
         trigger="poller",
@@ -2492,7 +2493,9 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
             ServiceSinkPolicy(
                 "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
             ),
-            ServiceSinkPolicy("spawn_open_code", "exact_roots", f'["{repo}"]'),
+            ServiceSinkPolicy(
+                "spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+            ),
         ),
         capability_tier=CapabilityTier.CODE_EXECUTION,
     )

@@ -1011,39 +1011,6 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
         return False
 
 
-def _target_within_exact_roots(target: str, destination: str) -> bool:
-    """Confine a service write to safe paths under roots frozen in its grant."""
-    from ._paths import PathOutsideHomeError, resolve_within_roots
-
-    if not Path(target).is_absolute():
-        return False
-    try:
-        raw = json.loads(destination)
-        if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
-            return False
-        roots = [Path(p).resolve() for p in raw]
-        candidate = Path(target)
-        lexical_relatives = tuple(
-            candidate.relative_to(root)
-            for root in roots
-            if candidate == root or candidate.is_relative_to(root)
-        )
-        if any(WriteResourceAdapter._is_protected_path(path) for path in lexical_relatives):
-            return False
-        resolved = resolve_within_roots(roots, target)
-        relative = next(
-            resolved.relative_to(root)
-            for root in roots
-            if resolved == root or resolved.is_relative_to(root)
-        )
-    except (
-        json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError,
-        StopIteration, ValueError,
-    ):
-        return False
-    return not WriteResourceAdapter._is_protected_path(relative)
-
-
 def _target_within_trigger_service_write_roots(target: str, destination: str) -> bool:
     """Confine dynamic trigger writes to frozen roots and safe home data paths."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
@@ -1154,7 +1121,6 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
-    "exact_roots": _target_within_exact_roots,
     "trigger_service_write_roots": _target_within_trigger_service_write_roots,
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
