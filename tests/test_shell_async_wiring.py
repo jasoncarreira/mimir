@@ -64,9 +64,14 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
 
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
-        on_complete=None, auth_context=None,
+        on_complete=None, auth_context=None, env_overlay=None,
     ) -> _FakeJob:
-        spawned.append({"command": command, "argv": argv, "channel_id": channel_id})
+        spawned.append({
+            "command": command,
+            "argv": argv,
+            "channel_id": channel_id,
+            "env_overlay": env_overlay,
+        })
         return _FakeJob(command=command, channel_id=channel_id)
 
     monkeypatch.setattr(reg, "spawn", _fake_spawn)
@@ -92,6 +97,20 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
     assert argv[2].endswith("\nsleep 5")  # original command preserved verbatim
     # The recorded command (for display) stays the clean original.
     assert fake_registry._spawned_log[0]["command"] == "sleep 5"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_direct_pytest_unsets_inherited_injection(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    await shell_async.bash_async.coroutine(  # type: ignore[misc]
+        command="pytest tests",
+        mimir_direct_argv=["pytest", "tests"],
+    )
+
+    overlay = fake_registry._spawned_log[0]["env_overlay"]  # type: ignore[attr-defined]
+    assert overlay["PYTEST_ADDOPTS"] is None
+    assert overlay["PYTEST_PLUGINS"] is None
 
 
 @pytest.mark.asyncio
@@ -557,9 +576,14 @@ def fake_registry_with_channel(
 
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
-        on_complete=None, auth_context=None,
+        on_complete=None, auth_context=None, env_overlay=None,
     ) -> _FakeJob:
-        spawned.append({"command": command, "argv": argv, "channel_id": channel_id})
+        spawned.append({
+            "command": command,
+            "argv": argv,
+            "channel_id": channel_id,
+            "env_overlay": env_overlay,
+        })
         return _FakeJob(command=command, channel_id=channel_id, job_id="j_new")
 
     monkeypatch.setattr(reg, "spawn", _fake_spawn)

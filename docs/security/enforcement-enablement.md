@@ -291,7 +291,33 @@ capability — under it a research poller could overwrite **another poller's
 file/state capability must resolve to a **specific, per-trigger root derived from
 operator config** — e.g. `state/pollers/<name>/…` and/or explicitly named
 knowledge roots — **not** reuse of the global writable roots, and it must not be
-able to write another trigger's authority/config.
+able to write another trigger's authority/config. Repo-working pollers are the
+explicit exception for configured external repository roots, as described below.
+
+**Repository-review execution profile.** A poller using the built-in `github`
+authority profile is explicitly repo-working. Its `shell_exec` and `bash_async`
+sinks use `shell_profile=repo_review`, while research and custom pollers retain
+`scheduler_read_only`. `repo_review` is a command-shape allow-list for the
+operations observed in review turns: bounded `gh pr view/diff/checks`, Git
+status/log/diff/fetch/checkout, `npm ci --ignore-scripts`, `npm test`/`npm run
+test`, and pytest (directly or as `uv run pytest`) with a narrow selection and
+reporting option allow-list plus relative collection paths. It excludes pytest
+plugin/config/debugger controls such as `-p`, `-c`, `-o`, `--rootdir`, and
+`--pdb`, rejects response files and absolute/traversing collection paths, and scrubs
+`PYTEST_ADDOPTS`/`PYTEST_PLUGINS` for direct execution. It does not admit shell
+launchers, arbitrary interpreters, `spawn_*`, `rm`, Git push/history/config
+mutation, GitHub credential mutation, or open-ended package install/update
+commands. `npm ci --ignore-scripts` is the one declared dependency-materialization
+command because a clean install is part of the repository test contract; lifecycle
+scripts and other network-installing package operations remain denied.
+
+Repo-working principals freeze the explicit `:rw` entries from
+`MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside the trigger's state
+root. The exact-root adapter still rejects paths outside those roots, read-only
+configured roots, relative targets, symlink escapes, and the protected write
+surfaces from #970 (`.env`, configuration, credentials, identities, secrets,
+prompts, and memory core). Thus repository access does not widen access to Mimir
+home or operator authority material.
 
 ### 5.2 `#906` becomes tier-based (defer to containment)
 

@@ -317,7 +317,7 @@ async def bash_async(
                 )
 
     try:
-        from ._shell_env import direct_exec_env, login_shell_command
+        from ._shell_env import direct_exec_env_overlay, login_shell_command
         argv = (
             mimir_direct_argv
             if mimir_direct_argv is not None
@@ -330,7 +330,7 @@ async def bash_async(
             "auth_context": auth_context,
         }
         if mimir_direct_argv is not None:
-            spawn_kwargs["env_overlay"] = direct_exec_env()
+            spawn_kwargs["env_overlay"] = direct_exec_env_overlay(argv)
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,

@@ -473,7 +473,8 @@ def build_trigger_service_principal(
                 operation, "exact_roots", json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
-            policies.append(ServiceSinkPolicy(operation, "shell_profile", "scheduler_read_only"))
+            shell_profile = "repo_review" if profile == "github" else "scheduler_read_only"
+            policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
         elif operation == "worklink_run":
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url" and profile == "heartbeat":
@@ -680,7 +681,7 @@ def resolve_configured_write_target(target: str) -> Path:
     return resolve_within_roots(_configured_file_write_roots(), target)
 
 
-_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[],*?~\n\r")
+_SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[]*?\n\r")
 
 
 def _arguments_match_allowlist(
@@ -813,6 +814,146 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     )
 
 
+def _target_matches_pytest_command(arguments: list[str]) -> bool:
+    """Admit bounded pytest selection/reporting options and relative test paths.
+
+    Pytest executes repository test code by design, but its wider option surface
+    can also import arbitrary plugins, redirect configuration, or open an
+    interactive debugger. Keep that control plane out of autonomous reviews.
+    """
+    flag_options = frozenset({
+        "-q", "-x", "-s", "-v", "-vv", "--collect-only",
+        "--disable-warnings", "--exitfirst", "--failed-first", "--last-failed",
+        "--no-header", "--no-summary", "--quiet", "--strict-config",
+        "--strict-markers", "--verbose",
+    })
+    value_options = frozenset({
+        "-k", "-m", "--capture", "--color", "--durations",
+        "--durations-min", "--maxfail", "--show-capture", "--tb",
+    })
+    option_prefixes = (
+        "--capture=", "--color=", "--durations=", "--durations-min=",
+        "--maxfail=", "--show-capture=", "--tb=",
+    )
+
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        # Pytest expands ``@file`` response operands after authorization. A
+        # response file could therefore smuggle any denied option into argv.
+        if argument.startswith("@"):
+            return False
+        if argument in flag_options or argument.startswith(option_prefixes):
+            index += 1
+            continue
+        if argument in value_options:
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if argument == "--" or argument.startswith("-"):
+            return False
+
+        # Collection operands may include a node id after ``::``. Keep their
+        # filesystem component lexical and relative so pytest cannot discover
+        # config/conftest/plugin code from an unrelated host tree.
+        path_text = argument.split("::", 1)[0]
+        path = Path(path_text)
+        if path.is_absolute() or ".." in path.parts:
+            return False
+        index += 1
+    return True
+
+
+def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
+    """Require a script-free clean install with no operands or option terminator."""
+    allowed_options = frozenset({
+        "--ignore-scripts", "--include=dev", "--no-audit", "--no-fund",
+        "--omit=optional", "--prefer-offline",
+    })
+    return (
+        arguments.count("--ignore-scripts") == 1
+        and all(argument in allowed_options for argument in arguments)
+    )
+
+
+def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
+    """Validate commands needed to inspect and test a trusted repository PR."""
+    if _target_matches_read_only_shell_command(argv):
+        return True
+    if not argv:
+        return False
+
+    if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
+        subcommand = argv[2]
+        options = {
+            "view": frozenset({"--comments", "--json", "--jq", "--repo", "--template"}),
+            "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
+            "checks": frozenset({
+                "--fail-fast", "--interval", "--json", "--jq", "--repo",
+                "--required", "--watch",
+            }),
+        }.get(subcommand)
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options,
+        )
+
+    if argv[0] == "git" and len(argv) >= 2:
+        subcommand = argv[1]
+        arguments = argv[2:]
+        if subcommand in {"diff", "log", "show"}:
+            return _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                    "--exit-code", "--full-index", "--name-only", "--name-status",
+                    "--no-color", "--no-ext-diff", "--no-merges", "--no-patch",
+                    "--no-textconv", "--oneline", "--quiet", "--raw", "--stat",
+                    "--staged",
+                }),
+                option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+            )
+        if subcommand == "fetch":
+            if not _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({
+                    "--append", "--atomic", "--dry-run", "--no-tags", "--prune",
+                    "--quiet", "--tags", "--verbose",
+                }),
+                option_prefixes=("--depth=", "--deepen=", "--filter="),
+            ):
+                return False
+            operands = [argument for argument in arguments if not argument.startswith("-")]
+            # A URL or ext:: remote can select a helper executable. Review
+            # fetches use only the checkout's conventional configured remotes.
+            return not operands or operands[0] in {"origin", "upstream"}
+        if subcommand == "checkout":
+            return _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({
+                    "--detach", "--guess", "--no-guess", "--no-overlay", "--overlay",
+                    "--progress", "--quiet",
+                }),
+            )
+        return False
+
+    if argv[0] == "npm":
+        if argv[1:2] == ["ci"]:
+            return _target_matches_npm_ci_command(argv[2:])
+        if argv[1:2] == ["test"] or argv[1:3] == ["run", "test"]:
+            return _arguments_match_allowlist(
+                argv[2:] if argv[1] == "test" else argv[3:],
+                exact_options=frozenset({"--if-present", "--ignore-scripts"}),
+            )
+        return False
+
+    if argv[0] == "pytest":
+        return _target_matches_pytest_command(argv[1:])
+    if argv[:3] == ["uv", "run", "pytest"]:
+        return _target_matches_pytest_command(argv[3:])
+    return False
+
+
 def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
     """Return the exact argv admitted by a trusted service shell profile.
 
@@ -829,10 +970,16 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
         return None
     if not argv:
         return None
+    # A leading tilde is shell home expansion; an embedded tilde such as
+    # ``HEAD~1`` is a normal Git revision expression and is passed literally.
+    if any(argument.startswith("~") for argument in argv):
+        return None
 
     allowed = False
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
+    elif destination == "repo_review":
+        allowed = _target_matches_repo_review_shell_command(argv)
     elif destination == "upgrade_workspace":
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
@@ -858,7 +1005,7 @@ def _target_matches_worklink_repo(target: str, destination: str) -> bool:
 
 
 def _target_within_exact_roots(target: str, destination: str) -> bool:
-    """Confine a service write to the absolute roots frozen in its grant."""
+    """Confine a service write to safe paths under roots frozen in its grant."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
     if not Path(target).is_absolute():
@@ -867,10 +1014,27 @@ def _target_within_exact_roots(target: str, destination: str) -> bool:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
-        resolve_within_roots([Path(p) for p in raw], target)
-    except (json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError):
+        roots = [Path(p).resolve() for p in raw]
+        candidate = Path(target)
+        lexical_relatives = tuple(
+            candidate.relative_to(root)
+            for root in roots
+            if candidate == root or candidate.is_relative_to(root)
+        )
+        if any(WriteResourceAdapter._is_protected_path(path) for path in lexical_relatives):
+            return False
+        resolved = resolve_within_roots(roots, target)
+        relative = next(
+            resolved.relative_to(root)
+            for root in roots
+            if resolved == root or resolved.is_relative_to(root)
+        )
+    except (
+        json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError,
+        StopIteration, ValueError,
+    ):
         return False
-    return True
+    return not WriteResourceAdapter._is_protected_path(relative)
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
