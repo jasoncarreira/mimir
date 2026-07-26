@@ -169,24 +169,40 @@ def test_shell_exec_surfaces_bash_syntax_error():
     assert "shell-parse error" not in result  # the shlex path is gone
 
 
-# ─── trusted PATH (login_shell_command) ──────────────────────────────
+# ─── trusted system tools + venv-bin fallback on PATH ────────────────
 
 
-def test_login_shell_command_sets_fixed_trusted_path():
-    """The post-profile PATH must not inherit an agent-writable directory."""
+def test_login_shell_command_puts_system_tools_before_venv_bin():
+    """The free-form login shell keeps ``mimir`` and venv Python reachable.
+
+    Root-owned system directories come first so an agent-writable virtualenv
+    cannot shadow tools such as Git or GitHub CLI.
+    """
+    import os
+    import sys
+
     from mimir.tools._shell_env import _TRUSTED_PATH, login_shell_command
 
-    cmd = "git status"
+    cmd = "mimir reflection introspection-report --days 7"
     wrapped = login_shell_command(cmd)
+    venv_bin = os.path.dirname(sys.executable)
+    expected_path = os.pathsep.join((_TRUSTED_PATH, venv_bin))
 
-    assert wrapped.startswith(f"export PATH={_TRUSTED_PATH}")
+    assert wrapped.startswith(f"export PATH={expected_path}")
+    assert expected_path.split(os.pathsep)[-1] == venv_bin
     # The original command is preserved verbatim at the tail.
     assert wrapped.endswith("\n" + cmd)
 
 
-def test_shell_exec_sets_fixed_trusted_path():
-    """The login-shell path is replaced after the profile initializes it."""
+def test_shell_exec_puts_venv_bin_after_system_tools_on_path():
+    """End-to-end: login initialization cannot drop the venv fallback."""
+    import os
+    import sys
+
     from mimir.tools._shell_env import _TRUSTED_PATH
 
+    venv_bin = os.path.dirname(sys.executable)
+    expected_path = os.pathsep.join((_TRUSTED_PATH, venv_bin))
     out = shell_exec.invoke({"command": 'echo "PATHCHECK:$PATH"'})
-    assert f"PATHCHECK:{_TRUSTED_PATH}" in out
+
+    assert f"PATHCHECK:{expected_path}" in out

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 from pathlib import Path
-
 
 _TRUSTED_PATH_DIRS = (
     "/usr/local/sbin",
@@ -24,8 +24,18 @@ _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
 
 
 def login_shell_command(command: str) -> str:
-    """Wrap an interactive/admin command with the deployment's trusted PATH."""
-    return f"export PATH={shlex.quote(_TRUSTED_PATH)}\n{command}"
+    """Wrap an interactive/admin command with system tools before the venv bin.
+
+    The free-form login-shell path needs the environment's ``mimir`` console
+    script and Python interpreter. Append that directory after the fixed,
+    root-owned tool directories so it remains reachable without being able to
+    shadow system tools such as Git or GitHub CLI.
+    """
+    venv_bin = os.path.dirname(sys.executable or "")
+    path = os.pathsep.join(
+        part for part in (_TRUSTED_PATH, venv_bin) if part
+    )
+    return f"export PATH={shlex.quote(path)}\n{command}"
 
 
 def _is_pytest_argv(argv: list[str] | None) -> bool:
