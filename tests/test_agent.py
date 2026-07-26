@@ -3594,12 +3594,9 @@ async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
 
 
 def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
-    """claude-code stays unavailable unless its adapter can install the
-    PreToolUse budget/prohibited-action enforcement hook."""
+    """claude-code stays unavailable when its adapter cannot be imported."""
     import sys
-    import types
 
-    from mimir import _langchain_claude_code_patches as lcc_patches
     from mimir import providers
     from mimir.agent import _resolve_model
     from mimir.providers import ClaudeCodeAuthStatus
@@ -3610,19 +3607,12 @@ def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):
         "claude_code_auth_status",
         lambda **_kw: ClaudeCodeAuthStatus(True, "test auth ok", ""),
     )
-    fake_lcc = types.ModuleType("langchain_claude_code")
-    fake_lcc.ChatClaudeCode = lambda **_kwargs: "SHOULD_NOT_CONSTRUCT"
-    monkeypatch.setitem(sys.modules, "langchain_claude_code", fake_lcc)
-    monkeypatch.setattr(
-        lcc_patches,
-        "langchain_claude_code_adapter_compatibility",
-        lambda *_args, **_kwargs: lcc_patches.AdapterCompatibility(
-            False, "test adapter unavailable"
-        ),
-    )
+    monkeypatch.setitem(sys.modules, "langchain_claude_code", None)
     with pytest.raises(ImportError) as excinfo:
         _resolve_model("claude-code:claude-sonnet-4-6")
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
     msg = str(excinfo.value)
+    assert "requires the 'claude-code' extra" in msg
     assert "mimir-agent[claude-code]" in msg
     assert "claude setup-token" in msg
     assert "claude -p 'ping'" in msg
@@ -3659,8 +3649,10 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
         lambda *_args, **_kwargs: None,
     )
 
+    enforcement_error = RuntimeError("test enforcement hook unavailable")
+
     def _fail_enforcement(*_args, **_kwargs):
-        raise RuntimeError("Claude Code PreToolUse enforcement hook unavailable")
+        raise enforcement_error
 
     monkeypatch.setattr(
         "mimir._langchain_claude_code_patches.ensure_tool_enforcement_hooks_installed",
@@ -3671,8 +3663,9 @@ def test_resolve_model_claude_code_home_dotenv_requires_enforcement(
         encoding="utf-8",
     )
     cfg = Config.from_env()
-    with pytest.raises((ImportError, RuntimeError), match="PreToolUse"):
+    with pytest.raises(RuntimeError) as excinfo:
         resolve_model_from_config(cfg)
+    assert excinfo.value is enforcement_error
 
 
 # ─── chainlink #508: deliver: failure notice on EARLY-phase crash ────
