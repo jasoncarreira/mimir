@@ -2515,6 +2515,16 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    if command.startswith("/usr/local/bin/chainlink"):
+        import mimir.access_control as access_control
+
+        chainlink = tmp_path / "chainlink"
+        chainlink.write_text("", encoding="utf-8")
+        monkeypatch.setitem(
+            access_control._MAINTENANCE_PINNED_EXECUTABLES,
+            "/usr/local/bin/chainlink",
+            chainlink,
+        )
     service = get_service_principal("scheduled_tick")
     assert service is not None
 
@@ -2530,6 +2540,61 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         "bash_async", "shell_profile", "maintenance",
     )
     assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "command_key"),
+    [
+        ("gh pr list --state open", "gh"),
+        ("ls -la", "ls"),
+        ("grep -n needle sample.txt", "grep"),
+        ("wc -l sample.txt", "wc"),
+        ("pwd -P", "pwd"),
+        ("jq -r .name sample.json", "jq"),
+        ("rg --no-config -n needle .", "rg"),
+        (
+            "/usr/local/bin/chainlink issue ready --json",
+            "/usr/local/bin/chainlink",
+        ),
+    ],
+)
+def test_maintenance_shell_returns_pinned_execution_argv(
+    command: str,
+    command_key: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    executable = tmp_path / command_key.rsplit("/", 1)[-1]
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setitem(
+        access_control._MAINTENANCE_PINNED_EXECUTABLES,
+        command_key,
+        executable,
+    )
+
+    argv = parse_service_shell_argv(command, "maintenance")
+
+    assert argv is not None
+    assert argv[0] == str(executable)
+    assert Path(argv[0]).is_absolute()
+
+
+def test_maintenance_shell_fails_loudly_when_pinned_executable_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import mimir.access_control as access_control
+
+    missing = Path("/definitely-missing/gh")
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "gh", missing)
+
+    with caplog.at_level("ERROR", logger="mimir.access_control"):
+        assert parse_service_shell_argv("gh pr list --state open", "maintenance") is None
+
+    assert "maintenance_pinned_executable_missing" in caplog.text
+    assert str(missing) in caplog.text
 
 
 @pytest.mark.parametrize(

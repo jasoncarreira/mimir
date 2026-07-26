@@ -982,7 +982,18 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     return False
 
 
-_MAINTENANCE_GIT_EXECUTABLE = "/usr/bin/git"
+_MAINTENANCE_PINNED_EXECUTABLES = {
+    "git": Path("/usr/bin/git"),
+    "gh": Path("/usr/bin/gh"),
+    "ls": Path("/usr/bin/ls"),
+    "grep": Path("/usr/bin/grep"),
+    "wc": Path("/usr/bin/wc"),
+    "pwd": Path("/usr/bin/pwd"),
+    "jq": Path("/usr/bin/jq"),
+    "rg": Path("/usr/bin/rg"),
+    "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
+}
+_MAINTENANCE_GIT_EXECUTABLE = str(_MAINTENANCE_PINNED_EXECUTABLES["git"])
 _MAINTENANCE_GIT_BASE_OVERRIDES = (
     "-c", "core.fsmonitor=",
     "-c", "core.hooksPath=/dev/null",
@@ -1083,6 +1094,8 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     """
     if not argv or argv[0] != "git":
         return None
+    if _maintenance_pinned_execution_argv(["git"]) is None:
+        return None
 
     arguments = argv[1:]
     requested_root: str | None = None
@@ -1171,6 +1184,34 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     return execution_argv
 
 
+def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+    """Replace an admitted maintenance command with a trusted absolute binary.
+
+    Maintenance commands execute with ``shell=False``, but a bare ``argv[0]``
+    would still be selected through PATH. The runtime PATH begins with the
+    project virtualenv, which can sit under a service-writable root, so bind
+    every admitted executable to a fixed regular file before authorization.
+    Missing, symlinked, or replaced binaries are environment drift and fail
+    closed with a distinct log fingerprint rather than falling back to PATH.
+    """
+    if not argv:
+        return None
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(argv[0])
+    if expected is None:
+        return None
+    try:
+        resolved = expected.resolve(strict=True)
+        if resolved != expected or not expected.is_file():
+            raise OSError("expected a non-symlink regular file")
+    except (OSError, RuntimeError) as exc:
+        log.error(
+            "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
+            argv[0], expected, exc,
+        )
+        return None
+    return [str(expected), *argv[1:]]
+
+
 def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
     """Validate read/inspection commands used by scheduled maintenance."""
     if _target_matches_read_only_shell_command(argv):
@@ -1208,11 +1249,6 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
 
     chainlink_command = argv[0]
     if chainlink_command != "/usr/local/bin/chainlink":
-        return False
-    try:
-        if Path(chainlink_command).resolve(strict=True) != Path(chainlink_command):
-            return False
-    except (OSError, RuntimeError):
         return False
     if argv[1:2] == ["issue"] and len(argv) >= 3:
         subcommand = argv[2]
@@ -1256,7 +1292,8 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
     elif destination == "maintenance":
         if argv[0] == "git":
             return _maintenance_git_execution_argv(argv)
-        allowed = _target_matches_maintenance_shell_command(argv)
+        if _target_matches_maintenance_shell_command(argv):
+            return _maintenance_pinned_execution_argv(argv)
     elif destination == "upgrade_workspace":
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
