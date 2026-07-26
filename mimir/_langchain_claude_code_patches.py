@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code-mimir"
 UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code"
 
+# These flags describe fixes already shipped by the controlled distribution.
+# Keep the declaration path so a future adapter can assert native support without
+# Mimir reintroducing the retired patches; the current distribution does not use it.
 _REQUIRED_ADAPTER_FEATURES = frozenset(
     {
         "arun_config",
@@ -34,8 +37,6 @@ _REQUIRED_ADAPTER_FEATURES = frozenset(
         "sdk_tool_events",
     }
 )
-# Forward-compatibility path for a future adapter that advertises equivalent
-# support directly. The current controlled distribution does not exercise it.
 
 
 @dataclass(frozen=True)
