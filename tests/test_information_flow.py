@@ -876,6 +876,177 @@ def test_service_principal_cannot_bypass_incompatible_sink_labels():
 
 
 @pytest.mark.parametrize(
+    ("target", "source_principal"),
+    [
+        ("scheduler:heartbeat", "attacker"),
+        ("slack-C-other", "service:scheduler"),
+    ],
+)
+def test_complete_forged_label_cannot_egress_from_service_turn(
+    target: str,
+    source_principal: str,
+) -> None:
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        service_principal="scheduler",
+    )
+    forged = InformationFlowLabels().with_source(SourceLabel(
+        principal=source_principal,
+        domain="channel",
+        resource_id="scheduler:heartbeat",
+        bridge_instance="service:scheduler",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:scheduler"}),
+        integrity="trusted",
+    ))
+    auth = create_auth_context(event, enforce=True, ifc_labels=forged)
+
+    assert forged.sources[0].is_complete is True
+    decision = SinkGate.check_sink_flow(
+        "send_message", target, forged, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_cross_turn_ifc_guards_use_and_update_only_exact_request_carrier() -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.tools.budget_gate import _current_ifc_labels, _merge_result_labels
+
+    active_labels = _labels("slack-C1")
+    active_auth = replace(_auth("slack-C1"), ifc_labels=active_labels)
+    active_ctx = SimpleNamespace(
+        turn_id="active-turn",
+        auth_context=active_auth,
+        ifc_labels=active_labels,
+        turn_event_emitter=None,
+    )
+    request_labels = _labels("slack-C1", sources=frozenset({"slack-C-private"}))
+    request_auth = replace(_auth("slack-C1"), ifc_labels=request_labels)
+    added = InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain="mcp",
+        resource_id="external-result",
+        bridge_instance=None,
+        sensitivity="internal",
+        source_kind="mcp",
+    ))
+
+    token = set_current_turn(active_ctx)
+    try:
+        current = _current_ifc_labels(request_auth)
+        decision = SinkGate.check_sink_flow(
+            "send_message", "slack-C1", current, request_auth, enforce=True,
+        )
+        _merge_result_labels(request_auth, added)
+    finally:
+        reset_current_turn(token)
+
+    assert decision.allowed is False
+    assert active_ctx.ifc_labels is active_labels
+    assert active_ctx.auth_context is active_auth
+    assert request_auth.ifc_state.current(request_labels) is not request_labels
+
+
+@pytest.mark.asyncio
+async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution() -> None:
+    from mimir.mcp_client import (
+        MCPAuthorizationResult,
+        MCPProvenance,
+        MCPServerConfig,
+        _bridge_mcp_tool,
+        clear_mcp_adapter_registry,
+        register_mcp_adapter,
+    )
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    config = MCPServerConfig(name="external", command="x", args=[])
+    tools = {}
+    for direction in ("source", "sink", "both"):
+        adapter_name = f"external-{direction}"
+
+        def classifier(request, direction=direction):  # type: ignore[no-untyped-def]
+            resources = (f"resource-{direction}",)
+            return MCPAuthorizationResult(
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                source_resources=resources if direction in {"source", "both"} else (),
+                sink_resources=resources if direction in {"sink", "both"} else (),
+            )
+
+        register_mcp_adapter(
+            adapter_name, "v1", "p1", classifier, flow_direction=direction,
+        )
+        provenance = replace(
+            MCPProvenance.create(config, direction, {}),
+            classification="open",
+            adapter_name=adapter_name,
+            adapter_version="v1",
+            policy_version="p1",
+        )
+        tools[direction] = _bridge_mcp_tool(
+            server_name="external", tool_name=direction, description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+
+    labels = InformationFlowLabels()
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    middleware = BudgetGateMiddleware()
+    source_calls = 0
+
+    async def source_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal source_calls
+        source_calls += 1
+        assert auth.ifc_state.has_untrusted_active_ingest(labels) is False
+        return ToolMessage(content="external data", tool_call_id=request.tool_call["id"])
+
+    def request(direction: str) -> ToolCallRequest:
+        tool = tools[direction]
+        return ToolCallRequest(
+            tool_call={
+                "name": tool.name, "args": {}, "id": f"mcp-{direction}",
+                "type": "tool_call",
+            },
+            tool=tool,
+            state=None,
+            runtime=Runtime(context=auth),
+        )
+
+    try:
+        source_result = await middleware.awrap_tool_call(request("source"), source_handler)
+        assert source_calls == 1
+        assert source_result.status != "error"
+        assert auth.ifc_state.has_untrusted_active_ingest(labels) is True
+
+        for direction in ("sink", "both"):
+            authorization = ToolRegistry().authorize_tool(
+                tools[direction].name,
+                auth,
+                enforce=True,
+                mcp_tool=tools[direction],
+                arguments={},
+                ifc_labels=auth.ifc_state.current(labels),
+            )
+            assert authorization.allowed is False
+            assert authorization.reason == "ifc_label_blocked:external_mcp"
+
+            sink_calls = 0
+
+            async def sink_handler(_request: ToolCallRequest) -> ToolMessage:
+                nonlocal sink_calls
+                sink_calls += 1
+                return ToolMessage(content="sent", tool_call_id=f"mcp-{direction}")
+
+            denied = await middleware.awrap_tool_call(request(direction), sink_handler)
+            assert denied.status == "error"
+            assert sink_calls == 0
+    finally:
+        clear_mcp_adapter_registry()
+
+
+@pytest.mark.parametrize(
     ("tool_name", "target", "sink_category"),
     [
         ("shell_exec", "printf untrusted", "shell_process"),

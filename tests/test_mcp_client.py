@@ -1061,6 +1061,55 @@ class TestMCPResourceAdapter:
         assert authorization.reason == "mcp_unknown_flow_direction"
         assert called is False
 
+    def test_classifier_flow_metadata_mismatch_hard_fails_closed(self) -> None:
+        from mimir.access_control import ToolRegistry
+        from mimir.mcp_client import (
+            MCPAuthorizationResult,
+            MCPProvenance,
+            MCPServerConfig,
+            _bridge_mcp_tool,
+            register_mcp_adapter,
+        )
+        from mimir.models import AuthContext, InformationFlowLabels
+
+        def classifier(_request):  # type: ignore[no-untyped-def]
+            return MCPAuthorizationResult(
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                sink_resources=("external-repository",),
+            )
+
+        config = MCPServerConfig(name="github", command="x", args=[])
+        provenance = replace(
+            MCPProvenance.create(config, "get_repository", {}),
+            classification="open",
+            adapter_name="github-read-policy",
+            adapter_version="v1",
+            policy_version="p1",
+        )
+        register_mcp_adapter(
+            "github-read-policy", "v1", "p1", classifier,
+            flow_direction="source",
+        )
+        tool = _bridge_mcp_tool(
+            server_name="github", tool_name="get_repository", description="",
+            input_schema={}, session=object(), provenance=provenance,
+        )
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("admin",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+
+        authorization = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"repository": "external-repository"},
+            ifc_labels=InformationFlowLabels(),
+        )
+
+        assert authorization.allowed is False
+        assert authorization.reason == "mcp_flow_metadata_mismatch"
+
     def test_non_mcp_tool_passes_through(self) -> None:
         from mimir.access_control import MCPResourceAdapter
 
