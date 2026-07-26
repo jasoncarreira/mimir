@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+from pathlib import Path
+
+from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
@@ -46,6 +51,38 @@ def test_direct_exec_env_preserves_unrelated_command_environment(monkeypatch) ->
     assert env["PYTEST_ADDOPTS"] == "-q"
     assert env["PYTEST_PLUGINS"] == "example"
     assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" not in env
+
+
+def test_direct_exec_env_discards_writable_path_and_does_not_select_decoy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    decoy_dir = repo_root / ".venv" / "bin"
+    decoy_dir.mkdir(parents=True)
+    decoy = decoy_dir / "pwd"
+    decoy.write_text("#!/bin/sh\nprintf 'DECOY\\n'\n", encoding="utf-8")
+    decoy.chmod(0o755)
+    trusted_dir = tmp_path / "image-root" / "bin"
+    trusted_dir.mkdir(parents=True)
+    trusted_tool = trusted_dir / "pwd"
+    trusted_tool.write_text("#!/bin/sh\nprintf 'SYSTEM\\n'\n", encoding="utf-8")
+    trusted_tool.chmod(0o755)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo_root}:rw")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(decoy_dir), "/usr/bin", "/bin")))
+    monkeypatch.setattr(_shell_env, "_TRUSTED_PATH", str(trusted_dir))
+
+    env = direct_exec_env(["pwd"])
+    completed = subprocess.run(
+        ["pwd"], capture_output=True, check=True, env=env, cwd=repo_root, text=True,
+    )
+
+    assert completed.stdout.strip() == "SYSTEM"
+    assert all(
+        not Path(entry).resolve().is_relative_to(repo_root.resolve())
+        for entry in env["PATH"].split(os.pathsep)
+    )
 
 
 def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch) -> None:

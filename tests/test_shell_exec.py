@@ -169,36 +169,24 @@ def test_shell_exec_surfaces_bash_syntax_error():
     assert "shell-parse error" not in result  # the shlex path is gone
 
 
-# ─── venv-bin on PATH (login_shell_command) ──────────────────────────
+# ─── trusted PATH (login_shell_command) ──────────────────────────────
 
 
-def test_login_shell_command_prepends_venv_bin():
-    """The agent's shell runs via ``bash -lc`` (login shell resets PATH).
-    login_shell_command prepends the venv bin — where ``mimir`` and the venv
-    ``python`` live — via an export that runs after the profile, so ``mimir``
-    is reachable regardless of how the server was launched."""
-    import os
-    import sys
+def test_login_shell_command_sets_fixed_trusted_path():
+    """The post-profile PATH must not inherit an agent-writable directory."""
+    from mimir.tools._shell_env import _TRUSTED_PATH, login_shell_command
 
-    from mimir.tools._shell_env import login_shell_command
-
-    cmd = "mimir reflection introspection-report --days 7"
+    cmd = "git status"
     wrapped = login_shell_command(cmd)
-    venv_bin = os.path.dirname(sys.executable)
 
-    assert wrapped.startswith("export PATH=")
-    assert venv_bin in wrapped
+    assert wrapped.startswith(f"export PATH={_TRUSTED_PATH}")
     # The original command is preserved verbatim at the tail.
     assert wrapped.endswith("\n" + cmd)
 
 
-def test_shell_exec_puts_venv_bin_on_path():
-    """End-to-end: the venv bin (where the `mimir` console script lives) is on
-    PATH in the shell_exec subprocess, even though `bash -lc` resets PATH from
-    the login profile."""
-    import os
-    import sys
+def test_shell_exec_sets_fixed_trusted_path():
+    """The login-shell path is replaced after the profile initializes it."""
+    from mimir.tools._shell_env import _TRUSTED_PATH
 
-    venv_bin = os.path.dirname(sys.executable)
     out = shell_exec.invoke({"command": 'echo "PATHCHECK:$PATH"'})
-    assert venv_bin in out
+    assert f"PATHCHECK:{_TRUSTED_PATH}" in out
