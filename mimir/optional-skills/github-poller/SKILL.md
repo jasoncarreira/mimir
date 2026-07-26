@@ -108,12 +108,14 @@ For each repo in `GITHUB_REPOS`:
   reads a request-changes review without pushing fixes loses the work signal
   when the cursor advances. Each poll, your open PRs whose latest substantive
   review per reviewer is `CHANGES_REQUESTED` **and** whose reviewed diff has
-  not materially changed are reminded on an elapsed-time cadence (60 minutes
-  by default). Polls before the interval expires do not refresh the timestamp.
-  A substantive fix, later approval clearing all blocking reviews, or PR
-  close/merge stops reminders; a content-free rebase with the same patch does
-  not. This is bounded at-least-once prompting, not an outcome acknowledgement,
-  remediation lease, or exactly-once execution.
+  not materially changed are reminded on an hourly elapsed-time cadence, with a
+  one-minute allowance for per-run timestamp jitter. Polls before the interval
+  expires do not refresh the timestamp. A substantive fix, later approval
+  clearing all blocking reviews, or PR close/merge stops reminders; a
+  content-free rebase with the same patch does not. Reminder emissions use a
+  bounded attempt series and a one-shot give-up signal; because queued emissions
+  are not proof of delivery, an unchanged unresolved PR starts a fresh series
+  after a 24-hour backstop rather than staying silent forever.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
@@ -137,13 +139,13 @@ Polling 1 repo every 15 min @ 4 endpoints = ~16 calls/hr/repo. For a 5-repo watc
 
 ## Batching
 
-`pollers.json` sets `batch_size=5`: GitHub items emitted in a single cron tick get coalesced into AgentEvents of up to 5 items each. A typical 1-3-event tick collapses to 1 turn; a 12-event backfill (e.g. after a cursor sync past a busy PR-review hour) splits into 3 turns (5 + 5 + 2) instead of firing 12 separate turns. Each batched turn renders as a numbered list with a `<poller> reported N items (batch X of Y)` header so the agent can scan the batch + react per-item, and `extra.items[]` carries per-item metadata (URLs, refs) for programmatic access. Tune via `batch_size` in `pollers.json` if your repos generate different event volumes.
+`pollers.json` sets `batch_size=1`: each independent GitHub item gets its own turn and full tool budget. This deliberately avoids combining multiple PR reviews or remediations into one turn whose shared budget can strand later items. Tune only with care: larger batches reduce turn count but couple unrelated GitHub work to one execution budget.
 
 ## Cursor file
 
 Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-injected `STATE_DIR`). Survives container rebuilds. First run looks back 1 hour to bound the backfill burst.
 
-The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_reminded_at": ISO-8601 UTC timestamp}}}`. It tracks unresolved own-PR stale states and enforces the elapsed reminder floor while the live snapshot remains semantically blocked. Closed, unblocked, or substantively changed PRs drop out. Pre-cadence bare-string values (`{pr_number: head_sha}`) migrate quietly on their first successful observation with `last_reminded_at` set to that poll's time, so they wait one full interval before becoming eligible.
+The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_reminded_at": ISO-8601 UTC timestamp, "attempts": count}}}`. It tracks unresolved own-PR stale states, the hourly reminder floor, and bounded attempt series while the live snapshot remains semantically blocked. At the cap it emits one `pr_changes_requested_gave_up` signal; a head change re-arms immediately, and an unchanged parked entry re-arms after the 24-hour delivery-loss backstop. Closed, unblocked, or substantively changed PRs drop out. Pre-cadence bare-string and structured-without-`attempts` entries migrate quietly as attempt 1 with `last_reminded_at` set to that poll's time, preventing an upgrade-time emit storm.
 
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
 
