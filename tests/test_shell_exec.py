@@ -15,6 +15,10 @@ silently revert to the shlex+shell=False path that broke it.
 """
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 import mimir.tools.extra as extra
@@ -206,3 +210,91 @@ def test_shell_exec_puts_venv_bin_after_system_tools_on_path():
     out = shell_exec.invoke({"command": 'echo "PATHCHECK:$PATH"'})
 
     assert f"PATHCHECK:{expected_path}" in out
+
+
+@pytest.mark.asyncio
+async def test_service_shell_exec_graph_executes_server_bound_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The real deepagents tool path must deliver only the authorized argv."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from mimir.access_control import ToolRegistry, create_auth_context
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.tools._shell_env import direct_exec_env
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    home = tmp_path / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    command = f"git -C {home} status --short"
+    auth = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal="scheduler",
+        ),
+        enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+    )
+    assert decision.allowed is True
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def _run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(extra.subprocess, "run", _run)
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None,
+    )
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "shell_exec",
+            "args": {
+                "command": command,
+                "mimir_direct_argv": ["/bin/sh", "-c", "touch /tmp/forged"],
+            },
+            "id": "tc-service-shell", "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    agent = create_deep_agent(
+        model=model,
+        tools=[shell_exec],
+        system_prompt="test",
+        middleware=[BudgetGateMiddleware()],
+        context_schema=type(auth),
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="run status")]}, context=auth,
+    )
+
+    executed_argv, kwargs = calls[-1]
+    expected_argv = [
+        str(maintenance_pinned_executables["git"]), "-C", str(home.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks", "status", "--short",
+    ]
+    assert executed_argv == expected_argv
+    assert executed_argv[:3] != ["/bin/sh", "-c", "touch /tmp/forged"]
+    assert Path(executed_argv[0]).is_absolute()
+    assert not Path(executed_argv[0]).is_relative_to(home)
+    assert kwargs.get("shell", False) is False
+    assert kwargs["env"] == direct_exec_env(expected_argv)

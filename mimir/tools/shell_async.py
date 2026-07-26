@@ -317,10 +317,17 @@ async def bash_async(
                 )
 
     try:
-        from ._shell_env import direct_exec_env_overlay, login_shell_command
+        from ._shell_env import (
+            bound_direct_exec_argv,
+            direct_exec_env_overlay,
+            login_shell_command,
+        )
+        direct_argv = bound_direct_exec_argv()
+        if direct_argv is None:
+            direct_argv = mimir_direct_argv
         argv = (
-            mimir_direct_argv
-            if mimir_direct_argv is not None
+            direct_argv
+            if direct_argv is not None
             else ["bash", "-lc", login_shell_command(command)]
         )
         spawn_kwargs: dict[str, Any] = {
@@ -329,7 +336,7 @@ async def bash_async(
             "on_complete": _ON_COMPLETE,
             "auth_context": auth_context,
         }
-        if mimir_direct_argv is not None:
+        if direct_argv is not None:
             spawn_kwargs["env_overlay"] = direct_exec_env_overlay(argv)
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
