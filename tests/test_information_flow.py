@@ -1997,8 +1997,11 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
 
     assert admitted.allowed is True
     assert admitted.reason == "ifc_allowed"
+    assert wrong_source.allowed is False
     assert wrong_source.reason == "ifc_label_blocked:file"
+    assert outside_root_decision.allowed is False
     assert outside_root_decision.reason == "service_sink_destination_denied"
+    assert tmp_decision.allowed is False
     assert tmp_decision.reason == "service_sink_destination_denied"
 
 

@@ -15,6 +15,7 @@ from mimir.access_control import (
     ServicePrincipal,
     ToolRegistry,
     create_auth_context,
+    get_operation_catalog,
     get_service_principal,
 )
 from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
@@ -351,6 +352,37 @@ async def test_budget_middleware_publishes_inventory_on_async_model_path() -> No
 
     assert result is request
     assert registry.list_tools() == ["async_surface_tool"]
+
+
+@pytest.mark.asyncio
+async def test_final_model_bound_tool_surface_is_fully_cataloged() -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from mimir.tools.registry import all_mimir_tools
+
+    class _InventoryModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    model = _InventoryModel(messages=iter([AIMessage(content="done")]))
+    agent = create_deep_agent(
+        model=model,
+        tools=all_mimir_tools(model_spec="openai:test"),
+        system_prompt="inventory test",
+        middleware=[budget_gate.BudgetGateMiddleware()],
+    )
+
+    await agent.ainvoke({"messages": [HumanMessage(content="finish")]})
+
+    runtime_tools = budget_gate.get_tool_registry().list_tools()
+    assert runtime_tools
+    unknown = sorted(
+        name for name in runtime_tools
+        if get_operation_catalog().get_decision(name) is OperationDecision.UNKNOWN
+    )
+    assert unknown == []
 
 
 def test_explicit_service_principals_are_separate_and_frozen() -> None:

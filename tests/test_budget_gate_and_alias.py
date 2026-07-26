@@ -34,6 +34,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
+from mimir.access_control import ToolRegistry
 from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
@@ -74,6 +75,52 @@ def _make_request(
         state=None,
         runtime=Runtime(context=auth_context),
     )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "reason"),
+    [
+        ("shell_exec", {"command": "printf tainted"}, "ifc_label_blocked:shell_process"),
+        (
+            "fetch_url",
+            {"url": "https://external.example/tainted"},
+            "egress_destination_not_approved",
+        ),
+    ],
+)
+def test_live_middleware_denies_tainted_shell_and_network_egress(
+    tool_name: str,
+    args: dict[str, Any],
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels = _ifc_labels()
+    auth = _ifc_auth()
+    auth.ifc_state.merge(labels)
+    decisions = []
+    authorize_tool = ToolRegistry.authorize_tool
+
+    def capture_decision(self, *call_args, **call_kwargs):  # type: ignore[no-untyped-def]
+        decision = authorize_tool(self, *call_args, **call_kwargs)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", capture_decision)
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="sent", tool_call_id=request.tool_call["id"])
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request(tool_name, auth_context=auth, args=args), handler,
+    )
+
+    assert decisions[-1].allowed is False
+    assert decisions[-1].reason == reason
+    assert result.status == "error"
+    assert handler_calls == 0
 
 
 def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
@@ -283,7 +330,9 @@ async def test_mcp_resource_adapter_runs_before_remote_handler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
+async def test_mcp_resource_adapter_still_enforces_external_sink_ifc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dataclasses import replace
 
     from mimir.mcp_client import (
@@ -357,6 +406,15 @@ async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
         source_channels=frozenset({"untrusted-channel"}),
     )
     handler_calls = 0
+    decisions = []
+    authorize_tool = ToolRegistry.authorize_tool
+
+    def capture_decision(self, *call_args, **call_kwargs):  # type: ignore[no-untyped-def]
+        decision = authorize_tool(self, *call_args, **call_kwargs)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", capture_decision)
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
         nonlocal handler_calls
@@ -385,6 +443,7 @@ async def test_mcp_resource_adapter_still_enforces_external_sink_ifc() -> None:
         clear_mcp_adapter_registry()
 
     assert result.status == "error"
+    assert decisions[-1].allowed is False
     assert "ifc_label_blocked:external_mcp" in str(result.content)
     assert handler_calls == 0
 
