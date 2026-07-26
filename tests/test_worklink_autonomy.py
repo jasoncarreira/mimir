@@ -501,6 +501,52 @@ async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
 
 
 @pytest.mark.asyncio
+async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
+    import asyncio
+    import threading
+
+    registry, dispatched, _repo = _tool_env
+    entered = threading.Event()
+    release = threading.Event()
+    finished = False
+    worker_thread: int | None = None
+    passed_loop = None
+
+    class SlowArbiter:
+        def should_fire(self, *, priority="normal", event_loop=None):
+            nonlocal finished, worker_thread, passed_loop
+            worker_thread = threading.get_ident()
+            passed_loop = event_loop
+            entered.set()
+            release.wait(timeout=1)
+            finished = True
+            return _FakeDecision(False, priority=priority)
+
+    registry.set_arbiter(SlowArbiter())
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    timer = threading.Timer(0.1, release.set)
+    timer.start()
+    try:
+        run_task = asyncio.create_task(
+            registry.worklink_run.ainvoke({"issue_id": 443})
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        progressed_before_gate_finished = not finished
+        out = await run_task
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert progressed_before_gate_finished
+    assert worker_thread != loop_thread
+    assert passed_loop is loop
+    assert "worklink_run shed" in out
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
 async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env) -> None:
     registry, dispatched, repo_dir = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
