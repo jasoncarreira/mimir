@@ -16,8 +16,50 @@ case for "all tests pass on every PR" (memory/core/40-learned-behaviors
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def maintenance_pinned_executables(tmp_path_factory):
+    """Isolate maintenance authorization tests from host executable layout."""
+    from mimir import access_control
+
+    executable_dir = tmp_path_factory.mktemp("maintenance-executables")
+    real_git = Path(shutil.which("git") or "git").resolve(strict=True)
+    replacements: dict[str, Path] = {}
+    for command in access_control._MAINTENANCE_PINNED_EXECUTABLES:
+        executable = executable_dir / command.rsplit("/", 1)[-1]
+        if command == "git":
+            executable.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(str(real_git))} \"$@\"\n",
+                encoding="utf-8",
+            )
+        else:
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
+        replacements[command] = executable
+
+    original = access_control._MAINTENANCE_PINNED_EXECUTABLES.copy()
+    access_control._MAINTENANCE_PINNED_EXECUTABLES.update(replacements)
+    yield replacements
+    access_control._MAINTENANCE_PINNED_EXECUTABLES.clear()
+    access_control._MAINTENANCE_PINNED_EXECUTABLES.update(original)
+
+
+@pytest.fixture
+def maintenance_git_home(tmp_path, monkeypatch):
+    """Give maintenance-shell authorization an explicit real Git root."""
+    home = tmp_path / "maintenance-home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(home)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    return home
 
 
 @pytest.fixture(autouse=True, scope="session")

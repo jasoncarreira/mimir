@@ -311,6 +311,71 @@ commands. `npm ci --ignore-scripts` is the one declared dependency-materializati
 command because a clean install is part of the repository test contract; lifecycle
 scripts and other network-installing package operations remain denied.
 
+**Scheduled-maintenance execution profile.** Static `scheduled_tick` services and
+the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers
+remain on `repo_review`, research/custom pollers remain on
+`scheduler_read_only`, and upgrades remain on `upgrade_workspace`. The profile
+adds only command-shape allow-lists for maintenance inspection: Git
+`status`/`branch --show-current`/`log`/`diff`/`show`, each requiring
+`git -C <configured-root> ...` so the repository target is explicit in the
+authorized argv (bare Git commands are deliberately denied), including the
+workspace-scoped landed-fix check in
+`mimir/prompt_templates/issues-audit.md:48` and the prompt-common `git log
+--oneline -<n>` shorthand), GitHub PR/issue `list` and `view`, and Chainlink
+issue `list`, `ready`, and `show`. The pinned operator-installed absolute
+Chainlink path is accepted only at that exact regular-file location; bare or other
+model-supplied executable paths remain denied. These support the read/inspect
+work called for by
+heartbeat's backlog and state-management workflow
+(`mimir/prompt_templates/heartbeat.md:121-179`), reflection's repository and
+issue follow-up review (`mimir/prompt_templates/reflect.md:97-153`), memory
+hygiene's bounded follow-up triage
+(`mimir/prompt_templates/memory-hygiene.md:62-84`), and the issues audit's fix
+verification (`mimir/prompt_templates/issues-audit.md:38-64`).
+
+`maintenance` deliberately does not authorize the mutating examples in those
+prompts. Chainlink create/comment, file deletion, Git commit/push/history/config
+mutation, GitHub mutation or authentication, package installation, test runners,
+arbitrary interpreters, shell launchers, and `spawn_*` remain denied. Maintenance
+Git execution also resolves `-C` within `MIMIR_HOME` or an explicit
+`MIMIR_FILE_TOOL_ROOTS` entry (the implicit `/tmp` file-tool convenience root is
+not included), injects `-C` even when the model omitted it, and binds execution
+to a no-pager/config-neutralized argv. Every admitted Git argv includes
+`-c core.fsmonitor= -c core.hooksPath=/dev/null -c diff.external=
+-c protocol.allow=never --no-pager --no-optional-locks`; diff-producing
+subcommands also receive `--no-ext-diff --no-textconv`. The direct-exec
+sandbox scrubs inherited `GIT_*` repository/config/helper selectors and disables
+system config plus optional locks. Configured clean/smudge/process
+filter driver names are enumerated before admission and neutralized with
+per-driver `-c filter.<driver>.<kind>=` overrides. This prevents repo or global
+Git configuration and checkout attributes from launching fsmonitor,
+external-diff, textconv, or content-filter helpers. Verbose `git status` is
+excluded because it renders a diff; admitted status forms and `branch` do not
+accept the two diff flags. Like every shell profile, it inherits
+control-character rejection,
+`shlex` parsing, leading-tilde rejection, and the requirement that the admitted
+argv itself is the execution artifact.
+
+The profile does **not** make the shipped prompts' shell snippets fully
+compatible. The production corpus measured during PR #1188 review contained
+10,140 maintenance shell occurrences, of which only 100 were admitted at the
+reviewed head: 99% used pipelines, redirects, `&&`, or globs rejected by the
+shared control-character guard. That guard remains intentionally unchanged.
+The architecture decision for this slice is prompt migration to structured file
+and purpose-built tools, not a bounded-pipeline parser hidden in an allow-list
+PR; `cat`/`head`/`tail`/`sed` remain out of this profile. The shipped maintenance
+prompts now state that boundary explicitly; memory hygiene replaces its
+arbitrary-interpreter scan, issues audit replaces its glob/sort pipeline,
+reflection replaces its command substitution, redirect, `tail | jq`, and
+rotation shell snippets, and heartbeat no longer recommends jq pipelines or
+committing from the maintenance turn. Existing
+operator-customized prompt copies still need the same migration. Therefore the
+original "empty `service_sink_destination_denied` class" acceptance criterion is
+not a valid success metric for existing free-form prompt output. Re-baseline that
+telemetry after prompt migration before treating the class as a regression.
+File-write scope for dynamic principals is likewise a separate policy concern and
+is not widened by this profile.
+
 Repo-working principals freeze the explicit `:rw` entries from
 `MIMIR_FILE_TOOL_ROOTS` into their file-sink roots alongside the trigger's state
 root. The exact-root adapter still rejects paths outside those roots, read-only

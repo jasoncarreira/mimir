@@ -464,6 +464,7 @@ def test_turn_history_result_is_untrusted_active_ingest():
 def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     memory = tmp_path / "memory" / "heartbeat.md"
@@ -1903,7 +1904,7 @@ def test_service_file_policy_rejects_read_only_file_tool_root(
 @pytest.mark.parametrize(
     ("trigger", "canonical", "admitted_command"),
     [
-        ("scheduled_tick", "scheduler", "git status --short"),
+        ("scheduled_tick", "scheduler", "status --short"),
         ("upgrade", "system", "uv sync"),
     ],
 )
@@ -1911,6 +1912,7 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
     trigger: str,
     canonical: str,
     admitted_command: str,
+    maintenance_git_home: Path,
 ):
     channel = f"{trigger}:configured"
     service = AuthContext(
@@ -1925,6 +1927,8 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
         enforcement_enabled=True,
     )
     labels = _labels(channel, sources=frozenset({channel}))
+    if trigger == "scheduled_tick":
+        admitted_command = f"git -C {maintenance_git_home} {admitted_command}"
 
     admitted = SinkGate.check_sink_flow(
         "shell_exec", admitted_command, labels, service, enforce=True,

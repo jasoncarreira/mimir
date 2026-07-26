@@ -20,17 +20,20 @@ New in chainlink #866:
 
 from __future__ import annotations
 
-import logging
 import hashlib
 import json
+import logging
 import os
+import re
 import shlex
+import subprocess
+from collections.abc import Callable
 from contextvars import ContextVar, Token
-from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .identities import AccessMetadata
 from .read_policy import (
@@ -480,7 +483,11 @@ def build_trigger_service_principal(
                 json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
-            shell_profile = "repo_review" if profile == "github" else "scheduler_read_only"
+            shell_profile = (
+                "repo_review" if profile == "github"
+                else "maintenance" if profile == "heartbeat"
+                else "scheduler_read_only"
+            )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
         elif operation == "worklink_run":
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
@@ -538,6 +545,20 @@ def _configured_file_roots() -> list[Path]:
 
     extra_roots = _parse_file_tool_roots(
         os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home)
+    )
+    return [Path(home), *(Path(path) for path, _mode in extra_roots)]
+
+
+def _configured_maintenance_git_roots() -> list[Path]:
+    """Return home plus explicit file-tool roots, excluding implicit ``/tmp``."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
     )
     return [Path(home), *(Path(path) for path, _mode in extra_roots)]
 
@@ -961,6 +982,288 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     return False
 
 
+_MAINTENANCE_PINNED_EXECUTABLES = {
+    "git": Path("/usr/bin/git"),
+    "gh": Path("/usr/bin/gh"),
+    "ls": Path("/usr/bin/ls"),
+    "grep": Path("/usr/bin/grep"),
+    "wc": Path("/usr/bin/wc"),
+    "pwd": Path("/usr/bin/pwd"),
+    "jq": Path("/usr/bin/jq"),
+    "rg": Path("/usr/bin/rg"),
+    "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
+}
+_MAINTENANCE_GIT_BASE_OVERRIDES = (
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "diff.external=",
+    "-c", "protocol.allow=never",
+)
+_MAINTENANCE_GIT_ENV_DENY_PREFIXES = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_OPTIONAL_LOCKS",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+)
+
+
+def _maintenance_git_probe_env() -> dict[str, str]:
+    """Return a deterministic environment for authorization-time Git probes."""
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith(_MAINTENANCE_GIT_ENV_DENY_PREFIXES):
+            env.pop(key, None)
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_PAGER": "cat",
+        "GIT_OPTIONAL_LOCKS": "0",
+    })
+    return env
+
+
+def _maintenance_git_filter_overrides(
+    root: Path, git_executable: str,
+) -> list[str] | None:
+    """Return argv overrides that disable configured content filter drivers.
+
+    Git has no generic "disable all filters" switch. A checkout-controlled
+    ``.gitattributes`` file can select any filter driver whose command is defined
+    in repository config, and even a read-only ``diff`` can invoke its clean
+    side. Enumerate the effective command-bearing keys with the same hardened
+    binary/config/environment contract as execution, validate the NUL-delimited
+    names, then shadow each command with an empty command in the final argv.
+    """
+    command = [
+        git_executable, "-C", str(root),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "--no-pager", "config", "--local", "--null", "--name-only",
+        "--get-regexp", r"^filter\..*\.(clean|smudge|process)$",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env=_maintenance_git_probe_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 1 and not result.stdout:
+        return []
+    if result.returncode != 0:
+        return None
+
+    raw_names = result.stdout.split(b"\0")
+    if raw_names[-1:] == [b""]:
+        raw_names.pop()
+    overrides: list[str] = []
+    for raw_name in raw_names:
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if not re.fullmatch(r"filter\.[^.\x00]+\.(?:clean|smudge|process)", name):
+            return None
+        overrides.extend(("-c", f"{name}="))
+    return overrides
+
+
+def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
+    """Validate maintenance Git input and return its hardened execution argv.
+
+    Git's ostensibly read-only commands can execute helpers selected by checkout
+    configuration and attributes. Bind every invocation to a configured
+    file-tool root, neutralize fsmonitor/external-diff/filter configuration in
+    the returned execution artifact, and append explicit textconv/external-diff
+    disables to diff-producing subcommands.
+    """
+    if not argv or argv[0] != "git":
+        return None
+    pinned_git = _maintenance_pinned_execution_argv(["git"])
+    if pinned_git is None:
+        return None
+
+    # The authorized command must name its repository in argv. Relying on the
+    # service process cwd would leave the actual target outside the audited
+    # authorization artifact.
+    arguments = argv[1:]
+    if arguments[:1] != ["-C"] or len(arguments) < 3 or arguments[1].startswith("-"):
+        return None
+    requested_root = arguments[1]
+    arguments = arguments[2:]
+
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    roots = _configured_maintenance_git_roots()
+    try:
+        root = resolve_within_roots(
+            roots,
+            requested_root if requested_root is not None else str(roots[0]),
+        )
+    except (IndexError, OSError, PathOutsideHomeError, RuntimeError):
+        return None
+
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        # ``--verbose``/``-v`` renders a diff and can execute a configured
+        # textconv/filter helper. Keep maintenance status to metadata-only
+        # forms; the hardened argv still disables fsmonitor and optional locks.
+        allowed = (
+            "--" not in subcommand_arguments
+            and not any(argument.startswith("-v") for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch",
+                    "--ignore-submodules", "--long", "--no-ahead-behind",
+                    "--porcelain", "--short", "--show-stash",
+                    "--untracked-files",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        )
+    elif subcommand == "branch":
+        allowed = subcommand_arguments == ["--show-current"]
+    elif subcommand in {"diff", "log", "show"}:
+        # ``-<digits>`` is Git's bounded max-count shorthand used by the
+        # maintenance prompts (for example ``git log --oneline -5``).
+        arguments_without_count_shorthand = [
+            argument
+            for argument in subcommand_arguments
+            if not (subcommand == "log" and argument.startswith("-") and argument[1:].isdigit())
+        ]
+        allowed = (
+            "--" not in subcommand_arguments
+            and _arguments_match_allowlist(
+                arguments_without_count_shorthand,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                    "--exit-code", "--full-index", "--grep", "--name-only",
+                    "--name-status", "--no-color", "--no-merges", "--no-patch",
+                    "--oneline", "--quiet", "--raw", "--stat", "--staged",
+                }),
+                option_prefixes=(
+                    "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
+                ),
+            )
+        )
+    else:
+        return None
+    if not allowed:
+        return None
+
+    filter_overrides = _maintenance_git_filter_overrides(root, pinned_git[0])
+    if filter_overrides is None:
+        return None
+    execution_argv = [
+        pinned_git[0], "-C", str(root),
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        *filter_overrides, "--no-pager", "--no-optional-locks",
+        subcommand, *subcommand_arguments,
+    ]
+    if subcommand in {"diff", "log", "show"}:
+        execution_argv.extend(("--no-ext-diff", "--no-textconv"))
+    return execution_argv
+
+
+def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+    """Replace an admitted maintenance command with a trusted absolute binary.
+
+    Maintenance commands execute with ``shell=False``, but a bare ``argv[0]``
+    would still be selected through PATH. The runtime PATH begins with the
+    project virtualenv, which can sit under a service-writable root, so bind
+    every admitted executable to a fixed regular file before authorization.
+    Missing, symlinked, or replaced binaries are environment drift and fail
+    closed with a distinct log fingerprint rather than falling back to PATH.
+    """
+    if not argv:
+        return None
+    expected = _MAINTENANCE_PINNED_EXECUTABLES.get(argv[0])
+    if expected is None:
+        return None
+    try:
+        resolved = expected.resolve(strict=True)
+        if resolved != expected or not expected.is_file() or not os.access(expected, os.X_OK):
+            raise OSError("expected an executable non-symlink regular file")
+    except (OSError, RuntimeError) as exc:
+        log.error(
+            "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
+            argv[0], expected, exc,
+        )
+        return None
+    return [str(expected), *argv[1:]]
+
+
+def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
+    """Validate read/inspection commands used by scheduled maintenance."""
+    if _target_matches_read_only_shell_command(argv):
+        return True
+    if not argv:
+        return False
+
+    if argv[0] == "git":
+        return _maintenance_git_execution_argv(argv) is not None
+
+    if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
+        resource = argv[1]
+        subcommand = argv[2]
+        options = {
+            ("pr", "list"): frozenset({
+                "--app", "--assignee", "--author", "--base", "--draft", "--head",
+                "--json", "--jq", "--label", "--limit", "--repo", "--search",
+                "--state", "--template",
+            }),
+            ("pr", "view"): frozenset({
+                "--comments", "--json", "--jq", "--repo", "--template",
+            }),
+            ("issue", "list"): frozenset({
+                "--app", "--assignee", "--author", "--json", "--jq", "--label",
+                "--limit", "--mention", "--milestone", "--repo", "--search",
+                "--state", "--template",
+            }),
+            ("issue", "view"): frozenset({
+                "--comments", "--json", "--jq", "--repo", "--template",
+            }),
+        }.get((resource, subcommand))
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options,
+        )
+
+    chainlink_command = argv[0]
+    if chainlink_command != "/usr/local/bin/chainlink":
+        return False
+    if argv[1:2] == ["issue"] and len(argv) >= 3:
+        subcommand = argv[2]
+        options = {
+            "list": frozenset({"--json", "--label", "--priority", "--status"}),
+            "ready": frozenset({"--json"}),
+            "show": frozenset({"--json"}),
+        }.get(subcommand)
+        return options is not None and _arguments_match_allowlist(
+            argv[3:], exact_options=options,
+        )
+    return False
+
+
 def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
     """Return the exact argv admitted by a trusted service shell profile.
 
@@ -987,6 +1290,11 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
         allowed = _target_matches_repo_review_shell_command(argv)
+    elif destination == "maintenance":
+        if argv[0] == "git":
+            return _maintenance_git_execution_argv(argv)
+        if _target_matches_maintenance_shell_command(argv):
+            return _maintenance_pinned_execution_argv(argv)
     elif destination == "upgrade_workspace":
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
@@ -2728,8 +3036,9 @@ class ToolRegistry:
         if not self._shadow_logging_enabled:
             return
         try:
-            from .event_logger import log_event
             import asyncio
+
+            from .event_logger import log_event
             fields = auth.as_log_fields()
             service = auth.service_principal
             if service is None and auth_context is not None:
@@ -3381,8 +3690,8 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                     "edit_file", "static_service_write_roots",
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "scheduler_read_only"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "scheduler_read_only"),
+                ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
+                ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
                 ServiceSinkPolicy("spawn_claude_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),

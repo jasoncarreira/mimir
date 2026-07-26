@@ -54,18 +54,18 @@ def test_reflection_prompt_documents_both_tracks():
         assert criterion in body, f"missing promotion criterion: {criterion}"
 
 
-def test_reflection_prompt_references_cli_subcommand():
-    """The workflow must point at the ``mimir reflection
-    most-retrieved`` CLI subcommand — that's how the agent gets
-    atom-to-core promotion candidates."""
+def test_reflection_prompt_respects_maintenance_shell_profile():
+    """Scheduled reflection must not instruct a denied general CLI entry point."""
     body = (
         Path(__file__).parent.parent
         / "mimir"
         / "prompt_templates"
         / "reflect.md"
     ).read_text()
-    assert "mimir reflection most-retrieved" in body
-    assert "--contributed-only" in body
+    assert "profile does not admit the `mimir` CLI" in body
+    assert "state/reports/introspection-YYYY-MM-DD.md" in body
+    assert "state/reports/applied-audit-YYYY-MM-DD.md" in body
+    assert "```bash" not in body
 
 
 def test_reflection_prompt_defines_gepa_recommendation_boundary():

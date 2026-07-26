@@ -25,6 +25,11 @@ def _is_pytest_argv(argv: list[str] | None) -> bool:
     return bool(argv) and (argv[0] == "pytest" or argv[:3] == ["uv", "run", "pytest"])
 
 
+def _is_git_argv(argv: list[str] | None) -> bool:
+    """Return whether *argv* invokes the server-pinned maintenance Git binary."""
+    return bool(argv) and argv[0] == "/usr/bin/git"
+
+
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
@@ -40,6 +45,18 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     if _is_pytest_argv(argv):
         env.pop("PYTEST_ADDOPTS", None)
         env.pop("PYTEST_PLUGINS", None)
+    if _is_git_argv(argv):
+        # The maintenance profile binds Git to a configured -C root and injects
+        # config-neutralizing argv. Inherited GIT_* variables must not select a
+        # different repository, config source, helper executable, or diff tool.
+        for key in tuple(env):
+            if key.startswith("GIT_"):
+                env.pop(key, None)
+        env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_PAGER": "cat",
+            "GIT_OPTIONAL_LOCKS": "0",
+        })
     venv_bin = os.path.dirname(sys.executable or "")
     if venv_bin:
         current_path = env.get("PATH", "")
@@ -58,6 +75,10 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     if _is_pytest_argv(argv):
         overlay["PYTEST_ADDOPTS"] = None
         overlay["PYTEST_PLUGINS"] = None
+    if _is_git_argv(argv):
+        for key in os.environ:
+            if key.startswith("GIT_") and key not in overlay:
+                overlay[key] = None
     return overlay
 
 

@@ -26,6 +26,15 @@ This is *your* turn. There is no user waiting for a reply.
   somewhere — most heartbeats end silently.
 - Don't manufacture a reply just because turns usually have one.
 
+## Tooling boundary
+
+Prefer structured tools (`read_file`, `ls`, `glob`, `grep`, `file_search`) for
+file inspection; do not wrap maintenance reads in shell pipelines, redirects,
+`&&`, or globs. The maintenance shell profile intentionally rejects those
+compositions. Use direct `git`/`gh`/`chainlink` commands only for repository or
+tracker queries the structured tools cannot express, and use the file tools for
+`cat`/`head`/`tail`/`sed`-shaped reads.
+
 ## Step 1 — Librarian Protocol
 
 Run this first, every heartbeat. Five quick checks (~2 min total).
@@ -147,8 +156,9 @@ budget thresholds, prefer:
   tagging. These edit files; tokens are bounded.
 - **Backlog pruning** — read `state/heartbeat-backlog.md`, mark
   obsolete items as done. Useful and cheap.
-- **Bash-only investigations** — jq pipelines over events.jsonl don't
-  burn agent tokens. Dropping into Bash for analysis is a lever.
+- **Structured local investigations** — use `read_file`/`grep`/`file_search`
+  over logs and reports. Avoid shell pipelines; the maintenance profile rejects
+  them, and a bounded structured scan is a better fit when budget is tight.
 - **Skipping fan-out** — don't fan out climber / researcher / critic
   subagents; their token cost is the parent's plus the subagent's.
 
@@ -175,8 +185,9 @@ Ranges from light to heavy:
   promotion for a recent ingestion
 - **External world** — RSS / feed / Bluesky browse if a backlog item
   pointed at one
-- **State management** — git-commit any uncommitted memory work, tidy
-  in-progress markers
+- **State management** — inspect uncommitted memory work and tidy in-progress
+  markers. Scheduled maintenance may inspect Git state but must not commit or
+  push; leave repository mutation for an operator-authorized turn.
 
 ### Don't do reflection-shaped work here
 

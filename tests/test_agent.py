@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from dataclasses import asdict, replace
@@ -364,7 +365,9 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
 
         ctx = get_current_turn()
         assert ctx is not None
-        sink_target = "git status" if self.tool_name == "shell_exec" else None
+        sink_target = (
+            f"git -C {Path(os.environ['MIMIR_HOME'])} status" if self.tool_name == "shell_exec" else None
+        )
         auth = get_tool_registry().authorize_tool(
             self.tool_name,
             ctx.auth_context,
@@ -715,6 +718,9 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
     fake_agent = _ServicePrincipalToolProbeAgent(tool_name)
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
     agent._config.access_control_enforced = True
+    if tool_name == "shell_exec":
+        home = agent._config.home
+        subprocess.run(["git", "init", "-q", str(home)], check=True)
 
     service_authority = None
     event_principal = {
