@@ -175,6 +175,8 @@ def test_cache_hit_rate_excludes_output_from_denom():
 
 def test_context_window_known_models():
     assert context_window_for("claude-opus-5") == 1_000_000
+    assert context_window_for("claude-sonnet-5") == 1_000_000
+    assert context_window_for("claude-fable-5") == 1_000_000
     assert context_window_for("claude-opus-4-7") == 200_000
     assert context_window_for("claude-sonnet-4-6") == 200_000
 
@@ -191,18 +193,28 @@ def test_context_window_unknown_model_falls_back():
     assert context_window_for(None) == 200_000
 
 
-def test_context_window_1m_beta_does_not_promote_unknown_prefixed_model():
+def test_context_window_1m_beta_promotes_prefixed_model_ids():
     from mimir.usage_stats import CONTEXT_1M_BETA
 
     assert (
+        context_window_for("claude-opus-4-8", betas=[CONTEXT_1M_BETA])
+        == 1_000_000
+    )
+    assert (
+        context_window_for(
+            "claude-sonnet-4-5-20250929", betas=[CONTEXT_1M_BETA]
+        )
+        == 1_000_000
+    )
+    assert (
         context_window_for("claude-opus-4-future", betas=[CONTEXT_1M_BETA])
-        == 200_000
+        == 1_000_000
     )
     assert (
         context_window_for(
             "claude-sonnet-4-future[1m]", betas=[CONTEXT_1M_BETA]
         )
-        == 200_000
+        == 1_000_000
     )
 
 

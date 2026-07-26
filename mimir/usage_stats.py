@@ -42,17 +42,20 @@ log = logging.getLogger(__name__)
 # "current turn / cap" percentage in the usage block. Best-effort:
 # unknown models fall back to ``_DEFAULT_CONTEXT_WINDOW``.
 #
-# Sources: Anthropic API docs as of the cutoff. Claude Opus 5 has a
-# native 1M-token context window. The 1M variant of Opus 4.7 reports
-# its own model id (``claude-opus-4-7[1m]``) in the Claude Code surface;
-# bare ``claude-opus-4-7`` is the 200k variant unless the request opts
-# into the 1M context window via the ``context-1m-2025-08-07`` beta
-# header (see ``CONTEXT_1M_BETA`` below). Pass ``betas=`` to
+# Sources: Anthropic API docs as of the cutoff. Claude Opus 5,
+# Sonnet 5, and Fable 5 have native 1M-token context windows. The 1M
+# variant of Opus 4.7 reports its own model id
+# (``claude-opus-4-7[1m]``) in the Claude Code surface; bare
+# ``claude-opus-4-7`` is the 200k variant unless the request opts into
+# the 1M context window via the ``context-1m-2025-08-07`` beta header
+# (see ``CONTEXT_1M_BETA`` below). Pass ``betas=`` to
 # ``context_window_for`` to reflect that. Other Claude Code bracketed
 # deployment variants fall back to the corresponding bare model entry.
 _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # Opus 5.x
+    # 5.x
     "claude-opus-5": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-fable-5": 1_000_000,
     # Opus 4.x
     "claude-opus-4-7": 200_000,
     "claude-opus-4-7[1m]": 1_000_000,
@@ -221,18 +224,22 @@ def context_window_for(
             model = base_model
         normalized_model = model
         context_window = _MODEL_CONTEXT_WINDOWS.get(normalized_model)
-        if context_window is None:
-            return _DEFAULT_CONTEXT_WINDOW
     if (
         betas
         and CONTEXT_1M_BETA in betas
+        and "[" not in normalized_model
+        and "]" not in normalized_model
         and any(
             normalized_model.startswith(prefix)
             for prefix in _CONTEXT_1M_MODEL_PREFIXES
         )
     ):
         return 1_000_000
-    return context_window
+    return (
+        context_window
+        if context_window is not None
+        else _DEFAULT_CONTEXT_WINDOW
+    )
 
 
 def aggregate(
