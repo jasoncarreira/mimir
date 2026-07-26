@@ -176,13 +176,47 @@ def test_cache_hit_rate_excludes_output_from_denom():
 def test_context_window_known_models():
     assert context_window_for("claude-opus-5") == 1_000_000
     assert context_window_for("claude-opus-4-7") == 200_000
-    assert context_window_for("claude-opus-4-7[1m]") == 1_000_000
     assert context_window_for("claude-sonnet-4-6") == 200_000
+
+
+def test_context_window_strips_claude_code_variant_suffix():
+    assert context_window_for("claude-opus-5[1m]") == 1_000_000
+    assert context_window_for("claude-opus-4-7[1m]") == 1_000_000
+    assert context_window_for("claude-sonnet-4-6[fast]") == 200_000
 
 
 def test_context_window_unknown_model_falls_back():
     assert context_window_for("some-future-model") == 200_000
+    assert context_window_for("some-future-model[1m]") == 200_000
     assert context_window_for(None) == 200_000
+
+
+def test_context_window_1m_beta_does_not_promote_unknown_prefixed_model():
+    from mimir.usage_stats import CONTEXT_1M_BETA
+
+    assert (
+        context_window_for("claude-opus-4-future", betas=[CONTEXT_1M_BETA])
+        == 200_000
+    )
+    assert (
+        context_window_for(
+            "claude-sonnet-4-future[1m]", betas=[CONTEXT_1M_BETA]
+        )
+        == 200_000
+    )
+
+
+def test_context_window_malformed_variant_falls_back():
+    from mimir.usage_stats import CONTEXT_1M_BETA
+
+    assert context_window_for("claude-opus-5[1m]]") == 200_000
+    assert context_window_for("claude-opus-4-7[1m][fast]") == 200_000
+    assert (
+        context_window_for(
+            "claude-sonnet-4-6[fast][1m]", betas=[CONTEXT_1M_BETA]
+        )
+        == 200_000
+    )
 
 
 def test_context_window_1m_beta_lifts_opus_4_and_sonnet_4():

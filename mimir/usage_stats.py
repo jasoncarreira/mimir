@@ -48,7 +48,8 @@ log = logging.getLogger(__name__)
 # bare ``claude-opus-4-7`` is the 200k variant unless the request opts
 # into the 1M context window via the ``context-1m-2025-08-07`` beta
 # header (see ``CONTEXT_1M_BETA`` below). Pass ``betas=`` to
-# ``context_window_for`` to reflect that.
+# ``context_window_for`` to reflect that. Other Claude Code bracketed
+# deployment variants fall back to the corresponding bare model entry.
 _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Opus 5.x
     "claude-opus-5": 1_000_000,
@@ -198,15 +199,40 @@ def context_window_for(
 
     ``betas`` reflects Anthropic beta headers active on the request.
     When ``CONTEXT_1M_BETA`` is present and the model is a Claude 4.x
-    Opus or Sonnet, the 1M window applies — the per-model dict's bare
-    ``claude-opus-4-7`` entry would otherwise return the 200k default.
+    Opus or Sonnet, the 1M window applies. Claude Code deployment ids may
+    append one bracketed variant (for example, ``claude-opus-5[1m]``),
+    which is stripped before the exact model lookup.
     """
-    if betas and CONTEXT_1M_BETA in betas and model:
-        if any(model.startswith(p) for p in _CONTEXT_1M_MODEL_PREFIXES):
-            return 1_000_000
     if not model:
         return _DEFAULT_CONTEXT_WINDOW
-    return _MODEL_CONTEXT_WINDOWS.get(model, _DEFAULT_CONTEXT_WINDOW)
+    exact_context_window = _MODEL_CONTEXT_WINDOWS.get(model)
+    if exact_context_window is not None:
+        normalized_model = model
+        context_window = exact_context_window
+    else:
+        base_model, separator, variant = model.rpartition("[")
+        if (
+            separator
+            and variant.endswith("]")
+            and "]" not in variant[:-1]
+            and "[" not in base_model
+            and "]" not in base_model
+        ):
+            model = base_model
+        normalized_model = model
+        context_window = _MODEL_CONTEXT_WINDOWS.get(normalized_model)
+        if context_window is None:
+            return _DEFAULT_CONTEXT_WINDOW
+    if (
+        betas
+        and CONTEXT_1M_BETA in betas
+        and any(
+            normalized_model.startswith(prefix)
+            for prefix in _CONTEXT_1M_MODEL_PREFIXES
+        )
+    ):
+        return 1_000_000
+    return context_window
 
 
 def aggregate(
