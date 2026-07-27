@@ -49,7 +49,9 @@ DEFAULT_ENV_TEMPLATE = dedent(
     #   codex-plus:gpt-5.6-luna           (default — Codex subscription OAuth)
     #   anthropic:claude-sonnet-4-6       (direct Anthropic API)
     #   claude-code:claude-sonnet-4-6     (Max OAuth subprocess; opt in via
-    #                                      ``mimir setup --subscription``)
+    #                                      ``mimir setup --model claude-sonnet-4-6
+    #                                      --subscription``. Cannot be used with
+    #                                      MIMIR_ACCESS_CONTROL_ENFORCED — see #910)
     #   anthropic:MiniMax-M2.7            (Minimax via Anthropic-compat —
     #                                      also set ANTHROPIC_BASE_URL)
     #   anthropic:kimi-k2-0905-preview    (Moonshot Kimi)
@@ -57,7 +59,9 @@ DEFAULT_ENV_TEMPLATE = dedent(
     #
     # ``mimir setup --model <name>`` auto-detects the right prefix +
     # writes ANTHROPIC_BASE_URL when the provider needs one (Minimax,
-    # Moonshot). Without --model, mimir uses ``anthropic:claude-sonnet-4-6``.
+    # Moonshot). Without --model, mimir uses ``codex-plus:gpt-5.6-luna`` —
+    # the same default the runtime falls back to when this file and the
+    # environment are both silent, so there is one default, not two.
     # Runtime loads this file as defaults; exported environment wins.
     MIMIR_MODEL_SPEC=
 
@@ -692,7 +696,7 @@ def setup_home(
     ``model`` is a bare model name (no provider prefix); setup uses
     ``mimir.model_registry.detect_route`` to resolve to the right
     ``MIMIR_MODEL_SPEC`` + any provider-specific env vars. ``None``
-    falls back to ``DEFAULT_MODEL_NAME``.
+    falls back to ``DEFAULT_MODEL_SPEC``.
 
     ``subscription`` declares the deployment is on a subscription
     plan (not pay-per-token). Effect is provider-polymorphic — see
@@ -1063,6 +1067,20 @@ def _print_setup_report(status: dict[str, object]) -> None:
         adapter_extra = extra_for_spec(model_spec)
         if adapter_extra:
             print(f"  model adapter: pip install mimir-agent[{adapter_extra}]")
+        # A claude-code spec cannot be combined with enforcement: the SDK
+        # subprocess hook can't carry the server-created per-turn
+        # AuthContext, so startup preflight refuses the pair (#910). Say so
+        # at setup time rather than letting the operator discover it as a
+        # ProviderEnforcementCompatibilityError on first enforced boot.
+        # Keyed on the resolved spec, not on --subscription, so it also
+        # covers an explicit ``--model claude-code:<model>``.
+        if model_spec.strip().lower().replace("_", "-").startswith("claude-code:"):
+            print(
+                "                 ↑ cannot be used with "
+                "MIMIR_ACCESS_CONTROL_ENFORCED=true until #910 lands; "
+                "choose codex-plus:, anthropic:, or openai: if you plan "
+                "to enable authorization."
+            )
         if status.get("model_spec_from_env"):
             print(
                 "                 ↑ from exported MIMIR_MODEL_SPEC — this "

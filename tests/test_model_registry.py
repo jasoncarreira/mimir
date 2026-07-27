@@ -18,7 +18,7 @@ from mimir.model_registry import (
     BILLING_API,
     BILLING_SUBSCRIPTION,
     DEFAULT_API_HOURLY_COST_LIMIT_USD,
-    DEFAULT_MODEL_NAME,
+    DEFAULT_MODEL_SPEC,
     PROVIDER_ANTHROPIC_API,
     PROVIDER_ANTHROPIC_MAX,
     PROVIDER_MINIMAX,
@@ -28,30 +28,51 @@ from mimir.model_registry import (
 )
 
 
-# ── default behavior (now direct Anthropic API, not claude-code) ─────
+# ── default behavior (Codex Plus subscription, enforcement-compatible) ─
 
 
-def test_detect_route_none_uses_default_anthropic_api():
-    """No model arg → default to ``anthropic:<DEFAULT>``. Forward-
-    looking default since Anthropic is sunsetting claude-code on
-    subscription plans; the API path stays working regardless of
-    Max plan availability."""
+def test_detect_route_none_uses_default_codex_plus():
+    """No model arg → the shipped default spec. Codex Plus is a
+    subscription route, and unlike the previous ``claude-code:`` default
+    it passes the enforcement startup preflight (#910)."""
     route = detect_route(None)
-    assert route.model_spec == f"anthropic:{DEFAULT_MODEL_NAME}"
-    assert route.provider_name == PROVIDER_ANTHROPIC_API
-    assert route.billing_mode == BILLING_API
-    assert route.env == {}
+    assert route.model_spec == DEFAULT_MODEL_SPEC == "codex-plus:gpt-5.6-luna"
+    assert route.billing_mode == BILLING_SUBSCRIPTION
 
 
 def test_detect_route_empty_uses_default():
-    route = detect_route("")
-    assert route.model_spec == f"anthropic:{DEFAULT_MODEL_NAME}"
-    assert route.provider_name == PROVIDER_ANTHROPIC_API
+    assert detect_route("").model_spec == DEFAULT_MODEL_SPEC
 
 
 def test_detect_route_whitespace_uses_default():
-    route = detect_route("   ")
-    assert route.model_spec == f"anthropic:{DEFAULT_MODEL_NAME}"
+    assert detect_route("   ").model_spec == DEFAULT_MODEL_SPEC
+
+
+def test_setup_default_matches_runtime_fallback():
+    """There is ONE default. ``mimir setup`` (via ``detect_route(None)``)
+    and the ``Config.from_env`` fallback must select the same spec — the
+    contradiction mimir-carreira caught on PR #1212 was these two drifting
+    apart, so pin them together."""
+    from mimir.config import DEFAULT_MODEL_SPEC as CONFIG_DEFAULT
+
+    assert detect_route(None).model_spec == CONFIG_DEFAULT == DEFAULT_MODEL_SPEC
+
+
+def test_default_spec_passes_enforcement_preflight():
+    """The shipped default must not be a provider that startup refuses
+    under enforcement — that incompatibility is the reason it changed."""
+    from mimir.access_control import resolve_access_control_enforcement
+
+    assert resolve_access_control_enforcement(
+        True, model_spec=DEFAULT_MODEL_SPEC,
+    ) is True
+
+
+def test_subscription_flag_without_model_keeps_default():
+    """With a subscription-backed default, a bare ``--subscription`` is a
+    no-op rather than flipping to claude-code: the default spec is
+    pre-qualified, so it passes straight through."""
+    assert detect_route(None, subscription=True).model_spec == DEFAULT_MODEL_SPEC
 
 
 # ── --subscription flag (provider-polymorphic) ─────────────────────────

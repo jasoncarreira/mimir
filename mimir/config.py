@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
+# Single source of the shipped default. ``mimir setup`` writes this same
+# spec via ``detect_route(None)``, so a setup-created home and a home that
+# never ran setup select the same model. model_registry imports only
+# ``providers`` (stdlib-only), so this is not circular.
+from .model_registry import DEFAULT_MODEL_SPEC
 
 
 log = logging.getLogger(__name__)
@@ -1025,7 +1030,7 @@ class Config:
         _load_home_dotenv(home)
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
-        model_spec = _env("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+        model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
         # itself). Computing it twice was redundant and could in theory
