@@ -76,7 +76,10 @@ counted against the tool-call budget).
 ## Spawned processes
 
 - Spawn tools (``spawn_claude_code`` / ``spawn_codex``) within
-  operator-documented budget caps — **autonomous**.
+  operator-documented budget caps — **autonomous only when the turn's
+  server-defined authority profile lists that exact capability**. In particular,
+  a poller-triggered PR review must complete in its current turn and must not
+  spawn a coding agent.
 - Spawn tools with elevated budget — **escalate-first**.
 - Async shell jobs for read / observe shapes (test runs, log
   scans, build watches) — **autonomous**. For write / mutate

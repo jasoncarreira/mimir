@@ -3080,6 +3080,15 @@ def test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized(
     )
     assert decision.allowed is True, decision.reason
 
+    shadow = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=False,
+        target_channel=command,
+    )
+    assert shadow.allowed is True
+    assert shadow.would_block is False
+
     inspection = ToolRegistry().authorize_tool(
         "shell_exec",
         _service_auth(service, InformationFlowLabels()),

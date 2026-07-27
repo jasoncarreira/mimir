@@ -3564,8 +3564,10 @@ async def test_fire_poller_budget_checks_do_not_block_loop_and_reuse_snapshot(
     monkeypatch.setattr("mimir.scheduler.aggregate_poller_turn_usage", slow_aggregate)
     monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
     timers = [
-        threading.Timer(0.1, releases[0].set),
-        threading.Timer(0.2, releases[1].set),
+        # These are deadlock watchdogs, not scheduling deadlines. Leave
+        # enough room for a loaded full-suite event loop to observe entry.
+        threading.Timer(1.0, releases[0].set),
+        threading.Timer(2.0, releases[1].set),
     ]
     for timer in timers:
         timer.start()
