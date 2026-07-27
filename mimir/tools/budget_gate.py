@@ -389,6 +389,17 @@ def _request_for_authorized_execution(
         # The authorization adapter already admitted this call. Failing to bind
         # a direct argv here must not fall back to the original ``bash -lc``
         # surface if a config probe races, times out, or otherwise changes.
+        #
+        # ``/usr/bin/false`` ignores its arguments, so the reason below never
+        # reaches the caller: the agent sees only "exit 1, empty output" and
+        # cannot tell a profile refusal from a broken binary. Log it under a
+        # distinct fingerprint so the cause is greppable, naming the profile
+        # and the rejected command.
+        log.error(
+            "service_shell_argv_binding_failed profile=%s command=%r",
+            policy.destination,
+            target[:200],
+        )
         args["mimir_direct_argv"] = [
             "/usr/bin/false",
             "trusted-service shell argv binding failed closed",
