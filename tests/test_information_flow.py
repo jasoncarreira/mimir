@@ -1309,6 +1309,98 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
     assert other_path.reason == "egress_destination_not_approved"
 
 
+def _github_fetch_service() -> ServicePrincipal:
+    return ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        capabilities=("fetch_url",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "fetch_url", "github_pr_api", "GITHUB_REPOS",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://api.github.com/repos/acme/widget/pulls/7",
+        "https://api.github.com/repos/acme/widget/pulls/7/reviews",
+        "https://api.github.com/repos/acme/widget/pulls/7/comments",
+    ],
+)
+def test_github_poller_fetch_allows_only_pr_read_endpoints_for_configured_repo(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "other/repo, Acme/Widget")
+    auth, labels = _trigger_service_context(_github_fetch_service(), integrity="untrusted")
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://api.github.com/repos/acme/unconfigured/pulls/7",
+        "http://api.github.com/repos/acme/widget/pulls/7",
+        "https://api.github.com.evil.test/repos/acme/widget/pulls/7",
+        "https://api.github.com/repos/acme/widget/issues/7",
+        "https://api.github.com/repos/acme/widget/pulls/7/files",
+        "https://api.github.com/repos/acme/widget/pulls/7?diff=1",
+        "https://api.github.com/repos/acme/widget/pulls/7/../comments",
+        "https://api.github.com/repos/acme/widget/pulls/7/%2e%2e/comments",
+        "https://api.github.com/repos/acme%2Fattacker/widget/pulls/7",
+        "https://api.github.com/repos/acme/widget%5Crepo/pulls/7",
+    ],
+)
+def test_github_poller_fetch_rejects_widening_shapes(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    auth, labels = _trigger_service_context(_github_fetch_service(), integrity="untrusted")
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "egress_destination_not_approved"
+
+
+def test_github_repo_template_does_not_change_exact_url_approval_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    exact = "https://approved.example/fixed"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", exact)
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    auth, _labels = _trigger_service_context(_github_fetch_service(), integrity="trusted")
+
+    assert access_control.approved_fetch_urls(auth) == frozenset({exact})
+    assert not access_control.fetch_url_is_approved(f"{exact}/child", auth)
+
+
+def test_github_pr_fetch_execution_pin_contains_only_current_exact_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _authorized_fetch_urls_for_tool
+
+    target = "https://api.github.com/repos/acme/widget/pulls/7/comments"
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    auth, _labels = _trigger_service_context(_github_fetch_service(), integrity="trusted")
+
+    assert _authorized_fetch_urls_for_tool("fetch_url", auth, target) == frozenset({target})
+
+
 def test_configured_exact_url_preserves_literal_comma_without_approving_prefix(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

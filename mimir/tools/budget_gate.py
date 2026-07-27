@@ -50,12 +50,15 @@ from ..models import AuthContext
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
     OperationDecision,
+    SinkCategory,
     ToolAuthorization,
     approve_live_declassification,
     approved_fetch_urls,
+    fetch_url_is_approved,
     classify_protected_result,
     get_tool_registry,
     get_trusted_service_from_auth_context,
+    normalize_sink_destination,
     parse_service_shell_argv,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
@@ -339,9 +342,15 @@ def _extract_sink_targets(
 def _authorized_fetch_urls_for_tool(
     tool_name: str,
     auth_context: AuthContext | None,
+    target: str | None = None,
 ) -> frozenset[str] | None:
     if tool_name == "fetch_url":
-        return approved_fetch_urls(auth_context)
+        approved = set(approved_fetch_urls(auth_context))
+        if target is not None and fetch_url_is_approved(target, auth_context):
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+            if normalized is not None:
+                approved.add(normalized)
+        return frozenset(approved)
     if tool_name == "web_search":
         from ..access_control import _fixed_web_search_url
 
@@ -921,7 +930,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         capture_token = begin_protected_result_capture()
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(tool_name, auth_context)
+        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+            tool_name, auth_context, _extract_sink_target(request, auth_context),
+        )
         if authorized_fetch_urls is not None:
             from .web import begin_authorized_fetch
 
@@ -1078,7 +1089,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         capture_token = begin_protected_result_capture()
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(tool_name, auth_context)
+        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+            tool_name, auth_context, _extract_sink_target(request, auth_context),
+        )
         if authorized_fetch_urls is not None:
             from .web import begin_authorized_fetch
 
