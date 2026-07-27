@@ -3062,6 +3062,34 @@ def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
     assert decision.allowed is True, decision.reason
 
 
+def test_repo_review_shell_profile_admits_pr_view_repo_alias(
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(
+        "gh pr view 1220 -R jasoncarreira/mimir --json "
+        "number,title,state,isDraft,author,headRefOid,reviews,comments,body,files",
+        "repo_review",
+    )
+
+    assert argv is not None
+    assert argv[0] == str(maintenance_pinned_executables["gh"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews/4789681429",
+        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews --paginate",
+        "gh api repos/jasoncarreira/mimir/pulls/1220/files --paginate",
+        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews -f body=approved",
+        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews --method POST",
+        "gh api user",
+    ],
+)
+def test_repo_review_shell_profile_rejects_gh_api(command: str) -> None:
+    assert parse_service_shell_argv(command, "repo_review") is None
+
+
 def test_every_service_shell_profile_returns_absolute_executables(
     maintenance_git_home: Path,
 ) -> None:

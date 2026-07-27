@@ -18,8 +18,8 @@ skill.
 the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
 **Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
-diff accessible — either under 20k lines via `gh pr diff`, or file list via
-`gh api repos/.../pulls/<n>/files --paginate` for large PRs.
+diff accessible via `gh pr diff`, with `gh pr view --json files` available when
+the full patch exceeds GitHub's diff-size limit.
 
 **Guarantees**:
 - A review is posted to GitHub (not just output to turn text) via `gh pr review`.
@@ -39,34 +39,44 @@ gate and cannot approve release of its own inputs. Do not call
 coding process. A denied attempt is a working security boundary, not a reason to
 request either capability.
 
+**Shell execution rule**: Use exactly one command per `shell_exec` call. The
+poller's shell profile parses and executes one authorized argv with
+`shell=False`; it does not run a shell. Never send `cd`, `&&`, `;`, pipes,
+redirects, heredocs, or command substitution as part of another command. Keep
+the repository argument explicit with `--repo <owner>/<repo>` where supported.
+
 ## Step-by-step
 
 ### 1. Get PR context
 
 ```bash
-gh pr view <num> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
+gh pr view <num> --repo <owner>/<repo> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
 ```
 
-Note the `headRefOid` (SHA) — you need it if you fetch file content via the
-API.
+Note the `headRefOid` (SHA) so every later observation can be tied to the exact
+reviewed head.
 
 ### 2. Get the diff
 
 ```bash
-gh pr diff <num>
+gh pr diff <num> --repo <owner>/<repo>
 ```
 
 The diff is the **authoritative source for what changed**. Read it carefully
 before reaching for local file reads.
 
-For PRs whose diff exceeds ~20k lines use the file-list fallback:
+If `gh pr diff` reports that the diff exceeds GitHub's size limit, use the
+already-admitted PR view surface for a bounded file list:
 
 ```bash
-gh api repos/jasoncarreira/mimir/pulls/<num>/files --paginate \
-  --jq '.[] | "\(.status) \(.filename)"'
+gh pr view <num> --repo <owner>/<repo> --json files
 ```
 
-### 3. Fetch source files only when necessary — and safely
+Do not fall back to `gh api`. Even read-shaped `gh api --jq` can inspect local
+environment data, and the profile deliberately keeps that broader command
+surface unavailable.
+
+### 3. Read source files only when necessary — and safely
 
 Use local `Read` only when you need extended context beyond what the diff
 shows (e.g., the full function surrounding a changed line, a test file
@@ -74,18 +84,9 @@ you want to read in full). **Before calling `Read`, ask: "is this file
 on the currently-checked-out branch?"** If the PR branch is not checked
 out locally, the file may not exist or may show the wrong version.
 
-**Correct alternatives when the local checkout may be stale or on a
-different branch:**
-
-```bash
-# Fetch a file from the PR's HEAD SHA via API
-gh api "repos/jasoncarreira/mimir/contents/<path>?ref=<headRefOid>" \
-  --jq '.content' | base64 -d
-
-# Or fetch the raw blob
-gh api "repos/jasoncarreira/mimir/git/blobs/<blob_sha>" --jq '.content' \
-  | base64 -d
-```
+When the local checkout may be stale or on another branch, rely on the diff and
+the bounded `gh pr view --json files` result instead of composing a download and
+decoder pipeline. Local context is supplemental, not required.
 
 **If a local `Read` returns "file does not exist":** do NOT bail. Log it
 in your notes ("couldn't read <file> locally — reviewing from diff only")
@@ -119,43 +120,27 @@ effect (`gh pr review`), submission verification, and wrap-up. A review
 with perfect extra evidence that never reaches GitHub is worse than a
 bounded review that lands with an honest validation note.
 
+Write the multiline review with the `write_file` tool to a dedicated file under
+`<MIMIR_HOME>/scratch/`, then make one of these single-command calls:
+
 ```bash
-# Approve
-gh pr review <num> --approve --body "$(cat <<'EOF'
-## Summary
-...
-
-## Observations
-...
-EOF
-)"
-
-# Request changes
-gh pr review <num> --request-changes --body "$(cat <<'EOF'
-## Summary
-...
-
-## Blocking issues
-...
-EOF
-)"
-
-# Comment only (no verdict, for questions / early feedback)
-gh pr review <num> --comment --body "$(cat <<'EOF'
-...
-EOF
-)"
+gh pr review <num> --repo <owner>/<repo> --approve --body-file <MIMIR_HOME>/scratch/review-<num>.md
 ```
 
-Use a heredoc (`<<'EOF' ... EOF`) to pass the body — inline quoting breaks
-on `$`, backticks, and multi-line text.
+```bash
+gh pr review <num> --repo <owner>/<repo> --request-changes --body-file <MIMIR_HOME>/scratch/review-<num>.md
+```
+
+```bash
+gh pr review <num> --repo <owner>/<repo> --comment --body-file <MIMIR_HOME>/scratch/review-<num>.md
+```
 
 ### 6. Confirm submission
 
 After the `gh pr review` call completes:
 
 ```bash
-gh pr view <num> --json reviews --jq '.reviews[-1] | {state, author: .author.login, submitted: .submittedAt}'
+gh pr view <num> --repo <owner>/<repo> --json reviews
 ```
 
 Verify your login (`mimir-carreira`) appears in the reviews list.
@@ -203,6 +188,6 @@ nothing about the submission requirement.
 | Symptom | Fix |
 |---|---|
 | `Read(tests/foo.py)` -> "file does not exist" | Skip Read, continue from diff, still submit |
-| `gh pr diff <num>` -> HTTP 406 "diff too large" | Fall back to `gh api .../pulls/<num>/files` for file list |
+| `gh pr diff <num>` -> HTTP 406 "diff too large" | Fall back to `gh pr view <num> --repo <owner>/<repo> --json files` |
 | `gh pr review` exits non-zero | Check `--help`; verify PR is open; retry once |
-| Review body contains backticks / `${}` | Use `<<'EOF'` heredoc (single-quote prevents expansion) |
+| Review body contains shell syntax or multiple lines | Write it under `<MIMIR_HOME>/scratch/` and use `--body-file` |
