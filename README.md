@@ -151,10 +151,9 @@ mid-turn injection, …) that are easy to miss. `.env.example` is a copy-paste
 starter covering the common ones. See the
 **[authorization reference](./docs/authorization.md)** for identity roles,
 requester-resource decisions, trusted services, IFC, and the shadow-first
-enablement runbook. Authorization enforcement is default-off. The default
-`codex-plus:` provider is compatible with it; only `claude-code:` is refused at
-startup, because that subprocess hook cannot carry the per-turn authorization
-context.
+enablement runbook. Authorization enforcement is default-off, and every model
+provider supports it — including `claude-code:`, whose subprocess hooks receive
+the per-turn authorization context through a server-owned carrier.
 
 ## Web UI
 
@@ -214,8 +213,7 @@ aren't mounted). Full details + a compose example:
 - `codex-plus:<model>` — ChatGPT Plus / Pro Codex subscription via the
   OAuth-backed gateway. **Default** (`codex-plus:gpt-5.6-luna`), used by both
   `mimir setup` and the runtime fallback.
-- `claude-code:<model>` — Max OAuth subprocess (free under Max plan; cannot be
-  combined with `MIMIR_ACCESS_CONTROL_ENFORCED`).
+- `claude-code:<model>` — Max OAuth subprocess (free under Max plan).
 - `anthropic:<model>` — direct Anthropic API (paid credit).
 - `openai:<model>` — direct OpenAI.
 

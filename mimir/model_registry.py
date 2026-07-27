@@ -109,16 +109,11 @@ class ModelRoute:
 #: on the Codex Plus subscription route without depending on bare-name
 #: prefix detection.
 #:
-#: It is also enforcement-compatible. A ``claude-code:`` default made
-#: ``MIMIR_ACCESS_CONTROL_ENFORCED=true`` fail startup preflight, because
-#: that subprocess hook cannot carry the per-turn AuthContext (#910).
-#:
 #: Consequence for ``--subscription``: with a subscription-backed default,
 #: the bare flag is a no-op (Codex Plus is already subscription billing).
 #: It still flips an explicitly requested Claude-family model to
 #: ``claude-code:`` — e.g. ``mimir setup --model claude-sonnet-4-6
-#: --subscription`` — and setup warns there that the result cannot be used
-#: with enforcement until #910 lands.
+#: --subscription``.
 DEFAULT_MODEL_SPEC = "codex-plus:gpt-5.6-luna"
 
 
