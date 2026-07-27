@@ -1944,26 +1944,56 @@ def test_service_shell_refusal_always_carries_a_reason(
 
 
 def test_service_shell_refusal_reason_withholds_argument_values() -> None:
-    """The reason names option and command NAMES, never their values.
+    """A refusal reason echoes only fixed-vocabulary tokens, never a value.
 
     A service command can legitimately carry a credential — ``git -c
     http.extraheader=...`` is the real example — and this text is returned to the
     model and recorded in the turn transcript, so a reason that echoed the
     command line would be a disclosure channel (#1015 review criteria).
+
+    The sentinel is injected at every argv position, because the shapes that leak
+    are not the obvious ones. An earlier version of this test used only values in
+    a *separate* argv token and values containing URL punctuation, and passed
+    while two real holes were open: a value attached to a short option
+    (``-HAuthorization:SEKRIT`` has no ``=`` to split on) and a plain-looking
+    positional (``private/path/SEKRIT`` is shaped exactly like an API resource
+    path). Both were caught in review of #1223, not by this test.
     """
     from mimir.access_control import parse_service_shell_argv_with_reason
 
-    for command in (
-        "git -c http.extraheader=AUTHORIZATION:Bearer-tp-SEKRIT fetch --all",
-        "curl https://example.test/hook?access_token=tp-SEKRIT",
-    ):
-        argv, reason = parse_service_shell_argv_with_reason(command, "repo_review")
-        assert argv is None
-        assert "SEKRIT" not in reason, reason
-        assert "Bearer" not in reason and "access_token" not in reason, reason
-        # ...while still being actionable: the executable is named, and for the
-        # first case so is the option name that carried the value.
-        assert "repo_review" in reason
+    sentinel = "tpSEKRITvalue"
+    commands = (
+        # value in a separate token after a known option
+        f"git -c http.extraheader=AUTHORIZATION:{sentinel} fetch --all",
+        # value ATTACHED to a short option: no '=' to split on
+        f"gh api -H Authorization:Bearer-{sentinel} repos/x/pulls/1",
+        f"gh -t{sentinel} pr view 1",
+        # long option with an attached value
+        f"gh pr view 1 --token={sentinel}",
+        # bare alphanumeric positional
+        f"gh api {sentinel}",
+        # plain-looking path positional, shaped like an API resource
+        f"gh api private/path/{sentinel}",
+        # the executable itself
+        f"/opt/{sentinel}/bin/tool run",
+        # value inside a URL
+        f"curl https://example.test/hook?access_token={sentinel}",
+    )
+    for command in commands:
+        for profile in ("repo_review", "maintenance", "scheduler_read_only"):
+            argv, reason = parse_service_shell_argv_with_reason(command, profile)
+            assert argv is None, f"{command!r} should not be admitted"
+            assert sentinel not in reason, f"[{profile}] leaked: {reason}"
+
+    # ...while staying actionable: the profile is named, and a known option
+    # spelling is still reported so the caller can see what it sent.
+    _, reason = parse_service_shell_argv_with_reason(
+        "gh pr view 1 --json number --badoption x", "repo_review",
+    )
+    assert "repo_review" in reason
+    assert "--json" in reason        # a known spelling is named
+    assert "<option>" in reason      # the unknown one is withheld, not echoed
+    assert "--badoption" not in reason
 
 
 def test_compound_command_refusal_says_what_to_do_instead() -> None:

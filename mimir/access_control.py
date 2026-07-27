@@ -1526,28 +1526,56 @@ _SHELL_PROFILE_SINGLE_ARGV_HINT = (
 )
 
 
-# A command/subcommand/resource-path token, safe to name back to the caller.
-# Anything else — a URL, a ``key=value``, a token-bearing query string — renders
-# as ``<value>``, because a positional can carry a credential just as an option
-# value can and this text is returned to the model and kept in the transcript.
-_SERVICE_SHELL_SHAPE_TOKEN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+# Display-only vocabulary for refusal messages. A token is echoed back to the
+# caller ONLY if it is literally a member of one of these sets; anything else
+# becomes a placeholder. That makes "no argument value is ever disclosed" a
+# property of construction rather than of a pattern.
+#
+# Pattern matching cannot do this job. An attached short-option value
+# (``-HAuthorization:Bearer-...``) has the same shape as a legitimate long
+# option, and a secret can be bare alphanumerics or a plain-looking path
+# (``private/path/...``), indistinguishable from a subcommand or an API resource.
+#
+# Absence from these sets can only make a message *less specific* — it can never
+# change an authorization decision, admit a command, or deny one. That asymmetry
+# is what makes a hand-maintained display list safe: its worst failure is a
+# vaguer sentence. The executables are derived from the pin map so they cannot
+# drift from the commands that can actually run.
+_SERVICE_SHELL_DISPLAY_COMMANDS = frozenset(_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS)
+_SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
+    "add", "api", "branch", "checkout", "checks", "close", "comment", "commit",
+    "create", "describe", "diff", "fetch", "init", "issue", "label", "list",
+    "lock", "log", "ls-files", "merge-base", "pr", "pull", "push", "ready",
+    "relate", "remote", "rev-parse", "review", "run", "show", "status", "sync",
+    "test", "update", "view",
+})
+_SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
+    "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
+    "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
+    "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
+    "--json", "--jq", "--label", "--limit", "--mention", "--milestone",
+    "--no-pager", "--oneline", "--priority", "--repo", "--request-changes",
+    "--search", "--short", "--state", "--status", "--template",
+})
 
 
 def _service_shell_command_shape(argv: list[str]) -> str:
-    """Name the refused command surface without quoting argument values.
+    """Name the refused command surface without echoing any argument value.
 
-    ``argv[0]`` plus up to two following non-option tokens — enough to identify
-    which command and subcommand were refused, while leaving option *values*
-    out, since a service command can legitimately carry a credential.
+    The executable plus up to two following non-option tokens, each passed
+    through the display vocabulary — enough to identify which command and
+    subcommand were refused, while a resource path or any other value renders as
+    ``<value>``.
     """
-    shape = [argv[0][:40] if _SERVICE_SHELL_SHAPE_TOKEN.match(argv[0]) else "<value>"]
+    shape = [
+        argv[0] if argv[0] in _SERVICE_SHELL_DISPLAY_COMMANDS else "<command>"
+    ]
     for token in argv[1:]:
         if token.startswith("-"):
             break
-        if not _SERVICE_SHELL_SHAPE_TOKEN.match(token):
-            shape.append("<value>")
-            break
-        shape.append(token[:40])
+        shape.append(
+            token if token in _SERVICE_SHELL_DISPLAY_SUBCOMMANDS else "<value>"
+        )
         if len(shape) >= 3:
             break
     return " ".join(shape)
@@ -1555,10 +1583,15 @@ def _service_shell_command_shape(argv: list[str]) -> str:
 
 def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
     """Explain that a well-formed command is outside the profile's allowlist."""
-    options = sorted({
-        token.split("=", 1)[0] for token in argv[1:] if token.startswith("-")
+    supplied = [token for token in argv[1:] if token.startswith("-")]
+    named = sorted({
+        token for token in supplied if token in _SERVICE_SHELL_DISPLAY_OPTIONS
     })
-    option_text = f" Options sent: {', '.join(options)}." if options else ""
+    # One placeholder stands in for every option that is not a known spelling,
+    # including any that carries its value attached to it.
+    if len(named) != len(set(supplied)):
+        named.append("<option>")
+    option_text = f" Options sent: {', '.join(named)}." if named else ""
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
