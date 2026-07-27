@@ -72,9 +72,12 @@ def test_every_denial_sets_would_block() -> None:
             or "Constant(value=False)" in rendered
         )
         if is_denial and "would_block" not in keywords:
-            missing.append(node.lineno)
+            reason = keywords.get("reason")
+            missing.append(
+                reason.value if isinstance(reason, ast.Constant) else f"line {node.lineno}"
+            )
 
-    assert missing == [2245], missing
+    assert missing == ["not_a_channel_operation"], missing
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
