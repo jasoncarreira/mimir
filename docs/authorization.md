@@ -512,7 +512,15 @@ necessary but not sufficient for production enablement.
 - Complete the planned adversarial-review/hardening rounds, including the
   current #912-#920 series, until repeated reviews produce diminishing findings
   and no unresolved HIGH or MEDIUM authorization findings.
-- Run the full suite on the exact revision to deploy. Review any local tools,
+- Require the standing `tests / pytest-enforced` CI job to pass on the exact
+  revision to deploy. It runs the full suite with enforcement on and deliberately
+  leaves `MIMIR_MODEL_SPEC` unset, exercising the shipped
+  `codex-plus:gpt-5.6-luna` default. A green run means "nothing failed"; it does
+  not by itself prove that enforcement-sensitive paths ran. The executable guard
+  `tests/test_env_isolation.py::test_no_test_is_skipped_because_enforcement_is_on`
+  keeps that result from decaying into "nothing ran" by rejecting tests skipped
+  because enforcement is on.
+- Require the ordinary unenforced suite to pass as well. Review any local tools,
   MCP adapters, bridges, harness egress, service triggers, and persisted SAGA or
   commitment migrations that are not represented by upstream tests.
 - Confirm `state/identities.yaml` has deliberate canonical aliases and `user` or
@@ -524,6 +532,64 @@ necessary but not sufficient for production enablement.
 - Confirm protected legacy data and derived ACL behavior are acceptable. Current
   trusted platform services intentionally retain broad internal SAGA read scope;
   verify their outputs remain owner/ACL-intersected and IFC-gated.
+
+Evidence measured on 2026-07-27 for the current enablement revision:
+
+- the enforced full suite with explicit
+  `MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6` completed with 0 failures and 16
+  skips;
+- the enforced full suite with `MIMIR_MODEL_SPEC` unset, matching the standing CI
+  job and shipped default, completed with 0 failures and 16 skips;
+- the unenforced full suite also had 16 skips, so skip parity confirms that the
+  enforced results were not made green by enforcement-specific skipping;
+- the live deployment's `state/identities.yaml` contained canonical principal
+  `jason` with both `user` and `admin` roles; and
+- the live deployment's `saga.db` `atoms` table contained `owner_principal`,
+  `origin_domain`, and `visibility`.
+
+Treat these as recorded evidence, not permanent facts. Immediately before the
+operator-controlled flip, re-verify the two deployment preconditions:
+
+```bash
+uv run python - <<'PY'
+import os
+from pathlib import Path
+
+import yaml
+
+path = Path(os.environ["MIMIR_HOME"]) / "state" / "identities.yaml"
+people = yaml.safe_load(path.read_text(encoding="utf-8")).get("people", [])
+principals_with_admin = [
+    person.get("canonical")
+    for person in people
+    if "admin" in ((person.get("access") or {}).get("roles") or [])
+]
+assert principals_with_admin, (
+    f"{path}: no deliberate admin identity found; "
+    f"configured principals={[person.get('canonical') for person in people]}"
+)
+print(f"{path}: admin identities verified: {principals_with_admin}")
+PY
+```
+
+The admin principal is deployment-specific. This check deliberately verifies the
+required role rather than assuming a particular canonical name.
+
+```bash
+uv run python - <<'PY'
+import os
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+
+path = Path(os.environ["MIMIR_HOME"]) / ".mimir" / "saga.db"
+with closing(sqlite3.connect(path)) as connection:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(atoms)")}
+required = {"owner_principal", "origin_domain", "visibility"}
+assert required <= columns, sorted(required - columns)
+print(f"{path}: atoms ownership columns verified")
+PY
+```
 
 ### 2. Validate in shadow first
 
@@ -548,20 +614,18 @@ enforcement is enabled.
 
 ### 3. Pass startup preflights
 
-The shipped default (`codex-plus:gpt-5.6-luna`) already passes the provider
-compatibility preflight. Claude Code subprocess hooks now receive the exact
-per-invocation authorization context through the server-owned carrier, so a
-tested `claude-code:` model also passes. In a staging process with the same
-environment and policy files, set:
+No model-provider change is required before enablement. The shipped
+`codex-plus:gpt-5.6-luna` default supports enforcement, and Claude Code
+subprocess hooks carry the exact per-invocation authorization context through a
+server-owned opaque carrier. There is no live provider-compatibility startup
+exception. Do not pin `MIMIR_MODEL_SPEC` in the enforced CI job: leaving it unset
+is what continuously validates the configuration a fresh install receives.
 
-```dotenv
-MIMIR_ACCESS_CONTROL_ENFORCED=true
-MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna
-```
-
-Startup must complete without `CapabilityMatrixError`. Do not bypass this check.
-Exercise at least one allowed and one denied request for each human tier,
-resource adapter, service principal, and configured external tool.
+In a staging process with the same environment and policy files, perform the
+operator-controlled enforcement trial. Startup must complete without
+`CapabilityMatrixError`; do not bypass this check. Exercise at least one allowed
+and one denied request for each human tier, resource adapter, service principal,
+and configured external tool.
 
 ### 4. Enable and monitor
 
