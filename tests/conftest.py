@@ -91,3 +91,28 @@ def _clear_mimir_api_key():
     yield
     if saved is not None:
         os.environ["MIMIR_API_KEY"] = saved
+
+
+@pytest.fixture(autouse=True)
+def _isolate_process_env():
+    """Snapshot and restore ``os.environ`` around every test.
+
+    ``mimir.config._load_home_dotenv`` calls ``load_dotenv(..., override=False)``,
+    which MUTATES the process environment. That is correct at runtime — it is how
+    ``<home>/.env`` becomes defaults while operator exports still win — but it
+    leaks in tests: ``monkeypatch`` can only restore variables it set itself, so
+    keys loaded from a temp-home ``.env`` outlive the test that wrote them.
+
+    The leak is not theoretical. Before #1209, a test wrote
+    ``MIMIR_MODEL_SPEC=claude-code:*`` into a temp home and loaded it; under
+    ``MIMIR_ACCESS_CONTROL_ENFORCED=1`` every later ``Config.from_env()`` then hit
+    the provider gate, producing ~186 cascading failures from one root cause.
+    Enforcement amplifies the leak, so this fixture is a prerequisite for running
+    the suite enforced in CI.
+    """
+    saved = os.environ.copy()
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)

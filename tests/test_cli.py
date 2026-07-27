@@ -479,8 +479,12 @@ def test_main_run_subcommand_exports_home_env(tmp_path: Path):
     assert captured["MIMIR_HOME"] == str(home.resolve())
 
 
-def test_main_no_args_runs_server(tmp_path: Path):
+def test_main_no_args_runs_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Bare ``mimir`` — no subcommand — defaults to running the server."""
+    # ``run`` refuses to start without --home or MIMIR_HOME. This test used to
+    # inherit MIMIR_HOME leaked by an earlier test in this file; set it here so
+    # the test passes in isolation too.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     called = {"yes": False}
 
     def fake_run_server() -> None:

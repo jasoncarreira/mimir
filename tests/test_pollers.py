@@ -313,6 +313,14 @@ def test_unknown_or_out_of_bounds_authority_rejects_instance(
 def test_instance_root_and_operator_alert_are_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This test needs MIMIR_HOME set but pointing SOMEWHERE ELSE than the poller
+    # state tree. The gate needs a home to resolve service write scope at all
+    # (unset -> even the poller's own cursor is ADMIN_REQUIRED), but a home of
+    # ``tmp_path`` would blanket-cover ``<home>/state/**`` and make the sibling
+    # poller's cursor writable too, defeating the "exact" assertion below. It
+    # previously relied on MIMIR_HOME leaking from an unrelated test FILE, which
+    # happened to satisfy both conditions — so this file failed when run alone.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "agent-home"))
     skills = tmp_path / "skills"
     authority = _authority(capabilities=["write_file", "operator_alert"])
     _write_pollers_json(skills / "feed", [
