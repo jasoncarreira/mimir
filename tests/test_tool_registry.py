@@ -910,19 +910,12 @@ def test_mutation_sink_destinations_are_normalized(
     "model_spec",
     ["claude-code:claude-sonnet-4-6", "claude_code:claude-sonnet-4-6"],
 )
-def test_enforcement_enablement_rejects_claude_code_provider(
+def test_enforcement_enablement_accepts_claude_code_provider(
     model_spec: str,
 ) -> None:
-    from mimir.access_control import (
-        ProviderEnforcementCompatibilityError,
-        resolve_access_control_enforcement,
-    )
+    from mimir.access_control import resolve_access_control_enforcement
 
-    with pytest.raises(
-        ProviderEnforcementCompatibilityError,
-        match="claude-code subprocess.*per-turn AuthContext",
-    ):
-        resolve_access_control_enforcement(True, model_spec=model_spec)
+    assert resolve_access_control_enforcement(True, model_spec=model_spec) is True
 
 
 def test_capability_matrix_report_generates_complete_report() -> None:

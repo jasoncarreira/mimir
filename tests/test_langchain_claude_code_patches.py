@@ -9,31 +9,57 @@ unsupported.
 from __future__ import annotations
 
 import asyncio
-import os
 import types
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
 
 from mimir._langchain_claude_code_patches import (
+    _InvocationAuthCarrier,
+    _auth_carrier_var,
     _post_tool_use_failure_hook,
     _post_tool_use_hook,
     _pre_tool_use_hook,
     _tool_events_var,
     install_tool_event_hooks,
 )
+from mimir.models import AuthContext, InformationFlowLabels
 
 
-_ENFORCEMENT_ENABLED = os.environ.get(
-    "MIMIR_ACCESS_CONTROL_ENFORCED", "",
-).strip().lower() in {"1", "true", "yes", "on"}
-_CLAUDE_CODE_ENFORCEMENT_SKIP = pytest.mark.skipif(
-    _ENFORCEMENT_ENABLED,
-    reason=(
-        "not applicable under enforcement until #910 carries the server-created "
-        "per-turn AuthContext into Claude Code subprocess hooks"
-    ),
-)
+def _auth_context(
+    *,
+    principal: str = "admin",
+    roles: tuple[str, ...] = ("user", "admin"),
+) -> AuthContext:
+    return AuthContext(
+        principal=principal,
+        canonical_principal=principal,
+        roles=roles,
+        event_ingress="discord",
+        trigger="user_message",
+        channel_id="discord:channel:1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def _auth_config(auth_context: AuthContext | None = None) -> dict[str, Any]:
+    runtime = types.SimpleNamespace(context=auth_context or _auth_context())
+    return {"configurable": {"__pregel_runtime": runtime}}
+
+
+@contextmanager
+def _authorized_hook_context(auth_context: AuthContext | None = None):
+    carrier = _InvocationAuthCarrier()
+    binding = carrier.bind(auth_context or _auth_context())
+    token = _auth_carrier_var.set(carrier)
+    try:
+        yield carrier
+    finally:
+        carrier.clear(binding)
+        _auth_carrier_var.reset(token)
 
 
 # ── install_tool_event_hooks ────────────────────────────────────────
@@ -45,7 +71,6 @@ def _clear_tool_event_marker(cls: type) -> None:
 
 
 @pytest.mark.asyncio
-@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_pre_post_hooks_record_events_with_tool_use_id():
     """The pre/post hook callbacks themselves should append correctly
     shaped event dicts to the active capture list. Verifies the
@@ -54,11 +79,12 @@ async def test_pre_post_hooks_record_events_with_tool_use_id():
     events: list[dict[str, Any]] = []
     token = _tool_events_var.set(events)
     try:
-        await _pre_tool_use_hook(
-            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
-            "toolu_01abc",
-            None,
-        )
+        with _authorized_hook_context():
+            await _pre_tool_use_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                "toolu_01abc",
+                None,
+            )
         await _post_tool_use_hook(
             {
                 "tool_name": "Bash",
@@ -116,7 +142,6 @@ async def test_failure_hook_records_is_error_true():
 
 
 @pytest.mark.asyncio
-@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_noop_outside_active_context():
     """When no capture context is set (``_tool_events_var`` is None),
     the hook callbacks must silently no-op — they can't append to a
@@ -124,11 +149,88 @@ async def test_hooks_noop_outside_active_context():
     from a stray code path that hasn't entered our patched _aquery."""
     # Verify ContextVar default is None before we set it anywhere.
     assert _tool_events_var.get() is None
-    out = await _pre_tool_use_hook(
-        {"tool_name": "Bash", "tool_input": {}}, "toolu_orphan", None,
-    )
+    with _authorized_hook_context():
+        out = await _pre_tool_use_hook(
+            {"tool_name": "Bash", "tool_input": {}}, "toolu_orphan", None,
+        )
     assert out == {}  # no-op return shape
     assert _tool_events_var.get() is None  # untouched
+
+
+@pytest.mark.asyncio
+async def test_pre_tool_hook_missing_carrier_fails_closed(monkeypatch):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    result = await _pre_tool_use_hook(
+        {"tool_name": "Bash", "tool_input": {"command": "true"}},
+        "toolu_missing",
+        None,
+    )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "missing_auth_context" in output["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pre_tool_hook_uses_auth_context_for_sink_scope():
+    user = _auth_context(principal="user", roles=("user",))
+    with _authorized_hook_context(user):
+        same_channel = await _pre_tool_use_hook(
+            {"tool_name": "send_message", "tool_input": {}},
+            "toolu_same",
+            None,
+        )
+        cross_channel = await _pre_tool_use_hook(
+            {
+                "tool_name": "send_message",
+                "tool_input": {"channel_id": "discord:channel:other"},
+            },
+            "toolu_cross",
+            None,
+        )
+
+    assert same_channel == {}
+    assert cross_channel["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_reused_sdk_hook_task_resolves_each_turns_auth_context():
+    """A hook task forked at connect must not retain turn one's authority."""
+    carrier = _InvocationAuthCarrier()
+    first_binding = carrier.bind(_auth_context(principal="first-admin"))
+    carrier_token = _auth_carrier_var.set(carrier)
+    requests: asyncio.Queue[tuple[str, asyncio.Future[dict]] | None] = asyncio.Queue()
+
+    async def reused_sdk_client_hook_task() -> None:
+        while (request := await requests.get()) is not None:
+            tool_use_id, result = request
+            result.set_result(await _pre_tool_use_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "true"}},
+                tool_use_id,
+                None,
+            ))
+
+    task = asyncio.create_task(reused_sdk_client_hook_task())
+    try:
+        first_result = asyncio.get_running_loop().create_future()
+        await requests.put(("toolu_turn_1", first_result))
+        assert await first_result == {}
+
+        carrier.clear(first_binding)
+        second_binding = carrier.bind(
+            _auth_context(principal="second-user", roles=("user",)),
+        )
+        second_result = asyncio.get_running_loop().create_future()
+        await requests.put(("toolu_turn_2", second_result))
+        denial = await second_result
+        assert denial["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "admin_required" in denial["hookSpecificOutput"]["permissionDecisionReason"]
+        carrier.clear(second_binding)
+    finally:
+        await requests.put(None)
+        await task
+        _auth_carrier_var.reset(carrier_token)
 
 
 def _make_dummy_for_hooks() -> tuple[type, type]:
@@ -241,7 +343,7 @@ async def test_install_hooks_attaches_tool_events_to_aquery_result():
         install_tool_event_hooks()
 
         instance = fake_cls()
-        content, tool_calls, gi = await instance._aquery()
+        content, tool_calls, gi = await instance._aquery(config=_auth_config())
 
         assert content == "done"
         events = gi.get("tool_events")
@@ -271,7 +373,7 @@ async def test_install_hooks_attaches_tool_events_to_astream_result_chunk():
         install_tool_event_hooks()
 
         instance = fake_cls()
-        chunks = [c async for c in instance._astream()]
+        chunks = [c async for c in instance._astream(_config=_auth_config())]
 
         # Intermediate text chunk has no generation_info — untouched.
         assert chunks[0].generation_info is None
@@ -452,24 +554,25 @@ async def test_hooks_capture_built_in_bash_tool_integration():
     events: list[dict[str, Any]] = []
     token = _tool_events_var.set(events)
     try:
-        options = ClaudeAgentOptions(
-            hooks={
-                "PreToolUse": [HookMatcher(hooks=[_pre_tool_use_hook])],
-                "PostToolUse": [HookMatcher(hooks=[_post_tool_use_hook])],
-                "PostToolUseFailure": [
-                    HookMatcher(hooks=[_post_tool_use_failure_hook]),
-                ],
-            },
-            allowed_tools=["Bash"],
-            max_turns=4,
-        )
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(
-                "Use the Bash tool to run `echo hooks-integration-test` "
-                "and tell me what it printed. Then stop.",
+        with _authorized_hook_context():
+            options = ClaudeAgentOptions(
+                hooks={
+                    "PreToolUse": [HookMatcher(hooks=[_pre_tool_use_hook])],
+                    "PostToolUse": [HookMatcher(hooks=[_post_tool_use_hook])],
+                    "PostToolUseFailure": [
+                        HookMatcher(hooks=[_post_tool_use_failure_hook]),
+                    ],
+                },
+                allowed_tools=["Bash"],
+                max_turns=4,
             )
-            async for _ in client.receive_response():
-                pass
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(
+                    "Use the Bash tool to run `echo hooks-integration-test` "
+                    "and tell me what it printed. Then stop.",
+                )
+                async for _ in client.receive_response():
+                    pass
     finally:
         _tool_events_var.reset(token)
 
@@ -503,7 +606,6 @@ async def test_hooks_capture_built_in_bash_tool_integration():
 
 
 @pytest.mark.asyncio
-@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_capture_built_in_bash_tool_mocked():
     """Mocked companion to ``test_hooks_capture_built_in_bash_tool_integration``.
 
@@ -535,28 +637,29 @@ async def test_hooks_capture_built_in_bash_tool_mocked():
         # Each pair shares a tool_use_id and is delivered in this order:
         # pre(call1), post(call1), pre(call2), post(call2). Real model
         # output also typically yields one pair per Bash command.
-        await _pre_tool_use_hook(
-            {"tool_name": "Bash", "tool_input": {"command": "echo a"}},
-            tool_use_id="toolu_01",
-            _ctx=None,
-        )
-        await _post_tool_use_hook(
-            {"tool_name": "Bash",
-             "tool_response": {"stdout": "a\n", "stderr": "", "exit_code": 0}},
-            tool_use_id="toolu_01",
-            _ctx=None,
-        )
-        await _pre_tool_use_hook(
-            {"tool_name": "Bash", "tool_input": {"command": "echo b"}},
-            tool_use_id="toolu_02",
-            _ctx=None,
-        )
-        await _post_tool_use_hook(
-            {"tool_name": "Bash",
-             "tool_response": {"stdout": "b\n", "stderr": "", "exit_code": 0}},
-            tool_use_id="toolu_02",
-            _ctx=None,
-        )
+        with _authorized_hook_context():
+            await _pre_tool_use_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "echo a"}},
+                tool_use_id="toolu_01",
+                _ctx=None,
+            )
+            await _post_tool_use_hook(
+                {"tool_name": "Bash",
+                 "tool_response": {"stdout": "a\n", "stderr": "", "exit_code": 0}},
+                tool_use_id="toolu_01",
+                _ctx=None,
+            )
+            await _pre_tool_use_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "echo b"}},
+                tool_use_id="toolu_02",
+                _ctx=None,
+            )
+            await _post_tool_use_hook(
+                {"tool_name": "Bash",
+                 "tool_response": {"stdout": "b\n", "stderr": "", "exit_code": 0}},
+                tool_use_id="toolu_02",
+                _ctx=None,
+            )
     finally:
         _tool_events_var.reset(token)
 
@@ -606,7 +709,6 @@ async def test_hooks_capture_built_in_bash_tool_mocked():
 
 
 @pytest.mark.asyncio
-@_CLAUDE_CODE_ENFORCEMENT_SKIP
 async def test_hooks_capture_failure_path_mocked():
     """Companion to the success-path mock above. When the SDK reports a
     tool failure (PostToolUseFailure path), the appended event must
@@ -617,11 +719,12 @@ async def test_hooks_capture_failure_path_mocked():
     events: list[dict[str, Any]] = []
     token = _tool_events_var.set(events)
     try:
-        await _pre_tool_use_hook(
-            {"tool_name": "Bash", "tool_input": {"command": "exit 1"}},
-            tool_use_id="toolu_fail",
-            _ctx=None,
-        )
+        with _authorized_hook_context():
+            await _pre_tool_use_hook(
+                {"tool_name": "Bash", "tool_input": {"command": "exit 1"}},
+                tool_use_id="toolu_fail",
+                _ctx=None,
+            )
         await _post_tool_use_failure_hook(
             {"tool_name": "Bash", "error": "non-zero exit code: 1"},
             tool_use_id="toolu_fail",
@@ -699,7 +802,16 @@ async def test_tool_event_hooks_attach_events_to_stream_result_chunk():
         install_tool_event_hooks()
 
         instance = _FakeChatClaudeCode()
-        chunks = [c async for c in instance._astream()]
+        from langgraph.config import var_child_runnable_config
+
+        config_token = var_child_runnable_config.set(_auth_config())
+        try:
+            # BaseChatModel.astream does not forward RunnableConfig to
+            # _astream; the patched dispatch seam must read LangGraph's live
+            # invocation config before the SDK hook task forks.
+            chunks = [c async for c in instance._astream()]
+        finally:
+            var_child_runnable_config.reset(config_token)
 
         # First chunk is text — untouched by the hook wrapper.
         assert chunks[0].generation_info is None
