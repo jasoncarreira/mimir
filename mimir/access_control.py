@@ -2241,7 +2241,7 @@ class ChannelResourceAdapter:
         Returns:
             ToolAuthorization with allowed/reason fields populated
         """
-        if tool_name not in cls._CHANNEL_OPERATIONS:
+        if tool_name not in cls._CHANNEL_OPERATIONS:  # Misuse guard; never shadow-emitted.
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.UNKNOWN,

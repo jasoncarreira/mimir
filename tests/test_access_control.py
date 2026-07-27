@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import subprocess
@@ -40,6 +41,40 @@ from mimir.models import (
     TurnContext,
     TurnInteractivity,
 )
+
+
+def test_every_denial_sets_would_block() -> None:
+    """Every emitted denial must say enforcement would have blocked it.
+
+    ``would_block`` defaults to false, so omitting it from a denial branch emits
+    the confident but wrong claim that enforcement would have permitted the call.
+    The sole exemption is the non-channel misuse guard: it rejects regardless of
+    enforcement mode and returns before the shadow-event emitter is reached.
+    """
+    source = Path(access_control.__file__).read_text(encoding="utf-8")
+    missing: list[int] = []
+
+    for node in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "ToolAuthorization"
+        ):
+            continue
+
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg}
+        allowed = keywords.get("allowed")
+        if allowed is None:
+            continue
+
+        rendered = ast.dump(allowed)
+        is_denial = (
+            ("Not" in rendered and "enforce" in rendered)
+            or "Constant(value=False)" in rendered
+        )
+        if is_denial and "would_block" not in keywords:
+            missing.append(node.lineno)
+
+    assert missing == [2245], missing
 
 
 def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
