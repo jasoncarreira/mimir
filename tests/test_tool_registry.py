@@ -105,6 +105,18 @@ def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
     properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
 
     assert "mimir_direct_argv" not in properties
+    assert "cwd" in properties
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_shell_tool_description_states_both_execution_contracts(shell_tool) -> None:
+    description = shell_tool.description
+
+    assert "User/admin" in description
+    assert "bash -lc" in description
+    assert "trusted-service" in description
+    assert "one argv" in description
+    assert "no shell syntax" in description
 
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:

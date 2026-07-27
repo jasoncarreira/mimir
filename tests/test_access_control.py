@@ -2213,6 +2213,138 @@ async def test_model_cannot_forge_a_service_shell_refusal(
 
 
 @pytest.mark.asyncio
+async def test_service_shell_uses_resolved_authorized_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The path checked against read roots is exactly the path execution receives."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    allowed = tmp_path / "allowed"
+    link = tmp_path / "allowed-link"
+    home.mkdir()
+    allowed.mkdir()
+    link.symlink_to(allowed, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{allowed}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (allowed,),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open", "cwd": str(link)},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["cwd"] == str(allowed.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cwd_factory", "reason"),
+    [
+        (lambda _outside: "", "non-empty absolute path"),
+        (lambda _outside: "relative/path", "non-empty absolute path"),
+        (lambda outside: str(outside), "outside the trusted service's authorized read roots"),
+    ],
+    ids=["empty", "relative", "outside"],
+)
+async def test_service_shell_refuses_unauthorized_cwd_without_echoing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+    cwd_factory,
+    reason: str,
+) -> None:
+    """Invalid service cwd values return fixed-vocabulary text and execute nothing."""
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "secret-outside-root"
+    home.mkdir()
+    allowed.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{allowed}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (allowed,),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    calls: list[object] = []
+    supplied_cwd = cwd_factory(outside)
+
+    async def handler(request):
+        calls.append(request)
+        raise AssertionError("refused cwd must not execute")
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open", "cwd": supplied_cwd},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert reason in str(result.content)
+    if supplied_cwd:
+        assert supplied_cwd not in str(result.content)
+    assert "secret-outside-root" not in str(result.content)
+    assert calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("args_factory", "expected_reason"),
     [
