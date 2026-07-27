@@ -859,10 +859,15 @@ def test_print_setup_report_claude_code_operator_guidance(capsys):
     assert "git+https" not in out
 
 
-def test_print_setup_report_warns_claude_code_enforcement_incompatible(capsys):
-    """A claude-code spec is refused by the enforcement startup preflight
-    (#910). Setup must say so, rather than letting the operator discover
-    it as a ProviderEnforcementCompatibilityError on first enforced boot."""
+def test_print_setup_report_does_not_claim_claude_code_blocks_enforcement(capsys):
+    """#910 (PR #1213) landed the AuthContext carrier and removed the startup
+    refusal, so claude-code IS usable with MIMIR_ACCESS_CONTROL_ENFORCED=true.
+
+    #1212 had added a setup-time warning saying the opposite. It was true when
+    written and false two hours later; this asserts the claim is gone rather
+    than merely that some warning text changed, so the stale advice cannot
+    quietly return.
+    """
     status = {
         "home": "/tmp/test-home",
         "dirs_created": [],
@@ -876,27 +881,9 @@ def test_print_setup_report_warns_claude_code_enforcement_incompatible(capsys):
     }
     _print_setup_report(status)
     out = capsys.readouterr().out
-    assert "MIMIR_ACCESS_CONTROL_ENFORCED" in out
-    assert "#910" in out
-
-
-def test_print_setup_report_no_enforcement_warning_for_default_spec(capsys):
-    """The shipped default is enforcement-compatible, so the warning must
-    NOT fire for it — otherwise it is noise on every ordinary setup."""
-    status = {
-        "home": "/tmp/test-home",
-        "dirs_created": [],
-        "files_created": [],
-        "skills": {},
-        "subagents": {},
-        "model_spec": "codex-plus:gpt-5.6-luna",
-        "provider_name": "openai",
-        "billing_mode": "subscription",
-        "embedding_preset": "fastembed",
-    }
-    _print_setup_report(status)
-    out = capsys.readouterr().out
+    assert "model adapter: pip install mimir-agent[claude-code]" in out
     assert "MIMIR_ACCESS_CONTROL_ENFORCED" not in out
+    assert "#910" not in out
 
 
 
