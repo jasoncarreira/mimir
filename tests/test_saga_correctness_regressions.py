@@ -796,6 +796,101 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
 
 
 @pytest.mark.asyncio
+async def test_dedup_inner_guards_reject_mixed_owner_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.saga.client import SagaStore
+    from mimir.saga.cluster import cluster_by_similarity
+    from mimir.saga.dedup import dedup_pass, merge_duplicate_into_canonical
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "mixed-owner.saga.db", embedding_dim=4)
+    atom_ids: dict[str, list[str]] = {"alice": [], "bob": []}
+    for owner, suffix in (
+        ("alice", "canonical"),
+        ("bob", "canonical"),
+        ("alice", "duplicate"),
+        ("bob", "duplicate"),
+    ):
+        stored = await store.store(
+            content=f"{owner} private deployment note {suffix}",
+            metadata={"tags": [f"{owner}-{suffix}"]},
+            owner_principal=owner,
+            origin_domain="tenant-shared",
+            visibility="private",
+        )
+        atom_ids[owner].append(stored["atom_id"])
+
+    conn = store._ensure_conn()
+    owner_by_id = {
+        atom_id: owner
+        for owner, owner_ids in atom_ids.items()
+        for atom_id in owner_ids
+    }
+    mixed_candidates = [
+        {"id": atom_id}
+        for pair in zip(atom_ids["alice"], atom_ids["bob"])
+        for atom_id in pair
+    ]
+
+    clusters = cluster_by_similarity(
+        conn, mixed_candidates, threshold=0.92, scope_acl=True,
+    )
+
+    assert {frozenset(atom["id"] for atom in cluster) for cluster in clusters} == {
+        frozenset(atom_ids["alice"]),
+        frozenset(atom_ids["bob"]),
+    }
+
+    cross_owner_merged = merge_duplicate_into_canonical(
+        conn,
+        canonical={"id": atom_ids["alice"][0]},
+        duplicate={
+            "id": atom_ids["bob"][0],
+            "owner_principal": "alice",
+            "origin_domain": "tenant-shared",
+            "visibility": "private",
+        },
+    )
+    assert cross_owner_merged is False
+    assert conn.execute(
+        "SELECT SUM(tombstoned) FROM atoms WHERE id IN (?, ?)",
+        (atom_ids["alice"][0], atom_ids["bob"][0]),
+    ).fetchone()[0] == 0
+
+    scoped_results = []
+    cluster_input_sizes = []
+    for owner in ("alice", "bob"):
+        def cluster_scope(candidates):
+            cluster_input_sizes.append(len(candidates))
+            return cluster_by_similarity(
+                conn, candidates, threshold=0.92, scope_acl=True,
+            )
+
+        scoped_results.append(dedup_pass(
+            conn,
+            cluster_fn=cluster_scope,
+            owner_principal=owner,
+            origin_domain="tenant-shared",
+            visibility="private",
+        ))
+
+    assert cluster_input_sizes == [2, 2]
+    assert [result.candidates_scanned for result in scoped_results] == [2, 2]
+    assert [result.clusters_formed for result in scoped_results] == [1, 1]
+    assert sum(
+        len(result.duplicates_tombstoned) for result in scoped_results
+    ) == 2
+    assert all(
+        owner_by_id[canonical] == owner_by_id[duplicate]
+        for result in scoped_results
+        for canonical, duplicates in result.merges.items()
+        for duplicate in duplicates
+    )
+
+
+@pytest.mark.asyncio
 async def test_consolidate_keeps_rollback_branch_live_atom_in_faiss_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

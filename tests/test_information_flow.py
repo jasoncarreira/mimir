@@ -26,6 +26,7 @@ from mimir.access_control import (
     approve_live_declassification,
     audit_declassification,
     create_auth_context,
+    get_service_principal,
     get_sink_category,
     get_tool_flow_direction,
     classify_protected_result,
@@ -1168,6 +1169,54 @@ def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
     )
 
     assert decision.allowed is expected
+
+
+def test_worklink_repo_service_adapter_allows_only_configured_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    wrong_repo = tmp_path / "wrong-repo"
+    repo.mkdir()
+    wrong_repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    service = ServicePrincipal(
+        canonical="poller:worklink-repo",
+        trigger="poller",
+        capabilities=("worklink_run",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    auth, labels = _trigger_service_context(service, integrity="trusted")
+
+    allowed = SinkGate.check_sink_flow(
+        "worklink_run", str(repo), labels, auth, enforce=True,
+    )
+    denied = SinkGate.check_sink_flow(
+        "worklink_run", str(wrong_repo), labels, auth, enforce=True,
+    )
+
+    assert allowed.allowed is True
+    assert denied.allowed is False
+
+
+def test_upgrade_service_add_schedule_allows_same_scope() -> None:
+    service = get_service_principal("upgrade")
+    assert service is not None
+    auth, labels = _trigger_service_context(service, integrity="trusted")
+
+    decision = ToolRegistry().authorize_tool(
+        "add_schedule",
+        auth,
+        enforce=True,
+        target_channel="scheduler:job:nightly",
+        ifc_labels=labels,
+    )
+
+    assert decision.allowed is True
 
 
 def test_generic_spawn_is_blocked_even_for_trusted_trigger(
