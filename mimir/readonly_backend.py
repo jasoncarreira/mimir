@@ -153,6 +153,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if any(part in self._traversal_excludes for part in rel_parts):
             return True
         from .read_policy import (
+            is_current_service_protected_read_path,
             is_mimir_home_root,
             is_protected_read_path,
             non_admin_read_filter_enabled,
@@ -161,7 +162,10 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         protected = (
             non_admin_read_filter_enabled()
             and not is_mimir_home_root(path)
-            and is_protected_read_path(path)
+            and (
+                is_protected_read_path(path)
+                or is_current_service_protected_read_path(path)
+            )
         )
         if protected:
             from .read_policy import emit_hard_read_denial
