@@ -561,9 +561,7 @@ class Config:
     #
     # See ``mimir.agent._resolve_model``. Defaults to
     # ``codex-plus:gpt-5.6-luna`` (Codex subscription OAuth, no API-key
-    # billing). Every provider now supports enforcement; the historical
-    # ``claude-code:`` startup refusal was removed once #910 plumbed the
-    # per-turn AuthContext across the SDK hook boundary.
+    # billing). Every provider supports ``MIMIR_ACCESS_CONTROL_ENFORCED``.
     model_spec: str
 
     # Per-call retry budget for non-claude-code providers (anthropic,
