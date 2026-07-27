@@ -59,6 +59,7 @@ from .channel_registry import (
 )
 from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
+from .model_registry import DEFAULT_MODEL_SPEC
 from .event_logger import log_event, log_event_sync, safe_log_event
 from .feedback import FeedbackLog
 from . import health
@@ -673,7 +674,7 @@ def resolve_model_from_config(
     """
     model_spec = os.environ.get(
         "MIMIR_MODEL_SPEC",
-        getattr(config, "model_spec", "claude-code:claude-sonnet-4-6"),
+        getattr(config, "model_spec", DEFAULT_MODEL_SPEC),
     )
     return _resolve_model(
         model_spec,

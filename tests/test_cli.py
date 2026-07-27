@@ -91,7 +91,7 @@ def test_setup_banner_reports_effective_env_model_spec(
     assert status["model_spec_from_env"] is True
     # The --model/default route is still surfaced (banner note + the
     # <home>/.env template scaffold).
-    assert str(status["setup_default_spec"]).startswith("anthropic:")
+    assert status["setup_default_spec"] == "codex-plus:gpt-5.6-luna"
 
 
 def test_setup_banner_uses_default_route_without_env(
@@ -101,7 +101,7 @@ def test_setup_banner_uses_default_route_without_env(
     --model/default route (unchanged behavior)."""
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     status = setup_home(tmp_path / "agent")
-    assert str(status["model_spec"]).startswith("anthropic:")
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
     assert status["model_spec_from_env"] is False
 
 
@@ -855,33 +855,88 @@ def test_print_setup_report_claude_code_operator_guidance(capsys):
     assert "git+https" not in out
 
 
+def test_print_setup_report_warns_claude_code_enforcement_incompatible(capsys):
+    """A claude-code spec is refused by the enforcement startup preflight
+    (#910). Setup must say so, rather than letting the operator discover
+    it as a ProviderEnforcementCompatibilityError on first enforced boot."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "model_spec": "claude-code:claude-sonnet-4-6",
+        "provider_name": "anthropic-max",
+        "billing_mode": "subscription",
+        "embedding_preset": "fastembed",
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "MIMIR_ACCESS_CONTROL_ENFORCED" in out
+    assert "#910" in out
+
+
+def test_print_setup_report_no_enforcement_warning_for_default_spec(capsys):
+    """The shipped default is enforcement-compatible, so the warning must
+    NOT fire for it — otherwise it is noise on every ordinary setup."""
+    status = {
+        "home": "/tmp/test-home",
+        "dirs_created": [],
+        "files_created": [],
+        "skills": {},
+        "subagents": {},
+        "model_spec": "codex-plus:gpt-5.6-luna",
+        "provider_name": "openai",
+        "billing_mode": "subscription",
+        "embedding_preset": "fastembed",
+    }
+    _print_setup_report(status)
+    out = capsys.readouterr().out
+    assert "MIMIR_ACCESS_CONTROL_ENFORCED" not in out
+
+
 
 
 # ─── --model flag (auto-routing via model_registry) ─────────────────────
 
 
-def test_setup_default_model_routes_to_anthropic_api(tmp_path: Path):
-    """No ``--model`` → default to direct Anthropic API
-    (``anthropic:claude-sonnet-4-6``). Forward-looking default since
-    Anthropic is sunsetting claude-code subscription plans."""
+def test_setup_default_model_routes_to_codex_plus(tmp_path: Path):
+    """No ``--model`` → the shipped default spec, written into the fresh
+    home. This is the SAME spec ``Config.from_env`` falls back to, so a
+    setup-created home and a never-setup home run the same model."""
     home = tmp_path / "h"
     status = setup_home(home)
     env = (home / ".env").read_text()
-    assert "MIMIR_MODEL_SPEC=anthropic:claude-sonnet-4-6" in env
-    assert status["model_spec"] == "anthropic:claude-sonnet-4-6"
-    assert status["provider_name"] == "anthropic-api"
-    assert status["billing_mode"] == "api"
+    assert "MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna" in env
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
+    assert status["provider_name"] == "openai"
+    assert status["billing_mode"] == "subscription"
+
+    from mimir.config import DEFAULT_MODEL_SPEC
+    assert status["model_spec"] == DEFAULT_MODEL_SPEC
 
 
 def test_setup_max_oauth_routes_claude_to_claude_code(tmp_path: Path):
-    """``--subscription`` opts INTO the Max OAuth path for
-    operators with active Max plans."""
+    """``--subscription`` still opts INTO the Max OAuth path for operators
+    with active Max plans — but it now needs an explicit Claude ``--model``,
+    because the default spec is already a subscription route."""
     home = tmp_path / "h"
-    status = setup_home(home, subscription=True)
+    status = setup_home(home, model="claude-sonnet-4-6", subscription=True)
     env = (home / ".env").read_text()
     assert "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6" in env
     assert status["model_spec"] == "claude-code:claude-sonnet-4-6"
     assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+
+
+def test_setup_bare_subscription_flag_keeps_default(tmp_path: Path):
+    """Behavior change worth pinning: with a subscription-backed default,
+    a bare ``--subscription`` no longer flips to claude-code. It used to
+    yield ``claude-code:claude-sonnet-4-6``; now the pre-qualified default
+    passes straight through, which also keeps it enforcement-compatible."""
+    home = tmp_path / "h"
+    status = setup_home(home, subscription=True)
+    assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
     assert status["billing_mode"] == "subscription"
 
 
@@ -947,10 +1002,17 @@ def test_setup_subscription_route_writes_quota_poll_flag(tmp_path: Path):
     """Subscription-mode routes get ``MIMIR_QUOTA_POLL_ENABLED=1`` so
     the runtime registers the OAuth usage poller at boot."""
     home = tmp_path / "h"
-    status = setup_home(home, subscription=True)
+    status = setup_home(home, model="claude-sonnet-4-6", subscription=True)
     env = (home / ".env").read_text()
     assert "MIMIR_QUOTA_POLL_ENABLED=1" in env
     assert "quota poller" in status["monitor_status"]
+
+    # The default route is subscription billing too, so it must also write
+    # the flag (its monitor label is Codex-specific rather than the
+    # Anthropic "quota poller" wording).
+    home2 = tmp_path / "h2"
+    setup_home(home2)
+    assert "MIMIR_QUOTA_POLL_ENABLED=1" in (home2 / ".env").read_text()
 
 
 def test_setup_preserves_operator_monitor_override_on_rerun(tmp_path: Path):

@@ -98,11 +98,28 @@ class ModelRoute:
     monitor_label: str = ""
 
 
-#: Default model when ``mimir setup`` runs without ``--model``.
-#: Resolves to ``anthropic:claude-sonnet-4-6`` (direct Anthropic API)
-#: by default; ``mimir setup --subscription`` flips Claude family
-#: routes to ``claude-code:`` (Max OAuth subprocess).
-DEFAULT_MODEL_NAME = "claude-sonnet-4-6"
+#: Default spec when ``mimir setup`` runs without ``--model``. This is
+#: the SAME value as the ``Config.from_env`` runtime fallback for
+#: ``MIMIR_MODEL_SPEC`` — there is deliberately one default, so a home
+#: created by ``mimir setup`` and a home that never ran setup select the
+#: same model.
+#:
+#: Fully qualified on purpose: ``detect_route`` passes a ``provider:model``
+#: string straight through its pre-qualified branch, so the default lands
+#: on the Codex Plus subscription route without depending on bare-name
+#: prefix detection.
+#:
+#: It is also enforcement-compatible. A ``claude-code:`` default made
+#: ``MIMIR_ACCESS_CONTROL_ENFORCED=true`` fail startup preflight, because
+#: that subprocess hook cannot carry the per-turn AuthContext (#910).
+#:
+#: Consequence for ``--subscription``: with a subscription-backed default,
+#: the bare flag is a no-op (Codex Plus is already subscription billing).
+#: It still flips an explicitly requested Claude-family model to
+#: ``claude-code:`` — e.g. ``mimir setup --model claude-sonnet-4-6
+#: --subscription`` — and setup warns there that the result cannot be used
+#: with enforcement until #910 lands.
+DEFAULT_MODEL_SPEC = "codex-plus:gpt-5.6-luna"
 
 
 def detect_route(
@@ -111,11 +128,12 @@ def detect_route(
     """Resolve a bare model name to its canonical routing config.
 
     ``model`` is what the operator typed verbatim. ``None`` / empty
-    falls back to ``DEFAULT_MODEL_NAME``. Detection is prefix-based —
-    unknown names route to direct Anthropic API (the safest forward-
-    looking default since Anthropic is sunsetting claude-code on
-    subscription plans — the API path stays working regardless of
-    Max-plan availability).
+    falls back to ``DEFAULT_MODEL_SPEC`` (``codex-plus:gpt-5.6-luna``).
+    Detection is otherwise prefix-based, and an UNRECOGNIZED bare name
+    routes to direct Anthropic API — not to the default. That fallback
+    is deliberate: an unknown name is most likely a Claude model this
+    registry has not learned yet, and the API path works regardless of
+    Max-plan availability.
 
     ``subscription`` (operator-passed via ``mimir setup
     --subscription``) tells setup the operator's billing is a fixed
@@ -134,7 +152,7 @@ def detect_route(
     Without the flag, every route is API mode → cost-monitor with
     a default ``$/hr`` ceiling.
     """
-    name = (model or "").strip() or DEFAULT_MODEL_NAME
+    name = (model or "").strip() or DEFAULT_MODEL_SPEC
 
     # API-mode monitor: enable per-turn cost tracking with a sane
     # default ceiling so unexpected runaway burn alerts. Spike-ratio

@@ -273,7 +273,9 @@ Channel bridges (Slack, Discord, Web, Bench) are NOT separate processes — they
 
 The deepagents singleton (`CompiledStateGraph`) is built lazily on the first turn and reused across all subsequent turns — it is thread-safe and constructed once per process. `create_deep_agent(model=..., tools=..., system_prompt=..., backend=...)` configures it with the full mimir tool set and a `WriteGuardBackend` (enforces per-directory write-permission from `Config.writable_dirs`).
 
-Model: `claude-code:claude-sonnet-4-6` (default, overridable via `MIMIR_MODEL_SPEC`). The `claude-code:` prefix routes through `langchain-claude-code` / the Claude Code CLI subprocess. Other model specs (e.g. `anthropic:claude-opus-4-7`) route through `langchain-anthropic` directly.
+Model: `codex-plus:gpt-5.6-luna` (default, overridable via `MIMIR_MODEL_SPEC`). The `codex-plus:` prefix routes through `langchain-codex-plus` against the OAuth-backed Codex gateway (`chatgpt.com/backend-api`), which is a different wire protocol from the public OpenAI API. It is the default because it is subscription-backed and, unlike `claude-code:`, compatible with `MIMIR_ACCESS_CONTROL_ENFORCED` — the same value is used by both `mimir setup` and the `Config.from_env` fallback, so there is one default rather than two.
+
+Alternatives: `claude-code:<model>` routes through `langchain-claude-code` / the Claude Code CLI subprocess (Max OAuth; refused at startup when enforcement is on, pending the AuthContext carrier work). `anthropic:<model>` (e.g. `anthropic:claude-opus-4-7`) and `openai:<model>` route through `langchain-anthropic` / `langchain-openai` directly.
 
 ### 4.3 Subagents (out-of-process delegation)
 

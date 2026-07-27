@@ -75,13 +75,16 @@ list and per-OS install commands.
 ### Install from PyPI
 
 ```bash
-pip install "mimir-agent[anthropic]"   # pick the model-provider extra(s) you'll use
+pip install "mimir-agent[codex-plus]"   # the default model's adapter; pick others as needed
 
 # Set up an agent home (creates dirs, seeds skills, generates API keys)
+# Without --model this writes the default spec, codex-plus:gpt-5.6-luna.
 mimir setup --home ~/mimir-home
 
 # Configure auth — pick one
-#   API key:                     edit ~/mimir-home/.env, set ANTHROPIC_API_KEY
+#   Codex subscription (default): `codex auth login`; see "Alternative providers"
+#   Anthropic API key:           install [anthropic], `mimir setup --model claude-sonnet-4-6`,
+#                                then set ANTHROPIC_API_KEY in ~/mimir-home/.env
 #   Anthropic Max plan:          install [claude-code] + Claude Code CLI; see below
 #   Gateway:                     set ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
 #   Non-Anthropic Anthropic-compat (Minimax, Kimi, …): see "Alternative providers"
@@ -148,8 +151,10 @@ mid-turn injection, …) that are easy to miss. `.env.example` is a copy-paste
 starter covering the common ones. See the
 **[authorization reference](./docs/authorization.md)** for identity roles,
 requester-resource decisions, trusted services, IFC, and the shadow-first
-enablement runbook. Authorization enforcement is default-off and is incompatible
-with the default `claude-code:` subprocess provider.
+enablement runbook. Authorization enforcement is default-off. The default
+`codex-plus:` provider is compatible with it; only `claude-code:` is refused at
+startup, because that subprocess hook cannot carry the per-turn authorization
+context.
 
 ## Web UI
 
@@ -206,7 +211,11 @@ aren't mounted). Full details + a compose example:
 
 `MIMIR_MODEL_SPEC` picks the model and provider. Forms:
 
-- `claude-code:<model>` — Max OAuth subprocess (default, free under Max plan).
+- `codex-plus:<model>` — ChatGPT Plus / Pro Codex subscription via the
+  OAuth-backed gateway. **Default** (`codex-plus:gpt-5.6-luna`), used by both
+  `mimir setup` and the runtime fallback.
+- `claude-code:<model>` — Max OAuth subprocess (free under Max plan; cannot be
+  combined with `MIMIR_ACCESS_CONTROL_ENFORCED`).
 - `anthropic:<model>` — direct Anthropic API (paid credit).
 - `openai:<model>` — direct OpenAI.
 
