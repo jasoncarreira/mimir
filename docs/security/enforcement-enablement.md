@@ -746,12 +746,12 @@ descending portability:
 
 **Remaining open:** none — the rev-3 questions are resolved. Trust is wholesale
 for trusted sources (§4); the provenance schema + informational recall are set
-(§5.3); JIRA trust is by instance (§4). What's left before flipping the flag is
-the implementation work (§8) plus the §7 blockers, not open design questions.
+(§5.3); JIRA trust is by instance (§4). The §7 blockers are closed; current
+operator readiness and flip-time checks live in the enablement runbook.
 
 ---
 
-## 7. Other enablement blockers (from the review — on the path)
+## 7. Other enablement blockers (closed)
 
 The standalone review findings are **fixed and merged** (2026-07-19, each
 masked-check-verified):
@@ -768,15 +768,14 @@ masked-check-verified):
   built-ins + registered MCP; `_env_access_control_enforced` no longer raises in
   `wrap_tool_call`).
 
-**Still open before the flag can flip** (chainlinks #922, #923):
-- **#922** — migrate trusted-service autonomous maintenance off raw write-shell
-  (the scheduler/poller shell profile is read-only; a write-shell maintenance turn
-  breaks on enable). Overlaps with §5 — those turns should move to contained/scoped
-  sinks per the tier model.
-- **#923** — make the test suite enforcement-clean: with the flag on,
-  `test_dispatcher` fails and the broad suites hang, so CI cannot validate
-  enable-time regressions. Must be green under `MIMIR_ACCESS_CONTROL_ENFORCED=1`
-  before enabling.
+The remaining chainlinks are also **closed**:
+
+- **#922** — trusted-service autonomous maintenance uses the bounded maintenance
+  shell profile.
+- **#923** — the suite is enforcement-clean. The standing
+  `tests / pytest-enforced` CI job now runs the full suite with enforcement on and
+  the shipped model default; see the enablement runbook for the measured results
+  and skip-parity guard.
 
 ---
 
@@ -824,8 +823,7 @@ masked-check-verified):
 6a. **Enforcement-aware prompt guidance** (§5.6): a flag-gated prompt block +
    heartbeat/poller profile guidance describing the trust/taint model — ergonomics
    only, never a boundary.
-7. **Enable-time verification**: land the §7 blockers still open (#922 write-shell
-   migration; #923 enforcement-clean suite), run the full suite under
-   `MIMIR_ACCESS_CONTROL_ENFORCED=1` green, then the runbook in
-   [`../authorization.md`](../authorization.md). (The other §7 review items —
-   #1140–1144 — are already merged.)
+7. **Enable-time verification**: #922 and #923 are closed. Require the standing
+   enforced CI job and the ordinary suite to remain green, then follow the
+   operator enablement runbook in [`../authorization.md`](../authorization.md).
+   (The other §7 review items — #1140–1144 — are also merged.)
