@@ -961,6 +961,40 @@ def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
     )
 
 
+def _repo_review_body_files_within_scratch(arguments: list[str]) -> bool:
+    """Confine ``--body-file`` to the service's own scratch root.
+
+    A review body must come from a file (newlines cannot survive the shell
+    control-character check), so the file itself becomes the egress surface: an
+    unconstrained path would let a trusted service publish any readable file to
+    GitHub. Restricting it to ``<home>/scratch`` means a service can only
+    publish content it authored there. Checked lexically AND resolved, so a
+    symlink planted in scratch cannot launder a path outside it.
+    """
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return "--body-file" not in arguments
+    scratch_root = (Path(home).resolve() / "scratch").resolve()
+    for index, argument in enumerate(arguments):
+        if argument != "--body-file":
+            continue
+        if index + 1 >= len(arguments):
+            return False
+        candidate = Path(arguments[index + 1])
+        if not candidate.is_absolute():
+            candidate = Path(home).resolve() / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        if not (
+            candidate.is_relative_to(scratch_root)
+            and resolved.is_relative_to(scratch_root)
+        ):
+            return False
+    return True
+
+
 def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     """Validate commands needed to inspect and test a trusted repository PR."""
     if _target_matches_read_only_shell_command(argv):
@@ -977,10 +1011,33 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
                 "--fail-fast", "--interval", "--json", "--jq", "--repo",
                 "--required", "--watch",
             }),
+            # Submitting the review is the point of the repo_review profile —
+            # without this the poller can read a PR and reach a verdict but has
+            # no way to post it, which is exactly what happened when this
+            # profile first went live (the agent reported every command
+            # "exiting 1 with empty output" and messaged the operator instead).
+            #
+            # ``--body-file`` is required, not a convenience: a review body is
+            # inherently multi-line, and ``\n`` is in
+            # ``_SHELL_CONTROL_CHARACTERS`` (correctly — it separates commands),
+            # so a multi-line ``--body`` can never be admitted. Command
+            # substitution (``--body "$(cat ...)"``) is rejected for the same
+            # reason. A file is therefore the only way to carry a real review.
+            #
+            # Its path is constrained to the scratch root below. Unconstrained,
+            # ``--body-file <home>/.env`` would publish the operator's secrets
+            # to GitHub as a review — egress wearing a review's clothes. Scoped
+            # to scratch, a service can only publish what it wrote there itself.
+            "review": frozenset({
+                "--approve", "--body", "--body-file", "--comment", "--repo",
+                "--request-changes",
+            }),
         }.get(subcommand)
-        return options is not None and _arguments_match_allowlist(
+        if options is None or not _arguments_match_allowlist(
             argv[3:], exact_options=options,
-        )
+        ):
+            return False
+        return _repo_review_body_files_within_scratch(argv[3:])
 
     if argv[0] == "git" and len(argv) >= 2:
         subcommand = argv[1]

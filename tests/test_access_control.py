@@ -2890,6 +2890,66 @@ def test_every_production_service_shell_pin_targets_outside_write_roots(
             assert access_control._maintenance_resolved_pin(command) == expected
 
 
+def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The poller must be able to POST a review, not just read a PR.
+
+    When ``repo_review`` first went live it admitted ``gh pr view``/``diff`` but
+    not ``review``, so the github poller reached a verdict on a PR and had no
+    way to submit it — it reported every command "exiting 1 with empty output"
+    (``/usr/bin/false`` from the fail-closed argv bind) and messaged the
+    operator instead.
+
+    ``--body-file`` is required rather than optional: a review body is
+    multi-line and ``\n`` is a shell control character, so a multi-line
+    ``--body`` can never be admitted. The file path is therefore an egress
+    surface and is confined to the scratch root.
+    """
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    scratch.mkdir(parents=True)
+    (home / "secret.txt").write_text("SECRET", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    def admitted(command: str) -> bool:
+        return parse_service_shell_argv(command, "repo_review") is not None
+
+    # Posting a review is admitted, in each verdict shape.
+    for verdict in ("--request-changes", "--approve", "--comment"):
+        assert admitted(
+            f"gh pr review 7 --repo o/r {verdict} --body-file {scratch}/review.md"
+        ), verdict
+    assert admitted("gh pr review 7 --repo o/r --approve --body ok")
+    # Reading still works (regression guard on the pre-existing entries).
+    assert admitted("gh pr view 7 --repo o/r --json number")
+
+    # The body file may not leave scratch — plainly, lexically, or by symlink.
+    assert not admitted(
+        f"gh pr review 7 --repo o/r --approve --body-file {home}/secret.txt"
+    )
+    assert not admitted(
+        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/../secret.txt"
+    )
+    escape = scratch / "escape.md"
+    escape.symlink_to(home / "secret.txt")
+    assert not admitted(
+        f"gh pr review 7 --repo o/r --approve --body-file {escape}"
+    )
+    # A dangling option value must not be treated as absent.
+    assert not admitted("gh pr review 7 --repo o/r --approve --body-file")
+    # Neither newlines nor substitution may reach argv.
+    assert not admitted('gh pr review 7 --repo o/r --approve --body "a\nb"')
+    assert not admitted(
+        'gh pr review 7 --repo o/r --approve --body "$(cat /etc/passwd)"'
+    )
+    # Still no state-changing gh beyond review.
+    assert not admitted("gh pr merge 7 --repo o/r --squash")
+
+
 def test_service_shell_pin_inside_configured_write_root_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
