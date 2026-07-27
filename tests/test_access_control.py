@@ -2083,6 +2083,13 @@ async def test_refused_service_shell_returns_the_reason_and_executes_nothing(
 
     assert calls == [], "a refused service shell command must not reach the handler"
     assert result.status == "error"
+    # No identity can run this command as written, so the message must not send
+    # the caller after an identity change. Both paths say the same thing: the
+    # enforced one used to lead with "requires an admin identity" and append the
+    # real cause, which gave two incompatible diagnoses and preserved exactly the
+    # misdirection this exists to remove.
+    assert "requires an admin identity" not in result.content
+    assert result.content.startswith("shell_exec was refused before execution")
     # Same actionable text either way: which character, which profile, what to
     # write instead.
     assert "'&'" in result.content

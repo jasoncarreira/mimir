@@ -575,16 +575,20 @@ def _is_admin_sensitive_tool(
 def _admin_denial_message(
     tool_name: str, reason: str | None, detail: str | None = None,
 ) -> str:
-    reason_text = f" ({reason})" if reason else ""
     # A shell-profile refusal is a command-shape problem, not a privilege
-    # problem. Without the detail this reads "requires an admin identity" for a
-    # command no identity can run as written, which sends the caller looking for
-    # the wrong fix — the failure mode that cost the #1221 review outage.
-    detail_text = f" Refused because {detail}" if detail else ""
+    # problem: no identity can run the command as written. Leading with
+    # "requires an admin identity" and appending the real cause gives two
+    # incompatible diagnoses and keeps pointing the caller at an identity
+    # change, which is the failure mode this exists to remove. So when a detail
+    # identifies the actual refusal, it replaces the admin wording rather than
+    # trailing it — and the enforced path then reads identically to the
+    # argv-binding path, which is the same refusal seen at a different gate.
+    reason_text = f" ({reason})" if reason else ""
+    if detail:
+        return f"{tool_name} was refused before execution{reason_text}: {detail}"
     return (
         f"{tool_name} requires an admin identity{reason_text}. "
         "The tool call was refused before execution."
-        f"{detail_text}"
     )
 
 
