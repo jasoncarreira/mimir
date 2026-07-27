@@ -559,21 +559,31 @@ import yaml
 
 path = Path(os.environ["MIMIR_HOME"]) / "state" / "identities.yaml"
 people = yaml.safe_load(path.read_text(encoding="utf-8")).get("people", [])
-jason = next(person for person in people if person.get("canonical") == "jason")
-roles = set((jason.get("access") or {}).get("roles") or [])
-assert {"user", "admin"} <= roles, roles
-print(f"{path}: jason roles verified")
+principals_with_admin = [
+    person.get("canonical")
+    for person in people
+    if "admin" in ((person.get("access") or {}).get("roles") or [])
+]
+assert principals_with_admin, (
+    f"{path}: no deliberate admin identity found; "
+    f"configured principals={[person.get('canonical') for person in people]}"
+)
+print(f"{path}: admin identities verified: {principals_with_admin}")
 PY
 ```
+
+The admin principal is deployment-specific. This check deliberately verifies the
+required role rather than assuming a particular canonical name.
 
 ```bash
 uv run python - <<'PY'
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 path = Path(os.environ["MIMIR_HOME"]) / ".mimir" / "saga.db"
-with sqlite3.connect(path) as connection:
+with closing(sqlite3.connect(path)) as connection:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(atoms)")}
 required = {"owner_principal", "origin_domain", "visibility"}
 assert required <= columns, sorted(required - columns)
