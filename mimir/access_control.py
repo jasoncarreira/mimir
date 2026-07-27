@@ -420,7 +420,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "memory_get",
         "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
-        "agrep", "get_turn", "mimir_get_turn",
+        "agrep", "file_search", "get_turn", "mimir_get_turn",
+        "write_file", "edit_file",
     }),
 }
 
@@ -1780,14 +1781,17 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     candidate = Path(target)
-    if not home or not candidate.is_absolute():
+    if not home:
         return False
+    home_root = Path(home).resolve()
+    if not candidate.is_absolute():
+        candidate = home_root / candidate
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
         roots = [Path(path).resolve() for path in raw]
-        memory_root = (Path(home).resolve() / "memory").resolve()
+        memory_root = (home_root / "memory").resolve()
         lexical_relatives = tuple(
             (root, candidate.relative_to(root))
             for root in roots
@@ -1802,7 +1806,7 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
             for root, relative in lexical_relatives
         ):
             return False
-        resolved = resolve_within_roots(roots, target)
+        resolved = resolve_within_roots(roots, str(candidate))
         resolved_relatives = tuple(
             (root, resolved.relative_to(root))
             for root in roots
@@ -1820,6 +1824,24 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         )
         for root, relative in resolved_relatives
     )
+
+
+def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
+    """Prevent one session boundary from mutating another channel's memory."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    try:
+        relative = candidate.resolve().relative_to(
+            (Path(home).resolve() / "memory" / "channels").resolve()
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The prompt also authorizes shared non-channel memory and state paths.
+        return True
+    return bool(relative.parts) and relative.parts[0] == channel_id
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
@@ -2198,7 +2220,18 @@ class SinkGate:
                 if service_policy is not None
                 else None
             )
-            if adapter is None or not adapter(target, service_policy.destination):
+            synthesis_scope_denied = (
+                service.canonical == "synthesis"
+                and sink_category is SinkCategory.FILE
+                and not _synthesis_target_matches_session(
+                    target, getattr(auth_context, "channel_id", None),
+                )
+            )
+            if (
+                adapter is None
+                or synthesis_scope_denied
+                or not adapter(target, service_policy.destination)
+            ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
@@ -4277,30 +4310,21 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
-            capabilities=(
-                "saga_end_session",
-                "saga_mark_contributions",
-                "saga_feedback",
-                "saga_record_skill_learning",
-                "memory_get",
-                "memory_store",
-                "mimir_get_turn",
-                "get_turn",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "bash_jobs_list",
-                "bash_job_output",
-            ),
+            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
             readable_domains=(
                 "session", "saga", "filesystem", "turn_history", "shell_jobs",
             ),
-            sink_destinations=("session_boundary", "saga"),
+            sink_destinations=("filesystem", "session_boundary", "saga"),
+            sink_policies=(
+                ServiceSinkPolicy(
+                    "write_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+                ServiceSinkPolicy(
+                    "edit_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+            ),
             creation_path="mimir.server._on_session_idle",
             authority_profile="session-boundary",
             capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,

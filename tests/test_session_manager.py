@@ -9,7 +9,13 @@ from pathlib import Path
 import pytest
 
 from mimir.event_logger import init_logger
-from mimir.models import AuthContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
+    SourceLabel,
+)
 from mimir.session_manager import ChannelSession, SessionManager, _make_saga_session_id
 
 
@@ -22,6 +28,25 @@ def _auth(owner: str, channel: str = "c1") -> AuthContext:
         trigger="user_message",
         channel_id=channel,
         interactivity=None,
+    )
+
+
+def _untrusted_auth(owner: str, channel: str = "c1") -> AuthContext:
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=owner,
+        domain="channel",
+        resource_id=channel,
+        bridge_instance="discord",
+        sensitivity="private",
+        authorized_principals=frozenset({owner}),
+        integrity=Integrity.UNTRUSTED,
+    ))
+    return AuthContext(
+        **{
+            **_auth(owner, channel).__dict__,
+            "ifc_labels": labels,
+            "ifc_state": InformationFlowState(labels=labels),
+        }
     )
 
 
@@ -72,6 +97,19 @@ async def test_source_acl_is_immutable_and_monotonically_intersected():
     )
     assert session.source_acl.provenance_complete is False
     assert session.source_acl.visibility == "legacy_admin"
+
+
+@pytest.mark.asyncio
+async def test_session_ifc_carrier_monotonically_retains_untrusted_ingest():
+    mgr = SessionManager(idle_minutes=60)
+    session = await mgr.touch(
+        "c1", _untrusted_auth("alice"), origin_domain="discord",
+    )
+    await mgr.touch("c1", _auth("alice"), origin_domain="discord")
+
+    labels = session.ifc_state.current()
+    assert labels is not None
+    assert labels.has_untrusted_active_ingest is True
 
 
 @pytest.mark.asyncio

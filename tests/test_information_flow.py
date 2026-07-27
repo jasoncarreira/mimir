@@ -51,6 +51,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    IntegrityEffect,
     SourceLabel,
     TurnInteractivity,
 )
@@ -193,6 +194,11 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
             authorized_principals=frozenset({f"service:{service_principal}"}),
             source_kind="service",
             integrity=integrity,
+            integrity_effect=(
+                IntegrityEffect.INFORMATIONAL
+                if trigger == "saga_session_end"
+                else IntegrityEffect.ACTIVE_INGEST
+            ),
         )
     })
     decision = SinkGate.check_sink_flow(
@@ -1974,6 +1980,61 @@ def test_same_scope_synthesis_write_remains_allowed():
 
     assert decision.allowed is True
     assert decision.reason is None
+
+
+def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "memory" / "channels" / "slack-C1").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = builtin_trigger_service_principal("session-boundary", home)
+    inherited = _labels()
+    event = AgentEvent(
+        trigger="saga_session_end",
+        channel_id="slack-C1",
+        service_principal="synthesis",
+        service_authority=authority,
+        ifc_labels=inherited,
+    )
+    labels = _initialize_ifc_labels(event)
+    auth = AuthContext(
+        principal="service:synthesis",
+        canonical_principal="synthesis",
+        roles=("service",),
+        event_ingress=None,
+        trigger="saga_session_end",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    memory_write = ToolRegistry().authorize_tool(
+        "write_file",
+        auth,
+        enforce=True,
+        ifc_labels=labels,
+        target_channel="memory/channels/slack-C1/summary.md",
+    )
+    cross_channel = SinkGate.check_sink_flow(
+        "send_message", "slack-C2", labels, auth, enforce=True,
+    )
+
+    synthesis_sources = [
+        source for source in labels.sources
+        if source.principal == "service:synthesis"
+    ]
+    assert inherited.has_untrusted_active_ingest is True
+    assert labels.has_untrusted_active_ingest is True
+    assert synthesis_sources[-1].integrity_effect == IntegrityEffect.INFORMATIONAL
+    assert memory_write.allowed is True
+    assert cross_channel.allowed is False
+    assert cross_channel.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize(

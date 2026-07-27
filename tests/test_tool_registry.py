@@ -1015,16 +1015,16 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     assert synthesis is not None
 
     turn_ops = {"mimir_get_turn", "get_turn"}
-    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search"}
+    write_ops = {"write_file", "edit_file"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
     shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
 
-    all_expected = turn_ops | read_ops | memory_ops | saga_ops | shell_inspection_ops
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
-    assert not synthesis.has_capability("write_file")
-    assert not synthesis.has_capability("edit_file")
+    assert synthesis.can_write_sink("filesystem")
     assert synthesis.can_read_domain("shell_jobs")
     assert not synthesis.can_write_sink("shell_process")
     assert synthesis.sink_policy_for("shell_exec") is None
