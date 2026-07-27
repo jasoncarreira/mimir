@@ -126,6 +126,53 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+  pytest-enforced:
+    # The same suite with MIMIR_ACCESS_CONTROL_ENFORCED=1.
+    #
+    # Why this job exists: authorization regressions are invisible to the
+    # unenforced matrix by construction. Every gate that fails closed only under
+    # enforcement passes silently with the flag off, which is how #999, #1000 and
+    # #1001 all reached main and had to be found by hand afterwards.
+    #
+    # MIMIR_MODEL_SPEC is deliberately LEFT UNSET so the run exercises the
+    # shipped default (codex-plus:gpt-5.6-luna) — the configuration a fresh
+    # install actually gets. That default is enforcement-compatible; a
+    # claude-code: default used to fail startup preflight outright.
+    #
+    # One Python version is enough: enforcement behavior is not
+    # version-specific, and the 3.11/3.12 matrix above already covers the
+    # interpreter axis. No provider credentials are required — model resolution
+    # is not exercised by the suite.
+    #
+    # A green run here means "nothing failed", NOT "enforcement is covered".
+    # tests/test_env_isolation.py::test_no_test_is_skipped_because_enforcement_is_on
+    # is what keeps those two the same claim, by failing if anyone silences an
+    # enforced failure with a skipif on the flag.
+    needs: skill-conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Run mimir test suite (enforcement on)
+        env:
+          MIMIR_ACCESS_CONTROL_ENFORCED: "1"
+        run: uv run pytest -q --tb=short
+
   claude-code-extra-smoke:
     # The claude-code extra is the permanent install path for Anthropic Max
     # subprocess deployments. Keep a focused CI smoke so a dependency/metadata
