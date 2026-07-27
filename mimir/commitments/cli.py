@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..models import AuthContext, TurnInteractivity
 from .models import (
     CommitmentKind,
     CommitmentRecord,
@@ -33,6 +34,17 @@ from .models import (
     make_commitment_id,
 )
 from .store import CommitmentsStore
+
+
+_OPERATOR_AUTH_CONTEXT = AuthContext(
+    principal="operator",
+    canonical_principal="operator",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="commitments_cli",
+    channel_id=None,
+    interactivity=TurnInteractivity.NON_INTERACTIVE,
+)
 
 
 def _parse_iso(s: str) -> float:
@@ -261,10 +273,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     rows = store.list(
         channel_id=args.channel,
         status=status,
-        actor_principal=args.owner,
-        include_service=args.include_service,
         owner_principal=args.owner,
+        auth_context=_OPERATOR_AUTH_CONTEXT,
     )
+    if not args.include_service:
+        rows = [
+            row for row in rows
+            if row.visibility != CommitmentVisibility.SERVICE.value
+        ]
     if not rows:
         print("(no commitments match)")
         return 0

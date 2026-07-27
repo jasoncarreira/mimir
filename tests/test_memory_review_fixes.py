@@ -11,6 +11,7 @@ Pins the behaviors that addressed reviewer findings #4, #5, #7, #9, #10:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,6 +28,10 @@ ADMIN_AUTH = AuthContext(
     interactivity=None,
 )
 ADMIN_SCOPE = ADMIN_AUTH
+
+
+def _end_auth(session_id: str) -> AuthContext:
+    return replace(ADMIN_AUTH, saga_session_id=session_id)
 
 
 # Stub provider so we don't need real voyage credentials in unit tests.
@@ -98,6 +103,7 @@ async def test_end_session_persists_channel_id(client, monkeypatch):
         "s1",
         "summary",
         channel_id="C123",
+        auth_context=_end_auth("s1"),
     )
     assert result["channel"] == "C123"
     conn = client._ensure_conn()
@@ -108,10 +114,9 @@ async def test_end_session_persists_channel_id(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_end_session_without_channel_id_still_works(client, monkeypatch):
-    """Caller without a channel_id (e.g. operator-driven manual close)
-    should still get a boundary written; sessions.channel_id is NULL."""
+    """An authorized close may omit channel_id; sessions.channel_id is NULL."""
     _patch_provider(monkeypatch)
-    result = await client.end_session("s2", "summary")
+    result = await client.end_session("s2", "summary", auth_context=_end_auth("s2"))
     assert result["channel"] is None
     assert result["session_summary_written"] is True
 
@@ -121,8 +126,8 @@ async def test_recent_session_boundaries_scopes_to_channel(client, monkeypatch):
     """Cross-channel boundaries shouldn't leak into per-channel queries
     once channel_id is properly threaded through."""
     _patch_provider(monkeypatch)
-    await client.end_session("sA", "channel A session", channel_id="CHAN_A")
-    await client.end_session("sB", "channel B session", channel_id="CHAN_B")
+    await client.end_session("sA", "channel A session", channel_id="CHAN_A", auth_context=_end_auth("sA"))
+    await client.end_session("sB", "channel B session", channel_id="CHAN_B", auth_context=_end_auth("sB"))
     boundaries_a = await client.recent_session_boundaries(
         channel_id="CHAN_A",
         count=10,
@@ -175,8 +180,8 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
     channel B's most-retrieved query."""
     _patch_provider(monkeypatch)
     # Bootstrap: close a session in each channel so the sessions rows exist.
-    await client.end_session("sA", "A session", channel_id="CHAN_A")
-    await client.end_session("sB", "B session", channel_id="CHAN_B")
+    await client.end_session("sA", "A session", channel_id="CHAN_A", auth_context=_end_auth("sA"))
+    await client.end_session("sB", "B session", channel_id="CHAN_B", auth_context=_end_auth("sB"))
     # Store an atom and write retrieval events tied to each session.
     # Use a freshly-computed timestamp 1 hour in the past — comfortably
     # inside the 7-day ``most_retrieved_atoms`` window regardless of

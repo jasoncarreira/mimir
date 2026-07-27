@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mimir.models import AuthContext, TurnInteractivity
+
 
 # ─── Bench knobs ─────────────────────────────────────────────────────
 
@@ -305,6 +307,16 @@ async def _write_generated_session_boundaries(client, q: dict) -> dict:
             unfinished=fields.get("unfinished") or [],
             emotional_state=fields.get("emotional_state"),
             channel_id="longmemeval",
+            auth_context=AuthContext(
+                principal="benchmark-operator",
+                canonical_principal="benchmark-operator",
+                roles=("admin",),
+                event_ingress=None,
+                trigger="longmemeval",
+                channel_id="longmemeval",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+                saga_session_id=sid,
+            ),
         )
         if result.get("session_summary_written"):
             written += 1

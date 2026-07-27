@@ -107,6 +107,7 @@ class SagaClient(Protocol):
         emotional_state: str | None = None,
         closed_since: list[str] | None = None,
         channel_id: str | None = None,
+        auth_context: Any = None,
     ) -> dict[str, Any]: ...
 
     async def consolidate(

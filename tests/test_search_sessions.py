@@ -5,6 +5,7 @@ channel filtering, limit capping, and the schema-v3 migration path.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -22,6 +23,10 @@ ADMIN_SCOPE = AuthContext(
     channel_id=None,
     interactivity=None,
 )
+
+
+def _end_auth(session_id: str) -> AuthContext:
+    return replace(ADMIN_SCOPE, saga_session_id=session_id)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -76,9 +81,9 @@ async def test_search_sessions_empty_db(store):
 async def test_search_sessions_basic_result_shape(store):
     """After ending two sessions, search returns dicts with required keys."""
     await store.end_session("sess-a", "Python and asyncio patterns",
-                            channel_id="discord-test")
+                            channel_id="discord-test", auth_context=_end_auth("sess-a"))
     await store.end_session("sess-b", "Cooking pasta and risotto",
-                            channel_id="discord-test")
+                            channel_id="discord-test", auth_context=_end_auth("sess-b"))
 
     results = await store.search_sessions("programming patterns", auth_context=ADMIN_SCOPE)
     assert isinstance(results, list)
@@ -106,8 +111,8 @@ async def test_search_sessions_skips_mismatched_dim_embedding(store, tmp_path, m
     # Force the Python cosine fallback (bypass the sessions FAISS index).
     monkeypatch.setattr(type(store), "_ensure_sessions_index", lambda self, conn: None)
 
-    await store.end_session("sess-good", "Python asyncio patterns", channel_id="ch")
-    await store.end_session("sess-bad", "Cooking pasta and risotto", channel_id="ch")
+    await store.end_session("sess-good", "Python asyncio patterns", channel_id="ch", auth_context=_end_auth("sess-good"))
+    await store.end_session("sess-bad", "Cooking pasta and risotto", channel_id="ch", auth_context=_end_auth("sess-bad"))
     # Simulate a provider switch: sess-bad's stored embedding is now 8-dim
     # (32 bytes), mismatched against the 4-dim query.
     con = sqlite3.connect(tmp_path / "test.saga.db")
@@ -129,8 +134,8 @@ async def test_search_sessions_skips_mismatched_dim_embedding(store, tmp_path, m
 @pytest.mark.asyncio
 async def test_search_sessions_recency_ordering(store):
     """With alpha=0 (recency-only), the more-recent session ranks higher."""
-    await store.end_session("sess-recent", "Topics A", channel_id="ch-x")
-    await store.end_session("sess-older", "Topics B", channel_id="ch-x")
+    await store.end_session("sess-recent", "Topics A", channel_id="ch-x", auth_context=_end_auth("sess-recent"))
+    await store.end_session("sess-older", "Topics B", channel_id="ch-x", auth_context=_end_auth("sess-older"))
 
     # Age sess-older by patching ended_at in the sessions table.
     conn = store._ensure_conn()
@@ -153,9 +158,9 @@ async def test_search_sessions_recency_ordering(store):
 async def test_search_sessions_channel_filter(store):
     """channel_id filter restricts results to a single channel."""
     await store.end_session("sess-alpha", "Alpha channel session",
-                            channel_id="ch-alpha")
+                            channel_id="ch-alpha", auth_context=_end_auth("sess-alpha"))
     await store.end_session("sess-beta", "Beta channel session",
-                            channel_id="ch-beta")
+                            channel_id="ch-beta", auth_context=_end_auth("sess-beta"))
 
     alpha_results = await store.search_sessions("session", channel_id="ch-alpha", auth_context=ADMIN_SCOPE)
     beta_results = await store.search_sessions("session", channel_id="ch-beta", auth_context=ADMIN_SCOPE)
@@ -174,7 +179,7 @@ async def test_search_sessions_limit(store):
     """limit parameter caps the number of results."""
     for i in range(5):
         await store.end_session(f"sess-{i}", f"Session {i} summary",
-                                channel_id="ch-limit")
+                                channel_id="ch-limit", auth_context=_end_auth(f"sess-{i}"))
 
     results = await store.search_sessions("session summary", limit=3, auth_context=ADMIN_SCOPE)
     assert len(results) <= 3
@@ -199,7 +204,7 @@ async def test_search_sessions_schema_migration_adds_embedding_columns(
     # Step 1: Initialize via SagaStore so all tables and full schema exist.
     s1 = SagaStore(db_path=db_path, embedding_dim=4)
     await s1.end_session("sess-migrate", "Migration test session",
-                         channel_id="ch-mig")
+                         channel_id="ch-mig", auth_context=_end_auth("sess-migrate"))
 
     # Step 2: Drop the embedding columns by recreating the sessions table without
     # them.  SQLite doesn't support DROP COLUMN before 3.35, so use the

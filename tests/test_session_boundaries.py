@@ -98,6 +98,16 @@ async def test_synthesized_private_boundary_is_readable_only_by_source_owner(
         origin_domain="discord",
         visibility="private",
         provenance={"created_by": "alice", "derived_by": "service:synthesis"},
+        auth_context=AuthContext(
+            principal="test-admin",
+            canonical_principal="test-admin",
+            roles=("admin",),
+            event_ingress="test",
+            trigger="test",
+            channel_id="discord-dm",
+            interactivity=None,
+            saga_session_id="session-alice",
+        ),
     )
 
     def _auth(owner: str) -> AuthContext:

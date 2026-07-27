@@ -11,6 +11,7 @@ port in tier 5 v2.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -26,6 +27,10 @@ ADMIN_AUTH = AuthContext(
     interactivity=None,
 )
 ADMIN_SCOPE = ADMIN_AUTH
+
+
+def _end_auth(session_id: str) -> AuthContext:
+    return replace(ADMIN_AUTH, saga_session_id=session_id)
 
 
 @pytest.fixture
@@ -202,8 +207,8 @@ async def test_query_enables_session_boundary_rrf_by_default(tmp_path, monkeypat
     client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
     boundary_atom = await client.store("Alice prefers concise replies", session_id="s1")
     await client.store("Bob likes verbose explanations", session_id="s2")
-    await client.end_session("s1", "Alice reply preferences")
-    await client.end_session("s2", "Bob reply preferences")
+    await client.end_session("s1", "Alice reply preferences", auth_context=_end_auth("s1"))
+    await client.end_session("s2", "Bob reply preferences", auth_context=_end_auth("s2"))
 
     def fake_search_sessions(conn, query, **kwargs):
         assert query == "unmatched-query"
@@ -224,7 +229,7 @@ async def test_query_can_disable_session_boundary_rrf(tmp_path, monkeypatch):
     _patch_provider(monkeypatch)
     client = SagaStore(db_path=tmp_path / "mimir.saga.db", embedding_dim=4)
     await client.store("Alice prefers concise replies", session_id="s1")
-    await client.end_session("s1", "Alice reply preferences")
+    await client.end_session("s1", "Alice reply preferences", auth_context=_end_auth("s1"))
 
     async def unexpected_search_sessions(*args, **kwargs):
         raise AssertionError("session boundary lane should be disabled")
@@ -263,6 +268,7 @@ async def test_client_end_session_writes_summary(client, monkeypatch):
         "s1",
         "we discussed PR review",
         topics_discussed=["pr-review"],
+        auth_context=_end_auth("s1"),
     )
     assert result["session_id"] == "s1"
     assert result["session_summary_written"] is True
@@ -271,8 +277,8 @@ async def test_client_end_session_writes_summary(client, monkeypatch):
 @pytest.mark.asyncio
 async def test_client_end_session_idempotent(client, monkeypatch):
     _patch_provider(monkeypatch)
-    r1 = await client.end_session("s1", "first call")
-    r2 = await client.end_session("s1", "second call")
+    r1 = await client.end_session("s1", "first call", auth_context=_end_auth("s1"))
+    r2 = await client.end_session("s1", "second call", auth_context=_end_auth("s1"))
     assert r1["session_id"] == r2["session_id"] == "s1"
     assert r1["session_summary_written"] is True
     assert r2["session_summary_written"] is False
@@ -461,8 +467,8 @@ async def test_memory_get_tool_no_client():
 @pytest.mark.asyncio
 async def test_client_recent_session_boundaries(client, monkeypatch):
     _patch_provider(monkeypatch)
-    await client.end_session("s1", "first")
-    await client.end_session("s2", "second")
+    await client.end_session("s1", "first", auth_context=_end_auth("s1"))
+    await client.end_session("s2", "second", auth_context=_end_auth("s2"))
     boundaries = await client.recent_session_boundaries(
         count=10, auth_context=ADMIN_SCOPE
     )

@@ -102,6 +102,11 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "wiki_backlinks_unhealthy",
 })
 _AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
+_AGENT_SELF_CHANNEL_CARRIERS = frozenset({
+    "cross_turn_send_duplicate",
+    "send_message_loop_hard_stop",
+    "send_message_loop_warning",
+})
 
 
 def _is_agent_self_record(record: dict) -> bool:
@@ -117,6 +122,20 @@ def _is_agent_self_record(record: dict) -> bool:
         # carrying an event kind.
         return isinstance(record.get("error"), str) and bool(record["error"])
     return kind in _AGENT_SELF_EVENT_KINDS or kind.startswith(_AGENT_SELF_EVENT_PREFIXES)
+
+
+def _sanitize_agent_self_record(record: dict) -> dict:
+    """Remove user-scoped payloads from globally visible self-feedback."""
+    if _record_principal(record) is not None or not _is_agent_self_record(record):
+        return record
+    kind = record.get("type")
+    if kind == "error":
+        return {**record, "channel_id": None, "error": None, "message": None}
+    if kind in _AGENT_SELF_CHANNEL_CARRIERS:
+        return {**record, "channel_id": None}
+    if not isinstance(kind, str) and (record.get("error") or record.get("result_is_error")):
+        return {**record, "channel_id": None, "error": None}
+    return record
 
 
 class _RecordSnapshot:
@@ -577,7 +596,7 @@ class FeedbackLog:
         # This scan has no time cutoff. Its sibling _authorized_snapshot
         # preserves saturated window fallback through stream_filtered.
         return [
-            record
+            _sanitize_agent_self_record(record)
             for record in iter_snapshot_or_tail(snapshot, path)
             if cls._record_authorized(record, auth_context)
         ]
@@ -595,7 +614,7 @@ class FeedbackLog:
         def stream_filtered(window_path: Path):
             for record in iter_window_records(snapshot, window_path):
                 if cls._record_authorized(record, auth_context):
-                    yield record
+                    yield _sanitize_agent_self_record(record)
 
         return _RecordSnapshot(
             records,

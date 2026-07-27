@@ -140,6 +140,14 @@ def _session_row(client: SagaStore, session_id: str):
 
 
 @pytest.mark.asyncio
+async def test_end_session_denies_absent_auth_context(client: SagaStore) -> None:
+    with pytest.raises(PermissionError, match="session write denied"):
+        await client.end_session("unauthorized-session", "must not be written")
+
+    assert _session_row(client, "unauthorized-session") is None
+
+
+@pytest.mark.asyncio
 async def test_end_session_retry_is_idempotent_and_cannot_rebind(
     client: SagaStore,
 ) -> None:
