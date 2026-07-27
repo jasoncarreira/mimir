@@ -2136,8 +2136,10 @@ async def test_service_capability_allowed_admin_operation_emits_non_blocking_aud
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         decision = registry.authorize_tool("saga_feedback", auth, enforce=False)
         await asyncio.sleep(0)
+    enforced = registry.authorize_tool("saga_feedback", auth, enforce=True)
 
     assert decision.allowed is True
+    assert captured[0][1]["would_block"] is (not enforced.allowed)
     assert decision.is_shadow_decision is True
     assert captured == [(
         "shadow_tool_decision",
@@ -2168,8 +2170,10 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         decision = registry.authorize_tool("remove_schedule", auth, enforce=False)
         await asyncio.sleep(0)
+    enforced = registry.authorize_tool("remove_schedule", auth, enforce=True)
 
     assert decision.allowed is True
+    assert captured[0][1]["would_block"] is (not enforced.allowed)
     assert captured == [(
         "shadow_tool_decision",
         {
@@ -2181,6 +2185,40 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
     )]
     assert captured[0][1]["reason"] == "admin_required"
     assert captured[0][1]["service_principal"] == "scheduler"
+
+
+@pytest.mark.asyncio
+async def test_shadow_sink_event_records_redacted_resolved_destination() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    target = "HTTPS://Example.INVALID:443/api?token=ghp_secretvalue"
+    auth = _write_auth()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        shadow = registry.authorize_tool(
+            "fetch_url", auth, enforce=False, target_channel=target,
+        )
+        await asyncio.sleep(0)
+        enforced = registry.authorize_tool(
+            "fetch_url", auth, enforce=True, target_channel=target,
+        )
+
+    assert shadow.allowed is True
+    assert enforced.allowed is False
+    assert len(captured) == 1
+    kind, fields = captured[0]
+    assert kind == "shadow_tool_decision"
+    assert fields["allowed"] is True
+    assert fields["would_block"] is (not enforced.allowed)
+    assert fields["reason"] == enforced.reason
+    assert fields["target"] == "https://example.invalid/api?token=[REDACTED]"
+    assert fields["trigger"] == "user_message"
 
 
 def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:

@@ -523,6 +523,27 @@ def test_compute_stats_rolls_up_tool_calls_and_failures():
     assert by_tool["fetch_url"]["calls"] == 0
     assert by_tool["fetch_url"]["errors"] == 1
 
+
+def test_compute_stats_accepts_old_and_self_classifying_shadow_events():
+    events = [
+        {
+            "timestamp": _ts(), "type": "shadow_tool_decision",
+            "tool": "fetch_url", "allowed": True,
+        },
+        {
+            "timestamp": _ts(), "type": "shadow_tool_decision",
+            "tool": "fetch_url", "allowed": True, "would_block": True,
+            "target": "https://example.invalid/", "trigger": "user_message",
+        },
+    ]
+
+    payload = compute_stats([
+        dict(event, _ts=datetime.fromisoformat(event["timestamp"]))
+        for event in events
+    ], days=7)
+
+    assert payload["by_event"]["shadow_tool_decision"] == 2
+
 # ─── Route wiring through register_routes ────────────────────────────
 
 
