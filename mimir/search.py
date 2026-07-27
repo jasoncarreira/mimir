@@ -767,7 +767,11 @@ class Indexer:
                     }
 
         if not include_protected and candidates:
-            from .read_policy import is_protected_read_path, text_contains_secret
+            from .read_policy import (
+                emit_hard_read_denial,
+                is_protected_read_path,
+                text_contains_secret,
+            )
 
             candidate_paths = {row["path"] for row in candidates.values()}
             protected_paths = {
@@ -784,6 +788,10 @@ class Indexer:
                         for row in rows
                     ):
                         protected_paths.add(path)
+            for path in protected_paths:
+                emit_hard_read_denial(
+                    "file_search", str(self._home / path), "protected_read_result",
+                )
             candidates = {
                 key: row for key, row in candidates.items()
                 if row["path"] not in protected_paths

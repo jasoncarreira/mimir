@@ -145,7 +145,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         self._max_scan_files = max_scan_files
         self._grep_timeout_seconds = grep_timeout_seconds
 
-    def _is_excluded(self, path: Path) -> bool:
+    def _is_excluded(self, path: Path, *, tool: str | None = None) -> bool:
         try:
             rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
         except (OSError, RuntimeError, ValueError):
@@ -158,21 +158,26 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             non_admin_read_filter_enabled,
         )
 
-        return (
+        protected = (
             non_admin_read_filter_enabled()
             and not is_mimir_home_root(path)
             and is_protected_read_path(path)
         )
+        if protected and tool is not None:
+            from .read_policy import emit_hard_read_denial
 
-    def _walk_files(self, root: Path) -> Iterator[Path]:
+            emit_hard_read_denial(tool, str(path), "protected_read_target")
+        return protected
+
+    def _walk_files(self, root: Path, *, tool: str) -> Iterator[Path]:
         for dirpath, dirnames, filenames in os.walk(root):
             base = Path(dirpath)
             dirnames[:] = sorted(
-                name for name in dirnames if not self._is_excluded(base / name)
+                name for name in dirnames if not self._is_excluded(base / name, tool=tool)
             )
             for filename in sorted(filenames):
                 candidate = base / filename
-                if not self._is_excluded(candidate):
+                if not self._is_excluded(candidate, tool=tool):
                     yield candidate
 
     def _ripgrep_search(
@@ -255,7 +260,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if base_full.is_file():
             candidates = iter([base_full])
         else:
-            candidates = self._walk_files(root)
+            candidates = self._walk_files(root, tool="grep")
         scanned = 0
         matches = 0
         truncated: str | None = None
@@ -283,6 +288,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             from .read_policy import non_admin_read_filter_enabled, result_is_protected
 
             if non_admin_read_filter_enabled() and result_is_protected(fp, text=content):
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("grep", str(fp), "protected_read_result")
                 continue
             for line_num, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
@@ -361,7 +369,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if search_path.is_file():
             candidates = iter([search_path])
         else:
-            candidates = self._walk_files(search_path)
+            candidates = self._walk_files(search_path, tool="glob")
         try:
             for candidate in candidates:
                 scanned += 1
@@ -374,6 +382,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 from .read_policy import non_admin_read_filter_enabled, result_is_protected
 
                 if non_admin_read_filter_enabled() and result_is_protected(matched_path):
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial(
+                        "glob", str(matched_path), "protected_read_result",
+                    )
                     continue
                 try:
                     is_file = matched_path.is_file()
@@ -436,9 +449,18 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 try:
                     resolved = self._resolve_path(str(entry.get("path", "")).rstrip("/"))
                 except (OSError, RuntimeError, ValueError):
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial(
+                        "ls", str(entry.get("path", "")), "unresolved_read_target",
+                    )
                     continue
                 if not result_is_protected(resolved):
                     safe.append(entry)
+                else:
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial("ls", str(resolved), "protected_read_result")
             filtered = safe
         return LsResult(error=result.error, entries=filtered)
 
@@ -512,9 +534,18 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
         if non_admin_read_filter_enabled():
             try:
-                if result_is_protected(self._resolve_path(file_path)):
+                resolved = self._resolve_path(file_path)
+                if result_is_protected(resolved):
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial(
+                        "read_file", str(resolved), "protected_read_target",
+                    )
                     return ReadResult(error="Read denied: protected file")
             except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 return ReadResult(error="Read denied: unresolved path")
         try:
             result = super().read(file_path, offset, limit)
@@ -531,9 +562,18 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
         if non_admin_read_filter_enabled():
             try:
-                if result_is_protected(self._resolve_path(file_path)):
+                resolved = self._resolve_path(file_path)
+                if result_is_protected(resolved):
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial(
+                        "read_file", str(resolved), "protected_read_target",
+                    )
                     return ReadResult(error="Read denied: protected file")
             except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 return ReadResult(error="Read denied: unresolved path")
         result = await super().aread(file_path, offset, limit)
         if result.error is None:
@@ -834,6 +874,27 @@ class WriteGuardBackend:
         if ctx is not None:
             denial["turn_id"] = ctx.turn_id
         self._denials.append(denial)
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        tool = "edit_file" if op.startswith("edit") else "write_file"
+        if op.startswith("upload"):
+            tool = "upload_files"
+        if "prompts_readonly" in op:
+            reason = "prompts_readonly"
+        elif "core_memory_readonly" in op:
+            reason = "core_memory_readonly"
+        elif "identities_protected" in op:
+            reason = "identities_protected"
+        else:
+            reason = "filesystem_target_not_writable"
+        resolved = self._resolve_target(file_path)
+        _emit_hard_boundary_denied(
+            tool=tool,
+            boundary="filesystem_write_guard",
+            reason=reason,
+            target=str(resolved) if resolved is not None else file_path,
+            turn_context=ctx,
+        )
         # Bound the buffer: denials with no turn_id (setup/non-turn
         # callables) and denials from turns that died before the post-turn
         # drain are never drained by the turn-scoped path — drop oldest so
@@ -1094,6 +1155,12 @@ class ReadOnlyFilesystemBackend:
     def __init__(self, root_dir: Path) -> None:
         self._fs = _RootAwareFilesystemBackend(root_dir=root_dir, virtual_mode=True)
 
+    def _resolved_target(self, file_path: str) -> str:
+        try:
+            return str(self._fs._resolve_path(file_path))
+        except (OSError, RuntimeError, ValueError):
+            return file_path
+
     def __getattr__(self, name: str) -> Any:
         if name in self._ALLOWED_READS:
             return getattr(self._fs, name)
@@ -1103,6 +1170,14 @@ class ReadOnlyFilesystemBackend:
         )
 
     def write(self, file_path: str, content: str) -> WriteResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="write_file",
+            boundary="readonly_filesystem",
+            reason="write_readonly",
+            target=self._resolved_target(file_path),
+        )
         return WriteResult(error=f"Write blocked. '{file_path}' is read-only.")
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
@@ -1115,6 +1190,14 @@ class ReadOnlyFilesystemBackend:
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="edit_file",
+            boundary="readonly_filesystem",
+            reason="edit_readonly",
+            target=self._resolved_target(file_path),
+        )
         return EditResult(error=f"Edit blocked. '{file_path}' is read-only.")
 
     async def aedit(
@@ -1132,6 +1215,15 @@ class ReadOnlyFilesystemBackend:
         )
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        for path, _ in files:
+            _emit_hard_boundary_denied(
+                tool="upload_files",
+                boundary="readonly_filesystem",
+                reason="upload_readonly",
+                target=self._resolved_target(path),
+            )
         return [FileUploadResponse(path=path, error="permission_denied") for path, _ in files]
 
     async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:

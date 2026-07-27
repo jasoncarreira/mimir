@@ -575,7 +575,9 @@ def test_static_shell_service_principals_have_job_inspection_companions() -> Non
             assert companions <= capabilities, principal.canonical
 
 
-def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
+def test_capability_matrix_preflight_fails_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.access_control import (
         ServicePrincipal,
         _TRUSTED_SERVICE_PRINCIPALS,
@@ -583,6 +585,11 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
     )
 
     original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
     try:
         _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
             canonical="scheduler",
@@ -596,6 +603,11 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
         assert is_complete is False
         assert len(errors) > 0
         assert any("no capabilities" in e for e in errors)
+        hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+        assert hard["tool"] == "startup"
+        assert hard["boundary"] == "capability_matrix_preflight"
+        assert hard["reason"] == "capability_matrix_incomplete"
+        assert any("no capabilities" in error for error in hard["target"])
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)

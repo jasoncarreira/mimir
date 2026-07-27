@@ -315,7 +315,7 @@ class TestMiddlewareBlocksProhibited:
         handler.assert_called_once_with(request)
 
     def test_middleware_emits_algedonic_event(self) -> None:
-        """Blocked prohibited action emits a 'prohibited_action_blocked' event."""
+        """The real guard emits both legacy and hard-denial audit events."""
         captured_events: list[tuple] = []
 
         def fake_emit(kind: str, **kwargs: Any) -> None:
@@ -323,7 +323,10 @@ class TestMiddlewareBlocksProhibited:
 
         with patch("mimir.tools.budget_gate._emit_event_sync", side_effect=fake_emit):
             middleware = BudgetGateMiddleware()
-            request = _make_request("shell_exec", "git push --force origin main")
+            request = _make_request(
+                "shell_exec",
+                "git push --force origin main # token=ghp_secretvalue",
+            )
             handler = MagicMock()
             middleware.wrap_tool_call(request, handler)
 
@@ -337,6 +340,15 @@ class TestMiddlewareBlocksProhibited:
         assert "reason" in kwargs
         assert len(kwargs["reason"]) <= 200
         assert kwargs["tool"] == "shell_exec"
+        _, hard = next(e for e in captured_events if e[0] == "hard_boundary_denied")
+        assert hard == {
+            "tool": "shell_exec",
+            "boundary": "prohibited_action_guard",
+            "reason": "prohibited_action",
+            "target": "git push --force origin main # token=[REDACTED]",
+            "trigger": "user_message",
+            "service_principal": None,
+        }
 
 
 class TestAdminSensitiveDeepagentsExecute:

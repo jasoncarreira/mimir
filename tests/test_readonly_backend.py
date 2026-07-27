@@ -47,10 +47,22 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/state/sub/dir/note.txt", content="hi")
         assert getattr(r, "error", None) is None
 
-    def test_blocks_write_to_non_writable_dir(self, home: Path) -> None:
+    def test_blocks_write_to_non_writable_dir(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         r = b.write(file_path="/logs/bad.txt", content="hi")
         assert "Write blocked" in (getattr(r, "error", "") or "")
+        hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+        assert hard["tool"] == "write_file"
+        assert hard["boundary"] == "filesystem_write_guard"
+        assert hard["reason"] == "filesystem_target_not_writable"
+        assert hard["target"] == str(home / "logs" / "bad.txt")
 
     def test_blocks_write_to_implicit_dir(self, home: Path) -> None:
         # .mimir/ is not in writable_dirs; saga db must not be writable
@@ -609,10 +621,22 @@ class TestCoreMemoryReflectionGate:
 
 
 class TestReadOnlyFilesystemBackend:
-    def test_blocks_all_writes(self, home: Path) -> None:
+    def test_blocks_all_writes(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
         b = ReadOnlyFilesystemBackend(root_dir=home)
         r = b.write(file_path="/state/anywhere.txt", content="no")
         assert "read-only" in (getattr(r, "error", "") or "")
+        hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+        assert hard["tool"] == "write_file"
+        assert hard["boundary"] == "readonly_filesystem"
+        assert hard["reason"] == "write_readonly"
+        assert hard["target"] == str(home / "state" / "anywhere.txt")
 
     def test_blocks_all_edits(self, home: Path) -> None:
         b = ReadOnlyFilesystemBackend(root_dir=home)

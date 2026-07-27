@@ -43,7 +43,12 @@ def test_production_backend_offloads_and_appends_on_fresh_home(
         trigger="user_message",
         channel_id="channel",
         interactivity=None,
-        enforcement_enabled=True,
+        enforcement_enabled=False,
+    )
+    events = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
     )
 
     token = set_current_turn(SimpleNamespace(turn_id="offload", auth_context=auth))
@@ -61,6 +66,11 @@ def test_production_backend_offloads_and_appends_on_fresh_home(
     assert "Human: first" in history.read_text()
     assert "Human: second" in history.read_text()
     assert direct_read.error == "Read denied: protected file"
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert hard["boundary"] == "protected_read_policy"
+    assert hard["reason"] == "protected_read_target"
+    assert hard["target"] == str(history)
+    assert hard["trigger"] == "user_message"
 
     denied = backend.write("/not_writable/outside.md", "blocked")
     assert "Write blocked" in (denied.error or "")
