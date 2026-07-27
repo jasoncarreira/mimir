@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import shutil
 import os
 import subprocess
 from dataclasses import FrozenInstanceError, replace
@@ -2918,6 +2919,15 @@ def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
     def admitted(command: str) -> bool:
         return parse_service_shell_argv(command, "repo_review") is not None
 
+    # The body is CAPTURED during authorization (see the check/use-race test
+    # below), so it must already exist and be readable — a not-yet-written body
+    # file is refused rather than admitted on the strength of its path alone.
+    (scratch / "review.md").write_text("## Summary\nbody\n", encoding="utf-8")
+    (scratch / "r.md").write_text("ok\n", encoding="utf-8")
+    assert not admitted(
+        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/absent.md"
+    )
+
     # Posting a review is admitted, in each verdict shape.
     for verdict in ("--request-changes", "--approve", "--comment"):
         assert admitted(
@@ -2935,7 +2945,7 @@ def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
         f"gh pr review 7 --repo o/r --approve --body-file {scratch}/../secret.txt"
     )
     escape = scratch / "escape.md"
-    escape.symlink_to(home / "secret.txt")
+    escape.symlink_to(home / "secret.txt")  # exists, but points outside scratch
     assert not admitted(
         f"gh pr review 7 --repo o/r --approve --body-file {escape}"
     )
@@ -2948,6 +2958,79 @@ def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
     )
     # Still no state-changing gh beyond review.
     assert not admitted("gh pr merge 7 --repo o/r --squash")
+
+
+def test_repo_review_body_is_captured_not_re_looked_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """A review body must survive authorization as CONTENT, never as a path.
+
+    Validating a pathname and then handing the same pathname to ``gh`` is a
+    check/use race (mimir-carreira on #1221): any service-writable process can
+    swap the accepted file — or a parent component — for a symlink pointing
+    outside scratch between the check and ``gh``'s open, publishing arbitrary
+    readable content as a PR review.
+
+    The authorized argv therefore carries the captured body inline and no
+    ``--body-file`` at all, so a post-authorization swap has nothing to act on.
+    """
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    scratch.mkdir(parents=True)
+    (home / "secret.txt").write_text("TOP SECRET", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    body = scratch / "review.md"
+    body.write_text("## Summary\nsecond line\n", encoding="utf-8")
+    argv = parse_service_shell_argv(
+        f"gh pr review 7 --repo o/r --request-changes --body-file {body}",
+        "repo_review",
+    )
+
+    assert argv is not None
+    # The pathname does not survive: nothing for gh to look up again.
+    assert "--body-file" not in argv
+    assert str(body) not in argv
+    # Multiline content is inlined verbatim — safe because no shell reparses an
+    # argv list, which is why the control-character rule does not apply here.
+    assert argv[argv.index("--body") + 1] == "## Summary\nsecond line\n"
+
+    # THE RACE: swap the accepted file for a symlink out of scratch, as a
+    # concurrent writer would, then confirm the already-authorized argv is
+    # unaffected and the secret is nowhere in it.
+    body.unlink()
+    body.symlink_to(home / "secret.txt")
+    assert argv[argv.index("--body") + 1] == "## Summary\nsecond line\n"
+    assert not any("TOP SECRET" in part for part in argv)
+
+    # And a body that is ALREADY an outside-pointing symlink is refused outright.
+    assert parse_service_shell_argv(
+        f"gh pr review 7 --repo o/r --approve --body-file {body}", "repo_review",
+    ) is None
+
+    # A swapped PARENT component is refused too (O_NOFOLLOW on each element).
+    nested = scratch / "d" / "b.md"
+    nested.parent.mkdir()
+    nested.write_text("fine", encoding="utf-8")
+    assert parse_service_shell_argv(
+        f"gh pr review 7 --repo o/r --approve --body-file {nested}", "repo_review",
+    ) is not None
+    shutil.rmtree(scratch / "d")
+    (scratch / "d").symlink_to(home)
+    assert parse_service_shell_argv(
+        f"gh pr review 7 --repo o/r --approve --body-file {scratch}/d/secret.txt",
+        "repo_review",
+    ) is None
+
+    # An oversize body is refused rather than silently truncated into a review.
+    big = scratch / "big.md"
+    big.write_text("x" * (access_control._REVIEW_BODY_MAX_BYTES + 1), encoding="utf-8")
+    assert parse_service_shell_argv(
+        f"gh pr review 7 --repo o/r --approve --body-file {big}", "repo_review",
+    ) is None
 
 
 def test_service_shell_pin_inside_configured_write_root_fails_closed(

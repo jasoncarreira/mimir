@@ -961,38 +961,109 @@ def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
     )
 
 
-def _repo_review_body_files_within_scratch(arguments: list[str]) -> bool:
-    """Confine ``--body-file`` to the service's own scratch root.
+#: Cap on a captured review body. GitHub rejects review bodies past ~65k, so a
+#: larger file is a mistake or an attempt to wedge the exec, not a real review.
+_REVIEW_BODY_MAX_BYTES = 65_536
 
-    A review body must come from a file (newlines cannot survive the shell
-    control-character check), so the file itself becomes the egress surface: an
-    unconstrained path would let a trusted service publish any readable file to
-    GitHub. Restricting it to ``<home>/scratch`` means a service can only
-    publish content it authored there. Checked lexically AND resolved, so a
-    symlink planted in scratch cannot launder a path outside it.
+
+def _capture_review_body_beneath_scratch(path_text: str) -> str | None:
+    """Read a review body from scratch through descriptor-relative no-follow IO.
+
+    Validating a pathname and then handing that same pathname to ``gh`` is a
+    check/use race: ``Path.resolve()`` proves only what the path meant at check
+    time, and any service-writable process can swap the file — or a parent
+    component — for a symlink pointing outside scratch before ``gh`` opens it,
+    publishing arbitrary readable content as a PR review.
+
+    So the pathname never survives authorization. We anchor on the fully
+    resolved scratch root (``resolve()`` leaves no symlinks in it), walk each
+    component with ``O_NOFOLLOW`` (openat semantics), read the contents here,
+    and the caller substitutes ``--body <captured>`` into the already-parsed
+    argv. Inlining multiline text is safe at that point precisely because no
+    shell reparses an argv list — the control-character rule that forced a file
+    in the first place applies to the raw command string, not to argv.
+
+    Mirrors the spawn-artifact hardening in ``tools/registry.py`` (#1134).
+    Returns ``None`` when the body cannot be captured safely, which the caller
+    turns into a refusal.
     """
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
-        return "--body-file" not in arguments
+        return None
     scratch_root = (Path(home).resolve() / "scratch").resolve()
-    for index, argument in enumerate(arguments):
-        if argument != "--body-file":
+    candidate = Path(path_text)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    # Lexical containment first, so a traversal never reaches the walk.
+    try:
+        relative = candidate.relative_to(scratch_root)
+    except ValueError:
+        return None
+    parts = relative.parts
+    if not parts or ".." in parts:
+        return None
+
+    opened: list[int] = []
+    try:
+        opened.append(os.open(scratch_root, os.O_RDONLY | os.O_DIRECTORY))
+    except OSError:
+        return None
+    try:
+        for part in parts[:-1]:
+            opened.append(
+                os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=opened[-1],
+                )
+            )
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=opened[-1])
+    except OSError:
+        return None
+    finally:
+        for fd_open in opened:
+            try:
+                os.close(fd_open)
+            except OSError:
+                pass
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            # Read one byte past the cap so an oversize file is detected rather
+            # than silently truncated into a published review.
+            raw = handle.read(_REVIEW_BODY_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _REVIEW_BODY_MAX_BYTES:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
+    """Replace ``--body-file <path>`` with ``--body <captured contents>``.
+
+    Returns ``argv`` unchanged when no body file is named, or ``None`` when a
+    named body cannot be captured safely.
+    """
+    if "--body-file" not in argv:
+        return argv
+    out: list[str] = []
+    index = 0
+    while index < len(argv):
+        if argv[index] != "--body-file":
+            out.append(argv[index])
+            index += 1
             continue
-        if index + 1 >= len(arguments):
-            return False
-        candidate = Path(arguments[index + 1])
-        if not candidate.is_absolute():
-            candidate = Path(home).resolve() / candidate
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return False
-        if not (
-            candidate.is_relative_to(scratch_root)
-            and resolved.is_relative_to(scratch_root)
-        ):
-            return False
-    return True
+        if index + 1 >= len(argv):
+            return None
+        body = _capture_review_body_beneath_scratch(argv[index + 1])
+        if body is None:
+            return None
+        out.extend(["--body", body])
+        index += 2
+    return out
 
 
 def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
@@ -1037,7 +1108,10 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
             argv[3:], exact_options=options,
         ):
             return False
-        return _repo_review_body_files_within_scratch(argv[3:])
+        # The body file's SAFETY is enforced at capture time, not here — see
+        # ``_capture_review_body_beneath_scratch``. Admission only decides the
+        # option is permitted.
+        return True
 
     if argv[0] == "git" and len(argv) >= 2:
         subcommand = argv[1]
@@ -1444,7 +1518,17 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
-        allowed = _target_matches_repo_review_shell_command(argv)
+        if _target_matches_repo_review_shell_command(argv):
+            pinned = _maintenance_pinned_execution_argv(argv)
+            # Capture any review body HERE, so the returned artifact carries no
+            # pathname for ``gh`` to look up again. See
+            # ``_capture_review_body_beneath_scratch``: validating a path and
+            # then passing that path on is a check/use race.
+            return (
+                _repo_review_argv_with_captured_body(pinned)
+                if pinned is not None else None
+            )
+        return None
     elif destination == "maintenance":
         if argv[0] == "git":
             return _maintenance_git_execution_argv(argv)
