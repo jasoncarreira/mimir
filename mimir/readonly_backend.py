@@ -145,7 +145,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         self._max_scan_files = max_scan_files
         self._grep_timeout_seconds = grep_timeout_seconds
 
-    def _is_excluded(self, path: Path, *, tool: str | None = None) -> bool:
+    def _is_excluded(self, path: Path, *, tool: str) -> bool:
         try:
             rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
         except (OSError, RuntimeError, ValueError):
@@ -163,7 +163,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             and not is_mimir_home_root(path)
             and is_protected_read_path(path)
         )
-        if protected and tool is not None:
+        if protected:
             from .read_policy import emit_hard_read_denial
 
             emit_hard_read_denial(tool, str(path), "protected_read_target")
@@ -225,7 +225,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             if not ftext:
                 continue
             p = Path(ftext)
-            if self._is_excluded(p):
+            if self._is_excluded(p, tool="grep"):
                 continue
             if self.virtual_mode:
                 try:

@@ -1039,3 +1039,51 @@ def test_denial_buffer_is_bounded(tmp_path: Path):
     assert len(b._denials) == 512
     assert b._denials[0]["file_path"] == "/logs/blocked-88.txt"
     assert b._denials[-1]["file_path"] == "/logs/blocked-599.txt"
+
+
+def test_every_exclusion_site_reports_which_tool_withheld_the_path():
+    """No read-withholding path may be silent (#1012).
+
+    ``_is_excluded`` emits ``hard_boundary_denied`` only for the caller that
+    names its tool. The first version of this made ``tool`` optional and left
+    ``_ripgrep_search`` passing nothing, so the *primary* grep path recorded
+    nothing while the instrumented one — the Python walker — is only the
+    fallback taken when ``rg`` is absent. ``rg`` is a pinned executable in
+    production, so the covered path was the one that does not run and the tests
+    passed anyway.
+
+    This is a source check rather than a behavioural one because reaching
+    ``_ripgrep_search`` requires ``rg`` on the test host; the point is that a
+    call site cannot be added without naming its tool. The keyword-only
+    ``tool: str`` with no default is the real guard — this test explains why it
+    must stay that way.
+    """
+    import ast
+    import inspect
+
+    from mimir import readonly_backend
+
+    source = inspect.getsource(readonly_backend)
+    tree = ast.parse(source)
+
+    signature = inspect.signature(readonly_backend._RootAwareFilesystemBackend._is_excluded)
+    tool_param = signature.parameters["tool"]
+    assert tool_param.default is inspect.Parameter.empty, (
+        "_is_excluded(tool=...) must stay required; a default lets a new call "
+        "site withhold a path silently, which is the defect this guards"
+    )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "_is_excluded"):
+            continue
+        if not any(kw.arg == "tool" for kw in node.keywords):
+            offenders.append(f"readonly_backend.py:{node.lineno}")
+
+    assert not offenders, (
+        "these _is_excluded call sites withhold a path without recording which "
+        "tool did it: " + ", ".join(offenders)
+    )

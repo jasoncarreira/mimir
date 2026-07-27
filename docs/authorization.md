@@ -637,6 +637,24 @@ MCP classifier failures, middleware read-scope decisions, and final harness IFC
 egress remain ordinary enforcement decisions: with enforcement off they proceed
 and emit shadow/would-block evidence rather than a hard denial.
 
+#### 2026-07-27 low-count residue classification (#1017)
+
+The 15:21-21:07 shadow pass contained 11 decisions outside the larger classes.
+They are deliberately recorded here so a later audit does not treat a quiet log
+as a reason to widen authority:
+
+| Events | Classification | Evidence and disposition |
+|---|---|---|
+| 4 `system` `shell_exec` / `service_sink_destination_denied` | **(c) Already fixed** | All four came from the one-shot 0.7.0 reconciliation and stopped after 15:22:20. #1011/#1220 added `<home>/scratch` to the static service write roots. `test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized` replays `git -C <scratch proposal> ...` through fresh enforced and shadow decisions, asserting admission and `would_block == false`. Compound `cd X && ...` remains intentionally inadmissible. The shipped upgrade prompt now names the admitted single-argv form so a future live reconciliation does not replay the stale command shape. No scope or capability was widened here. |
+| 3 `poller:github-activity` `approve_declassification` / `admin_required` | **(b) Correct denial; behavior change** | A review poller consumes taint-gated PR content. Letting it approve its own declassification would erase the independent admin decision and turn prompt injection into its own release authority. The `github` profile omits this capability. Trigger and review-skill guidance now say to stop attempting it; no grant was added. |
+| 3 `send_message`/`react` / `ifc_label_blocked:same_channel` (`system`, poller, and principal-less interactive) | **(a) Genuine over-taint gap, folded into #1016** | The sink gate already permits every known sensitivity label when all accumulated sources are complete and destination-compatible (`test_every_known_label_can_flow_to_compatible_same_channel`). These events instead carried unrelated or incomplete untrusted provenance, including a turn with no principal, matching #1016's session-boundary/derived-input over-taint rather than a messaging capability gap. IFC derivation is therefore owned and verified by #1016; this leaf makes no duplicate gate change. |
+| 1 `poller:github-activity` `spawn_claude_code` / `admin_required` | **(b) Correct denial; behavior change** | Spawn is a code-execution and network boundary, not a review primitive. A poller-triggered review must inspect and submit in its current bounded turn; delegating to a coding process would escape that review path's authority. The `github` profile omits every spawn capability, and prompt/skill guidance now makes the restriction explicit. No grant was added. |
+
+For the (c) row, the fresh shadow replay is empty for the documented legitimate
+`git -C` action. A future live reconciliation should confirm the same; a quiet
+interval with no upgrade turn is not equivalent evidence. The old compound form
+must still be denied if requested.
+
 ### 3. Pass startup preflights
 
 No model-provider change is required before enablement. The shipped

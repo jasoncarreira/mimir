@@ -354,6 +354,13 @@ def build_turn_prompt(
                 "``worklink_run`` is usable only before any untrusted active ingest "
                 "in this turn."
             )
+        if trigger_authority_profile == "github":
+            lines.append(
+                "Complete review work in this turn. Do not call "
+                "``approve_declassification`` (a taint-gated poller cannot approve "
+                "its own release) or any spawn tool (review authority does not "
+                "delegate into a coding process); neither capability is available."
+            )
         _add_labeled("Autonomous trigger authority", "\n".join(lines))
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities

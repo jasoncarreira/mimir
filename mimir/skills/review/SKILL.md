@@ -32,6 +32,13 @@ diff accessible — either under 20k lines via `gh pr diff`, or file list via
 review PRs it authored (when `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author,
 a different reviewer is needed).
 
+When the trigger is `poller:github-activity`, perform the review in the current
+turn. Do not call `approve_declassification`: the poller is subject to the taint
+gate and cannot approve release of its own inputs. Do not call
+`spawn_claude_code` or another spawn tool: a review turn does not delegate into a
+coding process. A denied attempt is a working security boundary, not a reason to
+request either capability.
+
 ## Step-by-step
 
 ### 1. Get PR context

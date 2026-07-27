@@ -15,7 +15,9 @@ Conflict markers present: `{conflicts}`
 Your job:
 
 1. Read the changed files under `{worktree}/memory/core/` and `{worktree}/prompts/`.
-2. Review the staged diff in the proposal worktree (`git diff --cached` from `{worktree}`).
+2. Review the staged diff with `git -C {worktree} diff --cached`. Service shell
+   commands must be one admitted argv; do not express the working directory as
+   `cd {worktree} && ...` or use another compound shell command.
 3. If any file contains conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), resolve them deliberately:
    - preserve local/operator customizations that are still load-bearing;
    - incorporate shipped-default changes that update policy, workflows, or safety boundaries;
