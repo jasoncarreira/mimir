@@ -1576,18 +1576,25 @@ class SinkGate:
         """
         from .models import InformationFlowLabels
 
+        sink_category = sink_category or get_sink_category(tool_name)
+        service = get_trusted_service_from_auth_context(auth_context)
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=not enforce,
                 reason="missing_ifc_labels",
+                service_principal=service,
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=(
+                    resolve_sink_target(tool_name, sink_category, target, service)
+                    if target else None
+                ),
             )
 
-        sink_category = sink_category or get_sink_category(tool_name)
         if sink_category == SinkCategory.UNKNOWN:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1597,9 +1604,9 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
             )
 
-        service = get_trusted_service_from_auth_context(auth_context)
         if not target:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1610,6 +1617,7 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
             )
 
         is_application_egress = sink_category in {
@@ -1618,6 +1626,9 @@ class SinkGate:
             SinkCategory.EXTERNAL_MCP,
         }
         normalized_target = normalize_sink_destination(sink_category, target)
+        resolved_target = resolve_sink_target(
+            tool_name, sink_category, target, service,
+        )
         if is_application_egress and ifc_labels.labels and not ifc_labels.sources:
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1628,6 +1639,8 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
             )
         state = getattr(auth_context, "ifc_state", None)
         has_untrusted_active_ingest = (
@@ -1662,6 +1675,7 @@ class SinkGate:
                     reason="ifc_declassification_approved",
                     service_principal=service,
                     enforcement_enabled=enforce,
+                    resolved_sink_target=resolved_target,
                 )
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -1672,6 +1686,8 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
             )
         if tool_name == "web_search":
             fixed_web_search_url = _fixed_web_search_url()
@@ -1685,6 +1701,8 @@ class SinkGate:
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
                 )
         if tool_name == "fetch_url" and (
             normalized_target is None
@@ -1699,6 +1717,8 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
             )
         if tool_name in {"webhook", "http_request"} and (
             normalized_target is None
@@ -1713,6 +1733,8 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
+                resolved_sink_target=resolved_target,
             )
         service_policy: ServiceSinkPolicy | None = None
         if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
@@ -1731,6 +1753,8 @@ class SinkGate:
                             required_tier=AccessTier.ADMIN,
                             enforcement_enabled=enforce,
                             is_shadow_decision=not enforce,
+                            would_block=True,
+                            resolved_sink_target=resolved_target,
                         )
                     service_policy = candidate
         if service is not None and sink_category in {
@@ -1754,6 +1778,8 @@ class SinkGate:
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
                 )
             service_policy = service.sink_policy_for(tool_name)
             adapter = (
@@ -1771,6 +1797,8 @@ class SinkGate:
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
                 )
 
         if not ifc_labels.labels:
@@ -1781,6 +1809,7 @@ class SinkGate:
                 reason="no_labels",
                 service_principal=service,
                 enforcement_enabled=enforce,
+                resolved_sink_target=resolved_target,
             )
 
         allowed_sinks = cls._get_allowed_sinks(
@@ -1822,6 +1851,7 @@ class SinkGate:
                     reason="ifc_declassification_approved",
                     service_principal=service,
                     enforcement_enabled=enforce,
+                    resolved_sink_target=resolved_target,
                 )
             reason = f"ifc_label_blocked:{sink_category.value}"
             is_shadow = not enforce
@@ -1834,6 +1864,8 @@ class SinkGate:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=is_shadow,
+                would_block=True,
+                resolved_sink_target=resolved_target,
             )
 
         return ToolAuthorization(
@@ -1843,6 +1875,7 @@ class SinkGate:
             reason="ifc_allowed",
             service_principal=service,
             enforcement_enabled=enforce,
+            resolved_sink_target=resolved_target,
         )
 
     @classmethod
@@ -2009,6 +2042,27 @@ def normalize_sink_destination(
         except ValueError:
             return None
     return value
+
+
+def resolve_sink_target(
+    tool_name: str,
+    sink_category: SinkCategory,
+    target: str,
+    service: ServicePrincipal | None,
+) -> str | None:
+    """Return the concrete destination representation evaluated by the gate."""
+    if sink_category is not SinkCategory.SHELL_PROCESS:
+        return normalize_sink_destination(sink_category, target)
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is not None and policy.adapter == "shell_profile":
+        execution_argv = parse_service_shell_argv(target, policy.destination)
+        if execution_argv is not None:
+            argv = execution_argv
+    return json.dumps(argv, ensure_ascii=True) if argv else None
 
 
 def approve_live_declassification(
@@ -2187,7 +2241,7 @@ class ChannelResourceAdapter:
         Returns:
             ToolAuthorization with allowed/reason fields populated
         """
-        if tool_name not in cls._CHANNEL_OPERATIONS:
+        if tool_name not in cls._CHANNEL_OPERATIONS:  # Misuse guard; never shadow-emitted.
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.UNKNOWN,
@@ -2208,6 +2262,7 @@ class ChannelResourceAdapter:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
             )
 
         # Channel tools resolve an omitted/empty target to the current turn's
@@ -2245,6 +2300,8 @@ class ChannelResourceAdapter:
             required_tier=AccessTier.ADMIN if not is_admin else AccessTier.USER,
             enforcement_enabled=enforce,
             is_shadow_decision=is_shadow,
+            would_block=not is_admin,
+            resolved_sink_target=resolved_target,
         )
 
     @classmethod
@@ -2364,6 +2421,11 @@ class WriteResourceAdapter:
             required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
             enforcement_enabled=enforce,
             is_shadow_decision=not enforce and not in_scope,
+            would_block=not in_scope,
+            resolved_sink_target=(
+                normalize_sink_destination(SinkCategory.FILE, target)
+                if target is not None else None
+            ),
         )
 
 
@@ -2772,6 +2834,13 @@ class MCPResourceAdapter:
                                     is_shadow_decision=(
                                         sink_check.is_shadow_decision if sink_check is not None else False
                                     ),
+                                    would_block=(
+                                        sink_check.would_block if sink_check is not None else False
+                                    ),
+                                    resolved_sink_target=(
+                                        sink_check.resolved_sink_target
+                                        if sink_check is not None else None
+                                    ),
                                     protected_source_resources=result.source_resources,
                                     protected_sink_resources=result.sink_resources,
                                     flow_direction=flow_direction,
@@ -2800,6 +2869,13 @@ class MCPResourceAdapter:
             required_tier=AccessTier.ADMIN if is_admin else AccessTier.USER,
             enforcement_enabled=enforce,
             is_shadow_decision=shadow_sink or (not enforce and denied_by_policy),
+            would_block=(
+                sink_check.would_block if shadow_sink and sink_check is not None
+                else denied_by_policy
+            ),
+            resolved_sink_target=(
+                sink_check.resolved_sink_target if sink_check is not None else None
+            ),
             protected_source_resources=(
                 validated_result.source_resources if validated_result is not None else None
             ),
@@ -2888,6 +2964,7 @@ class MCPResourceAdapter:
                     reason="non_mcp_tool_name",
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
+                    would_block=True,
                 )
             decision = OperationDecision.ADMIN_REQUIRED
 
@@ -2911,6 +2988,7 @@ class MCPResourceAdapter:
             reason=reason,
             enforcement_enabled=enforce,
             is_shadow_decision=not enforce and not allowed,
+            would_block=not allowed,
         )
 
 
@@ -2939,6 +3017,10 @@ class ToolAuthorization:
     required_tier: AccessTier = AccessTier.USER
     enforcement_enabled: bool = False
     is_shadow_decision: bool = False
+    # Enforcement verdict, independent of whether compatibility mode lets the
+    # current call proceed.
+    would_block: bool = False
+    resolved_sink_target: str | None = None
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
@@ -3089,12 +3171,20 @@ class ToolRegistry:
                 service = get_trusted_service_from_auth_context(auth_context)
             if target is None and auth.protected_sink_resources:
                 target = ",".join(auth.protected_sink_resources)
+            resolved_target = auth.resolved_sink_target
+            if resolved_target is None and target is not None:
+                category = get_sink_category(auth.tool_name)
+                resolved_target = resolve_sink_target(
+                    auth.tool_name, category, target, service,
+                )
+            from .redaction import redact_payload
+
             fields.update({
                 # Shadow decisions cover both compatibility bypasses and trusted
                 # service-capability grants. Bypasses carry the denial reason
                 # that enforcement would apply; capability grants do not.
-                "would_block": auth.reason is not None,
-                "target": target,
+                "would_block": auth.would_block,
+                "target": redact_payload(resolved_target),
                 "trigger": (
                     getattr(auth_context, "origin_trigger", None)
                     or getattr(auth_context, "trigger", None)
@@ -3156,6 +3246,7 @@ class ToolRegistry:
                 required_tier=AccessTier.ADMIN,
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
+                would_block=True,
             )
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(
@@ -3233,26 +3324,32 @@ class ToolRegistry:
         required_tier = AccessTier.USER
         reason = None
         is_shadow = False
+        would_block = False
         service_allowed = (
             service_can_invoke_operation(service_principal, tool_name)
         )
 
         if decision == OperationDecision.OPEN:
             allowed = True
+            would_block = False
         elif decision == OperationDecision.ADMIN_REQUIRED:
             required_tier = AccessTier.ADMIN
             if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                 allowed = True
+                would_block = False
             elif service_allowed:
                 allowed = True
                 is_shadow = not enforce
+                would_block = False
             elif enforce:
                 allowed = False
                 reason = "admin_required"
+                would_block = True
             else:
                 allowed = True
                 reason = "admin_required"
                 is_shadow = True
+                would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
             if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
                 channel_auth = ChannelResourceAdapter.authorize_channel_operation(
@@ -3290,6 +3387,7 @@ class ToolRegistry:
                 required_tier = AccessTier.USER if allowed else AccessTier.ADMIN
                 if not allowed:
                     reason = "read_scope"
+                    would_block = True
                     if not enforce:
                         allowed = True
                         is_shadow = True
@@ -3298,10 +3396,12 @@ class ToolRegistry:
                 if enforce:
                     allowed = False
                     reason = "resource_scoped"
+                    would_block = True
                 else:
                     allowed = True
                     reason = "resource_scoped"
                     is_shadow = True
+                    would_block = True
         else:
             # Explicit service capabilities are authoritative even if a newly
             # added operation has not reached the catalog yet. This is a narrow
@@ -3310,13 +3410,16 @@ class ToolRegistry:
             # runtime inventory or supplied by the caller.
             if service_allowed:
                 allowed = True
+                would_block = False
             elif enforce:
                 allowed = False
                 reason = "unknown_operation"
+                would_block = True
             else:
                 allowed = True
                 reason = "unknown_operation"
                 is_shadow = True
+                would_block = True
 
         auth = ToolAuthorization(
             tool_name=tool_name,
@@ -3327,6 +3430,13 @@ class ToolRegistry:
             required_tier=required_tier,
             enforcement_enabled=enforce,
             is_shadow_decision=is_shadow,
+            would_block=would_block,
+            resolved_sink_target=(
+                resolve_sink_target(
+                    tool_name, sink_category, sink_target, service_principal,
+                )
+                if sink_target is not None else None
+            ),
             flow_direction=flow_direction,
         )
 
