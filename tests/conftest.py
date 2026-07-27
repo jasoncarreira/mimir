@@ -19,6 +19,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -35,30 +36,44 @@ def middleware_event_logger(tmp_path):
 
 
 @pytest.fixture(autouse=True, scope="session")
-def maintenance_pinned_executables(tmp_path_factory):
+def maintenance_pinned_executables():
     """Isolate maintenance authorization tests from host executable layout."""
     from mimir import access_control
 
-    executable_dir = tmp_path_factory.mktemp("maintenance-executables")
-    real_git = Path(shutil.which("git") or "git").resolve(strict=True)
-    replacements: dict[str, Path] = {}
-    for command in access_control._MAINTENANCE_PINNED_EXECUTABLES:
-        executable = executable_dir / command.rsplit("/", 1)[-1]
-        if command == "git":
-            executable.write_text(
-                f"#!/bin/sh\nexec {shlex.quote(str(real_git))} \"$@\"\n",
-                encoding="utf-8",
-            )
-        else:
-            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        executable.chmod(0o755)
-        replacements[command] = executable
+    # Why not ``tmp_path_factory``: pytest's tmp base lives under ``/tmp``,
+    # which is now a service-writable root, and #991 requires every pinned
+    # executable to resolve OUTSIDE every writable root — so a pin planted
+    # there fails closed.
+    #
+    # Why ``.resolve()`` on the base: ``_maintenance_resolved_pin`` rejects a
+    # pin whose ``resolve(strict=True)`` differs from its spelling. On macOS
+    # ``/var`` is a symlink to ``private/var``, so an unresolved ``/var/tmp``
+    # base makes every pin fail its own non-symlink identity check — green on
+    # Linux CI, 72 failures locally. Canonicalize before planting.
+    pin_base = Path("/var/tmp").resolve()
+    with tempfile.TemporaryDirectory(
+        prefix="mimir-maintenance-executables-", dir=pin_base,
+    ) as executable_dir_text:
+        executable_dir = Path(executable_dir_text).resolve()
+        real_git = Path(shutil.which("git") or "git").resolve(strict=True)
+        replacements: dict[str, Path] = {}
+        for command in access_control._MAINTENANCE_PINNED_EXECUTABLES:
+            executable = executable_dir / command.rsplit("/", 1)[-1]
+            if command == "git":
+                executable.write_text(
+                    f"#!/bin/sh\nexec {shlex.quote(str(real_git))} \"$@\"\n",
+                    encoding="utf-8",
+                )
+            else:
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            replacements[command] = executable
 
-    original = access_control._MAINTENANCE_PINNED_EXECUTABLES.copy()
-    access_control._MAINTENANCE_PINNED_EXECUTABLES.update(replacements)
-    yield replacements
-    access_control._MAINTENANCE_PINNED_EXECUTABLES.clear()
-    access_control._MAINTENANCE_PINNED_EXECUTABLES.update(original)
+        original = access_control._MAINTENANCE_PINNED_EXECUTABLES.copy()
+        access_control._MAINTENANCE_PINNED_EXECUTABLES.update(replacements)
+        yield replacements
+        access_control._MAINTENANCE_PINNED_EXECUTABLES.clear()
+        access_control._MAINTENANCE_PINNED_EXECUTABLES.update(original)
 
 
 @pytest.fixture

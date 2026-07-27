@@ -1856,6 +1856,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
 async def test_service_shell_executes_pinned_non_git_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     """A writable PATH entry cannot replace an admitted maintenance command."""
     from langchain_core.messages import ToolMessage
@@ -1864,10 +1865,7 @@ async def test_service_shell_executes_pinned_non_git_argv(
     from mimir.models import InformationFlowLabels
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
-    pinned_gh = tmp_path / "trusted-gh"
-    pinned_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    pinned_gh.chmod(0o755)
-    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "gh", pinned_gh)
+    pinned_gh = maintenance_pinned_executables["gh"]
 
     event = AgentEvent(
         trigger="scheduled_tick",
@@ -2283,7 +2281,7 @@ def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
     [("scheduled_tick", "scheduler"), ("upgrade", "system")],
 )
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
+def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
     trigger: str,
     canonical: str,
     tool_name: str,
@@ -2292,11 +2290,11 @@ def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
 ) -> None:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
+    outside = Path("/opt") / f"mimir-outside-{tmp_path.name}"
     (home / "state").mkdir(parents=True)
     (home / "memory").mkdir()
+    (home / "scratch").mkdir()
     repo.mkdir()
-    outside.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     service = get_service_principal(trigger)
@@ -2308,6 +2306,11 @@ def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
         home / "state" / "reports" / "x.md",
         home / "memory" / "issues" / "x.md",
         home / "memory" / "channels" / "C1" / "notes.md",
+        home / "scratch" / "proposals" / "upgrade" / "result.md",
+        # ``.resolve()``: on macOS ``/tmp`` is a symlink to ``private/tmp``, and
+        # the write-root check compares the lexical spelling against resolved
+        # roots — an unresolved ``/tmp`` target matches nothing and is denied.
+        Path("/tmp").resolve() / f"mimir-service-write-{tmp_path.name}.txt",
         repo / "src" / "x.py",
         repo / ".gitignore",
         repo / ".gitattributes",
@@ -2320,7 +2323,6 @@ def test_static_service_write_allows_safe_home_state_memory_and_repo_roots(
     for target in (
         home / "root.txt",
         outside / "data.txt",
-        Path("/tmp/unscoped.txt"),
     ):
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
@@ -2394,12 +2396,13 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
     home = tmp_path / "home"
     state = home / "state"
     memory = home / "memory"
+    scratch = home / "scratch"
     repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
+    outside = Path("/opt") / f"mimir-outside-{tmp_path.name}"
     state.mkdir(parents=True)
     memory.mkdir()
+    scratch.mkdir()
     repo.mkdir()
-    outside.mkdir()
     (state / "escape").symlink_to(outside, target_is_directory=True)
     (state / "credentials").symlink_to(repo, target_is_directory=True)
     (memory / "core").symlink_to(repo, target_is_directory=True)
@@ -2411,6 +2414,11 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
     (state / "nested-repo" / ".git").symlink_to(
         outside, target_is_directory=True,
     )
+    (scratch / "protected-alias").symlink_to(
+        home / "state" / "prompts", target_is_directory=True,
+    )
+    (home / "state" / "prompts").mkdir()
+    (scratch / ".git").symlink_to(repo / "safe", target_is_directory=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     service = get_service_principal(trigger)
@@ -2425,12 +2433,89 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
         repo / "prompts" / "system.md",
         repo / "git-metadata" / "hooks" / "pre-commit",
         state / "nested-repo" / ".git" / "hooks" / "post-merge",
+        scratch / "protected-alias" / "token.txt",
+        scratch / ".git" / "config",
     ):
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, target_channel=str(target),
         )
         assert decision.allowed is False, target
         assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_static_service_write_git_metadata_exception_is_scratch_only(
+    trigger: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    state = home / "state"
+    repo = tmp_path / "repo"
+    scratch.mkdir(parents=True)
+    state.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    service = get_service_principal(trigger)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    allowed = registry.authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        target_channel=str(scratch / "proposal" / ".git" / "index"),
+    )
+    assert allowed.allowed is True
+
+    for target in (
+        repo / ".git" / "index",
+        state / ".git" / "index",
+        Path("/tmp") / f"mimir-{tmp_path.name}" / ".git" / "index",
+    ):
+        denied = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert denied.allowed is False, target
+        assert denied.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env", ".mimir", ".venv", "config", "credentials", "identities",
+        "prompts", "secret", "secrets",
+    ],
+)
+@pytest.mark.parametrize("root_kind", ["scratch", "tmp"])
+def test_new_static_service_roots_retain_protected_name_denials(
+    name: str,
+    root_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "scratch").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    service = get_service_principal("upgrade")
+    assert service is not None
+    root = home / "scratch" if root_kind == "scratch" else Path("/tmp") / tmp_path.name
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=True,
+        target_channel=str(root / name / "payload"),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
 
 
 @pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
@@ -2699,7 +2784,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
         "upgrade_workspace": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
-            "git status --short", "uv lock",
+            f"git -C {maintenance_git_home} status --short", "uv lock",
         ),
     }
 
@@ -2708,6 +2793,48 @@ def test_every_service_shell_profile_returns_absolute_executables(
             argv = parse_service_shell_argv(command, profile)
             assert argv is not None, (profile, command)
             assert Path(argv[0]).is_absolute(), (profile, command, argv)
+
+
+def test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home = tmp_path / "home"
+    worktree = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    worktree.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    command = f"git -C {worktree} diff --cached"
+
+    argv = parse_service_shell_argv(command, "upgrade_workspace")
+
+    assert argv == [
+        str(maintenance_pinned_executables["git"]),
+        "-C", str(worktree.resolve()),
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=", "-c", "protocol.allow=never",
+        "--no-pager", "--no-optional-locks", "diff", "--cached",
+        "--no-ext-diff", "--no-textconv",
+    ]
+    service = get_service_principal("upgrade")
+    assert service is not None
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=True,
+        target_channel=command,
+    )
+    assert decision.allowed is True, decision.reason
+
+    inspection = ToolRegistry().authorize_tool(
+        "shell_exec",
+        _service_auth(service, InformationFlowLabels()),
+        enforce=True,
+        target_channel=f"ls -ld {worktree}",
+    )
+    assert inspection.allowed is True, inspection.reason
 
 
 def test_repo_review_npm_uses_pinned_interpreter_and_script(
@@ -2747,7 +2874,9 @@ def test_every_production_service_shell_pin_targets_outside_write_roots(
         "_MAINTENANCE_PINNED_EXECUTABLES",
         access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS,
     )
-    write_roots = access_control._configured_repo_write_roots()
+    write_roots = access_control._static_service_write_roots()
+    assert home / "scratch" in write_roots
+    assert Path("/tmp").resolve() in write_roots
     for command, expected in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.items():
         resolved = expected.resolve(strict=False)
         assert all(
@@ -2907,6 +3036,7 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
     command_key: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     import mimir.access_control as access_control
 
@@ -2914,12 +3044,7 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    executable = tmp_path / command_key.rsplit("/", 1)[-1]
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-    monkeypatch.setitem(
-        access_control._MAINTENANCE_PINNED_EXECUTABLES, command_key, executable,
-    )
+    assert maintenance_pinned_executables[command_key].exists()
     if command_key == "git":
         command = command.replace("git ", f"git -C {home} ", 1)
     service = get_service_principal("scheduled_tick")
@@ -2958,19 +3083,9 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
 def test_maintenance_shell_returns_pinned_execution_argv(
     command: str,
     command_key: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
-    import mimir.access_control as access_control
-
-    executable = tmp_path / command_key.rsplit("/", 1)[-1]
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-    monkeypatch.setitem(
-        access_control._MAINTENANCE_PINNED_EXECUTABLES,
-        command_key,
-        executable,
-    )
+    executable = maintenance_pinned_executables[command_key]
 
     argv = parse_service_shell_argv(command, "maintenance")
 
@@ -3036,6 +3151,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
     arguments: list[str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     import mimir.access_control as access_control
 
@@ -3044,12 +3160,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
-    pinned_git = tmp_path / "git"
-    pinned_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    pinned_git.chmod(0o755)
-    monkeypatch.setitem(
-        access_control._MAINTENANCE_PINNED_EXECUTABLES, "git", pinned_git,
-    )
+    pinned_git = maintenance_pinned_executables["git"]
 
     command = command.replace("git ", f"git -C {home} ", 1)
     assert parse_service_shell_argv(command, "maintenance") == [

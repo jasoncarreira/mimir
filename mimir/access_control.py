@@ -591,6 +591,26 @@ def _configured_repo_write_roots() -> list[Path]:
     return [Path(path) for path, mode in extra_roots if mode == "rw"]
 
 
+def _static_service_write_roots() -> list[Path]:
+    """Return the complete filesystem scope writable by static services.
+
+    ``/tmp`` is intentionally shared and attacker-influenced; granting it here
+    matches the file-tool backend's existing RW scope. Protected-name checks
+    below still apply, and executable pins must remain outside every root.
+    """
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+    home_root = Path(home).resolve()
+    return list(dict.fromkeys([
+        *(root.resolve() for root in _configured_repo_write_roots()),
+        (home_root / "state").resolve(),
+        (home_root / "memory").resolve(),
+        (home_root / "scratch").resolve(),
+        Path("/tmp").resolve(),
+    ]))
+
+
 def _target_within_configured_roots(target: str, _destination: str) -> bool:
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -633,6 +653,7 @@ def _is_static_service_protected_write_path(
     path: Path,
     *,
     under_memory_root: bool = False,
+    allow_git_metadata: bool = False,
 ) -> bool:
     """Keep live scheduler/system writes away from operator-controlled data."""
     if under_memory_root and (
@@ -641,9 +662,10 @@ def _is_static_service_protected_write_path(
         return True
     for part in (part.lower() for part in path.parts):
         stem = Path(part).stem
+        is_git_metadata = part == ".git" or part.rstrip(".") == ".git"
         if (
-            part in _STATIC_SERVICE_PROTECTED_WRITE_NAMES
-            or part.rstrip(".") == ".git"
+            (part in _STATIC_SERVICE_PROTECTED_WRITE_NAMES and part != ".git")
+            or (is_git_metadata and not (part == ".git" and allow_git_metadata))
             or stem.split(".", 1)[0] in {
                 "config", "credentials", "identities", "secret", "secrets",
             }
@@ -656,19 +678,18 @@ def _is_static_service_protected_write_path(
 
 
 def _target_within_static_service_write_roots(target: str, _destination: str) -> bool:
-    """Authorize static service writes to repo RW roots and safe home data."""
+    """Authorize static service writes to narrow roots and safe home data."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return False
     home_root = Path(home).resolve()
+    state_root = (home_root / "state").resolve()
     memory_root = (home_root / "memory").resolve()
-    roots = [
-        *(root.resolve() for root in _configured_repo_write_roots()),
-        (home_root / "state").resolve(),
-        memory_root,
-    ]
+    scratch_root = (home_root / "scratch").resolve()
+    home_write_roots = {state_root, memory_root, scratch_root}
+    roots = _static_service_write_roots()
     candidate = Path(target)
     if not candidate.is_absolute():
         candidate = home_root / candidate
@@ -677,30 +698,63 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
         # prevents a protected component that is itself a symlink (for example
         # ``state/credentials -> <repo>/data``) from laundering its name by
         # resolving into another otherwise-safe configured root.
-        lexical_relatives = tuple(
-            (root, candidate.relative_to(root))
-            for root in roots
-            if candidate == root or candidate.is_relative_to(root)
+        lexical_root, lexical_relative = max(
+            (
+                (root, candidate.relative_to(root))
+                for root in roots
+                if candidate == root or candidate.is_relative_to(root)
+            ),
+            key=lambda item: len(item[0].parts),
         )
-        if any(
-            _is_static_service_protected_write_path(
-                relative,
-                under_memory_root=root == memory_root,
-            )
-            for root, relative in lexical_relatives
+        lexical_has_git_metadata = any(
+            part.lower().rstrip(".") == ".git"
+            for part in lexical_relative.parts
+        )
+        if (
+            (candidate == home_root or candidate.is_relative_to(home_root))
+            and lexical_root not in home_write_roots
+        ):
+            return False
+        # ``allow_git_metadata`` permits exactly ``.git`` under scratch — not
+        # its trailing-dot laundering variants, and NOT ``.git/config``: the
+        # ``config`` name is independently protected, which preserves #984's
+        # invariant that .gitignore/.gitattributes may SELECT a filter or diff
+        # driver while the definitions (in config) stay unwritable, even inside
+        # scratch. Consequence: ``git init`` / ``git config`` in scratch are
+        # refused. That does not break the proposals flow — ``proposals.py``
+        # creates its worktrees through a direct server-side subprocess, not
+        # through ``shell_exec``, so that path is not gated here. Do not
+        # "fix" a git-init refusal by unprotecting ``config``.
+        if _is_static_service_protected_write_path(
+            lexical_relative,
+            under_memory_root=lexical_root == memory_root,
+            allow_git_metadata=lexical_root == scratch_root,
         ):
             return False
         resolved = resolve_within_roots(roots, str(candidate))
-        root, relative = next(
-            (root, resolved.relative_to(root))
-            for root in roots
-            if resolved == root or resolved.is_relative_to(root)
+        root, relative = max(
+            (
+                (root, resolved.relative_to(root))
+                for root in roots
+                if resolved == root or resolved.is_relative_to(root)
+            ),
+            key=lambda item: len(item[0].parts),
         )
+        if (
+            (resolved == home_root or resolved.is_relative_to(home_root))
+            and root not in home_write_roots
+        ):
+            return False
+        # A lexical scratch/.git alias may not launder writes into another
+        # writable root. Both spellings must remain inside scratch.
+        if lexical_has_git_metadata and root != scratch_root:
+            return False
     except (OSError, PathOutsideHomeError, RuntimeError, StopIteration, ValueError):
         return False
     return not _is_static_service_protected_write_path(
         relative,
         under_memory_root=root == memory_root,
+        allow_git_metadata=root == scratch_root,
     )
 
 
@@ -756,7 +810,7 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
             arguments,
             exact_options=frozenset({
                 "-1", "-A", "-a", "-d", "-F", "-h", "-l", "-la", "-al",
-                "-lh", "-hl", "--all", "--almost-all", "--directory",
+                "-ld", "-dl", "-lh", "-hl", "--all", "--almost-all", "--directory",
                 "--classify", "--human-readable",
             }),
             option_prefixes=("--color=",),
@@ -1203,7 +1257,7 @@ def _maintenance_pin_is_service_writable(expected: Path) -> bool:
         resolved = expected.resolve(strict=True)
         return any(
             resolved == root or resolved.is_relative_to(root)
-            for root in (path.resolve(strict=True) for path in _configured_repo_write_roots())
+            for root in _static_service_write_roots()
         )
     except (OSError, RuntimeError):
         return True
@@ -1340,6 +1394,8 @@ def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
         if _target_matches_maintenance_shell_command(argv):
             return _maintenance_pinned_execution_argv(argv)
     elif destination == "upgrade_workspace":
+        if argv[0] == "git":
+            return _maintenance_git_execution_argv(argv)
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])

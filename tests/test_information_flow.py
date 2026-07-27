@@ -1992,14 +1992,12 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
 ):
     home = tmp_path / "home"
     configured_root = tmp_path / "configured"
-    outside_root = tmp_path / "outside"
+    outside_root = Path("/var/tmp") / f"mimir-outside-{tmp_path.name}"
     home.mkdir()
     configured_root.mkdir()
-    outside_root.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{configured_root}:rw")
-    # This test needs a genuinely unconfigured sibling. The live parser's
-    # default /tmp route would otherwise encompass pytest's entire tmp_path.
+    # Static services grant /tmp independently of the file backend parser.
     monkeypatch.setattr("mimir.config._ALWAYS_RW_FILE_TOOL_ROOTS", ())
     channel = f"{trigger}:configured"
     service = AuthContext(
@@ -2038,7 +2036,10 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     )
     tmp_decision = SinkGate.check_sink_flow(
         tool_name,
-        "/tmp/explicit-always-rw-service-write",
+        # Canonicalized: on macOS ``/tmp`` is a symlink to ``private/tmp`` and
+        # the write-root check compares the lexical spelling against resolved
+        # roots, so an unresolved ``/tmp`` target matches no root and is denied.
+        str(Path("/tmp").resolve() / "explicit-always-rw-service-write"),
         _labels(channel, sources=frozenset({channel})),
         service,
         enforce=True,
@@ -2050,8 +2051,8 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     assert wrong_source.reason == "ifc_label_blocked:file"
     assert outside_root_decision.allowed is False
     assert outside_root_decision.reason == "service_sink_destination_denied"
-    assert tmp_decision.allowed is False
-    assert tmp_decision.reason == "service_sink_destination_denied"
+    assert tmp_decision.allowed is True
+    assert tmp_decision.reason == "ifc_allowed"
 
 
 def test_service_file_policy_uses_live_file_tool_roots(
@@ -2094,7 +2095,7 @@ def test_service_file_policy_rejects_read_only_file_tool_root(
     monkeypatch: pytest.MonkeyPatch,
 ):
     home = tmp_path / "home"
-    workspace = tmp_path / "workspace"
+    workspace = Path("/var/tmp") / f"mimir-readonly-{tmp_path.name}"
     home.mkdir()
     workspace.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
@@ -2112,13 +2113,16 @@ def test_service_file_policy_rejects_read_only_file_tool_root(
         enforcement_enabled=True,
     )
 
-    decision = SinkGate.check_sink_flow(
-        "write_file",
-        str(workspace / "result.txt"),
-        _labels(channel, sources=frozenset({channel})),
-        service,
-        enforce=True,
-    )
+    try:
+        decision = SinkGate.check_sink_flow(
+            "write_file",
+            str(workspace / "result.txt"),
+            _labels(channel, sources=frozenset({channel})),
+            service,
+            enforce=True,
+        )
+    finally:
+        workspace.rmdir()
 
     assert decision.allowed is False
     assert decision.reason == "service_sink_destination_denied"
