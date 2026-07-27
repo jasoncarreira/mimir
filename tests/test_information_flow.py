@@ -2036,7 +2036,10 @@ def test_service_file_policy_requires_configured_root_and_compatible_source(
     )
     tmp_decision = SinkGate.check_sink_flow(
         tool_name,
-        "/tmp/explicit-always-rw-service-write",
+        # Canonicalized: on macOS ``/tmp`` is a symlink to ``private/tmp`` and
+        # the write-root check compares the lexical spelling against resolved
+        # roots, so an unresolved ``/tmp`` target matches no root and is denied.
+        str(Path("/tmp").resolve() / "explicit-always-rw-service-write"),
         _labels(channel, sources=frozenset({channel})),
         service,
         enforce=True,

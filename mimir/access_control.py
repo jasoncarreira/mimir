@@ -715,6 +715,16 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
             and lexical_root not in home_write_roots
         ):
             return False
+        # ``allow_git_metadata`` permits exactly ``.git`` under scratch — not
+        # its trailing-dot laundering variants, and NOT ``.git/config``: the
+        # ``config`` name is independently protected, which preserves #984's
+        # invariant that .gitignore/.gitattributes may SELECT a filter or diff
+        # driver while the definitions (in config) stay unwritable, even inside
+        # scratch. Consequence: ``git init`` / ``git config`` in scratch are
+        # refused. That does not break the proposals flow — ``proposals.py``
+        # creates its worktrees through a direct server-side subprocess, not
+        # through ``shell_exec``, so that path is not gated here. Do not
+        # "fix" a git-init refusal by unprotecting ``config``.
         if _is_static_service_protected_write_path(
             lexical_relative,
             under_memory_root=lexical_root == memory_root,

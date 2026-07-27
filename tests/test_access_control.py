@@ -2307,7 +2307,10 @@ def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
         home / "memory" / "issues" / "x.md",
         home / "memory" / "channels" / "C1" / "notes.md",
         home / "scratch" / "proposals" / "upgrade" / "result.md",
-        Path("/tmp") / f"mimir-service-write-{tmp_path.name}.txt",
+        # ``.resolve()``: on macOS ``/tmp`` is a symlink to ``private/tmp``, and
+        # the write-root check compares the lexical spelling against resolved
+        # roots — an unresolved ``/tmp`` target matches nothing and is denied.
+        Path("/tmp").resolve() / f"mimir-service-write-{tmp_path.name}.txt",
         repo / "src" / "x.py",
         repo / ".gitignore",
         repo / ".gitattributes",
