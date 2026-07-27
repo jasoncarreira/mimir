@@ -191,6 +191,56 @@ def test_non_admin_sees_principal_less_agent_self_but_not_user_event(tmp_path: P
     }
 
 
+def test_agent_self_feedback_redacts_foreign_user_data_before_render(tmp_path: Path):
+    foreign_text = "ALICE-PRIVATE-PROMPT"
+    foreign_channel = "alice-private-channel"
+    log = _make_log(
+        tmp_path,
+        events=[
+            {
+                "timestamp": _ts(0.5), "type": "error",
+                "channel_id": foreign_channel,
+                "error": f"request failed while handling {foreign_text}",
+            },
+            {
+                "timestamp": _ts(0.4), "type": "send_message_loop_hard_stop",
+                "channel_id": foreign_channel, "streak": 3,
+            },
+            {
+                "timestamp": _ts(0.3), "type": "send_message_loop_warning",
+                "channel_id": foreign_channel, "streak": 2,
+            },
+            {
+                "timestamp": _ts(0.2), "type": "cross_turn_send_duplicate",
+                "channel_id": foreign_channel, "count": 3,
+            },
+        ],
+        turns=[{
+            "ts": _ts(0.1),
+            "turn_id": "alice-turn",
+            "channel_id": foreign_channel,
+            "error": f"turn failed after input {foreign_text}",
+            "result_is_error": True,
+        }],
+    )
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="bob-channel",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert foreign_text not in block.content
+    assert foreign_channel not in block.content
+    assert "error in" in block.content
+    assert "turn error" in block.content
+    assert "send_message_loop_hard_stop" in block.content
+    assert "send_message_loop_warning" in block.content
+    assert "cross-turn send loop" in block.content
+
+
 def test_authorized_feedback_preserves_saturated_window_fallback(tmp_path: Path):
     events_path = tmp_path / "logs" / "events.jsonl"
     records = [

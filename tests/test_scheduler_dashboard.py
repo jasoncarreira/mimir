@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from mimir.commitments.models import CommitmentRecord, CommitmentVisibility
+from mimir.commitments.store import CommitmentsStore
 from mimir.models import AgentEvent
 from mimir.scheduler import Scheduler
 from mimir.scheduler_dashboard import build_scheduler_dashboard_payload
@@ -18,6 +20,28 @@ def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "*/5 * * * *") 
         "pollers": [{"name": name, "command": "true", "cron": cron}],
     }), encoding="utf-8")
     return skill
+
+
+@pytest.mark.asyncio
+async def test_scheduler_dashboard_renders_owned_private_commitments(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    await store.add(CommitmentRecord(
+        id="c-private",
+        channel_id="alice-channel",
+        text="Alice owned commitment",
+        owner_principal="alice",
+        visibility=CommitmentVisibility.PRIVATE.value,
+    ))
+
+    payload = build_scheduler_dashboard_payload(
+        scheduler=None,
+        commitments_store=store,
+        events=[],
+    )
+
+    assert [(row["id"], row["text"]) for row in payload["commitments"]] == [
+        ("c-private", "Alice owned commitment")
+    ]
 
 
 @pytest.mark.asyncio

@@ -75,6 +75,26 @@ def test_add_then_list(home: Path, capsys: pytest.CaptureFixture):
     assert "chan-1" in out
 
 
+def test_list_renders_owned_private_commitment_for_operator(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    _run([
+        "commitments", "add",
+        "--channel", "alice-channel",
+        "--owner", "alice",
+        "--visibility", "private",
+        "--text", "Alice private commitment",
+    ], home)
+    capsys.readouterr()
+
+    rc = _run(["commitments", "list"], home)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Alice private commitment" in out
+    assert "owner=alice" in out
+
+
 def test_complete_marks_terminal(home: Path, capsys: pytest.CaptureFixture):
     _run(["commitments", "add",
           "--channel", "c1", "--text", "X"], home)

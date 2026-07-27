@@ -8,6 +8,7 @@ from typing import Any
 
 from .commitments.models import CommitmentRecord, CommitmentStatus
 from .commitments.store import CommitmentsStore
+from .models import AuthContext, TurnInteractivity
 from .poller_budget import aggregate_poller_turn_usage
 from .pollers import POLLER_CHANNEL_PREFIX
 from .scheduler import SCHEDULER_CHANNEL_PREFIX, Scheduler
@@ -18,6 +19,15 @@ ACTIVE_COMMITMENT_STATUSES = frozenset({
     CommitmentStatus.DELIVERED.value,
     CommitmentStatus.SNOOZED.value,
 })
+_DASHBOARD_AUTH_CONTEXT = AuthContext(
+    principal="operator",
+    canonical_principal="operator",
+    roles=("admin",),
+    event_ingress=None,
+    trigger="scheduler_dashboard",
+    channel_id=None,
+    interactivity=TurnInteractivity.NON_INTERACTIVE,
+)
 
 SECRET_MARKERS = (
     "KEY",
@@ -330,7 +340,10 @@ def _commitment_rows(
     if commitments_store is None:
         return []
     rows: list[dict[str, Any]] = []
-    for rec in commitments_store.list(include_unbound=True):
+    for rec in commitments_store.list(
+        include_unbound=True,
+        auth_context=_DASHBOARD_AUTH_CONTEXT,
+    ):
         if rec.status not in ACTIVE_COMMITMENT_STATUSES:
             continue
         bucket = _commitment_due_bucket(rec, now_unix=now_unix)

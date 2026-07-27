@@ -1566,22 +1566,20 @@ class SagaStore:
         NULL).
         """
 
-        mutation_scope = None
-        if auth_context is not None:
-            mutation_scope = _saga_mutation_scope(auth_context, "saga_end_session")
-            if (
-                mutation_scope is None
-                or getattr(auth_context, "saga_session_id", None) != session_id
-            ):
-                raise PermissionError("session write denied")
-            if isinstance(mutation_scope, str) and owner_principal != mutation_scope:
-                raise PermissionError("session write denied")
-            # A trusted service's mutation scope proves execution authority.
-            # The durable session row deliberately inherits the source session's
-            # user ACL, including its ingress origin_domain (discord/slack/web),
-            # so atom-read readable_domains must not be applied here. Session-id
-            # binding above plus reflect()'s immutable row-identity check prevent
-            # first-writer preemption and later owner/channel/domain rebinding.
+        mutation_scope = _saga_mutation_scope(auth_context, "saga_end_session")
+        if (
+            mutation_scope is None
+            or getattr(auth_context, "saga_session_id", None) != session_id
+        ):
+            raise PermissionError("session write denied")
+        if isinstance(mutation_scope, str) and owner_principal != mutation_scope:
+            raise PermissionError("session write denied")
+        # A trusted service's mutation scope proves execution authority.
+        # The durable session row deliberately inherits the source session's
+        # user ACL, including its ingress origin_domain (discord/slack/web),
+        # so atom-read readable_domains must not be applied here. Session-id
+        # binding above plus reflect()'s immutable row-identity check prevent
+        # first-writer preemption and later owner/channel/domain rebinding.
 
         # The agent has already done the synthesis — it's calling
         # end_session with the rendered fields. The new reflect()
