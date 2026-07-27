@@ -1262,8 +1262,9 @@ def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser"
             ".env. Also wires the usage monitor that matches the "
             "provider's billing model — subscription routes get quota "
             "polling; API routes get per-turn cost tracking with a "
-            "default $/hr ceiling. Default model: claude-sonnet-4-6 "
-            "via direct API. See ``mimir/model_registry.py`` for the "
+            "default $/hr ceiling. Without --model: "
+            "codex-plus:gpt-5.6-luna (the same default the runtime "
+            "falls back to). See ``mimir/model_registry.py`` for the "
             "full mapping."
         ),
     )

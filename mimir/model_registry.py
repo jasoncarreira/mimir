@@ -128,11 +128,12 @@ def detect_route(
     """Resolve a bare model name to its canonical routing config.
 
     ``model`` is what the operator typed verbatim. ``None`` / empty
-    falls back to ``DEFAULT_MODEL_SPEC``. Detection is prefix-based —
-    unknown names route to direct Anthropic API (the safest forward-
-    looking default since Anthropic is sunsetting claude-code on
-    subscription plans — the API path stays working regardless of
-    Max-plan availability).
+    falls back to ``DEFAULT_MODEL_SPEC`` (``codex-plus:gpt-5.6-luna``).
+    Detection is otherwise prefix-based, and an UNRECOGNIZED bare name
+    routes to direct Anthropic API — not to the default. That fallback
+    is deliberate: an unknown name is most likely a Claude model this
+    registry has not learned yet, and the API path works regardless of
+    Max-plan availability.
 
     ``subscription`` (operator-passed via ``mimir setup
     --subscription``) tells setup the operator's billing is a fixed
