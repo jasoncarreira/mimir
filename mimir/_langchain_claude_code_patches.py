@@ -17,6 +17,7 @@ import asyncio
 import contextvars
 import importlib.metadata as importlib_metadata
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -144,6 +145,49 @@ _tool_events_var: contextvars.ContextVar[list[dict[str, Any]] | None] = (
     contextvars.ContextVar("mimir_claude_code_tool_events", default=None)
 )
 
+
+class _InvocationAuthCarrier:
+    """Server-owned bridge from an SDK hook task to the current invocation.
+
+    The random token is a generation guard, not a presented credential: the SDK
+    hook signature has no place to carry a capability token, so ``resolve()``
+    reads the active generation directly. Authority instead rests on the carrier
+    ContextVar reaching only tasks forked after it is set, rebinding for every
+    invocation with cleanup in ``finally``, and ``lock`` preventing overlapping
+    invocations. ``clear(token)`` uses the generation guard so stale teardown
+    cannot clear a newer binding.
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self._active_token: bytes | None = None
+        self._bindings: dict[bytes, Any] = {}
+
+    def bind(self, auth_context: Any) -> bytes:
+        from .models import AuthContext
+
+        token = secrets.token_bytes(32)
+        self._bindings.clear()
+        if isinstance(auth_context, AuthContext):
+            self._bindings[token] = auth_context
+        self._active_token = token
+        return token
+
+    def resolve(self) -> Any | None:
+        if self._active_token is None:
+            return None
+        return self._bindings.get(self._active_token)
+
+    def clear(self, token: bytes) -> None:
+        self._bindings.pop(token, None)
+        if self._active_token == token:
+            self._active_token = None
+
+
+_auth_carrier_var: contextvars.ContextVar[_InvocationAuthCarrier | None] = (
+    contextvars.ContextVar("mimir_claude_code_auth_carrier", default=None)
+)
+
 _TOOL_EVENT_HOOKS_MARKER = "_mimir_tool_event_hooks_installed"
 
 
@@ -198,6 +242,7 @@ def _claude_code_pre_tool_enforcement(
     tool_use_id: str,
     *,
     session_id: str | None = None,
+    auth_context: Any | None = None,
 ) -> dict[str, Any]:
     """Run mimir's pre-execution gates for Claude Code SDK tools.
 
@@ -206,20 +251,27 @@ def _claude_code_pre_tool_enforcement(
     tool call. Keep the order aligned with ``BudgetGateMiddleware``: admin,
     prohibited bash, then budget.
     """
+    from types import SimpleNamespace
+
     from .tools.budget_gate import (
         _check_admin_authorized,
         _check_and_increment_or_deny,
+        _current_ifc_labels,
         _emit_event_sync,
         _emit_tool_call_sync,
+        _extract_sink_target,
     )
     from .tools.prohibited_action_guard import check_prohibited_bash, is_bash_tool
-    # The SDK hook API does not expose LangGraph Runtime.context, and its
-    # callback task may be detached. Never substitute SDK/model session_id,
-    # active-turn registries, or inherited ContextVars as authorization. Under
-    # enforcement this missing exact carrier fails closed; in unenforced legacy
-    # mode behavior remains open. Config startup rejects claude-code combined
-    # with enforcement until adapter-level carrier plumbing exists.
-    admin_denial = _check_admin_authorized(tool_name, None)
+
+    request = SimpleNamespace(tool_call={"name": tool_name, "args": tool_input})
+    sink_target = _extract_sink_target(request, auth_context)
+    admin_denial = _check_admin_authorized(
+        tool_name,
+        auth_context,
+        sink_target,
+        _current_ifc_labels(auth_context),
+        arguments=tool_input,
+    )
     if admin_denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, admin_denial)
@@ -289,6 +341,11 @@ async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> d
         tool_input,
         tool_use_id,
         session_id=session_id,
+        auth_context=(
+            carrier.resolve()
+            if (carrier := _auth_carrier_var.get()) is not None
+            else None
+        ),
     )
 
 
@@ -341,6 +398,42 @@ async def _post_tool_use_failure_hook(
         "is_error": True,
     })
     return {}
+
+
+def _auth_context_from_config(config: Any) -> Any | None:
+    """Extract only the exact AuthContext attached to this graph invocation."""
+    from .models import AuthContext
+
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    runtime = configurable.get("__pregel_runtime")
+    context = getattr(runtime, "context", None)
+    return context if isinstance(context, AuthContext) else None
+
+
+def _invocation_auth_context(config: Any = None) -> Any | None:
+    """Resolve the graph runtime at dispatch, before an SDK hook task forks."""
+    if config is None:
+        try:
+            from langgraph.config import get_config
+
+            config = get_config()
+        except RuntimeError:
+            return None
+    return _auth_context_from_config(config)
+
+
+def _model_auth_carrier(model: Any) -> _InvocationAuthCarrier:
+    carrier = model.__dict__.get("_mimir_invocation_auth_carrier")
+    if not isinstance(carrier, _InvocationAuthCarrier):
+        carrier = _InvocationAuthCarrier()
+        model.__dict__["_mimir_invocation_auth_carrier"] = carrier
+    return carrier
+
+
+def _aquery_config(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "config" in kwargs:
+        return kwargs["config"]
+    return args[1] if len(args) > 1 else None
 
 
 def install_tool_event_hooks() -> None:
@@ -446,33 +539,45 @@ def install_tool_event_hooks() -> None:
         return options
 
     async def _patched_aquery(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
-        events: list[dict[str, Any]] = []
-        token = _tool_events_var.set(events)
-        try:
-            content, tool_calls, generation_info = await _orig_aquery(
-                self, *args, **kwargs,
-            )
-            if events:
-                generation_info["tool_events"] = events
-            return content, tool_calls, generation_info
-        finally:
-            _tool_events_var.reset(token)
+        carrier = _model_auth_carrier(self)
+        async with carrier.lock:
+            binding = carrier.bind(_invocation_auth_context(_aquery_config(args, kwargs)))
+            carrier_token = _auth_carrier_var.set(carrier)
+            events: list[dict[str, Any]] = []
+            events_token = _tool_events_var.set(events)
+            try:
+                content, tool_calls, generation_info = await _orig_aquery(
+                    self, *args, **kwargs,
+                )
+                if events:
+                    generation_info["tool_events"] = events
+                return content, tool_calls, generation_info
+            finally:
+                carrier.clear(binding)
+                _auth_carrier_var.reset(carrier_token)
+                _tool_events_var.reset(events_token)
 
     async def _patched_astream(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
-        events: list[dict[str, Any]] = []
-        token = _tool_events_var.set(events)
-        try:
-            async for chunk in _orig_astream(self, *args, **kwargs):
-                gi = getattr(chunk, "generation_info", None)
-                # The result chunk is the one with ``finish_reason``; by
-                # the time it's yielded, all hooks for this stream have
-                # fired (SDK emits ResultMessage after the tool loop).
-                if gi and "finish_reason" in gi and events:
-                    gi["tool_events"] = events
-                    chunk.generation_info = gi
-                yield chunk
-        finally:
-            _tool_events_var.reset(token)
+        carrier = _model_auth_carrier(self)
+        async with carrier.lock:
+            binding = carrier.bind(_invocation_auth_context(kwargs.get("_config")))
+            carrier_token = _auth_carrier_var.set(carrier)
+            events: list[dict[str, Any]] = []
+            events_token = _tool_events_var.set(events)
+            try:
+                async for chunk in _orig_astream(self, *args, **kwargs):
+                    gi = getattr(chunk, "generation_info", None)
+                    # The result chunk is the one with ``finish_reason``; by
+                    # the time it's yielded, all hooks for this stream have
+                    # fired (SDK emits ResultMessage after the tool loop).
+                    if gi and "finish_reason" in gi and events:
+                        gi["tool_events"] = events
+                        chunk.generation_info = gi
+                    yield chunk
+            finally:
+                carrier.clear(binding)
+                _auth_carrier_var.reset(carrier_token)
+                _tool_events_var.reset(events_token)
 
     ccm.ClaudeCodeChatModel._build_options = _patched_build_options
     ccm.ClaudeCodeChatModel._aquery = _patched_aquery

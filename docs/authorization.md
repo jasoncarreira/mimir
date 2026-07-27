@@ -359,7 +359,7 @@ boundary.
 | Setting | Default | Authorization effect |
 |---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open denial and harness egress checks remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
-| `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the provider and participates in the enforcement compatibility preflight. The default provider is enforcement-compatible, so enabling authorization does not require changing it. Only `claude-code:*` fails the preflight, because that subprocess hook cannot carry the server-created per-turn authorization context (#910). |
+| `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the model provider. The shipped default is enforcement-compatible. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned opaque carrier, so `claude-code:*` is also compatible with enforcement. |
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
 
@@ -420,21 +420,6 @@ matrix, resource adapters, SAGA ownership predicates, or sink map. They live in:
 - `mimir/models.py`: frozen `AuthContext` and IFC carriers;
 - `mimir/tools/budget_gate.py`: exact runtime-carrier extraction and live tool
   middleware.
-
-### Provider compatibility gate
-
-`resolve_access_control_enforcement()` raises
-`ProviderEnforcementCompatibilityError` when enforcement is requested with a
-normalized `claude-code` provider. The Claude Code SDK subprocess hook cannot
-receive Mimir's exact server-created per-turn `AuthContext`; startup rejects the
-combination rather than running a partially usable agent whose non-open tools
-all fail for a missing carrier.
-
-Use `anthropic:`, `openai:`, or `codex-plus:` with enforcement. Provider names
-are normalized to lowercase with `_` changed to `-`, so both `claude-code:` and
-`claude_code:` are rejected. The preflight is an explicit rejection of Claude
-Code, not a general provider allowlist; normal model resolution separately
-rejects invalid/unsupported provider specs.
 
 ## How to extend
 
@@ -563,20 +548,20 @@ enforcement is enabled.
 
 ### 3. Pass startup preflights
 
-The shipped default (`codex-plus:gpt-5.6-luna`) already passes this preflight.
-Only a `claude-code:` provider fails it; if you have set one, change
-`MIMIR_MODEL_SPEC` to a tested `anthropic:`, `openai:`, or `codex-plus:` model.
-In a staging process with the same environment and policy files, set:
+The shipped default (`codex-plus:gpt-5.6-luna`) already passes the provider
+compatibility preflight. Claude Code subprocess hooks now receive the exact
+per-invocation authorization context through the server-owned carrier, so a
+tested `claude-code:` model also passes. In a staging process with the same
+environment and policy files, set:
 
 ```dotenv
 MIMIR_ACCESS_CONTROL_ENFORCED=true
 MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna
 ```
 
-Startup must complete without `ProviderEnforcementCompatibilityError` or
-`CapabilityMatrixError`. Do not bypass either check. Exercise at least one
-allowed and one denied request for each human tier, resource adapter, service
-principal, and configured external tool.
+Startup must complete without `CapabilityMatrixError`. Do not bypass this check.
+Exercise at least one allowed and one denied request for each human tier,
+resource adapter, service principal, and configured external tool.
 
 ### 4. Enable and monitor
 

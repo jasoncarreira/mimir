@@ -3933,10 +3933,6 @@ class CapabilityMatrixError(Exception):
     """Raised when enforcement is requested with an incomplete matrix."""
 
 
-class ProviderEnforcementCompatibilityError(Exception):
-    """Raised when the active model provider cannot safely enforce authz."""
-
-
 def _capability_matrix_errors() -> list[str]:
     errors: list[str] = []
     for operation, direction in sorted(_TOOL_FLOW_MAP.items()):
@@ -4173,23 +4169,8 @@ def resolve_access_control_enforcement(
     *,
     model_spec: str | None = None,
 ) -> bool:
-    """Fail closed at the enforcement enablement boundary.
-
-    Claude Code executes tools in an SDK subprocess whose hook API does not
-    carry Mimir's server-created per-turn ``AuthContext``. Refuse this provider
-    combination at startup rather than enabling enforcement that denies every
-    non-open subprocess tool and leaves the agent unusable.
-    """
+    """Fail closed at the enforcement enablement boundary."""
     if requested:
-        provider = (model_spec or "").partition(":")[0].strip().lower().replace("_", "-")
-        if provider == "claude-code":
-            raise ProviderEnforcementCompatibilityError(
-                "MIMIR_ACCESS_CONTROL_ENFORCED=true is incompatible with "
-                f"MIMIR_MODEL_SPEC={model_spec!r}: the claude-code subprocess "
-                "tool hook cannot receive Mimir's server-created per-turn "
-                "AuthContext. Disable enforcement or select anthropic:, openai:, "
-                "or codex-plus:."
-            )
         assert_capability_matrix_complete()
         assert_model_tool_inventory_cataloged(model_spec=model_spec)
     return requested
