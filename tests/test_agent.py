@@ -787,8 +787,21 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
         last_message_at=0.0,
     )
 
+    from mimir.models import InformationFlowLabels, SourceLabel
+
+    session_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="external-user",
+        domain="channel",
+        resource_id=session.channel_id,
+        bridge_instance="discord",
+        sensitivity="private",
+        authorized_principals=frozenset({"external-user"}),
+    ))
+    session.ifc_state.merge(session_labels)
+
     event = _session_synthesis_event(session)
     assert event.service_principal == "synthesis"
+    assert event.ifc_labels == session_labels
     record = await agent.run_turn(event)
 
     assert record.error is None

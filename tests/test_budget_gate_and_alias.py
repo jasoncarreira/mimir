@@ -34,7 +34,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
-from mimir.access_control import ToolRegistry
+from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
 from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
@@ -42,7 +42,6 @@ from mimir.tools.budget_gate import (
     _check_and_increment_or_deny,
 )
 from tests.auth_helpers import attach_middleware_auth_context
-
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
 
@@ -125,6 +124,58 @@ def test_live_middleware_denies_tainted_shell_and_network_egress(
     assert decisions[-1].reason == reason
     assert result.status == "error"
     assert handler_calls == 0
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_synthesis_write_executes_resolved_authorized_path(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own_channel = home / "memory" / "channels" / "channel-a"
+    own_channel.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = AuthContext(
+        principal=f"service:{principal.canonical}",
+        canonical_principal=principal.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger="saga_session_end",
+        channel_id="channel-a",
+        interactivity=None,
+        is_service=True,
+        service_authority=principal,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+        domain="session",
+        resource_id="channel-a",
+        bridge_instance="internal",
+    )
+    executed_paths: list[str] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        executed_paths.append(str(request.tool_call["args"]["file_path"]))
+        return ToolMessage(
+            content="written",
+            tool_call_id=str(request.tool_call["id"]),
+            name=tool_name,
+        )
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request(
+            tool_name,
+            auth_context=auth,
+            args={"file_path": "memory/channels/channel-a/summary.md"},
+        ),
+        handler,
+    )
+
+    assert result.status != "error"
+    assert executed_paths == [str((own_channel / "summary.md").resolve())]
 
 
 def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
@@ -1119,8 +1170,8 @@ def test_middleware_sync_wrap_passes_through_under_budget():
 
 
 def test_sync_protected_read_allows_compatible_harness_egress():
-    from mimir.agent import Agent
     from mimir.access_control import protected_result_source, publish_protected_result
+    from mimir.agent import Agent
 
     auth = _ifc_auth()
     ctx = _ifc_turn(auth)
@@ -2146,8 +2197,9 @@ def test_get_turn_alias_is_a_distinct_tool() -> None:
 def test_get_turn_alias_returns_same_record(tmp_path) -> None:
     """The alias is wired to the same underlying turns.jsonl reader,
     so identical turn_id queries produce identical responses."""
-    from mimir.tools.extra import get_turn, mimir_get_turn, set_turns_log_path
     import json
+
+    from mimir.tools.extra import get_turn, mimir_get_turn, set_turns_log_path
 
     log_path = tmp_path / "turns.jsonl"
     log_path.write_text(json.dumps({

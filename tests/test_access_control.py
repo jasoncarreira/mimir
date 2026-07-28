@@ -555,6 +555,82 @@ def test_heartbeat_write_allows_safe_home_memory_and_state(
         assert decision.allowed is True, target
 
 
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "memory" / "channels" / "channel-a").mkdir(parents=True)
+    (home / "memory" / "issues").mkdir()
+    (home / "state" / "wiki" / "concepts").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+
+    for target in (
+        "memory/channels/channel-a/summary.md",
+        "memory/issues/gotcha.md",
+        "state/wiki/concepts/pattern.md",
+        str(home / "memory" / "issues" / "absolute.md"),
+    ):
+        decision = ToolRegistry().authorize_tool(
+            tool_name, auth, enforce=True, target_channel=target,
+        )
+        assert decision.allowed is True, (target, decision.reason)
+
+    other_channel = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        target_channel="memory/channels/channel-b/summary.md",
+    )
+    core = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        target_channel="memory/core/00-persona.md",
+    )
+    assert other_channel.allowed is False
+    assert other_channel.reason == "service_sink_destination_denied"
+    assert core.allowed is False
+    assert core.reason == "service_sink_destination_denied"
+
+
+def test_synthesis_unresolvable_other_channel_target_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    other_channel = home / "memory" / "channels" / "channel-b"
+    other_channel.mkdir(parents=True)
+    (other_channel / "loop").symlink_to(other_channel / "loop")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        auth,
+        enforce=True,
+        target_channel=str(other_channel / "loop" / "summary.md"),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
