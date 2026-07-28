@@ -280,8 +280,9 @@ def create_isolated_checkout(
 
     Some coding CLIs inspect git metadata instead of honoring their process cwd.
     A normal ``git worktree`` stores a ``.git`` file that points back into the
-    parent checkout's common git dir; Codex has been observed to treat that
-    parent as the active repository and edit it.  This checkout shape keeps the
+    parent checkout's common git dir. Codex has treated that parent as the active
+    repository, and OpenCode has exposed sibling worktrees through the resulting
+    shared project identity. This checkout shape keeps the
     same branch/diff contract while giving the backend a real repository rooted
     at the attempt path. ``git clone --local`` uses self-contained hardlinks, not
     alternates; the post-clone assertion enforces that no factory checkout can

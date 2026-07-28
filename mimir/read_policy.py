@@ -104,6 +104,15 @@ def _operator_secret_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def is_operator_secret_read_path(path: Path) -> bool:
+    """Return whether a path is an exact operator-configured secret file."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return True
+    return any(resolved == secret for secret in _operator_secret_paths())
+
+
 def _resolved_mimir_home() -> Path | None:
     home_raw = os.environ.get("MIMIR_HOME", "").strip()
     if not home_raw:
@@ -140,7 +149,7 @@ def is_protected_read_path(path: Path) -> bool:
         or any(part.lower() in _PROTECTED_DIR_NAMES for part in resolved.parts)
     ):
         return True
-    if any(resolved == secret for secret in _operator_secret_paths()):
+    if is_operator_secret_read_path(resolved):
         return True
 
     home = _resolved_mimir_home()
@@ -160,6 +169,8 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     authority = getattr(auth_context, "service_authority", None)
     if not getattr(authority, "filesystem_read_roots", ()):
         return False
+    if is_operator_secret_read_path(path):
+        return True
     # Keep authorization and read-boundary enforcement on one security list.
     # Import lazily to avoid a module cycle: access_control imports this module
     # from the authorization path that scans individual file contents.

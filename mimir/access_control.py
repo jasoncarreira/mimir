@@ -467,6 +467,14 @@ def build_trigger_service_principal(
         if is_github_activity and home
         else ()
     )
+    service_work_roots = (
+        (
+            Path(home) / "scratch",
+            Path(home) / "memory" / "channels" / canonical,
+        )
+        if is_github_activity and home
+        else ()
+    )
     write_roots = tuple(dict.fromkeys(
         root.resolve()
         for root in (
@@ -523,7 +531,9 @@ def build_trigger_service_principal(
         sink_destinations=tuple(sorted(sink_destinations)),
         sink_policies=tuple(policies),
         filesystem_read_roots=(
-            tuple(str(root.resolve()) for root in (*repo_roots, *fetch_cache_roots))
+            tuple(str(root.resolve()) for root in (
+                *repo_roots, *fetch_cache_roots, *service_work_roots,
+            ))
             if is_github_activity else ()
         ),
         creation_path=creation_path,
@@ -2101,7 +2111,7 @@ def _trigger_service_read_target_is_allowed(
     arguments: dict[str, Any] | None,
 ) -> bool:
     """Authorize a service read against its frozen roots, lexically and resolved."""
-    from .read_policy import file_contains_secret
+    from .read_policy import file_contains_secret, is_operator_secret_read_path
 
     args = arguments if isinstance(arguments, dict) else {}
     raw = (
@@ -2112,13 +2122,17 @@ def _trigger_service_read_target_is_allowed(
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         return False
     candidate = Path(raw)
+    roots = tuple(Path(root) for root in service.filesystem_read_roots)
     home = os.environ.get("MIMIR_HOME", "").strip()
-    cache_prefixes = ("attachments/fetch-cache", "/attachments/fetch-cache")
-    if home and any(raw == prefix or raw.startswith(prefix + "/") for prefix in cache_prefixes):
-        candidate = Path(home) / raw.lstrip("/")
+    if home:
+        home_candidate = Path(home) / raw.lstrip("/")
+        if any(
+            home_candidate == root or home_candidate.is_relative_to(root)
+            for root in roots
+        ):
+            candidate = home_candidate
     if not candidate.is_absolute():
         return False
-    roots = tuple(Path(root) for root in service.filesystem_read_roots)
     try:
         lexical_relative = max(
             (
@@ -2143,6 +2157,8 @@ def _trigger_service_read_target_is_allowed(
     except (OSError, RuntimeError, ValueError):
         return False
     if _is_trigger_service_protected_read_path(relative):
+        return False
+    if is_operator_secret_read_path(resolved):
         return False
     return not (
         tool_name in {"read_file", "aread"}
@@ -2359,6 +2375,37 @@ class SinkGate:
                 or not has_untrusted_active_ingest
             )
         return True
+
+    @staticmethod
+    def _is_trusted_operator_turn(ifc_labels: Any, auth_context: Any) -> bool:
+        """Recognize a bridge-authenticated operator's own turn ingress."""
+        from .models import Integrity, IntegrityEffect, TurnInteractivity
+
+        if (
+            auth_context is None
+            or get_trusted_service_from_auth_context(auth_context) is not None
+            or getattr(auth_context, "trigger", None) != "user_message"
+            or getattr(auth_context, "interactivity", None) != TurnInteractivity.INTERACTIVE
+            or getattr(auth_context, "event_ingress", None) is not None
+        ):
+            return False
+        principal = getattr(auth_context, "canonical_principal", None)
+        channel = getattr(auth_context, "resource_id", None)
+        domain = getattr(auth_context, "domain", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        if not all((principal, channel, domain, bridge)):
+            return False
+        return any(
+            source.source_kind == "channel"
+            and source.principal == principal
+            and source.domain == domain
+            and source.resource_id == channel
+            and source.bridge_instance == bridge
+            and principal in source.authorized_principals
+            and source.integrity == Integrity.TRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in getattr(ifc_labels, "sources", ())
+        )
 
     @classmethod
     def check_sink_flow(
@@ -2738,6 +2785,23 @@ class SinkGate:
             return frozenset()
 
         service = get_trusted_service_from_auth_context(auth_context)
+        trusted_operator_turn = cls._is_trusted_operator_turn(
+            ifc_labels, auth_context,
+        )
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = (
+            state.has_untrusted_active_ingest(ifc_labels)
+            if state is not None
+            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        )
+        if (
+            trusted_operator_turn
+            and not has_untrusted_active_ingest
+            and target is not None
+            and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
+        ):
+            return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
             and category is SinkCategory.SAME_CHANNEL
@@ -2832,7 +2896,15 @@ class SinkGate:
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
                         return frozenset()
             elif source_kind == "protected_prompt":
-                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                source_is_trusted_self_authored = (
+                    source.integrity == "trusted"
+                    and source.principal == effective_principal
+                )
+                if (
+                    not source_is_trusted_self_authored
+                    and ChannelResourceAdapter._resolve_channel(source.resource_id)
+                    != resolved_triggering
+                ):
                     return frozenset()
             elif source_kind != "protected_tool":
                 # Other derived/tool sources require their own destination adapter;
