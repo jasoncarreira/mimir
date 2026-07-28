@@ -1019,6 +1019,76 @@ def test_codex_local_subprocess_uses_isolated_checkout(tmp_path: Path) -> None:
     assert ["git", "-C", str(lease.path), "checkout", "-B", "issue/517-a2", "abc123"] in calls
 
 
+def test_concurrent_opencode_checkouts_do_not_share_parent_git_project(tmp_path: Path) -> None:
+    """#1019: linked attempts share the parent's git project, making a sibling
+    reachable to OpenCode's repo-wide search before external_directory applies.
+
+    Exercise the real backend checkout route twice: each OpenCode attempt must be
+    a standalone repository, so neither the sibling nor parent repo is under its
+    git toplevel/common directory while the full base history remains readable.
+    """
+    from mimir.worklink.orchestrator import _create_backend_checkout
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "shared.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "HEAD:main"], check=True)
+
+    leases = [
+        _create_backend_checkout(
+            repo,
+            issue_id=issue,
+            attempt=1,
+            base="main",
+            backend_name="opencode",
+            compute_shared_filesystem=True,
+            runner=lambda args: subprocess.run(args, capture_output=True, text=True, check=False),
+        )
+        for issue in (1018, 1014)
+    ]
+
+    assert all(lease.isolated_checkout for lease in leases)
+    assert not any(lease.path.is_relative_to(repo) for lease in leases)
+    assert leases[0].path.parent == leases[1].path.parent
+    for lease, sibling in ((leases[0], leases[1]), (leases[1], leases[0])):
+        top = subprocess.run(
+            ["git", "-C", str(lease.path), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        common = subprocess.run(
+            ["git", "-C", str(lease.path), "rev-parse", "--git-common-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        history = subprocess.run(
+            ["git", "-C", str(lease.path), "rev-list", "--count", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert Path(top).resolve() == lease.path.resolve()
+        assert (lease.path / common).resolve().is_relative_to(lease.path.resolve())
+        assert not sibling.path.resolve().is_relative_to(Path(top).resolve())
+        assert history == "1"
+        assert subprocess.run(
+            ["git", "-C", str(lease.path), "remote", "get-url", "origin"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == str(origin)
+
+
 def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> None:
     from mimir.worklink.orchestrator import _with_outside_worktree_detection
 
