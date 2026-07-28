@@ -372,15 +372,20 @@ def _fetch_base_from_origin(
     # fails every base fetch — which consumed six worklink attempts across three
     # leaves before it was diagnosed by hand.
     if result.returncode != 0:
-        repaired_refs = _prune_dangling_refs(repo, runner=runner)
-        if repaired_refs:
+        repaired_refs, retained_refs = _prune_dangling_refs(repo, runner=runner)
+        if repaired_refs or retained_refs:
             if event_logger is not None:
                 event_logger(
                     "worklink_base_refs_repaired",
                     repo=str(repo),
                     base=remote_base,
                     pruned=[f"{name}@{sha}" for name, sha in repaired_refs],
+                    # Named, not silently skipped: a dangling refs/heads or
+                    # refs/tags keeps the fetch failing, and the operator needs to
+                    # know which name is holding it rather than re-deriving it.
+                    retained=[f"{name}@{sha}" for name, sha in retained_refs],
                 )
+        if repaired_refs:
             result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
     if result.returncode == 0 and not _dangling_alternates(repo):
         return True
@@ -509,20 +514,39 @@ def _dangling_refs(repo: Path, *, runner: Runner) -> list[tuple[str, str]]:
     return dangling
 
 
-def _prune_dangling_refs(repo: Path, *, runner: Runner) -> list[tuple[str, str]]:
-    """Delete refs whose objects are gone, so a base fetch can proceed.
+#: The only namespace this module will prune automatically. A remote-tracking ref
+#: under ``origin`` is reconstructible: the next fetch that can see the remote
+#: re-creates it, so deleting one destroys no name for any history.
+_DISPOSABLE_REF_PREFIX = "refs/remotes/origin/"
 
-    Only refs are removed, never objects or history. A deleted remote-tracking ref
-    is re-created by the next fetch that can see it; a deleted local branch whose
-    tip object is already absent was unusable regardless. Nothing recoverable is
-    discarded, which is what makes this safe to do automatically — unlike removing
-    an alternate, which can strand objects that exist nowhere else.
+
+def _prune_dangling_refs(repo: Path, *, runner: Runner) -> tuple[
+    list[tuple[str, str]], list[tuple[str, str]]
+]:
+    """Delete only reconstructible refs whose objects are gone.
+
+    Returns ``(pruned, retained)``.
+
+    Scoped to ``refs/remotes/origin/*`` on purpose. An earlier version deleted
+    every unresolvable ref, reasoning that a local branch whose tip object is
+    absent "was unusable anyway". That is wrong when the alternate holding those
+    objects is only *temporarily* unavailable — an unmounted volume, or a store
+    that can be restored. The objects come back; the branch name does not, and it
+    may be the only local name for that history. So a ``refs/heads/*`` or
+    ``refs/tags/*`` casualty is reported and left alone, and the fetch fails closed
+    with the retained refs named so an operator can decide.
+
+    Objects and history are never touched here in any case — only refs.
     """
     pruned: list[tuple[str, str]] = []
+    retained: list[tuple[str, str]] = []
     for name, sha in _dangling_refs(repo, runner=runner):
+        if not name.startswith(_DISPOSABLE_REF_PREFIX):
+            retained.append((name, sha))
+            continue
         if runner(["git", "-C", str(repo), "update-ref", "-d", name]).returncode == 0:
             pruned.append((name, sha))
-    return pruned
+    return pruned, retained
 
 
 def _prune_dangling_alternates(repo: Path) -> tuple[list[Path], Path | None]:

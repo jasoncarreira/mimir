@@ -95,10 +95,54 @@ def test_base_fetch_repairs_refs_left_dangling_by_a_reclaimed_alternate(tmp_path
         f"the dangling ref was not detected: {found}"
     )
 
-    pruned = _prune_dangling_refs(repo, runner=runner)
+    pruned, retained = _prune_dangling_refs(repo, runner=runner)
     assert any(name.endswith("origin/pr/1188") for name, _ in pruned)
-    assert _dangling_refs(repo, runner=runner) == [], "residue remained after repair"
+    assert retained == [], "nothing outside origin/* was dangling in this fixture"
 
     # History is untouched: only refs are removed, never objects.
     log = _git("log", "--oneline", cwd=repo)
     assert log.returncode == 0 and "c1" in log.stdout
+
+
+def test_repair_never_deletes_a_local_branch_or_tag(tmp_path):
+    """Only reconstructible refs may be pruned automatically.
+
+    A local branch or tag whose objects came from an alternate that is only
+    TEMPORARILY unavailable is not disposable: the objects can come back, the name
+    cannot. An earlier version of this repair deleted every unresolvable ref on the
+    reasoning that such a branch "was unusable anyway" — wrong for the temporary
+    case, and caught in review of #1234. A remote-tracking ref under origin is
+    different in kind: the next fetch that can see the remote re-creates it.
+    """
+    from mimir.worklink.worktree import _prune_dangling_refs
+
+    def runner(argv):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+    repo = tmp_path / "base"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", ".", cwd=repo)
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+         "--allow-empty", "-m", "c1", cwd=repo)
+
+    missing = "6795361c8816152361df477dbaf777910c50bc3a"
+    refs = repo / ".git" / "refs"
+    (refs / "remotes" / "origin" / "pr").mkdir(parents=True)
+    (refs / "remotes" / "origin" / "pr" / "1188").write_text(missing + "\n", encoding="utf-8")
+    (refs / "heads" / "rescue-me").write_text(missing + "\n", encoding="utf-8")
+    (refs / "tags").mkdir(parents=True, exist_ok=True)
+    (refs / "tags" / "v-orphan").write_text(missing + "\n", encoding="utf-8")
+
+    pruned, retained = _prune_dangling_refs(repo, runner=runner)
+
+    pruned_names = {name for name, _ in pruned}
+    retained_names = {name for name, _ in retained}
+
+    assert "refs/remotes/origin/pr/1188" in pruned_names
+    assert "refs/heads/rescue-me" in retained_names, (
+        "a local branch was deleted; its objects may return but its name cannot"
+    )
+    assert "refs/tags/v-orphan" in retained_names, "a tag was deleted"
+    assert (refs / "heads" / "rescue-me").is_file()
+    assert (refs / "tags" / "v-orphan").is_file()
+    assert not (refs / "remotes" / "origin" / "pr" / "1188").is_file()
