@@ -11,6 +11,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
+from tests.auth_helpers import middleware_auth_context
 
 
 def _request(command: str, *, direct_argv: list[str] | None = None) -> SimpleNamespace:
@@ -79,7 +80,7 @@ def _tool_request(
         },
         tool=None,
         state=None,
-        runtime=Runtime(context=None),
+        runtime=Runtime(context=middleware_auth_context()),
     )
 
 
@@ -189,7 +190,6 @@ def test_wrap_tool_call_recovered_poller_and_manual_race_has_one_side_effect(
 ) -> None:
     from mimir.tools import budget_gate
 
-    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
     # The service authorization layer authored this argv before the review guard.
     monkeypatch.setattr(
@@ -236,7 +236,6 @@ def test_wrap_tool_call_releases_review_claim_when_handler_raises(
 ) -> None:
     from mimir.tools import budget_gate
 
-    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     releases: list[None] = []
     claim = guard.ReviewClaim(
         "o/r", 152, "head-1", "mimir-carreira", "APPROVED", False,
@@ -264,7 +263,6 @@ def test_wrap_tool_call_duplicate_release_remains_idempotent(
 ) -> None:
     from mimir.tools import budget_gate
 
-    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     class CountingLock:
         releases = 0
 
@@ -303,7 +301,6 @@ def test_wrap_tool_call_serves_service_refusal_before_review_detection(
 ) -> None:
     from mimir.tools import budget_gate
 
-    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     refusal = "shell_exec was refused before execution: profile rejected command"
     request = _tool_request(
         "gh pr review 152 --repo o/r --approve", tool_call_id="refused",
