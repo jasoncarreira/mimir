@@ -529,6 +529,10 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
         source_kind="protected_prompt", integrity="untrusted",
         integrity_effect="active_ingest",
     ))
+    incompatible_reply = ToolRegistry().authorize_tool(
+        "send_message", auth, enforce=True, target_channel=event.channel_id,
+        ifc_labels=incompatible,
+    )
     harness = SinkGate.check_sink_flow(
         "activity_panel_edit", event.channel_id, incompatible, auth, enforce=True,
     )
@@ -536,7 +540,41 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     assert reply.allowed is True
     assert cross_channel.allowed is False
     assert declassification.allowed is True
+    assert incompatible_reply.allowed is False
     assert harness.allowed is False
+
+
+def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources():
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="reply to me",
+    )
+    auth, labels = _runtime_operator_context(event)
+    trusted_self_authored = _prompt_source_labels(
+        auth, domain="recent_activity", resource="message:self",
+        channel_id="slack-C2", self_authored=True,
+    )
+    untrusted_other_authored = _prompt_source_labels(
+        auth, domain="recent_activity", resource="message:other",
+        channel_id="slack-C2", principal="user-2", self_authored=False,
+    )
+
+    trusted_labels = labels
+    for source in trusted_self_authored.sources:
+        trusted_labels = trusted_labels.with_source(source)
+    untrusted_labels = labels
+    for source in untrusted_other_authored.sources:
+        untrusted_labels = untrusted_labels.with_source(source)
+
+    for tool in ("send_message", "react", "activity_panel_edit"):
+        trusted = SinkGate.check_sink_flow(
+            tool, event.channel_id, trusted_labels, auth, enforce=True,
+        )
+        untrusted = SinkGate.check_sink_flow(
+            tool, event.channel_id, untrusted_labels, auth, enforce=True,
+        )
+        assert trusted.allowed is True, (tool, trusted.reason)
+        assert untrusted.allowed is False, (tool, untrusted.reason)
 
 
 def test_protected_prompt_sources_are_informational():

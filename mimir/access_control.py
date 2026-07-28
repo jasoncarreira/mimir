@@ -2778,19 +2778,6 @@ class SinkGate:
         )
         if (
             trusted_operator_turn
-            and tool_name == "send_message"
-            and category is SinkCategory.SAME_CHANNEL
-        ):
-            triggering_channel = getattr(auth_context, "channel_id", None)
-            resolved_triggering = ChannelResourceAdapter._resolve_channel(
-                triggering_channel,
-            )
-            return (
-                frozenset({resolved_triggering})
-                if resolved_triggering else frozenset()
-            )
-        if (
-            trusted_operator_turn
             and not has_untrusted_active_ingest
             and target is not None
             and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
@@ -2890,7 +2877,15 @@ class SinkGate:
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
                         return frozenset()
             elif source_kind == "protected_prompt":
-                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
+                source_is_trusted_self_authored = (
+                    source.integrity == "trusted"
+                    and source.principal == effective_principal
+                )
+                if (
+                    not source_is_trusted_self_authored
+                    and ChannelResourceAdapter._resolve_channel(source.resource_id)
+                    != resolved_triggering
+                ):
                     return frozenset()
             elif source_kind != "protected_tool":
                 # Other derived/tool sources require their own destination adapter;
