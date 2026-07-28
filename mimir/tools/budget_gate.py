@@ -427,6 +427,28 @@ def _service_shell_refusal(request: ToolCallRequest) -> str | None:
     return refusal if isinstance(refusal, str) and refusal else None
 
 
+def _duplicate_review_result(request: ToolCallRequest, claim: Any) -> ToolMessage:
+    """Return and record the successful no-op without exposing review text."""
+    _emit_event_sync(
+        "github_review_duplicate_suppressed",
+        repo=claim.repo,
+        pr=claim.number,
+        head=claim.head,
+        reviewer=claim.reviewer,
+        review_state=claim.state,
+    )
+    return ToolMessage(
+        content=(
+            "GitHub review submission was not repeated: the existing "
+            f"{claim.state} review by {claim.reviewer} on exact head "
+            f"{claim.head} already satisfies this submission."
+        ),
+        tool_call_id=_tool_call_id(request),
+        name=_tool_name_from_request(request),
+        status="success",
+    )
+
+
 def _record_repo_review_checkout(
     request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
 ) -> None:
@@ -1159,6 +1181,18 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
+        from .github_review_guard import (
+            claim_review_submission,
+            review_submission_from_request,
+        )
+
+        review_spec = review_submission_from_request(execution_request)
+        review_claim = claim_review_submission(review_spec) if review_spec is not None else None
+        if review_claim is not None and review_claim.duplicate:
+            review_claim.release()
+            result = _duplicate_review_result(request, review_claim)
+            _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
+            return result
         if isinstance(direct_argv, list):
             from ._shell_env import bind_direct_exec_argv
 
@@ -1193,6 +1227,8 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             raise
         finally:
+            if review_claim is not None:
+                review_claim.release()
             if direct_argv_token is not None:
                 from ._shell_env import reset_direct_exec_argv
 
@@ -1348,6 +1384,22 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
+        from .github_review_guard import (
+            claim_review_submission,
+            review_submission_from_request,
+        )
+
+        review_spec = review_submission_from_request(execution_request)
+        review_claim = (
+            await asyncio.to_thread(claim_review_submission, review_spec)
+            if review_spec is not None
+            else None
+        )
+        if review_claim is not None and review_claim.duplicate:
+            review_claim.release()
+            result = _duplicate_review_result(request, review_claim)
+            _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
+            return result
         if isinstance(direct_argv, list):
             from ._shell_env import bind_direct_exec_argv
 
@@ -1382,6 +1434,8 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             raise
         finally:
+            if review_claim is not None:
+                review_claim.release()
             if direct_argv_token is not None:
                 from ._shell_env import reset_direct_exec_argv
 
