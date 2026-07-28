@@ -655,3 +655,87 @@ def test_self_containment_assert_rejects_alternates_dependency(tmp_path: Path) -
                 list(args), capture_output=True, text=True, check=False
             ),
         )
+
+
+def _hardlink_failure(path: Path) -> subprocess.CompletedProcess[str]:
+    """git's exact wording when it cannot hardlink an object into the clone."""
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=128,
+        stdout="",
+        stderr=(
+            f"fatal: failed to create link '{path}/.git/objects/dd/bb88b6dd951d45"
+            "8666c3eab73a71648924ccdb': Operation not permitted\n"
+        ),
+    )
+
+
+def test_clone_falls_back_to_object_copy_when_hardlinks_are_refused() -> None:
+    """#1245 regression: one unlinkable object killed every build.
+
+    A root-owned mode-444 object under ``fs.protected_hardlinks=1`` makes
+    ``clone --local`` fail outright. The attempt must degrade to an object copy
+    rather than dying, and must say so.
+    """
+    from mimir.worklink.worktree import _clone_attempt_checkout
+
+    calls: list[Sequence[str]] = []
+    events: list[tuple[str, dict]] = []
+    target = Path("/tmp/attempt-1029-3")
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if "--no-hardlinks" in args:
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        return _hardlink_failure(target)
+
+    _clone_attempt_checkout(
+        Path("/tmp/repo"), target,
+        runner=runner,
+        event_logger=lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert len(calls) == 2
+    assert "--no-hardlinks" not in calls[0]
+    assert "--no-hardlinks" in calls[1]
+    assert [name for name, _ in events] == ["worklink_checkout_hardlink_fallback"]
+    assert "Operation not permitted" in events[0][1]["detail"]
+
+
+def test_clone_does_not_retry_an_unrelated_failure() -> None:
+    """A fallback that fires on any error would turn a real fault into 179 MB
+    of copying and a confusing success. Only the hardlink error retries."""
+    from mimir.worklink.worktree import _clone_attempt_checkout
+
+    calls: list[Sequence[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="",
+            stderr="fatal: repository '/tmp/repo' does not exist\n",
+        )
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        _clone_attempt_checkout(
+            Path("/tmp/repo"), Path("/tmp/attempt"), runner=runner, event_logger=None,
+        )
+
+    assert len(calls) == 1
+
+
+def test_clone_raises_when_the_object_copy_also_fails() -> None:
+    """The fallback is a degradation, not a guarantee; it must still fail loud."""
+    from mimir.worklink.worktree import _clone_attempt_checkout
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "--no-hardlinks" in args:
+            return subprocess.CompletedProcess(
+                args=[], returncode=128, stdout="", stderr="fatal: out of disk\n",
+            )
+        return _hardlink_failure(Path("/tmp/attempt"))
+
+    with pytest.raises(RuntimeError, match="out of disk"):
+        _clone_attempt_checkout(
+            Path("/tmp/repo"), Path("/tmp/attempt"), runner=runner, event_logger=None,
+        )
