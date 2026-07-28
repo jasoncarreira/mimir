@@ -923,6 +923,13 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
                 f"from {authors} — resolve before merge"
             )
         return f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED review"
+    if rule_kind == "pr_auto_review_skipped_untrusted_author":
+        repo = _sanitize_field(str(ev.get("repo") or "?"))
+        number = _sanitize_field(str(ev.get("number") or "?"))
+        return (
+            f"automatic review skipped for {repo}#{number}: PR author is not "
+            "a verified collaborator or active organization member; review deliberately"
+        )
     if rule_kind == "gave_up" or rule_kind.endswith("_gave_up"):
         # A poller abandoned a retried action after exhausting its budget
         # (chainlink #299). The concrete event type names what was given up
