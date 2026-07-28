@@ -1198,7 +1198,7 @@ Event types ported from open-strix (`open-strix-base/docs/events.md`):
 | `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?, result.dedup{candidates_scanned, clusters_formed, canonicals_kept, duplicates_tombstoned, threshold}` — weekly cron, two-pass dedup + thematic (§5.6) |
 | `poller_stderr` / `poller_nonzero_exit` | `poller, exit_code, stderr` — pollers (§7.2.2) |
 | `send_message_loop_warning` / `send_message_loop_hard_stop` / `send_message_loop_detected` | `tool, channel_id, streak, similarity_ratio, reacted?` — circuit breaker (§7.2.4) |
-| `shadow_tool_decision` | `tool, decision, allowed, reason, required_tier, enforcement_enabled, is_shadow_decision, would_block, target, trigger, service_principal` — counterfactual enforcement result; the action proceeds in compatibility mode |
+| `shadow_tool_decision` | `tool, decision, allowed, reason, required_tier, enforcement_enabled, is_shadow_decision, would_block, target, requested_target, trigger, service_principal` — counterfactual enforcement result; `target` is server-resolved while bounded, scrubbed `requested_target` is unvalidated caller evidence; the action proceeds in compatibility mode |
 | `hard_boundary_denied` | `tool, boundary, reason, target, trigger, service_principal` — an always-on boundary actually refused the action; `target` is secret-scrubbed before emission and again before persistence |
 
 Writer: `mimir.event_logger.log_event(event_type, **payload)` — appends to `<home>/logs/events.jsonl`. Called from anywhere in the process (server, scheduler, tools, agent loop).

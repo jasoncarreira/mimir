@@ -273,6 +273,7 @@ async def test_shadow_decision_is_emitted_on_live_authorization_path() -> None:
                 **decision.as_log_fields(),
                 "would_block": True,
                 "target": None,
+                "requested_target": None,
                 "trigger": None,
             },
         )

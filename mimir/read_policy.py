@@ -23,6 +23,23 @@ READ_RESOURCE_OPERATIONS = frozenset({
 })
 
 
+def requested_read_target_from_arguments(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> Any:
+    """Return the caller-supplied read selector without validating it."""
+    args = arguments if isinstance(arguments, dict) else {}
+    if tool_name in {"read_file", "aread"}:
+        return args.get("file_path") or args.get("path")
+    if tool_name in {"ls", "als", "glob", "aglob", "grep", "agrep"}:
+        return args.get("path")
+    if tool_name == "file_search":
+        return args.get("path_prefix") if "path_prefix" in args else args.get("scope")
+    if tool_name in {"get_turn", "mimir_get_turn"}:
+        return args.get("turn_id")
+    return None
+
+
 def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
     """Record a protected result that the backend actually withheld."""
     from .tools.budget_gate import _emit_hard_boundary_denied

@@ -613,6 +613,15 @@ enforcement denials. Records with `would_block: false` are projected permits;
 legacy records without the field are unclassifiable and must not be inferred
 from `allowed` or `reason`.
 
+Each shadow record also has `target` and `requested_target` with deliberately
+different trust levels. `target` is the server-resolved destination used for
+audit classification. `requested_target` is UNVALIDATED caller input retained
+only to diagnose a refusal; it is never used by policy or authorization logic.
+The requested value is secret-scrubbed and truncated to 1,024 characters.
+`requested_target: null` explicitly means the operation had no caller-supplied
+target. In particular, `admin_required` records always include the field, using
+`null` for targetless administrative operations.
+
 Count `hard_boundary_denied` separately as actions that did not happen. These
 records can be unioned with shadow decisions for workflow-impact analysis, but
 must not be included in projected-enforcement totals. Their `boundary` and
