@@ -7,7 +7,7 @@ import os
 import shlex
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
 class ReviewSubmission:
     executable: str
     repo: str | None
-    number: int
+    number: int | None
     state: str
     cwd: str | None
 
@@ -65,15 +65,22 @@ def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
     if not isinstance(command, str):
         return None
     try:
-        argv = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();|&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        argv = list(lexer)
     except ValueError:
         return None
-    # Only a standalone invocation can be safely identified before a shell
-    # executes it. Review prompts use this shape; composed shell programs are
-    # intentionally not guessed at here.
-    if any(token in {"&&", "||", ";", "|", "&"} for token in argv):
-        return None
-    return argv, cwd
+    controls = {"&&", "||", ";", "|", "&", "(", ")"}
+    start = 0
+    for index in range(len(argv) + 1):
+        if index < len(argv) and argv[index] not in controls:
+            continue
+        segment = argv[start:index]
+        if len(segment) >= 3 and Path(segment[0]).name == "gh" and segment[1:3] == ["pr", "review"]:
+            return segment, cwd
+        start = index + 1
+    return None
 
 
 def review_submission_from_request(request: Any) -> ReviewSubmission | None:
@@ -111,7 +118,7 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
                 return None
             break
         index += 1
-    if number is None or number <= 0:
+    if number is not None and number <= 0:
         return None
     repo = _option_value(argv[3:], {"--repo", "-R"})
     return ReviewSubmission(argv[0], repo, number, states.pop(), cwd)
@@ -148,6 +155,20 @@ def _repo(spec: ReviewSubmission) -> str | None:
     if spec.repo:
         return spec.repo.strip() or None
     return _text(spec, ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+
+
+def _number(spec: ReviewSubmission, repo: str) -> int | None:
+    if spec.number is not None:
+        return spec.number
+    value = _text(
+        spec,
+        ["pr", "view", "--repo", repo, "--json", "number", "--jq", ".number"],
+    )
+    try:
+        number = int(value or "")
+    except ValueError:
+        return None
+    return number if number > 0 else None
 
 
 def _head(spec: ReviewSubmission, repo: str) -> str | None:
@@ -195,11 +216,15 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
     reviewer = _reviewer(spec)
     if not repo or not reviewer:
         return None
+    number = _number(spec, repo)
+    if number is None:
+        return None
+    spec = replace(spec, number=number)
     while True:
         head = _head(spec, repo)
         if not head:
             return None
-        key = (repo.casefold(), spec.number, head, reviewer.casefold(), spec.state)
+        key = (repo.casefold(), number, head, reviewer.casefold(), spec.state)
         with _locks_guard:
             lock = _locks.setdefault(key, threading.Lock())
         lock.acquire()
@@ -218,7 +243,7 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
             return None
         return ReviewClaim(
             repo=repo,
-            number=spec.number,
+            number=number,
             head=head,
             reviewer=reviewer,
             state=spec.state,
