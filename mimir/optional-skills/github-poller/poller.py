@@ -66,6 +66,73 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+def _ensure_mimir_import_path() -> None:
+    """Let an installed optional-skill poller import the source checkout.
+
+    Optional poller commands run as subprocesses from the installed skill dir, so
+    ``sys.path[0]`` is the skill directory rather than the mimir source checkout.
+    Prefer an explicit ``MIMIR_SOURCE_DIR`` supplied by the runtime; fall back to
+    the common editable-source layout where the interpreter lives in
+    ``<source>/.venv/bin``; finally accept mimirbot's container source path.
+    Pip-installed deployments do not need this repair because ``mimir`` is already
+    in site-packages.
+
+    This duplicates ``chainlink-orchestrator/poller.py``'s copy deliberately: the
+    repair has to run *before* ``mimir`` is importable, so it cannot itself live in
+    the ``mimir`` package. Each installed skill is a standalone directory, so a
+    shared helper would have to be copied in anyway. The invariant is covered by a
+    test that executes every optional-skill poller the way production does, rather
+    than by comparing the two copies textually.
+    """
+
+    exe = Path(sys.executable).resolve()
+    venv_root = exe.parent.parent
+    # When running directly from a source checkout, keep the script and imported
+    # package on that same revision even if MIMIR_SOURCE_DIR points at another
+    # checkout. Installed copies fail the __init__.py probe and fall through.
+    script_path = globals().get("__file__")
+    candidates = [Path(script_path).resolve().parents[3]] if script_path else []
+    if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
+        candidates.append(Path(source_dir))
+    if venv_root.name in {".venv", "venv"}:
+        candidates.append(venv_root.parent)
+    # Mimirbot-specific editable-source fallback: the deployed optional skill is
+    # under /mimir-home/skills, while the source checkout is mounted here.
+    candidates.append(Path("/workspace/mimir"))
+
+    for candidate in candidates:
+        if (candidate / "mimir" / "__init__.py").is_file():
+            # Source checkout first, so ``import mimir`` resolves to the checked-out
+            # code even when the poller is installed under <home>/skills.
+            path = str(candidate)
+            # It may already be present later in sys.path (notably when tests run
+            # a worktree script beside the primary checkout). Move, don't merely
+            # add, so script and imported package always come from one checkout.
+            while path in sys.path:
+                sys.path.remove(path)
+            sys.path.insert(0, path)
+
+            # Production poller commands may run under system ``python3`` rather
+            # than the mimir venv interpreter. In editable-source deployments the
+            # checked-out repo's venv holds runtime deps such as PyYAML, so add
+            # its site-packages too. This is a best-effort repair: pip-installed
+            # deployments already have dependencies on sys.path, and missing venvs
+            # simply fall through to the normal ImportError if deps are absent.
+            venv = candidate / ".venv"
+            if venv.is_dir():
+                for site in sorted((venv / "lib").glob("python*/site-packages")):
+                    site_path = str(site)
+                    if site_path not in sys.path:
+                        sys.path.append(site_path)
+            return
+
+
+_ensure_mimir_import_path()
+
+# Must stay AFTER the repair above. These resolve author trust server-side and are
+# what makes the collaborator-only review filter work; if they cannot be imported
+# the poller must fail rather than run without the filter, because "no filter"
+# means auto-reviewing every author's PR — the exact behaviour #1022 removed.
 from mimir.pollers import _github_author_is_trusted, _github_content_author
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
