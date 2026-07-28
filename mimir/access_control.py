@@ -2357,6 +2357,37 @@ class SinkGate:
             )
         return True
 
+    @staticmethod
+    def _is_trusted_operator_turn(ifc_labels: Any, auth_context: Any) -> bool:
+        """Recognize a bridge-authenticated operator's own turn ingress."""
+        from .models import Integrity, IntegrityEffect, TurnInteractivity
+
+        if (
+            auth_context is None
+            or get_trusted_service_from_auth_context(auth_context) is not None
+            or getattr(auth_context, "trigger", None) != "user_message"
+            or getattr(auth_context, "interactivity", None) != TurnInteractivity.INTERACTIVE
+            or getattr(auth_context, "event_ingress", None) is not None
+        ):
+            return False
+        principal = getattr(auth_context, "canonical_principal", None)
+        channel = getattr(auth_context, "resource_id", None)
+        domain = getattr(auth_context, "domain", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        if not all((principal, channel, domain, bridge)):
+            return False
+        return any(
+            source.source_kind == "channel"
+            and source.principal == principal
+            and source.domain == domain
+            and source.resource_id == channel
+            and source.bridge_instance == bridge
+            and principal in source.authorized_principals
+            and source.integrity == Integrity.TRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+            for source in getattr(ifc_labels, "sources", ())
+        )
+
     @classmethod
     def check_sink_flow(
         cls,
@@ -2735,6 +2766,36 @@ class SinkGate:
             return frozenset()
 
         service = get_trusted_service_from_auth_context(auth_context)
+        trusted_operator_turn = cls._is_trusted_operator_turn(
+            ifc_labels, auth_context,
+        )
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = (
+            state.has_untrusted_active_ingest(ifc_labels)
+            if state is not None
+            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        )
+        if (
+            trusted_operator_turn
+            and tool_name == "send_message"
+            and category is SinkCategory.SAME_CHANNEL
+        ):
+            triggering_channel = getattr(auth_context, "channel_id", None)
+            resolved_triggering = ChannelResourceAdapter._resolve_channel(
+                triggering_channel,
+            )
+            return (
+                frozenset({resolved_triggering})
+                if resolved_triggering else frozenset()
+            )
+        if (
+            trusted_operator_turn
+            and not has_untrusted_active_ingest
+            and target is not None
+            and category in {SinkCategory.SHELL_PROCESS, SinkCategory.FILE}
+        ):
+            return frozenset({target})
         is_triggering_channel_reply = (
             service is not None
             and category is SinkCategory.SAME_CHANNEL

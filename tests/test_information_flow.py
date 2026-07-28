@@ -442,6 +442,103 @@ def test_http_event_ingress_marker_taints_audience_egress_regardless_of_client_s
     assert decision.reason == "ifc_label_blocked:http_webhook"
 
 
+def _runtime_operator_context(event: AgentEvent) -> tuple[AuthContext, InformationFlowLabels]:
+    labels = _initialize_ifc_labels(event)
+    auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        roles=("user", "admin"),
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    return auth, labels
+
+
+def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = "https://approved.example/operator-input"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", destination)
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="make the requested local change",
+    )
+    auth, labels = _runtime_operator_context(event)
+    target = str(tmp_path / "operator.txt")
+
+    assert labels.has_untrusted_active_ingest is False
+    for tool, sink in (
+        ("shell_exec", "pwd"),
+        ("write_file", target),
+        ("edit_file", target),
+        ("send_message", event.channel_id),
+        ("react", event.channel_id),
+        ("fetch_url", destination),
+    ):
+        decision = ToolRegistry().authorize_tool(
+            tool, auth, enforce=True, target_channel=sink, ifc_labels=labels,
+        )
+        assert decision.allowed is True, (tool, decision.reason)
+        assert decision.would_block is False
+
+
+def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
+    tmp_path: Path,
+) -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="inspect this PR and then act",
+    )
+    auth, labels = _runtime_operator_context(event)
+    untrusted = SourceLabel(
+        principal="github", domain="filesystem", resource_id="pr-body.md",
+        bridge_instance="filesystem", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    tainted = labels.with_source(untrusted)
+    auth.ifc_state.merge(tainted, fallback=labels)
+
+    for tool, sink, category in (
+        ("shell_exec", "git status", "shell_process"),
+        ("write_file", str(tmp_path / "out.txt"), "file"),
+        ("edit_file", str(tmp_path / "out.txt"), "file"),
+    ):
+        decision = ToolRegistry().authorize_tool(
+            tool, auth, enforce=True, target_channel=sink, ifc_labels=tainted,
+        )
+        assert decision.allowed is False
+        assert decision.reason == f"ifc_label_blocked:{category}"
+
+    reply = ToolRegistry().authorize_tool(
+        "send_message", auth, enforce=True, target_channel=event.channel_id,
+        ifc_labels=tainted,
+    )
+    cross_channel = ToolRegistry().authorize_tool(
+        "send_message", auth, enforce=True, target_channel="slack-C2",
+        ifc_labels=tainted,
+    )
+    declassification = ToolRegistry().authorize_tool(
+        "approve_declassification", auth, enforce=True, ifc_labels=tainted,
+    )
+    incompatible = tainted.with_source(SourceLabel(
+        principal="user-1", domain="recent_activity", resource_id="slack-C2",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_prompt", integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    harness = SinkGate.check_sink_flow(
+        "activity_panel_edit", event.channel_id, incompatible, auth, enforce=True,
+    )
+
+    assert reply.allowed is True
+    assert cross_channel.allowed is False
+    assert declassification.allowed is True
+    assert harness.allowed is False
+
+
 def test_protected_prompt_sources_are_informational():
     source = next(iter(_prompt_source_labels(
         _auth(), domain="saga", resource="auto-recall", self_authored=True,
