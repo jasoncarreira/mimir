@@ -422,22 +422,23 @@ class WorklinkRunner:
                 event_logger=_log_event,
                 runner=_list_runner(runner),
             )
-            # chainlink #517: codex resolves the git project root from the
-            # filesystem, so when it executes on the CONTROLLER (a shared-filesystem
-            # compute) it must be pointed at an isolated checkout with its own
-            # ``.git``, never a parent-pointing worktree, or it edits the repo root
-            # (observed on #512/#513). ``_create_backend_checkout`` already routes
-            # codex + shared_filesystem to ``create_isolated_checkout``; this is a
-            # fail-loud backstop against that routing regressing. After #832 the
-            # only compute substrate is local_subprocess (shared_filesystem=true),
-            # so this guard fires for every codex run.
+            # Coding CLIs derive project identity from git metadata. A linked
+            # worktree shares the parent's common git dir, which made OpenCode's
+            # effective project include repo/.worklink and exposed concurrent
+            # sibling attempts to repo-wide searches (#1019). Codex can similarly
+            # resolve back to the parent (#517). Shared-filesystem runs therefore
+            # need an independent repository rooted at the attempt checkout.
             if (
-                selected_name == "codex"
+                selected_name in {"codex", "opencode"}
                 and compute.capabilities().shared_filesystem
                 and not lease.isolated_checkout
             ):
                 _log_event(
-                    "worklink_unsafe_codex_checkout",
+                    (
+                        "worklink_unsafe_codex_checkout"
+                        if selected_name == "codex"
+                        else "worklink_unsafe_opencode_checkout"
+                    ),
                     issue_id=issue.issue_id,
                     attempt=record.attempt,
                     compute_backend=compute.name,
@@ -447,9 +448,9 @@ class WorklinkRunner:
                     None,
                     "blocked",
                     reason=(
-                        "codex on a shared-filesystem compute must run in an isolated "
-                        "checkout (own .git), not a parent-pointing worktree, to avoid "
-                        "leaking edits into the repo root (chainlink #517)"
+                        f"{selected_name} on a shared-filesystem compute must run in an "
+                        "isolated checkout (own .git), not a parent-pointing worktree, "
+                        "to avoid exposing other checkouts (chainlink #517/#1019)"
                     ),
                 )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
@@ -2061,7 +2062,7 @@ def _create_backend_checkout(
     base_fetch: bool = True,
     event_logger: Callable[..., None] | None = None,
 ) -> WorktreeLease:
-    if backend_name == "codex" and compute_shared_filesystem:
+    if backend_name in {"codex", "opencode"} and compute_shared_filesystem:
         return create_isolated_checkout(
             repo,
             issue_id=issue_id,
