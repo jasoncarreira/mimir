@@ -202,7 +202,11 @@ def set_shell_job_registry(
 @tool(
     "bash_async",
     description=(
-        "Spawn a shell command in the background. Returns immediately "
+        "Spawn a command in the background. User/admin calls run through "
+        "``bash -lc`` with full shell syntax. Under a trusted-service profile, "
+        "the command must be one argv with no shell syntax and is executed "
+        "with ``shell=False``. Use ``cwd`` instead of a leading ``cd DIR &&``. "
+        "Returns immediately "
         "with a ``job_id``. When the command exits, a "
         "``shell_job_complete`` event fires on this channel with the "
         "exit code and tail output — you'll see it as a fresh turn, "
@@ -216,14 +220,17 @@ def set_shell_job_registry(
 async def bash_async(
     command: str,
     session_id: Optional[str] = None,
+    cwd: Optional[str] = None,
     mimir_direct_argv: Annotated[Optional[list[str]], InjectedToolArg] = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Args:
-        command: The shell command to spawn. Runs via ``bash -lc`` so
-            PATH and login env are loaded.
+        command: The command to spawn. User/admin calls run via ``bash -lc``;
+            trusted-service calls execute one server-authorized argv directly.
         session_id: Optional saga session id, threaded onto the
             completion event so it routes back to the right channel.
+        cwd: Working directory for the command. Trusted-service calls require an
+            authorized absolute directory and execute with its resolved path.
         mimir_direct_argv: Server-injected exact argv for trusted-service calls.
     """
     if _REGISTRY is None:
@@ -336,6 +343,8 @@ async def bash_async(
             "on_complete": _ON_COMPLETE,
             "auth_context": auth_context,
         }
+        if cwd:
+            spawn_kwargs["cwd"] = cwd
         if direct_argv is not None:
             spawn_kwargs["env_overlay"] = direct_exec_env_overlay(argv)
         job = _REGISTRY.spawn(

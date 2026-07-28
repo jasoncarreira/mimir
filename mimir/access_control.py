@@ -420,7 +420,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "memory_get",
         "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
-        "agrep", "get_turn", "mimir_get_turn",
+        "agrep", "file_search", "get_turn", "mimir_get_turn",
+        "write_file", "edit_file",
     }),
 }
 
@@ -1073,15 +1074,36 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     if not argv:
         return False
 
+    # ``--jq`` is deliberately absent from every option set below, here and in
+    # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
+    # ``env`` / ``$ENV`` builtins read the process environment — which
+    # ``direct_exec_env`` copies wholesale from the parent, credentials included.
+    # ``gh pr view <n> --repo <r> --json reviews --jq env`` was therefore an
+    # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
+    # MIMIR_API_KEY and the provider keys into the tool result, and from there
+    # into the model's context and the turn transcript. Enforcement was no
+    # defence: the command was ALLOWED, not merely unblocked.
+    #
+    # Nothing is lost by removing it. Every non-trivial filter was already
+    # refused, because ``|``, ``[``, ``]`` and ``{`` are shell metacharacters and
+    # the profile scans the raw command string before splitting it; only degenerate
+    # forms like ``--jq .reviews`` ever got through. ``--json`` returns the same
+    # data and the caller filters it itself.
+    #
+    # Do not "fix" this by blocklisting ``env`` and ``$ENV``: that is a denylist
+    # over an expression language, and the next builtin that reaches process
+    # state reopens it. ``--template`` is retained because gh's template function
+    # set is fixed and exposes no environment accessor — verify that claim again
+    # before adding any option that evaluates a caller-supplied expression.
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         options = {
             "view": frozenset({
-                "-R", "--comments", "--json", "--jq", "--repo", "--template",
+                "-R", "--comments", "--json", "--repo", "--template",
             }),
             "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
             "checks": frozenset({
-                "--fail-fast", "--interval", "--json", "--jq", "--repo",
+                "--fail-fast", "--interval", "--json", "--repo",
                 "--required", "--watch",
             }),
             # Submitting the review is the point of the repo_review profile —
@@ -1494,19 +1516,19 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
         options = {
             ("pr", "list"): frozenset({
                 "--app", "--assignee", "--author", "--base", "--draft", "--head",
-                "--json", "--jq", "--label", "--limit", "--repo", "--search",
+                "--json", "--label", "--limit", "--repo", "--search",
                 "--state", "--template",
             }),
             ("pr", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
             ("issue", "list"): frozenset({
-                "--app", "--assignee", "--author", "--json", "--jq", "--label",
+                "--app", "--assignee", "--author", "--json", "--label",
                 "--limit", "--mention", "--milestone", "--repo", "--search",
                 "--state", "--template",
             }),
             ("issue", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
         }.get((resource, subcommand))
         return options is not None and _arguments_match_allowlist(
@@ -1761,14 +1783,17 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     candidate = Path(target)
-    if not home or not candidate.is_absolute():
+    if not home:
         return False
+    home_root = Path(home).resolve()
+    if not candidate.is_absolute():
+        candidate = home_root / candidate
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
         roots = [Path(path).resolve() for path in raw]
-        memory_root = (Path(home).resolve() / "memory").resolve()
+        memory_root = (home_root / "memory").resolve()
         lexical_relatives = tuple(
             (root, candidate.relative_to(root))
             for root in roots
@@ -1783,7 +1808,7 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
             for root, relative in lexical_relatives
         ):
             return False
-        resolved = resolve_within_roots(roots, target)
+        resolved = resolve_within_roots(roots, str(candidate))
         resolved_relatives = tuple(
             (root, resolved.relative_to(root))
             for root in roots
@@ -1801,6 +1826,45 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         )
         for root, relative in resolved_relatives
     )
+
+
+def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
+    """Prevent one session boundary from mutating another channel's memory."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    try:
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(
+            (Path(home).resolve() / "memory" / "channels").resolve()
+        )
+    except (OSError, RuntimeError):
+        # Resolution failure cannot prove channel ownership; fail closed.
+        return False
+    except ValueError:
+        # The prompt also authorizes shared non-channel memory and state paths.
+        return True
+    return bool(relative.parts) and relative.parts[0] == channel_id
+
+
+def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
+    """Resolve a trigger-service write exactly as its sink adapter checks it."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise PathOutsideHomeError("MIMIR_HOME is not configured")
+    raw = json.loads(destination)
+    if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
+        raise PathOutsideHomeError("trigger-service write roots are invalid")
+    roots = [Path(path).resolve() for path in raw]
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    return resolve_within_roots(roots, str(candidate))
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
@@ -2179,7 +2243,18 @@ class SinkGate:
                 if service_policy is not None
                 else None
             )
-            if adapter is None or not adapter(target, service_policy.destination):
+            synthesis_scope_denied = (
+                service.canonical == "synthesis"
+                and sink_category is SinkCategory.FILE
+                and not _synthesis_target_matches_session(
+                    target, getattr(auth_context, "channel_id", None),
+                )
+            )
+            if (
+                adapter is None
+                or synthesis_scope_denied
+                or not adapter(target, service_policy.destination)
+            ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
@@ -4258,30 +4333,21 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
-            capabilities=(
-                "saga_end_session",
-                "saga_mark_contributions",
-                "saga_feedback",
-                "saga_record_skill_learning",
-                "memory_get",
-                "memory_store",
-                "mimir_get_turn",
-                "get_turn",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "bash_jobs_list",
-                "bash_job_output",
-            ),
+            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
             readable_domains=(
                 "session", "saga", "filesystem", "turn_history", "shell_jobs",
             ),
-            sink_destinations=("session_boundary", "saga"),
+            sink_destinations=("filesystem", "session_boundary", "saga"),
+            sink_policies=(
+                ServiceSinkPolicy(
+                    "write_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+                ServiceSinkPolicy(
+                    "edit_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+            ),
             creation_path="mimir.server._on_session_idle",
             authority_profile="session-boundary",
             capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,

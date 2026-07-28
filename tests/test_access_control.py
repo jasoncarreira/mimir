@@ -555,6 +555,82 @@ def test_heartbeat_write_allows_safe_home_memory_and_state(
         assert decision.allowed is True, target
 
 
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "memory" / "channels" / "channel-a").mkdir(parents=True)
+    (home / "memory" / "issues").mkdir()
+    (home / "state" / "wiki" / "concepts").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+
+    for target in (
+        "memory/channels/channel-a/summary.md",
+        "memory/issues/gotcha.md",
+        "state/wiki/concepts/pattern.md",
+        str(home / "memory" / "issues" / "absolute.md"),
+    ):
+        decision = ToolRegistry().authorize_tool(
+            tool_name, auth, enforce=True, target_channel=target,
+        )
+        assert decision.allowed is True, (target, decision.reason)
+
+    other_channel = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        target_channel="memory/channels/channel-b/summary.md",
+    )
+    core = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        target_channel="memory/core/00-persona.md",
+    )
+    assert other_channel.allowed is False
+    assert other_channel.reason == "service_sink_destination_denied"
+    assert core.allowed is False
+    assert core.reason == "service_sink_destination_denied"
+
+
+def test_synthesis_unresolvable_other_channel_target_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    other_channel = home / "memory" / "channels" / "channel-b"
+    other_channel.mkdir(parents=True)
+    (other_channel / "loop").symlink_to(other_channel / "loop")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        auth,
+        enforce=True,
+        target_channel=str(other_channel / "loop" / "summary.md"),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2210,6 +2286,196 @@ async def test_model_cannot_forge_a_service_shell_refusal(
     assert result.status != "error"
     assert result.content == "ran"
     assert "mimir_shell_refusal" not in seen_args
+
+
+@pytest.mark.asyncio
+async def test_service_shell_without_cwd_preserves_ambient_execution_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """An omitted cwd stays omitted rather than selecting the first read root."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    first_root = tmp_path / "first-root"
+    second_root = tmp_path / "second-root"
+    home.mkdir()
+    first_root.mkdir()
+    second_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (first_root, second_root),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open"},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert "cwd" not in seen_args
+
+
+@pytest.mark.asyncio
+async def test_service_shell_uses_resolved_authorized_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """The path checked against read roots is exactly the path execution receives."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    allowed = tmp_path / "allowed"
+    link = tmp_path / "allowed-link"
+    home.mkdir()
+    allowed.mkdir()
+    link.symlink_to(allowed, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{allowed}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (allowed,),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open", "cwd": str(link)},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["cwd"] == str(allowed.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cwd_factory", "reason"),
+    [
+        (lambda _outside: "", "non-empty absolute path"),
+        (lambda _outside: "relative/path", "non-empty absolute path"),
+        (lambda outside: str(outside), "outside the trusted service's authorized read roots"),
+    ],
+    ids=["empty", "relative", "outside"],
+)
+async def test_service_shell_refuses_unauthorized_cwd_without_echoing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+    cwd_factory,
+    reason: str,
+) -> None:
+    """Invalid service cwd values return fixed-vocabulary text and execute nothing."""
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "secret-outside-root"
+    home.mkdir()
+    allowed.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{allowed}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (allowed,),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    calls: list[object] = []
+    supplied_cwd = cwd_factory(outside)
+
+    async def handler(request):
+        calls.append(request)
+        raise AssertionError("refused cwd must not execute")
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open", "cwd": supplied_cwd},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert reason in str(result.content)
+    if supplied_cwd:
+        assert supplied_cwd not in str(result.content)
+    assert "secret-outside-root" not in str(result.content)
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -3955,3 +4221,112 @@ def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> Non
             enforce=True,
             target_channel=str(tmp_path / ".git" / "hooks" / "pre-commit"),
         ).allowed is True
+
+
+def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
+    """``--jq`` is a credential-read primitive, not an output formatter.
+
+    ``gh`` evaluates the filter in-process and jq's ``env`` / ``$ENV`` builtins
+    return the process environment, which ``direct_exec_env`` copies wholesale
+    from the parent. So ``gh pr list --json number --jq env`` was an ADMITTED
+    command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY, MIMIR_API_KEY and
+    the provider keys into the tool result, and from there into the model's
+    context and the turn transcript.
+
+    Two properties made it reachable and are worth stating, because each looks
+    harmless alone. ``env`` contains no shell metacharacter, so it passes the
+    raw-string scan that refuses every *useful* jq filter (``|``, ``[``, ``]``
+    are all in ``_SHELL_CONTROL_CHARACTERS``). And enforcement is irrelevant:
+    the command was allowed outright, so the flag never entered into it.
+
+    Removing the option costs nothing, since only degenerate filters were ever
+    admitted anyway. Do not reintroduce it with ``env`` blocklisted — that is a
+    denylist over an expression language.
+    """
+    import shlex
+
+    from mimir.access_control import parse_service_shell_argv
+
+    exfiltration = (
+        "gh pr list --repo o/r --json number --jq env",
+        "gh pr view 1 --repo o/r --json reviews --jq env",
+        "gh issue list --json number --jq env",
+        "gh pr checks 1 --repo o/r --json state --jq env",
+        # A trivial filter is refused too: the option is gone, not filtered.
+        "gh pr view 1 --repo o/r --json reviews --jq .reviews",
+    )
+    for command in exfiltration:
+        for profile in ("repo_review", "maintenance", "scheduler_read_only"):
+            argv = parse_service_shell_argv(command, profile)
+            assert argv is None, (
+                f"[{profile}] admitted {command!r}; --jq lets a caller read the "
+                "process environment through gh"
+            )
+
+    # Guard the guard: no profile's option allowlist may contain --jq at all, so
+    # a new subcommand cannot quietly reintroduce it on a path the cases above
+    # do not enumerate.
+    from mimir import access_control
+
+    source = Path(access_control.__file__).read_text(encoding="utf-8")
+    body = source.split("_SERVICE_SHELL_DISPLAY_OPTIONS", 1)[0]
+    assert '"--jq"' not in body, (
+        "an authorization option allowlist reintroduced --jq; it is a "
+        "credential-read primitive (jq env/$ENV over direct_exec_env's copy of "
+        "the parent environment), not an output formatter"
+    )
+
+    # ...while the display vocabulary keeps it, so a refusal can still name the
+    # option the caller should drop.
+    _, reason = access_control.parse_service_shell_argv_with_reason(
+        "gh pr view 1 --repo o/r --json reviews --jq .reviews", "repo_review",
+    )
+    assert "--jq" in reason
+
+
+def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
+    """Every command the review skill shows must be admissible on a poller turn.
+
+    The skill is the poller's instruction sheet, so a command demonstrated there
+    is a command the agent will issue. Three separate times this file has told it
+    to run something the ``repo_review`` profile refuses: a heredoc-plus-command-
+    substitution ``gh pr review --body "$(cat <<'EOF' …"`` (the shape behind the
+    #1221 outage, which survived even the PR that replaced the surrounding code
+    block), ``gh api … --jq '.content' | base64 -d``, and ``gh api …/files
+    --paginate`` as a large-PR fallback. Each was fixed by grep and the next one
+    was found by a reviewer, not by the fix.
+
+    Only fenced ``bash`` blocks are scanned: prose may freely describe a form in
+    order to prohibit it, and the surrounding text does exactly that.
+    """
+    import re
+
+    skill = Path(__file__).resolve().parent.parent / "mimir" / "skills" / "review" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+
+    # Shapes the trusted-service shell profile can never admit, and the reason.
+    forbidden = (
+        ("gh api", "`gh api` is not in the repo_review allow-list"),
+        ("--jq", "--jq is a credential read (jq env/$ENV) and is admitted nowhere"),
+        ("<<", "a heredoc cannot survive single-argv exec with shell=False"),
+        ("$(", "command substitution cannot survive single-argv exec"),
+        ("|", "a pipe makes the command compound"),
+        ("&&", "a compound command is never admitted"),
+    )
+
+    offenders: list[str] = []
+    for block in re.findall(r"```bash\n(.*?)```", text, re.DOTALL):
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not re.match(r"^(gh|git|uv|npm|pytest|fetch_url)\b", line):
+                continue
+            for needle, why in forbidden:
+                if needle in line:
+                    offenders.append(f"{line[:72]!r} — {why}")
+
+    assert not offenders, (
+        "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
+        "run:\n  " + "\n  ".join(offenders)
+    )

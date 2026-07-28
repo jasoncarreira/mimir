@@ -62,7 +62,7 @@ synthesis turns have narrow context (one session) and have been observed
 confabulating durable rules from one-off events. The pending buffer is
 the safe path.
 
-Use bash and the file-op tools. Call `mimir_get_turn` only for turns
+Use the file-op tools. Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
 
@@ -260,7 +260,7 @@ synthesis turns have narrow context (one session) and have been observed
 confabulating durable rules from one-off events. The pending buffer is
 the safe path.
 
-Use bash and the file-op tools. Call `mimir_get_turn` only for turns
+Use the file-op tools. Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
 

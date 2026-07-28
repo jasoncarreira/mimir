@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from .event_logger import log_event
-from .models import AuthContext, EgressSessionState, SessionACL
+from .models import (
+    AuthContext,
+    EgressSessionState,
+    InformationFlowLabels,
+    InformationFlowState,
+    SessionACL,
+)
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +64,7 @@ class ChannelSession:
     ended: bool = False
     source_acl: SessionACL = field(default_factory=SessionACL)
     egress_state: EgressSessionState = field(default_factory=EgressSessionState)
+    ifc_state: InformationFlowState = field(default_factory=InformationFlowState)
 
 
 def _make_saga_session_id(channel_id: str) -> str:
@@ -128,6 +135,10 @@ class SessionManager:
             origin_domain=origin_domain,
             visibility=visibility,
         )
+        inbound_labels = (
+            auth_context.ifc_state.current(auth_context.ifc_labels)
+            if auth_context is not None else None
+        )
         async with self._lock:
             now = time.time()
             session = self._sessions.get(channel_id)
@@ -135,6 +146,8 @@ class SessionManager:
                 if session.idle_handle is not None:
                     session.idle_handle.cancel()
                 session.source_acl = session.source_acl.intersect(inbound_acl)
+                if isinstance(inbound_labels, InformationFlowLabels):
+                    session.ifc_state.merge(inbound_labels)
                 session.last_message_at = now
                 session.idle_handle = self._schedule_idle(session)
                 return session
@@ -146,6 +159,8 @@ class SessionManager:
                 last_message_at=now,
                 source_acl=inbound_acl,
             )
+            if isinstance(inbound_labels, InformationFlowLabels):
+                new_session.ifc_state.merge(inbound_labels)
             new_session.idle_handle = self._schedule_idle(new_session)
             self._sessions[channel_id] = new_session
             await log_event(

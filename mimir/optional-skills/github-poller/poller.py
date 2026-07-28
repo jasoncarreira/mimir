@@ -66,6 +66,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from mimir.pollers import _github_author_is_trusted, _github_content_author
+
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "github-activity")
@@ -407,6 +409,107 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
+def _pr_author_is_trusted(
+    repo: str,
+    number: int,
+    url: str,
+    token: str,
+    trust_cache: dict[tuple[str, object], object],
+) -> bool:
+    """Resolve PR-author trust from GitHub and cache it for this poll cycle."""
+    author_key = (repo, number)
+    if author_key not in trust_cache:
+        trust_cache[author_key] = _github_content_author(
+            repo,
+            {"event_type": "pr_opened", "url": url},
+            token,
+        )
+    author = trust_cache[author_key]
+    trust_key = (repo, author if isinstance(author, str) else "")
+    if trust_key not in trust_cache:
+        trust_cache[trust_key] = _github_author_is_trusted(repo, author, token)
+    return trust_cache[trust_key] is True
+
+
+def _review_requested(pr: dict, me: str) -> bool:
+    return bool(me) and any(
+        isinstance(reviewer, dict) and reviewer.get("login") == me
+        for reviewer in (pr.get("requested_reviewers") or [])
+    )
+
+
+def _emit_pr_synchronize(
+    repo: str,
+    number: int,
+    title: str,
+    url: str,
+    previous_head: str,
+    current_head: str,
+    token: str,
+) -> None:
+    compare = _gh_api(
+        f"repos/{repo}/compare/{previous_head}...{current_head}", token,
+    )
+    commits: list = []
+    total_commits = 0
+    if isinstance(compare, dict):
+        commits = compare.get("commits") or []
+        total_commits = compare.get("ahead_by") or len(commits)
+    head_commit = commits[-1] if commits else {}
+    push_author = (
+        (head_commit.get("author") or {}).get("login")
+        or (head_commit.get("committer") or {}).get("login")
+    )
+    if total_commits and commits:
+        subjects = [
+            (commit.get("commit") or {}).get("message", "").split("\n")[0][:72]
+            for commit in commits[:3]
+        ]
+        bullets = "\n".join(f"  • {subject}" for subject in subjects if subject)
+        remaining = total_commits - sum(1 for subject in subjects if subject)
+        commit_block = f"{total_commits} commit(s):\n{bullets}"
+        if remaining > 0:
+            commit_block += f"\n  • … ({remaining} more)"
+    else:
+        commit_block = "(commit details unavailable)"
+    prompt = (
+        f"PR #{number} updated on {repo}: {title} "
+        f"(by @{push_author or 'unknown'})\n"
+        f"{commit_block}\n"
+        f"Previous head: {previous_head[:8]}, new head: {current_head[:8]}\n{url}"
+    )
+    _emit(
+        prompt,
+        event_type="pr_synchronize",
+        repo=repo,
+        number=number,
+        url=url,
+        previous_head=previous_head,
+        new_head=current_head,
+        head_sha=current_head,
+        author=push_author,
+    )
+
+
+def _surface_untrusted_pr_once(
+    repo: str,
+    number: int,
+    url: str,
+    surfaced_untrusted: set[str],
+) -> int:
+    key = str(number)
+    if key in surfaced_untrusted:
+        return 0
+    _emit_signal(
+        "pr_auto_review_skipped_untrusted_author",
+        repo=repo,
+        number=number,
+        url=url,
+    )
+    surfaced_untrusted.add(key)
+    return 1
+
+
 # ─── per-resource checks ──────────────────────────────────────────────
 
 
@@ -445,7 +548,14 @@ def _check_issues(repo: str, since: str, token: str, me: str) -> int:
     return count
 
 
-def _check_prs(repo: str, since: str, token: str, me: str) -> int:
+def _check_prs(
+    repo: str,
+    since: str,
+    token: str,
+    me: str,
+    trust_cache: dict[tuple[str, object], object] | None = None,
+    surfaced_untrusted: set[str] | None = None,
+) -> int:
     """New pull requests."""
     data = _gh_api(
         f"repos/{repo}/pulls?state=open&sort=created&direction=desc",
@@ -453,6 +563,8 @@ def _check_prs(repo: str, since: str, token: str, me: str) -> int:
     )
     if not isinstance(data, list):
         return 0
+    trust_cache = trust_cache if trust_cache is not None else {}
+    surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
     count = 0
     for pr in data:
         if me and pr.get("user", {}).get("login") == me:
@@ -461,8 +573,21 @@ def _check_prs(repo: str, since: str, token: str, me: str) -> int:
             continue
         author = pr.get("user", {}).get("login", "unknown")
         number = pr.get("number")
+        if not isinstance(number, int):
+            continue
         title = pr.get("title", "")
         url = pr.get("html_url", "")
+        # Explicit requests are handled by _check_pr_pushes regardless of
+        # author. Do not also report them as skipped automatic reviews.
+        if _review_requested(pr, me):
+            continue
+        if not _pr_author_is_trusted(
+            repo, number, url, token, trust_cache,
+        ):
+            count += _surface_untrusted_pr_once(
+                repo, number, url, surfaced_untrusted,
+            )
+            continue
         body = _truncate(pr.get("body") or "")
         prompt_parts = [f"New PR on {repo}: #{number} {title} (by @{author})"]
         if body:
@@ -548,6 +673,8 @@ def _check_pr_pushes(
     me: str,
     pr_heads: dict[str, str],
     pr_review_requests: dict[str, int] | None = None,
+    trust_cache: dict[tuple[str, object], object] | None = None,
+    surfaced_untrusted: set[str] | None = None,
 ) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
@@ -615,6 +742,9 @@ def _check_pr_pushes(
     new_heads: dict[str, str] = {}
     prior_review_requests: dict[str, int] = pr_review_requests or {}
     new_review_requests: dict[str, int] = {}
+    trust_cache = trust_cache if trust_cache is not None else {}
+    surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
+    current_open: set[str] = set()
     if not isinstance(data, list):
         # On API failure, preserve prior cursors so we don't false-fire
         # on the next successful poll. (If the poll truly missed a
@@ -633,6 +763,19 @@ def _check_pr_pushes(
         if not number:
             continue
         key = str(number)
+        current_open.add(key)
+
+        title = pr.get("title", "")
+        url = pr.get("html_url", "")
+        explicitly_requested = _review_requested(pr, me)
+        trusted_author = _pr_author_is_trusted(
+            repo, number, url, token, trust_cache,
+        )
+        if not trusted_author:
+            if not explicitly_requested and (not me or pr_author != me):
+                count += _surface_untrusted_pr_once(
+                    repo, number, url, surfaced_untrusted,
+                )
 
         # ─── pr_synchronize (push detection) ───
         current_sha = (pr.get("head") or {}).get("sha")
@@ -642,74 +785,21 @@ def _check_pr_pushes(
                 # First sighting — record, do not emit.
                 new_heads[key] = current_sha
             elif prev_sha != current_sha:
-                title = pr.get("title", "")
-                url = pr.get("html_url", "")
-                # Fetch commit list between previous and new head so the
-                # agent sees individual commit subjects, not just a sha
-                # delta.  GitHub caps the ``commits`` array at 250 items;
-                # ``ahead_by`` is the canonical count when the list is
-                # truncated.  On API failure we fall back to sha-only.
-                compare = _gh_api(
-                    f"repos/{repo}/compare/{prev_sha}...{current_sha}",
-                    token,
-                )
-                commits: list = []
-                total_commits = 0
-                if isinstance(compare, dict):
-                    commits = compare.get("commits") or []
-                    total_commits = compare.get("ahead_by") or len(commits)
-                head_commit = commits[-1] if commits else {}
-                push_author = (
-                    (head_commit.get("author") or {}).get("login")
-                    or (head_commit.get("committer") or {}).get("login")
-                )
-                if total_commits and commits:
-                    subjects = [
-                        (c.get("commit") or {}).get("message", "")
-                        .split("\n")[0][:72]
-                        for c in commits[:3]
-                    ]
-                    bullets = "\n".join(
-                        f"  • {s}" for s in subjects if s
-                    )
-                    shown = sum(1 for s in subjects if s)
-                    remaining = total_commits - shown
-                    commit_block = f"{total_commits} commit(s):\n{bullets}"
-                    if remaining > 0:
-                        commit_block += f"\n  • … ({remaining} more)"
+                if not trusted_author:
+                    new_heads[key] = current_sha
                 else:
-                    commit_block = "(commit details unavailable)"
-                prompt = (
-                    f"PR #{number} updated on {repo}: {title} "
-                    f"(by @{push_author or 'unknown'})\n"
-                    f"{commit_block}\n"
-                    f"Previous head: {prev_sha[:8]}, new head: "
-                    f"{current_sha[:8]}\n{url}"
-                )
-                _emit(
-                    prompt,
-                    event_type="pr_synchronize",
-                    repo=repo,
-                    number=number,
-                    url=url,
-                    previous_head=prev_sha,
-                    new_head=current_sha,
-                    head_sha=current_sha,
-                    author=push_author,
-                )
-                count += 1
-                new_heads[key] = current_sha
+                    _emit_pr_synchronize(
+                        repo, number, title, url, prev_sha, current_sha, token,
+                    )
+                    count += 1
+                    new_heads[key] = current_sha
             else:
                 new_heads[key] = current_sha
 
         # ─── pr_review_requested (reviewer added) ───
         # Skip if no agent login configured — nothing to match against.
         if me:
-            requested = pr.get("requested_reviewers") or []
-            currently_requested = any(
-                isinstance(r, dict) and r.get("login") == me
-                for r in requested
-            )
+            currently_requested = explicitly_requested
             if currently_requested:
                 # State reconciliation (chainlink #299): ``me`` being a
                 # requested reviewer is usually the authoritative "review
@@ -727,8 +817,6 @@ def _check_pr_pushes(
                 # running / never ran). Re-emit up to the cap; on exhaustion
                 # emit a one-shot give-up signal and go dormant.
                 prior_attempts = prior_review_requests.get(key, 0)
-                title = pr.get("title", "")
-                url = pr.get("html_url", "")
                 if prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
                     attempt = prior_attempts + 1
                     if attempt == 1:
@@ -786,6 +874,10 @@ def _check_pr_pushes(
                     # neither retry nor re-emit the give-up. Resets when
                     # ``me`` is removed (key drops from the rebuilt dict).
                     new_review_requests[key] = prior_attempts
+    # Keep a notification marker for the PR's entire open lifetime. A
+    # transient lookup recovery followed by another failure must not alert
+    # again; closed PRs naturally prune from the rebuilt open-PR snapshot.
+    surfaced_untrusted.intersection_update(current_open)
     return count, new_heads, new_review_requests
 
 
@@ -1345,12 +1437,21 @@ def main() -> None:
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
     new_cr_all: dict[str, dict[str, object]] = {}
+    untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
+    new_untrusted_all: dict[str, list[str]] = {}
+    trust_cache: dict[tuple[str, object], object] = {}
 
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
         total += _check_issues(repo, since, token, me)
-        total += _check_prs(repo, since, token, me)
+        surfaced_untrusted = {
+            str(value) for value in (untrusted_all.get(repo, []) or [])
+            if isinstance(value, (str, int)) and not isinstance(value, bool)
+        }
+        total += _check_prs(
+            repo, since, token, me, trust_cache, surfaced_untrusted,
+        )
         total += _check_issue_comments(repo, since, token, me)
         total += _check_pr_review_comments(repo, since, token, me)
         total += _check_pr_reviews(repo, since, token, me)
@@ -1358,10 +1459,13 @@ def main() -> None:
         repo_rr = _coerce_review_requests(rr_all.get(repo))
         push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
             repo, token, me, repo_heads, pr_review_requests=repo_rr,
+            trust_cache=trust_cache,
+            surfaced_untrusted=surfaced_untrusted,
         )
         total += push_count
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
+        new_untrusted_all[repo] = sorted(surfaced_untrusted)
         repo_cr = cr_all.get(repo, {}) or {}
         cr_count, new_repo_cr = _check_own_changes_requested(
             repo, token, me, repo_cr,
@@ -1373,6 +1477,7 @@ def main() -> None:
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
     cursor["pr_changes_requested"] = new_cr_all
+    cursor["pr_untrusted_authors"] = new_untrusted_all
     _save_cursor(cursor)
     print(
         f"Emitted {total} event(s) across {len(repos)} repo(s)",

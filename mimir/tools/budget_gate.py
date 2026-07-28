@@ -418,6 +418,38 @@ def _service_shell_refusal(request: ToolCallRequest) -> str | None:
     return refusal if isinstance(refusal, str) and refusal else None
 
 
+def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]:
+    """Resolve an explicit service cwd within the non-admin read roots."""
+    from ..read_policy import configured_non_admin_read_roots
+
+    if raw_cwd is None:
+        # Preserve the existing ambient/sticky cwd when the caller omits cwd.
+        return None, None
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
+        return None, "working directory must be a non-empty absolute path"
+    candidate = Path(raw_cwd)
+    if not candidate.is_absolute():
+        return None, "working directory must be a non-empty absolute path"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "working directory is not an accessible directory"
+    if not resolved.is_dir():
+        return None, "working directory is not an accessible directory"
+
+    roots: list[Path] = []
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_root.is_dir() and resolved_root not in roots:
+            roots.append(resolved_root)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None, "working directory is outside the trusted service's authorized read roots"
+    return str(resolved), None
+
+
 def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
@@ -450,6 +482,16 @@ def _request_for_authorized_execution(
     target = args.get("command")
     if not isinstance(target, str):
         return sanitized_request
+    resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
+    if cwd_refusal is not None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {cwd_refusal}."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if resolved_cwd is not None:
+        args["cwd"] = resolved_cwd
     argv, refusal = parse_service_shell_argv_with_reason(target, policy.destination)
     if argv is None:
         # The authorization adapter already admitted this call. Failing to bind
@@ -494,6 +536,36 @@ def _request_for_authorized_execution(
     args["mimir_direct_argv"] = argv
     tool_call = {**request.tool_call, "args": args}
     return request.override(tool_call=tool_call)
+
+
+def _request_with_resolved_service_write_path(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind a trigger-service file write to the path checked by authorization."""
+    if tool_name not in {"write_file", "edit_file"}:
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "trigger_service_write_roots":
+        return request
+
+    from ..access_control import resolve_trigger_service_write_target
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    argument_name = "file_path" if "file_path" in args else "path"
+    raw_path = args.get(argument_name)
+    if not isinstance(raw_path, str) or not raw_path:
+        return request
+    try:
+        args[argument_name] = str(
+            resolve_trigger_service_write_target(raw_path, policy.destination)
+        )
+    except (OSError, RuntimeError, ValueError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
 
 
 def _request_with_resolved_spawn_paths(
@@ -932,6 +1004,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
@@ -1113,6 +1188,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
