@@ -285,7 +285,15 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
             event_logger=event_logger,
         )
 
-    assert calls == [["git", "-C", str(tmp_path), "fetch", "origin", "main"]]
+    # A failed fetch now also probes for refs left dangling by a reclaimed
+    # alternate, because that residue makes every fetch fail until it is pruned
+    # (2026-07-28: a leftover refs/remotes/origin/pr/1188 cost six worklink
+    # attempts). Here the probe finds nothing, so the fetch must NOT be retried —
+    # a genuine network failure should fail closed immediately, not double up.
+    assert calls == [
+        ["git", "-C", str(tmp_path), "fetch", "origin", "main"],
+        ["git", "-C", str(tmp_path), "for-each-ref", "--format=%(refname) %(objectname)"],
+    ]
     assert events == [
         (
             "worklink_base_fetch_failed",
