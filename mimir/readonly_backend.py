@@ -22,15 +22,17 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import subprocess
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from deepagents.backends import FilesystemBackend
 from deepagents.backends.composite import CompositeBackend
@@ -43,6 +45,10 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain.tools import ToolRuntime
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
@@ -65,10 +71,151 @@ _DEFAULT_MAX_GREP_MATCHES = 2_000
 _DEFAULT_MAX_GLOB_MATCHES = 2_000
 _DEFAULT_MAX_SCAN_FILES = 20_000
 _DEFAULT_GREP_TIMEOUT_SECONDS = 10
+MAX_GREP_CONTEXT_LINES = 200
+_grep_context: ContextVar[tuple[int, int]] = ContextVar(
+    "mimir_grep_context", default=(0, 0),
+)
+
+
+class GrepWithContextSchema(BaseModel):
+    """DeepAgents grep schema extended with bounded line context."""
+
+    pattern: str = Field(description="Text pattern to search for (literal string, not regex).")
+    path: str | None = Field(
+        default=None,
+        description="Directory or file to search. Defaults to the current working directory.",
+    )
+    glob: str | None = Field(
+        default=None,
+        description="Glob pattern used to filter searched files (for example, '*.py').",
+    )
+    output_mode: Literal["files_with_matches", "content", "count"] = Field(
+        default="files_with_matches",
+        description=(
+            "Output format: 'files_with_matches' (paths only), 'content' "
+            "(matching and context lines), or 'count' (match counts per file)."
+        ),
+    )
+    before_context: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_GREP_CONTEXT_LINES,
+        description=f"Lines before each match for content output (max {MAX_GREP_CONTEXT_LINES}).",
+    )
+    after_context: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_GREP_CONTEXT_LINES,
+        description=f"Lines after each match for content output (max {MAX_GREP_CONTEXT_LINES}).",
+    )
+
+
+class MimirFilesystemMiddleware(FilesystemMiddleware):
+    """Filesystem middleware whose grep tool exposes backend context support."""
+
+    def _create_grep_tool(self) -> BaseTool:
+        stock_tool = super()._create_grep_tool()
+
+        def sync_grep(
+            pattern: Annotated[str, "Literal text to search for."],
+            runtime: ToolRuntime,
+            path: str | None = None,
+            glob: str | None = None,
+            output_mode: Literal["files_with_matches", "content", "count"] = "files_with_matches",
+            before_context: int = 0,
+            after_context: int = 0,
+        ):
+            token = _grep_context.set(
+                (before_context, after_context) if output_mode == "content" else (0, 0),
+            )
+            try:
+                return stock_tool.func(
+                    pattern=pattern,
+                    runtime=runtime,
+                    path=path,
+                    glob=glob,
+                    output_mode=output_mode,
+                )
+            finally:
+                _grep_context.reset(token)
+
+        async def async_grep(
+            pattern: Annotated[str, "Literal text to search for."],
+            runtime: ToolRuntime,
+            path: str | None = None,
+            glob: str | None = None,
+            output_mode: Literal["files_with_matches", "content", "count"] = "files_with_matches",
+            before_context: int = 0,
+            after_context: int = 0,
+        ):
+            token = _grep_context.set(
+                (before_context, after_context) if output_mode == "content" else (0, 0),
+            )
+            try:
+                return await stock_tool.coroutine(
+                    pattern=pattern,
+                    runtime=runtime,
+                    path=path,
+                    glob=glob,
+                    output_mode=output_mode,
+                )
+            finally:
+                _grep_context.reset(token)
+
+        return StructuredTool.from_function(
+            name="grep",
+            description=stock_tool.description,
+            func=sync_grep,
+            coroutine=async_grep,
+            infer_schema=False,
+            args_schema=GrepWithContextSchema,
+        )
 
 
 def _log_truncation(op: str, reason: str) -> None:
     log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
+
+
+def _contextualize_grep_matches(
+    matches: list[dict[str, Any]],
+    *,
+    reader: Callable[..., ReadResult],
+    before_context: int,
+    after_context: int,
+    max_lines: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Read merged line windows around matches without crossing files."""
+    by_path: dict[str, list[int]] = {}
+    for match in matches:
+        by_path.setdefault(str(match["path"]), []).append(int(match["line"]))
+
+    contextual: list[dict[str, Any]] = []
+    for file_path, line_numbers in by_path.items():
+        ranges = sorted(
+            (max(1, line - before_context), line + after_context)
+            for line in line_numbers
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        for start, end in merged:
+            read_result = reader(file_path, offset=start - 1, limit=end - start + 1)
+            if read_result.error or not read_result.file_data:
+                continue
+            content = str(read_result.file_data.get("content", ""))
+            for line_number, text in enumerate(content.splitlines(), start):
+                contextual.append({
+                    "path": file_path,
+                    "line": line_number,
+                    "text": text,
+                })
+                if len(contextual) >= max_lines:
+                    return contextual, f"returned more than {max_lines} match/context lines"
+    return contextual, None
 
 
 def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
@@ -153,6 +300,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if any(part in self._traversal_excludes for part in rel_parts):
             return True
         from .read_policy import (
+            is_current_service_scoped_read_path,
             is_current_service_protected_read_path,
             is_mimir_home_root,
             is_protected_read_path,
@@ -163,7 +311,10 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             non_admin_read_filter_enabled()
             and not is_mimir_home_root(path)
             and (
-                is_protected_read_path(path)
+                (
+                    not is_current_service_scoped_read_path(path)
+                    and is_protected_read_path(path)
+                )
                 or is_current_service_protected_read_path(path)
             )
         )
@@ -320,8 +471,27 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
     ) -> GrepResult:
         """Search for literal text with bounded traversal and result caps."""
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        if (
+            isinstance(before_context, bool)
+            or isinstance(after_context, bool)
+            or not isinstance(before_context, int)
+            or not isinstance(after_context, int)
+            or not 0 <= before_context <= MAX_GREP_CONTEXT_LINES
+            or not 0 <= after_context <= MAX_GREP_CONTEXT_LINES
+        ):
+            return GrepResult(
+                error=(
+                    "grep context must be integer line counts between 0 and "
+                    f"{MAX_GREP_CONTEXT_LINES}"
+                ),
+                matches=[],
+            )
         try:
             base_full = self._resolve_path(path or ".")
         except ValueError:
@@ -347,9 +517,31 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         for fpath, items in results.items():
             for line_num, line_text in items:
                 matches.append({"path": fpath, "line": int(line_num), "text": line_text})
+        if before_context or after_context:
+            matches, context_truncated = self._add_grep_context(
+                matches,
+                before_context=before_context,
+                after_context=after_context,
+            )
+            truncated = truncated or context_truncated
         if truncated:
             _log_truncation("Grep", truncated)
         return GrepResult(matches=matches)
+
+    def _add_grep_context(
+        self,
+        matches: list[dict[str, Any]],
+        *,
+        before_context: int,
+        after_context: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        return _contextualize_grep_matches(
+            matches,
+            reader=self.read,
+            before_context=before_context,
+            after_context=after_context,
+            max_lines=self._max_grep_matches,
+        )
 
     def glob(self, pattern: str, path: str = "/") -> GlobResult:  # noqa: C901, PLR0912
         """Find files matching a glob pattern without walking excluded trees forever."""
@@ -664,8 +856,10 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
     ) -> GrepResult:
-        result = super().grep(pattern, path, glob)
+        result = super().grep(pattern, path, glob, before_context, after_context)
         if result.error is None:
             self._publish_read_paths([
                 str(match.get("path"))
@@ -679,15 +873,12 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
     ) -> GrepResult:
-        result = await super().agrep(pattern, path, glob)
-        if result.error is None:
-            self._publish_read_paths([
-                str(match.get("path"))
-                for match in result.matches or ()
-                if match.get("path")
-            ])
-        return result
+        return await asyncio.to_thread(
+            self.grep, pattern, path, glob, before_context, after_context,
+        )
 
     def write(self, file_path: str, content: str) -> WriteResult:
         try:
@@ -1267,3 +1458,50 @@ class FileToolRouter(CompositeBackend):
         if callable(drain):
             return drain(turn_id=turn_id)
         return []
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        if (
+            isinstance(before_context, bool)
+            or isinstance(after_context, bool)
+            or not isinstance(before_context, int)
+            or not isinstance(after_context, int)
+            or not 0 <= before_context <= MAX_GREP_CONTEXT_LINES
+            or not 0 <= after_context <= MAX_GREP_CONTEXT_LINES
+        ):
+            return GrepResult(
+                error=(
+                    "grep context must be integer line counts between 0 and "
+                    f"{MAX_GREP_CONTEXT_LINES}"
+                ),
+                matches=[],
+            )
+        token = _grep_context.set((before_context, after_context))
+        try:
+            return super().grep(pattern, path, glob)
+        finally:
+            _grep_context.reset(token)
+
+    async def agrep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+        before_context: int = 0,
+        after_context: int = 0,
+    ) -> GrepResult:
+        if before_context == 0 and after_context == 0:
+            before_context, after_context = _grep_context.get()
+        token = _grep_context.set((before_context, after_context))
+        try:
+            return await super().agrep(pattern, path, glob)
+        finally:
+            _grep_context.reset(token)

@@ -459,6 +459,11 @@ def build_trigger_service_principal(
     )
     is_github_activity = canonical == "poller:github-activity"
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
+    fetch_cache_roots = (
+        (Path(home) / "attachments" / "fetch-cache",)
+        if is_github_activity and home
+        else ()
+    )
     write_roots = tuple(dict.fromkeys(
         root.resolve()
         for root in (
@@ -515,7 +520,8 @@ def build_trigger_service_principal(
         sink_destinations=tuple(sorted(sink_destinations)),
         sink_policies=tuple(policies),
         filesystem_read_roots=(
-            tuple(str(root) for root in repo_roots) if is_github_activity else ()
+            tuple(str(root.resolve()) for root in (*repo_roots, *fetch_cache_roots))
+            if is_github_activity else ()
         ),
         creation_path=creation_path,
         authority_profile=profile,
@@ -2103,6 +2109,10 @@ def _trigger_service_read_target_is_allowed(
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         return False
     candidate = Path(raw)
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    cache_prefixes = ("attachments/fetch-cache", "/attachments/fetch-cache")
+    if home and any(raw == prefix or raw.startswith(prefix + "/") for prefix in cache_prefixes):
+        candidate = Path(home) / raw.lstrip("/")
     if not candidate.is_absolute():
         return False
     roots = tuple(Path(root) for root in service.filesystem_read_roots)

@@ -100,6 +100,21 @@ repositories, and path traversal remain denied. `fetch_url` is GET-only and the
 returned content remains untrusted. Do not substitute `gh api`: it is outside
 the review profile, and pipes or compound shell commands are not admitted.
 
+`fetch_url` returns a cache path under `/attachments/fetch-cache/`. Read that
+path with `read_file`; use its `offset` and `limit` for an exact line range, or
+use `grep` with `output_mode="content"`, `before_context`, and `after_context`
+for bounded context around a match. Always pass the documented absolute virtual
+`/attachments/fetch-cache/...` form to `read_file`; although the backend also
+resolves relative `attachments/fetch-cache/...` paths, the file-tool schema
+requires an absolute path. Do not use `cat`,
+`head`, `sed`, `awk`, `python`, or `jq` to slice fetched content: those
+shell forms are not the bounded file-read interface and the observed slicing
+commands are refused; `awk`/`python` can execute code and `jq` can inspect the
+process environment, so widening their admitted forms is not a substitute.
+Never replace `fetch_url` with `curl`; direct `curl` to `api.github.com` would
+bypass the repository-bound egress adapter and redirect re-check, so it remains
+refused.
+
 
 **If a local `Read` returns "file does not exist":** do NOT bail. Log it
 in your notes ("couldn't read <file> locally — reviewing from diff only")

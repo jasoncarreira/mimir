@@ -113,6 +113,8 @@ _deepagents_patches.strip_deepagents_base_prompt()
 # otherwise summarization middleware can rebuild Pydantic tool schemas on
 # the asyncio loop at every model boundary (chainlink #600).
 _deepagents_patches.patch_deepagents_token_counter_tool_schema_cache()
+# Replace DeepAgents' fixed grep schema with Mimir's bounded -A/-B equivalent.
+_deepagents_patches.install_deepagents_grep_context_tool()
 # DeepAgents deliberately treats history-offload failures as non-fatal. Keep
 # summarization progressing, but retain the swallowed exception's traceback.
 install_offload_traceback_logging_patch()

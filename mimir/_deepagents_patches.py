@@ -12,6 +12,26 @@ _DEEPAGENTS_BASE_PROMPT_MARKER = "_mimir_base_prompt_stripped"
 
 
 _DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER = "_mimir_token_counter_tool_schema_cache"
+_DEEPAGENTS_GREP_CONTEXT_PATCH_MARKER = "_mimir_grep_context_tool"
+
+
+def install_deepagents_grep_context_tool() -> None:
+    """Use Mimir's bounded-context grep schema in every DeepAgents stack."""
+    try:
+        from deepagents import graph as deepagents_graph
+        from deepagents import middleware as deepagents_middleware
+        from deepagents.middleware import filesystem as filesystem_middleware
+
+        from .readonly_backend import MimirFilesystemMiddleware
+    except ImportError:
+        return
+    if getattr(deepagents_graph, _DEEPAGENTS_GREP_CONTEXT_PATCH_MARKER, False):
+        return
+    deepagents_graph.FilesystemMiddleware = MimirFilesystemMiddleware
+    deepagents_middleware.FilesystemMiddleware = MimirFilesystemMiddleware
+    filesystem_middleware.FilesystemMiddleware = MimirFilesystemMiddleware
+    setattr(deepagents_graph, _DEEPAGENTS_GREP_CONTEXT_PATCH_MARKER, True)
+    log.debug("installed bounded-context grep tool schema")
 
 
 def patch_deepagents_token_counter_tool_schema_cache() -> None:

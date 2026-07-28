@@ -18,6 +18,7 @@ import stat
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -326,12 +327,16 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     home = tmp_path / "home"
     persist_dir = home / "state" / "pollers" / "github-activity"
     scratch = home / "scratch"
+    fetch_cache = home / "attachments" / "fetch-cache"
     repo = tmp_path / "repo"
     persist_dir.mkdir(parents=True)
     scratch.mkdir()
+    fetch_cache.mkdir(parents=True)
     repo.mkdir()
     safe_file = repo / "src.py"
     safe_file.write_text("safe\n", encoding="utf-8")
+    fetched_file = fetch_cache / "body.txt"
+    fetched_file.write_text("fetched\n", encoding="utf-8")
     protected_names = (
         ".env", ".git", ".mimir", ".venv", "config", "credentials",
         "identities", "prompts", "secret", "secrets",
@@ -370,7 +375,9 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         "send_message" if capability == "operator_alert" else capability
         for capability in declared_capabilities
     ))
-    assert service.filesystem_read_roots == (str(repo.resolve()),)
+    assert service.filesystem_read_roots == (
+        str(repo.resolve()), str(fetch_cache.resolve()),
+    )
     for tool_name, arguments in (
         ("read_file", {"file_path": str(safe_file)}),
         ("grep", {"path": str(repo), "pattern": "safe"}),
@@ -379,6 +386,28 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
             tool_name, context, enforce=True, arguments=arguments,
         )
         assert decision.allowed is True, (tool_name, decision.reason)
+
+    for file_path in (
+        "attachments/fetch-cache/body.txt",
+        "/attachments/fetch-cache/body.txt",
+    ):
+        decision = registry.authorize_tool(
+            "read_file", context, enforce=True, arguments={"file_path": file_path},
+        )
+        assert decision.allowed is True, (file_path, decision.reason)
+
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.readonly_backend import WriteGuardBackend
+
+    token = set_current_turn(SimpleNamespace(turn_id="fetch-cache-read", auth_context=context))
+    try:
+        read_result = WriteGuardBackend(home, ["state"]).read(
+            "/attachments/fetch-cache/body.txt",
+        )
+    finally:
+        reset_current_turn(token)
+    assert read_result.error is None
+    assert read_result.file_data["content"] == "fetched\n"
 
     for target in (persist_dir / "cursor.json", scratch / "pr-1221-review.md"):
         decision = registry.authorize_tool(
