@@ -276,7 +276,6 @@ REVIEW_NEEDED_EVENT_TYPES = frozenset({
                                 # ``requested_reviewers`` on an open PR
 })
 
-
 _REVIEW_SUBMISSION_RULE = (
     "\n\n──── REVIEW SUBMISSION RULE ────\n"
     "This event needs a review. After drafting your review prose, "
@@ -392,6 +391,9 @@ def _emit(prompt: str, **extras: object) -> None:
     """
     event_type = extras.get("event_type")
     if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
+        related_comment = extras.pop("related_comment", "")
+        if isinstance(related_comment, str) and related_comment:
+            prompt = f"{prompt}\n\nRelated PR comment:\n{related_comment}"
         prompt = prompt + _REVIEW_SUBMISSION_RULE
         preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()
         if preload in ("1", "true", "yes"):
@@ -513,6 +515,8 @@ def _emit_pr_synchronize(
     previous_head: str,
     current_head: str,
     token: str,
+    *,
+    related_comment: str = "",
 ) -> None:
     compare = _gh_api(
         f"repos/{repo}/compare/{previous_head}...{current_head}", token,
@@ -555,6 +559,7 @@ def _emit_pr_synchronize(
         new_head=current_head,
         head_sha=current_head,
         author=push_author,
+        related_comment=related_comment,
     )
 
 
@@ -622,6 +627,8 @@ def _check_prs(
     me: str,
     trust_cache: dict[tuple[str, object], object] | None = None,
     surfaced_untrusted: set[str] | None = None,
+    review_needed_pr_numbers: set[str] | None = None,
+    review_context: dict[str, str] | None = None,
 ) -> int:
     """New pull requests."""
     data = _gh_api(
@@ -632,6 +639,10 @@ def _check_prs(
         return 0
     trust_cache = trust_cache if trust_cache is not None else {}
     surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
+    review_needed_pr_numbers = (
+        review_needed_pr_numbers if review_needed_pr_numbers is not None else set()
+    )
+    review_context = review_context if review_context is not None else {}
     count = 0
     for pr in data:
         if me and pr.get("user", {}).get("login") == me:
@@ -662,22 +673,85 @@ def _check_prs(
         prompt_parts.append(url)
         _emit("\n".join(prompt_parts), event_type="pr_opened",
               repo=repo, number=number, url=url, author=author,
-              head_sha=(pr.get("head") or {}).get("sha"))
+              head_sha=(pr.get("head") or {}).get("sha"),
+              related_comment=review_context.get(str(number), ""))
         count += 1
+        review_needed_pr_numbers.add(str(number))
     return count
 
 
-def _check_issue_comments(repo: str, since: str, token: str, me: str) -> int:
-    """New issue + PR conversation comments (the
-    /repos/{repo}/issues/comments endpoint covers both)."""
+
+def _collect_issue_comment_context(
+    repo: str,
+    since: str,
+    token: str,
+    me: str,
+) -> tuple[list[dict] | None, dict[str, str]]:
+    """Fetch comments once and collect recent PR prose for review prompts."""
     data = _gh_api(
         f"repos/{repo}/issues/comments?since={since}"
         f"&sort=created&direction=desc",
         token,
     )
     if not isinstance(data, list):
+        return None, {}
+    context: dict[str, str] = {}
+    for comment in data:
+        if me and comment.get("user", {}).get("login") == me:
+            continue
+        if (comment.get("created_at", "") or "") <= since:
+            continue
+        url = comment.get("html_url", "")
+        if "/pull/" not in url:
+            continue
+        issue_url = comment.get("issue_url", "")
+        issue_num = issue_url.rstrip("/").split("/")[-1] if issue_url else "?"
+        author = comment.get("user", {}).get("login", "unknown")
+        body = _truncate(comment.get("body") or "")
+        rendered = f"@{author}: {body}\n{url}"
+        if issue_num in context:
+            context[issue_num] = f"{context[issue_num]}\n\n{rendered}"
+        else:
+            context[issue_num] = rendered
+    return data, context
+
+def _check_issue_comments(
+    repo: str,
+    since: str,
+    token: str,
+    me: str,
+    *,
+    review_needed_pr_numbers: set[str] | None = None,
+    comments: list[dict] | None = None,
+) -> int:
+    """New issue + PR conversation comments.
+
+    The ``/repos/{repo}/issues/comments`` endpoint covers both issues and
+    pull requests.  PR comments need two extra guards:
+
+    * a comment discovered after its PR has closed or merged is terminal history,
+      not a fresh work signal;
+    * when the same poll already emitted a review-needed event for that PR (for
+      example ``pr_synchronize``), the comment is supporting context for that one
+      review, not a second independent turn.
+
+    Parent type comes from the authoritative issue resource's ``pull_request``
+    marker rather than the comment's presentation URL. Ordinary issue comments
+    keep the existing edge-triggered behaviour regardless of issue state. If the
+    live parent lookup fails, fail open and emit the comment rather than silently
+    losing a potentially actionable signal.
+    """
+    data = comments
+    if data is None:
+        data = _gh_api(
+            f"repos/{repo}/issues/comments?since={since}"
+            f"&sort=created&direction=desc",
+            token,
+        )
+    if not isinstance(data, list):
         return 0
     count = 0
+    parent_cache: dict[str, dict | None] = {}
     for comment in data:
         if me and comment.get("user", {}).get("login") == me:
             continue
@@ -690,6 +764,20 @@ def _check_issue_comments(repo: str, since: str, token: str, me: str) -> int:
         issue_num = (
             issue_url.rstrip("/").split("/")[-1] if issue_url else "?"
         )
+        presentation_is_pr = "/pull/" in url
+        if presentation_is_pr and issue_num in (review_needed_pr_numbers or set()):
+            continue
+        if issue_num not in parent_cache:
+            parent_cache[issue_num] = _gh_api(
+                f"repos/{repo}/issues/{issue_num}", token,
+            )
+        parent = parent_cache[issue_num]
+        is_pr_comment = isinstance(parent, dict) and bool(parent.get("pull_request"))
+        if is_pr_comment:
+            if issue_num in (review_needed_pr_numbers or set()):
+                continue
+            if parent.get("state") != "open":
+                continue
         prompt = (
             f"New comment on {repo} #{issue_num} by @{author}: {body}\n{url}"
         )
@@ -742,6 +830,8 @@ def _check_pr_pushes(
     pr_review_requests: dict[str, int] | None = None,
     trust_cache: dict[tuple[str, object], object] | None = None,
     surfaced_untrusted: set[str] | None = None,
+    review_needed_pr_numbers: set[str] | None = None,
+    review_context: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
@@ -811,6 +901,10 @@ def _check_pr_pushes(
     new_review_requests: dict[str, int] = {}
     trust_cache = trust_cache if trust_cache is not None else {}
     surfaced_untrusted = surfaced_untrusted if surfaced_untrusted is not None else set()
+    review_needed_pr_numbers = (
+        review_needed_pr_numbers if review_needed_pr_numbers is not None else set()
+    )
+    review_context = review_context if review_context is not None else {}
     current_open: set[str] = set()
     if not isinstance(data, list):
         # On API failure, preserve prior cursors so we don't false-fire
@@ -856,9 +950,17 @@ def _check_pr_pushes(
                     new_heads[key] = current_sha
                 else:
                     _emit_pr_synchronize(
-                        repo, number, title, url, prev_sha, current_sha, token,
+                        repo,
+                        number,
+                        title,
+                        url,
+                        prev_sha,
+                        current_sha,
+                        token,
+                        related_comment=review_context.get(key, ""),
                     )
                     count += 1
+                    review_needed_pr_numbers.add(key)
                     new_heads[key] = current_sha
             else:
                 new_heads[key] = current_sha
@@ -884,7 +986,19 @@ def _check_pr_pushes(
                 # running / never ran). Re-emit up to the cap; on exhaustion
                 # emit a one-shot give-up signal and go dormant.
                 prior_attempts = prior_review_requests.get(key, 0)
-                if prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
+                if key in review_needed_pr_numbers:
+                    # A synchronize/open event for this same PR already owns the
+                    # review turn in this poll. Count that canonical turn against
+                    # the request's retry budget so a failed review still retries
+                    # next poll without gaining an extra hidden attempt.
+                    if prior_attempts > REVIEW_REQUEST_MAX_ATTEMPTS:
+                        new_review_requests[key] = prior_attempts
+                    else:
+                        new_review_requests[key] = min(
+                            prior_attempts + 1,
+                            REVIEW_REQUEST_MAX_ATTEMPTS,
+                        )
+                elif prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
                     attempt = prior_attempts + 1
                     if attempt == 1:
                         status_line = (
@@ -915,8 +1029,10 @@ def _check_pr_pushes(
                         attempt=attempt,
                         max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
                         head_sha=current_sha,
+                        related_comment=review_context.get(key, ""),
                     )
                     count += 1
+                    review_needed_pr_numbers.add(key)
                     new_review_requests[key] = attempt
                 elif prior_attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
                     # Wedge guard exhausted: emitted the request
@@ -1517,10 +1633,16 @@ def main() -> None:
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
         }
-        total += _check_prs(
-            repo, since, token, me, trust_cache, surfaced_untrusted,
+        review_needed_pr_numbers: set[str] = set()
+        issue_comments, review_context = _collect_issue_comment_context(
+            repo, since, token, me,
         )
-        total += _check_issue_comments(repo, since, token, me)
+        pr_opened_count = _check_prs(
+            repo, since, token, me, trust_cache, surfaced_untrusted,
+            review_needed_pr_numbers=review_needed_pr_numbers,
+            review_context=review_context,
+        )
+        total += pr_opened_count
         total += _check_pr_review_comments(repo, since, token, me)
         total += _check_pr_reviews(repo, since, token, me)
         repo_heads = pr_heads_all.get(repo, {}) or {}
@@ -1529,8 +1651,18 @@ def main() -> None:
             repo, token, me, repo_heads, pr_review_requests=repo_rr,
             trust_cache=trust_cache,
             surfaced_untrusted=surfaced_untrusted,
+            review_needed_pr_numbers=review_needed_pr_numbers,
+            review_context=review_context,
         )
         total += push_count
+        total += _check_issue_comments(
+            repo,
+            since,
+            token,
+            me,
+            review_needed_pr_numbers=review_needed_pr_numbers,
+            comments=issue_comments,
+        )
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
         new_untrusted_all[repo] = sorted(surfaced_untrusted)
