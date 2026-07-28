@@ -46,6 +46,7 @@ from mimir.agent import (
 from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
+from mimir.harness_egress import harness_sink_allowed
 from mimir.models import (
     AgentEvent,
     AuthContext,
@@ -541,7 +542,8 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     assert cross_channel.allowed is False
     assert declassification.allowed is True
     assert incompatible_reply.allowed is False
-    assert harness.allowed is False
+    assert harness.allowed is True
+    assert harness.reason == "harness_metadata_display"
 
 
 def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources():
@@ -566,7 +568,7 @@ def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources
     for source in untrusted_other_authored.sources:
         untrusted_labels = untrusted_labels.with_source(source)
 
-    for tool in ("send_message", "react", "activity_panel_edit"):
+    for tool in ("send_message", "react"):
         trusted = SinkGate.check_sink_flow(
             tool, event.channel_id, trusted_labels, auth, enforce=True,
         )
@@ -893,14 +895,14 @@ def test_every_known_label_can_flow_to_compatible_same_channel(label: str):
 
 def test_all_labels_must_be_destination_compatible_to_pass():
     compatible = SinkGate.check_sink_flow(
-        "activity_panel_edit",
+        "send_message",
         "slack-C1",
         _labels(labels=ALL_LABELS),
         _auth(),
         enforce=True,
     )
     incompatible = SinkGate.check_sink_flow(
-        "activity_panel_edit",
+        "send_message",
         "slack-C1",
         _labels(labels=ALL_LABELS, sources=frozenset({"slack-C1", "slack-C2"})),
         _auth(),
@@ -2952,8 +2954,33 @@ def test_allowed_harness_sink_emits_no_denial_event(monkeypatch):
     assert sink_events == []
 
 
+@pytest.mark.parametrize("enforced", [False, True])
+def test_activity_panel_display_has_no_denial_class_and_does_not_widen_messages(
+    monkeypatch, enforced,
+):
+    sink_events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.harness_egress.log_event_sync",
+        lambda kind, **fields: sink_events.append((kind, fields)),
+    )
+    auth = replace(_auth("slack-C1"), enforcement_enabled=enforced)
+    incompatible = _labels(sources=frozenset({"slack-C-private"}))
+
+    for sink in ("activity_panel_post", "activity_panel_edit"):
+        assert get_sink_category(sink) is SinkCategory.HARNESS_DISPLAY
+        assert harness_sink_allowed(sink, "slack-C1", incompatible, auth) is True
+
+    message = SinkGate.check_sink_flow(
+        "send_message", "slack-C1", incompatible, auth, enforce=True,
+    )
+    assert get_sink_category("send_message") is SinkCategory.SAME_CHANNEL
+    assert message.allowed is False
+    assert message.reason == "ifc_label_blocked:same_channel"
+    assert sink_events == []
+
+
 @pytest.mark.asyncio
-async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_closed():
+async def test_activity_panel_metadata_updates_with_tainted_live_labels():
     bus = TurnEventBus()
     channels = ChannelRegistry()
     bridge = _Bridge()
@@ -2991,7 +3018,9 @@ async def test_activity_panel_post_and_detailed_edit_use_live_labels_and_fail_cl
         }
     )
 
-    assert bridge.edits == []
+    assert len(bridge.edits) == 1
+    assert "read_file" in (bridge.edits[0].text or "")
+    assert "protected preview" not in (bridge.edits[0].text or "")
 
 
 def test_turn_event_emitter_carries_ifc_to_panel_but_not_as_public_content():

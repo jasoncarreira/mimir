@@ -10,7 +10,6 @@ from mimir.bridges._activity_panel import (
     ActivityPanel,
     ActivityPanelModel,
     ActivityStep,
-    FoldedInput,
     render_discord_panel,
     render_panel_text,
 )
@@ -247,7 +246,8 @@ async def test_panel_posts_in_slack_thread_and_renders_sanitized_blocks():
     assert bridge.sends[0]["blocks"][0]["type"] == "section"
     text = "\n".join(update.text or "" for update in bridge.edits)
     assert "shell_exec" in text
-    assert "Jason" in text
+    assert "Jason" not in text
+    assert "+1 mid-turn message folded" in text
     assert "raw follow-up body" not in text
     assert "/secret/path" not in text
     assert "TOKEN=abc" not in text
@@ -497,7 +497,7 @@ async def test_coarse_default_redacts_detail_from_unopted_channel():
 
 
 @pytest.mark.asyncio
-async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it():
+async def test_detailed_setting_renders_only_harness_metadata():
     panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
 
     await panel.handle_event(
@@ -522,7 +522,7 @@ async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it()
     )
     live_text = bridge.edits[-1].text or ""
     assert "Calling shell_exec" in live_text
-    assert "args: cmd" in live_text
+    assert "args:" not in live_text
     assert "cat" not in live_text
     assert "/secret/path" not in live_text
     assert "TOKEN=abc" not in live_text
@@ -557,9 +557,10 @@ async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it()
             "content_delta": "ok SECRET=value /tmp/result.txt",
         }
     )
+    # Chunks carry turn content and never cause a panel edit.
     result_text = bridge.edits[-1].text or ""
     assert "Running shell_exec" in result_text
-    assert "ok [redacted] [path]" in result_text
+    assert "ok" not in result_text
     assert "Calling shell_exec" not in result_text
     assert "/tmp/result.txt" not in result_text
     assert "SECRET=value" not in result_text
@@ -580,12 +581,12 @@ async def test_detailed_mode_shows_only_inflight_scrubbed_detail_then_drops_it()
     )
     final_text = bridge.edits[-1].text or ""
     assert final_text == "✓ 1 steps"
-    assert "ok [redacted]" not in final_text
+    assert "ok" not in final_text
     assert "/tmp/result.txt" not in final_text
 
 
 @pytest.mark.asyncio
-async def test_detailed_mode_renders_arg_keys_not_raw_values():
+async def test_detailed_setting_does_not_render_arg_keys_or_values():
     panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
 
     await panel.handle_event(
@@ -615,7 +616,10 @@ async def test_detailed_mode_renders_arg_keys_not_raw_values():
     )
 
     live_text = bridge.edits[-1].text or ""
-    assert "args: cmd, password, Authorization, file_path" in live_text
+    assert "Calling shell_exec" in live_text
+    assert "cmd" not in live_text
+    assert "password" not in live_text
+    assert "Authorization" not in live_text
     assert "hunter2" not in live_text
     assert "sk-live-secret-value" not in live_text
     assert "attachments/secret.png" not in live_text
@@ -623,18 +627,7 @@ async def test_detailed_mode_renders_arg_keys_not_raw_values():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "content, leaked",
-    [
-        ('{"password": "hunter2", "path": "attachments/secret.png"}', ["hunter2", "attachments/secret.png"]),
-        ("{'API_KEY': 'sk-1234567890', 'file': 'C:\\\\Users\\\\Jason\\\\secret.txt'}", ["sk-1234567890", "C:\\\\Users\\\\Jason\\\\secret.txt"]),
-        ("Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456", ["ghp_abcdefghijklmnopqrstuvwxyz123456"]),
-        ("Authorization: Bearer eyJhbGciOiJ.payload.sig123ABCdef", ["eyJhbGciOiJ.payload.sig123ABCdef"]),
-        ("aws AKIA1234567890ABCDEF and relative memory/core/00-identity.md", ["AKIA1234567890ABCDEF", "memory/core/00-identity.md"]),
-        ("opaque Aa1234567890Bb1234567890Cc1234567890Dd1234567890", ["Aa1234567890Bb1234567890Cc1234567890Dd1234567890"]),
-    ],
-)
-async def test_detailed_mode_scrubs_realistic_result_secret_and_path_shapes(content: str, leaked: list[str]):
+async def test_detailed_setting_ignores_tool_result_content():
     panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
 
     await panel.handle_event(
@@ -663,14 +656,14 @@ async def test_detailed_mode_scrubs_realistic_result_secret_and_path_shapes(cont
             "turn_id": "t1",
             "channel_id": "slack-C01",
             "id": "c1",
-            "content_delta": content,
+            "content_delta": "distinct private result body",
         }
     )
 
     rendered = bridge.edits[-1].text or ""
-    assert "result:" in rendered
-    for value in leaked:
-        assert value not in rendered
+    assert "Running shell_exec" in rendered
+    assert "distinct private result body" not in rendered
+    assert "result:" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1009,7 +1002,7 @@ def test_render_final_summary_without_outbound_uses_folded_count():
         ActivityPanelModel(turn_id="t1", channel_id="slack-C01", finalized=True),
     )
     model.steps.append(ActivityStep("Thought", "done"))
-    model.folded_inputs.append(FoldedInput(source_id="m1"))
+    model.folded_input_count = 1
 
     assert render_panel_text(model) == "✓ 1 steps · +1 follow-up folded"
 
