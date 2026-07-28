@@ -19,7 +19,8 @@ the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
 **Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
 diff accessible — either under 20k lines via `gh pr diff`, or file list via
-`gh api repos/.../pulls/<n>/files --paginate` for large PRs.
+`gh pr view <n> --repo <owner>/<repo> --json files` for large PRs (`gh api` is
+not admitted on a poller turn).
 
 **Guarantees**:
 - A review is posted to GitHub (not just output to turn text) via `gh pr review`.
@@ -62,9 +63,18 @@ before reaching for local file reads.
 For PRs whose diff exceeds ~20k lines use the file-list fallback:
 
 ```bash
-gh api repos/jasoncarreira/mimir/pulls/<num>/files --paginate \
-  --jq '.[] | "\(.status) \(.filename)"'
+gh pr view <num> --repo jasoncarreira/mimir --json files
 ```
+
+Filter the returned JSON yourself rather than with `--jq` (see the note below).
+
+> **`--jq` is not available on poller or scheduled turns.** The trusted-service
+> shell profiles do not admit it: `gh` evaluates the filter in-process and jq's
+> `env` builtin reads the process environment, so the option is a credential
+> read rather than an output formatter. Use `--json <fields>` and filter the
+> returned JSON yourself. Piped and bracketed filters were already refused on
+> those turns anyway, because `|`, `[` and `]` are shell metacharacters.
+
 
 ### 3. Fetch source files only when necessary — and safely
 
@@ -78,14 +88,17 @@ out locally, the file may not exist or may show the wrong version.
 different branch:**
 
 ```bash
-# Fetch a file from the PR's HEAD SHA via API
-gh api "repos/jasoncarreira/mimir/contents/<path>?ref=<headRefOid>" \
-  --jq '.content' | base64 -d
-
-# Or fetch the raw blob
-gh api "repos/jasoncarreira/mimir/git/blobs/<blob_sha>" --jq '.content' \
-  | base64 -d
+gh pr diff <num> --repo jasoncarreira/mimir
 ```
+
+On a poller turn the diff plus a local `Read` of the checked-out branch is the
+whole available toolkit. Fetching a file at an arbitrary SHA is **not** admitted
+there today: `gh api` is outside the profile, and the
+`gh api ... --jq '.content' | base64 -d` form fails three ways at once — `gh api`
+is not admitted, `--jq` is not admitted, and the pipe makes it a compound
+command. Chainlink #1014 tracks admitting a bounded read of PR file contents; do
+not assume it exists until it lands.
+
 
 **If a local `Read` returns "file does not exist":** do NOT bail. Log it
 in your notes ("couldn't read <file> locally — reviewing from diff only")
@@ -119,44 +132,40 @@ effect (`gh pr review`), submission verification, and wrap-up. A review
 with perfect extra evidence that never reaches GitHub is worse than a
 bounded review that lands with an honest validation note.
 
+Write the body to a file under the agent scratch root first, then submit it with
+`--body-file`. On a poller turn this is the **only** form that works: the profile
+execs one argv with `shell=False`, so a heredoc, a `$(...)` substitution, and an
+inline multi-line `--body` are all refused — the body is read from the file
+during authorization and never re-opened at execution.
+
 ```bash
-# Approve
-gh pr review <num> --approve --body "$(cat <<'EOF'
-## Summary
-...
+# 1. Write the body (use the Write tool, or a single redirect-free command)
+#    to <scratch>/pr-<num>-review.md
 
-## Observations
-...
-EOF
-)"
-
-# Request changes
-gh pr review <num> --request-changes --body "$(cat <<'EOF'
-## Summary
-...
-
-## Blocking issues
-...
-EOF
-)"
-
-# Comment only (no verdict, for questions / early feedback)
-gh pr review <num> --comment --body "$(cat <<'EOF'
-...
-EOF
-)"
+# 2. Submit exactly one of these, as a single command:
+gh pr review <num> --repo jasoncarreira/mimir --approve         --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo jasoncarreira/mimir --request-changes --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo jasoncarreira/mimir --comment         --body-file <scratch>/pr-<num>-review.md
 ```
 
-Use a heredoc (`<<'EOF' ... EOF`) to pass the body — inline quoting breaks
-on `$`, backticks, and multi-line text.
+The body file must resolve beneath the agent scratch root, be a regular file
+reached without traversing a symlink, and be at most 64 KiB.
+
+**Do not use a heredoc, `$(...)`, or an inline multi-line `--body`.** All three
+are refused before execution on a poller turn, and a refused submission is how a
+completed review silently fails to reach GitHub. Write the body to the scratch
+file and pass `--body-file`: because the file is read during authorization, `$`,
+backticks and multi-line text need no escaping at all.
 
 ### 6. Confirm submission
 
 After the `gh pr review` call completes:
 
 ```bash
-gh pr view <num> --json reviews --jq '.reviews[-1] | {state, author: .author.login, submitted: .submittedAt}'
+gh pr view <num> --repo jasoncarreira/mimir --json reviews
 ```
+
+Read the last entry of `reviews` from the returned JSON.
 
 Verify your login (`mimir-carreira`) appears in the reviews list.
 
@@ -203,6 +212,6 @@ nothing about the submission requirement.
 | Symptom | Fix |
 |---|---|
 | `Read(tests/foo.py)` -> "file does not exist" | Skip Read, continue from diff, still submit |
-| `gh pr diff <num>` -> HTTP 406 "diff too large" | Fall back to `gh api .../pulls/<num>/files` for file list |
+| `gh pr diff <num>` -> HTTP 406 "diff too large" | Use `gh pr view <num> --repo <owner>/<repo> --json files` (`gh api` is not admitted) |
 | `gh pr review` exits non-zero | Check `--help`; verify PR is open; retry once |
-| Review body contains backticks / `${}` | Use `<<'EOF'` heredoc (single-quote prevents expansion) |
+| Review body contains backticks / `${}` | Nothing special — `--body-file` reads the file directly, so no shell expansion occurs |

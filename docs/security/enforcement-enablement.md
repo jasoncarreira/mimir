@@ -311,6 +311,23 @@ commands. `npm ci --ignore-scripts` is the one declared dependency-materializati
 command because a clean install is part of the repository test contract; lifecycle
 scripts and other network-installing package operations remain denied.
 
+**No profile admits `--jq`.** `gh` evaluates the filter in-process, and jq's
+`env` and `$ENV` builtins return the process environment — which
+`direct_exec_env` copies wholesale from the parent, credentials included. So
+`gh pr list --json number --jq env` was an *admitted* command that printed
+`DISCORD_TOKEN`, `GITHUB_TOKEN`, `GPG_KEY`, `MIMIR_API_KEY` and the provider keys
+into the tool result, and from there into the model's context and the turn
+transcript. Enforcement was not a mitigation, because the command was allowed
+rather than merely unblocked. The option is removed from every profile's
+allow-list; callers pass `--json <fields>` and filter the result themselves.
+Removing it costs nothing, since every non-degenerate filter was already refused
+by the metacharacter scan (`|`, `[`, `]` and `{` never reach `shlex`). Do not
+reintroduce it with `env` blocklisted: that is a denylist over an expression
+language, and the next builtin reaching process state reopens the hole. The same
+question applies to any future option that evaluates a caller-supplied
+expression — `--template` is retained only because gh's template function set is
+fixed and exposes no environment accessor.
+
 **Scheduled-maintenance execution profile.** Static `scheduled_tick` services and
 the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers
 remain on `repo_review`, research/custom pollers remain on

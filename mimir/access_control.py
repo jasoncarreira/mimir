@@ -1073,13 +1073,34 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     if not argv:
         return False
 
+    # ``--jq`` is deliberately absent from every option set below, here and in
+    # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
+    # ``env`` / ``$ENV`` builtins read the process environment — which
+    # ``direct_exec_env`` copies wholesale from the parent, credentials included.
+    # ``gh pr view <n> --repo <r> --json reviews --jq env`` was therefore an
+    # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
+    # MIMIR_API_KEY and the provider keys into the tool result, and from there
+    # into the model's context and the turn transcript. Enforcement was no
+    # defence: the command was ALLOWED, not merely unblocked.
+    #
+    # Nothing is lost by removing it. Every non-trivial filter was already
+    # refused, because ``|``, ``[``, ``]`` and ``{`` are shell metacharacters and
+    # the profile scans the raw command string before splitting it; only degenerate
+    # forms like ``--jq .reviews`` ever got through. ``--json`` returns the same
+    # data and the caller filters it itself.
+    #
+    # Do not "fix" this by blocklisting ``env`` and ``$ENV``: that is a denylist
+    # over an expression language, and the next builtin that reaches process
+    # state reopens it. ``--template`` is retained because gh's template function
+    # set is fixed and exposes no environment accessor — verify that claim again
+    # before adding any option that evaluates a caller-supplied expression.
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         options = {
-            "view": frozenset({"--comments", "--json", "--jq", "--repo", "--template"}),
+            "view": frozenset({"--comments", "--json", "--repo", "--template"}),
             "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
             "checks": frozenset({
-                "--fail-fast", "--interval", "--json", "--jq", "--repo",
+                "--fail-fast", "--interval", "--json", "--repo",
                 "--required", "--watch",
             }),
             # Submitting the review is the point of the repo_review profile —
@@ -1492,19 +1513,19 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
         options = {
             ("pr", "list"): frozenset({
                 "--app", "--assignee", "--author", "--base", "--draft", "--head",
-                "--json", "--jq", "--label", "--limit", "--repo", "--search",
+                "--json", "--label", "--limit", "--repo", "--search",
                 "--state", "--template",
             }),
             ("pr", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
             ("issue", "list"): frozenset({
-                "--app", "--assignee", "--author", "--json", "--jq", "--label",
+                "--app", "--assignee", "--author", "--json", "--label",
                 "--limit", "--mention", "--milestone", "--repo", "--search",
                 "--state", "--template",
             }),
             ("issue", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
         }.get((resource, subcommand))
         return options is not None and _arguments_match_allowlist(
