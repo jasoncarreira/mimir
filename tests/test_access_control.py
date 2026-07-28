@@ -3927,3 +3927,64 @@ def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> Non
             enforce=True,
             target_channel=str(tmp_path / ".git" / "hooks" / "pre-commit"),
         ).allowed is True
+
+
+def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
+    """``--jq`` is a credential-read primitive, not an output formatter.
+
+    ``gh`` evaluates the filter in-process and jq's ``env`` / ``$ENV`` builtins
+    return the process environment, which ``direct_exec_env`` copies wholesale
+    from the parent. So ``gh pr list --json number --jq env`` was an ADMITTED
+    command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY, MIMIR_API_KEY and
+    the provider keys into the tool result, and from there into the model's
+    context and the turn transcript.
+
+    Two properties made it reachable and are worth stating, because each looks
+    harmless alone. ``env`` contains no shell metacharacter, so it passes the
+    raw-string scan that refuses every *useful* jq filter (``|``, ``[``, ``]``
+    are all in ``_SHELL_CONTROL_CHARACTERS``). And enforcement is irrelevant:
+    the command was allowed outright, so the flag never entered into it.
+
+    Removing the option costs nothing, since only degenerate filters were ever
+    admitted anyway. Do not reintroduce it with ``env`` blocklisted — that is a
+    denylist over an expression language.
+    """
+    import shlex
+
+    from mimir.access_control import parse_service_shell_argv
+
+    exfiltration = (
+        "gh pr list --repo o/r --json number --jq env",
+        "gh pr view 1 --repo o/r --json reviews --jq env",
+        "gh issue list --json number --jq env",
+        "gh pr checks 1 --repo o/r --json state --jq env",
+        # A trivial filter is refused too: the option is gone, not filtered.
+        "gh pr view 1 --repo o/r --json reviews --jq .reviews",
+    )
+    for command in exfiltration:
+        for profile in ("repo_review", "maintenance", "scheduler_read_only"):
+            argv = parse_service_shell_argv(command, profile)
+            assert argv is None, (
+                f"[{profile}] admitted {command!r}; --jq lets a caller read the "
+                "process environment through gh"
+            )
+
+    # Guard the guard: no profile's option allowlist may contain --jq at all, so
+    # a new subcommand cannot quietly reintroduce it on a path the cases above
+    # do not enumerate.
+    from mimir import access_control
+
+    source = Path(access_control.__file__).read_text(encoding="utf-8")
+    body = source.split("_SERVICE_SHELL_DISPLAY_OPTIONS", 1)[0]
+    assert '"--jq"' not in body, (
+        "an authorization option allowlist reintroduced --jq; it is a "
+        "credential-read primitive (jq env/$ENV over direct_exec_env's copy of "
+        "the parent environment), not an output formatter"
+    )
+
+    # ...while the display vocabulary keeps it, so a refusal can still name the
+    # option the caller should drop.
+    _, reason = access_control.parse_service_shell_argv_with_reason(
+        "gh pr view 1 --repo o/r --json reviews --jq .reviews", "repo_review",
+    )
+    assert "--jq" in reason

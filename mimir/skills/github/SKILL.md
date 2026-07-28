@@ -184,6 +184,14 @@ gh api 'repos/jasoncarreira/mimir/issues?state=open&labels=bug' --jq '.[] | "\(.
 
 `--jq` filters work like inline jq queries; chain with shell tools when needed.
 
+> **`--jq` is not available on poller or scheduled turns.** The trusted-service
+> shell profiles do not admit it: `gh` evaluates the filter in-process and jq's
+> `env` builtin reads the process environment, so the option is a credential
+> read rather than an output formatter. Use `--json <fields>` and filter the
+> returned JSON yourself. Piped and bracketed filters were already refused on
+> those turns anyway, because `|`, `[` and `]` are shell metacharacters.
+
+
 ## When NOT to use this
 
 - Don't push to `main` even when you can — feature branch + PR is the
