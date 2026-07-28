@@ -427,6 +427,27 @@ def _service_shell_refusal(request: ToolCallRequest) -> str | None:
     return refusal if isinstance(refusal, str) and refusal else None
 
 
+def _record_repo_review_checkout(
+    request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
+) -> None:
+    """Record only a successfully executed checkout of this turn's bound head."""
+    state = getattr(auth_context, "repo_review_state", None)
+    if failed or state is None:
+        return
+    argv = (request.tool_call.get("args") or {}).get("mimir_direct_argv")
+    if not isinstance(argv, list):
+        return
+    if argv[-7:] == [
+        "pr", "checkout", str(state.pr_number),
+        "--repo", state.repo, "--branch", state.head_ref,
+    ] or (
+        len(argv) >= 2
+        and argv[-2:] == ["checkout", state.head_ref]
+        and argv[1:3] == ["-C", state.root]
+    ):
+        state.mark_checked_out()
+
+
 def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]:
     """Resolve an explicit service cwd within the non-admin read roots."""
     from ..read_policy import configured_non_admin_read_roots
@@ -501,7 +522,16 @@ def _request_for_authorized_execution(
         )
     if resolved_cwd is not None:
         args["cwd"] = resolved_cwd
-    argv, refusal = parse_service_shell_argv_with_reason(target, policy.destination)
+    if policy.destination == "repo_review":
+        argv, refusal = parse_service_shell_argv_with_reason(
+            target,
+            policy.destination,
+            review_state=getattr(auth_context, "repo_review_state", None),
+        )
+    else:
+        argv, refusal = parse_service_shell_argv_with_reason(
+            target, policy.destination,
+        )
     if argv is None:
         # The authorization adapter already admitted this call. Failing to bind
         # a direct argv here must not fall back to the original ``bash -lc``
@@ -1173,6 +1203,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
+        _record_repo_review_checkout(
+            execution_request, auth_context, failed=is_error,
+        )
         result_labels = _result_labels_for_call(
             tool_name,
             request,
@@ -1359,6 +1392,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
+        _record_repo_review_checkout(
+            execution_request, auth_context, failed=is_error,
+        )
         result_labels = _result_labels_for_call(
             tool_name,
             request,

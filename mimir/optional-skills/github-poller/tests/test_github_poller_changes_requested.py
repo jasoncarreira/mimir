@@ -43,7 +43,7 @@ def _pr(
         "title": title,
         "html_url": f"https://github.com/o/r/pull/{number}",
         "user": {"login": login},
-        "head": {"sha": sha},
+        "head": {"sha": sha, "ref": f"worklink/{number}"},
         "base": {"sha": base_sha},
     }
 
@@ -127,6 +127,7 @@ def test_stale_changes_requested_reemits_on_elapsed_boundary(
     assert cursor == {"638": _entry("aaa111")}
     [ev] = captured_emits
     assert ev["event_type"] == "pr_changes_requested_stale"
+    assert ev["head_ref"] == "worklink/638"
     assert ev["reviewers"] == ["jasoncarreira"]
     assert "stuck at CHANGES_REQUESTED" in ev["prompt"]
 
