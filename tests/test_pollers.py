@@ -328,15 +328,35 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     persist_dir = home / "state" / "pollers" / "github-activity"
     scratch = home / "scratch"
     fetch_cache = home / "attachments" / "fetch-cache"
+    own_memory = home / "memory" / "channels" / "poller:github-activity"
+    other_memory = home / "memory" / "channels" / "poller:other"
     repo = tmp_path / "repo"
     persist_dir.mkdir(parents=True)
     scratch.mkdir()
     fetch_cache.mkdir(parents=True)
+    own_memory.mkdir(parents=True)
+    other_memory.mkdir(parents=True)
     repo.mkdir()
     safe_file = repo / "src.py"
     safe_file.write_text("safe\n", encoding="utf-8")
     fetched_file = fetch_cache / "body.txt"
     fetched_file.write_text("fetched\n", encoding="utf-8")
+    scratch_file = scratch / "pr-150-review.md"
+    scratch_file.write_text("review verdict\n", encoding="utf-8")
+    own_memory_file = own_memory / "pr-reviews.md"
+    own_memory_file.write_text("own channel notes\n", encoding="utf-8")
+    other_memory_file = other_memory / "private.md"
+    other_memory_file.write_text("other channel notes\n", encoding="utf-8")
+    core_file = home / "memory" / "core" / "operator.md"
+    core_file.parent.mkdir(parents=True)
+    core_file.write_text("core memory\n", encoding="utf-8")
+    identities_file = home / "state" / "identities.yaml"
+    identities_file.write_text("people: []\n", encoding="utf-8")
+    prompt_file = home / "prompts" / "system.md"
+    prompt_file.parent.mkdir()
+    prompt_file.write_text("operator prompt\n", encoding="utf-8")
+    operator_secret = scratch / "operator-settings.json"
+    operator_secret.write_text("{}\n", encoding="utf-8")
     protected_names = (
         ".env", ".git", ".mimir", ".venv", "config", "credentials",
         "identities", "prompts", "secret", "secrets",
@@ -354,6 +374,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         resolved_aliases.append(alias / target.name)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(operator_secret))
 
     manifest_path = (
         Path(__file__).parents[1] / "mimir" / "optional-skills"
@@ -376,7 +397,8 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         for capability in declared_capabilities
     ))
     assert service.filesystem_read_roots == (
-        str(repo.resolve()), str(fetch_cache.resolve()),
+        str(repo.resolve()), str(fetch_cache.resolve()), str(scratch.resolve()),
+        str(own_memory.resolve()),
     )
     for tool_name, arguments in (
         ("read_file", {"file_path": str(safe_file)}),
@@ -390,6 +412,10 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     for file_path in (
         "attachments/fetch-cache/body.txt",
         "/attachments/fetch-cache/body.txt",
+        "scratch/pr-150-review.md",
+        "/scratch/pr-150-review.md",
+        "memory/channels/poller:github-activity/pr-reviews.md",
+        "/memory/channels/poller:github-activity/pr-reviews.md",
     ):
         decision = registry.authorize_tool(
             "read_file", context, enforce=True, arguments={"file_path": file_path},
@@ -399,15 +425,53 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.readonly_backend import WriteGuardBackend
 
+    hard_denials = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: hard_denials.append((kind, fields)),
+    )
     token = set_current_turn(SimpleNamespace(turn_id="fetch-cache-read", auth_context=context))
     try:
-        read_result = WriteGuardBackend(home, ["state"]).read(
-            "/attachments/fetch-cache/body.txt",
+        backend = WriteGuardBackend(home, ["state"])
+        for file_path, expected in (
+            ("/attachments/fetch-cache/body.txt", "fetched\n"),
+            ("/scratch/pr-150-review.md", "review verdict\n"),
+            (
+                "/memory/channels/poller:github-activity/pr-reviews.md",
+                "own channel notes\n",
+            ),
+        ):
+            read_result = backend.read(file_path)
+            assert read_result.error is None
+            assert read_result.file_data["content"] == expected
+        assert hard_denials == []
+
+        home_protected_targets = (
+            other_memory_file,
+            core_file,
+            identities_file,
+            prompt_file,
+            operator_secret,
         )
+        for target in home_protected_targets:
+            read_result = backend.read(str(target))
+            assert read_result.error == "Read denied: protected file", target
     finally:
         reset_current_turn(token)
-    assert read_result.error is None
-    assert read_result.file_data["content"] == "fetched\n"
+    assert len(hard_denials) == len(home_protected_targets)
+    assert all(
+        kind == "hard_boundary_denied"
+        and fields["boundary"] == "protected_read_policy"
+        for kind, fields in hard_denials
+    )
+
+    for target in home_protected_targets:
+        decision = registry.authorize_tool(
+            "read_file", context, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "read_scope"
 
     for target in (persist_dir / "cursor.json", scratch / "pr-1221-review.md"):
         decision = registry.authorize_tool(
