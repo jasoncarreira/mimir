@@ -1098,7 +1098,9 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         options = {
-            "view": frozenset({"--comments", "--json", "--repo", "--template"}),
+            "view": frozenset({
+                "-R", "--comments", "--json", "--repo", "--template",
+            }),
             "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
             "checks": frozenset({
                 "--fail-fast", "--interval", "--json", "--repo",

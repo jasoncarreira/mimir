@@ -253,6 +253,8 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     assert ev["event_type"] == "pr_opened"
     assert "REVIEW SUBMISSION RULE" in ev["prompt"]
     assert "Add config.json" in ev["prompt"]  # base prompt preserved
+    assert "one command per shell call" in ev["prompt"]
+    assert "never use cd, &&, semicolons, pipes, redirects" in ev["prompt"]
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
