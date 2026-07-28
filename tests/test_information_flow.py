@@ -483,6 +483,124 @@ def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement
         assert decision.would_block is False
 
 
+def test_clean_operator_can_direct_channel_and_notification_egress() -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+
+    for tool in ("send_message", "react"):
+        decision = ToolRegistry().authorize_tool(
+            tool, auth, enforce=True, target_channel="slack-C2", ifc_labels=labels,
+        )
+        assert decision.allowed is True, (tool, decision.reason)
+
+    for category in (
+        SinkCategory.CROSS_CHANNEL,
+        SinkCategory.DIRECT_MESSAGE,
+        SinkCategory.NOTIFICATION,
+    ):
+        decision = SinkGate.check_sink_flow(
+            "post_message", "slack-C2", labels, auth, enforce=True,
+            sink_category=category,
+        )
+        assert decision.allowed is True, (category, decision.reason)
+
+    public = SinkGate.check_sink_flow(
+        "post_message", "public", labels, auth, enforce=True,
+        sink_category=SinkCategory.PUBLIC,
+    )
+    assert public.allowed is False
+    assert public.reason == "ifc_label_blocked:public"
+
+
+@pytest.mark.parametrize(
+    "auth_change",
+    [
+        {"roles": ("user",)},
+        {"trigger": "scheduled_tick"},
+        {"interactivity": TurnInteractivity.NON_INTERACTIVE},
+        {"event_ingress": "http-api"},
+        {"bridge_instance": "discord"},
+        {"canonical_principal": "user-2"},
+    ],
+)
+def test_cross_channel_operator_allowance_requires_authenticated_ingress_conjuncts(
+    auth_change: dict[str, object],
+) -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+
+    decision = ToolRegistry().authorize_tool(
+        "send_message", replace(auth, **auth_change), enforce=True,
+        target_channel="slack-C2", ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+
+
+def test_cross_channel_operator_allowance_recloses_for_live_taint_and_source_acl() -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    untrusted = SourceLabel(
+        principal="github", domain="filesystem", resource_id="issue.md",
+        bridge_instance="filesystem", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    tainted = labels.with_source(untrusted)
+    auth.ifc_state.merge(tainted, fallback=labels)
+
+    tainted_decision = ToolRegistry().authorize_tool(
+        "send_message", auth, enforce=True, target_channel="slack-C2",
+        ifc_labels=tainted,
+    )
+    assert tainted_decision.allowed is False
+    assert tainted_decision.reason == "ifc_label_blocked:same_channel"
+
+    clean_auth, clean_labels = _runtime_operator_context(event)
+    unauthorized_private_source = SourceLabel(
+        principal="user-3", domain="protected_tool", resource_id="private-record",
+        bridge_instance="mimir", sensitivity="private",
+        authorized_principals=frozenset({"user-3"}), source_kind="protected_tool",
+        integrity="trusted", integrity_effect="informational",
+    )
+    acl_incompatible = clean_labels.with_source(unauthorized_private_source)
+    acl_decision = ToolRegistry().authorize_tool(
+        "send_message", clean_auth, enforce=True, target_channel="slack-C2",
+        ifc_labels=acl_incompatible,
+    )
+    assert acl_decision.allowed is False
+    assert acl_decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_cross_channel_operator_allowance_fails_closed_if_live_taint_is_unknown() -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    unknown_state = SimpleNamespace(
+        has_untrusted_active_ingest=lambda _: None,
+        consume_sink_approval=lambda **_: False,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "send_message", replace(auth, ifc_state=unknown_state), enforce=True,
+        target_channel="slack-C2", ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
 def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     tmp_path: Path,
 ) -> None:
@@ -554,7 +672,7 @@ def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources
     auth, labels = _runtime_operator_context(event)
     trusted_self_authored = _prompt_source_labels(
         auth, domain="recent_activity", resource="message:self",
-        channel_id="slack-C2", self_authored=True,
+        channel_id="slack-C2", principal="service:mimir", self_authored=True,
     )
     untrusted_other_authored = _prompt_source_labels(
         auth, domain="recent_activity", resource="message:other",

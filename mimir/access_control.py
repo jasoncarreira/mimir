@@ -2728,7 +2728,11 @@ class SinkGate:
         )
         effective_target = (
             ChannelResourceAdapter._resolve_channel(target)
-            if sink_category == SinkCategory.SAME_CHANNEL
+            if sink_category in {
+                SinkCategory.SAME_CHANNEL,
+                SinkCategory.CROSS_CHANNEL,
+                SinkCategory.DIRECT_MESSAGE,
+            }
             else target
         )
 
@@ -2814,6 +2818,42 @@ class SinkGate:
             and callable(getattr(state, "has_untrusted_active_ingest", None))
             else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
         )
+        triggering_channel = getattr(auth_context, "channel_id", None)
+        resolved_target_channel = (
+            ChannelResourceAdapter._resolve_channel(target)
+            if category in {
+                SinkCategory.SAME_CHANNEL,
+                SinkCategory.CROSS_CHANNEL,
+                SinkCategory.DIRECT_MESSAGE,
+            }
+            else target
+        )
+        is_cross_channel_operation = category in {
+            SinkCategory.CROSS_CHANNEL,
+            SinkCategory.DIRECT_MESSAGE,
+            SinkCategory.NOTIFICATION,
+        } or (
+            category is SinkCategory.SAME_CHANNEL
+            and resolved_target_channel
+            != ChannelResourceAdapter._resolve_channel(triggering_channel)
+        )
+        sources = getattr(ifc_labels, "sources", None)
+        if (
+            trusted_operator_turn
+            and has_untrusted_active_ingest is False
+            and "admin" in (getattr(auth_context, "roles", ()) or ())
+            and is_cross_channel_operation
+            and target is not None
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(
+                source.is_complete
+                and getattr(auth_context, "canonical_principal", None)
+                in source.authorized_principals
+                for source in sources
+            )
+        ):
+            return frozenset({resolved_target_channel})
         if (
             trusted_operator_turn
             and not has_untrusted_active_ingest
@@ -2867,7 +2907,6 @@ class SinkGate:
         if category != SinkCategory.SAME_CHANNEL:
             return frozenset()
 
-        triggering_channel = getattr(auth_context, "channel_id", None)
         if not triggering_channel:
             return frozenset()
         resolved_triggering = ChannelResourceAdapter._resolve_channel(triggering_channel)
@@ -2915,10 +2954,9 @@ class SinkGate:
                     if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
                         return frozenset()
             elif source_kind == "protected_prompt":
-                source_is_trusted_self_authored = (
-                    source.integrity == "trusted"
-                    and source.principal == effective_principal
-                )
+                # Framework-authored prompt blocks are marked trusted at their
+                # server-side loader; model output cannot set this provenance.
+                source_is_trusted_self_authored = source.integrity == "trusted"
                 if (
                     not source_is_trusted_self_authored
                     and ChannelResourceAdapter._resolve_channel(source.resource_id)
