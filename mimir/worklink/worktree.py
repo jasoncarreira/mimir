@@ -265,6 +265,67 @@ def create_worktree(
     )
 
 
+#: git's wording when ``clone --local`` cannot hardlink an object. Covers both
+#: hardlink failure modes: EPERM, when an object is owned by another uid and is
+#: not writable under ``fs.protected_hardlinks=1``, and EXDEV, when source and
+#: destination sit on different filesystems.
+_HARDLINK_FAILURE_MARKER = "failed to create link"
+
+
+def _clone_attempt_checkout(
+    repo: Path,
+    path: Path,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> None:
+    """Clone ``repo`` into ``path``, degrading to an object copy if it must.
+
+    ``--local`` hardlinks the object store and so costs essentially no disk
+    (measured: ~0 MB against 179 MB for the same clone with ``--no-hardlinks``).
+    It fails outright when even one object cannot be linked, which is not
+    hypothetical: a root-owned mode-444 object in a repo checked out by another
+    user is enough, and any process writing objects as a different uid creates
+    one. Every Worklink build on 2026-07-28 died one second after claiming on
+    exactly that, taking three attempts each off two leaves.
+
+    The retry is keyed on git's own error rather than a pre-flight scan of the
+    object store. A scan would have to guess which uid performs the clone --
+    the caller and the cloning subprocess need not share one -- and would be
+    wrong whenever that guess is wrong. Reacting to the failure cannot be wrong
+    about it, needs no stat of ~5k objects, and pays the copy only in the broken
+    case. An unrelated clone failure is re-raised untouched, so this never
+    silently converts a real error into a slow success.
+    """
+    clone = runner(["git", "clone", "--local", "--quiet", str(repo), str(path)])
+    if clone.returncode == 0:
+        return
+    detail = (clone.stderr or clone.stdout).strip()
+    if _HARDLINK_FAILURE_MARKER not in detail:
+        raise RuntimeError(detail or "git clone failed")
+
+    # The failed clone leaves a partial directory; --no-hardlinks needs a clean
+    # target, and create_isolated_checkout already refused a pre-existing path.
+    shutil.rmtree(path, ignore_errors=True)
+    if event_logger is not None:
+        event_logger(
+            "worklink_checkout_hardlink_fallback",
+            repo=str(repo),
+            path=str(path),
+            # Named rather than swallowed: a fallback that stays invisible turns
+            # a fixable ownership problem into a permanent disk cost nobody
+            # investigates.
+            detail=detail[:300],
+        )
+    copied = runner(
+        ["git", "clone", "--local", "--no-hardlinks", "--quiet", str(repo), str(path)],
+    )
+    if copied.returncode != 0:
+        raise RuntimeError(
+            (copied.stderr or copied.stdout).strip() or "git clone failed",
+        )
+
+
 def create_isolated_checkout(
     repo: Path,
     *,
@@ -307,9 +368,7 @@ def create_isolated_checkout(
         raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
     local_base = start_sha.stdout.strip()
 
-    clone = runner(["git", "clone", "--local", "--quiet", str(repo), str(path)])
-    if clone.returncode != 0:
-        raise RuntimeError((clone.stderr or clone.stdout).strip() or "git clone failed")
+    _clone_attempt_checkout(repo, path, runner=runner, event_logger=event_logger)
 
     remote = runner(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
     if remote.returncode == 0 and remote.stdout.strip():
