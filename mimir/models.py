@@ -521,6 +521,20 @@ class SessionACL:
 
 
 @dataclass(frozen=True)
+class RepoReviewState:
+    """Server-bound branch scope and monotonic checkout proof for one PR turn."""
+
+    repo: str
+    pr_number: int
+    head_ref: str
+    root: str
+    checked_out: bool = field(default=False, init=False, compare=False)
+
+    def mark_checked_out(self) -> None:
+        object.__setattr__(self, "checked_out", True)
+
+
+@dataclass(frozen=True)
 class AuthContext:
     """Frozen, server-created authorization context (chainlink #864).
 
@@ -567,6 +581,12 @@ class AuthContext:
     )
     egress_state: EgressSessionState = field(
         default_factory=EgressSessionState, repr=False, compare=False,
+    )
+    # Present only on a server-created github poller turn for one own-PR
+    # remediation event. The mutable bit is monotonic and records successful
+    # checkout; the authority-bearing scope itself remains frozen.
+    repo_review_state: RepoReviewState | None = field(
+        default=None, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.

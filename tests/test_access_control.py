@@ -37,6 +37,8 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
+    RepoReviewState,
     SessionACL,
     SourceLabel,
     TurnContext,
@@ -3300,7 +3302,6 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
         "git log --oneline --max-count=10",
         "git diff --stat HEAD~1",
         "git fetch origin pull/979/head",
-        "git checkout review-979",
         "npm ci --ignore-scripts --no-audit --no-fund",
         "npm test -- --run",
         "npm run test",
@@ -3354,6 +3355,250 @@ def test_repo_review_shell_profile_admits_pr_view_repo_alias(
 )
 def test_repo_review_shell_profile_rejects_gh_api(command: str) -> None:
     assert parse_service_shell_argv(command, "repo_review") is None
+def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    state = RepoReviewState("o/r", 979, "worklink/979", str(root.resolve()))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+    registry = ToolRegistry()
+
+    checkout_commands = (
+        "gh pr checkout 979 --repo o/r --branch worklink/979",
+        f"git -C {root} checkout worklink/979",
+    )
+    for command in checkout_commands:
+        assert registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        ).allowed is True
+
+    push = f"git -C {root} push origin worklink/979:worklink/979"
+    assert registry.authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=push,
+    ).allowed is False
+
+    state.mark_checked_out()
+    for command in (
+        f"git -C {root} add --all",
+        f"git -C {root} commit -m 'Address review feedback'",
+        push,
+    ):
+        decision = registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        )
+        assert decision.allowed is True, (command, decision.refusal_detail)
+
+    for command in (
+        f"git -C {root} push --force origin worklink/979:worklink/979",
+        f"git -C {root} push origin worklink/979:main",
+        f"git -C {root} push origin main:main",
+        f"git -C {root} push --delete origin worklink/979",
+        f"git -C {root} push --mirror origin",
+        f"git -C {root} checkout main",
+        f"git -C {root} reset --hard HEAD~1",
+        f"git -C {root} rebase main",
+        f"git -C {root} config credential.helper store",
+        f"git -C {tmp_path} push origin worklink/979:worklink/979",
+        "gh pr checkout 979 --repo attacker/other --branch worklink/979",
+        "gh pr checkout 979 --repo o/r --branch main",
+    ):
+        assert registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        ).allowed is False, command
+
+
+def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    state = RepoReviewState("o/r", 7, "worklink/7", str(root.resolve()))
+    state.mark_checked_out()
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    source = SourceLabel(
+        principal="service:poller:github-activity", domain="channel",
+        resource_id="poller:test", bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="service", integrity="trusted", integrity_effect="active_ingest",
+    )
+    trusted = InformationFlowLabels().with_channel("poller:test").with_source(source)
+    tainted = InformationFlowLabels().with_channel("poller:test").with_source(
+        replace(source, integrity="untrusted")
+    )
+    command = f"git -C {root} push origin worklink/7:worklink/7"
+
+    allowed = ToolRegistry().authorize_tool(
+        "shell_exec",
+        replace(
+            _service_auth(service, trusted), repo_review_state=state,
+            ifc_state=InformationFlowState(labels=trusted),
+        ),
+        enforce=True,
+        target_channel=command,
+        ifc_labels=trusted,
+    )
+    blocked = ToolRegistry().authorize_tool(
+        "shell_exec",
+        replace(
+            _service_auth(service, tainted), repo_review_state=state,
+            ifc_state=InformationFlowState(labels=tainted),
+        ),
+        enforce=True,
+        target_channel=command,
+        ifc_labels=tainted,
+    )
+
+    assert allowed.allowed is True
+    assert blocked.allowed is False
+    assert blocked.reason == "ifc_label_blocked:shell_process"
+
+
+@pytest.mark.asyncio
+async def test_repo_review_successful_checkout_unlocks_same_branch_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    state = RepoReviewState("o/r", 12, "worklink/12", str(root.resolve()))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()), repo_review_state=state,
+    )
+    seen: list[list[str]] = []
+
+    async def handler(request):
+        seen.append(request.tool_call["args"]["mimir_direct_argv"])
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    middleware = BudgetGateMiddleware()
+    before = await middleware.awrap_tool_call(
+        _tool_request(
+            auth, tool_name="shell_exec",
+            args={"command": f"git -C {root} push origin worklink/12:worklink/12"},
+        ),
+        handler,
+    )
+    assert before.status == "error"
+    assert state.checked_out is False
+
+    checkout = await middleware.awrap_tool_call(
+        _tool_request(
+            auth, tool_name="shell_exec",
+            args={"command": "gh pr checkout 12 --repo o/r --branch worklink/12"},
+        ),
+        handler,
+    )
+    assert checkout.status != "error"
+    assert state.checked_out is True
+
+    pushed = await middleware.awrap_tool_call(
+        _tool_request(
+            auth, tool_name="shell_exec",
+            args={"command": f"git -C {root} push origin worklink/12:worklink/12"},
+        ),
+        handler,
+    )
+    assert pushed.status != "error"
+    assert seen[-1][-3:] == ["push", "origin", "worklink/12:worklink/12"]
+
+
+def test_github_poller_binds_review_scope_from_server_event_and_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "remote", "add", "origin", "git@github.com:o/r.git"],
+        check=True,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={
+            "poller_name": "github-activity",
+            "items": [{
+                "event_type": "pr_changes_requested_stale",
+                "repo": "o/r", "number": 42, "head_ref": "worklink/42",
+            }],
+        },
+    )
+
+    auth = create_auth_context(event, enforce=True)
+
+    assert auth.repo_review_state == RepoReviewState(
+        "o/r", 42, "worklink/42", str(root.resolve()),
+    )
+
+    steered = replace(
+        event,
+        extra={**event.extra, "items": [{
+            "event_type": "pr_changes_requested_stale",
+            "repo": "attacker/other", "number": 42, "head_ref": "main",
+        }]},
+    )
+    assert create_auth_context(steered, enforce=True).repo_review_state is None
 
 
 def test_every_service_shell_profile_returns_absolute_executables(
@@ -3695,6 +3940,7 @@ def test_admitted_service_shell_command_without_pin_fails_closed(
     [
         "rm -rf .",
         "git push --force origin HEAD",
+        "git checkout review-979",
         "git reset --hard HEAD~1",
         "git rebase -i HEAD~2",
         "git config credential.helper store",

@@ -617,6 +617,86 @@ def _configured_repo_roots() -> list[Path]:
         os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
     )
     return [Path(path) for path, _mode in extra_roots]
+def _github_repo_from_remote(remote: str) -> str | None:
+    """Normalize a GitHub origin URL to its owner/repository slug."""
+    value = remote.strip()
+    match = re.fullmatch(
+        r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)([^/\s]+)/([^/\s]+?)(?:\.git)?/?",
+        value,
+    )
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def _valid_git_branch(value: object) -> bool:
+    """Apply Git's relevant ref-name exclusions without consulting a repository."""
+    if not isinstance(value, str) or not value or len(value) > 255:
+        return False
+    return not (
+        value.startswith(("-", ".", "/"))
+        or value.endswith((".", "/", ".lock"))
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+        or any(character in value for character in " ~^:?*[\\\x7f")
+        or any(ord(character) < 32 for character in value)
+        or any(part.startswith(".") or part.endswith(".lock") for part in value.split("/"))
+    )
+
+
+def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None) -> Any:
+    """Derive one immutable own-PR branch scope from trusted poller metadata."""
+    if (
+        service is None
+        or service.authority_profile != "github"
+        or event.trigger != "poller"
+        or not isinstance(event.extra, dict)
+    ):
+        return None
+    items = event.extra.get("items")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return None
+    item = items[0]
+    repo = item.get("repo")
+    number = item.get("number")
+    head_ref = item.get("head_ref")
+    if (
+        item.get("event_type") != "pr_changes_requested_stale"
+        or not isinstance(repo, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+        or not _valid_git_branch(head_ref)
+    ):
+        return None
+
+    git = _maintenance_resolved_pin("git")
+    if git is None:
+        return None
+    matching_roots: list[Path] = []
+    for configured in _configured_repo_write_roots():
+        try:
+            root = configured.resolve(strict=True)
+            result = subprocess.run(
+                [str(git), "-C", str(root), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+                 "config", "--local", "--get", "remote.origin.url"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                env=_maintenance_git_probe_env(),
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0 and _github_repo_from_remote(result.stdout) == repo:
+            matching_roots.append(root)
+    if len(matching_roots) != 1:
+        return None
+
+    from .models import RepoReviewState
+
+    return RepoReviewState(repo, number, head_ref, str(matching_roots[0]))
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -1094,7 +1174,54 @@ def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
     return out
 
 
-def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
+def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
+    """Return hardened argv for the branch-scoped Git mutation allow-list."""
+    if argv[:3] != ["git", "-C", state.root] or len(argv) < 4:
+        return None
+    subcommand = argv[3]
+    arguments = argv[4:]
+    branch = state.head_ref
+    if subcommand == "checkout":
+        allowed = arguments == [branch]
+    elif subcommand == "add":
+        allowed = state.checked_out and arguments in (["--all"], ["-A"])
+    elif subcommand == "commit":
+        allowed = (
+            state.checked_out
+            and len(arguments) == 2
+            and arguments[0] == "-m"
+            and bool(arguments[1].strip())
+        )
+    elif subcommand == "push":
+        allowed = state.checked_out and arguments == ["origin", f"{branch}:{branch}"]
+    else:
+        return None
+    if not allowed:
+        return None
+
+    git = _maintenance_resolved_pin("git")
+    if git is None:
+        return None
+    filter_overrides = _maintenance_git_filter_overrides(Path(state.root), str(git))
+    if filter_overrides is None:
+        return None
+    transport_overrides = (
+        ["-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]
+        if subcommand == "push"
+        else []
+    )
+    return [
+        str(git), "-C", state.root,
+        *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        *transport_overrides,
+        *filter_overrides,
+        "--no-pager", subcommand, *arguments,
+    ]
+
+
+def _target_matches_repo_review_shell_command(
+    argv: list[str], review_state: Any = None,
+) -> bool:
     """Validate commands needed to inspect and test a trusted repository PR."""
     if _target_matches_read_only_shell_command(argv):
         return True
@@ -1124,6 +1251,12 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     # before adding any option that evaluates a caller-supplied expression.
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
+        if subcommand == "checkout":
+            return review_state is not None and argv[3:] == [
+                str(review_state.pr_number),
+                "--repo", review_state.repo,
+                "--branch", review_state.head_ref,
+            ]
         options = {
             "view": frozenset({
                 "-R", "--comments", "--json", "--repo", "--template",
@@ -1164,6 +1297,9 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
         # option is permitted.
         return True
 
+    if argv[0] == "git" and review_state is not None and argv[1:2] == ["-C"]:
+        return _repo_review_git_execution_argv(argv, review_state) is not None
+
     if argv[0] == "git" and len(argv) >= 2:
         subcommand = argv[1]
         arguments = argv[2:]
@@ -1193,14 +1329,6 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
             # A URL or ext:: remote can select a helper executable. Review
             # fetches use only the checkout's conventional configured remotes.
             return not operands or operands[0] in {"origin", "upstream"}
-        if subcommand == "checkout":
-            return _arguments_match_allowlist(
-                arguments,
-                exact_options=frozenset({
-                    "--detach", "--guess", "--no-guess", "--no-overlay", "--overlay",
-                    "--progress", "--quiet",
-                }),
-            )
         return False
 
     if argv[0] == "npm":
@@ -1669,7 +1797,7 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
 
 
 def parse_service_shell_argv_with_reason(
-    target: str, destination: str,
+    target: str, destination: str, *, review_state: Any = None,
 ) -> tuple[list[str] | None, str]:
     """Return the argv a service shell profile admits, or why it refused.
 
@@ -1718,8 +1846,13 @@ def parse_service_shell_argv_with_reason(
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
-        if not _target_matches_repo_review_shell_command(argv):
+        if not _target_matches_repo_review_shell_command(argv, review_state):
             return None, _service_shell_not_admitted_reason(argv, destination)
+        if argv[:2] == ["git", "-C"]:
+            git_argv = _repo_review_git_execution_argv(argv, review_state)
+            if git_argv is None:
+                return None, _service_shell_not_admitted_reason(argv, destination)
+            return git_argv, ""
         pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
         if pinned is None:
             return None, reason
@@ -1764,13 +1897,17 @@ def parse_service_shell_argv_with_reason(
     return _maintenance_pinned_execution_argv_with_reason(argv)
 
 
-def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
+def parse_service_shell_argv(
+    target: str, destination: str, *, review_state: Any = None,
+) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
-    return parse_service_shell_argv_with_reason(target, destination)[0]
+    return parse_service_shell_argv_with_reason(
+        target, destination, review_state=review_state,
+    )[0]
 
 
 def _service_shell_refusal_detail(
-    target: object, policy: "ServiceSinkPolicy | None",
+    target: object, policy: "ServiceSinkPolicy | None", review_state: Any = None,
 ) -> str | None:
     """Prose for a shell-profile refusal; ``None`` for every other adapter.
 
@@ -1784,7 +1921,9 @@ def _service_shell_refusal_detail(
         or not isinstance(target, str)
     ):
         return None
-    argv, reason = parse_service_shell_argv_with_reason(target, policy.destination)
+    argv, reason = parse_service_shell_argv_with_reason(
+        target, policy.destination, review_state=review_state,
+    )
     return None if argv is not None else reason
 
 
@@ -2147,6 +2286,15 @@ class SinkGate:
             and callable(getattr(state, "has_untrusted_active_ingest", None))
             else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
         )
+        # Shell is an executable sink even when argv is tightly scoped. The
+        # profile bounds capability; IFC independently prevents untrusted PR
+        # content from exercising that capability on the same turn.
+        if (
+            service.authority_profile == "github"
+            and tool_name in {"shell_exec", "bash_async"}
+            and has_untrusted_active_ingest
+        ):
+            return False
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return tool_name == "worklink_run" and not has_untrusted_active_ingest
         if capability_tier is CapabilityTier.UNBOUNDED:
@@ -2393,6 +2541,22 @@ class SinkGate:
                 if service_policy is not None
                 else None
             )
+            review_state = getattr(auth_context, "repo_review_state", None)
+            service_target_allowed = False
+            if service_policy is not None and adapter is not None:
+                if (
+                    adapter is _target_matches_shell_profile
+                    and service_policy.destination == "repo_review"
+                ):
+                    service_target_allowed = parse_service_shell_argv(
+                        target,
+                        service_policy.destination,
+                        review_state=review_state,
+                    ) is not None
+                else:
+                    service_target_allowed = adapter(
+                        target, service_policy.destination,
+                    )
             synthesis_scope_denied = (
                 service.canonical == "synthesis"
                 and sink_category is SinkCategory.FILE
@@ -2403,7 +2567,7 @@ class SinkGate:
             if (
                 adapter is None
                 or synthesis_scope_denied
-                or not adapter(target, service_policy.destination)
+                or not service_target_allowed
             ):
                 return ToolAuthorization(
                     tool_name=tool_name,
@@ -2417,7 +2581,7 @@ class SinkGate:
                     would_block=True,
                     resolved_sink_target=resolved_target,
                     refusal_detail=_service_shell_refusal_detail(
-                        target, service_policy,
+                        target, service_policy, review_state,
                     ),
                 )
 
@@ -4367,6 +4531,33 @@ def classify_protected_result(
             ))
         return labels
 
+    if (
+        tool_name in {"shell_exec", "bash_async"}
+        and getattr(auth_context, "repo_review_state", None) is not None
+        and not failed
+    ):
+        # A review turn necessarily needs several shell steps. Preserve the
+        # output's untrusted integrity without treating each authorized command
+        # as a new active external ingest that would deadlock the next step.
+        principal = getattr(auth_context, "canonical_principal", None)
+        if principal:
+            principal = f"service:{principal}"
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=principal,
+            domain="shell",
+            resource_id="repo_review",
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            integrity_effect="informational",
+        ))
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+
     artifact = getattr(result, "artifact", None)
     if provenance is None and isinstance(artifact, ProtectedResultProvenance):
         provenance = artifact
@@ -5282,6 +5473,7 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         service_authority=registered_service if is_service else None,
+        repo_review_state=_repo_review_state_from_event(event, registered_service),
         enforcement_enabled=enforce,
         source_session_acl=(
             event.source_session_acl

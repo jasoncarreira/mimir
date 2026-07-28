@@ -1287,6 +1287,7 @@ def _check_own_changes_requested(
             number=number,
             url=url,
             head=head_sha,
+            head_ref=(pr.get("head") or {}).get("ref"),
             reviewers=sorted(blocking),
             author=(pr.get("user") or {}).get("login"),
             attempt=attempt,
