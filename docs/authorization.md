@@ -342,8 +342,8 @@ network, shell, spawn, notification, and file destinations. `SinkGate.check_sink
   sinks.
 
 The sink check runs before a model-invoked egress tool. Harness-owned final-text
-delivery and activity-panel post/edit paths invoke an enforced sink check at the
-final boundary even while general authorization is in shadow mode. SAGA
+delivery and activity-panel post/edit paths invoke the same sink check at the
+final boundary and obey the configured enforcement mode. SAGA
 ownership does not currently generate field-level IFC labels; after authorized
 recall, injected prompt context receives the conservative turn-level taint.
 
@@ -358,7 +358,7 @@ boundary.
 
 | Setting | Default | Authorization effect |
 |---|---|---|
-| `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open denial and harness egress checks remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open ingress and the always-on boundaries listed below remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
 | `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the model provider. The shipped default is enforcement-compatible. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned opaque carrier, so `claude-code:*` is also compatible with enforcement. |
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
@@ -608,9 +608,34 @@ Inspect structured inbound decisions and `shadow_tool_decision` events for:
 - IFC blocks caused by unknown sinks, missing targets, mixed source channels, or
   protected prompt/tool data reaching an active sink.
 
-Generic HTTP non-open denial and final harness egress checks are already hard
-boundaries in this phase. Do not interpret their denials as evidence that global
-enforcement is enabled.
+Count `shadow_tool_decision` records with `would_block: true` as projected
+enforcement denials. Records with `would_block: false` are projected permits;
+legacy records without the field are unclassifiable and must not be inferred
+from `allowed` or `reason`.
+
+Count `hard_boundary_denied` separately as actions that did not happen. These
+records can be unioned with shadow decisions for workflow-impact analysis, but
+must not be included in projected-enforcement totals. Their `boundary` and
+machine-readable `reason` identify the refusal, while `target`, `trigger`, and
+`service_principal` identify the affected workflow; targets are secret-scrubbed.
+
+The enforcement-independent denial inventory is:
+
+- generic HTTP ingress invoking a non-open operation (`http_event_ingress`);
+- final trusted-service shell argv binding (`service_shell_argv_binding`);
+- missing or invalid maintenance executable pins (`maintenance_pinned_executable`);
+- protected direct and collection reads for non-admin, non-service callers
+  (`protected_read_policy`);
+- writes outside configured writable roots and mutations routed to read-only
+  backends (`filesystem_write_guard`, `readonly_filesystem`);
+- the prohibited-action guardrail (`prohibited_action_guard`); and
+- exhausted per-turn tool-call budgets (`tool_call_budget`).
+
+An incomplete capability matrix emits the same event shape under
+`capability_matrix_preflight`; startup is refused when enforcement was requested.
+MCP classifier failures, middleware read-scope decisions, and final harness IFC
+egress remain ordinary enforcement decisions: with enforcement off they proceed
+and emit shadow/would-block evidence rather than a hard denial.
 
 #### 2026-07-27 low-count residue classification (#1017)
 

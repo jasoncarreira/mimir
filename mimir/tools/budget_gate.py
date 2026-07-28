@@ -171,13 +171,50 @@ def _emit_event_sync(kind: str, **kwargs: Any) -> None:
     (the denial text on the returned ToolMessage is still load-bearing).
     """
     try:
-        from ..event_logger import log_event  # lazy: supports monkeypatching in tests
+        from ..event_logger import safe_log_event
         loop = asyncio.get_running_loop()
-        task = loop.create_task(log_event(kind, **kwargs))
+        task = loop.create_task(safe_log_event(kind, **kwargs))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
     except RuntimeError:
         log.debug("budget event %s dropped: no running loop", kind)
+
+
+def _emit_hard_boundary_denied(
+    *,
+    tool: str,
+    boundary: str,
+    reason: str,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+    turn_context: Any | None = None,
+) -> None:
+    """Record an action that an always-on boundary actually refused."""
+    if auth_context is None and turn_context is not None:
+        candidate = getattr(turn_context, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+    if auth_context is None:
+        active_turn = _get_current_turn_context()
+        candidate = getattr(active_turn, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+
+    from ..redaction import redact_payload
+
+    service = get_trusted_service_from_auth_context(auth_context)
+    _emit_event_sync(
+        "hard_boundary_denied",
+        tool=tool,
+        boundary=boundary,
+        reason=reason,
+        # Pre-scrub for replaced emitters and other pre-persistence consumers.
+        target=redact_payload(target),
+        trigger=(
+            getattr(auth_context, "origin_trigger", None)
+            or getattr(auth_context, "trigger", None)
+            or getattr(turn_context, "trigger", None)
+        ),
+        service_principal=service.canonical if service is not None else None,
+    )
 
 
 def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
@@ -207,7 +244,13 @@ def _mark_budget_denied(ctx: Any, tool_name: str, count: int) -> None:
         ctx.tool_call_budget_first_denied_at_count = count
 
 
-def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str | None:
+def _check_and_increment_or_deny(
+    tool_name: str,
+    ctx: Any | None = None,
+    *,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
@@ -229,6 +272,14 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
             count=count,
             budget=budget,
             turn_id=getattr(ctx, "turn_id", None),
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="tool_call_budget",
+            reason="tool_call_budget_exhausted",
+            target=target,
+            auth_context=auth_context,
+            turn_context=ctx,
         )
         return _budget_denied_message(tool_name, count, budget)
     new_count = count + 1
@@ -412,14 +463,25 @@ def _request_for_authorized_execution(
             policy.destination,
             target[:200],
         )
-        # Tell the CALLER why, in the tool result. Binding ``/usr/bin/false``
-        # alone made every refusal look identical — it ignores its arguments, so
-        # the agent saw "exit 1, empty output" and could not distinguish a
-        # profile refusal from a broken binary or a dead runtime. It retried the
-        # same rejected shape, and diagnosed a stale deployment that was in fact
-        # current. The refusal is served from here without executing anything;
-        # the argv below stays as defense in depth, so a future refactor that
-        # drops this channel still fails closed rather than reaching a shell.
+        # Record it for the audit stream: this boundary fails closed whether or
+        # not enforcement is on, so without an event the refusal is invisible to
+        # the enablement evidence (#1012).
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="service_shell_argv_binding",
+            reason="service_shell_argv_binding_failed",
+            target=target,
+            auth_context=auth_context,
+        )
+        # ...and tell the CALLER why, in the tool result. Binding
+        # ``/usr/bin/false`` alone made every refusal look identical — it ignores
+        # its arguments, so the agent saw "exit 1, empty output" and could not
+        # distinguish a profile refusal from a broken binary or a dead runtime.
+        # It retried the same rejected shape, and diagnosed a stale deployment
+        # that was in fact current. The refusal is served from here without
+        # executing anything; the argv below stays as defense in depth, so a
+        # future refactor that drops this channel still fails closed rather than
+        # reaching a shell.
         args["mimir_shell_refusal"] = (
             f"{tool_name} was refused before execution: {refusal}"
         )
@@ -623,6 +685,7 @@ def _deny_admin_tool(
     *,
     ctx: Any | None,
     enforcement_enabled: bool,
+    target: Any = None,
     detail: str | None = None,
 ) -> str:
     author, canonical_author, roles = _admin_identity_fields(ctx)
@@ -646,6 +709,14 @@ def _deny_admin_tool(
         author=author,
         canonical_author=canonical_author,
     )
+    if reason == _HTTP_EVENT_ADMIN_DENIAL_REASON:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="http_event_ingress",
+            reason=reason,
+            target=target,
+            auth_context=ctx if isinstance(ctx, AuthContext) else None,
+        )
     # ``reason`` stays the machine key on both events; the prose detail is for
     # the caller's tool result only, so the audit stream keeps grouping cleanly.
     return _admin_denial_message(tool_name, reason, detail)
@@ -706,6 +777,7 @@ def _authorize_tool_call(
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
             enforcement_enabled=enforce,
+            target=target_channel,
         )
 
     privileged = auth.required_tier.value == "admin" or not auth.allowed
@@ -910,6 +982,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="prohibited_action_guard",
+                reason="prohibited_action",
+                target=_extract_sink_target(request, auth_context),
+                auth_context=auth_context,
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
             )
@@ -920,7 +999,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        denial = _check_and_increment_or_deny(tool_name)
+        denial = _check_and_increment_or_deny(
+            tool_name,
+            target=_extract_sink_target(request, auth_context),
+            auth_context=auth_context,
+        )
         if denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(
@@ -1080,6 +1163,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="prohibited_action_guard",
+                reason="prohibited_action",
+                target=_extract_sink_target(request, auth_context),
+                auth_context=auth_context,
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
             )
@@ -1090,7 +1180,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        denial = _check_and_increment_or_deny(tool_name)
+        denial = _check_and_increment_or_deny(
+            tool_name,
+            target=_extract_sink_target(request, auth_context),
+            auth_context=auth_context,
+        )
         if denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(

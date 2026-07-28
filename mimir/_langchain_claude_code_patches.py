@@ -258,6 +258,7 @@ def _claude_code_pre_tool_enforcement(
         _check_and_increment_or_deny,
         _current_ifc_labels,
         _emit_event_sync,
+        _emit_hard_boundary_denied,
         _emit_tool_call_sync,
         _extract_sink_target,
     )
@@ -287,6 +288,13 @@ def _claude_code_pre_tool_enforcement(
                     tool=tool_name,
                     reason=prohibition[:200],
                 )
+                _emit_hard_boundary_denied(
+                    tool=tool_name,
+                    boundary="prohibited_action_guard",
+                    reason="prohibited_action",
+                    target=command,
+                    auth_context=auth_context,
+                )
                 _emit_tool_call_sync(
                     tool_name,
                     ok=False,
@@ -307,7 +315,12 @@ def _claude_code_pre_tool_enforcement(
     from ._context import get_current_turn, get_turn_by_session_id
 
     budget_ctx = get_current_turn() or get_turn_by_session_id(session_id)
-    denial = _check_and_increment_or_deny(tool_name, budget_ctx)
+    denial = _check_and_increment_or_deny(
+        tool_name,
+        budget_ctx,
+        target=sink_target,
+        auth_context=auth_context,
+    )
     if denial is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, denial)

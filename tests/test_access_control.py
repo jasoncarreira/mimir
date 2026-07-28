@@ -1853,6 +1853,58 @@ async def test_service_shell_executes_the_exact_authorized_argv(
     ]
 
 
+def test_service_shell_final_binding_refusal_emits_hard_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal="scheduler",
+        ),
+        enforce=False,
+    )
+    command = "gh pr view 7 --repo o/r --json token=ghp_secretvalue"
+    request = _tool_request(
+        auth_context,
+        tool_name="shell_exec",
+        args={"command": command},
+    )
+    captured: list[tuple[str, dict[str, object]]] = []
+    # #1223 replaced the parser with a two-value contract: the admitted argv and
+    # the reason it was refused. Forcing a binding failure means returning both.
+    monkeypatch.setattr(
+        budget_gate,
+        "parse_service_shell_argv_with_reason",
+        lambda *_args: (None, "forced binding failure"),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        request, "shell_exec", auth_context,
+    )
+
+    assert bound.tool_call["args"]["mimir_direct_argv"] == [
+        "/usr/bin/false",
+        "trusted-service shell argv binding failed closed",
+    ]
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard == {
+        "tool": "shell_exec",
+        "boundary": "service_shell_argv_binding",
+        "reason": "service_shell_argv_binding_failed",
+        "target": "gh pr view 7 --repo o/r --json token=[REDACTED]",
+        "trigger": "scheduled_tick",
+        "service_principal": "scheduler",
+    }
+
+
 @pytest.mark.asyncio
 async def test_service_shell_executes_pinned_non_git_argv(
     tmp_path: Path,
@@ -3328,11 +3380,20 @@ def test_pinned_script_without_pinned_interpreter_fails_closed(
 def test_admitted_service_shell_command_without_pin_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
     monkeypatch.delitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm")
 
     assert parse_service_shell_argv(
         "npm ci --ignore-scripts", "repo_review",
     ) is None
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["boundary"] == "maintenance_pinned_executable"
+    assert hard["reason"] == "maintenance_executable_pin_missing"
+    assert hard["target"] == "npm"
 
 
 @pytest.mark.parametrize(

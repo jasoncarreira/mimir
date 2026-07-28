@@ -1398,6 +1398,14 @@ def _maintenance_resolved_pin(command: str) -> Path | None:
     """Validate one pin as a trusted executable outside service-writable roots."""
     expected = _MAINTENANCE_PINNED_EXECUTABLES.get(command)
     if expected is None:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_missing",
+            target=command,
+        )
         return None
     try:
         resolved = expected.resolve(strict=True)
@@ -1411,6 +1419,14 @@ def _maintenance_resolved_pin(command: str) -> Path | None:
         log.error(
             "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
             command, expected, exc,
+        )
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_invalid",
+            target=str(expected),
         )
         return None
     return resolved
@@ -4569,6 +4585,14 @@ def check_capability_matrix_complete(
     if errors:
         for error in errors:
             log.warning("capability_matrix_incomplete: %s", error)
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
         return (False, errors)
     return (True, [])
 
@@ -4577,6 +4601,14 @@ def assert_capability_matrix_complete() -> None:
     """Raise unless the enforcement matrix is complete and consistent."""
     errors = _capability_matrix_errors()
     if errors:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
         raise CapabilityMatrixError(
             "Access-control enforcement blocked by incomplete capability matrix: "
             + "; ".join(errors)
