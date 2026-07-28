@@ -162,6 +162,22 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
             finally:
                 _grep_context.reset(token)
 
+        # This module uses ``from __future__ import annotations``, so every
+        # annotation above is a string at runtime. LangChain decides which
+        # arguments are runtime-injected in
+        # ``StructuredTool._injected_args_keys``, which reads the RAW
+        # ``inspect.signature`` annotation and never resolves it via
+        # ``get_type_hints``. A stringified ``"ToolRuntime"`` is therefore not
+        # recognised as injected, and ``BaseTool._parse_input`` drops any key
+        # that is neither an ``args_schema`` field nor a known injected arg --
+        # so LangGraph's injected ``runtime`` was discarded and the wrapper was
+        # called without it. Bind the real class so detection sees an object.
+        # ``_injected_args_keys`` is a cached_property, so this must happen
+        # before the tool is first invoked; doing it here keeps it adjacent to
+        # the signatures it describes.
+        for wrapper in (sync_grep, async_grep):
+            wrapper.__annotations__["runtime"] = ToolRuntime
+
         return StructuredTool.from_function(
             name="grep",
             description=stock_tool.description,

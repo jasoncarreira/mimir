@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from deepagents.middleware.filesystem import FilesystemMiddleware
 
 from mimir.readonly_backend import (
     FileToolRouter,
@@ -854,6 +855,57 @@ class TestBuildFileToolRoutes:
         assert "1: before" in result.content
         assert "2: needle" in result.content
         assert "3: after" in result.content
+
+    def test_grep_tool_declares_every_injected_arg_the_stock_tool_declares(
+        self, tmp_path: Path,
+    ) -> None:
+        """Our wrapper must not lose an injected argument the stock tool has.
+
+        LangChain decides this in ``StructuredTool._injected_args_keys``, which
+        reads the raw ``inspect.signature`` annotation without resolving it
+        through ``get_type_hints``. Because ``mimir.readonly_backend`` uses
+        ``from __future__ import annotations`` while deepagents' filesystem
+        module does not, our ``runtime`` annotation is a plain string and was
+        not recognised as injected -- which silently dropped it during input
+        validation. Compare against the stock tool rather than hard-coding
+        ``{"runtime"}`` so a new injected parameter upstream also trips this.
+        """
+        backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+        stock_tool = FilesystemMiddleware(backend=backend)._create_grep_tool()
+        our_tool = MimirFilesystemMiddleware(backend=backend)._create_grep_tool()
+
+        assert stock_tool._injected_args_keys, "stock tool declares no injected args"
+        missing = stock_tool._injected_args_keys - our_tool._injected_args_keys
+        assert not missing, f"wrapper dropped injected args: {sorted(missing)}"
+
+    def test_grep_tool_keeps_injected_runtime_through_input_validation(
+        self, tmp_path: Path,
+    ) -> None:
+        """Invoke the way LangGraph does, so validation is exercised.
+
+        ``ToolNode`` puts the resolved runtime into the tool-call arguments and
+        then invokes the tool, so the value has to survive
+        ``BaseTool._parse_input``. Calling ``grep_tool.func`` directly (as the
+        schema test above does) hands ``runtime`` over by hand and therefore
+        cannot see it being discarded.
+        """
+        (tmp_path / "sample.txt").write_text("before\nneedle\nafter\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+        middleware = MimirFilesystemMiddleware(backend=backend)
+        grep_tool = next(tool for tool in middleware.tools if tool.name == "grep")
+
+        result = grep_tool.invoke({
+            "pattern": "needle",
+            "path": "/sample.txt",
+            "output_mode": "content",
+            "before_context": 1,
+            "after_context": 1,
+            # Mirrors ToolNode._inject_tool_args putting the runtime in the args.
+            "runtime": SimpleNamespace(tool_call_id="grep-injected"),
+        })
+
+        assert "2: needle" in result.content
+        assert result.status == "success"
 
     def test_glob_skips_worktrees_and_caps_matches_without_result_error(
         self, tmp_path: Path, caplog,
