@@ -158,6 +158,11 @@ BODY_PREVIEW_CHARS = 300
 # signal fires.
 REVIEW_REQUEST_MAX_ATTEMPTS = 3
 
+_RECOVERY_STATE_FILE = ".recovery.json"
+_REVIEW_TURN_EVENT_TYPES = frozenset({
+    "pr_opened", "pr_synchronize", "pr_review_requested",
+})
+
 # Unresolved review feedback is re-reminded on elapsed time rather than poll
 # count. A one-minute jitter allowance absorbs small per-run timestamp drift
 # without changing the intended hourly cadence. After bounded attempts give up,
@@ -215,6 +220,68 @@ def _coerce_review_requests(value: object) -> dict[str, int]:
     if isinstance(value, list):
         return {str(k): 1 for k in value if isinstance(k, (str, int)) and not isinstance(k, bool)}
     return {}
+
+
+def _review_recovery_state(
+    repo: str, number: str,
+) -> tuple[int, bool, bool, bool] | None:
+    """Return ``(started, pending, found, canonical)`` from recovery state.
+
+    ``None`` means recovery state is unavailable, for example when this script is
+    run directly outside the poller framework. Completed turns are removed by
+    reconciliation; failed turns remain when generic failed-turn recovery is
+    disabled, as it is for github-activity.
+    """
+    path = STATE_DIR / _RECOVERY_STATE_FILE
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    inflight = data.get("inflight") if isinstance(data, dict) else None
+    if not isinstance(inflight, dict):
+        return None
+
+    started = 0
+    pending = False
+    found = False
+    canonical = False
+    for entry in inflight.values():
+        if not isinstance(entry, dict):
+            continue
+        event = entry.get("event")
+        extra = event.get("extra") if isinstance(event, dict) else None
+        items = extra.get("items") if isinstance(extra, dict) else None
+        if not isinstance(items, list):
+            continue
+        matching_types = {
+            item.get("event_type")
+            for item in items
+            if (
+                isinstance(item, dict)
+                and item.get("event_type") in _REVIEW_TURN_EVENT_TYPES
+                and item.get("repo") == repo
+                and str(item.get("number")) == number
+            )
+        }
+        if not matching_types:
+            continue
+        found = True
+        canonical = canonical or bool(matching_types & {"pr_opened", "pr_synchronize"})
+        attempts = entry.get("attempts", 0)
+        attempts = (
+            attempts
+            if isinstance(attempts, int) and not isinstance(attempts, bool)
+            else 0
+        )
+        if entry.get("last_outcome_at"):
+            # Pre-fix persisted failures may still say attempts=0. The durable
+            # outcome proves that turn started even when the old counter did not.
+            started += max(attempts, 1)
+        else:
+            pending = True
+    return started, pending, found, canonical
 
 
 def _resolve_token() -> str:
@@ -865,18 +932,14 @@ def _check_pr_pushes(
     ── Review-request detection (state-reconciling re-emit, #299) ──
     Each PR's ``requested_reviewers`` list is checked against ``me``.
     Tracked via ``pr_review_requests`` — ``{pr_key: attempt_count}`` —
-    where ``attempt_count`` is how many ``pr_review_requested`` events
-    we've emitted for this PR while ``me`` stayed requested.
+    where ``attempt_count`` is how many review turns actually started for
+    this PR while ``me`` stayed requested.
 
-    While ``me`` is a requested reviewer the poller RE-EMITS
-    ``pr_review_requested`` once per poll (incrementing the count), up to
-    ``REVIEW_REQUEST_MAX_ATTEMPTS``. Rationale: a submitted review removes
-    ``me`` from ``requested_reviewers`` (GitHub clears it), so "still
-    requested on the next poll" means "no review landed" — the prior
-    attempt's turn failed, is still running, or never ran. Re-emitting
-    recovers a review dropped by a transient turn failure (the bug: the
-    old emit-once-on-transition model recorded the request as seen, so a
-    dead turn vanished — PR #511).
+    While ``me`` is a requested reviewer, recovery state distinguishes a
+    queued/running turn from a failed turn. A queued/running event is left
+    alone; a failed event consumes one attempt and is re-emitted, up to
+    ``REVIEW_REQUEST_MAX_ATTEMPTS``. A submitted review removes ``me`` from
+    ``requested_reviewers`` (GitHub clears it).
 
     On exhaustion (``attempt_count`` reaches the cap and ``me`` is STILL
     requested) it emits a one-shot ``pr_review_request_gave_up`` SIGNAL
@@ -984,10 +1047,8 @@ def _check_pr_pushes(
                 ):
                     continue
 
-                # Otherwise, a PR STILL requested on this poll means the
-                # prior attempt never landed (transient turn failure / still
-                # running / never ran). Re-emit up to the cap; on exhaustion
-                # emit a one-shot give-up signal and go dormant.
+                # Recovery state separates turns that failed from turns still
+                # queued/running. Only real failures spend retry budget.
                 prior_attempts = prior_review_requests.get(key, 0)
                 if key in review_needed_pr_numbers:
                     # A synchronize/open event for this same PR already owns the
@@ -1001,65 +1062,84 @@ def _check_pr_pushes(
                             prior_attempts + 1,
                             REVIEW_REQUEST_MAX_ATTEMPTS,
                         )
-                elif prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
-                    attempt = prior_attempts + 1
-                    if attempt == 1:
-                        status_line = (
-                            f"You (@{me}) were added to the reviewers list."
-                        )
-                    else:
-                        status_line = (
-                            f"You (@{me}) are STILL on the reviewers list "
-                            f"(re-request {attempt}/{REVIEW_REQUEST_MAX_ATTEMPTS}"
-                            f" — a prior review request produced no submitted "
-                            f"review; the turn may have failed). Submit the "
-                            f"review this time."
-                        )
-                    prompt = (
-                        f"Review requested on {repo} PR #{number}: "
-                        f"{title} (by @{pr_author or 'unknown'})\n"
-                        f"{status_line}\n"
-                        f"{url}"
-                    )
-                    _emit(
-                        prompt,
-                        event_type="pr_review_requested",
-                        repo=repo,
-                        number=number,
-                        url=url,
-                        requested_reviewer=me,
-                        author=pr_author,
-                        attempt=attempt,
-                        max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
-                        head_sha=current_sha,
-                        related_comment=review_context.get(key, ""),
-                    )
-                    count += 1
-                    review_needed_pr_numbers.add(key)
-                    new_review_requests[key] = attempt
-                elif prior_attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
-                    # Wedge guard exhausted: emitted the request
-                    # REVIEW_REQUEST_MAX_ATTEMPTS times and ``me`` is still
-                    # requested. Emit a one-shot give-up SIGNAL (no turn —
-                    # re-spawning would just burn another likely-failing
-                    # turn) so it surfaces in the negative algedonic block,
-                    # then park at the dormant sentinel (cap + 1).
-                    _emit_signal(
-                        "pr_review_request_gave_up",
-                        repo=repo,
-                        number=number,
-                        url=url,
-                        requested_reviewer=me,
-                        attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
-                    )
-                    count += 1
-                    new_review_requests[key] = prior_attempts + 1
                 else:
-                    # Already gave up (sentinel > cap) and ``me`` is still
-                    # requested. Stay dormant — carry the sentinel so we
-                    # neither retry nor re-emit the give-up. Resets when
-                    # ``me`` is removed (key drops from the rebuilt dict).
-                    new_review_requests[key] = prior_attempts
+                    recovery = _review_recovery_state(repo, key)
+                    recovery_available = recovery is not None
+                    if recovery is not None:
+                        started, pending, found, canonical = recovery
+                        if found:
+                            prior_attempts = max(
+                                started,
+                                prior_attempts if canonical else 0,
+                            )
+                        if pending:
+                            new_review_requests[key] = prior_attempts
+                            continue
+
+                    if prior_attempts < REVIEW_REQUEST_MAX_ATTEMPTS:
+                        attempt = prior_attempts + 1
+                        if attempt == 1:
+                            status_line = (
+                                f"You (@{me}) were added to the reviewers list."
+                            )
+                        else:
+                            status_line = (
+                                f"You (@{me}) are STILL on the reviewers list "
+                                f"(re-request {attempt}/{REVIEW_REQUEST_MAX_ATTEMPTS}"
+                                f" — a prior review request produced no submitted "
+                                f"review; the turn may have failed). Submit the "
+                                f"review this time."
+                            )
+                        prompt = (
+                            f"Review requested on {repo} PR #{number}: "
+                            f"{title} (by @{pr_author or 'unknown'})\n"
+                            f"{status_line}\n"
+                            f"{url}"
+                        )
+                        _emit(
+                            prompt,
+                            event_type="pr_review_requested",
+                            repo=repo,
+                            number=number,
+                            url=url,
+                            requested_reviewer=me,
+                            author=pr_author,
+                            attempt=attempt,
+                            max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+                            head_sha=current_sha,
+                            related_comment=review_context.get(key, ""),
+                        )
+                        count += 1
+                        review_needed_pr_numbers.add(key)
+                        # The framework stashes this event after the subprocess
+                        # exits. Until recovery records an outcome, it has not spent
+                        # an attempt. Direct script runs retain the legacy counter.
+                        new_review_requests[key] = (
+                            prior_attempts if recovery_available else attempt
+                        )
+                    elif prior_attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
+                        # Wedge guard exhausted: emitted the request
+                        # REVIEW_REQUEST_MAX_ATTEMPTS times and ``me`` is still
+                        # requested. Emit a one-shot give-up SIGNAL (no turn —
+                        # re-spawning would just burn another likely-failing
+                        # turn) so it surfaces in the negative algedonic block,
+                        # then park at the dormant sentinel (cap + 1).
+                        _emit_signal(
+                            "pr_review_request_gave_up",
+                            repo=repo,
+                            number=number,
+                            url=url,
+                            requested_reviewer=me,
+                            attempts=prior_attempts,
+                        )
+                        count += 1
+                        new_review_requests[key] = prior_attempts + 1
+                    else:
+                        # Already gave up (sentinel > cap) and ``me`` is still
+                        # requested. Stay dormant — carry the sentinel so we
+                        # neither retry nor re-emit the give-up. Resets when
+                        # ``me`` is removed (key drops from the rebuilt dict).
+                        new_review_requests[key] = prior_attempts
     # Keep a notification marker for the PR's entire open lifetime. A
     # transient lookup recovery followed by another failure must not alert
     # again; closed PRs naturally prune from the rebuilt open-PR snapshot.

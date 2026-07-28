@@ -771,6 +771,160 @@ def test_review_request_re_emits_until_cap_then_gives_up(monkeypatch):
     assert rr == {"42": cap + 1}
 
 
+def _review_recovery_entry(
+    *, attempts: int = 0, failed: bool = False,
+    event_type: str = "pr_review_requested",
+) -> dict:
+    entry = {
+        "attempts": attempts,
+        "event": {
+            "extra": {
+                "items": [{
+                    "event_type": event_type,
+                    "repo": "o/r",
+                    "number": 42,
+                }],
+            },
+        },
+    }
+    if failed:
+        entry["last_outcome_at"] = "2026-07-28T17:00:00+00:00"
+    return entry
+
+
+def test_queued_review_request_does_not_spend_attempts_or_duplicate(
+    monkeypatch, tmp_path,
+):
+    """A source waiting behind an occupied FIFO survives any poll count."""
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    recovery_path = tmp_path / ".recovery.json"
+    recovery_path.write_text(json.dumps({
+        "last_reconciled": "",
+        "inflight": {"queued-source": _review_recovery_entry()},
+    }), encoding="utf-8")
+
+    # Reproduce the incident's already-inflated cursor. Recovery is the source
+    # of truth and proves that no turn has started.
+    rr = {"42": poller.REVIEW_REQUEST_MAX_ATTEMPTS}
+    for _ in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1):
+        captured.clear()
+        count, _, rr = poller._check_pr_pushes(
+            "o/r", token="t", me="mimir-carreira",
+            pr_heads={"42": "sha"}, pr_review_requests=rr,
+        )
+        assert count == 0
+        assert captured == []
+        assert rr == {"42": 0}
+
+    # Once that turn really fails, exactly one attempt is consumed and the
+    # next retry is emitted. A subsequent successful review clears the cursor.
+    recovery_path.write_text(json.dumps({
+        "last_reconciled": "",
+        "inflight": {
+            "queued-source": _review_recovery_entry(attempts=1, failed=True),
+        },
+    }), encoding="utf-8")
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests=rr,
+    )
+    assert count == 1
+    assert captured[0]["event_type"] == "pr_review_requested"
+    assert captured[0]["attempt"] == 2
+    assert rr == {"42": 1}
+
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [_pr(42, "sha", requested_reviewers=[])],
+    )
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests=rr,
+    )
+    assert count == 0
+    assert rr == {}
+
+
+def test_three_started_failed_review_turns_reach_give_up(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    recovery_path = tmp_path / ".recovery.json"
+    rr: dict[str, int] = {"42": 0}
+
+    for failures, expected_attempt in ((1, 2), (2, 3)):
+        recovery_path.write_text(json.dumps({
+            "last_reconciled": "",
+            "inflight": {
+                f"failed-{i}": _review_recovery_entry(attempts=1, failed=True)
+                for i in range(failures)
+            },
+        }), encoding="utf-8")
+        captured.clear()
+        count, _, rr = poller._check_pr_pushes(
+            "o/r", token="t", me="mimir-carreira",
+            pr_heads={"42": "sha"}, pr_review_requests=rr,
+        )
+        assert count == 1
+        assert captured[0]["attempt"] == expected_attempt
+        assert rr == {"42": failures}
+
+    recovery_path.write_text(json.dumps({
+        "last_reconciled": "",
+        "inflight": {
+            f"failed-{i}": _review_recovery_entry(attempts=1, failed=True)
+            for i in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS)
+        },
+    }), encoding="utf-8")
+    captured.clear()
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests=rr,
+    )
+    assert count == 1
+    assert captured[0]["signal"] == "pr_review_request_gave_up"
+    assert captured[0]["attempts"] == poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    assert rr == {"42": poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1}
+
+
+def test_queued_canonical_review_turn_keeps_deliberate_attempt(monkeypatch, tmp_path):
+    captured = _capture_emits(monkeypatch)
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        poller, "_gh_api",
+        lambda endpoint, token: [
+            _pr(42, "sha", requested_reviewers=["mimir-carreira"]),
+        ],
+    )
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "last_reconciled": "",
+        "inflight": {
+            "queued-sync": _review_recovery_entry(event_type="pr_synchronize"),
+        },
+    }), encoding="utf-8")
+
+    count, _, rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests={"42": 1},
+    )
+
+    assert count == 0
+    assert captured == []
+    assert rr == {"42": 1}
+
+
 def test_review_request_gave_up_signal_shape(monkeypatch):
     """At the cap (and ``me`` still requested) the poller emits a SIGNAL
     record — ``signal`` not ``prompt`` (no turn) — that ``feedback.classify``
