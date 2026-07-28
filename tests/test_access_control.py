@@ -3988,3 +3988,51 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
         "gh pr view 1 --repo o/r --json reviews --jq .reviews", "repo_review",
     )
     assert "--jq" in reason
+
+
+def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
+    """Every command the review skill shows must be admissible on a poller turn.
+
+    The skill is the poller's instruction sheet, so a command demonstrated there
+    is a command the agent will issue. Three separate times this file has told it
+    to run something the ``repo_review`` profile refuses: a heredoc-plus-command-
+    substitution ``gh pr review --body "$(cat <<'EOF' …"`` (the shape behind the
+    #1221 outage, which survived even the PR that replaced the surrounding code
+    block), ``gh api … --jq '.content' | base64 -d``, and ``gh api …/files
+    --paginate`` as a large-PR fallback. Each was fixed by grep and the next one
+    was found by a reviewer, not by the fix.
+
+    Only fenced ``bash`` blocks are scanned: prose may freely describe a form in
+    order to prohibit it, and the surrounding text does exactly that.
+    """
+    import re
+
+    skill = Path(__file__).resolve().parent.parent / "mimir" / "skills" / "review" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+
+    # Shapes the trusted-service shell profile can never admit, and the reason.
+    forbidden = (
+        ("gh api", "`gh api` is not in the repo_review allow-list"),
+        ("--jq", "--jq is a credential read (jq env/$ENV) and is admitted nowhere"),
+        ("<<", "a heredoc cannot survive single-argv exec with shell=False"),
+        ("$(", "command substitution cannot survive single-argv exec"),
+        ("|", "a pipe makes the command compound"),
+        ("&&", "a compound command is never admitted"),
+    )
+
+    offenders: list[str] = []
+    for block in re.findall(r"```bash\n(.*?)```", text, re.DOTALL):
+        for raw in block.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not re.match(r"^(gh|git|uv|npm|pytest|fetch_url)\b", line):
+                continue
+            for needle, why in forbidden:
+                if needle in line:
+                    offenders.append(f"{line[:72]!r} — {why}")
+
+    assert not offenders, (
+        "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
+        "run:\n  " + "\n  ".join(offenders)
+    )

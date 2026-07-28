@@ -19,7 +19,8 @@ the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
 **Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
 diff accessible — either under 20k lines via `gh pr diff`, or file list via
-`gh api repos/.../pulls/<n>/files --paginate` for large PRs.
+`gh pr view <n> --repo <owner>/<repo> --json files` for large PRs (`gh api` is
+not admitted on a poller turn).
 
 **Guarantees**:
 - A review is posted to GitHub (not just output to turn text) via `gh pr review`.
@@ -150,8 +151,11 @@ gh pr review <num> --repo jasoncarreira/mimir --comment         --body-file <scr
 The body file must resolve beneath the agent scratch root, be a regular file
 reached without traversing a symlink, and be at most 64 KiB.
 
-Use a heredoc (`<<'EOF' ... EOF`) to pass the body — inline quoting breaks
-on `$`, backticks, and multi-line text.
+**Do not use a heredoc, `$(...)`, or an inline multi-line `--body`.** All three
+are refused before execution on a poller turn, and a refused submission is how a
+completed review silently fails to reach GitHub. Write the body to the scratch
+file and pass `--body-file`: because the file is read during authorization, `$`,
+backticks and multi-line text need no escaping at all.
 
 ### 6. Confirm submission
 
@@ -208,6 +212,6 @@ nothing about the submission requirement.
 | Symptom | Fix |
 |---|---|
 | `Read(tests/foo.py)` -> "file does not exist" | Skip Read, continue from diff, still submit |
-| `gh pr diff <num>` -> HTTP 406 "diff too large" | Fall back to `gh api .../pulls/<num>/files` for file list |
+| `gh pr diff <num>` -> HTTP 406 "diff too large" | Use `gh pr view <num> --repo <owner>/<repo> --json files` (`gh api` is not admitted) |
 | `gh pr review` exits non-zero | Check `--help`; verify PR is open; retry once |
-| Review body contains backticks / `${}` | Use `<<'EOF'` heredoc (single-quote prevents expansion) |
+| Review body contains backticks / `${}` | Nothing special — `--body-file` reads the file directly, so no shell expansion occurs |
