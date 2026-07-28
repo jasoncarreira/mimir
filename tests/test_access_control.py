@@ -2213,6 +2213,64 @@ async def test_model_cannot_forge_a_service_shell_refusal(
 
 
 @pytest.mark.asyncio
+async def test_service_shell_without_cwd_preserves_ambient_execution_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """An omitted cwd stays omitted rather than selecting the first read root."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    first_root = tmp_path / "first-root"
+    second_root = tmp_path / "second-root"
+    home.mkdir()
+    first_root.mkdir()
+    second_root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (first_root, second_root),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "gh pr list --state open"},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert "cwd" not in seen_args
+
+
+@pytest.mark.asyncio
 async def test_service_shell_uses_resolved_authorized_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
