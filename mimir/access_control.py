@@ -1835,13 +1835,34 @@ def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bo
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
     try:
-        relative = candidate.resolve().relative_to(
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(
             (Path(home).resolve() / "memory" / "channels").resolve()
         )
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError):
+        # Resolution failure cannot prove channel ownership; fail closed.
+        return False
+    except ValueError:
         # The prompt also authorizes shared non-channel memory and state paths.
         return True
     return bool(relative.parts) and relative.parts[0] == channel_id
+
+
+def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
+    """Resolve a trigger-service write exactly as its sink adapter checks it."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise PathOutsideHomeError("MIMIR_HOME is not configured")
+    raw = json.loads(destination)
+    if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
+        raise PathOutsideHomeError("trigger-service write roots are invalid")
+    roots = [Path(path).resolve() for path in raw]
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    return resolve_within_roots(roots, str(candidate))
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:

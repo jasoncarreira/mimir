@@ -538,6 +538,36 @@ def _request_for_authorized_execution(
     return request.override(tool_call=tool_call)
 
 
+def _request_with_resolved_service_write_path(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind a trigger-service file write to the path checked by authorization."""
+    if tool_name not in {"write_file", "edit_file"}:
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "trigger_service_write_roots":
+        return request
+
+    from ..access_control import resolve_trigger_service_write_target
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    argument_name = "file_path" if "file_path" in args else "path"
+    raw_path = args.get(argument_name)
+    if not isinstance(raw_path, str) or not raw_path:
+        return request
+    try:
+        args[argument_name] = str(
+            resolve_trigger_service_write_target(raw_path, policy.destination)
+        )
+    except (OSError, RuntimeError, ValueError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
+
+
 def _request_with_resolved_spawn_paths(
     request: ToolCallRequest,
     tool_name: str,
@@ -974,6 +1004,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
@@ -1155,6 +1188,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)

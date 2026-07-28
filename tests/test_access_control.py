@@ -603,6 +603,34 @@ def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
     assert core.reason == "service_sink_destination_denied"
 
 
+def test_synthesis_unresolvable_other_channel_target_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    other_channel = home / "memory" / "channels" / "channel-b"
+    other_channel.mkdir(parents=True)
+    (other_channel / "loop").symlink_to(other_channel / "loop")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        auth,
+        enforce=True,
+        target_channel=str(other_channel / "loop" / "summary.md"),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
