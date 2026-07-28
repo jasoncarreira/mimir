@@ -40,6 +40,7 @@ from .identities import AccessMetadata
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
     read_target_from_arguments,
+    requested_read_target_from_arguments,
 )
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
     from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
+
+_MAX_REQUESTED_TARGET_LENGTH = 1024
 
 
 class AccessTier(StrEnum):
@@ -4001,6 +4004,7 @@ class ToolRegistry:
         *,
         auth_context: "AuthContext | None" = None,
         target: str | None = None,
+        requested_target: Any = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -4023,12 +4027,21 @@ class ToolRegistry:
                 )
             from .redaction import redact_payload
 
+            redacted_requested_target = redact_payload(requested_target)
+            if redacted_requested_target is not None:
+                redacted_requested_target = str(redacted_requested_target)[
+                    :_MAX_REQUESTED_TARGET_LENGTH
+                ]
+
             fields.update({
                 # Shadow decisions cover both compatibility bypasses and trusted
                 # service-capability grants. Bypasses carry the denial reason
                 # that enforcement would apply; capability grants do not.
                 "would_block": auth.would_block,
                 "target": redact_payload(resolved_target),
+                # Caller input is evidence only. It is never resolved, compared
+                # with policy, or fed back into an authorization decision.
+                "requested_target": redacted_requested_target,
                 "trigger": (
                     getattr(auth_context, "origin_trigger", None)
                     or getattr(auth_context, "trigger", None)
@@ -4079,6 +4092,7 @@ class ToolRegistry:
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(
                     auth, auth_context=auth_context, target=target_channel,
+                    requested_target=target_channel,
                 )
             return auth
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
@@ -4095,6 +4109,7 @@ class ToolRegistry:
             if auth.is_shadow_decision:
                 self._emit_shadow_decision(
                     auth, auth_context=auth_context, target=target_channel,
+                    requested_target=target_channel,
                 )
             return auth
 
@@ -4157,6 +4172,7 @@ class ToolRegistry:
             if sink_check.is_shadow_decision:
                 self._emit_shadow_decision(
                     sink_check, auth_context=auth_context, target=sink_target,
+                    requested_target=target_channel,
                 )
 
         decision = preliminary_decision
@@ -4216,6 +4232,7 @@ class ToolRegistry:
                 if write_auth.is_shadow_decision:
                     self._emit_shadow_decision(
                         write_auth, auth_context=auth_context, target=sink_target,
+                        requested_target=target_channel,
                     )
                 return write_auth
             if tool_name in READ_RESOURCE_OPERATIONS:
@@ -4296,8 +4313,14 @@ class ToolRegistry:
         )
 
         if is_shadow:
+            requested_target = (
+                requested_read_target_from_arguments(tool_name, arguments)
+                if reason == "read_scope"
+                else target_channel
+            )
             self._emit_shadow_decision(
                 auth, auth_context=auth_context, target=sink_target,
+                requested_target=requested_target,
             )
 
         return auth

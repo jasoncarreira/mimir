@@ -2755,6 +2755,7 @@ async def test_service_capability_allowed_admin_operation_emits_non_blocking_aud
             **decision.as_log_fields(),
             "would_block": False,
             "target": "saga",
+            "requested_target": None,
             "trigger": "saga_session_end",
         },
     )]
@@ -2788,6 +2789,7 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
             **decision.as_log_fields(),
             "would_block": True,
             "target": "scheduler",
+            "requested_target": None,
             "trigger": "scheduled_tick",
         },
     )]
@@ -2827,6 +2829,87 @@ async def test_shadow_sink_event_records_redacted_resolved_destination() -> None
     assert fields["reason"] == enforced.reason
     assert fields["target"] == "https://example.invalid/api?token=[REDACTED]"
     assert fields["trigger"] == "user_message"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "requested_target", "reason"),
+    [
+        (
+            "read_file",
+            {"file_path": "/outside?token=secret-value&part=" + "x" * 1200},
+            "/outside?token=secret-value&part=" + "x" * 1200,
+            "read_scope",
+        ),
+        (
+            "list_channels",
+            {},
+            "workspace:token=secret-value",
+            "admin_required",
+        ),
+    ],
+)
+async def test_shadow_denial_records_bounded_redacted_requested_target(
+    tool_name: str,
+    arguments: dict[str, object],
+    requested_target: str,
+    reason: str,
+) -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        shadow = registry.authorize_tool(
+            tool_name,
+            _read_auth(),
+            enforce=False,
+            target_channel=(requested_target if reason == "admin_required" else None),
+            arguments=arguments,
+        )
+        await asyncio.sleep(0)
+    enforced = registry.authorize_tool(
+        tool_name,
+        _read_auth(),
+        enforce=True,
+        target_channel=(requested_target if reason == "admin_required" else None),
+        arguments=arguments,
+    )
+
+    assert shadow.is_shadow_decision is True
+    assert enforced.allowed is False
+    assert shadow.reason == enforced.reason == reason
+    assert len(captured) == 1
+    fields = captured[0][1]
+    assert fields["target"] is None
+    assert fields["requested_target"] == requested_target.replace(
+        "token=secret-value", "token=[REDACTED]",
+    )[:1024]
+    assert len(str(fields["requested_target"])) <= 1024
+
+
+@pytest.mark.asyncio
+async def test_admin_required_shadow_denial_marks_targetless_request_explicitly() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        shadow = registry.authorize_tool(
+            "list_channels", _read_auth(), enforce=False,
+        )
+        await asyncio.sleep(0)
+
+    assert shadow.reason == "admin_required"
+    assert captured[0]["requested_target"] is None
 
 
 def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
