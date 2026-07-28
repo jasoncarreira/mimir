@@ -317,6 +317,7 @@ class ServicePrincipal:
     readable_domains: tuple[str, ...] = ()
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
+    filesystem_read_roots: tuple[str, ...] = ()
     creation_path: str | None = None
     authority_profile: str | None = None
     capability_tier: CapabilityTier | None = None
@@ -456,9 +457,16 @@ def build_trigger_service_principal(
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory") if home else ()
     )
+    is_github_activity = canonical == "poller:github-activity"
+    repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     write_roots = tuple(dict.fromkeys(
         root.resolve()
-        for root in (*roots, *_configured_repo_write_roots(), *home_data_roots)
+        for root in (
+            *roots,
+            *(() if is_github_activity else _configured_repo_write_roots()),
+            *home_data_roots,
+            *((Path(home) / "scratch",) if is_github_activity and home else ()),
+        )
     ))
     operations = tuple(dict.fromkeys(
         "send_message" if capability == "operator_alert" else capability
@@ -504,6 +512,9 @@ def build_trigger_service_principal(
         readable_domains=tuple(sorted(readable_domains)),
         sink_destinations=tuple(sorted(sink_destinations)),
         sink_policies=tuple(policies),
+        filesystem_read_roots=(
+            tuple(str(root) for root in repo_roots) if is_github_activity else ()
+        ),
         creation_path=creation_path,
         authority_profile=profile,
         capability_tier=tier,
@@ -590,6 +601,20 @@ def _configured_repo_write_roots() -> list[Path]:
         os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
     )
     return [Path(path) for path, mode in extra_roots if mode == "rw"]
+
+
+def _configured_repo_roots() -> list[Path]:
+    """Return explicit external file-tool roots in either access mode."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return []
+
+    from .config import _parse_file_tool_roots
+
+    extra_roots = _parse_file_tool_roots(
+        os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+    )
+    return [Path(path) for path, _mode in extra_roots]
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -1865,6 +1890,67 @@ def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
     return resolve_within_roots(roots, str(candidate))
+
+
+_TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
+    ".env", ".git", ".mimir", ".venv", "config", "credentials",
+    "identities", "prompts", "secret", "secrets",
+})
+
+
+def _is_trigger_service_protected_read_path(path: Path) -> bool:
+    return any(part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES for part in path.parts)
+
+
+def _trigger_service_read_target_is_allowed(
+    service: ServicePrincipal,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> bool:
+    """Authorize a service read against its frozen roots, lexically and resolved."""
+    from .read_policy import file_contains_secret
+
+    args = arguments if isinstance(arguments, dict) else {}
+    raw = (
+        args.get("file_path") or args.get("path")
+        if tool_name in {"read_file", "aread"}
+        else args.get("path")
+    )
+    if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
+        return False
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return False
+    roots = tuple(Path(root) for root in service.filesystem_read_roots)
+    try:
+        lexical_relative = max(
+            (
+                candidate.relative_to(root)
+                for root in roots
+                if candidate == root or candidate.is_relative_to(root)
+            ),
+            key=lambda item: len(item.parts),
+        )
+        if _is_trigger_service_protected_read_path(lexical_relative):
+            return False
+        resolved = candidate.resolve(strict=True)
+        resolved_roots = tuple(root.resolve(strict=True) for root in roots)
+        root = max(
+            (
+                root for root in resolved_roots
+                if resolved == root or resolved.is_relative_to(root)
+            ),
+            key=lambda item: len(item.parts),
+        )
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if _is_trigger_service_protected_read_path(relative):
+        return False
+    return not (
+        tool_name in {"read_file", "aread"}
+        and (not resolved.is_file() or file_contains_secret(resolved))
+    )
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
@@ -3856,6 +3942,17 @@ class ToolRegistry:
                     allowed = True
                 elif service_allowed:
                     allowed = True
+                elif (
+                    service_principal is not None
+                    and service_principal.filesystem_read_roots
+                    and tool_name in {
+                        "read_file", "aread", "ls", "als", "glob", "aglob",
+                        "grep", "agrep",
+                    }
+                ):
+                    allowed = _trigger_service_read_target_is_allowed(
+                        service_principal, tool_name, arguments,
+                    )
                 else:
                     allowed = (
                         auth_context is not None
@@ -4791,6 +4888,7 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
                 }
                 for policy in principal.sink_policies
             ],
+            "filesystem_read_roots": list(principal.filesystem_read_roots),
             "creation_path": principal.creation_path,
         }
     return report

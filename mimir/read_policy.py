@@ -9,7 +9,6 @@ from typing import Any
 
 from .secret_scan import contains_secret
 
-
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE,
 )
@@ -68,7 +67,11 @@ def non_admin_read_filter_enabled() -> bool:
     if auth_context is None:
         return False
     roles = getattr(auth_context, "roles", ()) or ()
-    return "admin" not in roles and not getattr(auth_context, "is_service", False)
+    authority = getattr(auth_context, "service_authority", None)
+    service_has_read_scope = bool(getattr(authority, "filesystem_read_roots", ()))
+    return "admin" not in roles and (
+        not getattr(auth_context, "is_service", False) or service_has_read_scope
+    )
 
 
 def _operator_secret_paths() -> tuple[Path, ...]:
@@ -131,6 +134,44 @@ def is_protected_read_path(path: Path) -> bool:
     return False
 
 
+def is_current_service_protected_read_path(path: Path) -> bool:
+    """Apply the stricter trigger-service protected names during tool execution."""
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    authority = getattr(auth_context, "service_authority", None)
+    if not getattr(authority, "filesystem_read_roots", ()):
+        return False
+    # Keep authorization and read-boundary enforcement on one security list.
+    # Import lazily to avoid a module cycle: access_control imports this module
+    # from the authorization path that scans individual file contents.
+    from .access_control import _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+
+    for raw_root in authority.filesystem_read_roots:
+        root = Path(raw_root)
+        try:
+            if path == root or path.is_relative_to(root):
+                lexical = path.relative_to(root)
+                if any(
+                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+                    for part in lexical.parts
+                ):
+                    return True
+            resolved_root = root.resolve(strict=True)
+            resolved = path.resolve(strict=True)
+            if resolved == resolved_root or resolved.is_relative_to(resolved_root):
+                relative = resolved.relative_to(resolved_root)
+                if any(
+                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+                    for part in relative.parts
+                ):
+                    return True
+        except (OSError, RuntimeError, ValueError):
+            return True
+    return False
+
+
 def text_contains_secret(text: str, *, path: Path | None = None) -> bool:
     """Detect protected credential bodies, including path-specific config forms."""
     if contains_secret(text) or _PEM_PRIVATE_KEY_PATTERN.search(text):
@@ -154,7 +195,7 @@ def file_contains_secret(path: Path) -> bool:
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     """Check a result at its read boundary without re-reading supplied text."""
-    if is_protected_read_path(path):
+    if is_protected_read_path(path) or is_current_service_protected_read_path(path):
         return True
     if text is not None:
         return text_contains_secret(text, path=path)

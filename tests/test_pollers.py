@@ -40,7 +40,13 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
-from mimir.access_control import CapabilityTier, SinkGate, ToolRegistry, create_auth_context
+from mimir.access_control import (
+    CapabilityTier,
+    SinkGate,
+    ToolRegistry,
+    build_trigger_service_principal,
+    create_auth_context,
+)
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
 from mimir.models import InformationFlowLabels, SourceLabel
 
@@ -269,6 +275,129 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
     denied = registry.authorize_tool("saga_forget", context, enforce=True)
     assert denied.allowed is False
     assert denied.reason == "admin_required"
+
+
+def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    persist_dir = home / "state" / "pollers" / "github-activity"
+    scratch = home / "scratch"
+    repo = tmp_path / "repo"
+    persist_dir.mkdir(parents=True)
+    scratch.mkdir()
+    repo.mkdir()
+    safe_file = repo / "src.py"
+    safe_file.write_text("safe\n", encoding="utf-8")
+    protected_names = (
+        ".env", ".git", ".mimir", ".venv", "config", "credentials",
+        "identities", "prompts", "secret", "secrets",
+    )
+    protected_targets = []
+    resolved_aliases = []
+    for index, name in enumerate(protected_names):
+        protected_dir = repo / name
+        protected_dir.mkdir()
+        target = protected_dir / "payload.txt"
+        target.write_text("placeholder\n", encoding="utf-8")
+        alias = repo / f"alias-{index}"
+        alias.symlink_to(protected_dir, target_is_directory=True)
+        protected_targets.append(target)
+        resolved_aliases.append(alias / target.name)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+
+    manifest_path = (
+        Path(__file__).parents[1] / "mimir" / "optional-skills"
+        / "github-poller" / "pollers.json"
+    )
+    entry = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"][0]
+    declared_capabilities = tuple(entry["authority"]["capabilities"])
+    service = _parse_poller_authority(
+        entry["authority"], name=entry["name"], persist_dir=persist_dir,
+        state_root=home / "state" / "pollers", manifest_path=manifest_path,
+    )
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    registry = ToolRegistry()
+
+    assert service.capabilities == tuple(dict.fromkeys(
+        "send_message" if capability == "operator_alert" else capability
+        for capability in declared_capabilities
+    ))
+    assert service.filesystem_read_roots == (str(repo.resolve()),)
+    for tool_name, arguments in (
+        ("read_file", {"file_path": str(safe_file)}),
+        ("grep", {"path": str(repo), "pattern": "safe"}),
+    ):
+        decision = registry.authorize_tool(
+            tool_name, context, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is True, (tool_name, decision.reason)
+
+    for target in (persist_dir / "cursor.json", scratch / "pr-1221-review.md"):
+        decision = registry.authorize_tool(
+            "write_file", context, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is True, (target, decision.reason)
+    for target in (repo / "changed.py", tmp_path / "outside-review.md"):
+        decision = registry.authorize_tool(
+            "write_file", context, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
+
+    for target in (*protected_targets, *resolved_aliases):
+        decision = registry.authorize_tool(
+            "read_file", context, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "read_scope"
+
+
+def test_github_activity_scratch_write_denies_lexical_and_resolved_protected_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state = home / "state" / "pollers" / "github-activity"
+    scratch = home / "scratch"
+    state.mkdir(parents=True)
+    scratch.mkdir(parents=True)
+    protected_names = (
+        ".env", ".git", ".mimir", ".venv", "config", "credentials",
+        "identities", "prompts", "secret", "secrets",
+    )
+    lexical_targets = []
+    resolved_targets = []
+    for index, name in enumerate(protected_names):
+        protected_dir = scratch / name
+        protected_dir.mkdir()
+        alias = scratch / f"alias-{index}"
+        alias.symlink_to(protected_dir, target_is_directory=True)
+        lexical_targets.append(protected_dir / "review.md")
+        resolved_targets.append(alias / "review.md")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("write_file",),
+        roots=(state,), creation_path="test",
+    )
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+
+    for target in (*lexical_targets, *resolved_targets):
+        decision = ToolRegistry().authorize_tool(
+            "write_file", context, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "service_sink_destination_denied"
 
 
 def test_authority_is_strict_and_per_instance(tmp_path: Path) -> None:
