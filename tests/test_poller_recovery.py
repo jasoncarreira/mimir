@@ -152,6 +152,32 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
     assert st["inflight"]["sid-1"]["attempts"] == 1
 
 
+async def test_reconcile_counts_failure_when_reenqueue_is_disabled(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    outcome_at = _ts(5)
+    _write_outcome(
+        events, type_="turn_failed", channel_id="poller:github-activity",
+        source_id="sid-1", ts=outcome_at,
+    )
+    enq = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=enq,
+        recover_failed_turns=False,
+    )
+
+    assert summary["reenqueued"] == 0
+    assert enq.calls == []
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]
+    assert entry["attempts"] == 1
+    assert entry["last_outcome_at"] == outcome_at
+
+
 async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Path):
     """Budget exhaustion is a failed turn for telemetry, but replaying the
     same poller item under the unchanged budget would deterministically fail

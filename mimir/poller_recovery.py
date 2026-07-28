@@ -493,6 +493,11 @@ async def reconcile_failed_turns(
                         watermark = max(watermark, ts)
                     continue
                 if not recover_failed_turns:
+                    # Pollers with live-state reconciliation (notably GitHub
+                    # review requests) consume this durable count themselves.
+                    # The turn did start and fail even though generic recovery
+                    # will not re-enqueue it.
+                    entry["attempts"] = int(entry.get("attempts", 0)) + 1
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
