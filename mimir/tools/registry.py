@@ -1901,6 +1901,7 @@ async def spawn_claude_code(
     )
 
     assert guard.sem is not None
+    failure: str | None = None
     try:
         async with guard.sem:
             try:
@@ -1912,9 +1913,9 @@ async def spawn_claude_code(
                     child_env,
                 )
             except subprocess.TimeoutExpired:
-                return f"spawn_claude_code timed out after {timeout_s}s"
+                failure = f"spawn_claude_code timed out after {timeout_s}s"
             except FileNotFoundError:
-                return "spawn_claude_code failed: 'claude' CLI not on PATH"
+                failure = "spawn_claude_code failed: 'claude' CLI not on PATH"
     except BaseException:
         # The subprocess never started OR exited abnormally; the
         # rate-slot we reserved doesn't reflect real work that
@@ -1922,8 +1923,10 @@ async def spawn_claude_code(
         # accurate for the operator.
         await _spawn_release_rate_slot(guard, rate_token)
         raise
+    if failure is not None:
+        raise ToolException(failure)
     if returncode != 0:
-        return (
+        raise ToolException(
             f"spawn_claude_code failed: exit={returncode} "
             f"stderr={stderr[:500]}"
         )
@@ -1938,6 +1941,9 @@ async def spawn_claude_code(
         )
     except json.JSONDecodeError:
         return f"spawn_claude_code: raw output: {stdout[:2000]}"
+
+
+spawn_claude_code.handle_tool_error = True
 
 
 @tool
@@ -2021,6 +2027,7 @@ async def spawn_codex(
     )
 
     assert guard.sem is not None
+    failure: str | None = None
     try:
         async with guard.sem:
             try:
@@ -2034,18 +2041,25 @@ async def spawn_codex(
                     child_env,
                 )
             except subprocess.TimeoutExpired:
-                return f"spawn_codex timed out after {timeout_s}s"
+                failure = f"spawn_codex timed out after {timeout_s}s"
             except FileNotFoundError:
-                return "spawn_codex failed: 'codex' CLI not on PATH"
+                failure = "spawn_codex failed: 'codex' CLI not on PATH"
     except BaseException:
         await _spawn_release_rate_slot(guard, rate_token)
         raise
+    if failure is not None:
+        raise ToolException(failure)
     if returncode != 0:
-        return f"spawn_codex failed: exit={returncode} stderr={stderr[:500]}"
+        raise ToolException(
+            f"spawn_codex failed: exit={returncode} stderr={stderr[:500]}"
+        )
     # codex exec writes its result to stdout (text, or JSONL with --json).
     # Return it verbatim (truncated); unlike claude -p's structured JSON the
     # codex output shape varies by flags, so don't assume a parse.
     return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
+
+
+spawn_codex.handle_tool_error = True
 
 
 def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:

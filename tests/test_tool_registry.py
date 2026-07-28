@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import FrozenInstanceError
+import subprocess
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -98,6 +102,77 @@ def _service_labels(event) -> InformationFlowLabels:
             authorized_principals=frozenset({principal}) if principal else frozenset(),
         )}),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "failure_kind", "expected"),
+    [
+        ("spawn_claude_code", "exit", "exit=7 stderr=" + "x" * 500),
+        ("spawn_claude_code", "timeout", "timed out after 3s"),
+        ("spawn_claude_code", "missing", "'claude' CLI not on PATH"),
+        ("spawn_codex", "exit", "exit=7 stderr=" + "x" * 500),
+        ("spawn_codex", "timeout", "timed out after 3s"),
+        ("spawn_codex", "missing", "'codex' CLI not on PATH"),
+    ],
+)
+async def test_spawn_subprocess_failures_emit_failed_tool_calls(
+    tool_name: str,
+    failure_kind: str,
+    expected: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import registry
+
+    spawn_tool = getattr(registry, tool_name)
+    registry.set_spawn_config({"default_cwd": tmp_path})
+    registry._spawn_reset_for_tests()
+
+    def fail_subprocess(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        if failure_kind == "timeout":
+            raise subprocess.TimeoutExpired(cmd=tool_name, timeout=3)
+        if failure_kind == "missing":
+            raise FileNotFoundError(tool_name)
+        return 7, "", "x" * 501
+
+    monkeypatch.setattr(registry, "_run_claude_subprocess", fail_subprocess)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    node = ToolNode(
+        [spawn_tool],
+        awrap_tool_call=budget_gate.BudgetGateMiddleware().awrap_tool_call,
+    )
+    result = await node._afunc(
+        [{
+            "name": tool_name,
+            "args": {"prompt": "test", "timeout_s": 3},
+            "id": "spawn-failure",
+            "type": "tool_call",
+        }],
+        {},
+        Runtime(context=replace(
+            _auth_context(roles=("admin",), enforce=True),
+            ifc_labels=InformationFlowLabels(),
+        )),
+    )
+
+    messages = result["messages"] if isinstance(result, dict) else result
+    assert len(messages) == 1
+    assert messages[0].status == "error"
+    assert expected in messages[0].content
+    assert registry._SPAWN_GUARD.recent, "reported failures must retain their rate slot"
+    tool_call = next(
+        fields for kind, fields in events
+        if kind == "tool_call" and fields.get("tool") == tool_name
+    )
+    assert tool_call["ok"] is False
+    assert expected[:100] in str(tool_call["error"])
 
 
 @pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
