@@ -398,9 +398,9 @@ egress paths exist and therefore must be reviewed with the catalog/adapters:
   filesystem reachability; they do not replace operation authorization.
 - `MIMIR_MCP_SERVERS_JSON` and `MIMIR_MCP_SERVERS_PATH` add external tools.
   Missing or unapproved provenance remains admin-required.
-- `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`, `MIMIR_RESEND_NUDGE_CHANNELS`,
-  `MIMIR_ACTIVITY_PANEL_CHANNELS`, and `MIMIR_ACTIVITY_PANEL_DETAIL` enable
-  harness egress that remains subject to the final IFC sink gate.
+- `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS`, `MIMIR_RESEND_NUDGE_CHANNELS`, and
+  `MIMIR_ACTIVITY_PANEL_CHANNELS` enable harness egress that remains subject to
+  the final IFC sink gate.
 - `MIMIR_MIDTURN_INJECTION_CHANNELS` and `MIMIR_ATTACHMENTS_MAX_BYTES` shape
   inbound data that contributes to the turn's labels; they do not establish
   requester authority.

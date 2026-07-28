@@ -107,6 +107,7 @@ class SinkCategory(StrEnum):
     SAGA = "saga"
     SCHEDULER = "scheduler"
     PROPOSAL = "proposal"
+    HARNESS_DISPLAY = "harness_display"
     UNKNOWN = "unknown"
 
 
@@ -136,8 +137,10 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     # named explicitly and checked at their final send/edit boundary.
     "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
     "harness_resend_nudge": SinkCategory.SAME_CHANNEL,
-    "activity_panel_post": SinkCategory.SAME_CHANNEL,
-    "activity_panel_edit": SinkCategory.SAME_CHANNEL,
+    # These harness-only sinks accept metadata-only payloads. They are not
+    # model-selected messages and intentionally do not share SAME_CHANNEL.
+    "activity_panel_post": SinkCategory.HARNESS_DISPLAY,
+    "activity_panel_edit": SinkCategory.HARNESS_DISPLAY,
     "post_message": SinkCategory.CROSS_CHANNEL,
     "webhook": SinkCategory.HTTP_WEBHOOK,
     "http_request": SinkCategory.HTTP_WEBHOOK,
@@ -2475,6 +2478,22 @@ class SinkGate:
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
                 would_block=True,
+            )
+
+        # Activity-panel payloads are constrained at their producer to fixed
+        # harness metadata (status, sanitized tool names, and counts). They do
+        # not carry turn content, so turn taint is not relevant to this display.
+        if sink_category is SinkCategory.HARNESS_DISPLAY:
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.OPEN,
+                allowed=True,
+                reason="harness_metadata_display",
+                service_principal=service,
+                enforcement_enabled=enforce,
+                resolved_sink_target=resolve_sink_target(
+                    tool_name, sink_category, target, service,
+                ),
             )
 
         is_application_egress = sink_category in {

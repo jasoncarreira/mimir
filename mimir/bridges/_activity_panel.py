@@ -16,7 +16,6 @@ from typing import Any
 from ..channel_registry import ChannelRegistry
 from ..harness_egress import harness_sink_allowed
 from ..turn_event_bus import TurnEventBus
-from ..turn_event_redaction import scrub_detail as _shared_scrub_detail
 from .base import MessageUpdate
 
 log = logging.getLogger(__name__)
@@ -66,15 +65,6 @@ def trigger_enabled(trigger: Any) -> bool:
 class ActivityStep:
     label: str
     status: str = "running"
-    detail: str | None = None
-
-
-@dataclass
-class FoldedInput:
-    source_id: str | None = None
-    author: str | None = None
-    author_display: str | None = None
-    source: str | None = None
 
 
 @dataclass
@@ -88,10 +78,9 @@ class ActivityPanelModel:
     finalized: bool = False
     outbound_message_sent: bool = False
     failed: bool = False
-    detail_level: str = "coarse"
     steps: list[ActivityStep] = field(default_factory=list)
     in_flight: ActivityStep | None = None
-    folded_inputs: list[FoldedInput] = field(default_factory=list)
+    folded_input_count: int = 0
     span_tool_names: dict[str, str] = field(default_factory=dict)
     ifc_labels: Any = None
     auth_context: Any = None
@@ -111,7 +100,6 @@ class ActivityPanel:
         allowlist: tuple[str, ...],
         *,
         debounce_seconds: float = 1.0,
-        detail_levels: tuple[tuple[str, str], ...] = (),
         delete_grace_seconds: float = 2.0,
         default_ifc_labels: Any = None,
         default_auth_context: Any = None,
@@ -120,7 +108,6 @@ class ActivityPanel:
         self._channels = channels
         self._allowlist = allowlist
         self._debounce_seconds = max(0.0, debounce_seconds)
-        self._detail_levels = detail_levels
         self._delete_grace_seconds = max(0.0, delete_grace_seconds)
         self._default_ifc_labels = default_ifc_labels
         self._default_auth_context = default_auth_context
@@ -188,7 +175,6 @@ class ActivityPanel:
                 channel_id=channel_id,
                 reply_to_message_id=_clean(event.get("reply_to_message_id")),
                 thread_ts=_clean(event.get("thread_ts")),
-                detail_level=self._detail_level_for(channel_id),
                 ifc_labels=event.get("_ifc_labels", self._default_ifc_labels),
                 auth_context=event.get("_auth_context", self._default_auth_context),
             )
@@ -216,19 +202,12 @@ class ActivityPanel:
         phase = event.get("phase")
         if typ in ("reasoning", "tool_call", "tool_result"):
             self._apply_span(model, event)
-            if phase != "chunk" or model.detail_level == "detailed":
+            if phase != "chunk":
                 await self._schedule_edit(model)
         elif typ == "injected_input":
-            for item in event.get("inputs") or []:
-                if isinstance(item, dict):
-                    model.folded_inputs.append(
-                        FoldedInput(
-                            source_id=_clean(item.get("source_id")),
-                            author=_clean(item.get("author")),
-                            author_display=_clean(item.get("author_display")),
-                            source=_clean(item.get("source")),
-                        )
-                    )
+            model.folded_input_count += sum(
+                1 for item in event.get("inputs") or [] if isinstance(item, dict)
+            )
             await self._schedule_edit(model)
         elif typ == "outbound_message" and event.get("sent"):
             model.outbound_message_sent = True
@@ -238,9 +217,8 @@ class ActivityPanel:
             status = _clean(event.get("status")) or "ok"
             model.failed = status != "ok"
             final_folded = event.get("injected_input_count")
-            if isinstance(final_folded, int) and final_folded > len(model.folded_inputs):
-                for _ in range(final_folded - len(model.folded_inputs)):
-                    model.folded_inputs.append(FoldedInput())
+            if isinstance(final_folded, int):
+                model.folded_input_count = max(model.folded_input_count, final_folded)
             if model.in_flight is not None or not model.steps:
                 self._complete_in_flight(model)
             model.finalized = True
@@ -265,28 +243,15 @@ class ActivityPanel:
         elif span_id:
             name = model.span_tool_names.get(span_id, "")
         if phase == "chunk":
-            if model.in_flight is not None and model.detail_level == "detailed":
-                model.in_flight.detail = _merge_detail(model.in_flight.detail, _step_detail(event))
             return
         label = _step_label(event, tool_name=name)
         if phase == "start":
-            model.in_flight = ActivityStep(
-                label,
-                detail=_step_detail(event) if model.detail_level == "detailed" else None,
-            )
+            model.in_flight = ActivityStep(label)
         elif phase == "end":
-            if model.in_flight is not None and model.detail_level == "detailed":
-                model.in_flight.detail = _merge_detail(model.in_flight.detail, _step_detail(event))
             if event.get("type") == "tool_call":
                 model.in_flight = None
                 return
             self._complete_in_flight(model, fallback=label)
-
-    def _detail_level_for(self, channel_id: str) -> str:
-        for prefix, level in self._detail_levels:
-            if prefix == "*" or channel_id.startswith(prefix):
-                return "detailed" if level == "detailed" else "coarse"
-        return "coarse"
 
     def _complete_in_flight(
         self,
@@ -297,7 +262,6 @@ class ActivityPanel:
         step = model.in_flight or ActivityStep(fallback or "Working")
         if fallback:
             step.label = fallback
-        step.detail = None
         step.status = "done"
         model.steps.append(step)
         model.in_flight = None
@@ -454,8 +418,6 @@ def render_discord_panel_description(model: ActivityPanelModel) -> str:
         lines.append(f"[x] {step.label}")
     if model.in_flight is not None:
         lines.append(f"[ ] {model.in_flight.label}")
-        if model.detail_level == "detailed" and model.in_flight.detail:
-            lines.extend(_detail_lines(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -474,8 +436,6 @@ def render_panel_text(model: ActivityPanelModel) -> str:
         lines.append(f"✓ {step.label}")
     if model.in_flight is not None:
         lines.append(f"◌ {model.in_flight.label}")
-        if model.detail_level == "detailed" and model.in_flight.detail:
-            lines.extend(_detail_lines(model.in_flight.detail))
     folded = _folded_live_lines(model)
     if folded:
         lines.extend(folded)
@@ -483,7 +443,7 @@ def render_panel_text(model: ActivityPanelModel) -> str:
 
 
 def _folded_summary(model: ActivityPanelModel) -> str:
-    count = len(model.folded_inputs)
+    count = model.folded_input_count
     if count == 0:
         return ""
     label = "follow-up" if count == 1 else "follow-ups"
@@ -491,13 +451,9 @@ def _folded_summary(model: ActivityPanelModel) -> str:
 
 
 def _folded_live_lines(model: ActivityPanelModel) -> list[str]:
-    count = len(model.folded_inputs)
+    count = model.folded_input_count
     if count == 0:
         return []
-    last = model.folded_inputs[-1]
-    who = last.author_display or last.author
-    if count == 1 and who:
-        return [f"↳ folded in {who}'s follow-up"]
     label = "message" if count == 1 else "messages"
     return [f"↳ +{count} mid-turn {label} folded"]
 
@@ -516,64 +472,6 @@ def _step_label(event: dict[str, Any], *, tool_name: str = "") -> str:
             return f"Running {tool_name}" if tool_name else "Running tool"
         return f"Ran {tool_name}" if tool_name else "Ran skill"
     return "Working"
-
-
-def _step_detail(event: dict[str, Any]) -> str | None:
-    typ = event.get("type")
-    if typ == "reasoning":
-        detail = _scrub_detail(event.get("text"))
-        return f"thought: {detail}" if detail else None
-    if typ == "tool_call":
-        value = event.get("args_delta") if event.get("phase") == "chunk" else event.get("args")
-        return _tool_args_detail(value)
-    if typ == "tool_result":
-        value = (
-            event.get("content_delta")
-            if event.get("phase") == "chunk"
-            else event.get("content", event.get("result"))
-        )
-        detail = _scrub_detail(value)
-        return f"result: {detail}" if detail else None
-    return None
-
-
-def _merge_detail(existing: str | None, new: str | None, *, limit: int = 420) -> str | None:
-    if not new:
-        return existing
-    if not existing:
-        return new[:limit]
-    return f"{existing}\n{new}"[:limit]
-
-
-def _detail_lines(detail: str) -> list[str]:
-    return [f"  {line}" for line in detail.splitlines()[:4] if line]
-
-
-def _tool_args_detail(value: Any, *, limit: int = 320) -> str | None:
-    if isinstance(value, dict):
-        keys = [_clean_arg_key(key) for key in value.keys()]
-        keys = [key for key in keys if key]
-        if not keys:
-            return None
-        rendered = ", ".join(keys[:12])
-        if len(keys) > 12:
-            rendered = f"{rendered}, +{len(keys) - 12} more"
-        return f"args: {rendered}"
-    if isinstance(value, (list, tuple)):
-        return f"args: {len(value)} items"
-    detail = _scrub_detail(value, limit=limit)
-    return f"args: {detail}" if detail else None
-
-
-def _clean_arg_key(value: Any) -> str | None:
-    text = _clean(value, limit=48)
-    if not text:
-        return None
-    return re.sub(r"[^A-Za-z0-9_.:-]", "", text)[:48] or None
-
-
-def _scrub_detail(value: Any, *, limit: int = 320) -> str | None:
-    return _shared_scrub_detail(value, limit=limit)
 
 
 def _tool_name(value: Any) -> str:

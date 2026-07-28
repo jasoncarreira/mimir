@@ -1,4 +1,4 @@
-<!-- desc: live, in-place-edited "Working" activity panel in Slack/Discord — a passive per-turn step tracker driven by the TurnEventBus, opt-in and redaction-safe -->
+<!-- desc: live, in-place-edited "Working" activity panel in Slack/Discord — a passive metadata-only per-turn step tracker driven by the TurnEventBus -->
 
 # Activity panel (live tool-call panel for Slack / Discord)
 
@@ -45,16 +45,10 @@ reactions and replies stay explicit; the panel is automatic activity display.
 
 ## Configuration
 
-Both are prefix allow-lists / maps over channel ids; both default off/coarse.
-
-- `MIMIR_ACTIVITY_PANEL_CHANNELS` — comma-separated channel-id prefixes the
-  panel is enabled for (e.g. `discord-,slack-`). Empty = off. The panel only
-  posts for **user-facing work turns**; internal/system triggers never surface
-  one (see gating below), regardless of channel.
-- `MIMIR_ACTIVITY_PANEL_DETAIL` — detail level. `coarse` (default) shows step
-  labels only and is fully redacted. `detailed` additionally renders the current
-  in-flight step's detail inline. Accepts a bare level or per-channel
-  `prefix:level` pairs (e.g. `discord-:detailed`).
+`MIMIR_ACTIVITY_PANEL_CHANNELS` is a comma-separated channel-id prefix
+allow-list (for example, `discord-,slack-`). Empty = off. The panel only posts
+for **user-facing work turns**; internal/system triggers never surface one (see
+gating below), regardless of channel. All panels are metadata-only.
 
 ## Trigger gating (chainlink #725)
 
@@ -82,25 +76,21 @@ Derived from the span type + `tool_name` by `_step_label` (coarse-only vocabular
   dropped, and `tool_name` is carried on `tool_result/end` so it's the real
   tool name, not a generic fallback).
 
-## Detailed mode + redaction
+## Information-flow boundary
 
-Coarse mode never reads span args/results/text — it is safe on any channel.
-`detailed` mode surfaces the current in-flight step's detail inline (dropped when
-the step completes; the finalized message stays compact), which is why it is
-opt-in per channel. Its defenses (`_step_detail` / `_scrub_detail` in
-`_activity_panel.py`):
+The panel payload contains only harness-authored status vocabulary, sanitized
+tool names, step counts, and folded-input counts. It does not retain or render
+reasoning text, tool arguments or results, inbound message bodies, attachment
+paths, or author identity. This makes it harness display state rather than turn
+content egress; `activity_panel_post` and `activity_panel_edit` therefore use the
+dedicated `harness_display` sink category. Model-invoked `send_message` and
+`react` remain `same_channel` sinks and keep their IFC checks.
 
-- **Tool args render as KEYS only** — `args: file_path, cmd` — never the values,
-  so a secret in an arg value can't leak regardless of shape.
-- **Reasoning / tool-result previews are scrubbed + length-capped**:
-  `key=value` / quoted-JSON / dict-repr secret values, `Authorization: Bearer`
-  and bare bearer tokens, known token prefixes (`ghp_`, `sk-`, `AKIA`,
-  `github_pat_`), and a high-entropy fallback → `[redacted]`; absolute, `~`,
-  relative, and Windows-style paths → `[path]`.
-- Attachment paths and full inbound message bodies are never fed to the panel.
-
-Even so, detailed mode surfaces more turn internals than coarse — enable it only
-on channels you trust to see the agent's working detail.
+Each non-chunk span transition requests an edit, but edits are coalesced to at
+most about one per second per channel. The observed edit-heavy ratio is expected:
+one panel is posted per turn and then rewritten around tool/reasoning transitions.
+The debounce already coalesces bursts; further coalescing would make live status
+less responsive and is not needed for authorization correctness.
 
 ## Not this
 

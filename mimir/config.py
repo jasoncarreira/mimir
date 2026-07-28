@@ -457,37 +457,6 @@ def _parse_sources(raw: str) -> frozenset[str] | None:
     return frozenset(tokens)
 
 
-def _parse_activity_panel_detail(raw: str) -> tuple[tuple[str, str], ...]:
-    """Parse ``MIMIR_ACTIVITY_PANEL_DETAIL`` into ``(channel_prefix, level)``.
-
-    Accepted forms:
-    - ``detailed`` / ``coarse`` applies to every allow-listed channel.
-    - ``slack-C01:detailed,discord-:coarse`` applies by prefix.
-    Unknown levels are ignored so the default remains coarse.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        return ()
-    out: list[tuple[str, str]] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if ":" in entry:
-            prefix, level = entry.rsplit(":", 1)
-            prefix = prefix.strip() or "*"
-        else:
-            prefix, level = "*", entry
-        level = level.strip().lower()
-        if level not in ("coarse", "detailed"):
-            logging.getLogger(__name__).warning(
-                "MIMIR_ACTIVITY_PANEL_DETAIL: ignoring unknown level %r", level,
-            )
-            continue
-        out.append((prefix, level))
-    return tuple(out)
-
-
 _CHAT_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -996,11 +965,6 @@ class Config:
     # Passive live activity panel channel-prefix allowlist. Empty = off.
     # ``MIMIR_ACTIVITY_PANEL_CHANNELS``.
     activity_panel_channels: tuple[str, ...] = ()
-    # Optional activity panel detail level map. Empty/default = coarse for all
-    # channels. ``detailed`` opts every allow-listed channel into transient
-    # scrubbed in-flight detail; ``prefix:level`` entries opt specific prefixes.
-    # ``MIMIR_ACTIVITY_PANEL_DETAIL``.
-    activity_panel_detail: tuple[tuple[str, str], ...] = ()
     # chainlink #783: opt-in chat slash-skill discovery/invocation. Disabled by
     # default; the allowlist is normalized, lowercased skill slugs only.
     chat_skills_enabled: bool = False
@@ -1157,9 +1121,6 @@ class Config:
                 p.strip()
                 for p in _env("MIMIR_ACTIVITY_PANEL_CHANNELS", "").split(",")
                 if p.strip()
-            ),
-            activity_panel_detail=_parse_activity_panel_detail(
-                _env("MIMIR_ACTIVITY_PANEL_DETAIL", "")
             ),
             chat_skills_enabled=_env_bool("MIMIR_CHAT_SKILLS_ENABLED", False),
             chat_skill_allowlist=_parse_chat_skill_allowlist(
