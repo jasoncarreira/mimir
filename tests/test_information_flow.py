@@ -1412,6 +1412,8 @@ def test_github_poller_fetch_allows_only_repo_bounded_read_endpoints(
         "https://raw.githubusercontent.com/acme/widget",
         "https://raw.githubusercontent.com/acme/widget/main/file.py?download=1",
         "https://raw.githubusercontent.com/acme/widget/main/%2e%2e/secret",
+        "https://raw.githubusercontent.com/acme/widget/main/../../attacker/evil/file.py",
+        "https://raw.githubusercontent.com/acme/widget/main/./file.py",
         "https://raw.githubusercontent.com/acme%2Fattacker/widget/main/file.py",
         "https://raw.githubusercontent.com/acme/widget%5Crepo/main/file.py",
         "https://github.com/acme/widget/raw/main/file.py",

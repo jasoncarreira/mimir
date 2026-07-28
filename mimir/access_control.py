@@ -1911,6 +1911,7 @@ def _target_matches_github_pr_api(target: str, destination: str) -> bool:
         or parsed.query
         or "%" in parsed.path
         or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
     ):
         return False
     if parsed.netloc == "api.github.com":
