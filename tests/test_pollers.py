@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir import poller_recovery
+from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
 from mimir.pollers import (
@@ -165,6 +165,48 @@ def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
     profile = TRIGGER_AUTHORITY_PROFILES["research"]
     assert {"memory_store", "saga_feedback", "saga_mark_contributions"} <= profile
     assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+
+
+def test_github_profile_allows_only_its_bounded_fetch_capability(
+    tmp_path: Path,
+) -> None:
+    persist_dir = tmp_path / "github-activity"
+    persist_dir.mkdir()
+    authority = _parse_poller_authority(
+        _authority(
+            profile="github",
+            tier="code-execution",
+            capabilities=["fetch_url"],
+        ),
+        name="github-activity",
+        persist_dir=persist_dir,
+        state_root=tmp_path,
+        manifest_path=tmp_path / "pollers.json",
+    )
+
+    assert authority.sink_policy_for("fetch_url") == access_control.ServiceSinkPolicy(
+        "fetch_url", "github_pr_api", "GITHUB_REPOS",
+    )
+
+
+def test_non_github_poller_cannot_claim_unbounded_fetch_capability(
+    tmp_path: Path,
+) -> None:
+    persist_dir = tmp_path / "custom"
+    persist_dir.mkdir()
+
+    with pytest.raises(ValueError, match="capability exceeds declared tier"):
+        _parse_poller_authority(
+            _authority(
+                profile="custom",
+                tier="code-execution",
+                capabilities=["fetch_url"],
+            ),
+            name="custom",
+            persist_dir=persist_dir,
+            state_root=tmp_path,
+            manifest_path=tmp_path / "pollers.json",
+        )
 
 
 def test_shipped_poller_shell_authorities_have_job_inspection_companions(

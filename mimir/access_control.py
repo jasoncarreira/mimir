@@ -403,7 +403,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
         "file_search", "get_turn", "mimir_get_turn", "send_message",
         "operator_alert", "task", "memory_store", "saga_mark_contributions",
-        "saga_end_session", "saga_record_skill_learning",
+        "saga_end_session", "saga_record_skill_learning", "fetch_url",
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS),
@@ -503,6 +503,8 @@ def build_trigger_service_principal(
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url" and profile == "heartbeat":
             policies.append(ServiceSinkPolicy(operation, "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"))
+        elif operation == "fetch_url" and profile == "github":
+            policies.append(ServiceSinkPolicy(operation, "github_pr_api", "GITHUB_REPOS"))
     if "operator_alert" in capabilities:
         policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
     return ServicePrincipal(
@@ -1965,6 +1967,52 @@ def _target_matches_approved_url(target: str, destination: str) -> bool:
     return normalized is not None and normalized in _configured_exact_urls(destination)
 
 
+_GITHUB_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
+_GITHUB_PR_API_PATH = re.compile(
+    r"/repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)(?:/(reviews|comments))?\Z"
+)
+_GITHUB_RAW_REPO_PATH = re.compile(r"/([^/]+)/([^/]+)/([^/]+)(?:/(.+))?\Z")
+
+
+def _configured_github_repos(variable: str) -> frozenset[tuple[str, str]]:
+    """Return syntactically safe owner/repo pairs from server-owned config."""
+    repos: set[tuple[str, str]] = set()
+    for item in os.environ.get(variable, "").split(","):
+        parts = item.strip().split("/")
+        if (
+            len(parts) == 2
+            and all(part not in {"", ".", ".."} for part in parts)
+            and all(_GITHUB_REPO_SEGMENT.fullmatch(part) for part in parts)
+        ):
+            repos.add((parts[0].lower(), parts[1].lower()))
+    return frozenset(repos)
+
+
+def _target_matches_github_pr_api(target: str, destination: str) -> bool:
+    """Match bounded GitHub PR API or raw-content reads for configured repos."""
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != "https"
+        or parsed.query
+        or "%" in parsed.path
+        or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+    ):
+        return False
+    if parsed.netloc == "api.github.com":
+        match = _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+    elif parsed.netloc == "raw.githubusercontent.com":
+        match = _GITHUB_RAW_REPO_PATH.fullmatch(parsed.path)
+    else:
+        return False
+    if match is None:
+        return False
+    return (match[1].lower(), match[2].lower()) in _configured_github_repos(destination)
+
+
 def _configured_exact_urls(variable: str) -> frozenset[str]:
     """Read one exact URL or a JSON array of exact URLs from an environment variable."""
     configured = os.environ.get(variable, "").strip()
@@ -2008,6 +2056,21 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
     return frozenset(approved)
 
 
+def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
+    """Authorize an exact URL, or a service's explicitly bounded URL adapter."""
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    if normalized in approved_fetch_urls(auth_context):
+        return True
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for("fetch_url") if service is not None else None
+    if policy is None:
+        return False
+    adapter = _SERVICE_SINK_ADAPTERS.get(policy.adapter)
+    return adapter is not None and adapter(normalized, policy.destination)
+
+
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "configured_repo_write_roots": _target_within_configured_repo_write_roots,
@@ -2018,6 +2081,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "trigger_service_write_roots": _target_within_trigger_service_write_roots,
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
+    "github_pr_api": _target_matches_github_pr_api,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -2248,7 +2312,7 @@ class SinkGate:
                 )
         if tool_name == "fetch_url" and (
             normalized_target is None
-            or normalized_target not in approved_fetch_urls(auth_context)
+            or not fetch_url_is_approved(normalized_target, auth_context)
         ):
             return ToolAuthorization(
                 tool_name=tool_name,

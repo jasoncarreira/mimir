@@ -722,10 +722,18 @@ def _parse_poller_authority(
             )
         if name == "session-boundary" and _TIER_RANK[tier] > _TIER_RANK[CapabilityTier.SCOPED_WITH_PROVENANCE]:
             raise ValueError("session-boundary manifest cannot widen the built-in tier")
-    if any(_TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier] for cap in capabilities):
+    # GitHub fetches are statically unbounded as a generic operation, but this
+    # profile always receives the server-defined GITHUB_REPOS PR-path adapter.
+    bounded_profile_capabilities = {"fetch_url"} if profile == "github" else set()
+    if any(
+        _TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier]
+        for cap in capabilities
+        if cap not in bounded_profile_capabilities
+    ):
         raise ValueError(f"capability exceeds declared tier {tier.value!r}")
     if tier is CapabilityTier.UNBOUNDED or any(
         TRIGGER_CAPABILITY_TIERS[cap] is CapabilityTier.UNBOUNDED for cap in capabilities
+        if cap not in bounded_profile_capabilities
     ):
         raise ValueError("skill pollers cannot declare unbounded authority")
 

@@ -91,13 +91,14 @@ different branch:**
 gh pr diff <num> --repo jasoncarreira/mimir
 ```
 
-On a poller turn the diff plus a local `Read` of the checked-out branch is the
-whole available toolkit. Fetching a file at an arbitrary SHA is **not** admitted
-there today: `gh api` is outside the profile, and the
-`gh api ... --jq '.content' | base64 -d` form fails three ways at once — `gh api`
-is not admitted, `--jq` is not admitted, and the pipe makes it a compound
-command. Chainlink #1014 tracks admitting a bounded read of PR file contents; do
-not assume it exists until it lands.
+On a poller turn, use the diff plus a local `Read` of the checked-out branch.
+When the local checkout does not contain the reviewed head, `fetch_url` may read
+an exact file at that head using
+`https://raw.githubusercontent.com/<owner>/<repo>/<headRefOid>/<path>`. The owner
+and repo must be one of the server-configured `GITHUB_REPOS`; arbitrary hosts,
+repositories, and path traversal remain denied. `fetch_url` is GET-only and the
+returned content remains untrusted. Do not substitute `gh api`: it is outside
+the review profile, and pipes or compound shell commands are not admitted.
 
 
 **If a local `Read` returns "file does not exist":** do NOT bail. Log it
