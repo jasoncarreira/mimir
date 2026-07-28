@@ -860,6 +860,25 @@ def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
     assert "[poller:github-poller]" in block
 
 
+def test_untrusted_pr_skip_surfaces_for_operator(tmp_path: Path):
+    log = _make_log(
+        tmp_path,
+        events=[{
+            "timestamp": _ts(0.1),
+            "type": "pr_auto_review_skipped_untrusted_author",
+            "repo": "acme/widget",
+            "number": 17,
+            "url": "https://github.com/acme/widget/pull/17",
+        }],
+    )
+
+    block = log.recent_block()
+
+    assert block is not None
+    assert "automatic review skipped for acme/widget#17" in block
+    assert "review deliberately" in block
+
+
 def test_distinct_gave_up_event_types_keep_separate_counts(tmp_path: Path):
     """chainlink #321: suffix-classified give-up events render with the
     existing friendly wording, but their ×N counts stay per event type rather
