@@ -365,6 +365,23 @@ def _fetch_base_from_origin(
                 backup=str(backup),
             )
         result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
+    # A reclaimed alternate leaves refs behind. Pruning the alternates file removes
+    # the pointer but not the refs that resolved only through it, and git refuses
+    # the whole fetch on the first such ref ("fatal: bad object <ref>"). Repair that
+    # residue once too, otherwise a single stale remote-tracking ref permanently
+    # fails every base fetch — which consumed six worklink attempts across three
+    # leaves before it was diagnosed by hand.
+    if result.returncode != 0:
+        repaired_refs = _prune_dangling_refs(repo, runner=runner)
+        if repaired_refs:
+            if event_logger is not None:
+                event_logger(
+                    "worklink_base_refs_repaired",
+                    repo=str(repo),
+                    base=remote_base,
+                    pruned=[f"{name}@{sha}" for name, sha in repaired_refs],
+                )
+            result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
     if result.returncode == 0 and not _dangling_alternates(repo):
         return True
     if event_logger is not None:
@@ -461,6 +478,51 @@ def _alternate_entries(repo: Path) -> tuple[Path | None, list[tuple[str, Path]]]
 def _dangling_alternates(repo: Path) -> list[Path]:
     _alternates, entries = _alternate_entries(repo)
     return [path for _line, path in entries if not path.is_dir()]
+
+
+def _dangling_refs(repo: Path, *, runner: Runner) -> list[tuple[str, str]]:
+    """Refs whose target object is not present in this repository.
+
+    This is the residue an alternate leaves behind. Pruning a reclaimed alternate
+    removes the *pointer* to the vanished object store, but any ref that resolved
+    only through it still names an object that is now absent, and ``git fetch``
+    then refuses the whole operation with ``fatal: bad object <ref>``.
+
+    Observed on 2026-07-28: the janitor reclaimed
+    ``<home>/scratch/pr1188-object-db``, ``_prune_dangling_alternates`` had already
+    dropped that entry on an earlier run, and the leftover
+    ``refs/remotes/origin/pr/1188`` made every base fetch fail. Six worklink
+    attempts across three leaves were consumed and demoted before anyone looked.
+    """
+    listing = runner([
+        "git", "-C", str(repo), "for-each-ref", "--format=%(refname) %(objectname)",
+    ])
+    if listing.returncode != 0:
+        return []
+    dangling: list[tuple[str, str]] = []
+    for line in (listing.stdout or "").splitlines():
+        name, _, sha = line.strip().partition(" ")
+        if not name or not sha:
+            continue
+        if runner(["git", "-C", str(repo), "cat-file", "-e", sha]).returncode != 0:
+            dangling.append((name, sha))
+    return dangling
+
+
+def _prune_dangling_refs(repo: Path, *, runner: Runner) -> list[tuple[str, str]]:
+    """Delete refs whose objects are gone, so a base fetch can proceed.
+
+    Only refs are removed, never objects or history. A deleted remote-tracking ref
+    is re-created by the next fetch that can see it; a deleted local branch whose
+    tip object is already absent was unusable regardless. Nothing recoverable is
+    discarded, which is what makes this safe to do automatically — unlike removing
+    an alternate, which can strand objects that exist nowhere else.
+    """
+    pruned: list[tuple[str, str]] = []
+    for name, sha in _dangling_refs(repo, runner=runner):
+        if runner(["git", "-C", str(repo), "update-ref", "-d", name]).returncode == 0:
+            pruned.append((name, sha))
+    return pruned
 
 
 def _prune_dangling_alternates(repo: Path) -> tuple[list[Path], Path | None]:

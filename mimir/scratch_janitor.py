@@ -109,6 +109,88 @@ class SweepResult:
     kept: int = 0
     bytes_reclaimed: int = 0
     errors: tuple[str, ...] = ()
+    #: Entries retained because a git repository depends on them via
+    #: ``objects/info/alternates``. Reported separately from ``kept`` so a
+    #: protected entry is visible rather than looking merely young.
+    protected: tuple[str, ...] = ()
+
+
+def _alternate_referenced_paths(home: Path) -> frozenset[Path]:
+    """Object stores that a nearby git repository depends on.
+
+    A git repository can borrow objects from elsewhere via
+    ``objects/info/alternates``. If that target is inside a swept root, reclaiming
+    it corrupts the borrowing repository: ``git fetch`` then fails with
+    ``fatal: bad object <ref>`` for every ref that resolved only through it, and
+    the failure looks like a broken repo rather than a reclaimed directory.
+
+    That happened on 2026-07-28. ``<home>/scratch/pr1188-object-db`` was reclaimed
+    at the 1-day TTL while ``/workspace/mimir`` referenced it, and six worklink
+    attempts across three leaves failed and were auto-demoted before anyone traced
+    it. So the janitor now declines to reclaim what a repository is standing on.
+
+    Bounded on purpose: the candidate repositories are the configured source
+    checkout, the container source path, the operator-configured external file-tool
+    roots, and the home itself. This is a safety interlock, not a filesystem
+    search — an unlisted repository is no worse off than before this existed.
+    """
+    candidates: list[Path] = []
+    if source_dir := os.environ.get("MIMIR_SOURCE_DIR", "").strip():
+        candidates.append(Path(source_dir))
+    candidates.append(Path("/workspace/mimir"))
+    for item in os.environ.get("MIMIR_FILE_TOOL_ROOTS", "").split(","):
+        # Entries may carry a ``:ro`` / ``:rw`` access suffix.
+        raw = item.split(":")[0].strip()
+        if raw:
+            candidates.append(Path(raw))
+    candidates.append(home)
+
+    referenced: set[Path] = set()
+    seen: set[Path] = set()
+    for repo in candidates:
+        try:
+            repo = repo.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if repo in seen:
+            continue
+        seen.add(repo)
+        for objects in (repo / ".git" / "objects", repo / "objects"):
+            alternates = objects / "info" / "alternates"
+            try:
+                if not alternates.is_file():
+                    continue
+                lines = alternates.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line in lines:
+                entry = line.strip()
+                if not entry:
+                    continue
+                path = Path(entry)
+                if not path.is_absolute():
+                    path = objects / path
+                try:
+                    referenced.add(path.resolve())
+                except (OSError, RuntimeError):
+                    continue
+    return frozenset(referenced)
+
+
+def _entry_is_protected(entry: Path, protected_paths: frozenset[Path]) -> bool:
+    """True when a borrowed object store lives at or beneath ``entry``."""
+    if not protected_paths:
+        return False
+    try:
+        resolved = entry.resolve()
+    except (OSError, RuntimeError):
+        # Unresolvable means we cannot prove the entry is safe to delete. Keep it;
+        # a retained directory costs disk, a wrongly-deleted one costs a repository.
+        return True
+    for path in protected_paths:
+        if path == resolved or resolved in path.parents:
+            return True
+    return False
 
 
 def _tree_newest_mtime_and_size(
@@ -186,8 +268,12 @@ def sweep_scratch_roots(
     cutoff = (now if now is not None else time.time()) - ttl_days * 86400
     removed: list[str] = []
     errors: list[str] = []
+    protected_entries: list[str] = []
     kept = 0
     reclaimed = 0
+    # Object stores a git repository is borrowing. Reclaiming one corrupts the
+    # borrower, so these are never swept regardless of age.
+    protected_paths = _alternate_referenced_paths(home)
     for name in roots:
         root = _resolve_root(home, name)
         if root is None:
@@ -199,6 +285,10 @@ def sweep_scratch_roots(
             continue
         for entry in entries:
             try:
+                if _entry_is_protected(entry, protected_paths):
+                    kept += 1
+                    protected_entries.append(str(entry.relative_to(home)))
+                    continue
                 recent, size = _tree_newest_mtime_and_size(entry, cutoff)
                 if recent:
                     kept += 1
@@ -216,4 +306,5 @@ def sweep_scratch_roots(
         kept=kept,
         bytes_reclaimed=reclaimed,
         errors=tuple(errors),
+        protected=tuple(protected_entries),
     )
