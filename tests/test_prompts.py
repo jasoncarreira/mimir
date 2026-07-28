@@ -619,6 +619,23 @@ def test_turn_prompt_renders_exact_autonomous_trigger_authority():
     assert "``worklink_run`` is usable only before any untrusted active ingest" in prompt
 
 
+def test_github_trigger_prompt_rejects_self_declassification_and_spawn():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="poller:github-activity"),
+        trigger_authority_profile="github",
+        trigger_capability_tier="code-execution",
+        trigger_capabilities=("read_file", "worklink_run"),
+    )
+
+    assert "Complete review work in this turn" in prompt
+    assert "``approve_declassification``" in prompt
+    assert "any spawn tool" in prompt
+    assert "neither capability is available" in prompt
+
+
 def test_turn_prompt_auto_skill_block_no_frontmatter(tmp_path):
     """End-to-end pin (chainlink #212): ``find_skill_for_channel`` strips YAML
     frontmatter before the body reaches ``build_turn_prompt``.  The

@@ -23,6 +23,18 @@ READ_RESOURCE_OPERATIONS = frozenset({
     "file_search", "get_turn", "mimir_get_turn",
 })
 
+
+def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
+    """Record a protected result that the backend actually withheld."""
+    from .tools.budget_gate import _emit_hard_boundary_denied
+
+    _emit_hard_boundary_denied(
+        tool=tool,
+        boundary="protected_read_policy",
+        reason=reason,
+        target=target,
+    )
+
 _PROTECTED_BASENAMES = frozenset({
     ".env",
     "compose.env",

@@ -441,6 +441,10 @@ def _initialize_ifc_labels(
             for source in event.ifc_labels.sources
         ):
             integrity = Integrity.TRUSTED
+    # The boundary service authors the summary; it does not turn the completed
+    # session into a fresh external ingest. Inherited session sources remain on
+    # the carrier and continue to gate channel/network egress.
+    boundary_synthesis = event.trigger == "saga_session_end"
     labels = labels.with_source(SourceLabel(
         principal=canonical_principal,
         domain=domain,
@@ -452,7 +456,10 @@ def _initialize_ifc_labels(
         ),
         source_kind=source_kind,
         integrity=integrity,
-        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+        integrity_effect=(
+            IntegrityEffect.INFORMATIONAL
+            if boundary_synthesis else IntegrityEffect.ACTIVE_INGEST
+        ),
     ))
 
     for attachment in attachments or event.attachment_names:

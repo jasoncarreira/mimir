@@ -342,8 +342,8 @@ network, shell, spawn, notification, and file destinations. `SinkGate.check_sink
   sinks.
 
 The sink check runs before a model-invoked egress tool. Harness-owned final-text
-delivery and activity-panel post/edit paths invoke an enforced sink check at the
-final boundary even while general authorization is in shadow mode. SAGA
+delivery and activity-panel post/edit paths invoke the same sink check at the
+final boundary and obey the configured enforcement mode. SAGA
 ownership does not currently generate field-level IFC labels; after authorized
 recall, injected prompt context receives the conservative turn-level taint.
 
@@ -358,7 +358,7 @@ boundary.
 
 | Setting | Default | Authorization effect |
 |---|---|---|
-| `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open denial and harness egress checks remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
+| `MIMIR_ACCESS_CONTROL_ENFORCED` | `false` | Primary switch. False is compatibility/shadow mode; true enforces inbound identity, operation, resource, and IFC decisions. Generic HTTP non-open ingress and the always-on boundaries listed below remain fail-closed when false. Boolean parsing accepts `1/true/yes/on/y` and `0/false/no/off/n`; unset, empty, or invalid values resolve to the safe shipped default (`false`, with a warning for invalid input). |
 | `MIMIR_MODEL_SPEC` | `codex-plus:gpt-5.6-luna` | Selects the model provider. The shipped default is enforcement-compatible. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned opaque carrier, so `claude-code:*` is also compatible with enforcement. |
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
@@ -608,9 +608,52 @@ Inspect structured inbound decisions and `shadow_tool_decision` events for:
 - IFC blocks caused by unknown sinks, missing targets, mixed source channels, or
   protected prompt/tool data reaching an active sink.
 
-Generic HTTP non-open denial and final harness egress checks are already hard
-boundaries in this phase. Do not interpret their denials as evidence that global
-enforcement is enabled.
+Count `shadow_tool_decision` records with `would_block: true` as projected
+enforcement denials. Records with `would_block: false` are projected permits;
+legacy records without the field are unclassifiable and must not be inferred
+from `allowed` or `reason`.
+
+Count `hard_boundary_denied` separately as actions that did not happen. These
+records can be unioned with shadow decisions for workflow-impact analysis, but
+must not be included in projected-enforcement totals. Their `boundary` and
+machine-readable `reason` identify the refusal, while `target`, `trigger`, and
+`service_principal` identify the affected workflow; targets are secret-scrubbed.
+
+The enforcement-independent denial inventory is:
+
+- generic HTTP ingress invoking a non-open operation (`http_event_ingress`);
+- final trusted-service shell argv binding (`service_shell_argv_binding`);
+- missing or invalid maintenance executable pins (`maintenance_pinned_executable`);
+- protected direct and collection reads for non-admin, non-service callers
+  (`protected_read_policy`);
+- writes outside configured writable roots and mutations routed to read-only
+  backends (`filesystem_write_guard`, `readonly_filesystem`);
+- the prohibited-action guardrail (`prohibited_action_guard`); and
+- exhausted per-turn tool-call budgets (`tool_call_budget`).
+
+An incomplete capability matrix emits the same event shape under
+`capability_matrix_preflight`; startup is refused when enforcement was requested.
+MCP classifier failures, middleware read-scope decisions, and final harness IFC
+egress remain ordinary enforcement decisions: with enforcement off they proceed
+and emit shadow/would-block evidence rather than a hard denial.
+
+#### 2026-07-27 low-count residue classification (#1017)
+
+The 15:21-21:07 shadow pass contained 11 decisions outside the larger classes.
+They are deliberately recorded here so a later audit does not treat a quiet log
+as a reason to widen authority:
+
+| Events | Classification | Evidence and disposition |
+|---|---|---|
+| 4 `system` `shell_exec` / `service_sink_destination_denied` | **(c) Already fixed** | All four came from the one-shot 0.7.0 reconciliation and stopped after 15:22:20. #1011/#1220 added `<home>/scratch` to the static service write roots. `test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized` replays `git -C <scratch proposal> ...` through fresh enforced and shadow decisions, asserting admission and `would_block == false`. Compound `cd X && ...` remains intentionally inadmissible. The shipped upgrade prompt now names the admitted single-argv form so a future live reconciliation does not replay the stale command shape. No scope or capability was widened here. |
+| 3 `poller:github-activity` `approve_declassification` / `admin_required` | **(b) Correct denial; behavior change** | A review poller consumes taint-gated PR content. Letting it approve its own declassification would erase the independent admin decision and turn prompt injection into its own release authority. The `github` profile omits this capability. Trigger and review-skill guidance now say to stop attempting it; no grant was added. |
+| 3 `send_message`/`react` / `ifc_label_blocked:same_channel` (`system`, poller, and principal-less interactive) | **(a) Genuine over-taint gap, folded into #1016** | The sink gate already permits every known sensitivity label when all accumulated sources are complete and destination-compatible (`test_every_known_label_can_flow_to_compatible_same_channel`). These events instead carried unrelated or incomplete untrusted provenance, including a turn with no principal, matching #1016's session-boundary/derived-input over-taint rather than a messaging capability gap. IFC derivation is therefore owned and verified by #1016; this leaf makes no duplicate gate change. |
+| 1 `poller:github-activity` `spawn_claude_code` / `admin_required` | **(b) Correct denial; behavior change** | Spawn is a code-execution and network boundary, not a review primitive. A poller-triggered review must inspect and submit in its current bounded turn; delegating to a coding process would escape that review path's authority. The `github` profile omits every spawn capability, and prompt/skill guidance now makes the restriction explicit. No grant was added. |
+
+For the (c) row, the fresh shadow replay is empty for the documented legitimate
+`git -C` action. A future live reconciliation should confirm the same; a quiet
+interval with no upgrade turn is not equivalent evidence. The old compound form
+must still be denied if requested.
 
 ### 3. Pass startup preflights
 

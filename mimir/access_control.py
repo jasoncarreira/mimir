@@ -420,7 +420,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "memory_get",
         "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
-        "agrep", "get_turn", "mimir_get_turn",
+        "agrep", "file_search", "get_turn", "mimir_get_turn",
+        "write_file", "edit_file",
     }),
 }
 
@@ -1075,13 +1076,34 @@ def _target_matches_repo_review_shell_command(argv: list[str]) -> bool:
     if not argv:
         return False
 
+    # ``--jq`` is deliberately absent from every option set below, here and in
+    # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
+    # ``env`` / ``$ENV`` builtins read the process environment — which
+    # ``direct_exec_env`` copies wholesale from the parent, credentials included.
+    # ``gh pr view <n> --repo <r> --json reviews --jq env`` was therefore an
+    # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
+    # MIMIR_API_KEY and the provider keys into the tool result, and from there
+    # into the model's context and the turn transcript. Enforcement was no
+    # defence: the command was ALLOWED, not merely unblocked.
+    #
+    # Nothing is lost by removing it. Every non-trivial filter was already
+    # refused, because ``|``, ``[``, ``]`` and ``{`` are shell metacharacters and
+    # the profile scans the raw command string before splitting it; only degenerate
+    # forms like ``--jq .reviews`` ever got through. ``--json`` returns the same
+    # data and the caller filters it itself.
+    #
+    # Do not "fix" this by blocklisting ``env`` and ``$ENV``: that is a denylist
+    # over an expression language, and the next builtin that reaches process
+    # state reopens it. ``--template`` is retained because gh's template function
+    # set is fixed and exposes no environment accessor — verify that claim again
+    # before adding any option that evaluates a caller-supplied expression.
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         options = {
-            "view": frozenset({"--comments", "--json", "--jq", "--repo", "--template"}),
+            "view": frozenset({"--comments", "--json", "--repo", "--template"}),
             "diff": frozenset({"--color", "--name-only", "--patch", "--repo"}),
             "checks": frozenset({
-                "--fail-fast", "--interval", "--json", "--jq", "--repo",
+                "--fail-fast", "--interval", "--json", "--repo",
                 "--required", "--watch",
             }),
             # Submitting the review is the point of the repo_review profile —
@@ -1400,6 +1422,14 @@ def _maintenance_resolved_pin(command: str) -> Path | None:
     """Validate one pin as a trusted executable outside service-writable roots."""
     expected = _MAINTENANCE_PINNED_EXECUTABLES.get(command)
     if expected is None:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_missing",
+            target=command,
+        )
         return None
     try:
         resolved = expected.resolve(strict=True)
@@ -1414,11 +1444,21 @@ def _maintenance_resolved_pin(command: str) -> Path | None:
             "maintenance_pinned_executable_missing command=%s expected=%s error=%s",
             command, expected, exc,
         )
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="shell_exec",
+            boundary="maintenance_pinned_executable",
+            reason="maintenance_executable_pin_invalid",
+            target=str(expected),
+        )
         return None
     return resolved
 
 
-def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+def _maintenance_pinned_execution_argv_with_reason(
+    argv: list[str],
+) -> tuple[list[str] | None, str]:
     """Replace an admitted service command with a trusted absolute program.
 
     Service commands execute with ``shell=False``, but a bare ``argv[0]``
@@ -1426,22 +1466,38 @@ def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
     fixed regular file outside every configured service-writable root. Script
     pins also name their pinned interpreter explicitly, so their shebang cannot
     reintroduce PATH resolution below the authorized argv.
+
+    Returns the pinned argv and ``""``, or ``None`` and why pinning refused.
+    ``_maintenance_pinned_execution_argv`` is the argv-only view of this.
     """
     if not argv:
-        return None
+        return None, "the command is empty."
     command = argv[0]
     expected = _maintenance_resolved_pin(command)
     if expected is None:
-        return None
+        return None, (
+            f"the executable {command!r} has no trusted pinned path for service "
+            "execution. A pin must resolve to a regular file that is not a "
+            "symlink and lies outside every service-writable root, so the "
+            "program cannot be swapped between authorization and execution."
+        )
     interpreter_command = _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS.get(command)
     if interpreter_command is not None:
         interpreter = _maintenance_resolved_pin(interpreter_command)
         if interpreter is None:
-            return None
-        return [str(interpreter), str(expected), *argv[1:]]
+            return None, (
+                f"the pinned interpreter {interpreter_command!r} required to run "
+                f"the script {command!r} could not be resolved to a trusted path."
+            )
+        return [str(interpreter), str(expected), *argv[1:]], ""
     if command == "pytest":
-        return [str(expected), "-m", "pytest", *argv[1:]]
-    return [str(expected), *argv[1:]]
+        return [str(expected), "-m", "pytest", *argv[1:]], ""
+    return [str(expected), *argv[1:]], ""
+
+
+def _maintenance_pinned_execution_argv(argv: list[str]) -> list[str] | None:
+    """Argv-only view of :func:`_maintenance_pinned_execution_argv_with_reason`."""
+    return _maintenance_pinned_execution_argv_with_reason(argv)[0]
 
 
 def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
@@ -1460,19 +1516,19 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
         options = {
             ("pr", "list"): frozenset({
                 "--app", "--assignee", "--author", "--base", "--draft", "--head",
-                "--json", "--jq", "--label", "--limit", "--repo", "--search",
+                "--json", "--label", "--limit", "--repo", "--search",
                 "--state", "--template",
             }),
             ("pr", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
             ("issue", "list"): frozenset({
-                "--app", "--assignee", "--author", "--json", "--jq", "--label",
+                "--app", "--assignee", "--author", "--json", "--label",
                 "--limit", "--mention", "--milestone", "--repo", "--search",
                 "--state", "--template",
             }),
             ("issue", "view"): frozenset({
-                "--comments", "--json", "--jq", "--repo", "--template",
+                "--comments", "--json", "--repo", "--template",
             }),
         }.get((resource, subcommand))
         return options is not None and _arguments_match_allowlist(
@@ -1495,55 +1551,214 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
     return False
 
 
-def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
-    """Return the exact argv admitted by a trusted service shell profile.
+# Appended to refusals a rewrite cannot fix, so the caller is told what shape
+# to use instead of retrying the same one. The three named substitutions are the
+# ones observed in production: ``cd X && cmd``, an inline multi-line ``--body``,
+# and a heredoc.
+_SHELL_PROFILE_SINGLE_ARGV_HINT = (
+    "A trusted-service profile execs one argv directly with shell=False, so "
+    "shell syntax is never admitted and no quoting will change that. Issue one "
+    "command per call; select the working directory with the command's own "
+    "option (for example 'git -C <dir>') rather than 'cd <dir> && ...'; and pass "
+    "multi-line text through a file option (for example 'gh pr review "
+    "--body-file <path beneath the agent scratch root>') rather than an inline "
+    "multi-line value or a heredoc."
+)
+
+
+# Display-only vocabulary for refusal messages. A token is echoed back to the
+# caller ONLY if it is literally a member of one of these sets; anything else
+# becomes a placeholder. That makes "no argument value is ever disclosed" a
+# property of construction rather than of a pattern.
+#
+# Pattern matching cannot do this job. An attached short-option value
+# (``-HAuthorization:Bearer-...``) has the same shape as a legitimate long
+# option, and a secret can be bare alphanumerics or a plain-looking path
+# (``private/path/...``), indistinguishable from a subcommand or an API resource.
+#
+# Absence from these sets can only make a message *less specific* — it can never
+# change an authorization decision, admit a command, or deny one. That asymmetry
+# is what makes a hand-maintained display list safe: its worst failure is a
+# vaguer sentence. The executables are derived from the pin map so they cannot
+# drift from the commands that can actually run.
+_SERVICE_SHELL_DISPLAY_COMMANDS = frozenset(_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS)
+_SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
+    "add", "api", "branch", "checkout", "checks", "close", "comment", "commit",
+    "create", "describe", "diff", "fetch", "init", "issue", "label", "list",
+    "lock", "log", "ls-files", "merge-base", "pr", "pull", "push", "ready",
+    "relate", "remote", "rev-parse", "review", "run", "show", "status", "sync",
+    "test", "update", "view",
+})
+_SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
+    "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
+    "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
+    "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
+    "--json", "--jq", "--label", "--limit", "--mention", "--milestone",
+    "--no-pager", "--oneline", "--priority", "--repo", "--request-changes",
+    "--search", "--short", "--state", "--status", "--template",
+})
+
+
+def _service_shell_command_shape(argv: list[str]) -> str:
+    """Name the refused command surface without echoing any argument value.
+
+    The executable plus up to two following non-option tokens, each passed
+    through the display vocabulary — enough to identify which command and
+    subcommand were refused, while a resource path or any other value renders as
+    ``<value>``.
+    """
+    shape = [
+        argv[0] if argv[0] in _SERVICE_SHELL_DISPLAY_COMMANDS else "<command>"
+    ]
+    for token in argv[1:]:
+        if token.startswith("-"):
+            break
+        shape.append(
+            token if token in _SERVICE_SHELL_DISPLAY_SUBCOMMANDS else "<value>"
+        )
+        if len(shape) >= 3:
+            break
+    return " ".join(shape)
+
+
+def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
+    """Explain that a well-formed command is outside the profile's allowlist."""
+    supplied = [token for token in argv[1:] if token.startswith("-")]
+    named = sorted({
+        token for token in supplied if token in _SERVICE_SHELL_DISPLAY_OPTIONS
+    })
+    # One placeholder stands in for every option that is not a known spelling,
+    # including any that carries its value attached to it.
+    if len(named) != len(set(supplied)):
+        named.append("<option>")
+    option_text = f" Options sent: {', '.join(named)}." if named else ""
+    return (
+        f"the {destination!r} trusted-service shell profile does not admit "
+        f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
+        "admits a fixed set of commands, subcommands and options; anything "
+        "outside it is refused for this principal regardless of how it is "
+        "written."
+    )
+
+
+def parse_service_shell_argv_with_reason(
+    target: str, destination: str,
+) -> tuple[list[str] | None, str]:
+    """Return the argv a service shell profile admits, or why it refused.
 
     The returned argv is both the authorization artifact and the execution
     artifact. Callers must exec it directly with ``shell=False``; handing the
     original string to a shell would reintroduce an expansion layer the profile
     did not validate.
+
+    On refusal the second element says why. It is produced at the same branch
+    that refuses, so an explanation can never disagree with the decision it
+    describes — which is why this is one function with two outputs rather than a
+    separate explainer that could drift out of step with the rule.
+
+    Reasons are deliberately *structural*: metacharacters, the executable, the
+    subcommand and option NAMES. They never quote option values, because a
+    service command can carry a credential (``git -c http.extraheader=...``) and
+    this text is returned to the model and recorded in the turn transcript.
     """
-    if any(character in target for character in _SHELL_CONTROL_CHARACTERS):
-        return None
+    found = sorted(set(target) & _SHELL_CONTROL_CHARACTERS)
+    if found:
+        rendered = ", ".join(repr(character) for character in found)
+        return None, (
+            f"the command contains shell metacharacters ({rendered}), which the "
+            f"{destination!r} trusted-service shell profile never admits. "
+            + _SHELL_PROFILE_SINGLE_ARGV_HINT
+        )
     try:
         argv = shlex.split(target)
     except ValueError:
-        return None
+        return None, (
+            "the command could not be split into an argv because its quoting is "
+            "unbalanced. Close every quote, or pass the value through a file "
+            "option instead of inline."
+        )
     if not argv:
-        return None
+        return None, "the command is empty."
     # A leading tilde is shell home expansion; an embedded tilde such as
     # ``HEAD~1`` is a normal Git revision expression and is passed literally.
     if any(argument.startswith("~") for argument in argv):
-        return None
+        return None, (
+            "an argument begins with '~', which requires the shell home "
+            "expansion this profile does not perform. Use an absolute path."
+        )
 
     allowed = False
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
-        if _target_matches_repo_review_shell_command(argv):
-            pinned = _maintenance_pinned_execution_argv(argv)
-            # Capture any review body HERE, so the returned artifact carries no
-            # pathname for ``gh`` to look up again. See
-            # ``_capture_review_body_beneath_scratch``: validating a path and
-            # then passing that path on is a check/use race.
-            return (
-                _repo_review_argv_with_captured_body(pinned)
-                if pinned is not None else None
+        if not _target_matches_repo_review_shell_command(argv):
+            return None, _service_shell_not_admitted_reason(argv, destination)
+        pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
+        if pinned is None:
+            return None, reason
+        # Capture any review body HERE, so the returned artifact carries no
+        # pathname for ``gh`` to look up again. See
+        # ``_capture_review_body_beneath_scratch``: validating a path and
+        # then passing that path on is a check/use race.
+        captured = _repo_review_argv_with_captured_body(pinned)
+        if captured is None:
+            return None, (
+                "the '--body-file' path could not be captured. It must resolve "
+                "beneath the agent scratch root, be a regular file reached "
+                "without traversing a symlink, and be at most "
+                f"{_REVIEW_BODY_MAX_BYTES} bytes. The body is read once during "
+                "authorization so the path is never re-opened at execution."
             )
-        return None
+        return captured, ""
     elif destination == "maintenance":
         if argv[0] == "git":
-            return _maintenance_git_execution_argv(argv)
-        if _target_matches_maintenance_shell_command(argv):
-            return _maintenance_pinned_execution_argv(argv)
+            git_argv = _maintenance_git_execution_argv(argv)
+            if git_argv is None:
+                return None, _service_shell_not_admitted_reason(argv, destination)
+            return git_argv, ""
+        allowed = _target_matches_maintenance_shell_command(argv)
     elif destination == "upgrade_workspace":
         if argv[0] == "git":
-            return _maintenance_git_execution_argv(argv)
+            git_argv = _maintenance_git_execution_argv(argv)
+            if git_argv is None:
+                return None, _service_shell_not_admitted_reason(argv, destination)
+            return git_argv, ""
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])
         )
-    return _maintenance_pinned_execution_argv(argv) if allowed else None
+    else:
+        return None, (
+            f"there is no trusted-service shell profile named {destination!r}, "
+            "so no command can be admitted for this principal."
+        )
+    if not allowed:
+        return None, _service_shell_not_admitted_reason(argv, destination)
+    return _maintenance_pinned_execution_argv_with_reason(argv)
+
+
+def parse_service_shell_argv(target: str, destination: str) -> list[str] | None:
+    """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
+    return parse_service_shell_argv_with_reason(target, destination)[0]
+
+
+def _service_shell_refusal_detail(
+    target: object, policy: "ServiceSinkPolicy | None",
+) -> str | None:
+    """Prose for a shell-profile refusal; ``None`` for every other adapter.
+
+    Recomputes through the same parser the sink adapter just consulted, so the
+    explanation is by construction the one that produced the refusal rather than
+    a second reading of the rule.
+    """
+    if (
+        policy is None
+        or policy.adapter != "shell_profile"
+        or not isinstance(target, str)
+    ):
+        return None
+    argv, reason = parse_service_shell_argv_with_reason(target, policy.destination)
+    return None if argv is not None else reason
 
 
 def _target_matches_shell_profile(target: str, destination: str) -> bool:
@@ -1568,14 +1783,17 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     candidate = Path(target)
-    if not home or not candidate.is_absolute():
+    if not home:
         return False
+    home_root = Path(home).resolve()
+    if not candidate.is_absolute():
+        candidate = home_root / candidate
     try:
         raw = json.loads(destination)
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
         roots = [Path(path).resolve() for path in raw]
-        memory_root = (Path(home).resolve() / "memory").resolve()
+        memory_root = (home_root / "memory").resolve()
         lexical_relatives = tuple(
             (root, candidate.relative_to(root))
             for root in roots
@@ -1590,7 +1808,7 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
             for root, relative in lexical_relatives
         ):
             return False
-        resolved = resolve_within_roots(roots, target)
+        resolved = resolve_within_roots(roots, str(candidate))
         resolved_relatives = tuple(
             (root, resolved.relative_to(root))
             for root in roots
@@ -1608,6 +1826,45 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         )
         for root, relative in resolved_relatives
     )
+
+
+def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
+    """Prevent one session boundary from mutating another channel's memory."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    try:
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(
+            (Path(home).resolve() / "memory" / "channels").resolve()
+        )
+    except (OSError, RuntimeError):
+        # Resolution failure cannot prove channel ownership; fail closed.
+        return False
+    except ValueError:
+        # The prompt also authorizes shared non-channel memory and state paths.
+        return True
+    return bool(relative.parts) and relative.parts[0] == channel_id
+
+
+def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
+    """Resolve a trigger-service write exactly as its sink adapter checks it."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise PathOutsideHomeError("MIMIR_HOME is not configured")
+    raw = json.loads(destination)
+    if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
+        raise PathOutsideHomeError("trigger-service write roots are invalid")
+    roots = [Path(path).resolve() for path in raw]
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    return resolve_within_roots(roots, str(candidate))
 
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
@@ -2042,7 +2299,18 @@ class SinkGate:
                 if service_policy is not None
                 else None
             )
-            if adapter is None or not adapter(target, service_policy.destination):
+            synthesis_scope_denied = (
+                service.canonical == "synthesis"
+                and sink_category is SinkCategory.FILE
+                and not _synthesis_target_matches_session(
+                    target, getattr(auth_context, "channel_id", None),
+                )
+            )
+            if (
+                adapter is None
+                or synthesis_scope_denied
+                or not adapter(target, service_policy.destination)
+            ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
@@ -2054,6 +2322,9 @@ class SinkGate:
                     is_shadow_decision=not enforce,
                     would_block=True,
                     resolved_sink_target=resolved_target,
+                    refusal_detail=_service_shell_refusal_detail(
+                        target, service_policy,
+                    ),
                 )
 
         if not ifc_labels.labels:
@@ -3276,6 +3547,13 @@ class ToolAuthorization:
     # current call proceed.
     would_block: bool = False
     resolved_sink_target: str | None = None
+    # Why a refusal happened, in prose, for the caller's tool result. Separate
+    # from ``reason`` because that stays a stable machine key the audit
+    # classification groups on; this is the human/agent-facing explanation and
+    # must never be parsed. Populated for shell-profile refusals, where
+    # ``service_sink_destination_denied`` alone renders as "requires an admin
+    # identity" and misdescribes a command-shape problem as a privilege problem.
+    refusal_detail: str | None = None
     # ``None`` means provenance is unknown; ``()`` authoritatively classifies
     # the call as not reading a protected MCP source.
     protected_source_resources: tuple[str, ...] | None = None
@@ -4115,30 +4393,21 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ServicePrincipal(
             canonical="synthesis",
             trigger="saga_session_end",
-            capabilities=(
-                "saga_end_session",
-                "saga_mark_contributions",
-                "saga_feedback",
-                "saga_record_skill_learning",
-                "memory_get",
-                "memory_store",
-                "mimir_get_turn",
-                "get_turn",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "bash_jobs_list",
-                "bash_job_output",
-            ),
+            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
             readable_domains=(
                 "session", "saga", "filesystem", "turn_history", "shell_jobs",
             ),
-            sink_destinations=("session_boundary", "saga"),
+            sink_destinations=("filesystem", "session_boundary", "saga"),
+            sink_policies=(
+                ServiceSinkPolicy(
+                    "write_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+                ServiceSinkPolicy(
+                    "edit_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
+            ),
             creation_path="mimir.server._on_session_idle",
             authority_profile="session-boundary",
             capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -4444,6 +4713,14 @@ def check_capability_matrix_complete(
     if errors:
         for error in errors:
             log.warning("capability_matrix_incomplete: %s", error)
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
         return (False, errors)
     return (True, [])
 
@@ -4452,6 +4729,14 @@ def assert_capability_matrix_complete() -> None:
     """Raise unless the enforcement matrix is complete and consistent."""
     errors = _capability_matrix_errors()
     if errors:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="startup",
+            boundary="capability_matrix_preflight",
+            reason="capability_matrix_incomplete",
+            target=errors,
+        )
         raise CapabilityMatrixError(
             "Access-control enforcement blocked by incomplete capability matrix: "
             + "; ".join(errors)

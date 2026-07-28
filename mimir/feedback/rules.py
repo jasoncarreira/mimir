@@ -122,6 +122,9 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "poller_service_outage": ("negative", "poller_service_outage"),
     "poller_rate_limited":   ("negative", "poller_rate_limited"),
     "poller_signal":         ("negative", "poller_signal"),
+    "pr_auto_review_skipped_untrusted_author": (
+        "negative", "pr_auto_review_skipped_untrusted_author",
+    ),
     # Framework-emitted: ``poller_nonzero_exit`` fires whenever a poller
     # subprocess exits non-zero. Independent of skill-emitted signals
     # (those can fire WITH a successful exit). Negative so the operator

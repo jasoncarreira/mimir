@@ -59,7 +59,7 @@ from ..access_control import (
     get_tool_registry,
     get_trusted_service_from_auth_context,
     normalize_sink_destination,
-    parse_service_shell_argv,
+    parse_service_shell_argv_with_reason,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -174,13 +174,50 @@ def _emit_event_sync(kind: str, **kwargs: Any) -> None:
     (the denial text on the returned ToolMessage is still load-bearing).
     """
     try:
-        from ..event_logger import log_event  # lazy: supports monkeypatching in tests
+        from ..event_logger import safe_log_event
         loop = asyncio.get_running_loop()
-        task = loop.create_task(log_event(kind, **kwargs))
+        task = loop.create_task(safe_log_event(kind, **kwargs))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
     except RuntimeError:
         log.debug("budget event %s dropped: no running loop", kind)
+
+
+def _emit_hard_boundary_denied(
+    *,
+    tool: str,
+    boundary: str,
+    reason: str,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+    turn_context: Any | None = None,
+) -> None:
+    """Record an action that an always-on boundary actually refused."""
+    if auth_context is None and turn_context is not None:
+        candidate = getattr(turn_context, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+    if auth_context is None:
+        active_turn = _get_current_turn_context()
+        candidate = getattr(active_turn, "auth_context", None)
+        auth_context = candidate if isinstance(candidate, AuthContext) else None
+
+    from ..redaction import redact_payload
+
+    service = get_trusted_service_from_auth_context(auth_context)
+    _emit_event_sync(
+        "hard_boundary_denied",
+        tool=tool,
+        boundary=boundary,
+        reason=reason,
+        # Pre-scrub for replaced emitters and other pre-persistence consumers.
+        target=redact_payload(target),
+        trigger=(
+            getattr(auth_context, "origin_trigger", None)
+            or getattr(auth_context, "trigger", None)
+            or getattr(turn_context, "trigger", None)
+        ),
+        service_principal=service.canonical if service is not None else None,
+    )
 
 
 def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
@@ -210,7 +247,13 @@ def _mark_budget_denied(ctx: Any, tool_name: str, count: int) -> None:
         ctx.tool_call_budget_first_denied_at_count = count
 
 
-def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str | None:
+def _check_and_increment_or_deny(
+    tool_name: str,
+    ctx: Any | None = None,
+    *,
+    target: Any = None,
+    auth_context: AuthContext | None = None,
+) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
@@ -232,6 +275,14 @@ def _check_and_increment_or_deny(tool_name: str, ctx: Any | None = None) -> str 
             count=count,
             budget=budget,
             turn_id=getattr(ctx, "turn_id", None),
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="tool_call_budget",
+            reason="tool_call_budget_exhausted",
+            target=target,
+            auth_context=auth_context,
+            turn_context=ctx,
         )
         return _budget_denied_message(tool_name, count, budget)
     new_count = count + 1
@@ -363,6 +414,51 @@ def _authorized_fetch_urls_for_tool(
 _extract_channel_from_args = _extract_sink_target
 
 
+# Internal execution arguments only this module may set. A model-supplied value
+# is stripped before authorization: ``mimir_direct_argv`` would choose what runs,
+# and ``mimir_shell_refusal`` would let a model author text that reads as a
+# server authorization verdict.
+_SERVER_ONLY_SHELL_ARGS = frozenset({"mimir_direct_argv", "mimir_shell_refusal"})
+
+
+def _service_shell_refusal(request: ToolCallRequest) -> str | None:
+    """The server-authored refusal bound to this request, if it was refused."""
+    refusal = (request.tool_call.get("args") or {}).get("mimir_shell_refusal")
+    return refusal if isinstance(refusal, str) and refusal else None
+
+
+def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]:
+    """Resolve an explicit service cwd within the non-admin read roots."""
+    from ..read_policy import configured_non_admin_read_roots
+
+    if raw_cwd is None:
+        # Preserve the existing ambient/sticky cwd when the caller omits cwd.
+        return None, None
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
+        return None, "working directory must be a non-empty absolute path"
+    candidate = Path(raw_cwd)
+    if not candidate.is_absolute():
+        return None, "working directory must be a non-empty absolute path"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "working directory is not an accessible directory"
+    if not resolved.is_dir():
+        return None, "working directory is not an accessible directory"
+
+    roots: list[Path] = []
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_root.is_dir() and resolved_root not in roots:
+            roots.append(resolved_root)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None, "working directory is outside the trusted service's authorized read roots"
+    return str(resolved), None
+
+
 def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
@@ -378,9 +474,11 @@ def _request_for_authorized_execution(
         return request
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     # Never trust a model-supplied internal execution override. Ordinary calls
-    # discard it; trusted-service calls below replace it with server-parsed argv.
-    had_model_override = "mimir_direct_argv" in args
-    args.pop("mimir_direct_argv", None)
+    # discard it; trusted-service calls below replace it with server-parsed argv
+    # and, on refusal, a server-authored explanation.
+    had_model_override = bool(_SERVER_ONLY_SHELL_ARGS & args.keys())
+    for server_only_key in _SERVER_ONLY_SHELL_ARGS:
+        args.pop(server_only_key, None)
     sanitized_request = (
         request.override(tool_call={**request.tool_call, "args": args})
         if had_model_override
@@ -393,21 +491,50 @@ def _request_for_authorized_execution(
     target = args.get("command")
     if not isinstance(target, str):
         return sanitized_request
-    argv = parse_service_shell_argv(target, policy.destination)
+    resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
+    if cwd_refusal is not None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {cwd_refusal}."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if resolved_cwd is not None:
+        args["cwd"] = resolved_cwd
+    argv, refusal = parse_service_shell_argv_with_reason(target, policy.destination)
     if argv is None:
         # The authorization adapter already admitted this call. Failing to bind
         # a direct argv here must not fall back to the original ``bash -lc``
         # surface if a config probe races, times out, or otherwise changes.
         #
-        # ``/usr/bin/false`` ignores its arguments, so the reason below never
-        # reaches the caller: the agent sees only "exit 1, empty output" and
-        # cannot tell a profile refusal from a broken binary. Log it under a
-        # distinct fingerprint so the cause is greppable, naming the profile
-        # and the rejected command.
+        # Log under a distinct fingerprint so the cause stays greppable for an
+        # operator, naming the profile and the rejected command.
         log.error(
             "service_shell_argv_binding_failed profile=%s command=%r",
             policy.destination,
             target[:200],
+        )
+        # Record it for the audit stream: this boundary fails closed whether or
+        # not enforcement is on, so without an event the refusal is invisible to
+        # the enablement evidence (#1012).
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="service_shell_argv_binding",
+            reason="service_shell_argv_binding_failed",
+            target=target,
+            auth_context=auth_context,
+        )
+        # ...and tell the CALLER why, in the tool result. Binding
+        # ``/usr/bin/false`` alone made every refusal look identical — it ignores
+        # its arguments, so the agent saw "exit 1, empty output" and could not
+        # distinguish a profile refusal from a broken binary or a dead runtime.
+        # It retried the same rejected shape, and diagnosed a stale deployment
+        # that was in fact current. The refusal is served from here without
+        # executing anything; the argv below stays as defense in depth, so a
+        # future refactor that drops this channel still fails closed rather than
+        # reaching a shell.
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {refusal}"
         )
         args["mimir_direct_argv"] = [
             "/usr/bin/false",
@@ -418,6 +545,36 @@ def _request_for_authorized_execution(
     args["mimir_direct_argv"] = argv
     tool_call = {**request.tool_call, "args": args}
     return request.override(tool_call=tool_call)
+
+
+def _request_with_resolved_service_write_path(
+    request: ToolCallRequest,
+    tool_name: str,
+    auth_context: AuthContext | None,
+) -> ToolCallRequest:
+    """Bind a trigger-service file write to the path checked by authorization."""
+    if tool_name not in {"write_file", "edit_file"}:
+        return request
+    service = get_trusted_service_from_auth_context(auth_context)
+    policy = service.sink_policy_for(tool_name) if service is not None else None
+    if policy is None or policy.adapter != "trigger_service_write_roots":
+        return request
+
+    from ..access_control import resolve_trigger_service_write_target
+
+    args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
+    argument_name = "file_path" if "file_path" in args else "path"
+    raw_path = args.get(argument_name)
+    if not isinstance(raw_path, str) or not raw_path:
+        return request
+    try:
+        args[argument_name] = str(
+            resolve_trigger_service_write_target(raw_path, policy.destination)
+        )
+    except (OSError, RuntimeError, ValueError):
+        # Leave the original destination intact so the sink adapter denies it.
+        return request
+    return request.override(tool_call={**request.tool_call, "args": args})
 
 
 def _request_with_resolved_spawn_paths(
@@ -558,8 +715,20 @@ def _is_admin_sensitive_tool(
     return auth.required_tier.value == "admin" or not auth.allowed
 
 
-def _admin_denial_message(tool_name: str, reason: str | None) -> str:
+def _admin_denial_message(
+    tool_name: str, reason: str | None, detail: str | None = None,
+) -> str:
+    # A shell-profile refusal is a command-shape problem, not a privilege
+    # problem: no identity can run the command as written. Leading with
+    # "requires an admin identity" and appending the real cause gives two
+    # incompatible diagnoses and keeps pointing the caller at an identity
+    # change, which is the failure mode this exists to remove. So when a detail
+    # identifies the actual refusal, it replaces the admin wording rather than
+    # trailing it — and the enforced path then reads identically to the
+    # argv-binding path, which is the same refusal seen at a different gate.
     reason_text = f" ({reason})" if reason else ""
+    if detail:
+        return f"{tool_name} was refused before execution{reason_text}: {detail}"
     return (
         f"{tool_name} requires an admin identity{reason_text}. "
         "The tool call was refused before execution."
@@ -597,6 +766,8 @@ def _deny_admin_tool(
     *,
     ctx: Any | None,
     enforcement_enabled: bool,
+    target: Any = None,
+    detail: str | None = None,
 ) -> str:
     author, canonical_author, roles = _admin_identity_fields(ctx)
     _emit_event_sync(
@@ -619,7 +790,17 @@ def _deny_admin_tool(
         author=author,
         canonical_author=canonical_author,
     )
-    return _admin_denial_message(tool_name, reason)
+    if reason == _HTTP_EVENT_ADMIN_DENIAL_REASON:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="http_event_ingress",
+            reason=reason,
+            target=target,
+            auth_context=ctx if isinstance(ctx, AuthContext) else None,
+        )
+    # ``reason`` stays the machine key on both events; the prose detail is for
+    # the caller's tool result only, so the audit stream keeps grouping cleanly.
+    return _admin_denial_message(tool_name, reason, detail)
 
 
 def _check_admin_authorized(
@@ -677,6 +858,7 @@ def _authorize_tool_call(
             _HTTP_EVENT_ADMIN_DENIAL_REASON,
             ctx=ctx,
             enforcement_enabled=enforce,
+            target=target_channel,
         )
 
     privileged = auth.required_tier.value == "admin" or not auth.allowed
@@ -698,6 +880,7 @@ def _authorize_tool_call(
         auth.reason or "admin_required",
         ctx=ctx,
         enforcement_enabled=enforce,
+        detail=auth.refusal_detail,
     )
 
 
@@ -830,6 +1013,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
@@ -880,6 +1066,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="prohibited_action_guard",
+                reason="prohibited_action",
+                target=_extract_sink_target(request, auth_context),
+                auth_context=auth_context,
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
             )
@@ -890,7 +1083,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        denial = _check_and_increment_or_deny(tool_name)
+        denial = _check_and_increment_or_deny(
+            tool_name,
+            target=_extract_sink_target(request, auth_context),
+            auth_context=auth_context,
+        )
         if denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(
@@ -917,6 +1114,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        # A profile refusal is served as the tool result. Nothing is executed,
+        # so the caller reads why instead of an unexplained exit 1.
+        service_shell_refusal = _service_shell_refusal(execution_request)
+        if service_shell_refusal is not None:
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=service_shell_refusal, denied=True,
+            )
+            return ToolMessage(
+                content=service_shell_refusal,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
         if isinstance(direct_argv, list):
@@ -989,6 +1199,9 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = _tool_name_from_request(request)
         auth_context = _auth_context_from_request(request)
+        request = _request_with_resolved_service_write_path(
+            request, tool_name, auth_context,
+        )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
@@ -1039,6 +1252,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if prohibition is not None:
             _emit_event_sync("prohibited_action_blocked", tool=tool_name,
                              reason=prohibition[:200])
+            _emit_hard_boundary_denied(
+                tool=tool_name,
+                boundary="prohibited_action_guard",
+                reason="prohibited_action",
+                target=_extract_sink_target(request, auth_context),
+                auth_context=auth_context,
+            )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
             )
@@ -1049,7 +1269,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        denial = _check_and_increment_or_deny(tool_name)
+        denial = _check_and_increment_or_deny(
+            tool_name,
+            target=_extract_sink_target(request, auth_context),
+            auth_context=auth_context,
+        )
         if denial is not None:
             _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
             return ToolMessage(
@@ -1076,6 +1300,19 @@ class BudgetGateMiddleware(AgentMiddleware):
         execution_request = _request_for_authorized_execution(
             request, tool_name, auth_context,
         )
+        # A profile refusal is served as the tool result. Nothing is executed,
+        # so the caller reads why instead of an unexplained exit 1.
+        service_shell_refusal = _service_shell_refusal(execution_request)
+        if service_shell_refusal is not None:
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=service_shell_refusal, denied=True,
+            )
+            return ToolMessage(
+                content=service_shell_refusal,
+                tool_call_id=_tool_call_id(request),
+                name=tool_name,
+                status="error",
+            )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
         if isinstance(direct_argv, list):

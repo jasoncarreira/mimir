@@ -47,10 +47,22 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/state/sub/dir/note.txt", content="hi")
         assert getattr(r, "error", None) is None
 
-    def test_blocks_write_to_non_writable_dir(self, home: Path) -> None:
+    def test_blocks_write_to_non_writable_dir(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         r = b.write(file_path="/logs/bad.txt", content="hi")
         assert "Write blocked" in (getattr(r, "error", "") or "")
+        hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+        assert hard["tool"] == "write_file"
+        assert hard["boundary"] == "filesystem_write_guard"
+        assert hard["reason"] == "filesystem_target_not_writable"
+        assert hard["target"] == str(home / "logs" / "bad.txt")
 
     def test_blocks_write_to_implicit_dir(self, home: Path) -> None:
         # .mimir/ is not in writable_dirs; saga db must not be writable
@@ -609,10 +621,22 @@ class TestCoreMemoryReflectionGate:
 
 
 class TestReadOnlyFilesystemBackend:
-    def test_blocks_all_writes(self, home: Path) -> None:
+    def test_blocks_all_writes(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
         b = ReadOnlyFilesystemBackend(root_dir=home)
         r = b.write(file_path="/state/anywhere.txt", content="no")
         assert "read-only" in (getattr(r, "error", "") or "")
+        hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+        assert hard["tool"] == "write_file"
+        assert hard["boundary"] == "readonly_filesystem"
+        assert hard["reason"] == "write_readonly"
+        assert hard["target"] == str(home / "state" / "anywhere.txt")
 
     def test_blocks_all_edits(self, home: Path) -> None:
         b = ReadOnlyFilesystemBackend(root_dir=home)
@@ -1015,3 +1039,51 @@ def test_denial_buffer_is_bounded(tmp_path: Path):
     assert len(b._denials) == 512
     assert b._denials[0]["file_path"] == "/logs/blocked-88.txt"
     assert b._denials[-1]["file_path"] == "/logs/blocked-599.txt"
+
+
+def test_every_exclusion_site_reports_which_tool_withheld_the_path():
+    """No read-withholding path may be silent (#1012).
+
+    ``_is_excluded`` emits ``hard_boundary_denied`` only for the caller that
+    names its tool. The first version of this made ``tool`` optional and left
+    ``_ripgrep_search`` passing nothing, so the *primary* grep path recorded
+    nothing while the instrumented one — the Python walker — is only the
+    fallback taken when ``rg`` is absent. ``rg`` is a pinned executable in
+    production, so the covered path was the one that does not run and the tests
+    passed anyway.
+
+    This is a source check rather than a behavioural one because reaching
+    ``_ripgrep_search`` requires ``rg`` on the test host; the point is that a
+    call site cannot be added without naming its tool. The keyword-only
+    ``tool: str`` with no default is the real guard — this test explains why it
+    must stay that way.
+    """
+    import ast
+    import inspect
+
+    from mimir import readonly_backend
+
+    source = inspect.getsource(readonly_backend)
+    tree = ast.parse(source)
+
+    signature = inspect.signature(readonly_backend._RootAwareFilesystemBackend._is_excluded)
+    tool_param = signature.parameters["tool"]
+    assert tool_param.default is inspect.Parameter.empty, (
+        "_is_excluded(tool=...) must stay required; a default lets a new call "
+        "site withhold a path silently, which is the defect this guards"
+    )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "_is_excluded"):
+            continue
+        if not any(kw.arg == "tool" for kw in node.keywords):
+            offenders.append(f"readonly_backend.py:{node.lineno}")
+
+    assert not offenders, (
+        "these _is_excluded call sites withhold a path without recording which "
+        "tool did it: " + ", ".join(offenders)
+    )

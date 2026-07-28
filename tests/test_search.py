@@ -810,7 +810,14 @@ async def test_no_warning_when_dims_match(tmp_path: Path, caplog):
 
 
 @pytest.mark.asyncio
-async def test_non_admin_filter_rejects_basic_auth_git_config(tmp_path: Path):
+async def test_non_admin_filter_rejects_basic_auth_git_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    events = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
     safe = tmp_path / "state" / "config.md"
     safe.parent.mkdir(parents=True)
     safe.write_text(
@@ -860,6 +867,11 @@ async def test_non_admin_filter_rejects_basic_auth_git_config(tmp_path: Path):
         "example.invalid", scope="state", k=10, include_protected=False,
     )
     assert {result.path for result in filtered} == {"state/config.md"}
+    hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+    assert hard["tool"] == "file_search"
+    assert hard["boundary"] == "protected_read_policy"
+    assert hard["reason"] == "protected_read_result"
+    assert hard["target"] == str(tmp_path / protected_path)
 
 
 # ---- path_prefix + dynamic weights (file_search enhancements) ----------

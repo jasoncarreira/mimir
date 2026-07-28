@@ -105,6 +105,18 @@ def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
     properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
 
     assert "mimir_direct_argv" not in properties
+    assert "cwd" in properties
+
+
+@pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
+def test_shell_tool_description_states_both_execution_contracts(shell_tool) -> None:
+    description = shell_tool.description
+
+    assert "User/admin" in description
+    assert "bash -lc" in description
+    assert "trusted-service" in description
+    assert "one argv" in description
+    assert "no shell syntax" in description
 
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
@@ -575,7 +587,9 @@ def test_static_shell_service_principals_have_job_inspection_companions() -> Non
             assert companions <= capabilities, principal.canonical
 
 
-def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
+def test_capability_matrix_preflight_fails_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.access_control import (
         ServicePrincipal,
         _TRUSTED_SERVICE_PRINCIPALS,
@@ -583,6 +597,11 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
     )
 
     original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
     try:
         _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
             canonical="scheduler",
@@ -596,6 +615,11 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix() -> None:
         assert is_complete is False
         assert len(errors) > 0
         assert any("no capabilities" in e for e in errors)
+        hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+        assert hard["tool"] == "startup"
+        assert hard["boundary"] == "capability_matrix_preflight"
+        assert hard["reason"] == "capability_matrix_incomplete"
+        assert any("no capabilities" in error for error in hard["target"])
     finally:
         _TRUSTED_SERVICE_PRINCIPALS.clear()
         _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
@@ -991,16 +1015,16 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     assert synthesis is not None
 
     turn_ops = {"mimir_get_turn", "get_turn"}
-    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search"}
+    write_ops = {"write_file", "edit_file"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
     shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
 
-    all_expected = turn_ops | read_ops | memory_ops | saga_ops | shell_inspection_ops
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
-    assert not synthesis.has_capability("write_file")
-    assert not synthesis.has_capability("edit_file")
+    assert synthesis.can_write_sink("filesystem")
     assert synthesis.can_read_domain("shell_jobs")
     assert not synthesis.can_write_sink("shell_process")
     assert synthesis.sink_policy_for("shell_exec") is None
