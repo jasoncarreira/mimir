@@ -567,6 +567,46 @@ def test_fetched_page_integrity_comes_from_exact_operator_allowlist(
     assert source.integrity_effect == "active_ingest"
 
 
+def test_github_pr_fetch_authorization_does_not_confer_trusted_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    url = "https://api.github.com/repos/acme/widget/pulls/7/reviews"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    cache = tmp_path / "attachments" / "fetch-cache"
+    cache.mkdir(parents=True)
+    digest = hashlib.sha256(url.encode()).hexdigest()[:12]
+    body = cache / f"{digest}-reviews"
+    body.write_text("third-party review body", encoding="utf-8")
+    (cache / f"{body.name}.meta.json").write_text(json.dumps({
+        "url": url,
+        "final_url": url,
+        "file_path": f"/attachments/fetch-cache/{body.name}",
+    }), encoding="utf-8")
+    service = ServicePrincipal(
+        canonical="poller:github-activity",
+        trigger="poller",
+        capabilities=("fetch_url",),
+        readable_domains=("poller_payload",),
+        sink_policies=(ServiceSinkPolicy(
+            "fetch_url", "github_pr_api", "GITHUB_REPOS",
+        ),),
+        capability_tier=CapabilityTier.CODE_EXECUTION,
+    )
+    auth, _labels = _trigger_service_context(service, integrity="trusted")
+
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(body.resolve()), bridge_instance="filesystem",
+    )
+
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+
+
 def test_auto_recalled_untrusted_atom_is_visible_but_never_active_ingest():
     auth = _auth()
     labels = _auto_recall_source_labels(auth, {"_ifc_sources": [{
@@ -1334,9 +1374,11 @@ def _github_fetch_service() -> ServicePrincipal:
         "https://api.github.com/repos/acme/widget/pulls/7",
         "https://api.github.com/repos/acme/widget/pulls/7/reviews",
         "https://api.github.com/repos/acme/widget/pulls/7/comments",
+        "https://raw.githubusercontent.com/acme/widget/main/mimir/access_control.py",
+        "https://raw.githubusercontent.com/Acme/Widget/feature/authz/tests/test_access_control.py",
     ],
 )
-def test_github_poller_fetch_allows_only_pr_read_endpoints_for_configured_repo(
+def test_github_poller_fetch_allows_only_repo_bounded_read_endpoints(
     target: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1364,6 +1406,16 @@ def test_github_poller_fetch_allows_only_pr_read_endpoints_for_configured_repo(
         "https://api.github.com/repos/acme/widget/pulls/7/%2e%2e/comments",
         "https://api.github.com/repos/acme%2Fattacker/widget/pulls/7",
         "https://api.github.com/repos/acme/widget%5Crepo/pulls/7",
+        "https://raw.githubusercontent.com/acme/unconfigured/main/file.py",
+        "http://raw.githubusercontent.com/acme/widget/main/file.py",
+        "https://raw.githubusercontent.com.evil.test/acme/widget/main/file.py",
+        "https://raw.githubusercontent.com/acme/widget",
+        "https://raw.githubusercontent.com/acme/widget/main/file.py?download=1",
+        "https://raw.githubusercontent.com/acme/widget/main/%2e%2e/secret",
+        "https://raw.githubusercontent.com/acme%2Fattacker/widget/main/file.py",
+        "https://raw.githubusercontent.com/acme/widget%5Crepo/main/file.py",
+        "https://github.com/acme/widget/raw/main/file.py",
+        "https://patch-diff.githubusercontent.com/raw/acme/widget/pull/7.diff",
     ],
 )
 def test_github_poller_fetch_rejects_widening_shapes(

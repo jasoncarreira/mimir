@@ -1883,6 +1883,7 @@ _GITHUB_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _GITHUB_PR_API_PATH = re.compile(
     r"/repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)(?:/(reviews|comments))?\Z"
 )
+_GITHUB_RAW_REPO_PATH = re.compile(r"/([^/]+)/([^/]+)/([^/]+)(?:/(.+))?\Z")
 
 
 def _configured_github_repos(variable: str) -> frozenset[tuple[str, str]]:
@@ -1900,20 +1901,24 @@ def _configured_github_repos(variable: str) -> frozenset[tuple[str, str]]:
 
 
 def _target_matches_github_pr_api(target: str, destination: str) -> bool:
-    """Match only PR read endpoints beneath repos selected by ``GITHUB_REPOS``."""
+    """Match bounded GitHub PR API or raw-content reads for configured repos."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
     parsed = urlsplit(normalized)
     if (
         parsed.scheme != "https"
-        or parsed.netloc != "api.github.com"
         or parsed.query
         or "%" in parsed.path
         or "\\" in parsed.path
     ):
         return False
-    match = _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+    if parsed.netloc == "api.github.com":
+        match = _GITHUB_PR_API_PATH.fullmatch(parsed.path)
+    elif parsed.netloc == "raw.githubusercontent.com":
+        match = _GITHUB_RAW_REPO_PATH.fullmatch(parsed.path)
+    else:
+        return False
     if match is None:
         return False
     return (match[1].lower(), match[2].lower()) in _configured_github_repos(destination)
@@ -4164,12 +4169,8 @@ def _filesystem_result_integrity(
         if isinstance(final_url, str)
         else normalized
     )
-    if (
-        normalized is not None
-        and fetch_url_is_approved(normalized, auth_context)
-        and normalized_final is not None
-        and fetch_url_is_approved(normalized_final, auth_context)
-    ):
+    approved = approved_fetch_urls(auth_context)
+    if normalized is not None and normalized in approved and normalized_final in approved:
         return "trusted", "active_ingest"
     return "untrusted", "active_ingest"
 
