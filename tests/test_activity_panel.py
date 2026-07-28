@@ -164,7 +164,6 @@ def _panel_labels(channel_id: str = "slack-C01") -> InformationFlowLabels:
 def _panel(
     allowlist: tuple[str, ...] = ("slack-",),
     debounce: float = 0.0,
-    detail_levels: tuple[tuple[str, str], ...] = (),
     delete_grace: float = 2.0,
 ):
     bus = TurnEventBus()
@@ -176,7 +175,6 @@ def _panel(
         channels,
         allowlist,
         debounce_seconds=debounce,
-        detail_levels=detail_levels,
         delete_grace_seconds=delete_grace,
         default_ifc_labels=_panel_labels(),
         default_auth_context=_panel_auth(),
@@ -498,7 +496,7 @@ async def test_coarse_default_redacts_detail_from_unopted_channel():
 
 @pytest.mark.asyncio
 async def test_detailed_setting_renders_only_harness_metadata():
-    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+    panel, bridge = _panel()
 
     await panel.handle_event(
         {
@@ -587,7 +585,7 @@ async def test_detailed_setting_renders_only_harness_metadata():
 
 @pytest.mark.asyncio
 async def test_detailed_setting_does_not_render_arg_keys_or_values():
-    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+    panel, bridge = _panel()
 
     await panel.handle_event(
         {
@@ -628,7 +626,7 @@ async def test_detailed_setting_does_not_render_arg_keys_or_values():
 
 @pytest.mark.asyncio
 async def test_detailed_setting_ignores_tool_result_content():
-    panel, bridge = _panel(detail_levels=(("slack-C01", "detailed"),))
+    panel, bridge = _panel()
 
     await panel.handle_event(
         {

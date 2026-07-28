@@ -45,14 +45,10 @@ reactions and replies stay explicit; the panel is automatic activity display.
 
 ## Configuration
 
-Both are prefix allow-lists / maps over channel ids; both default off/coarse.
-
-- `MIMIR_ACTIVITY_PANEL_CHANNELS` — comma-separated channel-id prefixes the
-  panel is enabled for (e.g. `discord-,slack-`). Empty = off. The panel only
-  posts for **user-facing work turns**; internal/system triggers never surface
-  one (see gating below), regardless of channel.
-- `MIMIR_ACTIVITY_PANEL_DETAIL` is retained as a compatibility setting but no
-  longer changes panel content. All panels are metadata-only.
+`MIMIR_ACTIVITY_PANEL_CHANNELS` is a comma-separated channel-id prefix
+allow-list (for example, `discord-,slack-`). Empty = off. The panel only posts
+for **user-facing work turns**; internal/system triggers never surface one (see
+gating below), regardless of channel. All panels are metadata-only.
 
 ## Trigger gating (chainlink #725)
 

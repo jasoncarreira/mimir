@@ -100,7 +100,6 @@ class ActivityPanel:
         allowlist: tuple[str, ...],
         *,
         debounce_seconds: float = 1.0,
-        detail_levels: tuple[tuple[str, str], ...] = (),
         delete_grace_seconds: float = 2.0,
         default_ifc_labels: Any = None,
         default_auth_context: Any = None,
@@ -109,7 +108,6 @@ class ActivityPanel:
         self._channels = channels
         self._allowlist = allowlist
         self._debounce_seconds = max(0.0, debounce_seconds)
-        self._detail_levels = detail_levels
         self._delete_grace_seconds = max(0.0, delete_grace_seconds)
         self._default_ifc_labels = default_ifc_labels
         self._default_auth_context = default_auth_context

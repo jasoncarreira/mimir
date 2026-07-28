@@ -83,7 +83,6 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_AUTO_DELIVER_FINAL_TEXT_CHANNELS` | csv-list | `""` (off) | See [feature flags](#feature-flags-that-ship-off-by-default). Prefix allow-list; `*` = all interactive channels. |
 | `MIMIR_RESEND_NUDGE_CHANNELS` | csv-list | `""` (off) | One in-band re-prompt to `send_message` when a turn produced text but delivered nothing. |
 | `MIMIR_ACTIVITY_PANEL_CHANNELS` | csv-list | `""` (off) | Enable the live activity panel on matching channels. |
-| `MIMIR_ACTIVITY_PANEL_DETAIL` | csv map | `""` (coarse) | Panel detail: `detailed`/`coarse` globally, or `prefix:level` pairs (e.g. `discord-:detailed`). Detailed surfaces the current step's redacted preview — trusted channels only. |
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
