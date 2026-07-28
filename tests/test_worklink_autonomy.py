@@ -22,7 +22,7 @@ from typing import Sequence
 import pytest
 
 from mimir.worklink import autonomy
-from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
+from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -146,6 +146,50 @@ def test_reap_home_reads_content_keyed_comment_dicts() -> None:
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = claims.reap_home(ttl=timedelta(hours=2))
     assert [r.issue_id for r in reaped] == [49]
+
+
+def test_reap_home_does_not_reap_a_heartbeating_claim_made_after_a_reset() -> None:
+    """A reset restarts attempt numbering, so attempt order is not history order.
+
+    Reproduces #1019 on 2026-07-28: three attempts were consumed by the
+    dangling-alternates fault, a ``WORKLINK_CLAIM_RESET`` forgave them, and the
+    fresh claim came back as attempt 1. The reaper picked the pre-reset attempt 3
+    because it compared attempt numbers before timestamps, then judged staleness
+    from that dead record's 17-hour-old ``claimed_at`` and released a claim whose
+    last heartbeat was 56 seconds old.
+    """
+    comments = [
+        _claim_comment(1019, attempt=1, age=timedelta(hours=18)),
+        _claim_comment(1019, attempt=2, age=timedelta(hours=17, minutes=50)),
+        _claim_comment(1019, attempt=3, age=timedelta(hours=17, minutes=30)),
+        CLAIM_RESET_PREFIX + json.dumps({"reason": "alternates fault, not this leaf"}),
+        _claim_comment(
+            1019, attempt=1, age=timedelta(minutes=10),
+            heartbeat_age=timedelta(seconds=56),
+        ),
+    ]
+    fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+
+
+def test_reap_home_still_reaps_a_genuinely_stale_post_reset_claim() -> None:
+    """The generation ordering must not make post-reset claims unreapable."""
+    comments = [
+        _claim_comment(1019, attempt=3, age=timedelta(hours=17, minutes=30)),
+        CLAIM_RESET_PREFIX + json.dumps({"reason": "infrastructure fault"}),
+        _claim_comment(
+            1019, attempt=1, age=timedelta(hours=6),
+            heartbeat_age=timedelta(hours=5),
+        ),
+    ]
+    fake = FakeChainlink(in_progress=[1019], comments={1019: comments})
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+
+    assert [(r.issue_id, r.attempt, r.generation) for r in reaped] == [(1019, 1, 1)]
 
 
 def test_reap_home_fail_soft_when_in_progress_list_errors() -> None:

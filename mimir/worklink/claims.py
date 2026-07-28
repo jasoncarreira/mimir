@@ -8,7 +8,7 @@ as atomic during chainlink #438).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import json
 import logging
@@ -53,6 +53,13 @@ class ClaimRecord:
     agent_id: str
     claimed_at: datetime
     heartbeat_at: datetime | None = None
+    # How many honoured ``WORKLINK_CLAIM_RESET`` markers precede this record.
+    # Derived from position in the comment history rather than carried on the
+    # wire, so ``to_comment`` stays byte-identical. A reset restarts attempt
+    # numbering, which means ``attempt`` alone no longer orders the history:
+    # without this, a fresh attempt 1 is outranked by a dead attempt 3 from
+    # before the reset, and the reaper judges a live claim by that dead record.
+    generation: int = 0
 
     def is_stale(self, now: datetime, ttl: timedelta) -> bool:
         anchor = self.heartbeat_at or self.claimed_at
@@ -100,23 +107,59 @@ def _parse_dt(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
+def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
+    """Parse every claim record with its reset generation, plus the final one.
+
+    Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
+    generation of everything after it. Only the first ``MAX_CLAIM_RESETS``
+    markers advance it, matching the reset budget: later markers are inert, and
+    the records following them stay in the last honoured generation.
+
+    Every record is returned regardless of generation. The duplicate-liveness
+    guard and the stale-claim reaper both have to see a live claim even when it
+    predates a reset, so a generation changes how records are ORDERED, never
+    whether they exist.
+
+    The returned generation is the final counter, which is not always the
+    highest generation among the records: a reset posted after the last claim
+    leaves its generation empty, which is what tells ``next_attempt`` the
+    budget is fresh.
+    """
     records: list[ClaimRecord] = []
+    generation = 0
     for comment in comments:
         for line in comment.splitlines():
+            if line.startswith(CLAIM_RESET_PREFIX):
+                if generation < MAX_CLAIM_RESETS:
+                    generation += 1
+                continue
             if not line.startswith(CLAIM_PREFIX):
                 continue
             try:
-                records.append(ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :])))
+                record = ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :]))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
-    return records
+            records.append(replace(record, generation=generation))
+    return records, generation
+
+
+def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
+    return _scan_claim_comments(comments)[0]
 
 
 def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
-    """True when ``candidate`` supersedes ``current`` for the same issue:
-    a higher attempt, or the same attempt with a later claim/heartbeat
-    anchor (the record the reaper should judge for staleness)."""
+    """True when ``candidate`` supersedes ``current`` for the same issue.
+
+    Generation is compared first because a reset restarts attempt numbering, so
+    attempt numbers are only monotonic within a generation. Comparing attempt
+    first made every post-reset build lose to the stale pre-reset record with
+    the higher attempt number, and the reaper then judged staleness from that
+    dead record's anchor and released a claim that was still heartbeating.
+    Within one generation: a higher attempt, then a later claim/heartbeat
+    anchor (the record the reaper should judge for staleness).
+    """
+    if candidate.generation != current.generation:
+        return candidate.generation > current.generation
     if candidate.attempt != current.attempt:
         return candidate.attempt > current.attempt
     cand_anchor = candidate.heartbeat_at or candidate.claimed_at
@@ -359,28 +402,19 @@ class ChainlinkClaims:
         would let a second run claim an issue a live run already holds. Admission
         checks liveness before exhaustion, so a reset cannot smuggle a concurrent
         build past that guard.
+
+        Shares ``_scan_claim_comments`` with the reaper's record selection so the
+        two cannot disagree about which records a reset applies to. They did
+        disagree once: the budget honoured resets while the selection ordered by
+        attempt number alone, so every reset leaf's next build was reaped.
         """
-        attempts_since_reset: list[int] = []
-        resets_honoured = 0
-        for comment in comments:
-            for line in comment.splitlines():
-                if line.startswith(CLAIM_RESET_PREFIX):
-                    if resets_honoured < MAX_CLAIM_RESETS:
-                        resets_honoured += 1
-                        attempts_since_reset.clear()
-                    continue
-                if not line.startswith(CLAIM_PREFIX):
-                    continue
-                try:
-                    record = ClaimRecord.from_payload(
-                        json.loads(line[len(CLAIM_PREFIX):])
-                    )
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-                attempts_since_reset.append(record.attempt)
-        if not attempts_since_reset:
+        records, generation = _scan_claim_comments(comments)
+        attempts = [
+            record.attempt for record in records if record.generation == generation
+        ]
+        if not attempts:
             return 1
-        return max(attempts_since_reset) + 1
+        return max(attempts) + 1
 
     def reap_stale_claims(self, records: Iterable[ClaimRecord], *, ttl: timedelta) -> list[ClaimRecord]:
         """Release stale claims and move the issue back to ready or blocked.
