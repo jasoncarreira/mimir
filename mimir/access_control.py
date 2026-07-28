@@ -1181,7 +1181,23 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     subcommand = argv[3]
     arguments = argv[4:]
     branch = state.head_ref
-    if subcommand == "checkout":
+    if subcommand == "status":
+        allowed = (
+            all(argument.startswith("-") and argument != "--" for argument in arguments)
+            and _arguments_match_allowlist(
+                arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch",
+                    "--ignore-submodules", "--long", "--no-ahead-behind",
+                    "--porcelain", "--short", "--show-stash",
+                    "--untracked-files",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        )
+    elif subcommand == "checkout":
         allowed = arguments == [branch]
     elif subcommand == "add":
         allowed = state.checked_out and arguments in (["--all"], ["-A"])
@@ -1217,6 +1233,15 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         *filter_overrides,
         "--no-pager", subcommand, *arguments,
     ]
+
+
+def _option_value(arguments: list[str], option: str) -> str | None:
+    """Return one separated option value, rejecting absent or repeated options."""
+    positions = [index for index, value in enumerate(arguments) if value == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+        return None
+    value = arguments[positions[0] + 1]
+    return None if value.startswith("-") else value
 
 
 def _target_matches_repo_review_shell_command(
@@ -1257,6 +1282,24 @@ def _target_matches_repo_review_shell_command(
                 "--repo", review_state.repo,
                 "--branch", review_state.head_ref,
             ]
+        if subcommand in {"edit", "comment"}:
+            if review_state is None or argv[3:4] != [str(review_state.pr_number)]:
+                return False
+            arguments = argv[4:]
+            options = (
+                frozenset({"--add-reviewer", "--body-file", "--repo"})
+                if subcommand == "edit"
+                else frozenset({"--body-file", "--repo"})
+            )
+            return (
+                _arguments_match_allowlist(arguments, exact_options=options)
+                and _option_value(arguments, "--repo") == review_state.repo
+                and _option_value(arguments, "--body-file") is not None
+                and (
+                    subcommand != "edit"
+                    or _option_value(arguments, "--add-reviewer") is not None
+                )
+            )
         options = {
             "view": frozenset({
                 "-R", "--comments", "--json", "--repo", "--template",

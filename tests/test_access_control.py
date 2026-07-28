@@ -3386,6 +3386,14 @@ def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
         "gh pr checkout 979 --repo o/r --branch worklink/979",
         f"git -C {root} checkout worklink/979",
     )
+    for command in (
+        f"git -C {root} status",
+        f"git -C {root} status --short --branch",
+        f"git -C {root} status --porcelain=v2 --untracked-files=normal",
+    ):
+        assert registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        ).allowed is True
     for command in checkout_commands:
         assert registry.authorize_tool(
             "shell_exec", auth, enforce=True, target_channel=command,
@@ -3418,12 +3426,63 @@ def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
         f"git -C {root} rebase main",
         f"git -C {root} config credential.helper store",
         f"git -C {tmp_path} push origin worklink/979:worklink/979",
+        f"git -C {root} status --verbose",
+        f"git -C {root} status --porcelain evil",
         "gh pr checkout 979 --repo attacker/other --branch worklink/979",
         "gh pr checkout 979 --repo o/r --branch main",
     ):
         assert registry.authorize_tool(
             "shell_exec", auth, enforce=True, target_channel=command,
         ).allowed is False, command
+
+
+def test_repo_review_metadata_writes_are_bound_to_event_repo_and_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    scratch.mkdir(parents=True)
+    body_file = scratch / "pr-update.md"
+    body_file.write_text("updated evidence")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    state = RepoReviewState("o/r", 979, "worklink/979", str(tmp_path))
+
+    edit = parse_service_shell_argv(
+        f"gh pr edit 979 --repo o/r --body-file {body_file} "
+        "--add-reviewer jasoncarreira",
+        "repo_review",
+        review_state=state,
+    )
+    comment = parse_service_shell_argv(
+        f"gh pr comment 979 --repo o/r --body-file {body_file}",
+        "repo_review",
+        review_state=state,
+    )
+
+    assert edit == [
+        str(maintenance_pinned_executables["gh"]),
+        "pr", "edit", "979", "--repo", "o/r", "--body", "updated evidence",
+        "--add-reviewer", "jasoncarreira",
+    ]
+    assert comment == [
+        str(maintenance_pinned_executables["gh"]),
+        "pr", "comment", "979", "--repo", "o/r", "--body", "updated evidence",
+    ]
+
+    for command in (
+        f"gh pr edit 978 --repo o/r --body-file {body_file} --add-reviewer jasoncarreira",
+        f"gh pr edit 979 --repo attacker/other --body-file {body_file} --add-reviewer jasoncarreira",
+        f"gh pr edit 979 --repo o/r --body-file {body_file}",
+        "gh pr edit 979 --repo o/r --body injected --add-reviewer jasoncarreira",
+        f"gh pr comment 978 --repo o/r --body-file {body_file}",
+        f"gh pr comment 979 --repo attacker/other --body-file {body_file}",
+        "gh pr comment 979 --repo o/r --body injected",
+    ):
+        assert parse_service_shell_argv(
+            command, "repo_review", review_state=state,
+        ) is None, command
 
 
 def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
