@@ -1890,6 +1890,8 @@ def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
     return resolve_within_roots(roots, str(candidate))
+
+
 _TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
     ".env", ".git", ".mimir", ".venv", "config", "credentials",
     "identities", "prompts", "secret", "secrets",

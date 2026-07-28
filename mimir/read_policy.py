@@ -9,7 +9,6 @@ from typing import Any
 
 from .secret_scan import contains_secret
 
-
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [^-\r\n]*PRIVATE KEY-----", re.IGNORECASE,
 )
@@ -144,22 +143,29 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     authority = getattr(auth_context, "service_authority", None)
     if not getattr(authority, "filesystem_read_roots", ()):
         return False
-    protected = {
-        ".env", ".git", ".mimir", ".venv", "config", "credentials",
-        "identities", "prompts", "secret", "secrets",
-    }
+    # Keep authorization and read-boundary enforcement on one security list.
+    # Import lazily to avoid a module cycle: access_control imports this module
+    # from the authorization path that scans individual file contents.
+    from .access_control import _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+
     for raw_root in authority.filesystem_read_roots:
         root = Path(raw_root)
         try:
             if path == root or path.is_relative_to(root):
                 lexical = path.relative_to(root)
-                if any(part.lower() in protected for part in lexical.parts):
+                if any(
+                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+                    for part in lexical.parts
+                ):
                     return True
             resolved_root = root.resolve(strict=True)
             resolved = path.resolve(strict=True)
             if resolved == resolved_root or resolved.is_relative_to(resolved_root):
                 relative = resolved.relative_to(resolved_root)
-                if any(part.lower() in protected for part in relative.parts):
+                if any(
+                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+                    for part in relative.parts
+                ):
                     return True
         except (OSError, RuntimeError, ValueError):
             return True
