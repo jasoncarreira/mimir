@@ -172,6 +172,24 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     return False
 
 
+def is_current_service_scoped_read_path(path: Path) -> bool:
+    """Return whether the resolved path is inside a frozen service read root."""
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    authority = getattr(auth_context, "service_authority", None)
+    for raw_root in getattr(authority, "filesystem_read_roots", ()):
+        try:
+            root = Path(raw_root).resolve(strict=True)
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved == root or resolved.is_relative_to(root):
+            return True
+    return False
+
+
 def text_contains_secret(text: str, *, path: Path | None = None) -> bool:
     """Detect protected credential bodies, including path-specific config forms."""
     if contains_secret(text) or _PEM_PRIVATE_KEY_PATTERN.search(text):
@@ -195,7 +213,11 @@ def file_contains_secret(path: Path) -> bool:
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     """Check a result at its read boundary without re-reading supplied text."""
-    if is_protected_read_path(path) or is_current_service_protected_read_path(path):
+    service_scoped = is_current_service_scoped_read_path(path)
+    if (
+        (not service_scoped and is_protected_read_path(path))
+        or is_current_service_protected_read_path(path)
+    ):
         return True
     if text is not None:
         return text_contains_secret(text, path=path)

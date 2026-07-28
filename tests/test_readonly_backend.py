@@ -16,6 +16,8 @@ import pytest
 
 from mimir.readonly_backend import (
     FileToolRouter,
+    MAX_GREP_CONTEXT_LINES,
+    MimirFilesystemMiddleware,
     ReadOnlyFilesystemBackend,
     WriteGuardBackend,
     _RootAwareFilesystemBackend,
@@ -140,6 +142,23 @@ class TestWriteGuardBackend:
         result = b.read(file_path=absolute)
         text = getattr(result, "content", None) or str(result)
         assert "preexisting" in text
+
+    @pytest.mark.parametrize(
+        "file_path",
+        ["attachments/fetch-cache/body.txt", "/attachments/fetch-cache/body.txt"],
+    )
+    def test_read_fetch_cache_relative_and_virtual_paths(
+        self, home: Path, file_path: str,
+    ) -> None:
+        cache = home / "attachments" / "fetch-cache"
+        cache.mkdir(parents=True)
+        (cache / "body.txt").write_text("fetched body\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        result = backend.read(file_path=file_path)
+
+        assert result.error is None
+        assert result.file_data["content"] == "fetched body\n"
 
     def test_write_with_container_absolute_path(self, home: Path) -> None:
         # Writes via the container-absolute form must reach the same
@@ -778,6 +797,64 @@ class TestBuildFileToolRoutes:
         assert result.error is None
         assert "Grep truncated" in caplog.text
 
+    def test_grep_returns_bounded_overlapping_context_once(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "sample.txt").write_text(
+            "one\nneedle first\nbetween\nneedle second\nfive\n",
+            encoding="utf-8",
+        )
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.grep(
+            "needle", path="/sample.txt", before_context=1, after_context=1,
+        )
+
+        assert result.error is None
+        assert [(m["line"], m["text"]) for m in result.matches or []] == [
+            (1, "one"),
+            (2, "needle first"),
+            (3, "between"),
+            (4, "needle second"),
+            (5, "five"),
+        ]
+
+    @pytest.mark.parametrize("value", [-1, MAX_GREP_CONTEXT_LINES + 1, True])
+    def test_grep_rejects_context_outside_explicit_cap(
+        self, tmp_path: Path, value: object,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "sample.txt").write_text("needle\n", encoding="utf-8")
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.grep("needle", path="/", after_context=value)  # type: ignore[arg-type]
+
+        assert result.matches == []
+        assert f"between 0 and {MAX_GREP_CONTEXT_LINES}" in (result.error or "")
+
+    def test_grep_tool_schema_exposes_capped_context(self, tmp_path: Path) -> None:
+        (tmp_path / "sample.txt").write_text(
+            "before\nneedle\nafter\n", encoding="utf-8",
+        )
+        backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+        middleware = MimirFilesystemMiddleware(backend=backend)
+        grep_tool = next(tool for tool in middleware.tools if tool.name == "grep")
+
+        assert grep_tool.args["before_context"]["maximum"] == MAX_GREP_CONTEXT_LINES
+        assert grep_tool.args["after_context"]["maximum"] == MAX_GREP_CONTEXT_LINES
+        result = grep_tool.func(
+            pattern="needle",
+            runtime=SimpleNamespace(tool_call_id="grep-context"),
+            path="/sample.txt",
+            output_mode="content",
+            before_context=1,
+            after_context=1,
+        )
+        assert "1: before" in result.content
+        assert "2: needle" in result.content
+        assert "3: after" in result.content
+
     def test_glob_skips_worktrees_and_caps_matches_without_result_error(
         self, tmp_path: Path, caplog,
     ) -> None:
@@ -852,7 +929,12 @@ class TestBuildFileToolRoutes:
         token = set_current_turn(SimpleNamespace(turn_id="read-filter", auth_context=auth))
         try:
             backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
-            grep_paths = {m["path"] for m in backend.grep("needle", path="/").matches or []}
+            grep_paths = {
+                m["path"]
+                for m in backend.grep(
+                    "needle", path="/", before_context=1, after_context=1,
+                ).matches or []
+            }
             ls_names = {
                 Path(e["path"].rstrip("/")).name for e in backend.ls("/").entries or []
             }

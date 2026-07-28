@@ -4589,6 +4589,20 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
     assert "--jq" in reason
 
 
+@pytest.mark.parametrize("executable", ["awk", "sed", "cat", "head", "python", "curl"])
+def test_repo_review_profile_keeps_file_slicers_and_direct_curl_refused(
+    executable: str,
+) -> None:
+    from mimir.access_control import parse_service_shell_argv
+
+    command = (
+        "curl https://api.github.com/repos/acme/widget/pulls/7"
+        if executable == "curl"
+        else f"{executable} attachments/fetch-cache/body.txt"
+    )
+    assert parse_service_shell_argv(command, "repo_review") is None
+
+
 def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
     """Every command the review skill shows must be admissible on a poller turn.
 
