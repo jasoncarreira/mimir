@@ -356,27 +356,22 @@ def _cd_target(command: str, cwd: Path | None) -> Path | None:
 @tool
 def shell_exec(
     command: str,
+    cwd: str | None = None,
     mimir_direct_argv: Annotated[list[str] | None, InjectedToolArg] = None,
 ) -> str:
     """Execute a shell command and return stdout + stderr + exit code.
 
-    Runs the command through ``bash -lc`` (a real login shell), so shell
+    User/admin calls run through ``bash -lc`` (a real login shell), so shell
     syntax works: ``cd``-chains, pipes, redirects, ``&&`` / ``||``, globs,
-    and environment expansion. This matches ``bash_async`` and the #226
-    trust model — the agent is trusted with shell access within the
-    operator-configured container, which (not an in-process parse) is the
-    security boundary; the prohibited-action guard middleware still screens
-    the command string before it runs. Use ``bash_async`` for jobs that may
-    exceed the sync timeout.
-
-    Previously this used ``shlex.split`` + ``shell=False`` as an "injection
-    guard," but the module's own trust model contradicted it: ``bash_async``
-    already exposes a full shell, so half-gating only the sync path was
-    security theatre — while it silently broke ``cd``/pipes/redirects/``$``
-    for the agent (shell-wrapper fix, 2026-06).
+    and environment expansion. Under a trusted-service profile, the command
+    must instead be one argv with no shell syntax; the exact authorized argv
+    is executed with ``shell=False``. Use ``cwd`` rather than a leading
+    ``cd DIR &&``. Use ``bash_async`` for jobs that may exceed the sync timeout.
 
     Args:
         command: The full shell command line (run via ``bash -lc`` for user/admin calls).
+        cwd: Working directory for the command. Trusted-service calls require an
+            authorized absolute directory and execute with its resolved path.
         mimir_direct_argv: Server-injected exact argv for trusted-service calls.
             This is never a model authority surface: middleware replaces it after
             authorizing the original command.
@@ -386,7 +381,7 @@ def shell_exec(
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
-    cwd = _effective_shell_cwd()
+    effective_cwd = Path(cwd).expanduser() if cwd else _effective_shell_cwd()
     try:
         from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
         direct_argv = bound_direct_exec_argv()
@@ -401,7 +396,7 @@ def shell_exec(
             argv,
             capture_output=True,
             timeout=_SHELL_STATE["timeout_s"],
-            cwd=cwd,
+            cwd=effective_cwd,
             env=direct_exec_env(argv) if direct_argv is not None else None,
         )
     except subprocess.TimeoutExpired:
@@ -414,7 +409,7 @@ def shell_exec(
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     if proc.returncode == 0:
-        target = _cd_target(command, cwd)
+        target = _cd_target(command, effective_cwd)
         if target is not None and target.is_dir():
             _SHELL_STATE["cwd"] = target
     if stdout:

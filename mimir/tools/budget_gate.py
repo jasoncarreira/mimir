@@ -418,6 +418,38 @@ def _service_shell_refusal(request: ToolCallRequest) -> str | None:
     return refusal if isinstance(refusal, str) and refusal else None
 
 
+def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]:
+    """Resolve an explicit service cwd within the non-admin read roots."""
+    from ..read_policy import configured_non_admin_read_roots
+
+    if raw_cwd is None:
+        # Preserve the existing ambient/sticky cwd when the caller omits cwd.
+        return None, None
+    if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
+        return None, "working directory must be a non-empty absolute path"
+    candidate = Path(raw_cwd)
+    if not candidate.is_absolute():
+        return None, "working directory must be a non-empty absolute path"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "working directory is not an accessible directory"
+    if not resolved.is_dir():
+        return None, "working directory is not an accessible directory"
+
+    roots: list[Path] = []
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_root.is_dir() and resolved_root not in roots:
+            roots.append(resolved_root)
+    if not any(resolved.is_relative_to(root) for root in roots):
+        return None, "working directory is outside the trusted service's authorized read roots"
+    return str(resolved), None
+
+
 def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
@@ -450,6 +482,16 @@ def _request_for_authorized_execution(
     target = args.get("command")
     if not isinstance(target, str):
         return sanitized_request
+    resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
+    if cwd_refusal is not None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {cwd_refusal}."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if resolved_cwd is not None:
+        args["cwd"] = resolved_cwd
     argv, refusal = parse_service_shell_argv_with_reason(target, policy.destination)
     if argv is None:
         # The authorization adapter already admitted this call. Failing to bind

@@ -141,6 +141,16 @@ def test_shell_exec_initial_cwd_defaults_to_mimir_home(monkeypatch, tmp_path):
     assert "script-cwd=home" in result
 
 
+def test_shell_exec_accepts_explicit_cwd(tmp_path):
+    target = tmp_path / "explicit"
+    target.mkdir()
+
+    result = shell_exec.invoke({"command": "pwd", "cwd": str(target)})
+
+    assert "exit=0" in result
+    assert str(target) in result
+
+
 def test_shell_exec_standalone_cd_persists_for_later_calls(tmp_path):
     """A successful standalone cd updates the cwd used by later shell calls."""
     target = tmp_path / "workspace"

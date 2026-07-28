@@ -65,13 +65,14 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
 
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
-        on_complete=None, auth_context=None, env_overlay=None,
+        on_complete=None, auth_context=None, env_overlay=None, cwd=None,
     ) -> _FakeJob:
         spawned.append({
             "command": command,
             "argv": argv,
             "channel_id": channel_id,
             "env_overlay": env_overlay,
+            "cwd": cwd,
         })
         return _FakeJob(command=command, channel_id=channel_id)
 
@@ -98,6 +99,15 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
     assert argv[2].endswith("\nsleep 5")  # original command preserved verbatim
     # The recorded command (for display) stays the clean original.
     assert fake_registry._spawned_log[0]["command"] == "sleep 5"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_accepts_explicit_cwd(
+    fake_registry: ShellJobRegistry, tmp_path: Path,
+) -> None:
+    await shell_async.bash_async.ainvoke({"command": "sleep 5", "cwd": str(tmp_path)})
+
+    assert fake_registry._spawned_log[0]["cwd"] == str(tmp_path)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
