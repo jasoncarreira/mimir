@@ -17,6 +17,24 @@ import subprocess
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
+
+#: Operator marker that forgives the attempts consumed before it. The attempt
+#: budget is derived from claim comments, so an infrastructure fault that fails
+#: every attempt — a broken base-repo fetch, a reclaimed object store — exhausts a
+#: leaf that was never itself at fault, and relabelling cannot undo it because the
+#: count is recomputed from history on each dispatch. That happened to #1019,
+#: #1020 and #1023 on 2026-07-28: six attempts burned by dangling git alternates,
+#: three leaves demoted, and re-promotion re-exhausted them within seconds.
+#:
+#: Add with:  chainlink issue comment <id> 'WORKLINK_CLAIM_RESET {"reason": "..."}'
+CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
+
+#: How many resets one issue may be granted. Unbounded forgiveness would let a
+#: genuinely stuck leaf loop forever by resetting itself — the comment carries no
+#: author, so intent cannot be verified — which is exactly what ``max_attempts``
+#: exists to prevent. After this many, the cap re-asserts permanently and the leaf
+#: needs a human decision rather than another retry.
+MAX_CLAIM_RESETS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -333,10 +351,36 @@ class ChainlinkClaims:
             self._run("issue", "comment", str(issue_id), f"{prefix} {reason}")
 
     def next_attempt(self, comments: Iterable[str]) -> int:
-        records = claim_records_from_comments(comments)
-        if not records:
+        """The attempt number a fresh claim would take, honouring reset markers.
+
+        Only the attempt BUDGET is reset. ``claim_records_from_comments`` still
+        reports every claim, because the duplicate-liveness guard and the stale
+        claim reaper judge live runs from those records — forgetting them here
+        would let a second run claim an issue a live run already holds. Admission
+        checks liveness before exhaustion, so a reset cannot smuggle a concurrent
+        build past that guard.
+        """
+        attempts_since_reset: list[int] = []
+        resets_honoured = 0
+        for comment in comments:
+            for line in comment.splitlines():
+                if line.startswith(CLAIM_RESET_PREFIX):
+                    if resets_honoured < MAX_CLAIM_RESETS:
+                        resets_honoured += 1
+                        attempts_since_reset.clear()
+                    continue
+                if not line.startswith(CLAIM_PREFIX):
+                    continue
+                try:
+                    record = ClaimRecord.from_payload(
+                        json.loads(line[len(CLAIM_PREFIX):])
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                attempts_since_reset.append(record.attempt)
+        if not attempts_since_reset:
             return 1
-        return max(record.attempt for record in records) + 1
+        return max(attempts_since_reset) + 1
 
     def reap_stale_claims(self, records: Iterable[ClaimRecord], *, ttl: timedelta) -> list[ClaimRecord]:
         """Release stale claims and move the issue back to ready or blocked.
