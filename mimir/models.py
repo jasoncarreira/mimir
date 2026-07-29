@@ -625,6 +625,7 @@ class RepoReviewState:
 
     action_scope: RepoPRActionScope
     checked_out: bool = field(default=False, init=False, compare=False)
+    checkout_lease: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def repo(self) -> str:
@@ -640,10 +641,30 @@ class RepoReviewState:
 
     @property
     def root(self) -> str:
+        lease = self.checkout_lease
+        if lease is not None and getattr(lease, "is_active", False):
+            return str(lease.path)
         return self.action_scope.canonical_root
 
     def mark_checked_out(self) -> None:
         object.__setattr__(self, "checked_out", True)
+
+    def attach_checkout_lease(self, lease: Any) -> None:
+        """Activate only a lease issued for this immutable action scope."""
+        if (
+            getattr(lease, "scope_id", None) != self.action_scope.scope_id
+            or getattr(lease, "owner", None) != self.action_scope.principal
+            or not getattr(lease, "is_active", False)
+        ):
+            raise ValueError("checkout lease does not match review scope")
+        object.__setattr__(self, "checkout_lease", lease)
+        object.__setattr__(self, "checked_out", True)
+
+    def revoke_checkout_lease(self, lease: Any) -> None:
+        """Revoke the exact attached lease without affecting a replacement."""
+        if self.checkout_lease is lease:
+            object.__setattr__(self, "checkout_lease", None)
+            object.__setattr__(self, "checked_out", False)
 
 
 @dataclass(frozen=True)

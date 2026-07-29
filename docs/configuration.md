@@ -219,6 +219,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_FOLDERS` | csv `name:mode` | built-in | Per-subdir write permissions under home (`state:rw,logs:ro,...`). Unknown modes → `ro`; unsafe names rejected. |
 | `MIMIR_FILE_OP_ROOTS` | colon-list | `""` | Extra absolute roots (beyond home) the file-op tools may access (`:`-separated). |
 | `MIMIR_FILE_TOOL_ROOTS` | csv `path[:ro\|:rw]` | `""` | External roots routed to the file tools via CompositeBackend; `/tmp` always added rw. Rejects traversal / system roots / home overlap. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
+| `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Root for atomic, scope-bound PR checkout leases. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
 | `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
 | `MIMIR_MCP_SERVERS_JSON` | json | `""` | Inline MCP server config list (wins over `_PATH`). MCP is opt-in. |
 | `MIMIR_MCP_SERVERS_PATH` | path | `""` | Path to a JSON MCP server config file. |
