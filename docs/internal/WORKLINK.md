@@ -9,8 +9,8 @@ Status: **Live and autonomous** (as of 2026-07-08; the original #380 slices
 have all shipped, and the #832 substrate cleanup has retired the
 `docker-sibling` broker and `ecs-runtask` compute paths). The production model
 is **per-leaf execution**: Worklink claims a `worklink:ready` leaf, builds it
-in an attempt branch via the configured coding backend (opencode by default;
-#830), observes evidence, and opens one PR per leaf. **Integrated-epic mode
+in an attempt branch via the sole coding backend, opencode (#830), observes
+evidence, and opens one PR per leaf. **Integrated-epic mode
 was removed (#830)** — the in-mimir distributed epic runner (decompose →
 per-slice review → one integration branch → one draft PR) is gone. Epics are
 now built by the external **opencode feature-factory**; `worklink:epic`
@@ -154,7 +154,7 @@ vague parent issue can never be handed directly to a coding agent:
 | Role | Who | Intelligence | Output |
 |---|---|---|---|
 | **Planner / decomposer** | mimir, in LLM turns | mimir's model | Ready *leaf* issues: acceptance criteria, dependency edges, review criteria, labels |
-| **Executor** | `mimir/worklink/` — deterministic machinery (no model calls of its own) | the **backend CLI's** own agent loop (codex / claude / cursor / …) | A claimed issue → worktree → backend run → **observed** evidence bundle → state transition |
+| **Executor** | `mimir/worklink/` — deterministic machinery (no model calls of its own) | opencode's own agent loop | A claimed issue → worktree → backend run → **observed** evidence bundle → state transition |
 
 The executor is a process supervisor. It claims, prepares, spawns,
 observes, and reports. All building intelligence lives inside the
@@ -283,9 +283,7 @@ mimir/worklink/
   backends/
     __init__.py     # registry + capability resolution
     base.py         # ToolBackend protocol, Caps, WorkOrder, RawResult
-    codex.py        # first adapter
-    claude_cli.py   # second adapter (mechanical addition)
-    opencode.py     # #830 default backend
+    opencode.py     # sole coding backend
     feature_factory.py # #833 worklink:epic adapter
   compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, LocalSubprocessComputeBackend
 ```
@@ -377,7 +375,7 @@ summary):
 {
   "issue": 412,
   "attempt": 1,
-  "backend": "codex",
+  "backend": "opencode",
   "branch": "issue/412-a1",
   "worktree": ".worklink/412-1",
   "started_at": "...", "finished_at": "...",
@@ -416,7 +414,7 @@ class Caps:
     json_output: bool         # machine-readable result stream
     native_pr_creation: bool  # can open the PR itself
     worktree_safe: bool       # tolerates --cd into an arbitrary worktree
-    quota_pool: str | None    # e.g. "codex-subscription" — see §6
+    quota_pool: str | None    # e.g. "opencode" — see §6
 
 @dataclass(frozen=True)
 class WorkOrder:
@@ -450,13 +448,12 @@ is orchestrator code shared by every backend. Adding a backend is one
 file implementing the protocol plus a registry entry; it must never
 require touching the orchestrator.
 
-### Initial adapters
+### Registered backends
 
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
-| `codex` (first) | `codex exec --cd <worktree> --json <prompt>` | Already installed in the agent containers; JSON output; shares the ChatGPT-account quota pool with codex-routed agents |
-| `claude_cli` (second) | `claude -p <prompt> --output-format json` in worktree cwd | Implemented as a protocol-parity adapter; proves the interface is mechanical; separate Max-plan pool. Requires a deployment image with the `claude` CLI installed before real runs. |
-| `cursor` / others | per their headless CLIs | Added on demand |
+| `opencode` | `opencode run --dir <worktree> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
+| `feature_factory` | `feature-factory start ...` | Epic adapter that launches the external opencode feature-factory. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -465,7 +462,8 @@ and is configured for `native_pr_creation`).
 
 ### Execution substrate (the orthogonal `ComputeBackend` axis)
 
-`ToolBackend` answers **what** builds (codex / claude / opencode). The
+`ToolBackend` answers **what** builds (`opencode` for leaves or
+`feature_factory` for epics). The
 orthogonal `ComputeBackend` axis answers **where** it runs. **After the #832
 substrate cleanup, the only Worklink compute substrate is
 `local_subprocess`** (chainlink #832 retired `docker_sibling` and
@@ -542,11 +540,9 @@ normal PR review before merge. It also uses an explicit environment
 allowlist, so backend subprocesses do not inherit arbitrary ambient
 secrets by default. Those are the durable safety rails.
 
-That is **not the same as filesystem sandboxing**. In the current agent
-container, the Codex CLI only works with `--sandbox danger-full-access`;
-the default bwrap sandbox fails before useful work starts. Therefore a
-Codex-backed Worklink run has full container filesystem access from the
-backend process. The worktree cwd limits where the backend is asked to
+That is **not the same as filesystem sandboxing**. A Worklink run on the sole
+`local_subprocess` compute substrate has full container filesystem access from
+the backend process. The worktree cwd limits where opencode is asked to
 work, but it does not prevent reads or writes elsewhere in `/workspace`
 or `/mimir-home` if the backend agent/tool chooses to do them. Treat
 worktree isolation as an audit/review boundary, not a security boundary.
@@ -557,10 +553,9 @@ diff/tests itself. It is not acceptable as a silent autonomous-dispatch
 boundary without a fresh risk decision. The pre-#832 options were:
 
 1. **In-container sandbox (verified).** A one-line seccomp profile permitting
-   user namespaces (`docs/internal/seccomp-userns.json`) lets Codex's own bwrap
-   `--sandbox workspace-write` confine writes to the worktree and deny network —
-   verified model-free on the agent image (#452). Trade-off: userns widens the
-   container's kernel attack surface. Does **not** port to ECS Fargate.
+   user namespaces (`docs/internal/seccomp-userns.json`) was verified against
+   the retired Codex path (#452). It is historical context, not a shipping
+   Worklink backend or current opencode confinement guarantee.
 2. **Out-of-container worker** via the `ComputeBackend` axis above
    (`docker-sibling` through a broker, or `ecs-runtask`) — chainlink #454. The
    portable path; the only isolation that survives a move to AWS.
@@ -570,7 +565,7 @@ boundary without a fresh risk decision. The pre-#832 options were:
 
 After #832 options 1 and 2 are no longer shipping compute substrates. The
 seccomp/userns profile (1) is still a valid operator hardening for operators
-who want Codex confined to the worktree. Options 2 and 3 collapse: with no
+who want to evaluate analogous confinement. Options 2 and 3 collapse: with no
 isolated substrate shipped, the only shipping posture is the
 `local_subprocess` accept-the-risk fallback (3), gated by
 `defaults.allow_autonomous_local_subprocess` for autonomous dispatch. The
@@ -601,8 +596,7 @@ content verbatim into acceptance criteria.
 ## 6. Mimir integrations
 
 - **Quota arbitration.** A backend whose `quota_pool` matches the
-  agent's own provider shares real quota (mimirbot + codex workers =
-  one ChatGPT account). Autonomous dispatch (poller/tool) consults
+  agent's own provider shares real quota. Autonomous dispatch (poller/tool) consults
   `HomeostaticArbiter.should_fire(priority=<worklink priority>)` —
   default `normal`, configurable — so worker launches shed under TIGHT
   with everything else. Operator-invoked `mimir worklink run` always
@@ -615,7 +609,8 @@ content verbatim into acceptance criteria.
   may carry deployment-specific `tool_pins:`, but the source-controlled
   seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
   The seed covers pinned external executables that affect agent/worklink
-  operation: codex, chainlink, mermaid-cli, OpenCode tooling, and
+  operation: the separately installed Codex CLI, chainlink, mermaid-cli,
+  OpenCode tooling, and
   gmail-poller's gogcli helper. Each entry records category, upstream
   lookup source, current pin, install surface, smoke command, and risk
   notes; guard tests compare those pins against Dockerfile/scaffold/
@@ -631,7 +626,7 @@ content verbatim into acceptance criteria.
 
   | Tool | Category | Source lookup | Current pin | Install surface | Smoke command | Risk surface |
   |------|----------|---------------|-------------|-----------------|---------------|--------------|
-  | codex | `coding-cli` | npm package `@openai/codex` | `0.145.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | High: first Worklink coding backend; CLI drift can affect prompt execution, sandbox flags, transcript shape, and quota use. |
+  | codex | `coding-cli` | npm package `@openai/codex` | `0.145.0` | scaffold Dockerfiles when `codex-plus` is selected | `codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py` | Historical Worklink CLI, retained in this tool inventory until its separate installation surface is retired. It is not a registered Worklink backend. |
   | chainlink | `issue-cli` | GitHub release/tag `dollspace-gay/chainlink` | `chainlink-1.6.0` | bundled Chainlink skill `dockerfile.fragment` | `chainlink --version && chainlink issue ready` | High: Worklink coordination depends on issue, lock, comment, and dependency semantics. |
   | mermaid-cli | `renderer` | npm package `@mermaid-js/mermaid-cli` | `11.16.0` | scaffold Dockerfiles | `mmdc --version` | Low: renderer/Chromium drift affects diagram generation, not coding execution. |
   | gogcli | `integration-cli` | GitHub release/tag `steipete/gogcli` | `v0.9.0` | gmail-poller optional-skill `dockerfile.fragment` | `gog --version && gog gmail messages search 'in:inbox newer_than:1d' --account "$GOG_ACCOUNT" --max 1 --json --no-input` | High: pre-1.0 Gmail/Calendar helper drift can break polling subcommands on Muninn; large version jumps need an authenticated smoke before merge. |
@@ -639,18 +634,16 @@ content verbatim into acceptance criteria.
 ## 6.5 Compute-backend autonomy policy (#460, #832)
 
 Worklink composes on two orthogonal axes: the **ToolBackend** (*what* builds —
-`codex`, `claude_cli`, `opencode`, `feature_factory`; chosen by `backends:` +
+`opencode` or `feature_factory`; chosen by `backends:` +
 `routes[].backend`) and the **ComputeBackend** (*where* it runs). After the #832
 substrate cleanup the only Worklink compute substrate is `local_subprocess`
 (chainlink #832 retired `docker_sibling` and `ecs_runtask`; the
 `ComputeBackend` plumbing stays in place so a future isolated substrate can be
-added without an orchestrator change). They mix freely: codex-on-local,
-claude-on-local, opencode-on-local — a route matches first, otherwise the
-defaults apply.
+added without an orchestrator change). Both registered tool backends run on
+local subprocess compute; a route matches first, otherwise the defaults apply.
 
 `local_subprocess` runs the backend **unsandboxed**, with full
-container-filesystem access (codex needs `--sandbox danger-full-access` in the
-current image). That is an **explicit accept-the-risk fallback**, not the
+container-filesystem access. That is an **explicit accept-the-risk fallback**, not the
 recommended autonomous path. With no built-in isolated substrate to fall back
 to after #832, the only escape from the autonomous refusal is the
 `allow_autonomous_local_subprocess: true` opt-in.
@@ -689,17 +682,15 @@ leaf issues with explicit acceptance criteria and review criteria.
 - The issue should be an unblocked leaf, not a vague parent. Worklink expects
   concrete acceptance criteria plus review criteria; the prompt renderer passes
   those to the backend, and the evidence gate only checks observed mechanics.
-- Configure backend quirks in `<home>/worklink.yaml`. In the current production
-  container Codex requires `--sandbox danger-full-access`; the default bwrap
-  sandbox can fail before any code runs. That means the backend is **not
-  filesystem sandboxed**; see §5's trust model before using Worklink on
-  sensitive issues or enabling slice-3 autonomous dispatch.
+- Configure opencode arguments and permissions in `<home>/worklink.yaml`. The
+  backend is **not process-confined** on `local_subprocess`; see §5's trust
+  model before using Worklink on sensitive issues or enabling autonomous dispatch.
 
 Minimal current config shape:
 
 ```yaml
 defaults:
-  backend: codex
+  backend: opencode
   compute_backend: local_subprocess  # the only built-in compute substrate (#832)
   timeout_s: 1800
   priority: normal
@@ -707,18 +698,15 @@ defaults:
   base_branch: main          # worktrees cut from + PRs target this branch
 
 backends:
-  codex:
-    bin: codex
-    args: ["exec", "--json", "--sandbox", "danger-full-access"]
-  claude_cli:
-    bin: claude
   opencode:
     bin: opencode
     # Replaces the built-in Mimir-repo list: ["git *", "uv *"].
     # OpenCode evaluates the last matching pattern. Worklink always installs a
     # leading "*": deny rule, then these grants; "*" itself is rejected.
     bash_allowlist: ["git *", "uv *"]
-    args: ["-p", "--output-format", "json"]
+    args: ["--model", "openai/gpt-5.6-sol"]
+  feature_factory:
+    bin: feature-factory
 ```
 
 The `compute_backends:` stanza is not needed in normal configs — it is only
@@ -821,7 +809,7 @@ Current slice-1 recovery is manual:
 
 ```yaml
 defaults:
-  backend: codex
+  backend: opencode
   compute_backend: local_subprocess # the only built-in Worklink compute substrate (#832)
   timeout_s: 1800
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
@@ -835,7 +823,7 @@ defaults:
   # Retained-but-INERT since #830 (integrated-epic runner removed). These parse
   # for back-compat but no code consumes them; safe to omit:
   epic_branch_prefix: "epic/"       # (inert) was the integrated-epic branch prefix
-  reviewer_backend: codex           # (inert) was the epic per-slice reviewer backend
+  reviewer_backend: opencode        # (inert) was the epic per-slice reviewer backend
   tiered_review:
     # Glob patterns matched against any scope path with fnmatch; `**` is supported.
     # If set, this list REPLACES the framework defaults below; it is not merged.
@@ -865,17 +853,15 @@ defaults:
     multi_vote_reviewer_count: 3     # reviewer count for high-risk leaves
 
 routes:                     # first match wins
-  - label: "docs"
-    backend: claude_cli     # the other registered backend
   - repo: "jasoncarreira/mimir"
-    backend: codex
+    backend: opencode
 
 backends:                   # ToolBackend adapters — WHAT builds
-  codex:
-    bin: codex
-    args: ["exec", "--json"]
-  claude_cli:
-    bin: claude
+  opencode:
+    bin: opencode
+    args: ["--model", "openai/gpt-5.6-sol"]
+  feature_factory:
+    bin: feature-factory
 
 # Backend blocked path: coding CLIs can deliberately route planner/human issues
 # back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is
@@ -891,8 +877,10 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
   local-subprocess: {}      # the built-in default; accept-the-risk fallback
 ```
 
-Invalid or unknown compute-backend fields fail closed during config load
-instead of falling back to local execution.
+Invalid or unknown tool-backend and compute-backend fields fail closed during
+registry construction instead of falling back to another backend. Remove any
+vestigial `backends.codex`, `backends.claude_cli`, or routes/defaults selecting
+those retired names from operator-owned `worklink.yaml` files.
 
 Worklink's OpenCode backend passes a per-run `OPENCODE_PERMISSION` override with
 `external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
@@ -960,7 +948,7 @@ tool_pins:
    atomicity across processes; decide claim mechanism; document in this
    spec.
 2. **Slice 1 — vertical, operator-invoked.** `mimir worklink run
-   <issue>`: validate-leaf → claim → worktree → codex adapter →
+   <issue>`: validate-leaf → claim → worktree → coding adapter →
    observed evidence → transitions → PR. Dry-run on one non-critical
    issue (an adversarial-review LOW is a good guinea pig).
 3. **Slice 2 — planner.** `mimir/prompt_templates/decompose.md` +
@@ -977,8 +965,8 @@ tool_pins:
    `ComputeBackend` axis (#454) and/or the verified in-container seccomp profile
    (#452). Autonomous `local-subprocess` requires the explicit accept-the-risk
    opt-in.
-5. **Slice 4 — second adapter.** `claude_cli`, proving mechanical
-   addition.
+5. **Slice 4 — second adapter.** Historical `claude_cli` protocol-parity work;
+   retired with the legacy Codex adapter after opencode became the sole coding path.
 6. **Slice 5 — tool pins.** Inventory + drift poller + bump-issue
    filing.
 
