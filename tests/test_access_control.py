@@ -3752,6 +3752,23 @@ def test_repo_review_metadata_writes_are_bound_to_event_repo_and_pr(
         "pr", "comment", "979", "--repo", "o/r", "--body", "updated evidence",
     ]
 
+    without_rerequest = replace(
+        state.action_scope,
+        allowed_operations=state.action_scope.allowed_operations
+        - {access_control.RepoPRAction.PR_REREQUEST.value},
+    )
+    assert parse_service_shell_argv(
+        f"gh pr edit 979 --repo o/r --body-file {body_file} "
+        "--add-reviewer jasoncarreira",
+        "repo_review",
+        review_state=RepoReviewState(without_rerequest),
+    ) is None
+    assert parse_service_shell_argv(
+        f"gh pr comment 979 --repo o/r --body-file {body_file}",
+        "repo_review",
+        review_state=RepoReviewState(without_rerequest),
+    ) is not None
+
     for command in (
         f"gh pr edit 978 --repo o/r --body-file {body_file} --add-reviewer jasoncarreira",
         f"gh pr edit 979 --repo attacker/other --body-file {body_file} --add-reviewer jasoncarreira",
@@ -3993,6 +4010,8 @@ def _github_scope_test_setup(
         ("author", "someone-else"),
         ("head_repo", "fork/r"),
         ("head_remote", "upstream"),
+        ("head_ref", "refs/heads/not:a-branch"),
+        ("head_sha", "not-a-sha"),
     ],
 )
 def test_poller_scope_forged_or_wrong_authority_fields_fail_closed(
@@ -4042,9 +4061,17 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
 
     assert first is not None and second is not None
     assert first.scope_id == second.scope_id
-    assert first.allowed_operations == frozenset(
-        action.value for action in access_control.RepoPRAction
-    )
+    assert first.allowed_operations == frozenset({
+        access_control.RepoPRAction.INSPECT.value,
+        access_control.RepoPRAction.CHECKOUT.value,
+        access_control.RepoPRAction.WRITE.value,
+        access_control.RepoPRAction.COMMIT.value,
+        access_control.RepoPRAction.PUSH.value,
+        access_control.RepoPRAction.PR_COMMENT.value,
+        access_control.RepoPRAction.PR_EDIT.value,
+        access_control.RepoPRAction.PR_REREQUEST.value,
+    })
+    assert access_control.RepoPRAction.PR_REVIEW.value not in first.allowed_operations
     with pytest.raises(FrozenInstanceError):
         first.destination_ref = "refs/heads/main"
     with pytest.raises(ValueError, match="unsupported repo/PR action"):

@@ -38,6 +38,7 @@ class RepoPRAction(StrEnum):
     PUSH = "repo.push"
     PR_COMMENT = "pr.comment"
     PR_EDIT = "pr.edit"
+    PR_REREQUEST = "pr.rerequest"
     PR_REVIEW = "pr.review"
 
 

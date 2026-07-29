@@ -660,7 +660,16 @@ def _valid_git_branch(value: object) -> bool:
     )
 
 
-_REPO_PR_REMEDIATION_ACTIONS = frozenset(action.value for action in RepoPRAction)
+_REPO_PR_REMEDIATION_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.WRITE.value,
+    RepoPRAction.COMMIT.value,
+    RepoPRAction.PUSH.value,
+    RepoPRAction.PR_COMMENT.value,
+    RepoPRAction.PR_EDIT.value,
+    RepoPRAction.PR_REREQUEST.value,
+})
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
@@ -1636,9 +1645,16 @@ def _target_matches_repo_review_shell_command(
                 "--branch", review_state.head_ref,
             ]
         if subcommand in {"edit", "comment"}:
-            action = RepoPRAction.PR_EDIT if subcommand == "edit" else RepoPRAction.PR_COMMENT
+            required_actions = (
+                (RepoPRAction.PR_EDIT, RepoPRAction.PR_REREQUEST)
+                if subcommand == "edit"
+                else (RepoPRAction.PR_COMMENT,)
+            )
             if (
-                not _repo_review_action_allowed(review_state, action)
+                not all(
+                    _repo_review_action_allowed(review_state, action)
+                    for action in required_actions
+                )
                 or argv[3:4] != [str(review_state.pr_number)]
             ):
                 return False
