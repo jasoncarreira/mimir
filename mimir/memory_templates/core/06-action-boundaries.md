@@ -75,7 +75,7 @@ counted against the tool-call budget).
 
 ## Spawned processes
 
-- Spawn tools (``spawn_codex`` / ``spawn_open_code``) within
+- ``spawn_open_code`` within
   operator-documented budget caps — **autonomous only when the turn's
   server-defined authority profile lists that exact capability**. In particular,
   a poller-triggered PR review must complete in its current turn and must not

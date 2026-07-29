@@ -394,12 +394,6 @@ def claude_code_auth_status(
     )
 
 
-#: The Codex CLI that ``spawn_codex`` shells out to. Distinct from the
-#: codex-plus *API* provider (``langchain-codex-plus``, the ChatGPT-account
-#: chat adapter) — this is the local ``codex`` binary, a separate tool.
-_CODEX_CLI = "codex"
-
-
 _OPENCODE_CLI = "opencode"
 
 
@@ -411,15 +405,3 @@ def opencode_available() -> bool:
     coding substrate.
     """
     return shutil.which(_OPENCODE_CLI) is not None
-
-
-def codex_available() -> bool:
-    """True when the ``codex`` CLI — which the ``spawn_codex`` tool shells
-    out to (``codex exec``) — is on ``PATH``.
-
-    Tool registration gates ``spawn_codex`` on this (chainlink #293): a
-    deployment without the codex CLI shouldn't be handed a tool that can
-    only fail. Checks *presence*, not auth state — auth-state probing is a
-    heavier future refinement.
-    """
-    return shutil.which(_CODEX_CLI) is not None
