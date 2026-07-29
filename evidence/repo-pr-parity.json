@@ -1,0 +1,376 @@
+{
+  "acceptance_operator": null,
+  "accepted_mismatch_categories": [],
+  "counts": {
+    "operations_matched": 12,
+    "operations_mismatched": 0,
+    "operations_total": 12,
+    "primary_observed_effects": 7,
+    "scenarios_matched": 8,
+    "scenarios_mismatched": 0,
+    "scenarios_total": 8,
+    "shadow_observed_effects": 0
+  },
+  "cutover_blocked": false,
+  "mismatch_category_counts": {},
+  "mode": "offline_recorded_or_synthesized",
+  "operations": [
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [],
+        "decision": "allow",
+        "effects": [],
+        "result": "ok"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_metadata",
+      "scenario": "ordinary_review",
+      "scope_id": "eb3fc575b92aa5ed5a61f512fd25bd57b071664475e7f55a3b0d507474db7cd3",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [],
+        "result": "ok"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_submit_review",
+            "record_id": "audit:ordinary_review:pr_submit_review",
+            "scope_id": "eb3fc575b92aa5ed5a61f512fd25bd57b071664475e7f55a3b0d507474db7cd3"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_submit_review",
+            "receipt": "recorded:ordinary_review:pr_submit_review",
+            "scope_id": "eb3fc575b92aa5ed5a61f512fd25bd57b071664475e7f55a3b0d507474db7cd3"
+          }
+        ],
+        "result": "review_submitted"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_submit_review",
+      "scenario": "ordinary_review",
+      "scope_id": "eb3fc575b92aa5ed5a61f512fd25bd57b071664475e7f55a3b0d507474db7cd3",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "pr_submit_review"
+        ],
+        "result": "review_submitted"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_comment",
+            "record_id": "audit:own_pr_remediation:pr_comment",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_comment",
+            "receipt": "recorded:own_pr_remediation:pr_comment",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "result": "comment_created"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_comment",
+      "scenario": "own_pr_remediation",
+      "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "pr_comment"
+        ],
+        "result": "comment_created"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_rerequest_review",
+            "record_id": "audit:own_pr_remediation:pr_rerequest_review",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "pr_rerequest_review",
+            "receipt": "recorded:own_pr_remediation:pr_rerequest_review",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "result": "review_rerequested"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_rerequest_review",
+      "scenario": "own_pr_remediation",
+      "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "pr_rerequest_review"
+        ],
+        "result": "review_rerequested"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [],
+        "decision": "refuse",
+        "effects": [],
+        "result": "stale_scope"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "repo_push",
+      "scenario": "stale_head_refusal",
+      "scope_id": "7f4e17fe29628f1bf60561f553c1e38f71145084b32ac2ae951496232ed0f7ca",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "refuse",
+        "planned_effects": [],
+        "result": "stale_scope"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_stage",
+            "record_id": "audit:conflict_resolution:repo_stage",
+            "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_stage",
+            "receipt": "recorded:conflict_resolution:repo_stage",
+            "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea"
+          }
+        ],
+        "result": "staged"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "repo_stage",
+      "scenario": "conflict_resolution",
+      "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "repo_stage"
+        ],
+        "result": "staged"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_commit",
+            "record_id": "audit:conflict_resolution:repo_commit",
+            "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_commit",
+            "receipt": "recorded:conflict_resolution:repo_commit",
+            "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea"
+          }
+        ],
+        "result": "committed"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "repo_commit",
+      "scenario": "conflict_resolution",
+      "scope_id": "3a867bf9383d098e0812271e0c716de91961b2df2a9f79e54ee0b08b803c5aea",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "repo_commit"
+        ],
+        "result": "committed"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "escalation",
+            "record_id": "audit:unsupported_operation_escalation:escalation",
+            "scope_id": "2924e5ae06256d73792d48f4210a8e09b7b816a244e51aac53d369e57133dfc8"
+          }
+        ],
+        "decision": "escalate",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "escalation",
+            "receipt": "recorded:unsupported_operation_escalation:escalation",
+            "scope_id": "2924e5ae06256d73792d48f4210a8e09b7b816a244e51aac53d369e57133dfc8"
+          }
+        ],
+        "result": "unsupported_operation"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_resolve_thread",
+      "scenario": "unsupported_operation_escalation",
+      "scope_id": "2924e5ae06256d73792d48f4210a8e09b7b816a244e51aac53d369e57133dfc8",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "escalate",
+        "planned_effects": [
+          "escalation"
+        ],
+        "result": "unsupported_operation"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [],
+        "decision": "refuse",
+        "effects": [],
+        "result": "fork_refused"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "repo_status",
+      "scenario": "fork_refusal",
+      "scope_id": "5b995c0170729bccc7f2d8b031e78f9eb8a1b458917509aad689f7c7387df6d8",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "refuse",
+        "planned_effects": [],
+        "result": "fork_refused"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [],
+        "decision": "refuse",
+        "effects": [],
+        "result": "mixed_input"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_comment",
+      "scenario": "mixed_input_denial",
+      "scope_id": "b4cec5603fed6d4298a27977abc17a3c0f6678b31a1c9f54c4f5c231bedd581e",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "refuse",
+        "planned_effects": [],
+        "result": "mixed_input"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [],
+        "decision": "unavailable",
+        "effects": [],
+        "result": "coding_disabled"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "pr_metadata",
+      "scenario": "coding_disabled",
+      "scope_id": "bbcd7a4c4925998478c7781ae8d3cc8dc4348b9f86c1de17335befaf49e96f21",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "unavailable",
+        "planned_effects": [],
+        "result": "coding_disabled"
+      }
+    },
+    {
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "legacy": {
+        "audits": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_push",
+            "record_id": "audit:own_pr_remediation:repo_push",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "decision": "allow",
+        "effects": [
+          {
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "repo_push",
+            "receipt": "recorded:own_pr_remediation:repo_push",
+            "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1"
+          }
+        ],
+        "result": "pushed"
+      },
+      "matched": true,
+      "mismatch_categories": [],
+      "operation": "repo_push",
+      "scenario": "own_pr_remediation",
+      "scope_id": "0d06cd737eb530ffda138460fd08be461fc0dbda6f409510355bfd7ac8cd7ff1",
+      "shadow_observed_effect_count": 0,
+      "typed_shadow": {
+        "decision": "allow",
+        "planned_effects": [
+          "repo_push"
+        ],
+        "result": "pushed"
+      }
+    }
+  ],
+  "remaining_gaps": [
+    "Live review/remediation validation is the reviewer-executed gate in #1050.",
+    "This offline leaf does not invoke gh, chainlink, GitHub, or a live pull request."
+  ],
+  "schema_version": 1
+}
