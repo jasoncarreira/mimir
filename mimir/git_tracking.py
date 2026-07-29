@@ -57,6 +57,9 @@ log = logging.getLogger(__name__)
 _push_debounce_locks: dict[str, asyncio.Lock] = {}
 _pending_push_tasks: dict[str, asyncio.Task] = {}
 _push_retry_tasks: dict[str, asyncio.Task | None] = {}
+# Latest successful proposal cleanup observation, kept in memory so a restart
+# announces the current state again rather than inheriting stale suppression.
+_proposal_cleanup_skip_reasons: dict[str, dict[str, str]] = {}
 
 # Retry schedule after a push failure. Tests monkeypatch this.
 PUSH_RETRY_DELAYS: tuple[float, ...] = (300.0, 900.0, 2700.0)  # 5m, 15m, 45m
@@ -144,6 +147,7 @@ def reset_module_state() -> None:
             task.cancel()
     _push_retry_tasks.clear()
     _push_debounce_locks.clear()
+    _proposal_cleanup_skip_reasons.clear()
 
 
 # ─── git error type + subprocess wrapper ─────────────────────────────
@@ -300,13 +304,34 @@ async def _cleanup_resolved_proposal_branches(*, home: Path, turn_id: str) -> No
     try:
         from .proposals import cleanup_resolved_proposal_branches
 
-        await asyncio.to_thread(cleanup_resolved_proposal_branches, home)
+        key = _home_key(home)
+        async with _get_lock(home):
+            records = await asyncio.to_thread(
+                cleanup_resolved_proposal_branches,
+                home,
+                previous_skip_reasons=_proposal_cleanup_skip_reasons.get(key, {}),
+            )
+            _proposal_cleanup_skip_reasons[key] = {
+                record.branch: record.reason
+                for record in records
+                if record.action == "skipped"
+            }
     except Exception as exc:  # pragma: no cover - defensive; must not block commits
         await log_event(
             "proposal_cleanup_failed",
             turn_id=turn_id,
             error=_short_err(exc),
         )
+
+
+def proposal_branch_cleanup_status(home: Path) -> dict[str, str]:
+    """Return the latest observed ``branch -> skip reason`` cleanup state.
+
+    The snapshot is refreshed after every successful cleanup sweep and can be
+    queried without relying on edge-triggered events. A copy prevents callers
+    from changing the de-duplication state.
+    """
+    return dict(_proposal_cleanup_skip_reasons.get(_home_key(home), {}))
 
 # ─── public API: commit_turn_changes ──────────────────────────────────
 
@@ -1090,6 +1115,7 @@ __all__: tuple[str, ...] = (
     "GitError",
     "GitResult",
     "commit_turn_changes",
+    "proposal_branch_cleanup_status",
     "reset_module_state",
     "DEBOUNCE_SECONDS",
     "PUSH_TIMEOUT_SECONDS",

@@ -1037,7 +1037,9 @@ async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
 ) -> None:
     called: list[Path] = []
 
-    def fake_cleanup(home: Path) -> list[object]:
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[object]:
         called.append(home)
         return []
 
@@ -1048,6 +1050,61 @@ async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
     )
 
     assert called == [home_repo]
+
+
+@pytest.mark.asyncio
+async def test_proposal_cleanup_tracks_current_skip_state(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.proposals import ProposalCleanupRecord
+
+    previous_states: list[dict[str, str]] = []
+    reasons = iter(("open_pr", "open_pr", "content_not_on_main", None))
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[ProposalCleanupRecord]:
+        previous_states.append(dict(previous_skip_reasons))
+        reason = next(reasons)
+        if reason is None:
+            return [
+                ProposalCleanupRecord(
+                    "proposal/pending", "abc", "deleted", "resolved_content_on_main"
+                )
+            ]
+        return [ProposalCleanupRecord("proposal/pending", "abc", "skipped", reason)]
+
+    monkeypatch.setattr(
+        "mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup
+    )
+
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="t1"
+    )
+    assert git_tracking.proposal_branch_cleanup_status(home_repo) == {
+        "proposal/pending": "open_pr"
+    }
+
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="t2"
+    )
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="t3"
+    )
+    assert git_tracking.proposal_branch_cleanup_status(home_repo) == {
+        "proposal/pending": "content_not_on_main"
+    }
+
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="t4"
+    )
+    assert git_tracking.proposal_branch_cleanup_status(home_repo) == {}
+    assert previous_states == [
+        {},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "content_not_on_main"},
+    ]
 
 # ─── porcelain summary helper ───────────────────────────────────────
 

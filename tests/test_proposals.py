@@ -483,6 +483,79 @@ def test_cleanup_skips_unmerged_novel_branch(home: Path, monkeypatch: pytest.Mon
     ).stdout
 
 
+def test_cleanup_skip_events_are_edge_triggered_until_eventual_cleanup(
+    home: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r = open_proposal(home, branch="proposal/pending")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\npending\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title="pending", rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    events: list[dict] = []
+    pr_open = True
+
+    def fake_log(event_type: str, **payload) -> None:  # type: ignore[no-untyped-def]
+        events.append({"type": event_type, **payload})
+
+    monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log)
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_has_open_pr",
+        lambda home, branch: pr_open,
+    )
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(
+        home, previous_skip_reasons={}
+    )
+    previous = {record.branch: record.reason for record in records}
+    assert [(event["type"], event["reason"]) for event in events] == [
+        ("proposal_branch_cleanup_skipped", "open_pr")
+    ]
+
+    cleanup_resolved_proposal_branches(
+        home, previous_skip_reasons=previous
+    )
+    assert len(events) == 1
+
+    pr_open = False
+    records = cleanup_resolved_proposal_branches(
+        home, previous_skip_reasons=previous
+    )
+    previous = {record.branch: record.reason for record in records}
+    assert [(event["type"], event["reason"]) for event in events] == [
+        ("proposal_branch_cleanup_skipped", "open_pr"),
+        ("proposal_branch_cleanup_skipped", "content_not_on_main"),
+    ]
+
+    remote_work = home.parent / "pending-remote-work"
+    _git("clone", "-q", str(upstream), str(remote_work), cwd=home)
+    _git("config", "user.email", "remote@example.com", cwd=remote_work)
+    _git("config", "user.name", "remote", cwd=remote_work)
+    (remote_work / "prompts" / "reflect.md").write_text(
+        "# reflect\n\npending\n", encoding="utf-8"
+    )
+    _git("add", "prompts/reflect.md", cwd=remote_work)
+    _git("commit", "-q", "-m", "land pending proposal", cwd=remote_work)
+    _git("push", "-q", "origin", "main", cwd=remote_work)
+
+    records = cleanup_resolved_proposal_branches(
+        home, previous_skip_reasons=previous
+    )
+    assert records == [
+        next(record for record in records if record.branch == "proposal/pending")
+    ]
+    assert records[0].action == "deleted"
+    assert events[-1]["type"] == "proposal_branch_cleaned"
+    assert "proposal/pending" not in _git(
+        "ls-remote", "--heads", "origin", "proposal/pending", cwd=home
+    ).stdout
+
+
 def test_cleanup_skips_non_surface_changes_even_if_open_pr_closed(
     home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
