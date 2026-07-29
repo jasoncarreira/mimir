@@ -609,10 +609,9 @@ content verbatim into acceptance criteria.
   may carry deployment-specific `tool_pins:`, but the source-controlled
   seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
   The seed covers pinned external executables that affect agent/worklink
-  operation: the separately installed Codex CLI, chainlink, mermaid-cli,
-  OpenCode tooling, and
-  gmail-poller's gogcli helper. Each entry records category, upstream
-  lookup source, current pin, install surface, smoke command, and risk
+  operation: chainlink, mermaid-cli, osv-scanner, gmail-poller's gogcli
+  helper, and the OpenCode CLI and plugins. Each entry records category,
+  upstream lookup source, current pin, install surface, smoke command, and risk
   notes; guard tests compare those pins against Dockerfile/scaffold/
   skill-fragment literals so the inventory cannot silently drift from
   shipped installs. A low-priority maintenance poller inventories pins
@@ -923,12 +922,12 @@ even if another signal is absent.
 
 ```yaml
 tool_pins:
-  - name: codex                  # required: stable local tool name
+  - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "0.99.0"                # required: version, tag, or SHA currently expected
-    smoke: "codex --version"     # required: command used as bump evidence
+    pin: "1.17.15"               # required: version, tag, or SHA currently expected
+    smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
-    package: "@openai/codex"     # optional upstream package/repo identifier
+    package: "opencode-ai"       # optional upstream package/repo identifier
   - name: chainlink
     category: tracker
     pin: "git+dollspace-gay/chainlink@<sha>"
