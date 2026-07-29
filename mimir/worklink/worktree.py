@@ -609,6 +609,46 @@ def _alternates_backup_path(alternates: Path) -> Path:
     return backup
 
 
+def _recover_interrupted_alternates_probe(
+    repo: Path,
+    *,
+    base: str,
+    event_logger: EventLogger | None,
+) -> None:
+    """Restore an alternates file hidden by a probe that was killed mid-flight."""
+    objects = _git_objects_dir(repo)
+    if objects is None:
+        return
+    alternates = objects / "info" / "alternates"
+    if alternates.exists():
+        return
+
+    interrupted = sorted(
+        path
+        for path in alternates.parent.glob(f"{alternates.name}.worklink-check*")
+        if path.is_file()
+    )
+    if not interrupted:
+        return
+    if len(interrupted) > 1:
+        candidates = ", ".join(str(path) for path in interrupted)
+        raise RuntimeError(
+            "base repo alternates probe recovery refused; multiple interrupted "
+            f"probe files require operator review: {candidates}"
+        )
+
+    hidden = interrupted[0]
+    hidden.replace(alternates)
+    if event_logger is not None:
+        event_logger(
+            "worklink_base_alternates_probe_recovered",
+            repo=str(repo),
+            base=base.removeprefix("origin/"),
+            restored_from=str(hidden),
+            restored_to=str(alternates),
+        )
+
+
 def _check_without_alternates(
     repo: Path,
     alternates: Path,
@@ -648,6 +688,34 @@ def _repair_base_alternates(
     event_logger: EventLogger | None,
 ) -> None:
     """Remove every base-repo alternate, but only after proving it is unnecessary."""
+    objects = _git_objects_dir(repo)
+    if objects is None:
+        return
+    alternates = objects / "info" / "alternates"
+    if not alternates.is_file() and not any(
+        alternates.parent.glob(f"{alternates.name}.worklink-check*")
+    ):
+        return
+
+    # A missing alternates file plus a check file means "interrupted" only after
+    # every live probe has released this lock.  Without the lock, a concurrent
+    # Worklink attempt could mistake an active probe for a crashed one and restore
+    # the alternate while the first attempt is trying to verify its absence.
+    lock = alternates.with_name(f"{alternates.name}.worklink-probe.lock")
+    with _FileLock(lock):
+        _repair_base_alternates_locked(
+            repo, base=base, runner=runner, event_logger=event_logger
+        )
+
+
+def _repair_base_alternates_locked(
+    repo: Path,
+    *,
+    base: str,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> None:
+    _recover_interrupted_alternates_probe(repo, base=base, event_logger=event_logger)
     alternates, entries = _alternate_entries(repo)
     if alternates is None or not alternates.is_file():
         return

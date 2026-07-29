@@ -394,6 +394,60 @@ def test_valid_alternate_is_repaired_before_isolated_clone(tmp_path: Path) -> No
     assert fsck_index < prune_index
 
 
+def test_alternate_repair_recovers_probe_file_left_by_sigkill(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    donor = tmp_path / "donor"
+    subprocess.run(["git", "init", "-q", str(donor)], check=True)
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    original = f"{donor / '.git' / 'objects'}\n"
+    alternates.write_text(original, encoding="utf-8")
+    interrupted = alternates.with_name("alternates.worklink-check")
+    alternates.replace(interrupted)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    lease = create_isolated_checkout(
+        repo,
+        issue_id=1033,
+        attempt=3,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert not alternates.exists()
+    assert not interrupted.exists()
+    backups = list(alternates.parent.glob("alternates.worklink-backup*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == original
+    assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/main")
+    recovered_index = next(
+        i for i, (name, _payload) in enumerate(events)
+        if name == "worklink_base_alternates_probe_recovered"
+    )
+    repaired_index = next(
+        i for i, (name, _payload) in enumerate(events)
+        if name == "worklink_base_alternates_repaired"
+    )
+    assert recovered_index < repaired_index
+    recovered = events[recovered_index][1]
+    assert recovered["restored_from"] == str(interrupted)
+    assert recovered["restored_to"] == str(alternates)
+
+
+def test_alternate_repair_refuses_ambiguous_interrupted_probe_files(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    first = alternates.with_name("alternates.worklink-check")
+    second = alternates.with_name("alternates.worklink-check.1")
+    first.write_text("/first/objects\n", encoding="utf-8")
+    second.write_text("/second/objects\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="multiple interrupted probe files"):
+        create_isolated_checkout(repo, issue_id=1033, attempt=4)
+
+    assert not alternates.exists()
+    assert first.read_text(encoding="utf-8") == "/first/objects\n"
+    assert second.read_text(encoding="utf-8") == "/second/objects\n"
+
+
 def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path: Path) -> None:
     repo = _repo_with_main(tmp_path)
     donor = tmp_path / "donor"
