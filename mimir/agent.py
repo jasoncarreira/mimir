@@ -259,6 +259,11 @@ def _prompt_source_labels(
     ))
 
 
+def _recent_message_is_self_authored(message: Any) -> bool:
+    """Use persisted server provenance, never message text or model claims."""
+    return message.integrity == Integrity.TRUSTED
+
+
 def _auto_recall_source_labels(
     auth_context: AuthContext,
     payload: Mapping[str, Any],
@@ -1432,6 +1437,16 @@ class Agent:
         if event.extra.get("_buffer_recorded"):
             return
         try:
+            persisted_integrity = Integrity.UNTRUSTED
+            if (
+                event.ifc_labels is not None
+                and event.ifc_labels.sources
+                and all(
+                    source.integrity == Integrity.TRUSTED
+                    for source in event.ifc_labels.sources
+                )
+            ):
+                persisted_integrity = Integrity.TRUSTED
             msg = self._buffer.make_message(
                 channel_id=event.channel_id,
                 kind=self._kind_for_trigger(event.trigger),
@@ -1442,6 +1457,7 @@ class Agent:
                 author_display=event.author_display or event.author,
                 msg_id=event.source_id,
                 source=event.source,
+                integrity=persisted_integrity,
             )
             await self._buffer.append(msg)
             event.extra["_buffer_recorded"] = True
@@ -2428,6 +2444,14 @@ class Agent:
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
                     source=getattr(bridge, "name", None),
+                    integrity=(
+                        Integrity.TRUSTED
+                        if ctx.ifc_labels.sources and all(
+                            source.integrity == Integrity.TRUSTED
+                            for source in ctx.ifc_labels.sources
+                        )
+                        else Integrity.UNTRUSTED
+                    ),
                 )
                 await self._buffer.append(msg)
             except Exception:  # noqa: BLE001
@@ -4191,7 +4215,7 @@ class Agent:
                     channel_id=message.channel_id,
                     principal=message_principal,
                     bridge=message.source,
-                    self_authored=message.kind in {"assistant_message", "system_note"},
+                    self_authored=_recent_message_is_self_authored(message),
                 ),
             ))
         if saga_block:

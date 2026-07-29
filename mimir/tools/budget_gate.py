@@ -1236,6 +1236,19 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+        if tool_name in {"write_file", "edit_file"}:
+            from ..access_control import record_file_write_integrity
+
+            if not record_file_write_integrity(
+                _extract_sink_target(execution_request, auth_context),
+                _current_ifc_labels(auth_context),
+            ):
+                refusal = "file write refused: integrity metadata could not be persisted"
+                _emit_tool_call_sync(tool_name, ok=False, error=refusal, denied=True)
+                return ToolMessage(
+                    content=refusal, tool_call_id=_tool_call_id(request),
+                    name=tool_name, status="error",
+                )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
         from .github_review_guard import (
@@ -1439,6 +1452,21 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
+        if tool_name in {"write_file", "edit_file"}:
+            from ..access_control import record_file_write_integrity
+
+            recorded = await asyncio.to_thread(
+                record_file_write_integrity,
+                _extract_sink_target(execution_request, auth_context),
+                _current_ifc_labels(auth_context),
+            )
+            if not recorded:
+                refusal = "file write refused: integrity metadata could not be persisted"
+                _emit_tool_call_sync(tool_name, ok=False, error=refusal, denied=True)
+                return ToolMessage(
+                    content=refusal, tool_call_id=_tool_call_id(request),
+                    name=tool_name, status="error",
+                )
         direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
         direct_argv_token = None
         from .github_review_guard import (

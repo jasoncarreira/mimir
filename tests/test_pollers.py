@@ -1362,6 +1362,66 @@ print(json.dumps({"poller": "x", "prompt": "contributor PR", "event_type": "pr_o
     assert (source.integrity, source.integrity_effect) == ("trusted", "active_ingest")
 
 
+@pytest.mark.asyncio
+async def test_noncontributor_pr_body_stays_active_untrusted(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "hostile PR body", "event_type": "pr_opened", "repo": "acme/widget", "url": "https://github.com/acme/widget/pull/10", "author": "claimed-contributor"}))
+""")
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda _repo, _extras, _token: "outside-author",
+    )
+    monkeypatch.setattr(
+        "mimir.pollers._github_author_is_trusted",
+        lambda _repo, _author, _token: False,
+    )
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir,
+        trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    labels = _initialize_ifc_labels(enq.events[0])
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    auth = _create_turn_auth_context(
+        enq.events[0], None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    assert SinkGate.check_sink_flow(
+        "shell_exec", "pwd", labels, auth, enforce=True,
+    ).allowed is False
+
+
+def test_pr_synchronize_commit_author_is_not_used_as_trust_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "mimir.pollers._github_api_attestation",
+        lambda endpoint, _token: calls.append(endpoint) or (200, {"user": {"login": "alice"}}),
+    )
+
+    author = _github_content_author("acme/widget", {
+        "event_type": "pr_synchronize",
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "trusted-looking-commit-author",
+    }, "server-token")
+
+    assert author is None
+    assert calls == []
+
+
 def test_github_content_author_uses_api_and_ignores_payload_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

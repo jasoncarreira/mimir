@@ -28,6 +28,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
     from .models import AgentEvent, AuthContext, InformationFlowLabels, SourceLabel
 
 log = logging.getLogger(__name__)
+
+_persisted_file_integrity_lock = threading.Lock()
 
 _MAX_REQUESTED_TARGET_LENGTH = 1024
 
@@ -5463,17 +5466,15 @@ def _filesystem_result_integrity(
         return "untrusted", "active_ingest"
 
     if relative.parts and relative.parts[0] in {"memory", "state"}:
-        # Poller recovery is framework-written but stores complete external
-        # AgentEvents. Treating it as self-authored state would launder the
-        # stashed payload on a later filesystem read. Poller persist dirs are
-        # fixed under state/pollers by the scheduler, so fail this class closed.
-        if (
-            len(relative.parts) >= 4
-            and relative.parts[0:2] == ("state", "pollers")
-            and relative.name == ".recovery.json"
-        ):
+        # Poller subprocesses write this tree directly, outside the protected
+        # tool boundary, and may persist attacker-derived cursor/event fields.
+        # A path under state/pollers is therefore not proof of self-authorship.
+        if relative.parts[0:2] == ("state", "pollers"):
             return "untrusted", "active_ingest"
-        return "trusted", "informational"
+        persisted = _persisted_file_integrity(home, relative)
+        return persisted, (
+            "informational" if persisted == "trusted" else "active_ingest"
+        )
 
     cache_root = home / "attachments" / "fetch-cache"
     try:
@@ -5499,17 +5500,90 @@ def _filesystem_result_integrity(
         return "untrusted", "active_ingest"
     if recorded_resource != resource:
         return "untrusted", "active_ingest"
-    normalized = normalize_sink_destination(SinkCategory.NETWORK, url)
-    final_url = metadata.get("final_url")
-    normalized_final = (
-        normalize_sink_destination(SinkCategory.NETWORK, final_url)
-        if isinstance(final_url, str)
-        else normalized
-    )
-    approved = approved_fetch_urls(auth_context)
-    if normalized is not None and normalized in approved and normalized_final in approved:
-        return "trusted", "active_ingest"
+    # URL approval authorizes GET egress only. It never vouches for returned
+    # bytes, including redirects or cached copies (#1139).
     return "untrusted", "active_ingest"
+
+
+def _persisted_file_integrity(home: Path, relative: Path) -> str:
+    """Return server-recorded integrity for a mutable self-authored file."""
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    if not metadata_path.exists():
+        return "trusted"
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "untrusted"
+    if not isinstance(payload, dict):
+        return "untrusted"
+    value = payload.get(relative.as_posix())
+    if value is None:
+        return "trusted"
+    return "trusted" if value == "trusted" else "untrusted"
+
+
+def record_file_write_integrity(
+    resource_id: str | None,
+    labels: "InformationFlowLabels | None",
+) -> bool:
+    """Persist least-trust provenance before a model file write.
+
+    Metadata lives under the protected ``.mimir`` root, so a later model turn
+    cannot erase an untrusted mark. The destination chooses only which entry is
+    updated; integrity comes exclusively from the server-owned live carrier.
+    """
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value or not isinstance(resource_id, str) or not resource_id:
+        return True
+    home = Path(home_value).resolve(strict=False)
+    requested = Path(resource_id)
+    if requested.is_absolute():
+        try:
+            requested.relative_to(home)
+            resource = requested
+        except ValueError:
+            if requested.parts[1:2] in {("memory",), ("state",)}:
+                resource = home / requested.as_posix().lstrip("/")
+            else:
+                return True
+    else:
+        resource = home / requested
+    try:
+        resource = resource.resolve(strict=False)
+        relative = resource.relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not relative.parts or relative.parts[0] not in {"memory", "state"}:
+        return True
+    if relative.parts[0:2] == ("state", "pollers"):
+        return True
+    integrity = "untrusted"
+    sources = getattr(labels, "sources", ())
+    if sources and all(source.integrity == "trusted" for source in sources):
+        integrity = "trusted"
+
+    metadata_path = home / ".mimir" / "file-integrity.json"
+    with _persisted_file_integrity_lock:
+        try:
+            payload = (
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+                if metadata_path.exists()
+                else {}
+            )
+            if not isinstance(payload, dict):
+                return False
+            payload[relative.as_posix()] = integrity
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = metadata_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(metadata_path)
+            return True
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to persist file integrity for %s", relative)
+            return False
 
 
 def _incomplete_protected_result(

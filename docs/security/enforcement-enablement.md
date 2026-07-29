@@ -173,20 +173,24 @@ Two **independent** inputs decide what a turn may do:
      on the basis that its admins gate who can file/assign and won't route
      untrusted issues to us (operator decision). Declared per trigger like any
      other trust source.
-   - **`fetch_url` from an operator-approved URL** → trusted. The evidence is the
-      exact normalized URL in the server-side `approved_fetch_urls()` result
-      (`MIMIR_EGRESS_APPROVED_URLS`, trigger policy, or an audited session approval),
-      plus the framework-written fetch-cache sidecar tying those bytes to that URL.
-      Non-allow-listed pages remain untrusted active ingest.
+    - **Fetched page content** → untrusted active ingest, including content from
+       an operator-approved URL. `approved_fetch_urls()` authorizes exact-URL GET
+       egress and redirects; it is not a trust grant for returned bytes (#1139).
    - **Mimir's own context** (`<home>/memory/**`, `<home>/state/**`, and
       framework-preloaded self-authored prompt blocks) → trusted informational,
-      except framework payload stores such as
-      `<home>/state/pollers/*/.recovery.json`, which embed external events and
-      remain untrusted active ingest. Prior turn records also remain untrusted
-      active ingest because their events and injected inputs can embed external
-      content. Evidence is the resolved path under the configured home or an
-      explicit framework constructor classification; caller metadata and model
-      claims are ignored, and unknown prompt constructors fail closed.
+       except `<home>/state/pollers/**`, which poller subprocesses can populate
+       from external events and which remains untrusted active ingest. Successful
+       model writes to memory/state are stamped in protected `.mimir` metadata
+       with the least trust of the live server-owned carrier. A later read of an
+       untrusted-derived file therefore remains untrusted active ingest instead
+       of laundering taint through a self-authored-looking path. Prior assistant
+       history stores the same server-derived integrity at send time and reloads
+       as informational; clean self-authored history is trusted, while output
+       produced from untrusted input remains untrusted informational. Framework-
+       preloaded identities, prompts, session state, and other context assembled
+       from server-owned state are trusted informational. Resolved paths and
+       framework constructors are the evidence; caller metadata, model output,
+       and model-supplied parameters cannot choose these labels.
    - **An operator-configured MCP tool** → use that exact tool policy's explicit
      `result_integrity` grant. `trusted` vouches for successful returned content;
      `untrusted` retains untrusted active ingest. Server locality, transport,
@@ -228,6 +232,26 @@ user turn." Wherever this doc says "untrusted taint" / "the turn-taint gate," th
 is the exact test — *any untrusted **active-ingest** source this turn* — never
 confidentiality emptiness and never an informational recall.
 
+#### 2026-07-29 interactive shadow re-baseline (#1054)
+
+The local `MIMIR_HOME/logs/events.jsonl` audit contained 699
+`shadow_tool_decision` records on 2026-07-29 with `trigger=user_message` and
+`would_block=true`: 510 `shell_exec`, 112 `edit_file`, 45 `send_message`, 17
+`bash_async`, 12 `write_file`, two `react`, and one
+`saga_record_skill_learning`. This is a later, still-growing corpus than the
+issue's 649/day snapshot, so raw totals are not directly comparable.
+
+Replaying the 15 completed interactive turn traces in `turns.jsonl` under the
+narrower source rules projects 14 newly permitted early message sinks and 661
+remaining denials out of 675 recorded sink attempts. The other 24 shadow
+denials had no completed turn trace and are conservatively retained, producing
+a projected current-corpus count of **685**, 14 fewer than the same corpus's
+699 and 36 more than the earlier 649 snapshot because the live corpus grew.
+The completed-trace residue is 612 attempts after an active read of non-Mimir
+filesystem content and 49 after async shell output; the 24 incomplete-trace
+attempts remain unclassified. No genuinely untrusted source was reclassified to
+obtain this reduction.
+
 ### Per-trigger policy
 
 | Trigger | Capability set (the ceiling) | Trust / gating |
@@ -235,7 +259,7 @@ confidentiality emptiness and never an informational recall.
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
 | **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
-| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent. Content from an approved exact URL is trusted from the operator allow-list; non-approved destinations are blocked and any non-allow-listed content remains untrusted active ingest. Redirects are re-checked per hop; allowlist = exact URLs, not host wildcards (§5.4). |
+| **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent, but fetched content is always untrusted active ingest. Non-approved destinations are blocked; redirects are re-checked per hop; allowlist = exact URLs, not host wildcards (§5.4). |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
 | **(future) JIRA poller** | write chainlinks, update docs (scoped), write memory | **trusted** — we trust the pointed-at JIRA instance's admins to gate content (operator decision); declared like any other trigger |
 
