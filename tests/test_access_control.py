@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import shutil
 import os
+import shlex
 import subprocess
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -3582,10 +3584,6 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
         "git diff --stat HEAD~1",
         "git fetch origin pull/979/head",
         "npm ci --ignore-scripts --no-audit --no-fund",
-        "npm test -- --run",
-        "npm run test",
-        "pytest -q -x -k shell_profile --tb=short --maxfail=1 tests/test_access_control.py",
-        "uv run pytest tests/test_access_control.py -q -m 'not slow' --tb short",
     ],
 )
 def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
@@ -4357,8 +4355,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
             "git status --short", "gh pr view 979 --json title",
-            "npm ci --ignore-scripts", "pytest -q tests",
-            "uv run pytest -q tests",
+            "npm ci --ignore-scripts",
         ),
         "maintenance": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
@@ -4445,12 +4442,262 @@ def test_repo_review_npm_uses_pinned_interpreter_and_script(
     ]
 
 
-def test_repo_review_pytest_uses_pinned_interpreter_module(
+def _configure_project_test(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    executable: Path,
+    repo: Path,
+    fixed_arguments: list[str],
+) -> None:
+    if not os.environ.get("MIMIR_HOME"):
+        home = repo.parent / "project-test-home"
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    monkeypatch.setenv(
+        "MIMIR_PROJECT_TEST_COMMAND",
+        json.dumps({"argv": [str(executable), *fixed_arguments], "cwd": str(repo)}),
+    )
+
+
+@pytest.mark.parametrize(
+    ("pin", "fixed_arguments", "selectors"),
+    [
+        ("uv", ["run", "pytest", "-q"], ["tests/test_auth.py::test_denial"]),
+        ("npm", ["test", "--"], ["test/auth.test.js"]),
+        ("git", ["test"], ["./auth/...", "TestDenied"]),
+    ],
+    ids=["python", "javascript", "go-or-rust"],
+)
+@pytest.mark.parametrize(
+    "profile", ["scheduler_read_only", "repo_review", "maintenance", "upgrade_workspace"],
+)
+def test_project_test_command_is_configuration_driven_across_profiles(
+    pin: str,
+    fixed_arguments: list[str],
+    selectors: list[str],
+    profile: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
-    assert parse_service_shell_argv("pytest -q tests", "repo_review") == [
-        str(maintenance_pinned_executables["pytest"]), "-m", "pytest", "-q", "tests",
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = maintenance_pinned_executables[pin]
+    _configure_project_test(
+        monkeypatch, executable=executable, repo=repo, fixed_arguments=fixed_arguments,
+    )
+    command = shlex.join([str(executable), *fixed_arguments, *selectors])
+
+    argv, reason = parse_service_shell_argv_with_reason(command, profile)
+
+    assert argv == [str(executable), *fixed_arguments, *selectors]
+    assert reason == ""
+    assert access_control.configured_project_test_cwd(argv) == str(repo.resolve())
+
+
+def test_no_project_test_configuration_preserves_existing_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_PROJECT_TEST_COMMAND", raising=False)
+
+    assert parse_service_shell_argv("uv run pytest tests", "maintenance") is None
+    assert parse_service_shell_argv("npm test -- test/a.js", "repo_review") is None
+
+
+@pytest.mark.parametrize(
+    ("selectors", "reason"),
+    [
+        ([f"test/{index}" for index in range(33)], "project_test_selector_count_exceeded"),
+        (["a" * 257], "project_test_selector_too_long"),
+        (["a" * 200 for _ in range(32)], "project_test_selectors_too_large"),
+        (["--exec"], "project_test_selector_invalid"),
+        (["../outside/test"], "project_test_selector_traversal"),
+        (["/outside/test"], "project_test_selector_invalid"),
+        (["--", "anything"], "project_test_selector_invalid"),
+    ],
+)
+def test_project_test_selector_refusals_are_named(
+    selectors: list[str],
+    reason: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = maintenance_pinned_executables["uv"]
+    _configure_project_test(
+        monkeypatch, executable=executable, repo=repo, fixed_arguments=["test"],
+    )
+
+    argv, refusal = parse_service_shell_argv_with_reason(
+        shlex.join([str(executable), "test", *selectors]), "maintenance",
+    )
+
+    assert argv is None
+    assert reason in refusal
+
+
+def test_project_test_shell_metacharacters_stay_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executable = maintenance_pinned_executables["uv"]
+    _configure_project_test(
+        monkeypatch, executable=executable, repo=repo, fixed_arguments=["test"],
+    )
+
+    for selector in ("test;touch", "test[exec]", "test$HOME", "test|sh"):
+        argv, reason = parse_service_shell_argv_with_reason(
+            f"{executable} test {selector}", "maintenance",
+        )
+        assert argv is None
+        assert "shell metacharacters" in reason
+
+
+def test_project_test_binding_uses_operator_cwd_and_refuses_async(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.tools import budget_gate
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    executable = maintenance_pinned_executables["uv"]
+    _configure_project_test(
+        monkeypatch, executable=executable, repo=repo, fixed_arguments=["test"],
+    )
+    auth = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal="scheduler",
+        ),
+        enforce=True,
+    )
+    command = f"{executable} test tests/auth"
+
+    sync = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth, tool_name="shell_exec", args={"command": command, "cwd": str(outside)},
+        ),
+        "shell_exec",
+        auth,
+    )
+    async_request = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, tool_name="bash_async", args={"command": command}),
+        "bash_async",
+        auth,
+    )
+
+    assert sync.tool_call["args"]["cwd"] == str(repo.resolve())
+    assert sync.tool_call["args"]["mimir_direct_argv"] == [
+        str(executable), "test", "tests/auth",
     ]
+    assert "project_test_async_refused" in async_request.tool_call["args"][
+        "mimir_shell_refusal"
+    ]
+    assert "mimir_direct_argv" not in async_request.tool_call["args"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -c 'print(1)'", "python3 -m pytest", "node -e 'process.exit()'",
+        "ruby -e 'exit'", "sh -c 'true'", "bash -c 'true'", "perl -e 'exit'",
+    ],
+)
+def test_interpreters_remain_refused_with_project_test_configured(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _configure_project_test(
+        monkeypatch,
+        executable=maintenance_pinned_executables["uv"],
+        repo=repo,
+        fixed_arguments=["test"],
+    )
+
+    assert parse_service_shell_argv(command, "maintenance") is None
+
+
+def test_configured_test_command_cannot_be_an_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _configure_project_test(
+        monkeypatch,
+        executable=maintenance_pinned_executables["uv"],
+        repo=repo,
+        fixed_arguments=["run", "python", "-c", "print(1)"],
+    )
+
+    configured, reason = access_control._configured_project_test_command()
+
+    assert configured is None
+    assert reason == "project_test_config_interpreter_refused"
+
+
+def test_every_project_test_configuration_refusal_is_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    repo.mkdir()
+    outside.mkdir()
+    trusted = maintenance_pinned_executables["uv"]
+    planted = repo / "test-runner"
+    planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    planted.chmod(0o755)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+
+    cases = [
+        ("{", "project_test_config_invalid_json"),
+        (json.dumps({"argv": [str(trusted)]}), "project_test_config_invalid_shape"),
+        (
+            json.dumps({"argv": ["relative-runner"], "cwd": str(repo)}),
+            "project_test_config_executable_not_absolute",
+        ),
+        (
+            json.dumps({"argv": ["/definitely/missing/test-runner"], "cwd": str(repo)}),
+            "project_test_config_path_unavailable",
+        ),
+        (
+            json.dumps({"argv": [str(planted)], "cwd": str(repo)}),
+            "project_test_config_executable_untrusted",
+        ),
+        (
+            json.dumps({"argv": [str(trusted)], "cwd": str(outside)}),
+            "project_test_config_root_unauthorized",
+        ),
+    ]
+    for raw, expected_reason in cases:
+        monkeypatch.setenv("MIMIR_PROJECT_TEST_COMMAND", raw)
+        configured, reason = access_control._configured_project_test_command()
+        assert configured is None
+        assert reason == expected_reason
 
 
 def test_every_production_service_shell_pin_targets_outside_write_roots(
@@ -4643,17 +4890,17 @@ def test_service_shell_pin_inside_configured_write_root_fails_closed(
 ) -> None:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
-    planted = repo / ".venv" / "bin" / "pytest"
+    planted = repo / ".venv" / "bin" / "npm"
     home.mkdir()
     planted.parent.mkdir(parents=True)
     planted.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     planted.chmod(0o755)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
-    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "pytest", planted)
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "npm", planted)
 
     with caplog.at_level("ERROR", logger="mimir.access_control"):
-        assert parse_service_shell_argv("pytest -q tests", "repo_review") is None
+        assert parse_service_shell_argv("npm ci --ignore-scripts", "repo_review") is None
 
     assert "pin resolves within a configured service-writable root" in caplog.text
 

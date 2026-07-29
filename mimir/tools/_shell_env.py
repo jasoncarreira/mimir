@@ -56,18 +56,6 @@ def login_shell_command(command: str) -> str:
     return f"export PATH={shlex.quote(path)}\n{command}"
 
 
-def _is_pytest_argv(argv: list[str] | None) -> bool:
-    """Return whether *argv* invokes the profile's admitted pytest shapes."""
-    if not argv:
-        return False
-    command = Path(argv[0]).name
-    return (
-        command == "pytest"
-        or argv[1:3] == ["-m", "pytest"]
-        or command == "uv" and argv[1:3] == ["run", "pytest"]
-    )
-
-
 def _is_git_argv(argv: list[str] | None) -> bool:
     """Return whether *argv* invokes the server-pinned maintenance Git binary."""
     return bool(argv) and argv[0] == "/usr/bin/git"
@@ -78,18 +66,10 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
 
     Service-shell execution deliberately avoids a login shell. Its PATH contains
     only root-owned deployment directories; in particular, it excludes the
-    workspace virtualenv. Pytest is bound by the authorization pin table to the
-    already-running Python interpreter, so it does not need the virtualenv bin on
-    PATH. Pytest's explicit environment controls are also an argument/plugin-
-    injection surface, so remove them when the authorized executable is direct
-    pytest or ``uv run pytest``. Installed entry-point plugins remain available
-    because ordinary repository test suites depend on them; they are operator-
-    installed code rather than PR-selected argv.
+    workspace virtualenv. The project test executable and fixed arguments come
+    from operator configuration rather than language-specific inference here.
     """
     env = os.environ.copy()
-    if _is_pytest_argv(argv):
-        env.pop("PYTEST_ADDOPTS", None)
-        env.pop("PYTEST_PLUGINS", None)
     if _is_git_argv(argv):
         # The maintenance profile binds Git to a configured -C root and injects
         # config-neutralizing argv. Inherited GIT_* variables must not select a
@@ -109,14 +89,9 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
 def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | None]:
     """Return an inherited-environment overlay for an authorized async argv.
 
-    ``ShellJobRegistry`` overlays values onto its own inherited environment, so
-    pytest injection variables must be explicit ``None`` deletion markers rather
-    than merely absent from the mapping returned by :func:`direct_exec_env`.
+    ``ShellJobRegistry`` overlays values onto its own inherited environment.
     """
     overlay: dict[str, str | None] = direct_exec_env(argv)
-    if _is_pytest_argv(argv):
-        overlay["PYTEST_ADDOPTS"] = None
-        overlay["PYTEST_PLUGINS"] = None
     if _is_git_argv(argv):
         for key in os.environ:
             if key.startswith("GIT_") and key not in overlay:

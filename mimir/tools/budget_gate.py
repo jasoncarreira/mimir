@@ -56,6 +56,7 @@ from ..access_control import (
     approved_fetch_urls,
     fetch_url_is_approved,
     classify_protected_result,
+    configured_project_test_cwd,
     get_tool_registry,
     get_trusted_service_from_auth_context,
     normalize_sink_destination,
@@ -633,7 +634,19 @@ def _request_for_authorized_execution(
         ]
         tool_call = {**request.tool_call, "args": args}
         return request.override(tool_call=tool_call)
-    if Path(argv[0]).name == "chainlink":
+    project_test_cwd = configured_project_test_cwd(argv)
+    if project_test_cwd is not None and tool_name == "bash_async":
+        args["mimir_shell_refusal"] = (
+            "bash_async was refused before execution: "
+            "project_test_async_refused; configured project tests use shell_exec "
+            "so their wall-clock and returned output stay bounded."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if project_test_cwd is not None:
+        resolved_cwd, cwd_refusal = project_test_cwd, None
+    elif Path(argv[0]).name == "chainlink":
         resolved_cwd, cwd_refusal = _resolve_chainlink_service_cwd()
     else:
         resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))

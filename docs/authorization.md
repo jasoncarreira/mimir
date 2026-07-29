@@ -421,6 +421,34 @@ matrix, resource adapters, SAGA ownership predicates, or sink map. They live in:
 - `mimir/tools/budget_gate.py`: exact runtime-carrier extraction and live tool
   middleware.
 
+### Configured project tests
+
+`MIMIR_PROJECT_TEST_COMMAND` is the sole trusted-service exception for project
+tests. It is deployment/process configuration, not a repository file or model
+argument. The JSON object fixes both the complete command prefix and project
+working directory. For example, different deployments can select an installed
+JavaScript, Rust, Go, or Python test runner without changing a shell profile.
+
+The model can append zero to 32 relative test paths or selectors. Each is ASCII,
+at most 256 characters, the combined selector payload is at most 4,096 bytes,
+and traversal, absolute paths, option-shaped values, response files, shell
+metacharacters, and a model-supplied `--` separator are refused. A separator or
+runner option needed by the project belongs in the fixed operator argv.
+
+The configured executable must be an absolute executable regular file, not a
+symlink, and must remain outside every service-writable root. The configured
+working directory must resolve inside `MIMIR_FILE_TOOL_ROOTS`; a model-supplied
+`cwd` cannot replace it. Direct interpreter/shell commands are invalid even in
+this setting, and ordinary `python -c`, `node -e`, `ruby -e`, `sh -c`, and
+equivalent service requests remain outside every profile.
+
+Configured tests run only through synchronous `shell_exec`, directly with
+`shell=False`. `bash_async` refuses them as `project_test_async_refused`, keeping
+the existing 60-second wall-clock bound. Expiry returns the named
+`project_test_timeout` refusal; returned stdout and stderr are capped at 4,000
+and 2,000 characters respectively. With the setting unset, no test command is
+added to a trusted-service profile.
+
 ## How to extend
 
 ### Add an operation

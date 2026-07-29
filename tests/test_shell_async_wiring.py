@@ -30,6 +30,7 @@ import pytest
 
 from mimir.shell_jobs import ShellJobRegistry
 from mimir.tools import shell_async
+from mimir.tools._shell_env import direct_exec_env_overlay
 
 
 class _FakeJob:
@@ -111,17 +112,16 @@ async def test_bash_async_accepts_explicit_cwd(
 
 
 @pytest.mark.asyncio
-async def test_bash_async_direct_pytest_unsets_inherited_injection(
+async def test_bash_async_direct_command_uses_trusted_environment(
     fake_registry: ShellJobRegistry,
 ) -> None:
     await shell_async.bash_async.coroutine(  # type: ignore[misc]
-        command="pytest tests",
-        mimir_direct_argv=["pytest", "tests"],
+        command="pwd -P",
+        mimir_direct_argv=["/usr/bin/pwd", "-P"],
     )
 
     overlay = fake_registry._spawned_log[0]["env_overlay"]  # type: ignore[attr-defined]
-    assert overlay["PYTEST_ADDOPTS"] is None
-    assert overlay["PYTEST_PLUGINS"] is None
+    assert overlay["PATH"] == direct_exec_env_overlay()["PATH"]
 
 
 @pytest.mark.asyncio
@@ -858,7 +858,7 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
         enforcement_enabled=True,
         ifc_labels=labels,
     )
-    command = "npm test --ignore-scripts"
+    command = "npm ci --ignore-scripts"
     decision = ToolRegistry().authorize_tool(
         "bash_async", auth, enforce=True, target_channel=command,
         ifc_labels=labels,
@@ -907,7 +907,7 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
     expected_argv = [
         str(maintenance_pinned_executables["node"]),
         str(maintenance_pinned_executables["npm"]),
-        "test",
+        "ci",
         "--ignore-scripts",
     ]
     assert executed_argv == expected_argv

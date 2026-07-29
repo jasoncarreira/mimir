@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -315,6 +317,60 @@ _SHELL_STATE: dict[str, Any] = {
     "cwd": None,
     "timeout_s": 60.0,
 }
+_PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
+
+
+def _run_bounded_project_test(
+    argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run configured tests with bounded capture and kill their process group on timeout."""
+    proc = subprocess.Popen(  # noqa: S603 - argv is server-authorized
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        start_new_session=os.name != "nt",
+    )
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def drain(name: str, stream: Any) -> None:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            remaining = _PROJECT_TEST_CAPTURE_BYTES - len(captured[name])
+            if remaining > 0:
+                captured[name].extend(chunk[:remaining])
+
+    threads = [
+        threading.Thread(target=drain, args=(name, stream), daemon=True)
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for thread in threads:
+            thread.join(timeout=1)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+    return subprocess.CompletedProcess(
+        argv, returncode, bytes(captured["stdout"]), bytes(captured["stderr"]),
+    )
 
 
 def _initial_shell_cwd() -> Path | None:
@@ -392,14 +448,34 @@ def shell_exec(
             if direct_argv is not None
             else ["bash", "-lc", login_shell_command(command)]
         )
-        proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
-            argv,
-            capture_output=True,
-            timeout=_SHELL_STATE["timeout_s"],
-            cwd=effective_cwd,
-            env=direct_exec_env(argv) if direct_argv is not None else None,
+        direct_env = direct_exec_env(argv) if direct_argv is not None else None
+        from ..access_control import configured_project_test_cwd
+
+        is_project_test = (
+            direct_argv is not None
+            and configured_project_test_cwd(direct_argv) is not None
         )
+        if is_project_test:
+            proc = _run_bounded_project_test(
+                argv,
+                cwd=effective_cwd,
+                timeout=_SHELL_STATE["timeout_s"],
+                env=direct_env or {},
+            )
+        else:
+            proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
+                argv,
+                capture_output=True,
+                timeout=_SHELL_STATE["timeout_s"],
+                cwd=effective_cwd,
+                env=direct_env,
+            )
     except subprocess.TimeoutExpired:
+        if is_project_test:
+            return (
+                "shell_exec refused: project_test_timeout after "
+                f"{_SHELL_STATE['timeout_s']}s"
+            )
         return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
     except FileNotFoundError as exc:
         executable = direct_argv[0] if direct_argv else "bash"
@@ -413,7 +489,9 @@ def shell_exec(
         if target is not None and target.is_dir():
             _SHELL_STATE["cwd"] = target
     if stdout:
-        parts.append(f"stdout:\n{stdout[:4000]}")
+        suffix = "\n[shell stdout truncated]" if len(stdout) > 4000 else ""
+        parts.append(f"stdout:\n{stdout[:4000]}{suffix}")
     if stderr:
-        parts.append(f"stderr:\n{stderr[:2000]}")
+        suffix = "\n[shell stderr truncated]" if len(stderr) > 2000 else ""
+        parts.append(f"stderr:\n{stderr[:2000]}{suffix}")
     return "\n\n".join(parts)
