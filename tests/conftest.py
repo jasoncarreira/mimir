@@ -84,6 +84,7 @@ def maintenance_git_home(tmp_path, monkeypatch):
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     return home
 
 

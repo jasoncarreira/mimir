@@ -1886,6 +1886,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     event = AgentEvent(
         trigger="scheduled_tick",
         channel_id="scheduler:test",
@@ -2251,6 +2252,7 @@ async def test_model_cannot_forge_a_service_shell_refusal(
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     event = AgentEvent(
         trigger="scheduled_tick",
         channel_id="scheduler:test",
@@ -4328,7 +4330,7 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
         ("git diff --stat HEAD~1", "git"),
         ("git show --name-only 5444bb55", "git"),
         ("git log --oneline -5", "git"),
-        ("git branch --show-current", "git"),
+        ("git branch --list", "git"),
         # Maintenance turns use these read-only GitHub and Chainlink lookups.
         ("gh pr list --state open --limit 20", "gh"),
         ("gh pr view 979 --json title,state,reviews", "gh"),
@@ -4366,6 +4368,7 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     assert maintenance_pinned_executables[command_key].exists()
     if command_key == "git":
         command = command.replace("git ", f"git -C {home} ", 1)
@@ -4456,6 +4459,43 @@ def test_maintenance_git_denies_bare_commands(
         assert parse_service_shell_argv(command, "maintenance") is None
 
 
+def test_maintenance_git_defaults_off_and_false_is_identical(
+    maintenance_git_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = f"git -C {maintenance_git_home} status --short --branch"
+
+    monkeypatch.delenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", raising=False)
+    unset = parse_service_shell_argv(command, "maintenance")
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "false")
+    disabled = parse_service_shell_argv(command, "maintenance")
+
+    assert unset is None
+    assert disabled is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "status --short --branch",
+        "log -1 --oneline",
+        "diff --stat",
+        "show --name-only HEAD",
+        "fetch origin main",
+        "rev-parse --show-toplevel",
+        "merge-base --is-ancestor HEAD~1 HEAD",
+        "branch --list",
+    ],
+)
+def test_maintenance_git_opt_in_admits_only_documented_read_only_commands(
+    command: str,
+    maintenance_git_home: Path,
+) -> None:
+    assert parse_service_shell_argv(
+        f"git -C {maintenance_git_home} {command}", "maintenance",
+    ) is not None
+
+
 @pytest.mark.parametrize(
     ("command", "subcommand", "arguments"),
     [
@@ -4464,7 +4504,7 @@ def test_maintenance_git_denies_bare_commands(
         ("git diff --stat HEAD~1", "diff", ["--stat", "HEAD~1"]),
         ("git log -p", "log", ["-p"]),
         ("git show --name-only 5444bb55", "show", ["--name-only", "5444bb55"]),
-        ("git branch --show-current", "branch", ["--show-current"]),
+        ("git branch --list", "branch", ["--list"]),
     ],
 )
 def test_maintenance_git_returns_hardened_execution_argv(
@@ -4482,6 +4522,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     pinned_git = maintenance_pinned_executables["git"]
 
     command = command.replace("git ", f"git -C {home} ", 1)
@@ -4512,6 +4553,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
     subprocess.run(["git", "init", "-q", str(nested)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
 
     assert parse_service_shell_argv(
         f"git -C {nested} log --oneline -5", "maintenance",
@@ -4571,6 +4613,7 @@ def test_maintenance_git_execution_argv_suppresses_configured_helpers(
     )
     monkeypatch.setenv("MIMIR_HOME", str(repo))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
 
     subprocess.run(
         ["git", "-C", str(repo), "config", "diff.owned.textconv", str(helper)],
@@ -4641,7 +4684,6 @@ def test_maintenance_git_denies_unconfigured_roots_and_model_git_globals(
         "git status --verbose",
         "git status -v",
         "git log --no-textconv --oneline",
-        "git branch --list",
         "git diff -- sample.txt",
         "git log -- --all",
         "git show -- --format=raw",
@@ -4678,6 +4720,55 @@ def test_maintenance_shell_profile_denies_mutating_or_unbounded_commands(
     assert decision.reason == "service_sink_destination_denied"
 
 
+@pytest.mark.parametrize("flag", [None, "false", "true"])
+@pytest.mark.parametrize(
+    "subcommand",
+    [
+        "commit -m mutation", "push origin main", "checkout main", "merge main",
+        "rebase main", "reset --hard HEAD", "clean -fd", "worktree list",
+        "revert HEAD",
+    ],
+)
+def test_maintenance_git_mutations_are_denied_for_every_flag_state(
+    flag: str | None,
+    subcommand: str,
+    maintenance_git_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if flag is None:
+        monkeypatch.delenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", flag)
+
+    assert parse_service_shell_argv(
+        f"git -C {maintenance_git_home} {subcommand}", "maintenance",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "diff --ext-diff",
+        "log --output=stolen.txt",
+        "log --exec=touch",
+        "-c core.pager=cat log --oneline",
+        "-c alias.inspect=commit inspect",
+        "inspect",
+        "fetch --upload-pack=helper origin main",
+        "fetch https://example.invalid/repo.git main",
+        "branch --show-current",
+    ],
+)
+def test_maintenance_git_opt_in_denies_option_and_alias_escapes(
+    command: str,
+    maintenance_git_home: Path,
+) -> None:
+    assert parse_service_shell_argv(
+        f"git -C {maintenance_git_home} {command}", "maintenance",
+    ) is None
+
+
+@pytest.mark.parametrize("flag", ["false", "true"])
 @pytest.mark.parametrize(
     "command",
     [
@@ -4687,9 +4778,12 @@ def test_maintenance_shell_profile_denies_mutating_or_unbounded_commands(
         "gh pr view 'unterminated",
     ],
 )
-def test_maintenance_shell_profile_preserves_shared_argv_guards(command: str) -> None:
+def test_maintenance_shell_profile_preserves_shared_argv_guards(
+    flag: str, command: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import mimir.access_control as access_control
 
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", flag)
     assert access_control.parse_service_shell_argv(command, "maintenance") is None
 
 

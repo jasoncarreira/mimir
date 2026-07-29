@@ -27,6 +27,7 @@ _DEFAULT_TRUE_FIELDS = [
 _DEFAULT_FALSE_FIELDS = [
     ("MIMIR_ALLOW_UNAUTHENTICATED", "allow_unauthenticated"),
     ("MIMIR_ACCESS_CONTROL_ENFORCED", "access_control_enforced"),
+    ("MIMIR_MAINTENANCE_GIT_READ_ONLY", "maintenance_git_read_only"),
 ]
 
 _ALL_BOOL_FIELDS = _DEFAULT_TRUE_FIELDS + _DEFAULT_FALSE_FIELDS

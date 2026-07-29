@@ -232,6 +232,7 @@ authenticate transport only; they do not create a named requester.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_ACCESS_CONTROL_ENFORCED` | bool | `false` | Enforce the allow/deny policy (reject unknown/non-allowlisted authors); also gates the admin-sensitive tool path. Compatible with the default `MIMIR_MODEL_SPEC`. Claude Code subprocess hooks receive the exact per-invocation authorization context through a server-owned carrier, so `claude-code:*` is also enforcement-compatible. |
+| `MIMIR_MAINTENANCE_GIT_READ_ONLY` | bool | `false` | Opt heartbeat/maintenance turns into hardened read-only Git inspection for configured roots. Does not affect framework-owned home Git tracking or other shell profiles. |
 | `MIMIR_EGRESS_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs approved for application network egress. Configure multiple URLs as a JSON array, for example `["https://hooks.example/a", "https://hooks.example/b"]`; comma-separated URL lists are not supported. |
 | `MIMIR_HEARTBEAT_APPROVED_URLS` | URL or JSON array | `""` | Exact URLs the heartbeat service may fetch. Configure multiple URLs as a JSON array; comma-separated URL lists are not supported. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |

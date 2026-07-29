@@ -1737,6 +1737,13 @@ def _maintenance_git_filter_overrides(
     return overrides
 
 
+def _maintenance_git_read_only_enabled() -> bool:
+    """Return the deployment opt-in for Git on heartbeat-bound profiles."""
+    from .config import _env_bool
+
+    return _env_bool("MIMIR_MAINTENANCE_GIT_READ_ONLY", False)
+
+
 def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     """Validate maintenance Git input and return its hardened execution argv.
 
@@ -1795,7 +1802,38 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
             )
         )
     elif subcommand == "branch":
-        allowed = subcommand_arguments == ["--show-current"]
+        allowed = subcommand_arguments == ["--list"]
+    elif subcommand == "fetch":
+        # Keep transport to root-owned git-remote-https and deny caller options,
+        # URL operands, destination refspecs, and extra operands.
+        allowed = (
+            len(subcommand_arguments) <= 2
+            and all(not argument.startswith("-") for argument in subcommand_arguments)
+            and (
+                not subcommand_arguments
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", subcommand_arguments[0])
+                is not None
+            )
+            and (
+                len(subcommand_arguments) < 2
+                or _valid_git_branch(subcommand_arguments[1])
+            )
+        )
+    elif subcommand == "rev-parse":
+        allowed = _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "--abbrev-ref", "--git-dir", "--is-bare-repository",
+                "--is-inside-git-dir", "--is-inside-work-tree", "--short",
+                "--show-prefix", "--show-toplevel", "--verify",
+            }),
+            option_prefixes=("--short=",),
+        )
+    elif subcommand == "merge-base":
+        allowed = _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({"--all", "--is-ancestor", "--octopus"}),
+        )
     elif subcommand in {"diff", "log", "show"}:
         # ``-<digits>`` is Git's bounded max-count shorthand used by the
         # maintenance prompts (for example ``git log --oneline -5``).
@@ -1830,6 +1868,11 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     execution_argv = [
         pinned_git[0], "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        *(
+            ("-c", "protocol.https.allow=always")
+            if subcommand == "fetch"
+            else ()
+        ),
         *filter_overrides, "--no-pager", "--no-optional-locks",
         subcommand, *subcommand_arguments,
     ]
@@ -1940,7 +1983,10 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
         return False
 
     if argv[0] == "git":
-        return _maintenance_git_execution_argv(argv) is not None
+        return (
+            _maintenance_git_read_only_enabled()
+            and _maintenance_git_execution_argv(argv) is not None
+        )
 
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
         resource = argv[1]
@@ -2150,6 +2196,8 @@ def parse_service_shell_argv_with_reason(
         return captured, ""
     elif destination == "maintenance":
         if argv[0] == "git":
+            if not _maintenance_git_read_only_enabled():
+                return None, _service_shell_not_admitted_reason(argv, destination)
             git_argv = _maintenance_git_execution_argv(argv)
             if git_argv is None:
                 return None, _service_shell_not_admitted_reason(argv, destination)

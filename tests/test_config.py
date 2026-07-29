@@ -298,6 +298,17 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.tool_call_budget == 200
 
+    def test_maintenance_git_read_only_is_per_deployment_and_defaults_off(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", raising=False)
+        from mimir.config import Config
+
+        assert Config.from_env().maintenance_git_read_only is False
+        monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
+        assert Config.from_env().maintenance_git_read_only is True
+
     def test_turn_timeout_default_matches_documented_default(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

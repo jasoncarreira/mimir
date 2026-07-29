@@ -247,6 +247,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
     subprocess.run(["git", "init", "-q", str(home)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
     command = f"git -C {home} status --short"
     auth = create_auth_context(
         AgentEvent(

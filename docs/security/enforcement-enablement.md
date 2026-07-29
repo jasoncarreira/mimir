@@ -332,8 +332,12 @@ fixed and exposes no environment accessor.
 the built-in heartbeat authority use `shell_profile=maintenance`; GitHub pollers
 remain on `repo_review`, research/custom pollers remain on
 `scheduler_read_only`, and upgrades remain on `upgrade_workspace`. The profile
-adds only command-shape allow-lists for maintenance inspection: Git
-`status`/`branch --show-current`/`log`/`diff`/`show`, each requiring
+adds command-shape allow-lists for maintenance inspection. Git is absent by
+default and is enabled per deployment only by
+`MIMIR_MAINTENANCE_GIT_READ_ONLY=true`; deployments that do not need a source
+checkout gain no Git surface. When opted in it admits Git
+`status`/`branch --list`/`log`/`diff`/`show`/`fetch`/`rev-parse`/`merge-base`,
+each requiring
 `git -C <configured-root> ...` so the repository target is explicit in the
 authorized argv (bare Git commands are deliberately denied), including the
 workspace-scoped landed-fix check in

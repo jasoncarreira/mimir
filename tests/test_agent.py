@@ -710,6 +710,7 @@ async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
 )
 async def test_server_owned_triggers_reach_live_tool_middleware_with_service_authority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     trigger: str,
     tool_name: str,
     principal: str,
@@ -721,6 +722,7 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
     if tool_name == "shell_exec":
         home = agent._config.home
         subprocess.run(["git", "init", "-q", str(home)], check=True)
+        monkeypatch.setenv("MIMIR_MAINTENANCE_GIT_READ_ONLY", "true")
 
     service_authority = None
     event_principal = {

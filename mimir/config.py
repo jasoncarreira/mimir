@@ -938,6 +938,9 @@ class Config:
     # event without queueing a normal agent turn. DM denials always use the
     # pending-pairing path when access control is enforced.
     unauthorized_user_behavior: str = "ignore"
+    # Opt-in read-only Git argv surface for heartbeat/maintenance turns.
+    # This is separate from framework-owned home Git tracking above.
+    maintenance_git_read_only: bool = False
     # Pairing notification/reply controls. Operator alerts are deduped by the
     # pending-pairing first-write edge and coalesced over this window. DM
     # auto-replies are fixed text, DM-only, and globally rate-limited.
@@ -1088,6 +1091,9 @@ class Config:
             access_control_enforced=resolve_access_control_enforcement(
                 _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
                 model_spec=model_spec,
+            ),
+            maintenance_git_read_only=_env_bool(
+                "MIMIR_MAINTENANCE_GIT_READ_ONLY", False,
             ),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
