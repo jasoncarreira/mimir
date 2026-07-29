@@ -396,9 +396,12 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         "send_message" if capability == "operator_alert" else capability
         for capability in declared_capabilities
     ))
+    from mimir.read_policy import framework_large_tool_results_root
+
     assert service.filesystem_read_roots == (
         str(repo.resolve()), str(fetch_cache.resolve()), str(scratch.resolve()),
         str(own_memory.resolve()),
+        str(framework_large_tool_results_root(home)),
     )
     for tool_name, arguments in (
         ("read_file", {"file_path": str(safe_file)}),

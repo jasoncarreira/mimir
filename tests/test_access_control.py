@@ -263,6 +263,85 @@ def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
     assert result.service_principal is service
 
 
+@pytest.mark.parametrize("enforce", [False, True])
+def test_large_tool_result_root_is_available_to_service_principals(
+    enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import framework_large_tool_results_root
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    artifact_root = framework_large_tool_results_root(home)
+    assert artifact_root is not None
+    artifact_root.mkdir()
+    result_file = artifact_root / "call-id"
+    result_file.write_text(
+        "recoverable result ghp_" + "a" * 30 + "\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = build_trigger_service_principal(
+        canonical="synthesis",
+        trigger="saga_session_end",
+        profile="session-boundary",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("write_file", "read_file", "ls", "glob", "grep"),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    write = registry.authorize_tool(
+        "write_file", auth, enforce=enforce, target_channel=str(result_file),
+    )
+    assert write.allowed is True
+    for tool_name, arguments in (
+        ("read_file", {"file_path": str(result_file)}),
+        ("ls", {"path": str(artifact_root)}),
+        ("glob", {"path": str(artifact_root), "pattern": "*"}),
+        ("grep", {"path": str(artifact_root), "pattern": "recoverable"}),
+    ):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=enforce, arguments=arguments,
+        )
+        assert decision.allowed is True, (tool_name, decision.reason)
+
+    assert str(artifact_root.resolve()) in service.filesystem_read_roots
+    private = home / "private.txt"
+    private.write_text("private\n", encoding="utf-8")
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, "read_file", {"file_path": str(private)},
+    ) is False
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "ls", "glob", "grep"])
+def test_large_tool_result_root_is_available_to_interactive_non_admins(
+    tool_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import framework_large_tool_results_root
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    artifact_root = framework_large_tool_results_root(home)
+    assert artifact_root is not None
+    artifact_root.mkdir()
+    result_file = artifact_root / "call-id"
+    result_file.write_text(
+        "recoverable result ghp_" + "a" * 30 + "\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    arguments = (
+        {"file_path": str(result_file)}
+        if tool_name == "read_file"
+        else {"path": str(artifact_root), "pattern": "recoverable"}
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name, _read_auth(), enforce=True, arguments=arguments,
+    )
+
+    assert decision.allowed is True
+
+
 @pytest.mark.parametrize(
     "relative",
     [".", ".env", "compose.env", "config/settings.toml", ".mimir/saga.db", "state/identities.yaml"],

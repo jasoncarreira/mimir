@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,60 @@ READ_RESOURCE_OPERATIONS = frozenset({
     "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
     "file_search", "get_turn", "mimir_get_turn",
 })
+
+
+@lru_cache(maxsize=1)
+def _framework_large_tool_results_prefix() -> Path:
+    # Deepagents does not export the computed prefix. Read it from the same
+    # middleware instance that owns eviction so upstream prefix changes follow.
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    prefix = Path(FilesystemMiddleware()._large_tool_results_prefix)
+    if not prefix.is_absolute() or ".." in prefix.parts:
+        raise RuntimeError("deepagents returned an invalid artifact prefix")
+    return prefix
+
+
+def framework_large_tool_results_root(home: Path | None = None) -> Path | None:
+    """Map deepagents' own artifact prefix into Mimir's filesystem backend."""
+    if home is None:
+        home_raw = os.environ.get("MIMIR_HOME", "").strip()
+        if not home_raw:
+            return None
+        home = Path(home_raw)
+
+    prefix = _framework_large_tool_results_prefix()
+    return (home.resolve() / Path(*prefix.parts[1:])).resolve()
+
+
+def is_large_tool_results_path(path: Path) -> bool:
+    """Return whether a path is within the framework-owned artifact prefix."""
+    root = framework_large_tool_results_root()
+    if root is None:
+        return False
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved == root or resolved.is_relative_to(root)
+
+
+def resolve_large_tool_results_target(raw_path: str) -> Path | None:
+    """Resolve a physical or backend-virtual path within the artifact prefix."""
+    root = framework_large_tool_results_root()
+    home = _resolved_mimir_home()
+    if root is None or home is None:
+        return None
+    candidate = Path(raw_path)
+    candidates = (candidate, home / raw_path.lstrip("/"))
+    for possible in candidates:
+        try:
+            resolved = possible.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved == root or resolved.is_relative_to(root):
+            return resolved
+    return None
 
 
 def requested_read_target_from_arguments(
@@ -155,7 +210,13 @@ def is_protected_read_path(path: Path) -> bool:
     home = _resolved_mimir_home()
     if home is not None and (resolved == home or resolved.is_relative_to(home)):
         state = home / "state"
-        if not (resolved == state or resolved.is_relative_to(state)):
+        artifact_root = framework_large_tool_results_root(home)
+        if not (
+            resolved == state
+            or resolved.is_relative_to(state)
+            or artifact_root is not None
+            and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
+        ):
             return True
     return False
 
@@ -196,7 +257,9 @@ def is_current_service_protected_read_path(path: Path) -> bool:
                 ):
                     return True
         except (OSError, RuntimeError, ValueError):
-            return True
+            # Read roots, including the artifact root, may be created lazily.
+            # One absent root must not deny a target inside another valid root.
+            continue
     return False
 
 
@@ -241,6 +304,8 @@ def file_contains_secret(path: Path) -> bool:
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     """Check a result at its read boundary without re-reading supplied text."""
+    if is_large_tool_results_path(path):
+        return False
     service_scoped = is_current_service_scoped_read_path(path)
     if (
         (not service_scoped and is_protected_read_path(path))
@@ -253,7 +318,7 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
 
 
 def configured_non_admin_read_roots() -> tuple[Path, ...]:
-    """Return state, configured source roots, and /tmp, never the home root."""
+    """Return narrow home roots, configured source roots, and /tmp."""
     home_raw = os.environ.get("MIMIR_HOME", "").strip()
     if not home_raw:
         return ()
@@ -268,7 +333,8 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     configured = _parse_file_tool_roots(raw_configured, home)
     configured_paths = [Path(path) for path, _mode in configured]
     configured_path_set = set(configured_paths)
-    roots = [home / "state", *configured_paths]
+    artifact_root = framework_large_tool_results_root(home)
+    roots = [home / "state", *((artifact_root,) if artifact_root is not None else ()), *configured_paths]
 
     # The shared parser intentionally returns canonical paths. Retain any
     # validated spelling supplied by the operator for lexical root selection.
@@ -320,6 +386,7 @@ def resolve_non_admin_read_target(
     try:
         home = Path(home_raw).resolve(strict=True)
         state = (home / "state").resolve(strict=True)
+        artifact_root = framework_large_tool_results_root(home)
     except (OSError, RuntimeError):
         return None
     if allow_home_root and all(
@@ -355,7 +422,10 @@ def resolve_non_admin_read_target(
         if not allow_home_root:
             return None
     elif resolved.is_relative_to(home) and not (
-        resolved == state or resolved.is_relative_to(state)
+        resolved == state
+        or resolved.is_relative_to(state)
+        or artifact_root is not None
+        and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
     ):
         return None
     # Bind the call to the most specific root named by the caller. A repo path
@@ -365,11 +435,16 @@ def resolve_non_admin_read_target(
     )
     if not (resolved == selected_root or resolved.is_relative_to(selected_root)):
         return None
-    if is_protected_read_path(resolved) and not (
-        allow_home_root and resolved == home
+    if (
+        is_protected_read_path(resolved)
+        and not is_large_tool_results_path(resolved)
+        and not (allow_home_root and resolved == home)
     ):
         return None
-    if scan_file and (not resolved.is_file() or file_contains_secret(resolved)):
+    if scan_file and (
+        not resolved.is_file()
+        or not is_large_tool_results_path(resolved) and file_contains_secret(resolved)
+    ):
         return None
     return resolved
 
