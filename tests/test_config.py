@@ -21,6 +21,7 @@ remaining surface.
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -357,6 +358,23 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.chat_skills_enabled is True
         assert cfg.chat_skill_allowlist == ("memory", "github", "review")
+
+    def test_coding_capability_is_off_by_default_and_opt_in(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        from mimir.config import Config
+
+        with caplog.at_level(logging.INFO, logger="mimir.config"):
+            assert Config.from_env().coding_enabled is False
+        assert "coding assistant capability: disabled" in caplog.text
+
+        caplog.clear()
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        with caplog.at_level(logging.INFO, logger="mimir.config"):
+            assert Config.from_env().coding_enabled is True
+        assert "coding assistant capability: enabled" in caplog.text
 
     def test_file_op_extra_roots_empty_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)

@@ -48,6 +48,7 @@ exists — turn it on here first:
 | `MIMIR_ACTIVITY_PANEL_CHANNELS` | A passive, live-updating "working…" panel posted to the channel that accumulates the turn's steps and edits itself in place (Slack `chat.update` / Discord message edit). |
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | Fold an inbound user message into the currently-running turn instead of queuing it for the next one. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | Chat slash-skill discovery + invocation from a channel. |
+| `MIMIR_CODING_ENABLED` | Expose the `spawn_open_code` coding-assistant tool. Requires the `opencode` CLI on `PATH`; startup fails if enabled without it. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
 All channel-list flags take a comma-separated prefix allow-list (e.g.
@@ -86,6 +87,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
+| `MIMIR_CODING_ENABLED` | bool | `false` | Expose `spawn_open_code` to the agent. Enabling requires the `opencode` CLI on `PATH`; an unavailable CLI fails startup. |
 
 ## Concurrency, queue & timeouts
 
