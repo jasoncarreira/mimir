@@ -37,6 +37,7 @@ def _reset_guard_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIMIR_SPAWN_MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("MIMIR_SPAWN_MAX_PER_HOUR", raising=False)
     monkeypatch.delenv("MIMIR_SPAWN_MAX_DEPTH", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"

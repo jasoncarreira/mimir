@@ -19,6 +19,7 @@ from mimir.tools.registry import (
 def _reset_guard_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _spawn_reset_for_tests()
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
     monkeypatch.delenv("MIMIR_OPENCODE_SPAWN_ARGS", raising=False)
     auth_path = tmp_path / ".local" / "share" / "opencode" / "auth.json"

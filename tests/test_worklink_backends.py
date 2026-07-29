@@ -596,6 +596,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
@@ -657,6 +658,7 @@ def test_opencode_backend_uses_same_native_model_and_blocks_oauth_key_fallback(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OPENCODE_CONFIG", str(config))
     monkeypatch.setenv("OPENAI_API_KEY", "metered")
@@ -731,6 +733,7 @@ async def test_opencode_backend_transcript_filename_contract(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
