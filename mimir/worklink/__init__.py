@@ -8,7 +8,6 @@ validation live here as plain Python.
 from .backends import (
     BackendRegistry,
     Caps,
-    CodexBackend,
     ComputeBackend,
     ComputeCaps,
     ComputeLaunchError,
@@ -43,7 +42,6 @@ __all__ = [
     "BackendRegistry",
     "Caps",
     "ChainlinkClaims",
-    "CodexBackend",
     "ClaimRecord",
     "ClaimResult",
     "CommandResult",
