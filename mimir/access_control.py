@@ -5468,13 +5468,22 @@ def _deepagents_builtin_tool_names() -> tuple[str, ...]:
     return tuple(tool.name for item in middleware for tool in item.tools)
 
 
-def assert_model_tool_inventory_cataloged(*, model_spec: str | None = None) -> None:
+def assert_model_tool_inventory_cataloged(
+    *,
+    model_spec: str | None = None,
+    coding_enabled: bool = False,
+) -> None:
     """Raise if the assembled model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
 
     catalog = get_operation_catalog()
+    mimir_tools = all_mimir_tools(
+        model_spec=model_spec,
+        coding_enabled=coding_enabled,
+        require_coding_available=False,
+    )
     tool_names = {
-        *(tool.name for tool in all_mimir_tools(model_spec=model_spec)),
+        *(tool.name for tool in mimir_tools),
         *_deepagents_builtin_tool_names(),
     }
     unknown_tools = sorted({
@@ -5524,11 +5533,15 @@ def resolve_access_control_enforcement(
     requested: bool,
     *,
     model_spec: str | None = None,
+    coding_enabled: bool = False,
 ) -> bool:
     """Fail closed at the enforcement enablement boundary."""
     if requested:
         assert_capability_matrix_complete()
-        assert_model_tool_inventory_cataloged(model_spec=model_spec)
+        assert_model_tool_inventory_cataloged(
+            model_spec=model_spec,
+            coding_enabled=coding_enabled,
+        )
     return requested
 
 

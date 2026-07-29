@@ -1624,7 +1624,11 @@ class Agent:
                 )
 
             if self._agent_tools is None:
-                self._agent_tools = all_mimir_tools()
+                self._agent_tools = (
+                    all_mimir_tools(coding_enabled=True)
+                    if self._config.coding_enabled
+                    else all_mimir_tools()
+                )
 
             # Skills surfaced via SkillsMiddleware: pass operator +
             # bundled source paths as discovery sources. The framework
