@@ -241,7 +241,7 @@ def test_manifest_rejects_shell_authority_without_job_inspection_companions(
     persist_dir = tmp_path / "state" / "pollers" / "incomplete-shell"
     persist_dir.mkdir(parents=True)
 
-    with pytest.raises(ValueError, match="job-inspection companions"):
+    with pytest.raises(ValueError, match="capabilities require companions"):
         _parse_poller_authority(
             _authority(
                 profile="github",

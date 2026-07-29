@@ -16,7 +16,8 @@ from mimir._deepagents_subagent_auth import (
     _wrap_task_tool,
     install_subagent_auth_context_patch,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.access_control import builtin_trigger_service_principal, create_auth_context
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels
 from mimir.subagents import (
     CriticFinding,
     CriticFindings,
@@ -412,6 +413,33 @@ def test_task_subagent_authorizes_with_exact_parent_admin_carrier() -> None:
     assert child.contexts == [parent_auth]
     assert child.contexts[0] is parent_auth
     assert payload == {"allowed": True, "denial": None}
+
+
+def test_heartbeat_task_subagent_cannot_exceed_parent_capabilities(tmp_path) -> None:
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    parent_auth = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="heartbeat:test",
+            service_principal="heartbeat",
+            service_authority=authority,
+        ),
+        enforce=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    child = _AuthorizingSubagent()
+
+    result = _auth_task_tool(child).func(
+        description="attempt an authority-widening schedule mutation",
+        subagent_type="general-purpose",
+        runtime=_task_runtime(parent_auth),
+    )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert child.contexts == [parent_auth]
+    assert child.contexts[0] is parent_auth
+    assert payload["allowed"] is False
+    assert "requires an admin identity" in payload["denial"]
 
 
 @pytest.mark.asyncio

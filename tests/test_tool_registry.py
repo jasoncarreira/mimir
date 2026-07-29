@@ -726,14 +726,43 @@ def test_capability_matrix_preflight_check_passes_with_complete_matrix() -> None
     assert errors == []
 
 
-def test_static_shell_service_principals_have_job_inspection_companions() -> None:
-    from mimir.access_control import _TRUSTED_SERVICE_PRINCIPALS
+@pytest.mark.parametrize("capability", ["shell_exec", "bash_async"])
+def test_shell_job_start_capabilities_declare_inspection_companions(
+    capability: str,
+) -> None:
+    from mimir.access_control import _CAPABILITY_COMPANIONS
 
-    companions = {"bash_jobs_list", "bash_job_output"}
-    for principal in _TRUSTED_SERVICE_PRINCIPALS.values():
-        capabilities = set(principal.capabilities)
-        if capabilities & {"shell_exec", "bash_async"}:
-            assert companions <= capabilities, principal.canonical
+    assert _CAPABILITY_COMPANIONS[capability] == frozenset(
+        {"bash_jobs_list", "bash_job_output"}
+    )
+
+
+def test_capability_matrix_rejects_removed_declared_companion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
+
+    scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "scheduled_tick",
+        replace(
+            scheduler,
+            capabilities=tuple(
+                capability
+                for capability in scheduler.capabilities
+                if capability != "bash_job_output"
+            ),
+        ),
+    )
+
+    is_complete, errors = access_control.check_capability_matrix_complete()
+
+    assert is_complete is False
+    assert any(
+        "capabilities without companions: bash_job_output" in error
+        for error in errors
+    )
 
 
 def test_capability_matrix_preflight_fails_with_incomplete_matrix(
@@ -1129,12 +1158,13 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
-    spawn_ops = {"spawn_open_code"}
+    spawn_ops = {"spawn_open_code", "task"}
+    schedule_ops = {"list_schedules"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
     worklink_ops = {"worklink_run"}
 
-    all_expected = read_ops | write_ops | shell_ops | spawn_ops | proposal_ops | saga_ops | worklink_ops
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops | worklink_ops
     for cap in all_expected:
         assert scheduler.has_capability(cap), f"scheduler missing {cap}"
 
@@ -1171,12 +1201,14 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
     shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
+    pr_read_ops = {"pr_metadata", "pr_checks", "pr_reviews"}
 
-    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops | pr_read_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
     assert synthesis.can_write_sink("filesystem")
     assert synthesis.can_read_domain("shell_jobs")
+    assert synthesis.can_read_domain("repository")
     assert not synthesis.can_write_sink("shell_process")
     assert synthesis.sink_policy_for("shell_exec") is None
 
@@ -1235,9 +1267,12 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
 
     test_cases = [
         ("scheduled_tick", "shell_exec", True),
+        ("scheduled_tick", "task", True),
+        ("scheduled_tick", "list_schedules", True),
         ("scheduled_tick", "remove_schedule", False),
         ("scheduled_tick", "reload_pollers", False),
         ("saga_session_end", "saga_end_session", True),
+        ("saga_session_end", "shell_exec", False),
         ("saga_session_end", "spawn_open_code", False),
         ("saga_session_end", "add_schedule", False),
         ("upgrade", "submit_proposal", True),
