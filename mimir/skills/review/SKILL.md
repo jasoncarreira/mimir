@@ -13,6 +13,14 @@ skill.
 
 ## Contract
 
+For coding-enabled server-bound poller and heartbeat turns, use the typed
+`pr_metadata`, `pr_files`, `pr_diff`, `pr_checks`, `pr_reviews`, `pr_comments`,
+and `pr_review_requests` tools instead of `gh`. Submit through
+`pr_submit_review` or `pr_inline_review_comment`. These tools intentionally have
+no repository or PR selector: the immutable event authority supplies the only
+target. The CLI workflow below applies only to an interactive operator turn
+without a bound repo/PR tool surface.
+
 **Trigger**: Operator asks to review a PR; or the github-activity poller fires a
 `pr_opened` / `review_requested` event for a PR authored by someone other than
 the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.

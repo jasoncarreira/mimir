@@ -328,6 +328,20 @@ def _extract_sink_target(
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
     tool_name = _tool_name_from_request(request)
+    if tool_name in {
+        "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+        "pr_rerequest_review", "unsupported_operation", "repo_checkout",
+        "repo_cleanup", "repo_fetch", "repo_stage", "repo_commit", "repo_merge",
+        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
+        "repo_revert_abort", "repo_push",
+    }:
+        scope = getattr(auth_context, "repo_pr_action_scope", None)
+        if scope is None:
+            return None
+        return (
+            f"{scope.canonical_repo}#pull/{scope.pr_number}"
+            f"@{scope.observed_head_sha}:{scope.scope_id}"
+        )
     if tool_name in {"send_message", "react", "fetch_channel_history"}:
         explicit_channel = args.get("channel_id")
         if explicit_channel:

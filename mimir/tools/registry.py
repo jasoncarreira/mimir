@@ -2332,7 +2332,6 @@ def all_mimir_tools(
         saga_mark_contributions,
         saga_record_skill_learning,
     )
-    from .forge import FORGE_TOOLS
     tools = [
         approve_declassification,
         # Memory (read + write)
@@ -2378,9 +2377,6 @@ def all_mimir_tools(
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,
-        # Closed provider-neutral pull-request operations. Targets are injected
-        # from the immutable server-issued scope, never selected by the model.
-        *FORGE_TOOLS,
     ]
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
     if web_search_on or fetch_url_on:
@@ -2397,7 +2393,28 @@ def all_mimir_tools(
                     "MIMIR_CODING_ENABLED is true, but the opencode CLI is not "
                     "installed or is not on PATH"
                 )
-        tools.append(spawn_open_code)
+            git = Path("/usr/bin/git")
+            if not git.is_file() or not os.access(git, os.X_OK):
+                raise RuntimeError(
+                    "MIMIR_CODING_ENABLED is true, but the pinned Git binary "
+                    "/usr/bin/git is unavailable"
+                )
+            lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+            lease_root = Path(lease_root_value) if lease_root_value else None
+            if lease_root is None or not lease_root.is_absolute():
+                raise RuntimeError(
+                    "MIMIR_CODING_ENABLED is true, but "
+                    "MIMIR_PR_CHECKOUT_LEASE_ROOT is not configured as an absolute path"
+                )
+            if not lease_root.is_dir() or lease_root.is_symlink() or not os.access(lease_root, os.W_OK):
+                raise RuntimeError(
+                    "MIMIR_CODING_ENABLED is true, but the configured PR checkout "
+                    "lease root is unavailable or not writable"
+                )
+        from .forge import FORGE_TOOLS
+        from .repo import REPO_TOOLS
+
+        tools.extend((spawn_open_code, *FORGE_TOOLS, *REPO_TOOLS))
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

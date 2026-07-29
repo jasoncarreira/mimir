@@ -113,10 +113,12 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
 
 def test_coding_tool_is_registered_only_when_enabled_and_available(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     from mimir.tools import all_mimir_tools
 
     monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
 
     names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
     assert "spawn_open_code" in names
@@ -130,6 +132,18 @@ def test_enabled_coding_without_opencode_fails_loudly(
     monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
+        all_mimir_tools(coding_enabled=True)
+
+
+def test_enabled_coding_without_checkout_config_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+
+    with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
         all_mimir_tools(coding_enabled=True)
 
 
@@ -151,6 +165,71 @@ def test_declarative_coding_inventory_does_not_probe_cli_availability(
         )
     }
     assert "spawn_open_code" in names
+
+
+def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> None:
+    from mimir.access_control import (
+        OperationDecision,
+        SinkCategory,
+        ToolFlowDirection,
+        _TYPED_REPO_PR_TOOL_ACTIONS,
+        get_sink_category,
+        get_tool_flow_direction,
+    )
+    from mimir.tools import all_mimir_tools
+
+    default_names = {
+        tool.name for tool in all_mimir_tools(require_coding_available=False)
+    }
+    enabled_names = {
+        tool.name for tool in all_mimir_tools(
+            coding_enabled=True, require_coding_available=False,
+        )
+    }
+    typed_names = set(_TYPED_REPO_PR_TOOL_ACTIONS)
+
+    assert typed_names
+    assert typed_names.isdisjoint(default_names)
+    assert typed_names <= enabled_names
+    for name in typed_names:
+        assert OperationCatalog().get_decision(name) is OperationDecision.RESOURCE_SCOPED
+        direction = get_tool_flow_direction(name)
+        assert direction is not ToolFlowDirection.UNKNOWN
+        if direction in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+            assert get_sink_category(name) is not SinkCategory.UNKNOWN
+
+
+def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
+    from mimir.access_control import (
+        ToolFlowDirection,
+        _OPERATION_SINK_DESTINATION,
+        _TYPED_REPO_PR_TOOL_ACTIONS,
+        get_tool_flow_direction,
+    )
+
+    sinks = {
+        name for name in _TYPED_REPO_PR_TOOL_ACTIONS
+        if get_tool_flow_direction(name) in {
+            ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
+        }
+    }
+    assert sinks <= set(_OPERATION_SINK_DESTINATION)
+
+
+def test_typed_repo_pr_schemas_cannot_name_a_repository_or_pull_request() -> None:
+    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+    from mimir.tools import all_mimir_tools
+
+    tools = {
+        tool.name: tool
+        for tool in all_mimir_tools(
+            coding_enabled=True, require_coding_available=False,
+        )
+    }
+    forbidden = {"repo", "repository", "pr", "pull_request", "url", "host"}
+    for name in _TYPED_REPO_PR_TOOL_ACTIONS:
+        properties = tools[name].tool_call_schema.model_json_schema()["properties"]
+        assert forbidden.isdisjoint(properties), (name, properties)
 
 
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
