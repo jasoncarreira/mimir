@@ -1169,12 +1169,40 @@ _SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[]*?\n\r")
 _CHAINLINK_EXECUTABLES = frozenset({"chainlink", "/usr/local/bin/chainlink"})
 _CHAINLINK_OUTPUT_OPTIONS = frozenset({"-q", "--quiet", "--json"})
 _CHAINLINK_QUERY_SUBCOMMANDS = frozenset({
-    "show", "list", "search", "ready", "blocked",
+    "show", "list", "search", "ready", "blocked", "related", "cascade",
+    "next", "tree",
 })
 _CHAINLINK_MUTATION_SUBCOMMANDS = frozenset({
     "create", "update", "comment", "label", "unlabel", "block", "unblock",
     "relate", "unrelate", "close", "reopen", "subissue", "quick",
 })
+# Audited against ``chainlink issue --help``. These commands are mutations that
+# remain outside the bounded service surface rather than unclassified reads.
+_CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS = {
+    "close-all": "bulk mutation",
+    "delete": "irreversible mutation",
+    "falsify": "dependency mutation",
+    "tested": "test-reminder mutation",
+}
+# Audited against ``chainlink --help``. The service profile intentionally
+# exposes only bounded issue orientation and session status; these other roots
+# are recorded here so a CLI addition cannot disappear into a silent refusal.
+_CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS = {
+    "init": "tracker initialization",
+    "timer": "mixed read/write namespace outside issue orientation",
+    "export": "bulk serialization with a filesystem output option",
+    "import": "bulk tracker mutation",
+    "archive": "mixed read/write namespace outside issue orientation",
+    "milestone": "mixed read/write namespace outside issue orientation",
+    "daemon": "daemon lifecycle namespace",
+    "cpitd": "clone-detection lifecycle namespace",
+    "usage": "mixed read/write accounting namespace",
+    "agent": "agent identity and lock namespace",
+    "locks": "Worklink-owned coordination lifecycle",
+    "sync": "coordination fetch and local lock-state update",
+    "cascade": "use the bounded issue cascade form",
+    "falsify": "dependency mutation",
+}
 
 
 def _chainlink_issue_arguments_match(arguments: list[str]) -> bool:
@@ -1193,10 +1221,15 @@ def _chainlink_issue_arguments_match(arguments: list[str]) -> bool:
         value_options = {"-s", "--status", "-p", "--priority"}
         repeated_value_options = {"-l", "--label"}
         positional_shape = ()
-    elif subcommand in {"ready", "blocked"}:
+    elif subcommand in {"ready", "blocked", "next"}:
         positional_shape = ()
-    elif subcommand == "show":
+    elif subcommand in {"show", "related", "cascade"}:
         positional_shape = ("id",)
+    elif subcommand == "tree":
+        value_options = {"-s", "--status"}
+        # Current help renders the whole tree; deployed versions also accept a
+        # root issue. Both forms are bounded, read-only queries.
+        positional_shape = ("optional_id",)
     elif subcommand == "search":
         positional_shape = ("text",)
     elif subcommand in {"create", "quick"}:
@@ -1253,10 +1286,13 @@ def _chainlink_issue_arguments_match(arguments: list[str]) -> bool:
         positionals.append(argument)
         index += 1
 
+    if subcommand == "tree" and not positionals:
+        positional_shape = ()
     if len(positionals) != len(positional_shape):
         return False
     return all(
-        kind != "id" or (value.isascii() and value.isdigit() and int(value) > 0)
+        kind not in {"id", "optional_id"}
+        or (value.isascii() and value.isdigit() and int(value) > 0)
         for kind, value in zip(positional_shape, positionals)
     )
 
@@ -2575,8 +2611,9 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
         else:
             boundary = ""
         admitted = (
-            " Admitted Chainlink commands are issue show/list/search/ready/blocked; "
-            "session status; and issue create/update/comment/label/unlabel/block/unblock/"
+            " Admitted Chainlink queries are issue show/list/search/ready/blocked/"
+            "related/cascade/next/tree and session status; "
+            "admitted mutations are issue create/update/comment/label/unlabel/block/unblock/"
             "relate/unrelate/close/reopen/subissue/quick, using only each command's "
             "documented bounded options (-q/--quiet and --json included)."
         )
@@ -3090,7 +3127,8 @@ _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
 _CHAINLINK_TAINT_REFUSAL = (
     "this turn carries untrusted active ingest, so Chainlink tracker mutations "
     "are unavailable for this turn. Read-only queries remain admitted: issue "
-    "show, issue list, issue search, issue ready, issue blocked, and session status."
+    "show, issue list, issue search, issue ready, issue blocked, issue related, "
+    "issue cascade, issue next, issue tree, and session status."
 )
 
 

@@ -5106,6 +5106,11 @@ def test_maintenance_shell_returns_pinned_execution_argv(
         "chainlink issue search 'large tool result spill' --quiet",
         "chainlink issue ready --json",
         "chainlink issue blocked",
+        "chainlink issue related 1051 --json",
+        "chainlink issue cascade 1051 --quiet",
+        "chainlink issue next --json",
+        "chainlink issue tree 1051 --json",
+        "chainlink issue tree --status open -q",
         "chainlink session status --json",
         "chainlink issue create 'Track follow-up' -d 'Acceptance criteria' -p high -l rca",
         "chainlink issue update 1051 --title 'Updated title' --priority critical",
@@ -5145,6 +5150,11 @@ _CHAINLINK_QUERIES = (
     "chainlink issue search tracker --quiet",
     "chainlink issue ready --json",
     "chainlink issue blocked",
+    "chainlink issue related 1051 --json",
+    "chainlink issue cascade 1051 --quiet",
+    "chainlink issue next --json",
+    "chainlink issue tree 1051 --json",
+    "chainlink issue tree --status open -q",
     "chainlink session status --json",
 )
 _CHAINLINK_MUTATIONS = (
@@ -5177,6 +5187,53 @@ def _chainlink_service(profile: str, authority_profile: str) -> ServicePrincipal
         authority_profile=authority_profile,
         capability_tier=CapabilityTier.SCOPE_CONTAINED,
     )
+
+
+def _chainlink_help_commands(*arguments: str) -> set[str]:
+    executable = shutil.which("chainlink")
+    if executable is None:
+        pytest.skip("chainlink CLI is not installed")
+    result = subprocess.run(
+        [executable, *arguments, "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commands: set[str] = set()
+    in_commands = False
+    for line in result.stdout.splitlines():
+        if line == "Commands:":
+            in_commands = True
+            continue
+        if in_commands and not line.startswith("  "):
+            break
+        if in_commands and line.strip():
+            commands.add(line.split()[0])
+    commands.discard("help")
+    return commands
+
+
+def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> None:
+    audited = (
+        access_control._CHAINLINK_QUERY_SUBCOMMANDS
+        | access_control._CHAINLINK_MUTATION_SUBCOMMANDS
+        | set(access_control._CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS)
+    )
+
+    assert audited == _chainlink_help_commands("issue")
+    assert access_control._CHAINLINK_QUERY_SUBCOMMANDS == {
+        "blocked", "cascade", "list", "next", "ready", "related", "search",
+        "show", "tree",
+    }
+
+
+def test_chainlink_top_level_help_has_an_explicit_scope_decision() -> None:
+    audited = {"issue", "session"} | set(
+        access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS
+    )
+
+    assert audited == _chainlink_help_commands()
+    assert all(access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS.values())
 
 
 def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
@@ -5324,6 +5381,10 @@ def test_chainlink_executable_spellings_and_global_output_options_are_admitted(
         "chainlink issue create --description",
         "chainlink issue comment 1051",
         "chainlink issue close not-an-id",
+        "chainlink issue tree not-an-id",
+        "chainlink issue tree 1051 1052",
+        "chainlink issue tree --status",
+        "chainlink issue tree --output tree.json",
     ],
 )
 def test_chainlink_denies_destructive_alias_and_malformed_shapes(command: str) -> None:
