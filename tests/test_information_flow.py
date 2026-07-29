@@ -34,6 +34,7 @@ from mimir.access_control import (
     OperationDecision,
     ProtectedResultProvenance,
     protected_result_source,
+    record_file_write_integrity,
 )
 from mimir.agent import (
     Agent,
@@ -42,7 +43,9 @@ from mimir.agent import (
     _merge_ifc_labels,
     _prompt_source_labels,
     _propagate_ifc_labels,
+    _recent_message_is_self_authored,
 )
+from mimir.history import Message
 from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
@@ -766,12 +769,14 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
         assert decision.allowed is True, (tool, decision.reason)
 
 
-def test_poller_recovery_stash_is_untrusted_active_ingest(
+@pytest.mark.parametrize("name", [".recovery.json", "cursor.json"])
+def test_poller_managed_state_is_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    recovery = tmp_path / "state" / "pollers" / "github" / ".recovery.json"
+    recovery = tmp_path / "state" / "pollers" / "github" / name
     recovery.parent.mkdir(parents=True)
     recovery.write_text('{"inflight":{"event":{"content":"external"}}}', encoding="utf-8")
 
@@ -784,15 +789,11 @@ def test_poller_recovery_stash_is_untrusted_active_ingest(
     assert source.integrity_effect == "active_ingest"
 
 
-@pytest.mark.parametrize(
-    ("approved", "expected_integrity"),
-    [(True, "trusted"), (False, "untrusted")],
-)
-def test_fetched_page_integrity_comes_from_exact_operator_allowlist(
+@pytest.mark.parametrize("approved", [True, False])
+def test_fetch_approval_never_confers_integrity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     approved: bool,
-    expected_integrity: str,
 ) -> None:
     import hashlib
 
@@ -818,8 +819,75 @@ def test_fetched_page_integrity_comes_from_exact_operator_allowlist(
         resource_id=str(body.resolve()), bridge_instance="filesystem",
     )
 
-    assert source.integrity == expected_integrity
+    assert source.integrity == "untrusted"
     assert source.integrity_effect == "active_ingest"
+
+
+def test_untrusted_model_write_cannot_launder_through_self_authored_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    state_file = tmp_path / "state" / "notes.md"
+    state_file.parent.mkdir()
+    state_file.write_text("hostile payload persisted by the model", encoding="utf-8")
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    record_file_write_integrity(str(state_file), tainted)
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(state_file.resolve()), bridge_instance="filesystem",
+    )
+
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert json.loads(
+        (tmp_path / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    ) == {"state/notes.md": "untrusted"}
+
+
+def test_file_write_fails_closed_when_integrity_metadata_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / "memory" / "notes.md"
+    target.parent.mkdir()
+    metadata = tmp_path / ".mimir" / "file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text("not-json", encoding="utf-8")
+
+    assert record_file_write_integrity(str(target), InformationFlowLabels()) is False
+
+
+
+def test_prior_assistant_history_preserves_write_time_integrity() -> None:
+    clean = Message(
+        ts="now", msg_id="clean", channel_id="slack-C1", author=None,
+        author_display=None, kind="assistant_message", content="clean",
+        integrity="trusted",
+    )
+    tainted = Message(
+        ts="now", msg_id="tainted", channel_id="slack-C1", author=None,
+        author_display=None, kind="assistant_message", content="copied injection",
+        integrity="untrusted",
+    )
+    legacy_assistant = replace(clean, msg_id="legacy", integrity=None)
+    external_system_note = replace(
+        tainted, msg_id="poller", kind="system_note", integrity=None,
+    )
+
+    assert _recent_message_is_self_authored(clean) is True
+    assert _recent_message_is_self_authored(legacy_assistant) is False
+    assert _recent_message_is_self_authored(tainted) is False
+    assert _recent_message_is_self_authored(external_system_note) is False
+    assert Message.from_dict(tainted.to_dict()).integrity == "untrusted"
 
 
 def test_github_pr_fetch_authorization_does_not_confer_trusted_integrity(

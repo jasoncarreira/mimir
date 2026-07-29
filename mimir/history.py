@@ -55,6 +55,8 @@ class Message:
     # Origin tag for the Recent-activity allowlist. None on legacy records;
     # set to the inbound AgentEvent.source on new records (SPEC §5.4).
     source: str | None = None
+    # Server-derived integrity at persistence time. Legacy records fail closed.
+    integrity: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -67,6 +69,7 @@ class Message:
             "content": self.content,
             "thread_id": self.thread_id,
             "source": self.source,
+            "integrity": self.integrity,
         }
 
     @classmethod
@@ -81,6 +84,7 @@ class Message:
             content=data.get("content", ""),
             thread_id=data.get("thread_id"),
             source=data.get("source"),
+            integrity=data.get("integrity"),
         )
 
 
@@ -314,6 +318,7 @@ class MessageBuffer:
         thread_id: str | None = None,
         ts: str | None = None,
         source: str | None = None,
+        integrity: str | None = None,
     ) -> Message:
         return Message(
             ts=ts or _utc_now_iso(),
@@ -325,6 +330,7 @@ class MessageBuffer:
             content=content,
             thread_id=thread_id,
             source=source,
+            integrity=integrity,
         )
 
     # ---- read paths --------------------------------------------------------

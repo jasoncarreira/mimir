@@ -669,6 +669,16 @@ async def send_message(
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
                     source=bridge.name,
+                    integrity=(
+                        "trusted"
+                        if ctx is not None
+                        and ctx.ifc_labels.sources
+                        and all(
+                            source.integrity == "trusted"
+                            for source in ctx.ifc_labels.sources
+                        )
+                        else "untrusted"
+                    ),
                 )
                 await _buf.append(msg)
             except Exception:  # noqa: BLE001
