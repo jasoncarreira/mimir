@@ -927,6 +927,9 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     command = argv[0]
     arguments = argv[1:]
 
+    if _target_matches_chainlink_read_command(argv):
+        return True
+
     if command == "pwd":
         return set(arguments) <= {"-L", "-P"}
     if command == "ls":
@@ -1020,6 +1023,54 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
         }),
         option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
     )
+
+
+def _target_matches_chainlink_read_command(argv: list[str]) -> bool:
+    """Admit only tracker queries with bounded output options and operands."""
+    if not argv or argv[0] not in {"chainlink", "/usr/local/bin/chainlink"}:
+        return False
+    if len(argv) < 3:
+        return False
+
+    resource, subcommand = argv[1:3]
+    if resource == "session":
+        allowed_values = frozenset()
+        expected_operands = 0 if subcommand == "status" else -1
+    elif resource == "issue":
+        allowed_values = (
+            frozenset({"--label", "--priority", "--status"})
+            if subcommand == "list"
+            else frozenset()
+        )
+        expected_operands = {
+            "show": 1,
+            "search": 1,
+            "list": 0,
+            "ready": 0,
+            "blocked": 0,
+        }.get(subcommand, -1)
+    else:
+        return False
+    if expected_operands < 0:
+        return False
+
+    operands: list[str] = []
+    index = 3
+    while index < len(argv):
+        argument = argv[index]
+        if argument in {"--json", "--quiet"}:
+            index += 1
+            continue
+        if argument in allowed_values:
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                return False
+            index += 2
+            continue
+        if argument.startswith("-"):
+            return False
+        operands.append(argument)
+        index += 1
+    return len(operands) == expected_operands
 
 
 def _target_matches_pytest_command(arguments: list[str]) -> bool:
@@ -1640,6 +1691,7 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "pwd": Path("/usr/bin/pwd"),
     "jq": Path("/usr/bin/jq"),
     "rg": Path("/usr/bin/rg"),
+    "chainlink": Path("/usr/local/bin/chainlink"),
     "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
 }
 _MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
@@ -1967,19 +2019,6 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
             argv[3:], exact_options=options,
         )
 
-    chainlink_command = argv[0]
-    if chainlink_command != "/usr/local/bin/chainlink":
-        return False
-    if argv[1:2] == ["issue"] and len(argv) >= 3:
-        subcommand = argv[2]
-        options = {
-            "list": frozenset({"--json", "--label", "--priority", "--status"}),
-            "ready": frozenset({"--json"}),
-            "show": frozenset({"--json"}),
-        }.get(subcommand)
-        return options is not None and _arguments_match_allowlist(
-            argv[3:], exact_options=options,
-        )
     return False
 
 
@@ -2015,17 +2054,17 @@ _SHELL_PROFILE_SINGLE_ARGV_HINT = (
 # drift from the commands that can actually run.
 _SERVICE_SHELL_DISPLAY_COMMANDS = frozenset(_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS)
 _SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
-    "add", "api", "branch", "checkout", "checks", "close", "comment", "commit",
-    "create", "describe", "diff", "fetch", "init", "issue", "label", "list",
+    "add", "api", "blocked", "branch", "checkout", "checks", "close", "comment",
+    "commit", "create", "delete", "describe", "diff", "fetch", "init", "issue", "label", "list",
     "lock", "log", "ls-files", "merge-base", "pr", "pull", "push", "ready",
-    "relate", "remote", "rev-parse", "review", "run", "show", "status", "sync",
-    "test", "update", "view",
+    "relate", "remote", "rev-parse", "review", "run", "search", "session", "show",
+    "status", "sync", "test", "update", "view",
 })
 _SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
     "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
     "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
     "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
-    "--json", "--jq", "--label", "--limit", "--mention", "--milestone",
+    "--json", "--jq", "--label", "--limit", "--mention", "--milestone", "--quiet",
     "--no-pager", "--oneline", "--priority", "--repo", "--request-changes",
     "--search", "--short", "--state", "--status", "--template",
 })
@@ -2064,12 +2103,20 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     if len(named) != len(set(supplied)):
         named.append("<option>")
     option_text = f" Options sent: {', '.join(named)}." if named else ""
+    tracker_hint = (
+        " Tracker reads admit only 'issue show <id>', 'issue list', "
+        "'issue search <query>', 'issue ready', 'issue blocked', and "
+        "'session status', with optional '--json' and '--quiet'; 'issue list' "
+        "also admits '--label', '--priority', and '--status' filters."
+        if argv and argv[0] in {"chainlink", "/usr/local/bin/chainlink"}
+        else ""
+    )
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
         "admits a fixed set of commands, subcommands and options; anything "
         "outside it is refused for this principal regardless of how it is "
-        "written."
+        f"written.{tracker_hint}"
     )
 
 

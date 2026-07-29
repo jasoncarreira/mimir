@@ -31,6 +31,7 @@ from mimir.access_control import (
     create_auth_context,
     get_service_principal,
     parse_service_shell_argv,
+    parse_service_shell_argv_with_reason,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -2073,6 +2074,68 @@ def test_service_shell_refusal_always_carries_a_reason(
         )
 
 
+@pytest.mark.parametrize("profile", ["maintenance", "scheduler_read_only", "repo_review"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue show 1051",
+        "chainlink issue list --json",
+        "chainlink issue search 'large tool result spill' --quiet",
+        "chainlink issue ready --json --quiet",
+        "chainlink issue blocked",
+        "/usr/local/bin/chainlink session status --json",
+    ],
+)
+def test_service_shell_profiles_admit_pinned_tracker_reads(
+    profile: str,
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, profile)
+
+    assert argv is not None
+    assert argv[0] == str(maintenance_pinned_executables["chainlink"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue create title",
+        "chainlink issue close 1051",
+        "chainlink issue comment 1051 body",
+        "chainlink issue label 1051 bug",
+        "chainlink issue block 1051 1050",
+        "chainlink issue delete 1051",
+        "chainlink locks list",
+        "chainlink i show 1051",
+    ],
+)
+def test_service_shell_profiles_refuse_tracker_mutations_and_aliases(
+    command: str,
+) -> None:
+    for profile in ("maintenance", "scheduler_read_only", "repo_review"):
+        argv, reason = parse_service_shell_argv_with_reason(command, profile)
+        assert argv is None, (profile, command)
+        assert "Tracker reads admit only" in reason
+        assert "issue show <id>" in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue show 1051 --verbose",
+        "chainlink issue show 1051 -- --json",
+        "chainlink issue list --limit 20",
+        "chainlink issue search query extra",
+    ],
+)
+def test_service_shell_profiles_refuse_tracker_option_and_operand_smuggling(
+    command: str,
+) -> None:
+    for profile in ("maintenance", "scheduler_read_only", "repo_review"):
+        assert parse_service_shell_argv(command, profile) is None, (profile, command)
+
+
 def test_service_shell_refusal_reason_withholds_argument_values() -> None:
     """A refusal reason echoes only fixed-vocabulary tokens, never a value.
 
@@ -2405,6 +2468,84 @@ async def test_service_shell_uses_resolved_authorized_cwd(
 
     assert result.status != "error"
     assert seen_args["cwd"] == str(allowed.resolve())
+
+
+@pytest.mark.asyncio
+async def test_service_chainlink_uses_server_resolved_tracker_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """Tracker reads ignore an unusable model cwd and discover the store server-side."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    state = home / "state"
+    state.mkdir(parents=True)
+    (home / ".chainlink").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "chainlink issue show 1051 --json", "cwd": str(home)},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["cwd"] == str(state.resolve())
+    assert seen_args["mimir_direct_argv"] == [
+        str(maintenance_pinned_executables["chainlink"]),
+        "issue", "show", "1051", "--json",
+    ]
+
+
+def test_service_chainlink_cwd_follows_configured_tracker_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _resolve_service_chainlink_cwd
+
+    home = tmp_path / "home"
+    home.mkdir()
+    tracker_root = tmp_path / "tracker-root"
+    authorized = tracker_root / "work"
+    authorized.mkdir(parents=True)
+    (tracker_root / ".chainlink").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{authorized}:ro")
+
+    resolved, refusal = _resolve_service_chainlink_cwd()
+
+    assert refusal is None
+    assert resolved == str(authorized.resolve())
 
 
 @pytest.mark.asyncio
@@ -4648,7 +4789,6 @@ def test_maintenance_git_denies_unconfigured_roots_and_model_git_globals(
         "gh auth login",
         "gh pr create --title mutation",
         "gh issue comment 922 --body mutation",
-        "chainlink issue list --status open",
         "chainlink issue create mutation",
         "chainlink issue comment 922 mutation",
         "/tmp/chainlink issue list --status open",

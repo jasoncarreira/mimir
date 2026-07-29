@@ -500,6 +500,29 @@ def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]
     return str(resolved), None
 
 
+def _resolve_service_chainlink_cwd() -> tuple[str | None, str | None]:
+    """Find an authorized cwd whose ancestor contains the tracker store."""
+    from ..read_policy import configured_non_admin_read_roots
+
+    for root in configured_non_admin_read_roots():
+        try:
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_dir():
+            continue
+        if any(
+            (ancestor / ".chainlink").is_dir()
+            for ancestor in (resolved, *resolved.parents)
+        ):
+            return str(resolved), None
+    return None, (
+        "the tracker store could not be reached from any authorized working "
+        "directory; configure an authorized read root beneath the directory "
+        "that contains .chainlink"
+    )
+
+
 def _request_for_authorized_execution(
     request: ToolCallRequest,
     tool_name: str,
@@ -532,16 +555,6 @@ def _request_for_authorized_execution(
     target = args.get("command")
     if not isinstance(target, str):
         return sanitized_request
-    resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
-    if cwd_refusal is not None:
-        args["mimir_shell_refusal"] = (
-            f"{tool_name} was refused before execution: {cwd_refusal}."
-        )
-        return sanitized_request.override(
-            tool_call={**request.tool_call, "args": args}
-        )
-    if resolved_cwd is not None:
-        args["cwd"] = resolved_cwd
     if policy.destination == "repo_review":
         argv, refusal = parse_service_shell_argv_with_reason(
             target,
@@ -592,6 +605,19 @@ def _request_for_authorized_execution(
         ]
         tool_call = {**request.tool_call, "args": args}
         return request.override(tool_call=tool_call)
+    if Path(argv[0]).name == "chainlink":
+        resolved_cwd, cwd_refusal = _resolve_service_chainlink_cwd()
+    else:
+        resolved_cwd, cwd_refusal = _resolve_service_shell_cwd(args.get("cwd"))
+    if cwd_refusal is not None:
+        args["mimir_shell_refusal"] = (
+            f"{tool_name} was refused before execution: {cwd_refusal}."
+        )
+        return sanitized_request.override(
+            tool_call={**request.tool_call, "args": args}
+        )
+    if resolved_cwd is not None:
+        args["cwd"] = resolved_cwd
     args["mimir_direct_argv"] = argv
     tool_call = {**request.tool_call, "args": args}
     return request.override(tool_call=tool_call)
