@@ -70,6 +70,7 @@ traffic windows when possible.
 | `$MIMIR_HOME/.claude/.credentials.json` (path resolved by `MIMIR_CLAUDE_OAUTH_CREDENTIALS`; falls back to `$HOME/.claude/.credentials.json` only if MIMIR_HOME is unset) | Claude Max OAuth subprocess for `ANTHROPIC_BASE_URL`-routed deployments | `claude /login` from a terminal with access to the host browser | `mimir oauth-usage-check` (already exists); a non-failing `oauth_usage_polled` event in `events.jsonl` |
 | Gmail OAuth refresh tokens (gog keyring) | `gog` CLI for Gmail / Calendar | `gog auth login <account>` (interactive) | `gog gmail search 'newer_than:1h' --max 1 --account <name>` succeeds |
 | Google Workspace OAuth (gogcli) | Google Calendar, Drive | Same as above | `gog calendar list --account <name>` |
+| `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`) | OpenCode providers selected by native `opencode.jsonc` | `opencode auth login` using the provider/plugin's own flow | Inspect `opencode auth list` and the selected provider's stored `type`. For OpenAI subscription use, it must be `oauth`; a successful model response or ambient `OPENAI_API_KEY` proves connectivity only, not subscription billing. Mimir removes the conventional ambient API key from OAuth-backed coding runs. This store is separate from `~/.codex/auth.json`. |
 
 Critical Type C constraint: the storage path **must** live on the
 bind-mounted home or the refresh tokens get wiped on every container

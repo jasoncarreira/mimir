@@ -16,10 +16,23 @@ from mimir.tools.registry import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_guard_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def _reset_guard_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _spawn_reset_for_tests()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
     monkeypatch.delenv("MIMIR_OPENCODE_SPAWN_ARGS", raising=False)
+    auth_path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth_path.parent.mkdir(parents=True)
+    auth_path.write_text(
+        json.dumps(
+            {
+                "openai": {"type": "oauth", "refresh": "test-refresh"},
+                "anthropic": {"type": "api", "key": "test-key"},
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _capture_run(record: dict):
@@ -56,6 +69,32 @@ async def test_completed_run_returns_structured_result(
 
 
 @pytest.mark.asyncio
+async def test_native_config_model_beats_agent_default_and_forwards_referenced_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "opencode.jsonc"
+    config.write_text(
+        '{"model":"zai/glm-5","provider":{"zai":{"options":{"apiKey":"{env:ZAI_KEY}"}}}}',
+        encoding="utf-8",
+    )
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.write_text(json.dumps({"zai": {"type": "api", "key": "stored"}}), encoding="utf-8")
+    set_spawn_config({"default_cwd": tmp_path, "opencode_config_path": config})
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:agent-default")
+    monkeypatch.setenv("ZAI_KEY", "native-config-secret")
+    from mimir.tools import registry
+
+    record: dict = {}
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
+    await spawn_open_code.ainvoke({"prompt": "task"})
+
+    model_index = record["argv"].index("-m")
+    assert record["argv"][model_index + 1] == "zai/glm-5"
+    assert record["env"]["OPENCODE_CONFIG"] == str(config)
+    assert record["env"]["ZAI_KEY"] == "native-config-secret"
+
+
+@pytest.mark.asyncio
 async def test_child_env_is_allowlisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -78,7 +117,8 @@ async def test_child_env_is_allowlisted(
     child = record["env"]
     assert "DISCORD_BOT_TOKEN" not in child
     assert "MIMIR_API_KEY" not in child
-    assert child["OPENAI_API_KEY"] == "sk-openai"
+    # Stored OAuth is positively identified and the metered fallback is removed.
+    assert "OPENAI_API_KEY" not in child
     assert child["ANTHROPIC_API_KEY"] == "sk-ant"
     assert child["OPENCODE_SERVER_PASSWORD"] == "oc-pass"
     # opencode is provider-agnostic — the broad provider union must reach it.

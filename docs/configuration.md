@@ -65,6 +65,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_MODEL_MAX_RETRIES` | int | `6` | Per-call transient (429/5xx) retry budget for non-`claude-code` providers. The `claude-code` path ignores it. |
 | `MIMIR_MODEL_MAX_TOKENS` | int | `0` | Per-call **output** token cap for non-`claude-code` providers. `0` = provider default. Raise for thinking-via-Anthropic-compat models whose reasoning counts against output. |
 | `MIMIR_MODEL_REASONING_EFFORT` | str | `""` | Reasoning effort forwarded to Codex-Plus / OpenAI reasoning models. `""` = provider default. Anthropic / Minimax / claude-code ignore it. |
+| `OPENCODE_CONFIG` | path | `$XDG_CONFIG_HOME/opencode/opencode.jsonc` or `~/.config/opencode/opencode.jsonc` | OpenCode's native operator-owned JSON/JSONC. Its `model`, `provider`, plugin, proxy, and `{env:NAME}` settings are used unchanged by both `spawn_open_code` and the Worklink backend. If `model` is absent, the live `MIMIR_MODEL_SPEC` is translated to `provider/model`; an explicit spawn `model` wins over both. |
 | `MIMIR_EFFORT` | str | `high` | Effort level recorded on the config. |
 | `MIMIR_EMBED_MODEL` | str | `BAAI/bge-small-en-v1.5` | Embedding model id. |
 | `MIMIR_CONTEXT_1M` | bool | `true` | Opt into Anthropic's 1M-context beta header for Claude 4.x. Disable for accounts/models without the beta. |

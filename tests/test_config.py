@@ -376,6 +376,16 @@ class TestConfigFromEnv:
             assert Config.from_env().coding_enabled is True
         assert "coding assistant capability: enabled" in caplog.text
 
+    def test_opencode_config_uses_native_surface(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        self._base(monkeypatch)
+        path = tmp_path / "operator-opencode.jsonc"
+        monkeypatch.setenv("OPENCODE_CONFIG", str(path))
+        from mimir.config import Config
+
+        assert Config.from_env().opencode_config_path == path
+
     def test_enforced_coding_config_does_not_require_opencode_on_path(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
