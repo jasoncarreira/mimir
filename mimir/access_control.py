@@ -30,13 +30,18 @@ import subprocess
 import sys
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .identities import AccessMetadata
+from .models import (
+    NormalizedPullRequestSnapshot,
+    RepoPRAction,
+    RepoPRScopeProvenance,
+)
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
     read_target_from_arguments,
@@ -659,37 +664,35 @@ def _valid_git_branch(value: object) -> bool:
     )
 
 
-def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None) -> Any:
-    """Derive one immutable own-PR branch scope from trusted poller metadata."""
-    if (
-        service is None
-        or service.authority_profile != "github"
-        or event.trigger != "poller"
-        or not isinstance(event.extra, dict)
-    ):
-        return None
-    items = event.extra.get("items")
-    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
-        return None
-    item = items[0]
-    repo = item.get("repo")
-    number = item.get("number")
-    head_ref = item.get("head_ref")
-    if (
-        item.get("event_type") != "pr_changes_requested_stale"
-        or not isinstance(repo, str)
-        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
-        or not isinstance(number, int)
-        or isinstance(number, bool)
-        or number < 1
-        or not _valid_git_branch(head_ref)
-    ):
-        return None
+_REPO_PR_REMEDIATION_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.WRITE.value,
+    RepoPRAction.COMMIT.value,
+    RepoPRAction.PUSH.value,
+    RepoPRAction.PR_COMMENT.value,
+    RepoPRAction.PR_EDIT.value,
+    RepoPRAction.PR_REREQUEST.value,
+})
+_GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
+
+def _configured_scope_github_repos() -> frozenset[str]:
+    return frozenset(
+        f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
+    )
+
+
+def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
+    """Resolve one configured GitHub repo to its unique writable root and origin."""
+    repo = repo.lower()
+    if repo not in _configured_scope_github_repos():
+        return None
     git = _maintenance_resolved_pin("git")
     if git is None:
         return None
-    matching_roots: list[Path] = []
+    matching_roots: list[tuple[Path, str]] = []
     for configured in _configured_repo_write_roots():
         try:
             root = configured.resolve(strict=True)
@@ -705,14 +708,133 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             )
         except (OSError, RuntimeError, subprocess.SubprocessError):
             continue
-        if result.returncode == 0 and _github_repo_from_remote(result.stdout) == repo:
-            matching_roots.append(root)
+        observed_origin = result.stdout.strip()
+        remote_repo = _github_repo_from_remote(observed_origin)
+        if result.returncode == 0 and remote_repo is not None and remote_repo.lower() == repo:
+            matching_roots.append((root, observed_origin))
     if len(matching_roots) != 1:
         return None
+    root, observed_origin = matching_roots[0]
+    return str(root), observed_origin
 
+
+def _repo_pr_scope(
+    *,
+    provenance: str,
+    repo: object,
+    principal: object,
+    event_type: object,
+    number: object,
+    head_repo: object,
+    head_remote: object,
+    head_ref: object,
+    head_sha: object,
+    base_ref: object,
+    base_sha: object,
+) -> Any:
+    """Validate a complete observed PR snapshot and issue its closed scope."""
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if (
+        event_type != "pr_changes_requested_stale"
+        or not self_login
+        or principal != self_login
+        or not isinstance(repo, str)
+        or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+        or not isinstance(head_repo, str)
+        or head_repo.lower() != repo.lower()
+        or head_remote != "origin"
+        or not _valid_git_branch(head_ref)
+        or not _valid_git_branch(base_ref)
+        or not isinstance(head_sha, str)
+        or _GITHUB_SHA_PATTERN.fullmatch(head_sha) is None
+        or not isinstance(base_sha, str)
+        or _GITHUB_SHA_PATTERN.fullmatch(base_sha) is None
+    ):
+        return None
+    repo = repo.lower()
+    head_repo = head_repo.lower()
+    binding = _canonical_repo_binding(repo)
+    if binding is None:
+        return None
+    root, origin = binding
+    from .models import RepoPRActionScope
+
+    return RepoPRActionScope(
+        provenance=provenance,
+        canonical_repo=repo,
+        canonical_root=root,
+        canonical_origin=origin,
+        principal=self_login,
+        event_type=event_type,
+        allowed_operations=_REPO_PR_REMEDIATION_ACTIONS,
+        pr_number=number,
+        head_repo=head_repo,
+        head_remote=head_remote,
+        destination_ref=f"refs/heads/{head_ref}",
+        observed_head_sha=head_sha.lower(),
+        base_ref=base_ref,
+        observed_base_sha=base_sha.lower(),
+    )
+
+
+def create_server_discovered_heartbeat_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+    *,
+    event_type: str,
+) -> Any:
+    """Create heartbeat authority from one provider-normalized live PR snapshot."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return None
+    return _repo_pr_scope(
+        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        repo=repo,
+        principal=pull_request.author,
+        event_type=event_type,
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+    )
+
+
+def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None) -> Any:
+    """Derive one immutable own-PR scope from a trusted single poller item."""
+    if (
+        service is None
+        or service.authority_profile != "github"
+        or event.trigger != "poller"
+        or not isinstance(event.extra, dict)
+    ):
+        return None
+    items = event.extra.get("items")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return None
+    item = items[0]
     from .models import RepoReviewState
-
-    return RepoReviewState(repo, number, head_ref, str(matching_roots[0]))
+    scope = _repo_pr_scope(
+        provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
+        repo=item.get("repo"),
+        principal=item.get("author"),
+        event_type=item.get("event_type"),
+        number=item.get("number"),
+        head_repo=item.get("head_repo"),
+        head_remote=item.get("head_remote"),
+        head_ref=item.get("head_ref"),
+        head_sha=item.get("head_sha"),
+        base_ref=item.get("base_ref"),
+        base_sha=item.get("base_sha"),
+    )
+    return RepoReviewState(scope) if scope is not None else None
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -1210,6 +1332,16 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     else:
         return None
     branch = state.head_ref
+    required_action = {
+        "checkout": RepoPRAction.CHECKOUT,
+        "add": RepoPRAction.WRITE,
+        "commit": RepoPRAction.COMMIT,
+        "worktree": RepoPRAction.CHECKOUT,
+        "pull": RepoPRAction.CHECKOUT,
+        "push": RepoPRAction.PUSH,
+    }.get(subcommand, RepoPRAction.INSPECT)
+    if not _repo_review_action_allowed(state, required_action):
+        return None
     if subcommand == "status":
         allowed = (
             all(argument.startswith("-") and argument != "--" for argument in arguments)
@@ -1463,6 +1595,14 @@ def _option_value(arguments: list[str], option: str) -> str | None:
     return None if value.startswith("-") else value
 
 
+def _repo_review_action_allowed(review_state: Any, action: RepoPRAction) -> bool:
+    scope = getattr(review_state, "action_scope", None)
+    return (
+        scope is not None
+        and action.value in getattr(scope, "allowed_operations", frozenset())
+    )
+
+
 def _target_matches_repo_review_shell_command(
     argv: list[str], review_state: Any = None,
 ) -> bool:
@@ -1505,13 +1645,24 @@ def _target_matches_repo_review_shell_command(
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         if subcommand == "checkout":
-            return review_state is not None and argv[3:] == [
+            return _repo_review_action_allowed(review_state, RepoPRAction.CHECKOUT) and argv[3:] == [
                 str(review_state.pr_number),
                 "--repo", review_state.repo,
                 "--branch", review_state.head_ref,
             ]
         if subcommand in {"edit", "comment"}:
-            if review_state is None or argv[3:4] != [str(review_state.pr_number)]:
+            required_actions = (
+                (RepoPRAction.PR_EDIT, RepoPRAction.PR_REREQUEST)
+                if subcommand == "edit"
+                else (RepoPRAction.PR_COMMENT,)
+            )
+            if (
+                not all(
+                    _repo_review_action_allowed(review_state, action)
+                    for action in required_actions
+                )
+                or argv[3:4] != [str(review_state.pr_number)]
+            ):
                 return False
             arguments = argv[4:]
             options = (
@@ -1563,6 +1714,13 @@ def _target_matches_repo_review_shell_command(
             argv[3:], exact_options=options,
         ):
             return False
+        if subcommand == "review":
+            if (
+                not _repo_review_action_allowed(review_state, RepoPRAction.PR_REVIEW)
+                or argv[3:4] != [str(review_state.pr_number)]
+                or _option_value(argv[4:], "--repo") != review_state.repo
+            ):
+                return False
         # The body file's SAFETY is enforced at capture time, not here — see
         # ``_capture_review_body_beneath_scratch``. Admission only decides the
         # option is permitted.
@@ -2899,16 +3057,45 @@ class SinkGate:
                     target, getattr(auth_context, "channel_id", None),
                 )
             )
+            github_repo_scope_denied = False
+            scope = None
+            if (
+                service_target_allowed
+                and service.authority_profile == "github"
+                and sink_category is SinkCategory.FILE
+                and _target_within_configured_repo_write_roots(target, "")
+            ):
+                review_state = getattr(auth_context, "repo_review_state", None)
+                scope = getattr(review_state, "action_scope", None)
+                try:
+                    target_in_scope = (
+                        scope is not None
+                        and Path(target).resolve().is_relative_to(
+                            Path(scope.canonical_root).resolve()
+                        )
+                    )
+                except (OSError, RuntimeError):
+                    target_in_scope = False
+                github_repo_scope_denied = (
+                    not target_in_scope
+                    or not _repo_review_action_allowed(
+                        review_state, RepoPRAction.WRITE,
+                    )
+                )
             if (
                 adapter is None
                 or synthesis_scope_denied
                 or not service_target_allowed
+                or github_repo_scope_denied
             ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
                     allowed=not enforce,
-                    reason="service_sink_destination_denied",
+                    reason=(
+                        "repo_pr_scope_denied" if github_repo_scope_denied
+                        else "service_sink_destination_denied"
+                    ),
                     service_principal=service,
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
@@ -2918,6 +3105,7 @@ class SinkGate:
                     refusal_detail=_service_shell_refusal_detail(
                         target, service_policy, review_state,
                     ),
+                    repo_pr_action_scope=scope,
                 )
 
         if not ifc_labels.labels:
@@ -4217,9 +4405,11 @@ class ToolAuthorization:
     # the fail-closed posture and never perform a mutable policy lookup.
     result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
+    repo_pr_action_scope: Any = field(default=None, repr=False)
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
+        scope = self.repo_pr_action_scope
         return {
             "tool": self.tool_name,
             "decision": self.decision.value,
@@ -4229,6 +4419,12 @@ class ToolAuthorization:
             "service_principal": self.service_principal.canonical if self.service_principal else None,
             "enforcement_enabled": self.enforcement_enabled,
             "is_shadow_decision": self.is_shadow_decision,
+            "scope_provenance": getattr(scope, "provenance", None),
+            "scope_id": getattr(scope, "scope_id", None),
+            "granted_actions": sorted(
+                getattr(scope, "allowed_operations", frozenset())
+            ),
+            "refusal_reason": self.reason if not self.allowed else None,
         }
 
 
@@ -4464,6 +4660,10 @@ class ToolRegistry:
             if auth_context is not None
             else None
         )
+        repo_pr_action_scope = (
+            getattr(auth_context, "repo_pr_action_scope", None)
+            if auth_context is not None else None
+        )
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -4507,6 +4707,7 @@ class ToolRegistry:
                 auth_context,
                 enforce=enforce,
             )
+            sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return sink_check
             if sink_check.is_shadow_decision:
@@ -4569,6 +4770,7 @@ class ToolRegistry:
                     service_allowed=service_allowed,
                 )
                 write_auth.flow_direction = flow_direction
+                write_auth.repo_pr_action_scope = repo_pr_action_scope
                 if write_auth.is_shadow_decision:
                     self._emit_shadow_decision(
                         write_auth, auth_context=auth_context, target=sink_target,
@@ -4650,6 +4852,7 @@ class ToolRegistry:
                 if sink_target is not None else None
             ),
             flow_direction=flow_direction,
+            repo_pr_action_scope=repo_pr_action_scope,
         )
 
         if is_shadow:
@@ -5835,7 +6038,7 @@ def create_auth_context(
     - ContextVar fallback heuristics
     - Single-active-turn heuristics
     """
-    from .models import AuthContext, TurnInteractivity
+    from .models import AuthContext, RepoPRActionScope, RepoReviewState, TurnInteractivity
 
     author = event.author
     canonical = author
@@ -5881,6 +6084,25 @@ def create_auth_context(
     ):
         bridge_instance = f"service:{registered_service.canonical}"
 
+    repo_review_state = _repo_review_state_from_event(event, registered_service)
+    carried_scope = event.repo_pr_action_scope
+    if not (
+        isinstance(carried_scope, RepoPRActionScope)
+        and carried_scope.provenance == "server_discovered"
+        and registered_service is not None
+        and registered_service.authority_profile == "heartbeat"
+        and event.trigger == "scheduled_tick"
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+    ):
+        carried_scope = None
+    if repo_review_state is None and carried_scope is not None:
+        repo_review_state = RepoReviewState(carried_scope)
+    action_scope = (
+        repo_review_state.action_scope if repo_review_state is not None else None
+    )
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -5896,7 +6118,8 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         service_authority=registered_service if is_service else None,
-        repo_review_state=_repo_review_state_from_event(event, registered_service),
+        repo_review_state=repo_review_state,
+        repo_pr_action_scope=action_scope,
         enforcement_enabled=enforce,
         source_session_acl=(
             event.source_session_acl
