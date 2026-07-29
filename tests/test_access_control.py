@@ -31,6 +31,7 @@ from mimir.access_control import (
     create_auth_context,
     get_service_principal,
     parse_service_shell_argv,
+    parse_service_shell_argv_with_reason,
 )
 from mimir.identities import IdentityResolver
 from mimir.models import (
@@ -2429,6 +2430,67 @@ async def test_service_shell_uses_resolved_authorized_cwd(
 
 
 @pytest.mark.asyncio
+async def test_service_chainlink_uses_tracker_reaching_authorized_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """Chainlink gets a server-selected cwd without exposing the home root."""
+    from langchain_core.messages import ToolMessage
+
+    from mimir.models import InformationFlowLabels
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "home"
+    state = home / "state"
+    tracker = home / ".chainlink"
+    state.mkdir(parents=True)
+    tracker.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots",
+        lambda: (state,),
+    )
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        service_principal="scheduler",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"scheduler:test"}),
+    )
+    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    ctx = _turn("turn-scheduler", "saga-scheduler", auth_context)
+    ctx.ifc_labels = labels
+    seen_args: dict[str, object] = {}
+
+    async def handler(request):
+        seen_args.update(request.tool_call["args"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                auth_context,
+                tool_name="shell_exec",
+                args={"command": "chainlink issue show 1051", "cwd": str(home)},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert seen_args["cwd"] == str(state.resolve())
+    assert seen_args["mimir_direct_argv"] == [
+        str(maintenance_pinned_executables["chainlink"]),
+        "issue", "show", "1051",
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("cwd_factory", "reason"),
     [
@@ -4602,13 +4664,13 @@ def test_repo_review_shell_profile_denies_destructive_or_unbounded_commands(
         (
             "/usr/local/bin/chainlink issue list --status all "
             "--label worklink:ready --json",
-            "/usr/local/bin/chainlink",
+            "chainlink",
         ),
-        ("/usr/local/bin/chainlink issue ready --json", "/usr/local/bin/chainlink"),
-        ("/usr/local/bin/chainlink issue show 922 --json", "/usr/local/bin/chainlink"),
+        ("/usr/local/bin/chainlink issue ready --json", "chainlink"),
+        ("/usr/local/bin/chainlink issue show 922 --json", "chainlink"),
         (
             "/usr/local/bin/chainlink issue list --status open",
-            "/usr/local/bin/chainlink",
+            "chainlink",
         ),
     ],
 )
@@ -4657,7 +4719,7 @@ def test_maintenance_shell_profile_admits_prompt_inspection_commands(
         ("rg --no-config -n needle .", "rg"),
         (
             "/usr/local/bin/chainlink issue ready --json",
-            "/usr/local/bin/chainlink",
+            "chainlink",
         ),
     ],
 )
@@ -4673,6 +4735,109 @@ def test_maintenance_shell_returns_pinned_execution_argv(
     assert argv is not None
     assert argv[0] == str(executable)
     assert Path(argv[0]).is_absolute()
+
+
+@pytest.mark.parametrize("profile", ["scheduler_read_only", "maintenance", "repo_review"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue show 1051 --json",
+        "chainlink issue list --status all --label worklink:ready -q",
+        "chainlink issue search 'large tool result spill' --quiet",
+        "chainlink issue ready --json",
+        "chainlink issue blocked",
+        "chainlink session status --json",
+        "chainlink issue create 'Track follow-up' -d 'Acceptance criteria' -p high -l rca",
+        "chainlink issue update 1051 --title 'Updated title' --priority critical",
+        "chainlink issue comment 1051 'RCA note' --kind observation",
+        "chainlink issue label 1051 worklink:ready",
+        "chainlink issue unlabel 1051 worklink:ready",
+        "chainlink issue block 1051 1040",
+        "chainlink issue unblock 1051 1040",
+        "chainlink issue relate 1051 1040 --type caused-by",
+        "chainlink issue unrelate 1051 1040 -t caused-by",
+        "chainlink issue close 1051 --no-changelog",
+        "chainlink issue reopen 1051",
+        "chainlink issue subissue 1051 'Narrow leaf' --description 'Acceptance: covered'",
+        "chainlink issue quick 'Capture investigation' --label follow-up",
+    ],
+)
+def test_trusted_service_profiles_admit_bounded_chainlink_surface(
+    profile: str,
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, profile)
+
+    assert argv is not None
+    assert argv[0] == str(maintenance_pinned_executables["chainlink"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/usr/local/bin/chainlink issue show 1051 --json",
+        "chainlink --json issue show 1051",
+        "chainlink issue --quiet search tracker",
+    ],
+)
+def test_chainlink_executable_spellings_and_global_output_options_are_admitted(
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, "scheduler_read_only")
+
+    assert argv is not None
+    assert argv[0] == str(maintenance_pinned_executables["chainlink"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink show 1051",
+        "chainlink issue rm 1051",
+        "chainlink issue show 1051 --log-level debug",
+        "chainlink issue show --json delete 1051",
+        "chainlink issue create --description",
+        "chainlink issue comment 1051",
+        "chainlink issue close not-an-id",
+    ],
+)
+def test_chainlink_denies_destructive_alias_and_malformed_shapes(command: str) -> None:
+    assert parse_service_shell_argv(command, "maintenance") is None
+
+
+@pytest.mark.parametrize("executable", ["chainlink", "/usr/local/bin/chainlink"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "issue delete 1051",
+        "issue close-all --status open",
+        "init",
+        "locks claim 1051",
+        "locks steal 1051",
+        "locks release 1051",
+        "delete 1051",
+        "close-all --status open",
+    ],
+)
+def test_chainlink_boundary_survives_executable_spellings_and_flat_aliases(
+    executable: str,
+    arguments: str,
+) -> None:
+    assert parse_service_shell_argv(
+        f"{executable} --json {arguments}", "maintenance",
+    ) is None
+
+
+def test_chainlink_lock_refusal_names_coordination_boundary() -> None:
+    _, reason = parse_service_shell_argv_with_reason(
+        "chainlink locks release 1051", "maintenance",
+    )
+
+    assert "reserved to Worklink" in reason
+    assert "orphan an in-flight build" in reason
+    assert "issue show/list/search/ready/blocked" in reason
 
 
 @pytest.mark.parametrize("failure", ["missing", "symlink", "non_executable"])
@@ -4907,9 +5072,6 @@ def test_maintenance_git_denies_unconfigured_roots_and_model_git_globals(
         "gh auth login",
         "gh pr create --title mutation",
         "gh issue comment 922 --body mutation",
-        "chainlink issue list --status open",
-        "chainlink issue create mutation",
-        "chainlink issue comment 922 mutation",
         "/tmp/chainlink issue list --status open",
         "npm ci",
         "npm install left-pad",
