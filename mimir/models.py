@@ -6,6 +6,8 @@ TurnRecord is the on-disk turns.jsonl shape (SPEC §10.2).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import threading
 import uuid
@@ -19,6 +21,24 @@ class TurnInteractivity(StrEnum):
 
     INTERACTIVE = "interactive"
     NON_INTERACTIVE = "non_interactive"
+
+
+class RepoPRScopeProvenance(StrEnum):
+    POLLER_PAYLOAD = "poller_payload"
+    SERVER_DISCOVERED = "server_discovered"
+
+
+class RepoPRAction(StrEnum):
+    """Closed action vocabulary for one repo/PR authority scope."""
+
+    INSPECT = "repo.inspect"
+    CHECKOUT = "repo.checkout"
+    WRITE = "repo.write"
+    COMMIT = "repo.commit"
+    PUSH = "repo.push"
+    PR_COMMENT = "pr.comment"
+    PR_EDIT = "pr.edit"
+    PR_REVIEW = "pr.review"
 
 
 class FlowLabel(StrEnum):
@@ -448,6 +468,9 @@ class AgentEvent:
     # Exact immutable service grant selected by a trusted internal constructor.
     # Public ingress never copies this object from request data.
     service_authority: Any = None
+    # Optional server-discovered heartbeat authority. Poller scopes are always
+    # rebuilt from their one trusted payload item and never accepted here.
+    repo_pr_action_scope: "RepoPRActionScope | None" = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
@@ -521,14 +544,81 @@ class SessionACL:
 
 
 @dataclass(frozen=True)
-class RepoReviewState:
-    """Server-bound branch scope and monotonic checkout proof for one PR turn."""
+class RepoPRActionScope:
+    """Immutable server-issued authority for actions on one observed PR state."""
 
-    repo: str
+    provenance: RepoPRScopeProvenance
+    canonical_repo: str
+    canonical_root: str
+    canonical_origin: str
+    principal: str
+    event_type: str
+    allowed_operations: frozenset[str]
     pr_number: int
-    head_ref: str
-    root: str
+    head_repo: str
+    head_remote: str
+    destination_ref: str
+    observed_head_sha: str
+    base_ref: str
+    observed_base_sha: str
+    scope_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        provenance = RepoPRScopeProvenance(self.provenance)
+        object.__setattr__(self, "provenance", provenance)
+        if not isinstance(self.allowed_operations, frozenset):
+            raise TypeError("allowed_operations must be a frozenset")
+        unknown_actions = self.allowed_operations - frozenset(
+            action.value for action in RepoPRAction
+        )
+        if unknown_actions:
+            raise ValueError("unsupported repo/PR action")
+        authority = {
+            "provenance": self.provenance,
+            "canonical_repo": self.canonical_repo,
+            "canonical_root": self.canonical_root,
+            "canonical_origin": self.canonical_origin,
+            "principal": self.principal,
+            "event_type": self.event_type,
+            "allowed_operations": sorted(self.allowed_operations),
+            "pr_number": self.pr_number,
+            "head_repo": self.head_repo,
+            "head_remote": self.head_remote,
+            "destination_ref": self.destination_ref,
+            "observed_head_sha": self.observed_head_sha,
+            "base_ref": self.base_ref,
+            "observed_base_sha": self.observed_base_sha,
+        }
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
+        object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
+
+    @property
+    def head_ref(self) -> str:
+        return self.destination_ref.removeprefix("refs/heads/")
+
+
+@dataclass(frozen=True)
+class RepoReviewState:
+    """Immutable PR authority plus a monotonic, non-authority checkout proof."""
+
+    action_scope: RepoPRActionScope
     checked_out: bool = field(default=False, init=False, compare=False)
+
+    @property
+    def repo(self) -> str:
+        return self.action_scope.canonical_repo
+
+    @property
+    def pr_number(self) -> int:
+        return self.action_scope.pr_number
+
+    @property
+    def head_ref(self) -> str:
+        return self.action_scope.head_ref
+
+    @property
+    def root(self) -> str:
+        return self.action_scope.canonical_root
 
     def mark_checked_out(self) -> None:
         object.__setattr__(self, "checked_out", True)
@@ -586,6 +676,9 @@ class AuthContext:
     # remediation event. The mutable bit is monotonic and records successful
     # checkout; the authority-bearing scope itself remains frozen.
     repo_review_state: RepoReviewState | None = field(
+        default=None, repr=False, compare=False,
+    )
+    repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does

@@ -38,6 +38,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    RepoPRActionScope,
     RepoReviewState,
     SessionACL,
     SourceLabel,
@@ -99,6 +100,25 @@ def _event(author: str | None) -> AgentEvent:
         author=author,
         content="hello",
     )
+
+
+def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewState:
+    return RepoReviewState(RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo=repo,
+        canonical_root=root,
+        canonical_origin=f"https://github.com/{repo}.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in access_control.RepoPRAction),
+        pr_number=number,
+        head_repo=repo,
+        head_remote="origin",
+        destination_ref=f"refs/heads/{branch}",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    ))
 
 
 READ_RESOURCE_TOOLS = (
@@ -3450,9 +3470,11 @@ def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
     message_file = scratch / "commit-message.txt"
     message_file.write_text("Address review feedback\n", encoding="utf-8")
-    state = RepoReviewState("o/r", 1243, "issue/1028-a1", str(root.resolve()))
+    state = _review_state("o/r", 1243, "issue/1028-a1", str(root.resolve()))
     state.mark_checked_out()
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
@@ -3543,7 +3565,7 @@ def test_repo_review_profile_denies_privilege_widening_forms(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = RepoReviewState("o/r", 1243, "issue/1028-a1", str(root.resolve()))
+    state = _review_state("o/r", 1243, "issue/1028-a1", str(root.resolve()))
     state.mark_checked_out()
 
     assert parse_service_shell_argv(
@@ -3565,7 +3587,7 @@ def test_repo_review_worktree_write_stays_inside_configured_repo_roots(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = RepoReviewState("o/r", 1243, "fix/1243", str(root.resolve()))
+    state = _review_state("o/r", 1243, "fix/1243", str(root.resolve()))
 
     assert parse_service_shell_argv(
         f"git worktree add {outside / 'worktree'} fix/1243",
@@ -3585,7 +3607,7 @@ def test_repo_review_push_never_treats_protected_event_branch_as_owned(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = RepoReviewState("o/r", 1243, "main", str(root.resolve()))
+    state = _review_state("o/r", 1243, "main", str(root.resolve()))
     state.mark_checked_out()
 
     assert parse_service_shell_argv(
@@ -3626,7 +3648,7 @@ def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = RepoReviewState("o/r", 979, "worklink/979", str(root.resolve()))
+    state = _review_state("o/r", 979, "worklink/979", str(root.resolve()))
     service = build_trigger_service_principal(
         canonical="poller:github-activity",
         trigger="poller",
@@ -3706,7 +3728,7 @@ def test_repo_review_metadata_writes_are_bound_to_event_repo_and_pr(
     body_file = scratch / "pr-update.md"
     body_file.write_text("updated evidence")
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    state = RepoReviewState("o/r", 979, "worklink/979", str(tmp_path))
+    state = _review_state("o/r", 979, "worklink/979", str(tmp_path))
 
     edit = parse_service_shell_argv(
         f"gh pr edit 979 --repo o/r --body-file {body_file} "
@@ -3756,7 +3778,7 @@ def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
-    state = RepoReviewState("o/r", 7, "worklink/7", str(root.resolve()))
+    state = _review_state("o/r", 7, "worklink/7", str(root.resolve()))
     state.mark_checked_out()
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
@@ -3821,7 +3843,7 @@ async def test_repo_review_successful_checkout_unlocks_same_branch_push(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
-    state = RepoReviewState("o/r", 12, "worklink/12", str(root.resolve()))
+    state = _review_state("o/r", 12, "worklink/12", str(root.resolve()))
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
@@ -3885,6 +3907,8 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
     )
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
     authority = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
@@ -3898,25 +3922,174 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
             "poller_name": "github-activity",
             "items": [{
                 "event_type": "pr_changes_requested_stale",
-                "repo": "o/r", "number": 42, "head_ref": "worklink/42",
+                "repo": "o/r", "number": 42, "author": "mimir-bot",
+                "head_repo": "o/r", "head_remote": "origin",
+                "head_ref": "worklink/42", "head_sha": "a" * 40,
+                "base_ref": "main", "base_sha": "b" * 40,
             }],
         },
     )
 
     auth = create_auth_context(event, enforce=True)
 
-    assert auth.repo_review_state == RepoReviewState(
-        "o/r", 42, "worklink/42", str(root.resolve()),
-    )
+    assert auth.repo_review_state is not None
+    assert auth.repo_review_state.repo == "o/r"
+    assert auth.repo_review_state.pr_number == 42
+    assert auth.repo_review_state.head_ref == "worklink/42"
+    assert auth.repo_review_state.root == str(root.resolve())
+    assert auth.repo_pr_action_scope is auth.repo_review_state.action_scope
+    assert auth.repo_pr_action_scope.provenance == "poller_payload"
 
     steered = replace(
         event,
         extra={**event.extra, "items": [{
             "event_type": "pr_changes_requested_stale",
-            "repo": "attacker/other", "number": 42, "head_ref": "main",
+            "repo": "attacker/other", "number": 42, "author": "mimir-bot",
+            "head_repo": "attacker/other", "head_remote": "origin",
+            "head_ref": "main", "head_sha": "a" * 40,
+            "base_ref": "main", "base_sha": "b" * 40,
         }]},
     )
     assert create_auth_context(steered, enforce=True).repo_review_state is None
+
+
+def _github_scope_test_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, ServicePrincipal, dict[str, object]]:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "remote", "add", "origin", "https://github.com/o/r.git"],
+        check=True,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "write_file", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    item: dict[str, object] = {
+        "event_type": "pr_changes_requested_stale",
+        "repo": "o/r", "number": 42, "author": "mimir-bot",
+        "head_repo": "o/r", "head_remote": "origin",
+        "head_ref": "worklink/42", "head_sha": "a" * 40,
+        "base_ref": "main", "base_sha": "b" * 40,
+    }
+    return root, authority, item
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo", "attacker/other"),
+        ("event_type", "pr_review"),
+        ("author", "someone-else"),
+        ("head_repo", "fork/r"),
+        ("head_remote", "upstream"),
+    ],
+)
+def test_poller_scope_forged_or_wrong_authority_fields_fail_closed(
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item[field] = value
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+
+    assert create_auth_context(event, enforce=True).repo_pr_action_scope is None
+
+
+def test_poller_scope_requires_single_isolated_item_and_configured_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    base = dict(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+    )
+    mixed = AgentEvent(**base, extra={"items": [item, dict(item)]})
+    monkeypatch.setenv("GITHUB_REPOS", "other/repo")
+    unconfigured = AgentEvent(**base, extra={"items": [item]})
+
+    assert create_auth_context(mixed, enforce=True).repo_pr_action_scope is None
+    assert create_auth_context(unconfigured, enforce=True).repo_pr_action_scope is None
+
+
+def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    first = create_auth_context(event, enforce=True).repo_pr_action_scope
+    second = create_auth_context(event, enforce=True).repo_pr_action_scope
+
+    assert first is not None and second is not None
+    assert first.scope_id == second.scope_id
+    assert first.allowed_operations == frozenset(
+        action.value for action in access_control.RepoPRAction
+    )
+    with pytest.raises(FrozenInstanceError):
+        first.destination_ref = "refs/heads/main"
+    with pytest.raises(ValueError, match="unsupported repo/PR action"):
+        replace(first, allowed_operations=frozenset({"repo.push", "repo.anything"}))
+    fields = access_control.ToolAuthorization(
+        tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="repo_pr_scope_denied", repo_pr_action_scope=first,
+    ).as_log_fields()
+    assert fields["scope_provenance"] == "poller_payload"
+    assert fields["scope_id"] == first.scope_id
+    assert fields["granted_actions"] == sorted(first.allowed_operations)
+    assert fields["refusal_reason"] == "repo_pr_scope_denied"
+
+
+def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfork_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
+    pr = {
+        "state": "open", "number": 42, "user": {"login": "mimir-bot"},
+        "head": {
+            "ref": "worklink/42", "sha": "a" * 40,
+            "repo": {"full_name": "o/r"},
+        },
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+    scope = access_control.create_server_discovered_heartbeat_scope(
+        "o/r", pr, event_type="pr_changes_requested_stale",
+    )
+
+    assert scope is not None
+    assert scope.provenance == "server_discovered"
+    assert scope.canonical_root == str(root.resolve())
+    for change in (
+        {"state": "closed"},
+        {"user": {"login": "someone-else"}},
+        {"head": {**pr["head"], "repo": {"full_name": "fork/r"}}},
+    ):
+        candidate = {**pr, **change}
+        assert access_control.create_server_discovered_heartbeat_scope(
+            "o/r", candidate, event_type="pr_changes_requested_stale",
+        ) is None
+    assert access_control.create_server_discovered_heartbeat_scope(
+        "o/r", pr, event_type="pr_review",
+    ) is None
 
 
 def test_every_service_shell_profile_returns_absolute_executables(
@@ -4084,9 +4257,12 @@ def test_repo_review_profile_admits_pr_review_with_scratch_body_file(
     (home / "secret.txt").write_text("SECRET", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
 
     def admitted(command: str) -> bool:
-        return parse_service_shell_argv(command, "repo_review") is not None
+        return parse_service_shell_argv(
+            command, "repo_review", review_state=state,
+        ) is not None
 
     # The body is CAPTURED during authorization (see the check/use-race test
     # below), so it must already exist and be readable — a not-yet-written body
@@ -4154,9 +4330,11 @@ def test_repo_review_body_is_captured_not_re_looked_up(
 
     body = scratch / "review.md"
     body.write_text("## Summary\nsecond line\n", encoding="utf-8")
+    state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
     argv = parse_service_shell_argv(
         f"gh pr review 7 --repo o/r --request-changes --body-file {body}",
         "repo_review",
+        review_state=state,
     )
 
     assert argv is not None
@@ -4178,6 +4356,7 @@ def test_repo_review_body_is_captured_not_re_looked_up(
     # And a body that is ALREADY an outside-pointing symlink is refused outright.
     assert parse_service_shell_argv(
         f"gh pr review 7 --repo o/r --approve --body-file {body}", "repo_review",
+        review_state=state,
     ) is None
 
     # A swapped PARENT component is refused too (O_NOFOLLOW on each element).
@@ -4186,12 +4365,14 @@ def test_repo_review_body_is_captured_not_re_looked_up(
     nested.write_text("fine", encoding="utf-8")
     assert parse_service_shell_argv(
         f"gh pr review 7 --repo o/r --approve --body-file {nested}", "repo_review",
+        review_state=state,
     ) is not None
     shutil.rmtree(scratch / "d")
     (scratch / "d").symlink_to(home)
     assert parse_service_shell_argv(
         f"gh pr review 7 --repo o/r --approve --body-file {scratch}/d/secret.txt",
         "repo_review",
+        review_state=state,
     ) is None
 
     # An oversize body is refused rather than silently truncated into a review.
@@ -4199,6 +4380,7 @@ def test_repo_review_body_is_captured_not_re_looked_up(
     big.write_text("x" * (access_control._REVIEW_BODY_MAX_BYTES + 1), encoding="utf-8")
     assert parse_service_shell_argv(
         f"gh pr review 7 --repo o/r --approve --body-file {big}", "repo_review",
+        review_state=state,
     ) is None
 
 
