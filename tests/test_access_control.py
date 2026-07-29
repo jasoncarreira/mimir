@@ -2100,10 +2100,10 @@ def test_service_shell_refusal_reason_withholds_argument_values() -> None:
         f"gh -t{sentinel} pr view 1",
         # long option with an attached value
         f"gh pr view 1 --token={sentinel}",
-        # bare alphanumeric positional
-        f"gh api {sentinel}",
-        # plain-looking path positional, shaped like an API resource
-        f"gh api private/path/{sentinel}",
+        # API path values are admitted for GET, so force a refusal with a
+        # mutating method while retaining each positional value shape.
+        f"gh api {sentinel} --method POST",
+        f"gh api private/path/{sentinel} --method POST",
         # the executable itself
         f"/opt/{sentinel}/bin/tool run",
         # value inside a URL
@@ -3428,16 +3428,192 @@ def test_repo_review_shell_profile_admits_pr_view_repo_alias(
 @pytest.mark.parametrize(
     "command",
     [
-        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews/4789681429",
-        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews --paginate",
-        "gh api repos/jasoncarreira/mimir/pulls/1220/files --paginate",
         "gh api repos/jasoncarreira/mimir/pulls/1220/reviews -f body=approved",
         "gh api repos/jasoncarreira/mimir/pulls/1220/reviews --method POST",
-        "gh api user",
+        "gh api repos/jasoncarreira/mimir/pulls/1220/reviews --input body.json",
     ],
 )
-def test_repo_review_shell_profile_rejects_gh_api(command: str) -> None:
+def test_repo_review_shell_profile_rejects_mutating_gh_api(command: str) -> None:
     assert parse_service_shell_argv(command, "repo_review") is None
+
+
+def test_repo_review_profile_admits_bounded_review_and_remediation_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    root.mkdir()
+    scratch.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    message_file = scratch / "commit-message.txt"
+    message_file.write_text("Address review feedback\n", encoding="utf-8")
+    state = RepoReviewState("o/r", 1243, "issue/1028-a1", str(root.resolve()))
+    state.mark_checked_out()
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()), repo_review_state=state,
+    )
+    registry = ToolRegistry()
+    worktree = root / "review-worktree"
+    admitted = (
+        "gh api repos/o/r/pulls/1243/reviews --paginate",
+        "gh api user -X GET",
+        "gh issue view 1028 --repo o/r --json number,title --comments",
+        "gh auth status",
+        "git log --oneline -5 -- mimir/access_control.py",
+        "git rev-parse HEAD",
+        "git remote -v",
+        "git branch --list issue/1028-a1",
+        "git worktree list --porcelain",
+        "git add mimir/access_control.py tests/test_access_control.py",
+        "git commit -m 'Address review feedback'",
+        f"git commit --file {message_file}",
+        "git checkout issue/1028-a1",
+        "git checkout -B issue/1028-a1",
+        f"git worktree add {worktree} issue/1028-a1",
+        "git pull --ff-only origin issue/1028-a1",
+        "gh pr checkout 1243 --repo o/r --branch issue/1028-a1",
+        "git push --dry-run origin FETCH_HEAD:refs/heads/issue/1028-a1",
+    )
+
+    for command in admitted:
+        decision = registry.authorize_tool(
+            "shell_exec", auth, enforce=True, target_channel=command,
+        )
+        assert decision.allowed is True, (command, decision.refusal_detail)
+
+    commit_argv = parse_service_shell_argv(
+        "git commit -m safe", "repo_review", review_state=state,
+    )
+    assert commit_argv is not None
+    name_index = commit_argv.index("user.name=mimir")
+    email_index = commit_argv.index("user.email=noreply@mimir-agent.local")
+    assert commit_argv[name_index - 1:name_index + 1] == [
+        "-c", "user.name=mimir",
+    ]
+    assert commit_argv[email_index - 1:email_index + 1] == [
+        "-c", "user.email=noreply@mimir-agent.local",
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push origin issue/1028-a1:refs/heads/main",
+        "git push origin main:refs/heads/main",
+        "git push --force origin issue/1028-a1:refs/heads/issue/1028-a1",
+        "git push --force-with-lease origin issue/1028-a1:refs/heads/issue/1028-a1",
+        "git push --delete origin issue/1028-a1",
+        "git push --mirror origin",
+        "git push --all origin",
+        "git push --tags origin",
+        "git push origin",
+        "git -c user.email=operator@example.com commit -m impersonate",
+        "git -c user.name=operator commit -m impersonate",
+        "git commit --author operator -m impersonate",
+        "gh api repos/o/r/issues/1 -X POST",
+        "gh api repos/o/r/issues/1 --method PATCH",
+        "gh api repos/o/r/issues/1 -f body=mutating",
+        "gh api repos/o/r/issues/1 --field body=mutating",
+        "gh api repos/o/r/issues/1 --input body.json",
+        "gh api repos/o/r/issues/1 --jq .body",
+        "gh api repos/o/r/../private --paginate",
+    ],
+)
+def test_repo_review_profile_denies_privilege_widening_forms(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    state = RepoReviewState("o/r", 1243, "issue/1028-a1", str(root.resolve()))
+    state.mark_checked_out()
+
+    assert parse_service_shell_argv(
+        command, "repo_review", review_state=state,
+    ) is None
+
+
+def test_repo_review_worktree_write_stays_inside_configured_repo_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    home = tmp_path / "home"
+    root.mkdir()
+    outside.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    state = RepoReviewState("o/r", 1243, "fix/1243", str(root.resolve()))
+
+    assert parse_service_shell_argv(
+        f"git worktree add {outside / 'worktree'} fix/1243",
+        "repo_review", review_state=state,
+    ) is None
+
+
+def test_repo_review_push_never_treats_protected_event_branch_as_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    home = tmp_path / "home"
+    root.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    state = RepoReviewState("o/r", 1243, "main", str(root.resolve()))
+    state.mark_checked_out()
+
+    assert parse_service_shell_argv(
+        "git push origin main:main", "repo_review", review_state=state,
+    ) is None
+    assert parse_service_shell_argv(
+        "git push origin main:refs/heads/main", "repo_review", review_state=state,
+    ) is None
+
+
+@pytest.mark.parametrize("profile", ["maintenance", "scheduler_read_only", "upgrade_workspace"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh api repos/o/r/pulls/1243/reviews --paginate",
+        "gh auth status",
+        "git worktree list --porcelain",
+        "git add file.py",
+        "git checkout -B issue/1028-a1",
+        "git push origin FETCH_HEAD:refs/heads/issue/1028-a1",
+    ],
+)
+def test_repo_review_additions_do_not_widen_other_profiles(
+    profile: str, command: str,
+) -> None:
+    assert parse_service_shell_argv(command, profile) is None
+
+
 def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4732,3 +4908,41 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
         "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
         "run:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_repo_review_push_is_bound_to_the_event_branch_not_the_namespace() -> None:
+    """A namespace-only rule let one leaf push into a sibling leaf's PR.
+
+    `issue/1029-a1:refs/heads/issue/1030-a1` was admitted because both sides
+    matched `issue/*`. That fast-forwards commits into another leaf's branch
+    while its PR is under review — the push-layer analogue of #1019, where a
+    build wrote into a concurrent sibling's worktree. Worklink runs two
+    `issue/*` builds at once, so the sibling is normally present.
+    """
+    from mimir.access_control import _repo_review_push_refspec
+
+    event_branch = "issue/1029-a1"
+
+    assert _repo_review_push_refspec(f"{event_branch}:{event_branch}", event_branch)
+    assert _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/{event_branch}", event_branch,
+    )
+    assert _repo_review_push_refspec(
+        f"FETCH_HEAD:refs/heads/{event_branch}", event_branch,
+    )
+
+    # Same namespace, different leaf — the case that was wrongly admitted.
+    assert not _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/issue/1030-a1", event_branch,
+    )
+    assert not _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/fix/anything", event_branch,
+    )
+    # Still denied for the reasons the earlier form already covered.
+    for refspec in (
+        f"{event_branch}:refs/heads/main",
+        f"+{event_branch}:refs/heads/{event_branch}",
+        f":refs/heads/{event_branch}",
+        f"{event_branch}:refs/tags/v1",
+    ):
+        assert not _repo_review_push_refspec(refspec, event_branch), refspec

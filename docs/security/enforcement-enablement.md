@@ -701,6 +701,30 @@ Applies to any turn under enforcement; **heartbeats and pollers benefit most**
 guidance. It reduces needless blocks/declassify churn; it does **not** widen what
 is allowed.
 
+### 5.7 Operator-directed channel egress
+
+A clean interactive operator request may direct `send_message` or `react` to a
+channel other than the triggering channel, and may use sinks classified as
+`CROSS_CHANNEL`, `DIRECT_MESSAGE`, or `NOTIFICATION`. This is an authority
+allowance, not declassification: `PUBLIC` is excluded, and every source must
+still include the operator in its effective ACL.
+
+The allowance is derived only from server-owned ingress state. The turn must be
+a bridge-authenticated `user_message`, explicitly `INTERACTIVE`, have no HTTP or
+other `event_ingress`, and carry a trusted active-ingest channel source whose
+principal, domain, resource, and bridge match the frozen `AuthContext`. The
+caller must also have the existing `admin` role required by the channel resource
+adapter. Finally, the live monotonic IFC state must evaluate to no untrusted
+active ingest; an absent or non-boolean evaluation does not count as clean.
+Tainted and non-operator turns therefore remain behind the existing one-use
+`approve_declassification` path.
+
+For replies to the triggering channel, a cross-channel `protected_prompt`
+source is ignored for the channel-equality conjunct only when its server-created
+integrity is `trusted`, which is how framework-authored context is marked.
+Untrusted foreign activity still blocks every `SAME_CHANNEL` sink using the
+generic gate; there is no `send_message`-specific exception.
+
 ---
 
 ## 6. Decisions and remaining questions
