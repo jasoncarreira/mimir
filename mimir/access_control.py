@@ -37,7 +37,11 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .identities import AccessMetadata
-from .models import RepoPRAction, RepoPRScopeProvenance
+from .models import (
+    NormalizedPullRequestSnapshot,
+    RepoPRAction,
+    RepoPRScopeProvenance,
+)
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
     read_target_from_arguments,
@@ -688,7 +692,7 @@ def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
     git = _maintenance_resolved_pin("git")
     if git is None:
         return None
-    matching_roots: list[Path] = []
+    matching_roots: list[tuple[Path, str]] = []
     for configured in _configured_repo_write_roots():
         try:
             root = configured.resolve(strict=True)
@@ -704,12 +708,14 @@ def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
             )
         except (OSError, RuntimeError, subprocess.SubprocessError):
             continue
-        remote_repo = _github_repo_from_remote(result.stdout)
+        observed_origin = result.stdout.strip()
+        remote_repo = _github_repo_from_remote(observed_origin)
         if result.returncode == 0 and remote_repo is not None and remote_repo.lower() == repo:
-            matching_roots.append(root)
+            matching_roots.append((root, observed_origin))
     if len(matching_roots) != 1:
         return None
-    return str(matching_roots[0]), f"https://github.com/{repo}.git"
+    root, observed_origin = matching_roots[0]
+    return str(root), observed_origin
 
 
 def _repo_pr_scope(
@@ -775,29 +781,29 @@ def _repo_pr_scope(
 
 
 def create_server_discovered_heartbeat_scope(
-    repo: str, github_pr: dict[str, Any], *, event_type: str,
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+    *,
+    event_type: str,
 ) -> Any:
-    """Create heartbeat authority only from a server-fetched live GitHub PR."""
-    if not isinstance(github_pr, dict) or github_pr.get("state") != "open":
-        return None
-    head = github_pr.get("head")
-    base = github_pr.get("base")
-    author = github_pr.get("user")
-    if not all(isinstance(value, dict) for value in (head, base, author)):
+    """Create heartbeat authority from one provider-normalized live PR snapshot."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
         return None
     return _repo_pr_scope(
         provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
         repo=repo,
-        principal=author.get("login"),
+        principal=pull_request.author,
         event_type=event_type,
-        number=github_pr.get("number"),
-        head_repo=(head.get("repo") or {}).get("full_name")
-        if isinstance(head.get("repo"), dict) else None,
-        head_remote="origin",
-        head_ref=head.get("ref"),
-        head_sha=head.get("sha"),
-        base_ref=base.get("ref"),
-        base_sha=base.get("sha"),
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
     )
 
 

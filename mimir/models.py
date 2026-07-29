@@ -42,6 +42,27 @@ class RepoPRAction(StrEnum):
     PR_REVIEW = "pr.review"
 
 
+@dataclass(frozen=True)
+class NormalizedPullRequestSnapshot:
+    """Provider-neutral observed pull-request state supplied by an adapter.
+
+    Hosting-provider payloads must be normalized before they cross into the
+    authority layer.  The scope factory therefore never needs to understand a
+    GitHub ``head.repo.full_name``, Bitbucket source branch, or GitLab merge-
+    request payload.
+    """
+
+    state: str
+    number: int
+    author: str
+    head_repo: str
+    head_remote: str
+    head_ref: str
+    head_sha: str
+    base_ref: str
+    base_sha: str
+
+
 class FlowLabel(StrEnum):
     """Immutable information flow control labels (chainlink #871).
 

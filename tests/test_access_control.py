@@ -38,6 +38,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    NormalizedPullRequestSnapshot,
     RepoPRActionScope,
     RepoReviewState,
     SessionACL,
@@ -3979,7 +3980,7 @@ def _github_scope_test_setup(
     home.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(
-        ["git", "-C", str(root), "remote", "add", "origin", "https://github.com/o/r.git"],
+        ["git", "-C", str(root), "remote", "add", "origin", "git@github.com:o/r.git"],
         check=True,
     )
     monkeypatch.setenv("MIMIR_HOME", str(home))
@@ -4061,6 +4062,7 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
 
     assert first is not None and second is not None
     assert first.scope_id == second.scope_id
+    assert first.canonical_origin == "git@github.com:o/r.git"
     assert first.allowed_operations == frozenset({
         access_control.RepoPRAction.INSPECT.value,
         access_control.RepoPRAction.CHECKOUT.value,
@@ -4090,14 +4092,17 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
-    pr = {
-        "state": "open", "number": 42, "user": {"login": "mimir-bot"},
-        "head": {
-            "ref": "worklink/42", "sha": "a" * 40,
-            "repo": {"full_name": "o/r"},
-        },
-        "base": {"ref": "main", "sha": "b" * 40},
-    }
+    pr = NormalizedPullRequestSnapshot(
+        state="open",
+        number=42,
+        author="mimir-bot",
+        head_repo="o/r",
+        head_remote="origin",
+        head_ref="worklink/42",
+        head_sha="a" * 40,
+        base_ref="main",
+        base_sha="b" * 40,
+    )
     scope = access_control.create_server_discovered_heartbeat_scope(
         "o/r", pr, event_type="pr_changes_requested_stale",
     )
@@ -4105,17 +4110,36 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     assert scope is not None
     assert scope.provenance == "server_discovered"
     assert scope.canonical_root == str(root.resolve())
+    assert scope.canonical_origin == "git@github.com:o/r.git"
     for change in (
         {"state": "closed"},
-        {"user": {"login": "someone-else"}},
-        {"head": {**pr["head"], "repo": {"full_name": "fork/r"}}},
+        {"author": "someone-else"},
+        {"head_repo": "fork/r"},
     ):
-        candidate = {**pr, **change}
+        candidate = replace(pr, **change)
         assert access_control.create_server_discovered_heartbeat_scope(
             "o/r", candidate, event_type="pr_changes_requested_stale",
         ) is None
     assert access_control.create_server_discovered_heartbeat_scope(
         "o/r", pr, event_type="pr_review",
+    ) is None
+
+
+def test_heartbeat_scope_rejects_raw_provider_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _github_scope_test_setup(tmp_path, monkeypatch)
+    raw_github_payload = {
+        "state": "open",
+        "number": 42,
+        "user": {"login": "mimir-bot"},
+        "head": {"ref": "worklink/42", "sha": "a" * 40,
+                 "repo": {"full_name": "o/r"}},
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+
+    assert access_control.create_server_discovered_heartbeat_scope(
+        "o/r", raw_github_payload, event_type="pr_changes_requested_stale",  # type: ignore[arg-type]
     ) is None
 
 
