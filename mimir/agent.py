@@ -1597,6 +1597,11 @@ class Agent:
                     guard_outside_root=True,
                 )
                 roots = getattr(self._config, "file_tool_roots", ()) or ()
+                lease_root = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+                if lease_root:
+                    candidate = Path(lease_root)
+                    if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
+                        roots = (*roots, (str(candidate.resolve()), "rw"))
                 routes = build_file_tool_routes(roots) if roots else {}
                 if routes:
                     self._backend = FileToolRouter(default=home_backend, routes=routes)

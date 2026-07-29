@@ -2558,6 +2558,33 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
     )
 
 
+def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> bool:
+    """Admit one file target only beneath this turn's exact active lease."""
+    lease = getattr(review_state, "checkout_lease", None)
+    if lease is None or not getattr(lease, "is_active", False):
+        return False
+    if getattr(lease, "scope_id", None) != getattr(
+        getattr(review_state, "action_scope", None), "scope_id", None
+    ):
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    root = Path(lease.path)
+    try:
+        lexical = candidate.relative_to(root)
+        resolved_root = root.resolve(strict=True)
+        resolved = candidate.resolve(strict=False)
+        relative = resolved.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not (
+        WriteResourceAdapter._is_protected_path(lexical)
+        or WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(relative)
+    )
+
+
 def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
     """Prevent one session boundary from mutating another channel's memory."""
     home = os.environ.get("MIMIR_HOME", "").strip()
@@ -3178,6 +3205,14 @@ class SinkGate:
                     service_target_allowed = adapter(
                         target, service_policy.destination,
                     )
+            if (
+                not service_target_allowed
+                and sink_category is SinkCategory.FILE
+                and service.canonical == "poller:github-activity"
+            ):
+                service_target_allowed = _target_within_active_pr_checkout_lease(
+                    target, review_state,
+                )
             synthesis_scope_denied = (
                 service.canonical == "synthesis"
                 and sink_category is SinkCategory.FILE

@@ -650,7 +650,10 @@ def _request_with_resolved_service_write_path(
     if policy is None or policy.adapter != "trigger_service_write_roots":
         return request
 
-    from ..access_control import resolve_trigger_service_write_target
+    from ..access_control import (
+        _target_within_active_pr_checkout_lease,
+        resolve_trigger_service_write_target,
+    )
 
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     argument_name = "file_path" if "file_path" in args else "path"
@@ -658,9 +661,13 @@ def _request_with_resolved_service_write_path(
     if not isinstance(raw_path, str) or not raw_path:
         return request
     try:
-        args[argument_name] = str(
-            resolve_trigger_service_write_target(raw_path, policy.destination)
-        )
+        review_state = getattr(auth_context, "repo_review_state", None)
+        if _target_within_active_pr_checkout_lease(raw_path, review_state):
+            args[argument_name] = str(Path(raw_path).resolve(strict=False))
+        else:
+            args[argument_name] = str(
+                resolve_trigger_service_write_target(raw_path, policy.destination)
+            )
     except (OSError, RuntimeError, ValueError):
         # Leave the original destination intact so the sink adapter denies it.
         return request
