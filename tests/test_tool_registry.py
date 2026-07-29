@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import subprocess
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -40,7 +38,6 @@ _OLD_ADMIN_TOOLS = {
     "worklink_run",
     "shell_exec",
     "bash_async",
-    "spawn_codex",
     "spawn_open_code",
     "task",
     "saga_forget",
@@ -101,74 +98,6 @@ def _service_labels(event) -> InformationFlowLabels:
             authorized_principals=frozenset({principal}) if principal else frozenset(),
         )}),
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("tool_name", "failure_kind", "expected"),
-    [
-        ("spawn_codex", "exit", "exit=7 stderr=" + "x" * 500),
-        ("spawn_codex", "timeout", "timed out after 3s"),
-        ("spawn_codex", "missing", "'codex' CLI not on PATH"),
-    ],
-)
-async def test_spawn_subprocess_failures_emit_failed_tool_calls(
-    tool_name: str,
-    failure_kind: str,
-    expected: str,
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mimir.tools import registry
-
-    spawn_tool = getattr(registry, tool_name)
-    registry.set_spawn_config({"default_cwd": tmp_path})
-    registry._spawn_reset_for_tests()
-
-    def fail_subprocess(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
-        if failure_kind == "timeout":
-            raise subprocess.TimeoutExpired(cmd=tool_name, timeout=3)
-        if failure_kind == "missing":
-            raise FileNotFoundError(tool_name)
-        return 7, "", "x" * 501
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", fail_subprocess)
-    events: list[tuple[str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        budget_gate,
-        "_emit_event_sync",
-        lambda kind, **fields: events.append((kind, fields)),
-    )
-
-    node = ToolNode(
-        [spawn_tool],
-        awrap_tool_call=budget_gate.BudgetGateMiddleware().awrap_tool_call,
-    )
-    result = await node._afunc(
-        [{
-            "name": tool_name,
-            "args": {"prompt": "test", "timeout_s": 3},
-            "id": "spawn-failure",
-            "type": "tool_call",
-        }],
-        {},
-        Runtime(context=replace(
-            _auth_context(roles=("admin",), enforce=True),
-            ifc_labels=InformationFlowLabels(),
-        )),
-    )
-
-    messages = result["messages"] if isinstance(result, dict) else result
-    assert len(messages) == 1
-    assert messages[0].status == "error"
-    assert expected in messages[0].content
-    assert registry._SPAWN_GUARD.recent, "reported failures must retain their rate slot"
-    tool_call = next(
-        fields for kind, fields in events
-        if kind == "tool_call" and fields.get("tool") == tool_name
-    )
-    assert tool_call["ok"] is False
-    assert expected[:100] in str(tool_call["error"])
 
 
 @pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
@@ -489,11 +418,11 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
     [
         ("scheduled_tick", "shell_exec", "request_mimir_update", True),
         ("scheduled_tick", "read_file", "request_mimir_update", True),
-        ("upgrade", "submit_proposal", "spawn_codex", True),
-        ("upgrade", "read_file", "spawn_codex", True),
-        ("saga_session_end", "saga_end_session", "spawn_codex", True),
-        ("saga_session_end", "read_file", "spawn_codex", True),
-        ("saga_session_end", "memory_get", "spawn_codex", True),
+        ("upgrade", "submit_proposal", "spawn_open_code", True),
+        ("upgrade", "read_file", "spawn_open_code", True),
+        ("saga_session_end", "saga_end_session", "spawn_open_code", True),
+        ("saga_session_end", "read_file", "spawn_open_code", True),
+        ("saga_session_end", "memory_get", "spawn_open_code", True),
     ],
 )
 def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
@@ -1050,7 +979,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
-    spawn_ops = {"spawn_codex", "spawn_open_code"}
+    spawn_ops = {"spawn_open_code"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
     worklink_ops = {"worklink_run"}
@@ -1104,7 +1033,7 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     forbidden = {
         "shell_exec",
         "bash_async",
-        "spawn_codex",
+        "spawn_open_code",
         "add_schedule",
         "remove_schedule",
         "send_message",
@@ -1139,7 +1068,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     for cap in all_expected:
         assert system.has_capability(cap), f"system missing {cap}"
 
-    forbidden = {"spawn_codex", "worklink_run", "saga_forget"}
+    forbidden = {"spawn_open_code", "worklink_run", "saga_forget"}
     for cap in forbidden:
         assert not system.has_capability(cap), f"system should NOT have {cap}"
 
@@ -1162,7 +1091,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
         ("saga_session_end", "spawn_open_code", False),
         ("saga_session_end", "add_schedule", False),
         ("upgrade", "submit_proposal", True),
-        ("upgrade", "spawn_codex", False),
+        ("upgrade", "spawn_open_code", False),
         ("upgrade", "worklink_run", False),
     ]
 

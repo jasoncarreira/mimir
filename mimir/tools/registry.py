@@ -10,7 +10,7 @@ Tools ported:
                        set_poller_overrides, reload_pollers
   committools.py:     commitment_complete, commitment_snooze,
                        commitment_dismiss, commitment_list
-  spawn.py:           spawn_codex, spawn_open_code
+  spawn.py:           spawn_open_code
 
 Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
 other split-out tool modules, this is mimir's agent-facing surface.
@@ -1787,123 +1787,10 @@ def _run_spawn_subprocess(
         text=True,
         timeout=timeout_s,
         env=env,
-        # Headless spawn: never inherit the parent's stdin. ``codex exec``
-        # reads stdin (appends it to the prompt) and would block until the
-        # timeout if stdin is an open pipe/TTY; DEVNULL EOFs immediately so
-        # it uses the prompt arg only.
+        # Headless spawn: never inherit the parent's stdin.
         stdin=subprocess.DEVNULL,
     )
     return proc.returncode, proc.stdout, proc.stderr
-
-
-@tool
-async def spawn_codex(
-    prompt: str,
-    cwd: Optional[str] = None,
-    timeout_s: int = 1800,
-    name: Optional[str] = None,
-    model: Optional[str] = None,
-) -> str:
-    """Spawn a Codex CLI subprocess to execute a complex task.
-
-    Runs ``codex exec <prompt>`` once, non-interactively, and returns its
-    output. Use for work you'd rather hand to Codex than the parent agent —
-    context isolation, independent execution, or a second model's take.
-    Registered only when the ``codex`` CLI is on PATH (the tool-list gate
-    consults ``providers.codex_available``), so it never appears on a
-    deployment that can't run it.
-
-    Shares the per-hour / concurrency / recursion-depth budget with the
-    other coding CLI spawns, so an agent can't fork-bomb via either path.
-
-    Codex CLI invocation note: ``codex exec`` is the non-interactive
-    subcommand, but exact flags vary by codex version + setup. Extra
-    flags (sandbox / approval mode, ``--json``, ...) are injected
-    verbatim from ``MIMIR_CODEX_SPAWN_ARGS`` (shlex-split), so the
-    operator tunes the invocation without a code change.
-
-    Args:
-        prompt: The task to hand to the spawned Codex instance.
-        cwd: Working directory for the subprocess. Defaults to home.
-        timeout_s: Subprocess timeout (default 30 min).
-        name: Optional label recorded in the spawn log.
-        model: Codex model name, passed as ``--model``. Omit for the
-            CLI default.
-    """
-    cfg = _STATE["spawn_config"]
-    if cfg is None:
-        return "spawn_codex failed: no spawn config"
-    if not prompt or not prompt.strip():
-        return "spawn_codex failed: prompt is required"
-
-    # Shared spawn caps. Depth check first (cheapest), then the
-    # per-hour rate slot, then the concurrency semaphore.
-    guard = _spawn_guard_init()
-    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
-        _SPAWN_DEPTH_ENV
-    ) else 0
-    if current_depth >= guard.max_depth:
-        return (
-            f"spawn_codex refused: recursion depth cap reached "
-            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth}). "
-            f"The parent agent is already at this nesting level — "
-            f"deeper spawns would risk a fork-bomb / unbounded budget."
-        )
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_codex")
-    if rate_err is not None:
-        return rate_err
-
-    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
-    import shlex
-    argv = ["codex", "exec"]
-    # Operator-tunable extra flags (sandbox/approval mode, --json, etc.) —
-    # the codex CLI surface varies by version, so don't hardcode beyond
-    # the subcommand. e.g. MIMIR_CODEX_SPAWN_ARGS="--full-auto".
-    argv += shlex.split(os.environ.get("MIMIR_CODEX_SPAWN_ARGS", ""))
-    if model:
-        argv += ["--model", model]
-    # ``--`` separator so a prompt starting with ``-`` isn't parsed as a flag.
-    argv += ["--", prompt]
-
-    # Minimal env (#494): infra + OpenAI/Codex creds + the incremented
-    # spawn depth. codex also reads ~/.codex/auth.json via HOME (passed
-    # through). Unrelated secrets are NOT inherited.
-    child_env = _minimal_child_env(
-        depth=current_depth + 1, cred_prefixes=("OPENAI_", "CODEX_"),
-    )
-
-    assert guard.sem is not None
-    failure: str | None = None
-    try:
-        async with guard.sem:
-            try:
-                returncode, stdout, stderr = await asyncio.to_thread(
-                    _run_spawn_subprocess,
-                    argv,
-                    str(cwd_path) if cwd_path else None,
-                    timeout_s,
-                    child_env,
-                )
-            except subprocess.TimeoutExpired:
-                failure = f"spawn_codex timed out after {timeout_s}s"
-            except FileNotFoundError:
-                failure = "spawn_codex failed: 'codex' CLI not on PATH"
-    except BaseException:
-        await _spawn_release_rate_slot(guard, rate_token)
-        raise
-    if failure is not None:
-        raise ToolException(failure)
-    if returncode != 0:
-        raise ToolException(
-            f"spawn_codex failed: exit={returncode} stderr={stderr[:500]}"
-        )
-    # codex exec writes its result to stdout (text, or JSONL with --json).
-    # Return it verbatim (truncated); unlike claude -p's structured JSON the
-    # codex output shape varies by flags, so don't assume a parse.
-    return json.dumps({"result": stdout.strip()[:2000], "name": name}, indent=2)
-
-
-spawn_codex.handle_tool_error = True
 
 
 def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
@@ -2007,9 +1894,7 @@ async def spawn_open_code(
     provides a backend-shaped coding tool. Registered only when the
     ``opencode`` CLI is on PATH (``providers.opencode_available``).
 
-    Shares the spawn caps with spawn_codex — one
-    per-hour / concurrency / recursion-depth budget across all spawn
-    paths.
+    Uses the shared per-hour / concurrency / recursion-depth spawn budget.
 
     Args:
         prompt: The task to hand to the spawned OpenCode instance.
@@ -2461,11 +2346,7 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
             tools.append(web_search)
         if fetch_url_on:
             tools.append(fetch_url)
-    from ..providers import codex_available
-    # Gate spawn_codex on the ``codex`` CLI (chainlink #293).
-    if codex_available():
-        tools.append(spawn_codex)
-    # And for spawn_open_code on the ``opencode`` CLI (chainlink #830).
+    # Gate spawn_open_code on the ``opencode`` CLI (chainlink #830).
     from ..providers import opencode_available
     if opencode_available():
         tools.append(spawn_open_code)

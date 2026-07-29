@@ -112,7 +112,7 @@ you already rely on are contained-by-construction:
 > **Important correction (mimir review, rounds 1–2):** "code work" is **not
 > process-confined**, so it is safe only for **trusted** content — not for
 > untrusted payloads.
-> - Generic `spawn_*` (`spawn_open_code` / `spawn_codex`)
+> - Generic `spawn_open_code`
 >   isn't even git/review-contained: it runs the CLI as an ordinary subprocess
 >   whose only confinement is `spawn_workspace`
 >   (`_target_within_configured_write_roots` = **all of `MIMIR_HOME` + configured

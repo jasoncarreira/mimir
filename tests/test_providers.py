@@ -185,18 +185,3 @@ def test_claude_code_auth_status_accepts_credentials_without_printing_secret(
 
     assert status.ok is True
     assert secret not in status.reason + status.remediation
-
-
-# ── codex availability — spawn_codex gate (chainlink #293) ──────────
-
-
-def test_codex_available_reflects_cli_on_path(monkeypatch):
-    import mimir.providers as P
-
-    monkeypatch.setattr(
-        P.shutil, "which", lambda cmd: "/usr/bin/codex" if cmd == "codex" else None
-    )
-    assert P.codex_available() is True
-
-    monkeypatch.setattr(P.shutil, "which", lambda cmd: None)
-    assert P.codex_available() is False

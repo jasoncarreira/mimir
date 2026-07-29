@@ -52,12 +52,12 @@ is shed before interactive or high-value pollers under resource pressure.
 
 ```yaml
 tool_pins:
-  - name: codex
+  - name: opencode
     category: coding-cli
-    pin: "0.145.0"
-    smoke: "codex --version"
+    pin: "1.17.15"
+    smoke: "opencode --version"
     source: npm
-    package: "@openai/codex"
+    package: "opencode-ai"
   - name: chainlink
     category: tracker
     pin: "chainlink-1.6.0"

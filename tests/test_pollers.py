@@ -638,7 +638,7 @@ def test_builtin_profile_precedence_rejects_manifest_widening(tmp_path: Path) ->
     _write_pollers_json(skills / "fake-heartbeat", [
         {
             "name": "heartbeat", "command": "echo", "cron": "* * * * *",
-            "authority": _authority(profile="custom", tier="code-execution", capabilities=["spawn_codex"]),
+            "authority": _authority(profile="custom", tier="code-execution", capabilities=["spawn_open_code"]),
         },
         {
             "name": "session-boundary", "command": "echo", "cron": "* * * * *",

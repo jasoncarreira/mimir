@@ -250,7 +250,6 @@ authenticate transport only; they do not create a named requester.
 | `MIMIR_SPAWN_MAX_CONCURRENT` | int | `3` (floor 1) | Max concurrent spawned CLI subprocesses. |
 | `MIMIR_SPAWN_MAX_PER_HOUR` | int | `20` (floor 1) | Sliding-window per-hour spawn cap. |
 | `MIMIR_SPAWN_MAX_DEPTH` | int | `2` (floor 1) | Recursion-depth cap on nested spawns (fork-bomb guard). |
-| `MIMIR_CODEX_SPAWN_ARGS` | str (shell) | `""` | Extra flags appended to `codex exec` (e.g. `--full-auto`); shlex-split. |
 | `MIMIR_OPENCODE_SPAWN_ARGS` | str (shell) | `""` | Extra flags appended to `opencode run` (e.g. `--format json`); shlex-split. |
 
 > `MIMIR_SPAWN_DEPTH` is set by the harness on child subprocesses to track
