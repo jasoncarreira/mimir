@@ -1037,7 +1037,9 @@ async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
 ) -> None:
     called: list[Path] = []
 
-    def fake_cleanup(home: Path) -> list[object]:
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[object]:
         called.append(home)
         return []
 
@@ -1048,6 +1050,81 @@ async def test_commit_turn_changes_runs_proposal_cleanup_before_status(
     )
 
     assert called == [home_repo]
+
+
+@pytest.mark.asyncio
+async def test_proposal_cleanup_tracks_skip_reasons_for_edge_triggering(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.proposals import ProposalCleanupRecord
+
+    previous_states: list[dict[str, str]] = []
+    reasons = iter(("open_pr", "open_pr", "content_not_on_main", None))
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[ProposalCleanupRecord]:
+        previous_states.append(dict(previous_skip_reasons))
+        reason = next(reasons)
+        if reason is None:
+            return [
+                ProposalCleanupRecord(
+                    "proposal/pending", "abc", "deleted", "resolved_content_on_main"
+                )
+            ]
+        return [ProposalCleanupRecord("proposal/pending", "abc", "skipped", reason)]
+
+    monkeypatch.setattr(
+        "mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup
+    )
+
+    for turn_id in ("t1", "t2", "t3", "t4"):
+        await git_tracking._cleanup_resolved_proposal_branches(
+            home=home_repo, turn_id=turn_id
+        )
+
+    assert previous_states == [
+        {},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "open_pr"},
+        {"proposal/pending": "content_not_on_main"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_proposal_cleanup_restart_reannounces_active_skip(
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.proposals import ProposalCleanupRecord
+
+    previous_states: list[dict[str, str]] = []
+
+    def fake_cleanup(
+        home: Path, *, previous_skip_reasons: dict[str, str]
+    ) -> list[ProposalCleanupRecord]:
+        previous_states.append(dict(previous_skip_reasons))
+        return [ProposalCleanupRecord("proposal/pending", "abc", "skipped", "open_pr")]
+
+    monkeypatch.setattr(
+        "mimir.proposals.cleanup_resolved_proposal_branches", fake_cleanup
+    )
+
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="before-restart"
+    )
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="same-process"
+    )
+    git_tracking.reset_module_state()
+    await git_tracking._cleanup_resolved_proposal_branches(
+        home=home_repo, turn_id="after-restart"
+    )
+
+    assert previous_states == [
+        {},
+        {"proposal/pending": "open_pr"},
+        {},
+    ]
 
 # ─── porcelain summary helper ───────────────────────────────────────
 

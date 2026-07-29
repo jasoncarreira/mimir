@@ -35,7 +35,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 # Reuse the hardened helpers rather than reimplement: ``_redact`` is the shared
 # token scrubber (git_tracking imports it too), ``_run`` the uniform 30s-timeout
@@ -598,7 +598,17 @@ def _remove_worktree_for_branch(home: Path, branch: str) -> None:
     _git(["branch", "-D", branch], cwd=home)
 
 
-def _log_proposal_cleanup(record: ProposalCleanupRecord) -> None:
+def _log_proposal_cleanup(
+    record: ProposalCleanupRecord,
+    *,
+    previous_skip_reasons: Mapping[str, str] | None = None,
+) -> None:
+    if (
+        record.action == "skipped"
+        and previous_skip_reasons is not None
+        and previous_skip_reasons.get(record.branch) == record.reason
+    ):
+        return
     event_type = (
         "proposal_branch_cleaned"
         if record.action == "deleted"
@@ -617,7 +627,11 @@ def _log_proposal_cleanup(record: ProposalCleanupRecord) -> None:
         pass
 
 
-def cleanup_resolved_proposal_branches(home: Path) -> list[ProposalCleanupRecord]:
+def cleanup_resolved_proposal_branches(
+    home: Path,
+    *,
+    previous_skip_reasons: Mapping[str, str] | None = None,
+) -> list[ProposalCleanupRecord]:
     """Delete remote/local proposal branches whose PR is resolved and content is on main.\n\n    Safety gates:\n    - only proposal-owned prefixes (``proposal/`` and ``upgrade/``),
     - preserve any branch with an open PR,
     - delete only when the branch is ancestry-merged or the protected-surface
@@ -640,17 +654,23 @@ def cleanup_resolved_proposal_branches(home: Path) -> list[ProposalCleanupRecord
         has_open_pr = _proposal_branch_has_open_pr(home, branch)
         if has_open_pr is True:
             record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr")
-            _log_proposal_cleanup(record)
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
             records.append(record)
             continue
         if has_open_pr is None:
             record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr_unknown")
-            _log_proposal_cleanup(record)
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
             records.append(record)
             continue
         if not _proposal_branch_content_is_on_main(home, branch):
             record = ProposalCleanupRecord(branch, tip, "skipped", "content_not_on_main")
-            _log_proposal_cleanup(record)
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
             records.append(record)
             continue
         delete = _git(["push", "origin", "--delete", branch], cwd=home)
@@ -661,7 +681,9 @@ def cleanup_resolved_proposal_branches(home: Path) -> list[ProposalCleanupRecord
                 "skipped",
                 _redact(f"delete_failed: {(delete.stderr or '').strip()}"),
             )
-            _log_proposal_cleanup(record)
+            _log_proposal_cleanup(
+                record, previous_skip_reasons=previous_skip_reasons
+            )
             records.append(record)
             continue
         _remove_worktree_for_branch(home, branch)

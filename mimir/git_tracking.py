@@ -20,6 +20,11 @@ Design contract (see spec §"Post-turn commit hook contract"):
 - **Behavior gated on ``MIMIR_GIT_TRACKING_ENABLED=true``.** Default
   off so PR 4a lands inert ahead of the gitignore + secret hook in
   PR 4b. When disabled, ``commit_turn_changes`` is a no-op.
+- **Proposal cleanup status is event-log state.** Read the most recent
+  ``proposal_branch_cleanup_skipped`` event per branch from
+  ``<MIMIR_HOME>/logs/events.jsonl``. Skip-state changes re-emit, and process
+  restart clears the in-memory de-duplication map so every active skip is
+  announced again on the next successful sweep.
 
 The module is a singleton-by-coordination: ``_pending_push_task`` and
 ``_push_debounce_lock`` live at module scope so concurrent turns share
@@ -57,6 +62,9 @@ log = logging.getLogger(__name__)
 _push_debounce_locks: dict[str, asyncio.Lock] = {}
 _pending_push_tasks: dict[str, asyncio.Task] = {}
 _push_retry_tasks: dict[str, asyncio.Task | None] = {}
+# Latest successful proposal cleanup observation, kept in memory so a restart
+# announces the current state again rather than inheriting stale suppression.
+_proposal_cleanup_skip_reasons: dict[str, dict[str, str]] = {}
 
 # Retry schedule after a push failure. Tests monkeypatch this.
 PUSH_RETRY_DELAYS: tuple[float, ...] = (300.0, 900.0, 2700.0)  # 5m, 15m, 45m
@@ -144,6 +152,7 @@ def reset_module_state() -> None:
             task.cancel()
     _push_retry_tasks.clear()
     _push_debounce_locks.clear()
+    _proposal_cleanup_skip_reasons.clear()
 
 
 # ─── git error type + subprocess wrapper ─────────────────────────────
@@ -300,13 +309,25 @@ async def _cleanup_resolved_proposal_branches(*, home: Path, turn_id: str) -> No
     try:
         from .proposals import cleanup_resolved_proposal_branches
 
-        await asyncio.to_thread(cleanup_resolved_proposal_branches, home)
+        key = _home_key(home)
+        async with _get_lock(home):
+            records = await asyncio.to_thread(
+                cleanup_resolved_proposal_branches,
+                home,
+                previous_skip_reasons=_proposal_cleanup_skip_reasons.get(key, {}),
+            )
+            _proposal_cleanup_skip_reasons[key] = {
+                record.branch: record.reason
+                for record in records
+                if record.action == "skipped"
+            }
     except Exception as exc:  # pragma: no cover - defensive; must not block commits
         await log_event(
             "proposal_cleanup_failed",
             turn_id=turn_id,
             error=_short_err(exc),
         )
+
 
 # ─── public API: commit_turn_changes ──────────────────────────────────
 

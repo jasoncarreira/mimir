@@ -54,7 +54,7 @@ is shed before interactive or high-value pollers under resource pressure.
 tool_pins:
   - name: opencode
     category: coding-cli
-    pin: "1.17.15"
+    pin: "1.18.9"
     smoke: "opencode --version"
     source: npm
     package: "opencode-ai"

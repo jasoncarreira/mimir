@@ -14,8 +14,6 @@ from ..compute import (
     LocalSubprocessComputeBackend,
 )
 from .base import ToolBackend
-from .claude_cli import ClaudeCliBackend
-from .codex import CodexBackend
 from .feature_factory import FeatureFactoryBackend
 from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend
 
@@ -65,7 +63,7 @@ class TieredReviewConfig:
 
 @dataclass(frozen=True)
 class WorklinkDefaults:
-    backend: str = "codex"
+    backend: str = "opencode"
     timeout_s: int = 1800
     priority: str = "normal"
     test_command: str = "uv run pytest -q"
@@ -453,11 +451,14 @@ def _parse_route(value: Any) -> WorklinkRoute:
 class BackendRegistry:
     def __init__(self, config: WorklinkConfig | None = None) -> None:
         self.config = config or WorklinkConfig()
+        unknown_backend_configs = self.config.backend_settings.keys() - {
+            "feature_factory",
+            "opencode",
+        }
+        if unknown_backend_configs:
+            name = sorted(unknown_backend_configs)[0]
+            raise ValueError(f"unknown Worklink backend config: {name}")
         self._backends: dict[str, ToolBackend] = {
-            "codex": self._build_codex(self.config.backend_settings.get("codex", {})),
-            "claude_cli": self._build_claude_cli(
-                self.config.backend_settings.get("claude_cli", {})
-            ),
             "feature_factory": self._build_feature_factory(
                 self.config.backend_settings.get("feature_factory", {})
             ),
@@ -523,15 +524,6 @@ class BackendRegistry:
             return LocalSubprocessComputeBackend()
         raise ValueError(f"unknown Worklink compute backend config: {name}")
 
-
-    @staticmethod
-    def _build_codex(settings: Mapping[str, Any]) -> CodexBackend:
-        bin_name = str(settings.get("bin", "codex"))
-        args = settings.get("args", ["exec", "--json"])
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise ValueError("worklink codex args must be a list of strings")
-        return CodexBackend(bin=bin_name, extra_args=tuple(args))
-
     @staticmethod
     def _build_opencode(settings: Mapping[str, Any]) -> OpenCodeBackend:
         bin_name = str(settings.get("bin", "opencode"))
@@ -550,15 +542,6 @@ class BackendRegistry:
             extra_args=tuple(args),
             bash_allowlist=tuple(bash_allowlist),
         )
-
-    @staticmethod
-    def _build_claude_cli(settings: Mapping[str, Any]) -> ClaudeCliBackend:
-        bin_name = str(settings.get("bin", "claude"))
-        args = settings.get("args", ["-p", "--output-format", "json"])
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise ValueError("worklink claude_cli args must be a list of strings")
-        return ClaudeCliBackend(bin=bin_name, extra_args=tuple(args))
-
     @staticmethod
     def _build_feature_factory(settings: Mapping[str, Any]) -> FeatureFactoryBackend:
         bin_name = str(settings.get("bin", "feature-factory"))

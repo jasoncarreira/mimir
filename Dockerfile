@@ -49,7 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
-        npm install -g opencode-ai@1.17.15 ; \
+        npm install -g opencode-ai@1.18.9 ; \
         npm install -g opencode-feature-factory@0.2.1 ; \
         npm install -g opencode-project-memory@0.1.0 ; \
         npm install -g opencode-openai-codex-auth@4.4.0 ; \

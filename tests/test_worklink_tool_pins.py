@@ -62,6 +62,32 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
         assert pin.risk
 
 
+def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
+    root = Path(__file__).resolve().parents[1]
+    docs = (root / "docs/internal/WORKLINK.md").read_text(encoding="utf-8")
+    inventory_summary = docs.split(
+        "The seed covers pinned external executables", 1
+    )[1].split("Each entry records", 1)[0]
+
+    for expected in (
+        "chainlink",
+        "mermaid-cli",
+        "osv-scanner",
+        "gogcli",
+        "OpenCode CLI and plugins",
+    ):
+        assert expected in inventory_summary
+    assert "Codex CLI" not in inventory_summary
+
+    tool_pins_example = docs.split("```yaml\ntool_pins:", 1)[1].split("```", 1)[0]
+    assert "name: opencode" in tool_pins_example
+    assert 'smoke: "opencode --version"' in tool_pins_example
+    assert 'package: "opencode-ai"' in tool_pins_example
+    assert "name: codex" not in tool_pins_example
+    assert 'smoke: "codex --version"' not in tool_pins_example
+    assert 'package: "@openai/codex"' not in tool_pins_example
+
+
 def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
     root = Path(__file__).resolve().parents[1]
