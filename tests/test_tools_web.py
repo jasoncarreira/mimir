@@ -579,7 +579,7 @@ def test_all_mimir_tools_gates_spawn_codex_on_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # spawn_codex registers iff the codex CLI is available (chainlink #293),
-    # mirroring the spawn_claude_code gate. Patch the registry's
+    # mirroring the coding-CLI gate. Patch the registry's
     # codex_available so the test is deterministic regardless of whether a
     # codex CLI is installed in the test environment.
     import mimir.providers as providers

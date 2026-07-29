@@ -367,7 +367,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # acute signals; the agent sees it once per 24h window and clears
     # the orphans on a lint pass.
     "wiki_backlinks_unhealthy": ("negative", "wiki_health"),
-    # chainlink #60: spawn_claude_code completion signals. ``_completed``
+    # Legacy Claude coding-tool completion signals. ``_completed``
     # fires on a clean spawn exit; ``_auth_failed`` on 4xx + is_error
     # (token revoked, refresh failed, server-side quota exhausted);
     # ``_work_failed`` on the spawned agent loop ending badly

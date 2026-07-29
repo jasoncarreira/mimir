@@ -90,7 +90,6 @@ _ADMIN_TOOL_NAMES: frozenset[str] = frozenset(
         "worklink_run",
         "shell_exec",
         "bash_async",
-        "spawn_claude_code",
         "spawn_codex",
         "saga_forget",
         # Deepagents built-in write tools mutate tracked state / repo files.
@@ -339,7 +338,7 @@ def _extract_sink_target(
         target = args.get("file_path") or args.get("path")
     elif tool_name in {"shell_exec", "bash_async"}:
         target = args.get("command")
-    elif tool_name in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
+    elif tool_name in {"spawn_codex", "spawn_open_code"}:
         target = args.get("cwd") or os.environ.get("MIMIR_HOME")
     elif tool_name == "worklink_run":
         target = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
@@ -635,7 +634,7 @@ def _request_with_resolved_spawn_paths(
     auth_context: AuthContext | None,
 ) -> ToolCallRequest:
     """Bind service spawn execution to the paths checked by authorization."""
-    if tool_name not in {"spawn_claude_code", "spawn_codex", "spawn_open_code"}:
+    if tool_name not in {"spawn_codex", "spawn_open_code"}:
         return request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
@@ -681,7 +680,6 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
 
 _IFC_DELEGATION_TOOLS = frozenset({
     "task",
-    "spawn_claude_code",
     "spawn_codex",
     "spawn_open_code",
     "bash_async",

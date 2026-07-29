@@ -40,7 +40,7 @@ async def test_completed_run_returns_structured_result(
     from mimir.tools import registry
 
     record: dict = {"stdout": "implemented the thing"}
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
 
     raw = await spawn_open_code.ainvoke({"prompt": "do the thing", "cwd": str(tmp_path), "model": "anthropic/claude", "agent": "build"})
 
@@ -71,7 +71,7 @@ async def test_child_env_is_allowlisted(
     monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     record: dict = {}
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
 
     await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)})
 
@@ -95,7 +95,7 @@ async def test_auth_failure_classified(
     from mimir.tools import registry
 
     record: dict = {"returncode": 1, "stderr": "provider error: 401 Unauthorized"}
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
 
     payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
     assert payload["status"] == "auth_failed"
@@ -110,7 +110,7 @@ async def test_work_failure_classified(
     from mimir.tools import registry
 
     record: dict = {"returncode": 2, "stderr": "could not apply patch"}
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
 
     payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
     assert payload["status"] == "work_failed"
@@ -126,7 +126,7 @@ async def test_spawn_failed_when_cli_missing(
     def missing(argv, cwd, timeout_s, env=None):
         raise FileNotFoundError("opencode")
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", missing)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", missing)
 
     payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
     assert payload["status"] == "spawn_failed"
@@ -143,7 +143,7 @@ async def test_artifacts_written_with_labels_only_manifest(
 
     monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
     record: dict = {"stdout": "done"}
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_run(record))
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
 
     payload = json.loads(
         await spawn_open_code.ainvoke(
@@ -201,7 +201,7 @@ async def test_artifact_root_outside_home_refused_before_spawn(
         ran["spawned"] = True
         return 0, "done", ""
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
 
     raw = await spawn_open_code.ainvoke(
         {"prompt": "leak it", "artifact_root": str(outside)}
@@ -229,7 +229,7 @@ async def test_artifact_root_symlink_escape_refused(
         ran["spawned"] = True
         return 0, "done", ""
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
 
     raw = await spawn_open_code.ainvoke(
         {"prompt": "leak it", "artifact_root": str(home / "escape")}
@@ -251,7 +251,7 @@ async def test_artifact_root_within_home_subdir_ok(
     from mimir.tools import registry
 
     monkeypatch.setattr(
-        registry, "_run_claude_subprocess", _capture_run({"stdout": "done"})
+        registry, "_run_spawn_subprocess", _capture_run({"stdout": "done"})
     )
 
     payload = json.loads(
@@ -284,7 +284,7 @@ async def test_artifact_write_refuses_symlink_planted_during_run(
         (home / ".factory").symlink_to(outside, target_is_directory=True)
         return 0, "secret model output", ""
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", runner)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
 
     payload = json.loads(
         await spawn_open_code.ainvoke(
@@ -327,7 +327,7 @@ async def test_timeout_returns_structured_envelope(
     def hangs(argv, cwd, timeout_s, env=None):
         raise _subprocess.TimeoutExpired(argv, timeout_s)
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", hangs)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", hangs)
 
     payload = json.loads(
         await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path), "timeout_s": 7})

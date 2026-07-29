@@ -10,7 +10,7 @@ Tools ported:
                        set_poller_overrides, reload_pollers
   committools.py:     commitment_complete, commitment_snooze,
                        commitment_dismiss, commitment_list
-  spawn.py:           spawn_claude_code
+  spawn.py:           spawn_codex, spawn_open_code
 
 Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
 other split-out tool modules, this is mimir's agent-facing surface.
@@ -1592,19 +1592,14 @@ async def commitment_list(
 # ────────────────────────────────────────────────────────────────────
 
 
-# Pre-OSS hardening (review item #5). ``spawn_claude_code`` previously
-# had no concurrency cap, no per-hour rate cap, and no recursion-depth
-# limit. A misbehaving agent could fan out an unbounded number of
-# parallel ``claude`` subprocesses or recursively spawn itself into a
-# fork bomb. The defaults below are conservative and operator-overridable.
+# Spawned coding CLIs share concurrency, rate, and recursion-depth caps.
+# The defaults below are conservative and operator-overridable.
 _SPAWN_MAX_CONCURRENT_DEFAULT = 3
 _SPAWN_MAX_PER_HOUR_DEFAULT = 20
 _SPAWN_MAX_DEPTH_DEFAULT = 2
 
-# Env var the *child* claude subprocess sees so a nested
-# ``spawn_claude_code`` inside the subprocess increments before
-# checking against the depth cap. The harness sets this to
-# ``parent_depth + 1`` when spawning.
+# Env var a child coding subprocess sees so a nested spawn increments
+# before checking against the depth cap.
 _SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
 
 # Minimal-env allowlist for spawned CLI subprocesses (#494). The child
@@ -1630,8 +1625,8 @@ def _minimal_child_env(*, depth: int, cred_prefixes: tuple[str, ...]) -> dict[st
 
     Everything else in the parent ``os.environ`` (unrelated secrets) is
     dropped. ``cred_prefixes`` is the set of provider-credential prefixes
-    the target CLI legitimately needs (e.g. ``("ANTHROPIC_", "CLAUDE_")``
-    for claude, ``("OPENAI_", "CODEX_")`` for codex)."""
+    the target CLI legitimately needs (e.g. ``("OPENAI_", "CODEX_")``
+    for codex)."""
     env: dict[str, str] = {}
     for key in _CHILD_ENV_INFRA:
         val = os.environ.get(key)
@@ -1712,7 +1707,9 @@ def _spawn_reset_for_tests() -> None:
     _SPAWN_GUARD.recent.clear()
 
 
-async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> tuple[float | None, str | None]:
+async def _spawn_acquire_rate_slot(
+    guard: _SpawnGuard, tool_name: str,
+) -> tuple[float | None, str | None]:
     """Check + reserve a per-hour spawn slot.
 
     Returns ``(token, None)`` if a slot was reserved, where ``token`` is
@@ -1736,7 +1733,7 @@ async def _spawn_acquire_rate_slot(guard: _SpawnGuard) -> tuple[float | None, st
             oldest_age = int(now - guard.recent[0])
             return (
                 None,
-                f"spawn_claude_code refused: per-hour cap "
+                f"{tool_name} refused: per-hour cap "
                 f"({guard.max_per_hour}/h) reached — oldest entry "
                 f"{oldest_age}s ago. Raise MIMIR_SPAWN_MAX_PER_HOUR "
                 f"or wait for the window to roll forward.",
@@ -1765,7 +1762,7 @@ async def _spawn_release_rate_slot(guard: _SpawnGuard, token: float | None) -> N
             pass
 
 
-def _run_claude_subprocess(
+def _run_spawn_subprocess(
     argv: list[str],
     cwd: str | None,
     timeout_s: int,
@@ -1774,7 +1771,7 @@ def _run_claude_subprocess(
     """Sync subprocess.run wrapper — called from a thread via to_thread.
 
     Keeping the blocking I/O in a helper that's invoked through
-    ``asyncio.to_thread`` keeps spawn_claude_code from freezing the
+    ``asyncio.to_thread`` keeps coding-tool spawns from freezing the
     dispatcher's event loop for the duration of the subprocess (up to
     ``timeout_s=1800`` by default). Returns (returncode, stdout, stderr)
     or raises subprocess.TimeoutExpired / FileNotFoundError unchanged.
@@ -1793,157 +1790,10 @@ def _run_claude_subprocess(
         # Headless spawn: never inherit the parent's stdin. ``codex exec``
         # reads stdin (appends it to the prompt) and would block until the
         # timeout if stdin is an open pipe/TTY; DEVNULL EOFs immediately so
-        # it uses the prompt arg only. Harmless for ``claude -p`` too.
+        # it uses the prompt arg only.
         stdin=subprocess.DEVNULL,
     )
     return proc.returncode, proc.stdout, proc.stderr
-
-
-@tool
-async def spawn_claude_code(
-    prompt: str,
-    cwd: Optional[str] = None,
-    timeout_s: int = 1800,
-    name: Optional[str] = None,
-    model: Optional[str] = None,
-) -> str:
-    """Spawn a Claude Code subprocess to execute a complex task.
-
-    Use for work that needs deep context isolation, long-running
-    multi-step plans, or independent execution from the parent agent.
-    The subprocess runs ``claude -p <prompt>`` and captures its
-    output, final cost, and modelUsage metrics.
-
-    Pre-fix this was a sync function that called ``subprocess.run``
-    directly. deepagents awaited the sync callable, freezing the
-    dispatcher's event loop for up to ``timeout_s=1800`` seconds —
-    every other channel's worker blocked until the spawn finished.
-    Now async, with the blocking subprocess call wrapped in
-    ``asyncio.to_thread``.
-
-    **Model selection heuristic** (chainlink #158): pick based on
-    cognitive *depth* required, not output *shape* (destination path).
-    Passing ``model`` explicitly avoids the output-path-as-proxy
-    mis-tier (e.g. a wiki-page destination triggering a lighter model
-    for analytical work that needs deeper reasoning).
-
-    - ``model="opus"`` — analytical / evaluative work: VSM analysis,
-      gap inventories, skeptical code review, design decisions,
-      adversarial synthesis. Use when the task is "think critically"
-      even if the output lands at a doc/wiki path.
-    - ``model="sonnet"`` — default for most spawn work: implementation
-      tasks, benchmark runs, doc writing, spec drafts, mechanical
-      multi-step work where the path is well-defined.
-    - ``model="haiku"`` — high-throughput mechanical tasks that are
-      genuinely simple (e.g. format conversion, short summaries).
-      Rarely the right choice for spawn work; prefer sonnet as the
-      safe default.
-    - Omit ``model`` to let the claude CLI use its configured default
-      (currently sonnet-tier).
-
-    Args:
-        prompt: The task to hand to the spawned Claude Code instance.
-        cwd: Working directory for the subprocess. Defaults to home.
-        timeout_s: Subprocess timeout (default 30 min).
-        name: Optional label recorded in the spawn log.
-        model: Claude model alias or full name (e.g. ``"opus"``,
-            ``"sonnet"``, ``"claude-opus-4-7"``). Passed as
-            ``--model`` to the claude CLI. Omit to use the CLI
-            default. Use ``"opus"`` for analytical/evaluative work
-            even when the output destination is doc-shaped.
-    """
-    cfg = _STATE["spawn_config"]
-    if cfg is None:
-        return "spawn_claude_code failed: no spawn config"
-    if not prompt or not prompt.strip():
-        return "spawn_claude_code failed: prompt is required"
-
-    # ── Pre-OSS hardening (review item #5): concurrency / rate / depth caps.
-    guard = _spawn_guard_init()
-
-    # Depth check first — cheapest, no resource reservation needed.
-    # ``MIMIR_SPAWN_DEPTH`` is set by the harness on every nested
-    # spawn (``=parent_depth+1``); the root agent has it unset / 0.
-    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
-        _SPAWN_DEPTH_ENV
-    ) else 0
-    if current_depth >= guard.max_depth:
-        return (
-            f"spawn_claude_code refused: recursion depth cap reached "
-            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth}). "
-            f"The parent agent is already at this nesting level — "
-            f"deeper spawns would risk a fork-bomb / unbounded budget."
-        )
-
-    # Per-hour rate cap. Reserves a slot inside the rate_lock so two
-    # concurrent spawns can't both pass the check.
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
-    if rate_err is not None:
-        return rate_err
-
-    # Concurrency cap. The semaphore reserves a slot for the duration
-    # of the subprocess; pending spawns wait their turn rather than
-    # piling up unbounded.
-    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
-    # ``--`` separator before the prompt: the prompt is arbitrary
-    # operator/agent text, and a prompt starting with ``--<flag>``
-    # would otherwise be parsed by the claude CLI as another flag.
-    # (Review item — fast-follow in the §"Notable code bugs" section.)
-    argv = ["claude", "-p", "--output-format", "json"]
-    if model:
-        argv += ["--model", model]
-    argv += ["--", prompt]
-
-    # Minimal env (#494): infra + Anthropic/Claude creds + the
-    # incremented spawn depth. Unrelated secrets are NOT inherited.
-    child_env = _minimal_child_env(
-        depth=current_depth + 1, cred_prefixes=("ANTHROPIC_", "CLAUDE_"),
-    )
-
-    assert guard.sem is not None
-    failure: str | None = None
-    try:
-        async with guard.sem:
-            try:
-                returncode, stdout, stderr = await asyncio.to_thread(
-                    _run_claude_subprocess,
-                    argv,
-                    str(cwd_path) if cwd_path else None,
-                    timeout_s,
-                    child_env,
-                )
-            except subprocess.TimeoutExpired:
-                failure = f"spawn_claude_code timed out after {timeout_s}s"
-            except FileNotFoundError:
-                failure = "spawn_claude_code failed: 'claude' CLI not on PATH"
-    except BaseException:
-        # The subprocess never started OR exited abnormally; the
-        # rate-slot we reserved doesn't reflect real work that
-        # consumed budget. Release it so the per-hour window is
-        # accurate for the operator.
-        await _spawn_release_rate_slot(guard, rate_token)
-        raise
-    if failure is not None:
-        raise ToolException(failure)
-    if returncode != 0:
-        raise ToolException(
-            f"spawn_claude_code failed: exit={returncode} "
-            f"stderr={stderr[:500]}"
-        )
-    try:
-        result = json.loads(stdout)
-        return json.dumps(
-            {"result": result.get("result", "")[:2000],
-             "cost_usd": result.get("total_cost_usd"),
-             "num_turns": result.get("num_turns"),
-             "name": name},
-            indent=2,
-        )
-    except json.JSONDecodeError:
-        return f"spawn_claude_code: raw output: {stdout[:2000]}"
-
-
-spawn_claude_code.handle_tool_error = True
 
 
 @tool
@@ -1956,17 +1806,15 @@ async def spawn_codex(
 ) -> str:
     """Spawn a Codex CLI subprocess to execute a complex task.
 
-    The Codex analogue of ``spawn_claude_code``: runs ``codex exec
-    <prompt>`` once, non-interactively, and returns its output. Use for
-    work you'd rather hand to Codex (OpenAI) than the parent agent —
+    Runs ``codex exec <prompt>`` once, non-interactively, and returns its
+    output. Use for work you'd rather hand to Codex than the parent agent —
     context isolation, independent execution, or a second model's take.
     Registered only when the ``codex`` CLI is on PATH (the tool-list gate
     consults ``providers.codex_available``), so it never appears on a
     deployment that can't run it.
 
-    Shares the spawn caps with ``spawn_claude_code`` — the same
-    per-hour / concurrency / recursion-depth budget (a spawn is a spawn
-    regardless of which CLI), so an agent can't fork-bomb via either path.
+    Shares the per-hour / concurrency / recursion-depth budget with the
+    other coding CLI spawns, so an agent can't fork-bomb via either path.
 
     Codex CLI invocation note: ``codex exec`` is the non-interactive
     subcommand, but exact flags vary by codex version + setup. Extra
@@ -1988,8 +1836,7 @@ async def spawn_codex(
     if not prompt or not prompt.strip():
         return "spawn_codex failed: prompt is required"
 
-    # Shared spawn caps (same guard as spawn_claude_code — one budget
-    # across both spawn paths). Depth check first (cheapest), then the
+    # Shared spawn caps. Depth check first (cheapest), then the
     # per-hour rate slot, then the concurrency semaphore.
     guard = _spawn_guard_init()
     current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
@@ -2002,10 +1849,9 @@ async def spawn_codex(
             f"The parent agent is already at this nesting level — "
             f"deeper spawns would risk a fork-bomb / unbounded budget."
         )
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_codex")
     if rate_err is not None:
-        # The shared helper names spawn_claude_code; retarget for this tool.
-        return rate_err.replace("spawn_claude_code", "spawn_codex")
+        return rate_err
 
     cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
     import shlex
@@ -2032,9 +1878,7 @@ async def spawn_codex(
         async with guard.sem:
             try:
                 returncode, stdout, stderr = await asyncio.to_thread(
-                    # Generic argv subprocess runner (shared with
-                    # spawn_claude_code despite the historical name).
-                    _run_claude_subprocess,
+                    _run_spawn_subprocess,
                     argv,
                     str(cwd_path) if cwd_path else None,
                     timeout_s,
@@ -2160,11 +2004,10 @@ async def spawn_open_code(
     software-factory spec, phase 1): runs ``opencode run --dir <cwd>``
     once, non-interactively, and returns a structured result. OpenCode
     routes to whichever model provider its own config selects, so this
-    collapses the provider-shaped split (spawn_claude_code / spawn_codex)
-    into a backend-shaped one. Registered only when the ``opencode`` CLI
-    is on PATH (``providers.opencode_available``).
+    provides a backend-shaped coding tool. Registered only when the
+    ``opencode`` CLI is on PATH (``providers.opencode_available``).
 
-    Shares the spawn caps with spawn_claude_code/spawn_codex — one
+    Shares the spawn caps with spawn_codex — one
     per-hour / concurrency / recursion-depth budget across all spawn
     paths.
 
@@ -2196,9 +2039,9 @@ async def spawn_open_code(
             f"spawn_open_code refused: recursion depth cap reached "
             f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
         )
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard)
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
     if rate_err is not None:
-        return rate_err.replace("spawn_claude_code", "spawn_open_code")
+        return rate_err
 
     # Validate the (model-controlled) artifact_root BEFORE spawning so a
     # bad/escaping path is refused up front rather than after burning a run.
@@ -2256,7 +2099,7 @@ async def spawn_open_code(
         async with guard.sem:
             try:
                 returncode, stdout, stderr = await asyncio.to_thread(
-                    _run_claude_subprocess,
+                    _run_spawn_subprocess,
                     argv,
                     str(cwd_path) if cwd_path else None,
                     timeout_s,
@@ -2618,15 +2461,8 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
             tools.append(web_search)
         if fetch_url_on:
             tools.append(fetch_url)
-    # Spawn — register only when the ``claude`` CLI it shells out to is on
-    # PATH (chainlink #292). A deployment routed to a non-Claude provider
-    # (e.g. Minimax) typically has no claude CLI, so registering it would
-    # only offer the agent a tool that fails with "'claude' CLI not on
-    # PATH". Gates on CLI presence, not auth — see claude_code_available.
-    from ..providers import claude_code_available, codex_available
-    if claude_code_available():
-        tools.append(spawn_claude_code)
-    # Same gate for spawn_codex on the ``codex`` CLI (chainlink #293).
+    from ..providers import codex_available
+    # Gate spawn_codex on the ``codex`` CLI (chainlink #293).
     if codex_available():
         tools.append(spawn_codex)
     # And for spawn_open_code on the ``opencode`` CLI (chainlink #830).

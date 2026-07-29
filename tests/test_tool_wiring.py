@@ -4,8 +4,6 @@ Specifically:
 * ``_channel_from_config_or_state`` precedence (LangGraph configurable
   vs module-global _STATE vs explicit arg).
 * ``Agent.__init__`` accepts and stores ``commitments_store``.
-* ``spawn_claude_code`` is async (no event-loop block) and wraps
-  subprocess.run in to_thread.
 * ``set_commitments_store`` / ``set_spawn_config`` actually populate
   the module-global _STATE so the four commitment_* tools + the spawn
   tool can resolve their dependencies.
@@ -32,7 +30,6 @@ from mimir.tools.registry import (
     set_commitments_store,
     set_current_channel_id,
     set_spawn_config,
-    spawn_claude_code,
     spawn_codex,
 )
 
@@ -197,183 +194,11 @@ def test_set_spawn_config_populates_state(tmp_path: Path) -> None:
     assert _STATE["spawn_config"] is cfg
 
 
-# ─── spawn_claude_code async + to_thread ───────────────────────────
-
-
-def test_spawn_claude_code_is_coroutine() -> None:
-    # Pre-fix this was a sync function — deepagents would await a
-    # synchronous callable, freezing the event loop for ``timeout_s``
-    # seconds. langchain's @tool decorator routes async functions to
-    # ``coroutine`` (not ``func``); verify the async path is wired.
-    assert spawn_claude_code.coroutine is not None
-    assert asyncio.iscoroutinefunction(spawn_claude_code.coroutine)
-    # Sync path should be unset, otherwise deepagents would prefer it.
-    assert spawn_claude_code.func is None
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_does_not_block_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Verify the blocking subprocess.run is dispatched to a thread by
-    # checking that other coroutines on the loop still make progress
-    # while the "subprocess" is "running" (mocked as a sleep).
-    set_spawn_config({"default_cwd": tmp_path})
-
-    from mimir.tools import registry
-
-    sleep_started = asyncio.Event()
-    other_tick_seen = asyncio.Event()
-
-    def _slow_run(
-        argv: list[str],
-        cwd: str | None,
-        timeout_s: int,
-        env: dict[str, str] | None = None,
-    ) -> tuple[int, str, str]:
-        # Simulate a blocking subprocess that takes time. If this runs
-        # on the main loop, `other_tick_seen` will never get set.
-        sleep_started.set()
-        import time
-        time.sleep(0.5)
-        return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
-
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _slow_run)
-
-    async def _tick() -> None:
-        await sleep_started.wait()
-        # If spawn_claude_code is actually running on the loop thread,
-        # this `asyncio.sleep(0)` would block; instead it should yield
-        # back immediately because the subprocess.run is in a thread.
-        await asyncio.sleep(0.05)
-        other_tick_seen.set()
-
-    tick_task = asyncio.create_task(_tick())
-    result_str = await spawn_claude_code.ainvoke(
-        {"prompt": "hello", "timeout_s": 30}
-    )
-    await asyncio.wait_for(tick_task, timeout=2.0)
-
-    assert other_tick_seen.is_set()
-    result = json.loads(result_str)
-    assert result["result"] == "ok"
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_handles_missing_config(tmp_path: Path) -> None:
-    set_spawn_config(None)
-    msg = await spawn_claude_code.ainvoke({"prompt": "x"})
-    assert "no spawn config" in msg
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_rejects_empty_prompt(tmp_path: Path) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    msg = await spawn_claude_code.ainvoke({"prompt": "   "})
-    assert "prompt is required" in msg
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_surfaces_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-
-    from mimir.tools import registry
-
-    def _timeout_run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
-        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
-
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _timeout_run)
-    msg = await spawn_claude_code.ainvoke({"prompt": "x", "timeout_s": 1})
-    assert "timed out" in msg
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_handles_missing_claude_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-
-    from mimir.tools import registry
-
-    def _missing_cli(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
-        raise FileNotFoundError("claude not on PATH")
-
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _missing_cli)
-    msg = await spawn_claude_code.ainvoke({"prompt": "x"})
-    assert "not on PATH" in msg
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_passes_model_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # chainlink #158: explicit model= must appear as --model <name> in
-    # the subprocess argv. Prevents output-path-as-proxy mis-tiering
-    # (analytical work routed to a lighter model because the output
-    # destination looks doc-shaped).
-    set_spawn_config({"default_cwd": tmp_path})
-
-    from mimir.tools import registry
-
-    captured: list[list[str]] = []
-
-    def _capture_argv(
-        argv: list[str],
-        cwd: str | None,
-        timeout_s: int,
-        env: dict[str, str] | None = None,
-    ) -> tuple[int, str, str]:
-        captured.append(argv)
-        return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
-
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
-    await spawn_claude_code.ainvoke({"prompt": "analyse this", "model": "opus"})
-
-    assert captured, "subprocess was not called"
-    argv = captured[0]
-    assert "--model" in argv
-    assert argv[argv.index("--model") + 1] == "opus"
-    # prompt must still be the final positional arg
-    assert argv[-1] == "analyse this"
-
-
-@pytest.mark.asyncio
-async def test_spawn_claude_code_omits_model_flag_when_not_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # When model= is not passed, --model must NOT appear in argv so the
-    # claude CLI uses its own default (don't force a tier unnecessarily).
-    set_spawn_config({"default_cwd": tmp_path})
-
-    from mimir.tools import registry
-
-    captured: list[list[str]] = []
-
-    def _capture_argv(
-        argv: list[str],
-        cwd: str | None,
-        timeout_s: int,
-        env: dict[str, str] | None = None,
-    ) -> tuple[int, str, str]:
-        captured.append(argv)
-        return 0, json.dumps({"result": "ok", "total_cost_usd": 0, "num_turns": 0}), ""
-
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
-    await spawn_claude_code.ainvoke({"prompt": "run benchmark"})
-
-    assert captured
-    argv = captured[0]
-    assert "--model" not in argv
-    assert argv[-1] == "run benchmark"
-
-
 # ─── spawn_codex (chainlink #293) ──────────────────────────────────
 
 
 def test_spawn_codex_is_coroutine() -> None:
-    # Same async wiring as spawn_claude_code — @tool routes async to
+    # @tool routes async functions to
     # ``.coroutine``; the sync ``.func`` must be unset so deepagents
     # awaits it off the loop rather than blocking.
     assert spawn_codex.coroutine is not None
@@ -409,7 +234,7 @@ async def test_spawn_codex_builds_codex_exec_argv(
         captured.append(argv)
         return 0, "codex did the thing", ""
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", _capture_argv)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_argv)
     # Operator-injected extra flags must be threaded into the invocation.
     monkeypatch.setenv("MIMIR_CODEX_SPAWN_ARGS", "--full-auto")
 

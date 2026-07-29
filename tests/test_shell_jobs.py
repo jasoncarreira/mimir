@@ -150,7 +150,7 @@ def test_spawn_captures_channel_id(tmp_path: Path):
     assert job.snapshot()["channel_id"] == "discord-99"
 
 
-# ─── env_overlay + cwd (chainlink #60: spawn_claude_code uses these) ──
+# ─── env_overlay + cwd ─────────────────────────────────────────────
 
 
 def test_env_overlay_sets_value_visible_to_child(tmp_path: Path):
@@ -169,9 +169,8 @@ def test_env_overlay_sets_value_visible_to_child(tmp_path: Path):
 def test_env_overlay_none_unsets_inherited_var(tmp_path: Path, monkeypatch):
     """``env_overlay={"FOO": None}`` → child does NOT see ``FOO`` even
     when the parent inherited one. The None-means-unset semantic is
-    load-bearing for ``spawn_claude_code``: ``CLAUDECODE`` is set in
-    mimir's container and must be stripped so the spawn doesn't think
-    it's nested in a parent Claude Code session."""
+    load-bearing for subprocess callers: parent-only variables must be
+    removable from the child environment."""
     registry = _make_registry(tmp_path)
     monkeypatch.setenv("SHELL_JOB_INHERIT_ME", "should-be-stripped")
     job = registry.spawn(

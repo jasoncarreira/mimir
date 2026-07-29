@@ -334,7 +334,7 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 |---|---|---|---|
 | `MIMIR_GIT_URL` | str | `https://github.com/jasoncarreira/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
-| `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code CLI + adapter into the image. |
+| `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 
 > `MIMIR_GIT_USER_NAME` / `MIMIR_GIT_USER_EMAIL` appear in scaffold comments as

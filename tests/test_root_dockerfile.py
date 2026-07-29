@@ -54,11 +54,10 @@ def test_apt_layer_keeps_cache_hygiene() -> None:
     assert "rm -rf /var/lib/apt/lists/*" in text
 
 
-def test_claude_code_build_arg_installs_cli_and_adapter_extra() -> None:
-    """One root-image switch should install both Claude Code pieces."""
+def test_claude_code_build_arg_installs_only_adapter_extra() -> None:
     text = _text()
     assert "ARG MIMIR_ENABLE_CLAUDE_CODE=0" in text
-    assert "npm install -g @anthropic-ai/claude-code@2.1.220" in text
+    assert "npm install -g @anthropic-ai/claude-code" not in text
     assert 'pip install --no-cache-dir "mimir-agent[claude-code]"' in text
     assert "git+https://github.com/jasoncarreira/langchain-claude-code" not in text
 

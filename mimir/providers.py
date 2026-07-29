@@ -126,8 +126,7 @@ class ProviderSpec:
         requires_cli: An external CLI that must be on ``PATH`` for this
             provider's adapter to run (``"claude"`` for anthropic-max —
             Max OAuth is driven through the ``claude`` subprocess). Empty
-            = no CLI dependency. Tool registration consults this via
-            :func:`claude_code_available` (chainlink #292).
+            = no CLI dependency.
     """
 
     name: str
@@ -197,8 +196,7 @@ _ANTHROPIC_MAX = ProviderSpec(
     # label directly (chainlink #292 review).
     spec_prefixes=("claude-code",),
     quota_provider_key="anthropic",
-    # Max OAuth runs through the ``claude`` CLI subprocess; spawn_claude_code
-    # shells out to it too. Tool registration gates on its presence.
+    # Max OAuth runs through the ``claude`` CLI subprocess.
     requires_cli="claude",
 )
 _ANTHROPIC_API = ProviderSpec(
@@ -312,21 +310,6 @@ def extra_for_spec(model_spec: str) -> str:
     return SPEC_PREFIX_EXTRAS.get(prefix, "")
 
 
-def claude_code_available() -> bool:
-    """True when the ``claude`` CLI — the runtime dependency of the
-    claude-code (anthropic-max) provider, and of the ``spawn_claude_code``
-    tool that shells out to ``claude -p`` — is on ``PATH``.
-
-    Tool registration gates ``spawn_claude_code`` on this (chainlink #292):
-    a deployment routed to a non-Claude provider (e.g. Minimax) typically
-    has no ``claude`` CLI installed, so registering the tool there would
-    only offer the agent something that fails with "'claude' CLI not on
-    PATH". This checks *presence* only; provider startup and diagnostics
-    use :func:`claude_code_auth_status` for the non-secret auth probe.
-    """
-    return shutil.which(_ANTHROPIC_MAX.requires_cli or "claude") is not None
-
-
 def claude_code_auth_status(
     *,
     credentials_path: Path | None = None,
@@ -424,9 +407,8 @@ def opencode_available() -> bool:
     """True when the ``opencode`` CLI — which the ``spawn_open_code`` tool
     shells out to (``opencode run``) — is on ``PATH``.
 
-    Same registration gate pattern as :func:`codex_available` (#293) /
-    :func:`claude_code_available` (#292); presence, not auth state. Part of
-    the #830 pivot: opencode as the provider-agnostic coding substrate.
+    This is a presence, not auth-state, check for the provider-agnostic
+    coding substrate.
     """
     return shutil.which(_OPENCODE_CLI) is not None
 
@@ -435,9 +417,8 @@ def codex_available() -> bool:
     """True when the ``codex`` CLI — which the ``spawn_codex`` tool shells
     out to (``codex exec``) — is on ``PATH``.
 
-    Tool registration gates ``spawn_codex`` on this, mirroring
-    :func:`claude_code_available` / ``spawn_claude_code`` (chainlink #293):
-    a deployment without the codex CLI shouldn't be handed a tool that can
+    Tool registration gates ``spawn_codex`` on this (chainlink #293): a
+    deployment without the codex CLI shouldn't be handed a tool that can
     only fail. Checks *presence*, not auth state — auth-state probing is a
     heavier future refinement.
     """

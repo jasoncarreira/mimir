@@ -49,16 +49,6 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         risk="Low: renderer drift is usually isolated to diagram generation and Chromium dependencies.",
     ),
     ToolPin(
-        name="claude-code",
-        category="coding-cli",
-        pin="2.1.220",
-        smoke="claude --version",
-        source="npm",
-        package="@anthropic-ai/claude-code",
-        install="root/scaffold Dockerfiles only when MIMIR_ENABLE_CLAUDE_CODE=1",
-        risk="Medium: optional second coding backend; real smoke requires deployments with the Claude CLI installed.",
-    ),
-    ToolPin(
         name="osv-scanner",
         category="security-scanner",
         pin="v2.4.0",

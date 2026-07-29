@@ -42,7 +42,7 @@ reachable only by the operator and their bridges. Defaults reflect that:
 - Outbound network calls (PyPI version-check, model-provider APIs, skill
   pollers) are not sandboxed; use OS-level egress filtering if that matters
   to your deployment.
-- Subprocess-based skills (`spawn_claude_code`) inherit the agent process's
+- Subprocess-based coding tools inherit the agent process's
   environment. Sensitive environment variables propagate.
 
 If you operate mimir outside this model — multi-tenant, exposed to the

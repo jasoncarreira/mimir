@@ -18,7 +18,7 @@ The name is from Norse myth — Mímir, the keeper of memory and counsel.
 5. **Search/SAGA/indexing ship as skills, not inline tools.** A skill is a folder with `SKILL.md` + a Python module; at the model's interface a skill that exposes a function is still a tool. The distinction is packaging — skills are filesystem-installable and can be added without redeploying. Inline tools stay minimal — bash, file ops, channel messaging, scheduling, web.
 6. **No bespoke memory-block tools.** The agent edits memory blocks the same way a human would: bash and file ops. No `create_memory_block` / `update_memory_block` / etc.
 7. **SAGA in the same container, hooked on both ends.** Pre-message: SAGA is queried for relevant atoms and the hits are injected into the turn prompt (retrieval-on-read pattern). Post-message: SAGA's `mark_contributions` is called to weight the atoms that informed the reply.
-8. **Out-of-process delegation via `spawn_claude_code`.** Long-running or sandboxed sub-tasks run in a separate Claude Code process (not in the parent's context window). The parent fires `spawn_claude_code` with a budget cap and an agent profile; a wake-up event fires on the parent's channel when the child exits.
+8. **Bounded out-of-process execution.** Coding CLI tools run with shared concurrency, rate, and recursion-depth caps.
 
 ---
 
@@ -264,7 +264,7 @@ Channel bridges (Slack, Discord, Web, Bench) are NOT separate processes — they
 │    )                                                             │
 │      ├─ tool calls flow through mimir.tools (LangChain @tool)   │
 │      ├─ skill invocations resolved by SkillsMiddleware           │
-│      └─ spawn_claude_code MCP tool for out-of-process delegation│
+│      └─ bounded coding CLI tools for out-of-process execution   │
 │ 6. saga post-message hook     # SagaStore.feedback(atom_ids,    │
 │                               # output, feedback=pos/neg)        │
 │ 7. persist TurnRecord (delivery is explicit send_message; step 5)│
@@ -277,35 +277,15 @@ Model: `codex-plus:gpt-5.6-luna` (default, overridable via `MIMIR_MODEL_SPEC`). 
 
 Alternatives: `claude-code:<model>` routes through `langchain-claude-code` / the Claude Code CLI subprocess (Max OAuth). Every provider supports `MIMIR_ACCESS_CONTROL_ENFORCED`. `anthropic:<model>` (e.g. `anthropic:claude-opus-4-7`) and `openai:<model>` route through `langchain-anthropic` / `langchain-openai` directly.
 
-### 4.3 Subagents (out-of-process delegation)
+### 4.3 Out-of-process execution
 
-Mimir delegates long-running or context-isolated work via `spawn_claude_code` — an MCP tool that runs `claude -p --output-format json <prompt>` as a subprocess and returns the result JSON. This is the replacement for the original mountaineering `Agent()` SDK primitive.
-
-```
-spawn_claude_code(prompt, cwd=None, timeout_s=1800, name=None)
-   → asyncio.to_thread(_run_claude_subprocess)
-       → subprocess.run(["claude", "-p", "--output-format", "json", prompt])
-   ← {"result": "...", "cost_usd": ..., "num_turns": ...}
-```
-
-Agent profiles under `<home>/.claude/agents/` configure per-role behavior (system prompt, allowed tools). Three profiles ship by default:
-
-- **`code-implementer`** — multi-file code changes, test runs, PRs. Budget cap: $25.
-- **`bench-runner`** — benchmark / evaluation runs. Budget cap: $10.
-- **`doc-writer`** — documentation, wiki, spec authoring. Budget cap: $5.
-
-**Key properties of spawn_claude_code:**
-- The call is `async` — it wraps the blocking subprocess in `asyncio.to_thread`, so the dispatcher event loop stays free for other channels while the subprocess runs.
-- The spawn is **sequential from the caller's perspective**: `spawn_claude_code` awaits the subprocess to completion before returning the result. To run multiple spawns in parallel within one turn, the model issues multiple `spawn_claude_code` tool_use blocks in the same assistant message — deepagents/Claude Code executes them concurrently and returns all results before the next model generation.
-- There is no background/non-blocking spawn mode (no `AgentDefinition(background=True)` equivalent). Long-running spawns hold the turn open; structure multi-session work as chainlink subissues across heartbeat ticks instead.
-
-**Completion wake-up path.** For shell jobs launched via `bash_async`, completion is delivered as a `shell_job_complete` trigger on the spawning channel (§7.3). This is distinct from `spawn_claude_code` (synchronous) — bash_async is the non-blocking shell-command primitive, not the subagent primitive.
+Mimir can run configured coding CLIs through bounded tools. Long-running background shell work uses `bash_async`, whose completion is delivered as a `shell_job_complete` trigger on the spawning channel (§7.3).
 
 ### 4.4 Parallelism
 
 Mimir's parallelism model post-deepagents migration:
 
-**(1) Within-turn parallel tool calls.** When the model emits multiple `tool_use` blocks in a single assistant message, Claude Code / deepagents executes them concurrently. This is the primary within-turn parallelism surface — e.g. the model issues `spawn_claude_code(task_a)` + `spawn_claude_code(task_b)` + `file_search(q)` in one message; all three run in parallel, results return before the next model generation.
+**(1) Within-turn parallel tool calls.** When the model emits multiple `tool_use` blocks in a single assistant message, deepagents executes them concurrently and returns all results before the next model generation.
 
 **(2) Across-turn spawns via heartbeat chain.** For work that exceeds one turn's budget, decompose via chainlink subissues (§50-heartbeat-patterns.md) and pick one subissue per heartbeat. Each heartbeat is an independent turn; spawns within a heartbeat are synchronous.
 
@@ -389,7 +369,7 @@ The context is set via `set_current_turn(ctx)` at the top of `run_turn` and rese
 | `chat_history.jsonl` append | Single asyncio.Lock around the append (same pattern as `turn_logger`). |
 | Schedule changes | Single `_SCHEDULER_LOCK` (open-strix port) serializes `add_schedule` / `remove_schedule`. |
 
-**Subagents and concurrency.** A turn that issues N parallel `spawn_claude_code` tool calls counts as **one** in-flight slot in the global semaphore — the parent's `run_turn` holds the slot; each subprocess runs in `asyncio.to_thread` alongside the others. A fan-out of 5 spawns consumes 1 semaphore slot but 5 subprocess instances; tune `MIMIR_MAX_CONCURRENT_TURNS` with subprocess CPU/memory cost in mind, not just slot count.
+**Coding tools and concurrency.** A turn that issues parallel coding-tool calls counts as **one** in-flight turn slot; each subprocess also consumes the shared spawn guard's capacity.
 
 ### 4.8 Backpressure and admission
 
@@ -399,19 +379,7 @@ The context is set via `set_current_turn(ctx)` at the top of `run_turn` and rese
 
 ### 4.9 Budget enforcement and quota management
 
-Two distinct budget layers apply at runtime: per-spawn subagent caps and Anthropic platform quota windows.
-
-#### Per-spawn caps (spawn_claude_code)
-
-Each agent profile configures a hard dollar ceiling passed to the Claude Code subprocess via `--max-cost`:
-
-| Profile | Cap |
-|---|---|
-| `code-implementer` | $25 |
-| `bench-runner` | $10 |
-| `doc-writer` | $5 |
-
-When a spawn reaches its cap, Claude Code terminates the subprocess with a non-zero exit code and returns a partial result (whatever the subprocess completed before hitting the limit). The parent receives this in the `spawn_claude_code` tool result with a truncated `result` field and a `cost_usd` near the cap. The parent is responsible for detecting the truncation and filing a chainlink for follow-up rather than retrying the same spawn (retrying doubles the cost with no structural difference).
+Runtime budget controls include per-turn tool-call limits, shared coding-tool spawn caps, and provider platform quota windows.
 
 #### Platform quota windows (Anthropic API / OAuth)
 
@@ -436,8 +404,6 @@ The `arbiter` (in `mimir/arbiter.py`) polls the Anthropic usage endpoint on each
 6. **Early-recovery probe.** The recorded reset can be pessimistic or wrong (clamped garbage header, provider-side early roll), and a window sometimes clears intermittently well before it. While a pause is active, an interval job (`MIMIR_QUOTA_RECHECK_SECONDS`, default 180s) probes for fresh evidence: the pause is an authoritative cap (`quota_exhausted`, never a transient backoff), at least one rate-limit-store snapshot was observed AFTER the pause was recorded (the usage pollers keep running — cheap HTTP, not LLM turns), and no current window sits at/over the suppress wall (a still-pegged 5h window vetoes, even if the fresh 7d reading is low). On evidence: the pause clears immediately, `quota_recovered` fires with `early=true`, and a catch-up heartbeat runs through the normal arbiter gate. The probe disarms itself once the pause is gone; the one-shot recovery wake at `reset_at` remains the fallback.
 
 User-message turns are NOT blocked by the pause (interactive responsiveness wins over quota conservation). They'll hit the API and either succeed (window has reset) or get their own 429 — which the agent surfaces to the operator via `send_message` rather than vanishing silently.
-
-**Resume of in-flight work.** What's NOT covered: pause + resume of a `spawn_claude_code` subprocess that hits 429 partway through. The subprocess fails; its partial output (if written to `output_dir`) is preserved on disk, but there's no automatic re-invocation. The parent agent sees the failure and decides whether to retry after the window resets. A "subprocess resume after quota recovers" primitive is a future addition (track as §16 item 18 sub-b — when it bites operationally).
 
 #### Tool budget exemptions
 
@@ -888,7 +854,6 @@ Additional meta-tools:
 
 ### 7.6 Subagent spawning
 
-- `spawn_claude_code(prompt: str, cwd: str | None = None, timeout_s: int = 1800, name: str | None = None)` — spawn a Claude Code subprocess to execute a complex task. Returns output, cost, and model usage metrics. The subagent runs in its own context (fresh memory, no parent conversation history). Budget caps enforced via agent profiles under `<home>/.claude/agents/` (code-implementer: $25, bench-runner: $10, doc-writer: $5). See §4.3 for the full subagent model.
 
 ### 7.7 SAGA memory tools
 
@@ -964,7 +929,7 @@ All skills under `.mimir_builtin_skills/` as of 2026-05:
 | `world-scanning` | Catalog of pollers worth building (CI pipelines, releases, config drift, etc.). |
 
 **Dropped from original open-strix port:**
-- `mountaineering/` — removed with PR #271 (SubAgent delegation machinery dropped); `spawn_claude_code` is the out-of-process delegation primitive now (§7.6).
+- `mountaineering/` — removed with PR #271 (SubAgent delegation machinery dropped).
 - `prediction-review/` — depends on a journal mimir doesn't have.
 
 ### 8.3 Index integrity and rebuild
@@ -1249,8 +1214,6 @@ Mapping to the event list schema:
 
 The on-disk schema is identical to the SDK era — bench tooling (`benchmark/scripts/collate_turns.py`, `benchmark/overview_turns.py`, the turn viewer) reads this output without modification.
 
-Out-of-process subagents spawned via `spawn_claude_code` (§7, §4.3) run in a separate Claude Code process. Their turns are not flattened into the parent's event log — each subagent writes its own turns to the parent's `logs/` path via the spawner's `output_dir` param.
-
 ### 10.4 Retention
 
 `DEFAULT_MAX_TURNS = 5000` for turns.jsonl, `DEFAULT_MAX_EVENTS = 75000` for events.jsonl (15× the turns cap, sized to the observed ~14 events/turn rate so both files span roughly the same time window). When the line count exceeds the cap, the file is trimmed in-place to keep the most recent N records under a write lock with 10% hysteresis. Hard ceilings: `MIMIR_MAX_TURNS` clamps at 50000, `MIMIR_MAX_EVENTS` at 750000 — beyond that, on-disk weight (~300 MB at the events ceiling) starts to matter and operators should ship to an external log store instead.
@@ -1320,12 +1283,12 @@ open http://localhost:<host_port>/turns
 
 ### 12.1 Dockerfile
 
-Single-process build. SAGA runs in-process (workspace dependency, not a sidecar), so there's one Python process rather than supervisord managing two. Claude Code CLI is installed via npm — it's the subprocess transport for `spawn_claude_code` (§4.3) and the Max/OAuth auth path.
+Single-process build. SAGA runs in-process (workspace dependency, not a sidecar), so there's one Python process rather than supervisord managing two. The Claude Code CLI remains an operator-provided dependency for the optional Max/OAuth model provider.
 
 ```dockerfile
 FROM python:3.11-slim AS base
 
-# Node.js + Claude Code CLI (subprocess transport for spawn_claude_code)
+# Node.js tooling
 # git: required by the ``claude-code`` extra (langchain-claude-code is
 #      git-pinned until upstream patches land)
 # PDF ingest tools (poppler-utils for text PDFs, tesseract-ocr for scanned)
@@ -1479,7 +1442,7 @@ ANTHROPIC_CUSTOM_MODEL_OPTION=1     # skip claude-* name validation
 
 The benchmark adapter sets these before launching the container. `effort` and `thinking` params are ignored by non-Anthropic gateways (same behavior as the other adapters).
 
-When run against Claude (Opus 4.7 via OAuth or API key), all features work natively — adaptive thinking, `spawn_claude_code` subagents, 1M context beta.
+When run against Claude (Opus 4.7 via OAuth or API key), adaptive thinking and the 1M context beta are available.
 
 Slack and Discord bridge config is live (both implemented). Bluesky is handled by the `social-cli` optional skill poller, not an in-process bridge. Deferred config is mainly per-channel rate-limit granularity.
 
@@ -1587,7 +1550,7 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 1. **Bridge implementations.** Slack, Discord, and Web bridges are live (production). Bluesky is the `social-cli` optional skill poller (no in-process bridge). Per-channel rate-limit granularity (beyond the within-turn circuit breaker at §7.2.4) is still deferred.
 2. **Embedder upgrade path.** Likely target: `text-embedding-3-large` or a stronger open model. Decision deferred; v1 ships fastembed bge-small. Voyage AI embeddings explored as alternative (see `memory/issues/voyage-embedding-input-type-required.md`).
 3. **SAGA auto-store cadence.** SAGA's own atom extractor decides when to store from message content; mimir doesn't impose a separate cadence. Revisit if extraction is too noisy.
-4. **Subagent recursion.** [Resolved: changed post-deepagents migration] The `Agent` SDK tool is no longer the subagent mechanism. `spawn_claude_code` (§4.3) spawns an out-of-process Claude Code subprocess — recursion is possible (a subagent can itself call `spawn_claude_code`) but budget-gated. The original SDK-level "cannot spawn subagents" restriction no longer applies.
+4. **Subagent recursion.** [Resolved] Coding-tool subprocesses use shared recursion and rate caps.
 5. **Index regeneration cost.** With end-of-turn debounce (§3.4, §6.3) regeneration is one tree-walk per turn regardless of how many writes happened. Cheap for ~50 files; revisit if either tree crosses ~500 — at that point add a `MIMIR_INDEX_MAX_ENTRIES` cap on what `memory/INDEX.md` renders into the prompt and let the rest live behind `file_search`.
 6. **Renumbering pressure.** With 10-spacing, gaps close after ~10 inserts at a single position. Add a maintenance scheduled job ("renumber memory/core/ if gaps closed") in Phase 5.
 7. **SAGA decay/forget cadence.** Mimir runs periodic consolidation (§5.6) but leaves `/v1/decay` and `/v1/forget` to SAGA's internal defaults. Revisit if working memory grows unbounded or stale atoms degrade retrieval.
@@ -1596,7 +1559,7 @@ Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0
 10. **Bash content writes.** The prompt steers the agent toward `write_file`/`edit_file` for memory edits, but if it `echo > memory/core/00-persona.md`s anyway, last-writer-wins applies and there's no `flock`. Acceptable today; if it becomes a real failure mode, wrap bash with a path-aware preflight that runs cross-channel-path commands under `flock(1)`.
 11. **Channel ID conventions.** The spec assumes channel IDs are stable strings. When the same human's Slack ID changes (workspace migration) we lose continuity. Track this as a future "identity reconciliation" problem.
 12. **Within-turn parallel tool execution.** [Resolved: LangGraph handles this] Post-deepagents, LangGraph controls the tool-execution loop. Multiple tool calls in one assistant message run sequentially within the LangGraph state machine. No flock race; §4.4 sequential assumption holds.
-13. **Background subagent stream delivery.** [Resolved: moot] The `Agent(background=True)` SDK pattern is no longer used. Background delegation is via `spawn_claude_code` with `bash_async` wait patterns (§4.3). Completion arrives as a `shell_job_complete` wake-up event on the spawning channel.
+13. **Background subprocess delivery.** [Resolved] `bash_async` completion arrives as a `shell_job_complete` wake-up event on the spawning channel.
 
 ### Gap analysis (2026-05-23) — from external spec review
 
@@ -1612,7 +1575,7 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 
 17. **Session timeout for continuous channels.** [Resolved: turn-count cap] Implemented as `MIMIR_SAGA_SESSION_MAX_TURNS` (default 10, see §5.6). A continuous channel that never idles still gets synthesis after the cap is reached; the cap-path emits `saga_session_turn_cap_reached` so operators can distinguish it from the idle-timer path. The originally-suggested time-based fallback was deferred in favor of the turn cap — message-count is a tighter proxy for "session got long enough to synthesize" than wall-clock duration (a slow-burning channel at 1 msg/hour for 4h would otherwise force-synthesize on 4 turns, often too few to be useful, while a burst channel at 100 msg/min would not be capped at all by a 4h timer).
 
-18. **Tool-call budget enforcement and quota exhaustion handling.** [Mostly resolved] Per-turn tool-call cap via `BudgetGateMiddleware` (PR #282, intercepts deepagents built-ins too); per-spawn $25/$10/$5 caps and pre-tick arbiter suppression at 80% utilization at §4.9; mid-turn 429 handling via `QuotaPauseTracker` (§4.9, this PR) — exception classification, reset-time extraction, file-persisted pause, lazy expiry, `quota_exhausted` + `quota_recovered` algedonic events. **Sub-gap remaining:** automatic resume of a `spawn_claude_code` subprocess that died on 429 partway through. Subprocess partial output is preserved (if written to `output_dir`) but the parent agent has to manually decide to retry after the window resets. Deferred — wait for it to bite operationally.
+18. **Tool-call budget enforcement and quota exhaustion handling.** [Mostly resolved] Per-turn tool-call cap via `BudgetGateMiddleware` (PR #282, intercepts deepagents built-ins too); pre-tick arbiter suppression at 80% utilization at §4.9; mid-turn 429 handling via `QuotaPauseTracker` (§4.9, this PR) — exception classification, reset-time extraction, file-persisted pause, lazy expiry, `quota_exhausted` + `quota_recovered` algedonic events.
 
 #### Significant — scale and maturity concerns
 
@@ -1624,7 +1587,7 @@ Gaps identified by independent spec review, organized by severity. Critical gaps
 
 22. **Synthesis failure recovery.** SAGA session synthesis (`saga_session_end`) can fail if SAGA is unreachable or the LLM extraction step times out. Current behavior: the failure is logged; the session remains open; the next synthesis attempt starts from an even larger context. No retry policy, no partial-synthesis path, no operator alert on synthesis failure. Revisit when synthesis failures appear in events.jsonl.
 
-23. **Channel cardinality and cost attribution.** Cost is tracked at the turn level (`cost_usd` in `turns.jsonl`) but not rolled up per channel or per subagent profile. Multi-channel deployments have no per-channel spend dashboard. The per-spawn `cost_usd` return from `spawn_claude_code` exists but is not aggregated. Add cost roll-up (daily, per-channel, per-profile) as part of §11 (operator dashboard, §16 item 25).
+23. **Channel cardinality and cost attribution.** Cost is tracked at the turn level (`cost_usd` in `turns.jsonl`) but not rolled up per channel. Multi-channel deployments have no per-channel spend dashboard. Add cost roll-up (daily, per-channel) as part of §11 (operator dashboard, §16 item 25).
 
 #### Enhancement opportunities
 

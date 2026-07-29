@@ -40,7 +40,6 @@ _OLD_ADMIN_TOOLS = {
     "worklink_run",
     "shell_exec",
     "bash_async",
-    "spawn_claude_code",
     "spawn_codex",
     "spawn_open_code",
     "task",
@@ -108,9 +107,6 @@ def _service_labels(event) -> InformationFlowLabels:
 @pytest.mark.parametrize(
     ("tool_name", "failure_kind", "expected"),
     [
-        ("spawn_claude_code", "exit", "exit=7 stderr=" + "x" * 500),
-        ("spawn_claude_code", "timeout", "timed out after 3s"),
-        ("spawn_claude_code", "missing", "'claude' CLI not on PATH"),
         ("spawn_codex", "exit", "exit=7 stderr=" + "x" * 500),
         ("spawn_codex", "timeout", "timed out after 3s"),
         ("spawn_codex", "missing", "'codex' CLI not on PATH"),
@@ -136,7 +132,7 @@ async def test_spawn_subprocess_failures_emit_failed_tool_calls(
             raise FileNotFoundError(tool_name)
         return 7, "", "x" * 501
 
-    monkeypatch.setattr(registry, "_run_claude_subprocess", fail_subprocess)
+    monkeypatch.setattr(registry, "_run_spawn_subprocess", fail_subprocess)
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         budget_gate,
@@ -1054,7 +1050,7 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
-    spawn_ops = {"spawn_claude_code", "spawn_codex"}
+    spawn_ops = {"spawn_codex", "spawn_open_code"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
     worklink_ops = {"worklink_run"}
@@ -1108,7 +1104,6 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     forbidden = {
         "shell_exec",
         "bash_async",
-        "spawn_claude_code",
         "spawn_codex",
         "add_schedule",
         "remove_schedule",
@@ -1144,7 +1139,7 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     for cap in all_expected:
         assert system.has_capability(cap), f"system missing {cap}"
 
-    forbidden = {"spawn_claude_code", "spawn_codex", "worklink_run", "saga_forget"}
+    forbidden = {"spawn_codex", "worklink_run", "saga_forget"}
     for cap in forbidden:
         assert not system.has_capability(cap), f"system should NOT have {cap}"
 
@@ -1164,7 +1159,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
         ("scheduled_tick", "remove_schedule", False),
         ("scheduled_tick", "reload_pollers", False),
         ("saga_session_end", "saga_end_session", True),
-        ("saga_session_end", "spawn_claude_code", False),
+        ("saga_session_end", "spawn_open_code", False),
         ("saga_session_end", "add_schedule", False),
         ("upgrade", "submit_proposal", True),
         ("upgrade", "spawn_codex", False),

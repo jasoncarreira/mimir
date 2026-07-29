@@ -23,7 +23,7 @@ shadow bundled same-named entries on collision, matching
   env vars without touching the operator's existing secrets.
 
 The base template draws from mimirbot's actual Dockerfile —
-python:3.11-slim + git/gh/uv/Claude Code CLI/Node + a ``mimir``
+python:3.11-slim + git/gh/uv/Node + a ``mimir``
 non-root user — generalized so the container name is parametric.
 """
 
@@ -150,7 +150,7 @@ def collect_required_env_vars(home: Path) -> list[str]:
         "GH_USER_EMAIL",           # git config user.email
         "MIMIR_GIT_URL",           # mimir source clone URL — change for forks
         "MIMIR_DEFAULT_BRANCH",    # branch start.sh clones (default: main)
-        "MIMIR_ENABLE_CLAUDE_CODE",# 1 installs Claude Code CLI + adapter
+        "MIMIR_ENABLE_CLAUDE_CODE",# 1 installs Claude Code model adapter
         "MIMIR_ENABLE_OPENCODE",   # 1 installs + configures OpenCode runtime
     ]
     seen = set(baseline)
@@ -273,7 +273,7 @@ FROM python:3.11-slim
 # 2026-05: git for the source clone + agent dev loop, gh for PR
 # creation, build-essential for any C extensions, ca-certificates for
 # HTTPS clones, poppler-utils for PDF ingest, Node 22 (needed for
-# optional Claude Code CLI plus mermaid-cli), jq for JSONL log parsing
+# optional coding tools plus mermaid-cli), jq for JSONL log parsing
 # across many skill bodies + the introspection recipes.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
@@ -298,8 +298,6 @@ RUN apt-get update \\
 
 # Pinned mermaid CLI (used by mermaid-diagrams skill).
 RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
-
-__CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
@@ -374,7 +372,7 @@ FROM python:3.11-slim
 # Base system tooling — git for any local commits the agent makes,
 # gh for PR / issue automation, build-essential for C extensions
 # pulled by deps, poppler-utils + jq because skill bodies use them,
-# Node 22 for the optional claude-code CLI + mermaid CLI.
+# Node 22 for optional coding tools + mermaid CLI.
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends \\
         git \\
@@ -398,8 +396,6 @@ RUN apt-get update \\
 
 # Pinned mermaid CLI (used by mermaid-diagrams skill).
 RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
-
-__CLAUDE_CODE_INSTALL__
 
 __CODEX_INSTALL__
 
@@ -451,15 +447,14 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:${PATH}"
 #   discord, slack                   (bridges)
 #   mcp                              (Model Context Protocol)
 #
-# Set MIMIR_ENABLE_CLAUDE_CODE=1 below to install both the Claude Code
-# CLI and the adapter extra in one build switch.
+# Set MIMIR_ENABLE_CLAUDE_CODE=1 below to install the Claude Code model adapter.
+# Its CLI is an operator-provided runtime dependency and is not bundled.
 ARG MIMIR_EXTRAS="__MIMIR_EXTRAS__"
 RUN pip install --no-cache-dir --upgrade pip \\
  && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
-# Optional: install the Claude Code subprocess provider adapter. Set
-# ``MIMIR_ENABLE_CLAUDE_CODE=1`` to enable; the same build arg installs
-# the npm CLI above.
+# Optional: install the Claude Code model-provider adapter.
+ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\
         pip install --no-cache-dir "mimir-agent[claude-code]" ; \\
     fi
@@ -480,38 +475,19 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
-def _claude_code_install_block() -> str:
-    """Dockerfile block installing the Claude Code CLI when enabled.
-
-    The npm CLI is needed only for the Claude Code subprocess
-    provider. Gate it on the same build arg as the
-    ``mimir-agent[claude-code]`` Python provider so Codex/OpenAI/Anthropic
-    API deployments don't carry an unused CLI binary.
-    """
-    return (
-        "# Claude Code CLI — optional subprocess-provider transport.\n"
-        "# Same gate as the langchain-claude-code-mimir Python provider below.\n"
-        "ARG MIMIR_ENABLE_CLAUDE_CODE=0\n"
-        "RUN if [ \"$MIMIR_ENABLE_CLAUDE_CODE\" = \"1\" ]; then \\\n"
-        "        npm install -g @anthropic-ai/claude-code@2.1.220 ; \\\n"
-        "    fi"
-    )
-
-
 def _codex_install_block(install_codex: bool) -> str:
     """Dockerfile line installing the codex CLI, or a placeholder comment.
 
     Installed for codex-subscription deployments (the ``codex-plus``
     extra) so ``spawn_codex`` can shell out to ``codex exec`` and Codex
-    Plus auth (``~/.codex/auth.json``) is usable. Same npm-global pattern
-    as the optional claude-code CLI.
+    Plus auth (``~/.codex/auth.json``) is usable.
     """
     if not install_codex:
         return "# (codex CLI not installed — no codex-plus extra selected)"
     return (
         "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
         "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
-        "# at ~/.codex/auth.json. npm-global, like the claude-code CLI above.\n"
+        "# at ~/.codex/auth.json.\n"
         "RUN npm install -g @openai/codex@0.145.0"
     )
 
@@ -579,7 +555,6 @@ def render_dockerfile(
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
-    base = base.replace("__CLAUDE_CODE_INSTALL__", _claude_code_install_block())
     base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
     base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block(install_opencode))
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
@@ -621,8 +596,7 @@ services:
     build:
       context: .
       args:
-        # One switch for Claude Code support: installs the npm CLI at
-        # build time and makes workspace start.sh sync --extra claude-code.
+        # Install the Claude Code model adapter. Its CLI is operator-provided.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
         # Install the pinned OpenCode runtime + plugins. start.sh merges
         # their config into OpenCode's XDG path when the same flag is set.
@@ -689,8 +663,7 @@ services:
     build:
       context: .
       args:
-        # One switch for Claude Code support: installs the npm CLI and
-        # mimir-agent[claude-code] adapter extra at build time.
+        # Install the Claude Code model adapter. Its CLI is operator-provided.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
         # Install the pinned OpenCode runtime + plugins. start.sh merges
         # their config into OpenCode's XDG path when the same flag is set.

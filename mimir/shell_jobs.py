@@ -201,11 +201,7 @@ class ShellJobRegistry:
 
         ``env_overlay`` merges into the inherited env after defaults
         are applied; keys map to None to *unset* an inherited var.
-        ``cwd`` overrides the working directory the subprocess starts
-        in. Both used by ``spawn_claude_code`` to run the bundled CLI
-        with ``HOME=/mimir-home`` (so OAuth credentials resolve) and
-        without ``CLAUDECODE`` (so the spawn doesn't think it's
-        nested in a Claude Code session).
+        ``cwd`` overrides the working directory the subprocess starts in.
         """
         # Eagerly evict finished jobs that have aged out, bounding the
         # registry size and freeing their on-disk output files.
