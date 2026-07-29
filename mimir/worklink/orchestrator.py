@@ -9,7 +9,7 @@ PR only after the evidence gate passes, then clean up and release the lock.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -300,7 +300,9 @@ class WorklinkRunner:
     home: Path
     repo: Path
     chainlink_bin: str = "chainlink"
-    agent_id: str = "mimir-worklink"
+    agent_id: str = field(
+        default_factory=lambda: os.environ.get("MIMIR_WORKLINK_AGENT_ID") or "mimir-worklink"
+    )
     runner: Runner | None = None
     registry: BackendRegistry | None = None
 
@@ -538,7 +540,7 @@ class WorklinkRunner:
                     issue.issue_id,
                     status="failed",
                     review_ready=False,
-                    attempt=record.attempt,
+                    attempt=record.budget_attempt or record.attempt,
                     reason=str(exc),
                 )
             except Exception:
@@ -710,7 +712,7 @@ class WorklinkRunner:
             issue.issue_id,
             status=transition_status,
             review_ready=validation.review_ready,
-            attempt=attempt,
+            attempt=claim_record.budget_attempt or attempt,
             reason=transition_reason,
         )
         _log_event(
@@ -1085,7 +1087,7 @@ class WorklinkRunner:
                     issue.issue_id,
                     status="failed",
                     review_ready=False,
-                    attempt=record.attempt,
+                    attempt=record.budget_attempt or record.attempt,
                     reason=str(exc),
                 )
             except Exception:
@@ -1155,6 +1157,7 @@ class WorklinkRunner:
                 issue=issue,
                 claims=claims,
                 attempt=record.attempt,
+                budget_attempt=record.budget_attempt or record.attempt,
                 worktree=order.worktree,
                 lease=lease,
                 state=existing,
@@ -1216,6 +1219,7 @@ class WorklinkRunner:
             issue=issue,
             claims=claims,
             attempt=record.attempt,
+            budget_attempt=record.budget_attempt or record.attempt,
             worktree=order.worktree,
             lease=lease,
             state=state,
@@ -1313,6 +1317,7 @@ class WorklinkRunner:
         issue: IssueContext,
         claims: ChainlinkClaims,
         attempt: int,
+        budget_attempt: int,
         lease: WorktreeLease | None,
         status: str,
         reason: str | None,
@@ -1324,7 +1329,7 @@ class WorklinkRunner:
             issue.issue_id,
             status=status,
             review_ready=False,
-            attempt=attempt,
+            attempt=budget_attempt,
             reason=reason,
         )
         _log_event(
@@ -1360,6 +1365,7 @@ class WorklinkRunner:
         issue: IssueContext,
         claims: ChainlinkClaims,
         attempt: int,
+        budget_attempt: int,
         worktree: Path,
         lease: WorktreeLease | None,
         state: Any,
@@ -1390,6 +1396,7 @@ class WorklinkRunner:
                 issue=issue,
                 claims=claims,
                 attempt=attempt,
+                budget_attempt=budget_attempt,
                 lease=lease,
                 status="failed",
                 reason=stuck_reason,
@@ -1401,6 +1408,7 @@ class WorklinkRunner:
                 issue=issue,
                 claims=claims,
                 attempt=attempt,
+                budget_attempt=budget_attempt,
                 lease=lease,
                 status="failed",
                 reason="factory produced no run.json",
@@ -1419,7 +1427,7 @@ class WorklinkRunner:
                 issue.issue_id,
                 status="review",
                 review_ready=True,
-                attempt=attempt,
+                attempt=budget_attempt,
             )
             _epic_comment(
                 claims, issue.issue_id, f"factory completed; PR ready for review: {pr_url}"
@@ -1465,6 +1473,7 @@ class WorklinkRunner:
             issue=issue,
             claims=claims,
             attempt=attempt,
+            budget_attempt=budget_attempt,
             lease=lease,
             status="blocked",
             reason=reason,

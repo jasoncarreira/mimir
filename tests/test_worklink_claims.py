@@ -8,7 +8,14 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
+from mimir.worklink.claims import (
+    MAX_SHUTDOWN_ABORT_FORGIVENESS,
+    SHUTDOWN_ABORT_PREFIX,
+    ChainlinkClaims,
+    ClaimRecord,
+    ShutdownAbortRecord,
+    claim_records_from_comments,
+)
 from mimir.worklink.evidence import TestResult, WorklinkEvidence
 from mimir.worklink.orchestrator import _write_evidence
 
@@ -453,3 +460,99 @@ def test_claim_issue_allows_without_evidence_when_worklink_ready(tmp_path: Path)
 
     assert result.claimed is True
     assert result.record is not None
+
+
+def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget() -> None:
+    calls: list[list[str]] = []
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    own = ClaimRecord(1033, 1, "mimir-worklink:process-a", now)
+    other = ClaimRecord(1029, 1, "mimir-worklink:process-b", now)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps([{"id": 1033}, {"id": 1029}]), stderr=""
+            )
+        if call[1:4] == ["issue", "show", "1033"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"comments": [{"content": own.to_comment()}]}), stderr=""
+            )
+        if call[1:4] == ["issue", "show", "1029"]:
+            return subprocess.CompletedProcess(
+                call, 0, stdout=json.dumps({"comments": [{"content": other.to_comment()}]}), stderr=""
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(
+        agent_id=own.agent_id,
+        runner=runner,
+        clock=lambda: now + timedelta(minutes=1),
+    )
+    released = claims.release_owned_claims_for_shutdown()
+
+    assert released == [own]
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+    assert ["chainlink", "locks", "release", "1033"] in calls
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:in-progress"] in calls
+    assert not any("1029" in call and call[1:3] != ["issue", "show"] for call in calls)
+    assert not any(call[1:3] == ["locks", "steal"] for call in calls)
+
+    abort_comment = next(
+        call[-1]
+        for call in calls
+        if call[1:3] == ["issue", "comment"] and call[-1].startswith(SHUTDOWN_ABORT_PREFIX)
+    )
+    history = [own.to_comment(), abort_comment]
+    assert claims.attempts_used(history) == 0
+    assert claims.next_attempt(history) == 2
+
+
+def test_shutdown_abort_forgiveness_is_capped_and_attempt_ordinals_keep_advancing() -> None:
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    history: list[str] = []
+    for attempt in range(1, MAX_SHUTDOWN_ABORT_FORGIVENESS + 2):
+        claim = ClaimRecord(
+            1033,
+            attempt,
+            f"mimir-worklink:process-{attempt}",
+            now + timedelta(minutes=attempt),
+        )
+        history.extend(
+            [
+                claim.to_comment(),
+                ShutdownAbortRecord(
+                    issue_id=claim.issue_id,
+                    attempt=claim.attempt,
+                    agent_id=claim.agent_id,
+                    claimed_at=claim.claimed_at,
+                    aborted_at=claim.claimed_at + timedelta(seconds=10),
+                ).to_comment(),
+            ]
+        )
+
+    claims = ChainlinkClaims(agent_id="next")
+    assert claims.attempts_used(history) == 1
+    assert claims.next_attempt(history) == MAX_SHUTDOWN_ABORT_FORGIVENESS + 2
+
+
+def test_shutdown_abort_marker_cannot_pre_authorize_a_later_claim() -> None:
+    now = datetime(2026, 7, 29, tzinfo=UTC)
+    claim = ClaimRecord(1033, 1, "mimir-worklink:process-a", now)
+    abort = ShutdownAbortRecord(1033, 1, claim.agent_id, now, now + timedelta(seconds=1))
+
+    claims = ChainlinkClaims(agent_id="next")
+    assert claims.attempts_used([abort.to_comment(), claim.to_comment()]) == 1
+
+
+def test_normal_failed_transition_cannot_write_shutdown_abort_marker() -> None:
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(
+        agent_id="mimir-worklink:worker",
+        runner=lambda args: calls.append(list(args)) or completed(args),
+    )
+
+    claims.transition_issue(1033, status="failed", review_ready=False, attempt=1)
+
+    assert not any(SHUTDOWN_ABORT_PREFIX in token for call in calls for token in call)
