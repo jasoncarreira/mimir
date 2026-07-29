@@ -1198,10 +1198,23 @@ def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
 
 def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
     """Return hardened argv for the branch-scoped Git mutation allow-list."""
-    if argv[:3] != ["git", "-C", state.root] or len(argv) < 4:
+    if not argv or argv[0] != "git":
         return None
-    subcommand = argv[3]
-    arguments = argv[4:]
+    if argv[1:2] == ["-C"]:
+        if len(argv) < 4:
+            return None
+        try:
+            if Path(argv[2]).resolve() != Path(state.root).resolve():
+                return None
+        except (OSError, RuntimeError):
+            return None
+        subcommand = argv[3]
+        arguments = argv[4:]
+    elif len(argv) >= 2:
+        subcommand = argv[1]
+        arguments = argv[2:]
+    else:
+        return None
     branch = state.head_ref
     if subcommand == "status":
         allowed = (
@@ -1219,19 +1232,48 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
                 ),
             )
         )
+    elif _repo_review_git_read_arguments(subcommand, arguments):
+        allowed = True
     elif subcommand == "checkout":
-        allowed = arguments == [branch]
+        allowed = arguments in ([branch], ["-B", branch])
     elif subcommand == "add":
-        allowed = state.checked_out and arguments in (["--all"], ["-A"])
+        path_arguments = arguments[1:] if arguments[:1] == ["--"] else arguments
+        allowed = state.checked_out and (
+            arguments in (["--all"], ["-A"])
+            or bool(path_arguments)
+            and all(_repo_review_relative_path(path) for path in path_arguments)
+        )
     elif subcommand == "commit":
+        message = None
+        if len(arguments) == 2 and arguments[0] == "-m":
+            message = arguments[1] if arguments[1].strip() else None
+        elif len(arguments) == 2 and arguments[0] == "--file":
+            message = _capture_review_body_beneath_scratch(arguments[1])
+        allowed = state.checked_out and message is not None
+        if allowed:
+            arguments = ["-m", message]
+    elif subcommand == "worktree":
+        allowed = (
+            arguments[:1] == ["add"]
+            and len(arguments) == 3
+            and _repo_review_write_path(arguments[1], state.root)
+            and arguments[2] == branch
+        )
+    elif subcommand == "pull":
+        allowed = state.checked_out and arguments == ["--ff-only", "origin", branch]
+    elif subcommand == "push":
+        push_options = []
+        while arguments[:1] and arguments[0] in {
+            "--dry-run", "-u", "--set-upstream",
+        }:
+            push_options.append(arguments.pop(0))
         allowed = (
             state.checked_out
             and len(arguments) == 2
-            and arguments[0] == "-m"
-            and bool(arguments[1].strip())
+            and arguments[0] == "origin"
+            and _repo_review_push_refspec(arguments[1], branch)
         )
-    elif subcommand == "push":
-        allowed = state.checked_out and arguments == ["origin", f"{branch}:{branch}"]
+        arguments = [*push_options, *arguments]
     else:
         return None
     if not allowed:
@@ -1248,13 +1290,155 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         if subcommand == "push"
         else []
     )
-    return [
+    identity_overrides: list[str] = []
+    if subcommand == "commit":
+        from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+        identity_overrides = [
+            "-c", f"user.name={DEFAULT_USER_NAME}",
+            "-c", f"user.email={DEFAULT_USER_EMAIL}",
+        ]
+    execution_argv = [
         str(git), "-C", state.root,
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
         *transport_overrides,
+        *identity_overrides,
         *filter_overrides,
         "--no-pager", subcommand, *arguments,
     ]
+    if subcommand == "log":
+        execution_argv.extend(("--no-ext-diff", "--no-textconv"))
+    return execution_argv
+
+
+def _repo_review_relative_path(value: str) -> bool:
+    path = Path(value)
+    return bool(value) and not path.is_absolute() and ".." not in path.parts
+
+
+def _repo_review_write_path(value: str, root: str) -> bool:
+    """Confine a Git-created worktree to an explicit repository write root."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    try:
+        candidate = Path(value)
+        resolve_within_roots(
+            _configured_repo_write_roots(),
+            str(candidate if candidate.is_absolute() else Path(root) / candidate),
+        )
+    except (IndexError, OSError, PathOutsideHomeError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _repo_review_owned_branch(branch: str, event_branch: str) -> bool:
+    return _valid_git_branch(branch) and (
+        branch.startswith("issue/")
+        or branch.startswith("fix/")
+        or branch == event_branch and branch.startswith("worklink/")
+    )
+
+
+def _repo_review_push_refspec(refspec: str, event_branch: str) -> bool:
+    if refspec.startswith("+") or refspec.count(":") != 1:
+        return False
+    source, destination = refspec.split(":", 1)
+    if not destination.startswith("refs/heads/"):
+        # Preserve the existing exact event-branch form.
+        return (
+            source == event_branch
+            and destination == event_branch
+            and _repo_review_owned_branch(event_branch, event_branch)
+        )
+    destination_branch = destination.removeprefix("refs/heads/")
+    return (
+        _repo_review_owned_branch(destination_branch, event_branch)
+        and source in {"FETCH_HEAD", destination_branch, event_branch}
+    )
+
+
+def _repo_review_gh_api_arguments(arguments: list[str]) -> bool:
+    """Admit one parameterized API path and GET-only transport options."""
+    path: str | None = None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--paginate":
+            index += 1
+            continue
+        if argument in {"-X", "--method"}:
+            if index + 1 >= len(arguments) or arguments[index + 1] != "GET":
+                return False
+            index += 2
+            continue
+        if argument.startswith("-") or path is not None:
+            return False
+        path = argument
+        index += 1
+    if path is None or re.fullmatch(r"[A-Za-z0-9._~!()+,=:@%/-]+", path) is None:
+        return False
+    return all(segment not in {"", ".", ".."} for segment in path.split("/"))
+
+
+def _repo_review_gh_issue_view_arguments(arguments: list[str]) -> bool:
+    if not arguments or arguments[0].startswith("-"):
+        return False
+    index = 1
+    while index < len(arguments):
+        option = arguments[index]
+        if option == "--comments":
+            index += 1
+            continue
+        if option in {"--json", "--repo"}:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
+                return False
+            index += 2
+            continue
+        return False
+    return True
+
+
+def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bool:
+    if subcommand == "log":
+        before_separator, separator, pathspecs = arguments, [], []
+        if "--" in arguments:
+            position = arguments.index("--")
+            before_separator = arguments[:position]
+            separator = ["--"]
+            pathspecs = arguments[position + 1:]
+        counts_removed = [
+            value for value in before_separator
+            if not (value.startswith("-") and value[1:].isdigit())
+        ]
+        return (
+            (not separator or bool(pathspecs))
+            and _arguments_match_allowlist(
+                counts_removed,
+                exact_options=frozenset({
+                    "--abbrev-commit", "--decorate", "--name-only", "--name-status",
+                    "--no-color", "--no-merges", "--no-patch", "--oneline", "--stat",
+                }),
+                option_prefixes=("--max-count=", "--since=", "--until="),
+            )
+        )
+    if subcommand == "rev-parse":
+        return bool(arguments) and _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "--abbrev-ref", "--git-dir", "--is-inside-work-tree", "--short",
+                "--show-prefix", "--show-toplevel", "--verify",
+            }),
+            option_prefixes=("--short=",),
+        )
+    if subcommand == "remote":
+        return arguments == ["-v"]
+    if subcommand == "branch":
+        return bool(arguments) and arguments[0] == "--list" and all(
+            not value.startswith("-") for value in arguments[1:]
+        )
+    if subcommand == "worktree":
+        return arguments == ["list", "--porcelain"]
+    return False
 
 
 def _option_value(arguments: list[str], option: str) -> str | None:
@@ -1296,6 +1480,15 @@ def _target_matches_repo_review_shell_command(
     # state reopens it. ``--template`` is retained because gh's template function
     # set is fixed and exposes no environment accessor — verify that claim again
     # before adding any option that evaluates a caller-supplied expression.
+    if argv[0] == "gh" and argv[1:2] == ["api"]:
+        return _repo_review_gh_api_arguments(argv[2:])
+
+    if argv[0] == "gh" and argv[1:] == ["auth", "status"]:
+        return True
+
+    if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "issue":
+        return argv[2] == "view" and _repo_review_gh_issue_view_arguments(argv[3:])
+
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] == "pr":
         subcommand = argv[2]
         if subcommand == "checkout":
@@ -1368,6 +1561,12 @@ def _target_matches_repo_review_shell_command(
     if argv[0] == "git" and len(argv) >= 2:
         subcommand = argv[1]
         arguments = argv[2:]
+        if review_state is not None and subcommand in {
+            "add", "checkout", "commit", "pull", "push", "worktree",
+        }:
+            return _repo_review_git_execution_argv(argv, review_state) is not None
+        if _repo_review_git_read_arguments(subcommand, arguments):
+            return True
         if subcommand in {"diff", "log", "show"}:
             return _arguments_match_allowlist(
                 arguments,
@@ -1913,11 +2112,12 @@ def parse_service_shell_argv_with_reason(
     elif destination == "repo_review":
         if not _target_matches_repo_review_shell_command(argv, review_state):
             return None, _service_shell_not_admitted_reason(argv, destination)
-        if argv[:2] == ["git", "-C"]:
+        if argv[0] == "git" and review_state is not None:
             git_argv = _repo_review_git_execution_argv(argv, review_state)
-            if git_argv is None:
+            if git_argv is not None:
+                return git_argv, ""
+            if argv[:2] == ["git", "-C"]:
                 return None, _service_shell_not_admitted_reason(argv, destination)
-            return git_argv, ""
         pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
         if pinned is None:
             return None, reason
