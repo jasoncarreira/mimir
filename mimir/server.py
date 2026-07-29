@@ -760,6 +760,12 @@ def reattach_inflight_worklink_runs(
 
 
 def build_app(config: Config) -> web.Application:
+    # Assemble the actual model-bound surface eagerly so an operator who opted
+    # into coding gets an immediate startup failure when OpenCode is missing,
+    # rather than a broken tool appearing on the first turn.
+    from .tools import all_mimir_tools
+    all_mimir_tools(coding_enabled=getattr(config, "coding_enabled", False))
+
     process_session_id = make_process_session_id()
     worklink_agent_id = f"mimir-worklink:{process_session_id}"
     # Detached controllers inherit this process generation. The Chainlink

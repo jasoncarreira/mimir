@@ -100,6 +100,75 @@ def _service_labels(event) -> InformationFlowLabels:
     )
 
 
+def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+
+    assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
+
+
+def test_coding_tool_is_registered_only_when_enabled_and_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+
+    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    assert "spawn_open_code" in names
+
+
+def test_enabled_coding_without_opencode_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
+        all_mimir_tools(coding_enabled=True)
+
+
+def test_declarative_coding_inventory_does_not_probe_cli_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    def unexpected_probe() -> bool:
+        raise AssertionError("declarative inventory must not probe PATH")
+
+    monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+
+    names = {
+        tool.name
+        for tool in all_mimir_tools(
+            coding_enabled=True,
+            require_coding_available=False,
+        )
+    }
+    assert "spawn_open_code" in names
+
+
+def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
+    from mimir.server import build_app
+
+    config = SimpleNamespace(coding_enabled=True)
+    with (
+        patch(
+            "mimir.tools.all_mimir_tools",
+            side_effect=RuntimeError("opencode unavailable"),
+        ) as assemble,
+        pytest.raises(RuntimeError, match="opencode unavailable"),
+    ):
+        build_app(config)
+
+    assemble.assert_called_once_with(coding_enabled=True)
+
+
 @pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
 def test_direct_argv_is_hidden_from_model_tool_schema(shell_tool) -> None:
     properties = shell_tool.tool_call_schema.model_json_schema()["properties"]
@@ -858,7 +927,9 @@ def test_enforcement_enablement_rejects_uncataloged_model_tool(
 
     monkeypatch.setattr(
         "mimir.tools.registry.all_mimir_tools",
-        lambda model_spec=None: [SimpleNamespace(name="deliberately_uncataloged")],
+        lambda model_spec=None, **kwargs: [
+            SimpleNamespace(name="deliberately_uncataloged")
+        ],
     )
 
     with pytest.raises(
@@ -881,7 +952,7 @@ def test_enforcement_enablement_rejects_cataloged_tool_without_flow_metadata(
     )
     monkeypatch.setattr(
         "mimir.tools.registry.all_mimir_tools",
-        lambda model_spec=None: [SimpleNamespace(name=name)],
+        lambda model_spec=None, **kwargs: [SimpleNamespace(name=name)],
     )
 
     with pytest.raises(
