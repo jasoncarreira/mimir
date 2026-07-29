@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-import subprocess
 
 import pytest
 
-from mimir.access_control import CapabilityTier, ToolRegistry, build_trigger_service_principal
+from mimir.access_control import (
+    CapabilityTier,
+    ToolRegistry,
+    build_trigger_service_principal,
+)
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
@@ -127,6 +131,27 @@ def test_pr_checkout_recovery_refuses_scope_mismatch_and_symlink(tmp_path: Path)
     alias.symlink_to(lease.path, target_is_directory=True)
     with pytest.raises(RuntimeError, match="escapes"):
         recover_pr_checkout_lease(alias, scope, owner="mimir-bot", lease_root=lease_root)
+
+
+def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    refused = (
+        replace(lease, scope_id="other-scope"),
+        replace(lease, owner="other-owner"),
+        replace(lease, revoked=True),
+    )
+    for candidate in refused:
+        state = RepoReviewState(scope)
+        with pytest.raises(ValueError, match="does not match review scope"):
+            state.attach_checkout_lease(candidate)
+        assert state.checkout_lease is None
+        assert state.checked_out is False
 
 
 def _service_auth(service) -> AuthContext:
