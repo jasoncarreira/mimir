@@ -891,6 +891,116 @@ def resolve_configured_write_target(target: str) -> Path:
 
 _SHELL_CONTROL_CHARACTERS = frozenset(";|&`$><{}[]*?\n\r")
 
+_CHAINLINK_EXECUTABLES = frozenset({"chainlink", "/usr/local/bin/chainlink"})
+_CHAINLINK_OUTPUT_OPTIONS = frozenset({"-q", "--quiet", "--json"})
+_CHAINLINK_QUERY_SUBCOMMANDS = frozenset({
+    "show", "list", "search", "ready", "blocked",
+})
+_CHAINLINK_MUTATION_SUBCOMMANDS = frozenset({
+    "create", "update", "comment", "label", "unlabel", "block", "unblock",
+    "relate", "unrelate", "close", "reopen", "subissue", "quick",
+})
+
+
+def _chainlink_issue_arguments_match(arguments: list[str]) -> bool:
+    """Admit canonical tracker operations with exact option and operand shapes."""
+    if not arguments:
+        return False
+    subcommand = arguments[0]
+    if subcommand not in _CHAINLINK_QUERY_SUBCOMMANDS | _CHAINLINK_MUTATION_SUBCOMMANDS:
+        return False
+
+    flag_options = set(_CHAINLINK_OUTPUT_OPTIONS)
+    value_options: set[str] = set()
+    repeated_value_options: set[str] = set()
+    positional_shape: tuple[str, ...]
+    if subcommand == "list":
+        value_options = {"-s", "--status", "-p", "--priority"}
+        repeated_value_options = {"-l", "--label"}
+        positional_shape = ()
+    elif subcommand in {"ready", "blocked"}:
+        positional_shape = ()
+    elif subcommand == "show":
+        positional_shape = ("id",)
+    elif subcommand == "search":
+        positional_shape = ("text",)
+    elif subcommand in {"create", "quick"}:
+        value_options = {
+            "-d", "--description", "-p", "--priority", "-t", "--template",
+        }
+        repeated_value_options = {"-l", "--label"}
+        if subcommand == "create":
+            flag_options.add("-w")
+            flag_options.add("--work")
+        positional_shape = ("text",)
+    elif subcommand == "subissue":
+        value_options = {"-d", "--description", "-p", "--priority"}
+        repeated_value_options = {"-l", "--label"}
+        flag_options.update({"-w", "--work"})
+        positional_shape = ("id", "text")
+    elif subcommand == "update":
+        value_options = {
+            "-t", "--title", "-d", "--description", "-p", "--priority",
+        }
+        positional_shape = ("id",)
+    elif subcommand == "comment":
+        value_options = {"--kind"}
+        positional_shape = ("id", "text")
+    elif subcommand in {"label", "unlabel"}:
+        positional_shape = ("id", "text")
+    elif subcommand in {"block", "unblock", "relate", "unrelate"}:
+        if subcommand in {"relate", "unrelate"}:
+            value_options = {"-t", "--type"}
+        positional_shape = ("id", "id")
+    else:
+        if subcommand == "close":
+            flag_options.add("--no-changelog")
+        positional_shape = ("id",)
+
+    positionals: list[str] = []
+    seen_single_options: set[str] = set()
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in flag_options:
+            index += 1
+            continue
+        if argument in value_options or argument in repeated_value_options:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
+                return False
+            if argument in value_options and argument in seen_single_options:
+                return False
+            seen_single_options.add(argument)
+            index += 2
+            continue
+        if argument.startswith("-"):
+            return False
+        positionals.append(argument)
+        index += 1
+
+    if len(positionals) != len(positional_shape):
+        return False
+    return all(
+        kind != "id" or (value.isascii() and value.isdigit() and int(value) > 0)
+        for kind, value in zip(positional_shape, positionals)
+    )
+
+
+def _target_matches_chainlink_command(argv: list[str]) -> bool:
+    if not argv or argv[0] not in _CHAINLINK_EXECUTABLES:
+        return False
+    # Clap marks these options global, so accept them at the executable,
+    # resource, or subcommand level without widening any operand shape.
+    arguments = [
+        argument for argument in argv[1:]
+        if argument not in _CHAINLINK_OUTPUT_OPTIONS
+    ]
+    if arguments[:1] == ["issue"]:
+        return _chainlink_issue_arguments_match(arguments[1:])
+    if arguments[:2] == ["session", "status"]:
+        return all(option in _CHAINLINK_OUTPUT_OPTIONS for option in arguments[2:])
+    return False
+
 
 def _arguments_match_allowlist(
     arguments: list[str],
@@ -921,6 +1031,8 @@ def _arguments_match_allowlist(
 
 def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     """Validate an argv against the scheduler/poller read-only profile."""
+    if _target_matches_chainlink_command(argv):
+        return True
     # Do not accept ``/tmp/git`` merely because its basename is allow-listed.
     # The login shell may resolve bare names through its operator-controlled PATH,
     # but a model-supplied path must never select an arbitrary executable.
@@ -1640,7 +1752,7 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "pwd": Path("/usr/bin/pwd"),
     "jq": Path("/usr/bin/jq"),
     "rg": Path("/usr/bin/rg"),
-    "/usr/local/bin/chainlink": Path("/usr/local/bin/chainlink"),
+    "chainlink": Path("/usr/local/bin/chainlink"),
 }
 _MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
 _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
@@ -1967,19 +2079,6 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
             argv[3:], exact_options=options,
         )
 
-    chainlink_command = argv[0]
-    if chainlink_command != "/usr/local/bin/chainlink":
-        return False
-    if argv[1:2] == ["issue"] and len(argv) >= 3:
-        subcommand = argv[2]
-        options = {
-            "list": frozenset({"--json", "--label", "--priority", "--status"}),
-            "ready": frozenset({"--json"}),
-            "show": frozenset({"--json"}),
-        }.get(subcommand)
-        return options is not None and _arguments_match_allowlist(
-            argv[3:], exact_options=options,
-        )
     return False
 
 
@@ -2016,17 +2115,20 @@ _SHELL_PROFILE_SINGLE_ARGV_HINT = (
 _SERVICE_SHELL_DISPLAY_COMMANDS = frozenset(_MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS)
 _SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
     "add", "api", "branch", "checkout", "checks", "close", "comment", "commit",
-    "create", "describe", "diff", "fetch", "init", "issue", "label", "list",
-    "lock", "log", "ls-files", "merge-base", "pr", "pull", "push", "ready",
-    "relate", "remote", "rev-parse", "review", "run", "show", "status", "sync",
-    "test", "update", "view",
+    "block", "blocked", "close-all", "create", "delete", "describe", "diff",
+    "fetch", "init", "issue", "label", "list", "lock", "locks", "log",
+    "ls-files", "merge-base", "pr", "pull", "push", "quick", "ready", "relate",
+    "remote", "reopen", "rev-parse", "review", "run", "search", "session", "show",
+    "status", "subissue", "sync", "test", "unblock", "unlabel", "unrelate",
+    "update", "view",
 })
 _SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
     "-C", "-a", "-c", "-l", "-m", "-n", "-p", "-q",
     "--all", "--app", "--approve", "--assignee", "--author", "--base", "--body",
     "--body-file", "--branch", "--comment", "--comments", "--draft", "--head",
-    "--json", "--jq", "--label", "--limit", "--mention", "--milestone",
-    "--no-pager", "--oneline", "--priority", "--repo", "--request-changes",
+    "--description", "--json", "--jq", "--kind", "--label", "--limit",
+    "--mention", "--milestone", "--no-changelog", "--no-pager", "--oneline",
+    "--priority", "--quiet", "--repo", "--request-changes",
     "--search", "--short", "--state", "--status", "--template",
 })
 
@@ -2064,12 +2166,35 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     if len(named) != len(set(supplied)):
         named.append("<option>")
     option_text = f" Options sent: {', '.join(named)}." if named else ""
+    if argv and argv[0] in _CHAINLINK_EXECUTABLES:
+        operation = argv[1:3]
+        if argv[1:2] == ["locks"]:
+            boundary = (
+                " Lock lifecycle commands are reserved to Worklink because a shell-issued "
+                "claim, steal, or release can orphan an in-flight build; use the coordinated "
+                "Worklink path instead."
+            )
+        elif argv[1:2] == ["init"] or operation in (["issue", "delete"], ["issue", "close-all"]):
+            boundary = (
+                " Tracker initialization, deletion, and bulk close are deliberately denied; "
+                "they can shadow the tracker or cause irreversible or bulk work loss."
+            )
+        else:
+            boundary = ""
+        admitted = (
+            " Admitted Chainlink commands are issue show/list/search/ready/blocked; "
+            "session status; and issue create/update/comment/label/unlabel/block/unblock/"
+            "relate/unrelate/close/reopen/subissue/quick, using only each command's "
+            "documented bounded options (-q/--quiet and --json included)."
+        )
+    else:
+        boundary = admitted = ""
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
         "admits a fixed set of commands, subcommands and options; anything "
         "outside it is refused for this principal regardless of how it is "
-        "written."
+        f"written.{boundary}{admitted}"
     )
 
 
@@ -2118,6 +2243,9 @@ def parse_service_shell_argv_with_reason(
             "an argument begins with '~', which requires the shell home "
             "expansion this profile does not perform. Use an absolute path."
         )
+
+    if argv[0] == "/usr/local/bin/chainlink":
+        argv[0] = "chainlink"
 
     allowed = False
     if destination == "scheduler_read_only":
