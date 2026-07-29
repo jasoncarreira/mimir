@@ -22,7 +22,7 @@ class OpenCodeConfigError(ValueError):
     """The operator's native OpenCode configuration cannot be used."""
 
 
-class OpenCodeAuthError(ValueError):
+class OpenCodeAuthError(OpenCodeConfigError):
     """The selected OpenCode provider has an unsafe or invalid auth path."""
 
 
@@ -101,8 +101,11 @@ def resolve_opencode_invocation(
         source = "agent_model"
 
     provider = _provider_from_model(model)
-    auth_type, remove_env = _inspect_auth(provider, values)
-    pass_env = tuple(sorted(_native_env_references(native)))
+    env_references = _provider_env_references(native, provider)
+    auth_type, remove_env = _inspect_auth(
+        provider, values, env_references=env_references
+    )
+    pass_env = tuple(sorted(env_references))
     return OpenCodeInvocation(
         model=model,
         provider=provider,
@@ -138,6 +141,8 @@ def _provider_from_model(model: str) -> str:
 def _inspect_auth(
     provider: str,
     env: Mapping[str, str],
+    *,
+    env_references: set[str],
 ) -> tuple[str | None, tuple[str, ...]]:
     path = opencode_auth_path(env)
     try:
@@ -150,14 +155,22 @@ def _inspect_auth(
     ambient_name = f"{provider.upper().replace('-', '_')}_API_KEY"
 
     if entry is None:
+        ambient_present = bool(env.get(ambient_name, "").strip())
         # OpenAI is the dangerous special case: without an OpenCode credential
         # entry its built-in provider silently accepts the metered SDK key.
-        if provider == "openai" and env.get("OPENAI_API_KEY", "").strip():
+        if provider == "openai" and ambient_present:
             raise OpenCodeAuthError(
                 "OpenCode provider 'openai' has no stored auth; refusing ambient "
                 "OPENAI_API_KEY metered fallback. Run `opencode auth login` first."
             )
-        return None, ()
+        if ambient_present or env_references:
+            return None, ()
+        raise OpenCodeAuthError(
+            f"OpenCode provider {provider!r} has no credential: no stored auth entry, "
+            f"no ambient {ambient_name}, and no {{env:NAME}} reference in its native "
+            "provider config. Run `opencode auth login` or configure the provider's "
+            "credential source."
+        )
     if not isinstance(entry, dict):
         raise OpenCodeAuthError(
             f"OpenCode provider {provider!r} has an invalid auth entry in {path}"
@@ -204,6 +217,14 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
 
 
 _ENV_REFERENCE = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _provider_env_references(native: Mapping[str, object], provider: str) -> set[str]:
+    """Collect env references only from the selected provider's config block."""
+    providers = native.get("provider")
+    if not isinstance(providers, dict):
+        return set()
+    return _native_env_references(providers.get(provider))
 
 
 def _native_env_references(value: object) -> set[str]:

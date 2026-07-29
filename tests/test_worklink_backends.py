@@ -928,6 +928,12 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
     backend = OpenCodeBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(

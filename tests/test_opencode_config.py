@@ -50,7 +50,11 @@ def test_explicit_model_wins_over_native_config(tmp_path: Path) -> None:
     config.write_text('{"model":"openrouter/configured"}', encoding="utf-8")
     resolved = resolve_opencode_invocation(
         "opencode/explicit",
-        env=_env(tmp_path, OPENCODE_CONFIG=str(config)),
+        env=_env(
+            tmp_path,
+            OPENCODE_CONFIG=str(config),
+            OPENCODE_API_KEY="configured-elsewhere",
+        ),
     )
     assert resolved.model == "opencode/explicit"
     assert resolved.model_source == "explicit"
@@ -67,6 +71,8 @@ def test_explicit_model_wins_over_native_config(tmp_path: Path) -> None:
 def test_missing_config_falls_back_to_live_agent_model(
     tmp_path: Path, spec: str, expected: str
 ) -> None:
+    provider = expected.partition("/")[0]
+    _write_auth(tmp_path, {provider: {"type": "api", "key": "test-credential"}})
     resolved = resolve_opencode_invocation(env=_env(tmp_path, MIMIR_MODEL_SPEC=spec))
     assert resolved.model == expected
     assert resolved.model_source == "agent_model"
@@ -98,6 +104,45 @@ def test_openai_ambient_key_without_stored_auth_is_rejected(tmp_path: Path) -> N
                 OPENAI_API_KEY="must-not-appear",
             )
         )
+
+
+def test_missing_provider_credential_fails_loudly(tmp_path: Path) -> None:
+    with pytest.raises(OpenCodeConfigError, match="provider 'anthropic'.*no credential"):
+        resolve_opencode_invocation(
+            env=_env(tmp_path, MIMIR_MODEL_SPEC="claude-code:claude-sonnet-4-6")
+        )
+
+
+def test_selected_provider_env_reference_is_accepted(tmp_path: Path) -> None:
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        '{"model":"proxy/model","provider":{'
+        '"proxy":{"options":{"apiKey":"{env:PROXY_TOKEN}"}},'
+        '"other":{"options":{"apiKey":"{env:OTHER_TOKEN}"}}}}',
+        encoding="utf-8",
+    )
+
+    resolved = resolve_opencode_invocation(env=_env(tmp_path))
+
+    assert resolved.provider == "proxy"
+    assert resolved.auth_type is None
+    assert resolved.pass_env == ("PROXY_TOKEN",)
+
+
+def test_unselected_provider_env_reference_does_not_hide_missing_auth(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        '{"model":"anthropic/claude","provider":{'
+        '"proxy":{"options":{"apiKey":"{env:PROXY_TOKEN}"}}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OpenCodeAuthError, match="provider 'anthropic'.*no credential"):
+        resolve_opencode_invocation(env=_env(tmp_path))
 
 
 def test_arbitrary_provider_auth_type_is_not_hardcoded(tmp_path: Path) -> None:

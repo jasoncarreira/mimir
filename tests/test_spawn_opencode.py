@@ -24,7 +24,12 @@ def _reset_guard_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     auth_path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth_path.parent.mkdir(parents=True)
     auth_path.write_text(
-        json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
+        json.dumps(
+            {
+                "openai": {"type": "oauth", "refresh": "test-refresh"},
+                "anthropic": {"type": "api", "key": "test-key"},
+            }
+        ),
         encoding="utf-8",
     )
 
