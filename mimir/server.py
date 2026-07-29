@@ -1134,7 +1134,10 @@ def build_app(config: Config) -> web.Application:
     _agent_tools.set_commitments_store(commitments_store)
     # Spawn tools read ``.get("default_cwd")`` from this purpose-built
     # mapping rather than accepting the full Config.
-    _agent_tools.set_spawn_config({"default_cwd": config.home})
+    _agent_tools.set_spawn_config({
+        "default_cwd": config.home,
+        "opencode_config_path": config.opencode_config_path,
+    })
     # Async shell-job tools (bash_async / bash_jobs_list / bash_job_output)
     # share the Agent's ShellJobRegistry; the on_complete bridge fires
     # ``shell_job_complete`` AgentEvents back through the dispatcher

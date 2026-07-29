@@ -60,6 +60,16 @@ def _load_home_dotenv(home: Path) -> list[str]:
     return loaded
 
 
+def model_spec_at_call_time(home: Path | None = None) -> str:
+    """Resolve the live agent model, including its home-local dotenv defaults."""
+    if home is None:
+        raw_home = _env("MIMIR_HOME")
+        home = Path(raw_home).resolve() if raw_home else None
+    if home is not None:
+        _load_home_dotenv(home)
+    return _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if not raw:
@@ -972,6 +982,9 @@ class Config:
     # The OpenCode binary being installed is not operator consent to expose a
     # code-writing tool to the model. This capability is explicitly opt-in.
     coding_enabled: bool = False
+    # Native OpenCode JSON/JSONC selected through OPENCODE_CONFIG, or its
+    # standard XDG/HOME location. Provider/plugin settings remain OpenCode-owned.
+    opencode_config_path: Path | None = None
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -996,6 +1009,9 @@ class Config:
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
         coding_enabled = _env_bool("MIMIR_CODING_ENABLED", False)
+        from .opencode_config import opencode_config_path
+
+        resolved_opencode_config = opencode_config_path()
         log.info(
             "coding assistant capability: %s",
             "enabled" if coding_enabled else "disabled",
@@ -1136,6 +1152,7 @@ class Config:
                 _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
             ),
             coding_enabled=coding_enabled,
+            opencode_config_path=resolved_opencode_config,
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),

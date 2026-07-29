@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import re
 from typing import Sequence
 
+from ...config import model_spec_at_call_time
+from ...opencode_config import resolve_opencode_invocation
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, RawResult, WorkOrder, blocked_reason_from_output
 
@@ -54,6 +57,19 @@ class OpenCodeBackend:
         prompt = _prompt_for_order(order)
         args = list(self.extra_args)
         env = dict(order.env)
+        model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
+        model_spec_at_call_time(model_home)
+        invocation = resolve_opencode_invocation(env={**os.environ, **env})
+        args.extend(("-m", invocation.model))
+        if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
+            env["OPENCODE_CONFIG"] = str(invocation.config_path)
+        for key in invocation.pass_env:
+            if key in os.environ:
+                env[key] = os.environ[key]
+        for key in invocation.remove_env:
+            # WorkSpec overrides an allowlisted parent environment; an empty
+            # value is required here because omission would inherit it again.
+            env[key] = ""
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         return WorkSpec(
             issue_id=order.issue_id,
@@ -104,7 +120,9 @@ class OpenCodeBackend:
         error = (
             "backend output exceeded configured Worklink limit"
             if result.output_overflow
-            else blocked_reason or _error_from_status(status, result.stdout, result.stderr)
+            else blocked_reason or _error_from_status(
+                status, result.stdout, result.stderr, result.command
+            )
         )
         _write_transcript(
             transcript_path,
@@ -197,11 +215,26 @@ def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     return "failed"
 
 
-def _error_from_status(status: str, stdout: str, stderr: str) -> str | None:
+def _error_from_status(
+    status: str,
+    stdout: str,
+    stderr: str,
+    command: Sequence[str] = (),
+) -> str | None:
     if status == "success":
         return None
     detail = (stderr.strip() or stdout.strip()).splitlines()
     message = detail[-1] if detail else status
     if status == "timeout":
         return f"opencode execution timed out: {message}"
+    if status == "auth_error":
+        provider = _provider_from_command(command)
+        return f"OpenCode provider {provider!r} authentication failed: {message}"
     return message
+
+
+def _provider_from_command(command: Sequence[str]) -> str:
+    for index in range(len(command) - 2, -1, -1):
+        if command[index] in {"-m", "--model"}:
+            return command[index + 1].partition("/")[0] or "unknown"
+    return "unknown"

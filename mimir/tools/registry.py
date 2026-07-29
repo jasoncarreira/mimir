@@ -1901,8 +1901,8 @@ async def spawn_open_code(
         cwd: Working directory for the run. Defaults to home.
         timeout_s: Subprocess timeout (default 30 min).
         name: Optional label recorded in the spawn log/manifest.
-        model: ``provider/model`` (opencode ``-m`` format). Omit for the
-            opencode config default.
+        model: ``provider/model`` (opencode ``-m`` format). Omit to use the
+            OpenCode config model, then the agent's current model as fallback.
         agent: opencode agent name (``--agent``). Omit for default.
         artifact_root: When set, persist run artifacts under
             ``<artifact_root>/.factory/runs/<run_id>/`` — prompt.md,
@@ -1914,6 +1914,26 @@ async def spawn_open_code(
         return "spawn_open_code failed: no spawn config"
     if not prompt or not prompt.strip():
         return "spawn_open_code failed: prompt is required"
+
+    from ..opencode_config import (
+        OpenCodeAuthError,
+        OpenCodeConfigError,
+        resolve_opencode_invocation,
+    )
+    from ..config import model_spec_at_call_time
+
+    try:
+        spawn_home = cfg.get("default_cwd")
+        model_spec_at_call_time(Path(spawn_home) if spawn_home else None)
+        invocation = resolve_opencode_invocation(
+            model,
+            config_path=cfg.get("opencode_config_path"),
+        )
+    except (OpenCodeAuthError, OpenCodeConfigError) as exc:
+        return json.dumps({
+            "status": "auth_failed" if isinstance(exc, OpenCodeAuthError) else "config_failed",
+            "stderr": str(exc),
+        }, indent=2)
 
     guard = _spawn_guard_init()
     current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
@@ -1950,8 +1970,7 @@ async def spawn_open_code(
     # — the opencode CLI surface evolves, so don't hardcode beyond the
     # subcommand. e.g. MIMIR_OPENCODE_SPAWN_ARGS="--format json".
     argv += shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
-    if model:
-        argv += ["-m", model]
+    argv += ["-m", invocation.model]
     if agent:
         argv += ["--agent", agent]
     argv += ["--", prompt]
@@ -1972,6 +1991,13 @@ async def spawn_open_code(
             "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
         ),
     )
+    if invocation.config_path.exists() or os.environ.get("OPENCODE_CONFIG"):
+        child_env["OPENCODE_CONFIG"] = str(invocation.config_path)
+    for key in invocation.pass_env:
+        if key in os.environ:
+            child_env[key] = os.environ[key]
+    for key in invocation.remove_env:
+        child_env.pop(key, None)
 
     run_id = f"opencode-{uuid.uuid4().hex[:12]}"
     started = datetime.now(timezone.utc)
@@ -2016,7 +2042,7 @@ async def spawn_open_code(
                 "launcher": "mimir.spawn_open_code",
                 "name": name,
                 "cwd": str(cwd_path) if cwd_path else None,
-                "model": model,
+                "model": invocation.model,
                 "agent": agent,
                 "status": status,
                 "exit_code": returncode,
@@ -2049,6 +2075,8 @@ async def spawn_open_code(
         stderr = "'opencode' CLI not on PATH"
     elif status == "timeout":
         stderr = f"timed out after {timeout_s}s"
+    elif status == "auth_failed":
+        stderr = f"OpenCode provider {invocation.provider!r} authentication failed: {stderr}"
     return json.dumps(
         {
             "run_id": run_id,

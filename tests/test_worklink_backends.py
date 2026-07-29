@@ -926,6 +926,8 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
     backend = OpenCodeBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
@@ -954,7 +956,8 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
-        "opencode", "run", "--dir", str(order.worktree), "--", "-starts with dash"
+        "opencode", "run", "--dir", str(order.worktree),
+        "-m", "openai/gpt-5.6-luna", "--", "-starts with dash"
     )
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
     assert permission == {
@@ -965,6 +968,45 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert result.transcript_path.parent == transcript_root
     transcript = json.loads(result.transcript_path.read_text())
     assert transcript["backend"] == "opencode"
+
+
+def test_opencode_backend_uses_same_native_model_and_blocks_oauth_key_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "opencode.jsonc"
+    config.write_text('{"model":"openai/gpt-configured"}', encoding="utf-8")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config))
+    monkeypatch.setenv("OPENAI_API_KEY", "metered")
+    backend = OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
+    order = WorkOrder(
+        issue_id=1039,
+        worktree=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+    )
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="u",
+        base_ref="main",
+        branch="issue/1039-a1",
+        test_command="true",
+    )
+
+    assert spec.local_argv is not None
+    assert tuple(spec.local_argv)[-4:-2] == ("-m", "openai/gpt-configured")
+    assert spec.env["OPENAI_API_KEY"] == ""
+    assert spec.env["OPENCODE_CONFIG"] == str(config)
 
 
 @pytest.mark.asyncio
@@ -988,6 +1030,7 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
 
     auth = await backend.interpret(order, ComputeResult(1, "", "provider: unauthorized token"))
     assert auth.backend_status == "auth_error"
+    assert "provider 'unknown'" in (auth.error or "")
 
     quota = await backend.interpret(order, ComputeResult(1, "rate limit exceeded", ""))
     assert quota.backend_status == "quota_exhausted"
