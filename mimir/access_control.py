@@ -194,6 +194,18 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "pr_comment": SinkCategory.FORGE,
     "pr_rerequest_review": SinkCategory.FORGE,
     "unsupported_operation": SinkCategory.FORGE,
+    "repo_checkout": SinkCategory.FORGE,
+    "repo_cleanup": SinkCategory.FORGE,
+    "repo_fetch": SinkCategory.FORGE,
+    "repo_stage": SinkCategory.FORGE,
+    "repo_commit": SinkCategory.FORGE,
+    "repo_merge": SinkCategory.FORGE,
+    "repo_merge_abort": SinkCategory.FORGE,
+    "repo_rebase": SinkCategory.FORGE,
+    "repo_rebase_abort": SinkCategory.FORGE,
+    "repo_revert": SinkCategory.FORGE,
+    "repo_revert_abort": SinkCategory.FORGE,
+    "repo_push": SinkCategory.FORGE,
 }
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
@@ -291,6 +303,21 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_comment": ToolFlowDirection.SINK,
     "pr_rerequest_review": ToolFlowDirection.SINK,
     "unsupported_operation": ToolFlowDirection.SINK,
+    "repo_checkout": ToolFlowDirection.BOTH,
+    "repo_cleanup": ToolFlowDirection.SINK,
+    "repo_fetch": ToolFlowDirection.BOTH,
+    "repo_status": ToolFlowDirection.SOURCE,
+    "repo_diff": ToolFlowDirection.SOURCE,
+    "repo_unmerged": ToolFlowDirection.SOURCE,
+    "repo_stage": ToolFlowDirection.SINK,
+    "repo_commit": ToolFlowDirection.SINK,
+    "repo_merge": ToolFlowDirection.SINK,
+    "repo_merge_abort": ToolFlowDirection.SINK,
+    "repo_rebase": ToolFlowDirection.SINK,
+    "repo_rebase_abort": ToolFlowDirection.SINK,
+    "repo_revert": ToolFlowDirection.SINK,
+    "repo_revert_abort": ToolFlowDirection.SINK,
+    "repo_push": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -399,6 +426,33 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "http_request": CapabilityTier.UNBOUNDED,
     "ntfy_send": CapabilityTier.UNBOUNDED,
     "task": CapabilityTier.SCOPE_CONTAINED,
+    "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
+    "pr_files": CapabilityTier.SCOPE_CONTAINED,
+    "pr_diff": CapabilityTier.SCOPE_CONTAINED,
+    "pr_checks": CapabilityTier.SCOPE_CONTAINED,
+    "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
+    "pr_comments": CapabilityTier.SCOPE_CONTAINED,
+    "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
+    "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_cleanup": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_fetch": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_status": CapabilityTier.SCOPE_CONTAINED,
+    "repo_diff": CapabilityTier.SCOPE_CONTAINED,
+    "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
+    "repo_stage": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_merge": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_merge_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_rebase": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_rebase_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_revert": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_revert_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
 }
 
 _SHELL_JOB_START_CAPABILITIES = frozenset({"shell_exec", "bash_async"})
@@ -427,6 +481,13 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "file_search", "get_turn", "mimir_get_turn", "send_message",
         "operator_alert", "task", "memory_store", "saga_mark_contributions",
         "saga_end_session", "saga_record_skill_learning", "fetch_url",
+        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+        "pr_comments", "pr_review_requests", "pr_submit_review",
+        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
+        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
+        "repo_revert", "repo_revert_abort", "repo_push",
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS),
@@ -437,6 +498,13 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
         "saga_mark_contributions", "worklink_run", "send_message",
         "operator_alert", "fetch_url",
+        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+        "pr_comments", "pr_review_requests", "pr_submit_review",
+        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
+        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
+        "repo_revert", "repo_revert_abort", "repo_push",
     }),
     "session-boundary": frozenset({
         "memory_store", "saga_feedback", "saga_mark_contributions",
@@ -710,6 +778,24 @@ _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
     "unsupported_operation": None,
 }
+_REPO_TOOL_ACTIONS: dict[str, str] = {
+    "repo_checkout": RepoPRAction.CHECKOUT.value,
+    "repo_cleanup": RepoPRAction.CHECKOUT.value,
+    "repo_fetch": RepoPRAction.CHECKOUT.value,
+    "repo_status": RepoPRAction.INSPECT.value,
+    "repo_diff": RepoPRAction.INSPECT.value,
+    "repo_unmerged": RepoPRAction.INSPECT.value,
+    "repo_stage": RepoPRAction.WRITE.value,
+    "repo_commit": RepoPRAction.COMMIT.value,
+    "repo_merge": RepoPRAction.COMMIT.value,
+    "repo_merge_abort": RepoPRAction.WRITE.value,
+    "repo_rebase": RepoPRAction.COMMIT.value,
+    "repo_rebase_abort": RepoPRAction.WRITE.value,
+    "repo_revert": RepoPRAction.COMMIT.value,
+    "repo_revert_abort": RepoPRAction.WRITE.value,
+    "repo_push": RepoPRAction.PUSH.value,
+}
+_TYPED_REPO_PR_TOOL_ACTIONS = {**_FORGE_TOOL_ACTIONS, **_REPO_TOOL_ACTIONS}
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
@@ -4107,7 +4193,7 @@ class OperationCatalog:
     _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = (
         READ_RESOURCE_OPERATIONS
         | WriteResourceAdapter._RESOURCE_OPERATIONS
-        | frozenset(_FORGE_TOOL_ACTIONS)
+        | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -5036,9 +5122,9 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
-            if tool_name in _FORGE_TOOL_ACTIONS:
+            if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 scope = repo_pr_action_scope
-                required_action = _FORGE_TOOL_ACTIONS[tool_name]
+                required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
                 in_scope = (
                     scope is not None
                     and (
@@ -5207,6 +5293,18 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "memory_query": "saga",
     "memory_get": "saga",
     "commitment_list": "commitments",
+    "pr_metadata": "repository",
+    "pr_files": "repository",
+    "pr_diff": "repository",
+    "pr_checks": "repository",
+    "pr_reviews": "repository",
+    "pr_comments": "repository",
+    "pr_review_requests": "repository",
+    "repo_checkout": "repository",
+    "repo_fetch": "repository",
+    "repo_status": "repository",
+    "repo_diff": "repository",
+    "repo_unmerged": "repository",
 }
 
 # These BOTH tools return only server-created metadata inline. Their external
@@ -5230,6 +5328,18 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "grep",
     "agrep",
     "fetch_url",
+    "pr_metadata",
+    "pr_files",
+    "pr_diff",
+    "pr_checks",
+    "pr_reviews",
+    "pr_comments",
+    "pr_review_requests",
+    "repo_checkout",
+    "repo_fetch",
+    "repo_status",
+    "repo_diff",
+    "repo_unmerged",
 })
 
 
@@ -5419,6 +5529,40 @@ def classify_protected_result(
     from .models import InformationFlowLabels, SourceLabel
 
     args = arguments or {}
+    if tool_name in {
+        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+        "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
+        "repo_status", "repo_diff", "repo_unmerged",
+    }:
+        scope = getattr(auth_context, "repo_pr_action_scope", None)
+        if scope is None or failed:
+            return _incomplete_protected_result("repository", args)
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain="repository",
+            resource_id=(
+                f"{scope.canonical_repo}#pull/{scope.pr_number}"
+                f"@{scope.observed_head_sha}"
+            ),
+            bridge_instance="forge",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="untrusted",
+            # The immutable authority record already selected this exact PR.
+            # Preserve its confidentiality label without deadlocking the next
+            # scope-bound edit/review operation as fresh active ingress.
+            integrity_effect="informational",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
+
     if tool_name == "fetch_channel_history":
         resource = args.get("channel_id") or getattr(auth_context, "channel_id", None)
         principal = getattr(auth_context, "canonical_principal", None)
@@ -5723,6 +5867,12 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    **{
+        operation: "repository"
+        for operation, direction in _TOOL_FLOW_MAP.items()
+        if operation in _TYPED_REPO_PR_TOOL_ACTIONS
+        and direction in {ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH}
+    },
 }
 
 _OPERATION_SINK_DESTINATION: dict[str, str] = {
@@ -5779,6 +5929,18 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "pr_comment": "bound_pull_request",
     "pr_rerequest_review": "bound_pull_request",
     "unsupported_operation": "bound_pull_request",
+    "repo_checkout": "bound_pull_request",
+    "repo_cleanup": "bound_pull_request",
+    "repo_fetch": "bound_pull_request",
+    "repo_stage": "bound_pull_request",
+    "repo_commit": "bound_pull_request",
+    "repo_merge": "bound_pull_request",
+    "repo_merge_abort": "bound_pull_request",
+    "repo_rebase": "bound_pull_request",
+    "repo_rebase_abort": "bound_pull_request",
+    "repo_revert": "bound_pull_request",
+    "repo_revert_abort": "bound_pull_request",
+    "repo_push": "bound_pull_request",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
