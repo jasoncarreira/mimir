@@ -426,6 +426,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "http_request": CapabilityTier.UNBOUNDED,
     "ntfy_send": CapabilityTier.UNBOUNDED,
     "task": CapabilityTier.SCOPE_CONTAINED,
+    "list_schedules": CapabilityTier.SCOPE_CONTAINED,
     "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
     "pr_files": CapabilityTier.SCOPE_CONTAINED,
     "pr_diff": CapabilityTier.SCOPE_CONTAINED,
@@ -455,8 +456,19 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
 }
 
-_SHELL_JOB_START_CAPABILITIES = frozenset({"shell_exec", "bash_async"})
-_SHELL_JOB_INSPECTION_CAPABILITIES = frozenset({"bash_jobs_list", "bash_job_output"})
+_CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
+    "shell_exec": frozenset({"bash_jobs_list", "bash_job_output"}),
+    "bash_async": frozenset({"bash_jobs_list", "bash_job_output"}),
+}
+
+
+def _missing_capability_companions(capabilities: set[str]) -> set[str]:
+    return {
+        companion
+        for capability in capabilities
+        for companion in _CAPABILITY_COMPANIONS.get(capability, ())
+        if companion not in capabilities
+    }
 
 # Built-in services predate manifest-declarable trigger authority. Keep their
 # explicitly declared, review-bounded proposal workflow classified without
@@ -497,7 +509,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "als", "glob", "aglob", "grep", "agrep", "file_search",
         "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
         "saga_mark_contributions", "worklink_run", "send_message",
-        "operator_alert", "fetch_url",
+        "operator_alert", "fetch_url", "task", "list_schedules",
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
@@ -513,7 +525,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
         "agrep", "file_search", "get_turn", "mimir_get_turn",
-        "write_file", "edit_file",
+        "write_file", "edit_file", "pr_metadata", "pr_checks", "pr_reviews",
     }),
 }
 
@@ -537,13 +549,12 @@ def build_trigger_service_principal(
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
     capability_set = set(capabilities)
-    if capability_set & _SHELL_JOB_START_CAPABILITIES:
-        missing = _SHELL_JOB_INSPECTION_CAPABILITIES - capability_set
-        if missing:
-            raise ValueError(
-                "shell capabilities require job-inspection companions: "
-                f"{', '.join(sorted(missing))}"
-            )
+    missing = _missing_capability_companions(capability_set)
+    if missing:
+        raise ValueError(
+            "capabilities require companions: "
+            f"{', '.join(sorted(missing))}"
+        )
     home = os.environ.get("MIMIR_HOME", "").strip()
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory") if home else ()
@@ -5723,12 +5734,14 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "file_search",
                 "get_turn",
                 "mimir_get_turn",
+                "list_schedules",
             ),
             readable_domains=(
                 "configured_inputs",
                 "filesystem",
                 "turn_history",
                 "shell_jobs",
+                "schedule_metadata",
             ),
             sink_destinations=(
                 "configured_channel",
@@ -5761,6 +5774,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
             readable_domains=(
                 "session", "saga", "filesystem", "turn_history", "shell_jobs",
+                "repository",
             ),
             sink_destinations=("filesystem", "session_boundary", "saga"),
             sink_policies=(
@@ -5987,11 +6001,11 @@ def _capability_matrix_errors() -> list[str]:
             errors.append(
                 f"SAGA mutation '{operation}' must be cataloged ADMIN_REQUIRED"
             )
-    for trigger in sorted(_REQUIRED_SERVICE_PRINCIPALS):
-        principal = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-        if principal is None:
-            errors.append(f"Missing service principal for trigger: {trigger}")
-            continue
+    for trigger in sorted(
+        _REQUIRED_SERVICE_PRINCIPALS - _TRUSTED_SERVICE_PRINCIPALS.keys()
+    ):
+        errors.append(f"Missing service principal for trigger: {trigger}")
+    for trigger, principal in sorted(_TRUSTED_SERVICE_PRINCIPALS.items()):
         if principal.trigger != trigger:
             errors.append(
                 f"Service principal '{principal.canonical}' is registered for "
@@ -6014,14 +6028,12 @@ def _capability_matrix_errors() -> list[str]:
             )
 
         capability_set = set(principal.capabilities)
-        if capability_set & _SHELL_JOB_START_CAPABILITIES:
-            missing = _SHELL_JOB_INSPECTION_CAPABILITIES - capability_set
-            if missing:
-                errors.append(
-                    f"Service principal '{principal.canonical}' ({trigger}) has shell "
-                    f"capabilities without companions: {', '.join(sorted(missing))}"
-                )
-
+        missing = _missing_capability_companions(capability_set)
+        if missing:
+            errors.append(
+                f"Service principal '{principal.canonical}' ({trigger}) has "
+                f"capabilities without companions: {', '.join(sorted(missing))}"
+            )
         readable_domains = set(principal.readable_domains)
         sink_destinations = set(principal.sink_destinations)
         policies_by_operation = {policy.operation: policy for policy in principal.sink_policies}

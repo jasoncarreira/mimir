@@ -549,9 +549,43 @@ def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> No
 
     assert principal.capability_tier is access_control.CapabilityTier.UNBOUNDED
     assert "fetch_url" in principal.capabilities
+    assert "task" in principal.capabilities
+    assert "list_schedules" in principal.capabilities
+    assert "schedule_metadata" in principal.readable_domains
     assert principal.sink_policy_for("shell_exec") == access_control.ServiceSinkPolicy(
         "shell_exec", "shell_profile", "maintenance",
     )
+
+
+def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> None:
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+
+    assert {"pr_metadata", "pr_checks", "pr_reviews"} <= set(
+        principal.capabilities
+    )
+    assert "repository" in principal.readable_domains
+    for capability in ("pr_metadata", "pr_checks", "pr_reviews"):
+        assert access_control.TRIGGER_CAPABILITY_TIERS[capability] is CapabilityTier.SCOPE_CONTAINED
+    assert "shell_exec" not in principal.capabilities
+    assert "shell_process" not in principal.sink_destinations
+
+
+def test_heartbeat_capabilities_authorize_without_widening_adjacent_mutation(
+    tmp_path: Path,
+) -> None:
+    principal = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
+    auth = _service_auth(principal, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    assert registry.authorize_tool("task", auth, enforce=True).allowed is True
+    assert registry.authorize_tool(
+        "list_schedules", auth, enforce=True,
+    ).allowed is True
+    denied = registry.authorize_tool("add_schedule", auth, enforce=True)
+    assert denied.allowed is False
+    assert denied.reason == "admin_required"
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
