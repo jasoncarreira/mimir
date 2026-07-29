@@ -2258,7 +2258,12 @@ async def worklink_run(
     return " ".join(parts)
 
 
-def all_mimir_tools(model_spec: str | None = None) -> list:
+def all_mimir_tools(
+    model_spec: str | None = None,
+    *,
+    coding_enabled: bool = False,
+    require_coding_available: bool = True,
+) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
     Combines tools from memory_tool, store_tool, extra_tools, and
@@ -2269,6 +2274,12 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
     ``model_spec`` lets startup authorization inspect the same provider-gated
     surface before the agent is constructed. Runtime callers may omit it and
     use ``MIMIR_MODEL_SPEC`` as before.
+
+    ``coding_enabled`` is the operator's explicit opt-in to the coding-assistant
+    surface. Runtime assembly requires the OpenCode CLI by default so startup
+    fails loudly rather than exposing a broken tool. Declarative inventory
+    checks may pass ``require_coding_available=False`` to enumerate the enabled
+    surface without probing ambient CLI availability.
 
     Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
     only when the active LLM provider is not ``claude_code`` — Claude
@@ -2346,9 +2357,14 @@ def all_mimir_tools(model_spec: str | None = None) -> list:
             tools.append(web_search)
         if fetch_url_on:
             tools.append(fetch_url)
-    # Gate spawn_open_code on the ``opencode`` CLI (chainlink #830).
-    from ..providers import opencode_available
-    if opencode_available():
+    if coding_enabled:
+        if require_coding_available:
+            from ..providers import opencode_available
+            if not opencode_available():
+                raise RuntimeError(
+                    "MIMIR_CODING_ENABLED is true, but the opencode CLI is not "
+                    "installed or is not on PATH"
+                )
         tools.append(spawn_open_code)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
