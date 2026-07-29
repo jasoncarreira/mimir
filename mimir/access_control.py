@@ -112,6 +112,7 @@ class SinkCategory(StrEnum):
     SAGA = "saga"
     SCHEDULER = "scheduler"
     PROPOSAL = "proposal"
+    FORGE = "forge"
     HARNESS_DISPLAY = "harness_display"
     UNKNOWN = "unknown"
 
@@ -188,6 +189,11 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "open_proposal": SinkCategory.PROPOSAL,
     "submit_proposal": SinkCategory.PROPOSAL,
     "abandon_proposal": SinkCategory.PROPOSAL,
+    "pr_submit_review": SinkCategory.FORGE,
+    "pr_inline_review_comment": SinkCategory.FORGE,
+    "pr_comment": SinkCategory.FORGE,
+    "pr_rerequest_review": SinkCategory.FORGE,
+    "unsupported_operation": SinkCategory.FORGE,
 }
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
@@ -273,6 +279,18 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "harness_resend_nudge": ToolFlowDirection.SINK,
     "activity_panel_post": ToolFlowDirection.SINK,
     "activity_panel_edit": ToolFlowDirection.SINK,
+    "pr_metadata": ToolFlowDirection.SOURCE,
+    "pr_files": ToolFlowDirection.SOURCE,
+    "pr_diff": ToolFlowDirection.SOURCE,
+    "pr_checks": ToolFlowDirection.SOURCE,
+    "pr_reviews": ToolFlowDirection.SOURCE,
+    "pr_comments": ToolFlowDirection.SOURCE,
+    "pr_review_requests": ToolFlowDirection.SOURCE,
+    "pr_submit_review": ToolFlowDirection.SINK,
+    "pr_inline_review_comment": ToolFlowDirection.SINK,
+    "pr_comment": ToolFlowDirection.SINK,
+    "pr_rerequest_review": ToolFlowDirection.SINK,
+    "unsupported_operation": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -674,6 +692,24 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.PR_EDIT.value,
     RepoPRAction.PR_REREQUEST.value,
 })
+_REPO_PR_REVIEW_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.PR_REVIEW.value,
+})
+_FORGE_TOOL_ACTIONS: dict[str, str | None] = {
+    "pr_metadata": RepoPRAction.INSPECT.value,
+    "pr_files": RepoPRAction.INSPECT.value,
+    "pr_diff": RepoPRAction.INSPECT.value,
+    "pr_checks": RepoPRAction.INSPECT.value,
+    "pr_reviews": RepoPRAction.INSPECT.value,
+    "pr_comments": RepoPRAction.INSPECT.value,
+    "pr_review_requests": RepoPRAction.INSPECT.value,
+    "pr_submit_review": RepoPRAction.PR_REVIEW.value,
+    "pr_inline_review_comment": RepoPRAction.PR_REVIEW.value,
+    "pr_comment": RepoPRAction.PR_COMMENT.value,
+    "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
+    "unsupported_operation": None,
+}
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
@@ -731,21 +767,26 @@ def _repo_pr_scope(
     head_sha: object,
     base_ref: object,
     base_sha: object,
+    requested_reviewer: object = None,
 ) -> Any:
     """Validate a complete observed PR snapshot and issue its closed scope."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    is_remediation = event_type == "pr_changes_requested_stale"
+    is_review = event_type == "pr_review_requested" and requested_reviewer == self_login
     if (
-        event_type != "pr_changes_requested_stale"
+        not (is_remediation or is_review)
         or not self_login
-        or principal != self_login
+        or (is_remediation and principal != self_login)
         or not isinstance(repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
         or not isinstance(number, int)
         or isinstance(number, bool)
         or number < 1
         or not isinstance(head_repo, str)
-        or head_repo.lower() != repo.lower()
-        or head_remote != "origin"
+        or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
+        or (is_remediation and head_repo.lower() != repo.lower())
+        or (is_remediation and head_remote != "origin")
+        or (is_review and head_remote != "source")
         or not _valid_git_branch(head_ref)
         or not _valid_git_branch(base_ref)
         or not isinstance(head_sha, str)
@@ -769,7 +810,9 @@ def _repo_pr_scope(
         canonical_origin=origin,
         principal=self_login,
         event_type=event_type,
-        allowed_operations=_REPO_PR_REMEDIATION_ACTIONS,
+        allowed_operations=(
+            _REPO_PR_REMEDIATION_ACTIONS if is_remediation else _REPO_PR_REVIEW_ACTIONS
+        ),
         pr_number=number,
         head_repo=head_repo,
         head_remote=head_remote,
@@ -833,6 +876,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         head_sha=item.get("head_sha"),
         base_ref=item.get("base_ref"),
         base_sha=item.get("base_sha"),
+        requested_reviewer=item.get("requested_reviewer"),
     )
     return RepoReviewState(scope) if scope is not None else None
 
@@ -3277,6 +3321,7 @@ class SinkGate:
             SinkCategory.SAGA,
             SinkCategory.SCHEDULER,
             SinkCategory.PROPOSAL,
+            SinkCategory.FORGE,
         }:
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
@@ -3823,7 +3868,9 @@ class OperationCatalog:
     })
 
     _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = (
-        READ_RESOURCE_OPERATIONS | WriteResourceAdapter._RESOURCE_OPERATIONS
+        READ_RESOURCE_OPERATIONS
+        | WriteResourceAdapter._RESOURCE_OPERATIONS
+        | frozenset(_FORGE_TOOL_ACTIONS)
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -4752,6 +4799,36 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if tool_name in _FORGE_TOOL_ACTIONS:
+                scope = repo_pr_action_scope
+                required_action = _FORGE_TOOL_ACTIONS[tool_name]
+                in_scope = (
+                    scope is not None
+                    and (
+                        required_action is None
+                        or required_action in getattr(scope, "allowed_operations", frozenset())
+                    )
+                )
+                allowed = in_scope or not enforce
+                forge_auth = ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=decision,
+                    allowed=allowed,
+                    reason=None if in_scope else "repo_pr_scope_denied",
+                    service_principal=service_principal,
+                    required_tier=AccessTier.USER,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    flow_direction=flow_direction,
+                    repo_pr_action_scope=scope,
+                )
+                if forge_auth.is_shadow_decision:
+                    self._emit_shadow_decision(
+                        forge_auth, auth_context=auth_context, target=None,
+                        requested_target=None,
+                    )
+                return forge_auth
             if tool_name in ChannelResourceAdapter._CHANNEL_OPERATIONS:
                 channel_auth = ChannelResourceAdapter.authorize_channel_operation(
                     tool_name,
@@ -5460,6 +5537,11 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "harness_resend_nudge": "message",
     "activity_panel_post": "message",
     "activity_panel_edit": "message",
+    "pr_submit_review": "bound_pull_request",
+    "pr_inline_review_comment": "bound_pull_request",
+    "pr_comment": "bound_pull_request",
+    "pr_rerequest_review": "bound_pull_request",
+    "unsupported_operation": "bound_pull_request",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({

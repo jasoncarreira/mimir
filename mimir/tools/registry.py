@@ -2332,6 +2332,7 @@ def all_mimir_tools(
         saga_mark_contributions,
         saga_record_skill_learning,
     )
+    from .forge import FORGE_TOOLS
     tools = [
         approve_declassification,
         # Memory (read + write)
@@ -2377,6 +2378,9 @@ def all_mimir_tools(
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,
+        # Closed provider-neutral pull-request operations. Targets are injected
+        # from the immutable server-issued scope, never selected by the model.
+        *FORGE_TOOLS,
     ]
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
     if web_search_on or fetch_url_on:

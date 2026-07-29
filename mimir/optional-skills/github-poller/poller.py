@@ -1107,6 +1107,11 @@ def _check_pr_pushes(
                             attempt=attempt,
                             max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
                             head_sha=current_sha,
+                            head_repo=(pr.get("head") or {}).get("repo", {}).get("full_name"),
+                            head_remote="source",
+                            head_ref=(pr.get("head") or {}).get("ref"),
+                            base_ref=(pr.get("base") or {}).get("ref"),
+                            base_sha=(pr.get("base") or {}).get("sha"),
                             related_comment=review_context.get(key, ""),
                         )
                         count += 1
