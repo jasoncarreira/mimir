@@ -5477,10 +5477,10 @@ def assert_model_tool_inventory_cataloged(
     from .tools.registry import all_mimir_tools
 
     catalog = get_operation_catalog()
-    mimir_tools = (
-        all_mimir_tools(model_spec=model_spec, coding_enabled=True)
-        if coding_enabled
-        else all_mimir_tools(model_spec=model_spec)
+    mimir_tools = all_mimir_tools(
+        model_spec=model_spec,
+        coding_enabled=coding_enabled,
+        require_coding_available=False,
     )
     tool_names = {
         *(tool.name for tool in mimir_tools),

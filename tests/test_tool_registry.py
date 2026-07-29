@@ -133,6 +133,26 @@ def test_enabled_coding_without_opencode_fails_loudly(
         all_mimir_tools(coding_enabled=True)
 
 
+def test_declarative_coding_inventory_does_not_probe_cli_availability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+
+    def unexpected_probe() -> bool:
+        raise AssertionError("declarative inventory must not probe PATH")
+
+    monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+
+    names = {
+        tool.name
+        for tool in all_mimir_tools(
+            coding_enabled=True,
+            require_coding_available=False,
+        )
+    }
+    assert "spawn_open_code" in names
+
+
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     from mimir.server import build_app
 
@@ -907,7 +927,9 @@ def test_enforcement_enablement_rejects_uncataloged_model_tool(
 
     monkeypatch.setattr(
         "mimir.tools.registry.all_mimir_tools",
-        lambda model_spec=None: [SimpleNamespace(name="deliberately_uncataloged")],
+        lambda model_spec=None, **kwargs: [
+            SimpleNamespace(name="deliberately_uncataloged")
+        ],
     )
 
     with pytest.raises(
@@ -930,7 +952,7 @@ def test_enforcement_enablement_rejects_cataloged_tool_without_flow_metadata(
     )
     monkeypatch.setattr(
         "mimir.tools.registry.all_mimir_tools",
-        lambda model_spec=None: [SimpleNamespace(name=name)],
+        lambda model_spec=None, **kwargs: [SimpleNamespace(name=name)],
     )
 
     with pytest.raises(

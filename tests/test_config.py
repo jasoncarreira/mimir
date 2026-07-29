@@ -376,6 +376,24 @@ class TestConfigFromEnv:
             assert Config.from_env().coding_enabled is True
         assert "coding assistant capability: enabled" in caplog.text
 
+    def test_enforced_coding_config_does_not_require_opencode_on_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+
+        def unexpected_probe() -> bool:
+            raise AssertionError("config inventory validation must not probe PATH")
+
+        monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+
+        from mimir.config import Config
+
+        config = Config.from_env()
+        assert config.access_control_enforced is True
+        assert config.coding_enabled is True
+
     def test_file_op_extra_roots_empty_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
         monkeypatch.delenv("MIMIR_FILE_OP_ROOTS", raising=False)
