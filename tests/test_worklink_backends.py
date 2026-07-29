@@ -731,6 +731,14 @@ async def test_opencode_backend_transcript_filename_contract(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     backend = OpenCodeBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     issue_id = 831

@@ -23,15 +23,28 @@ from mimir.tools.registry import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_guard_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test gets a clean guard. The semaphore + lock are loop-
-    bound, so swapping loops between tests would error otherwise."""
+def _reset_guard_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test gets a clean guard and an explicit subscription credential.
+
+    The semaphore + lock are loop-bound, so swapping loops between tests would
+    error otherwise. Spawn-cap tests are not credential tests; provision an
+    isolated OpenCode OAuth record so they do not depend on the developer's
+    home auth store and cannot fail earlier at the credential gate in CI.
+    """
     _spawn_reset_for_tests()
     # Default env: no inherited depth, no operator overrides.
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
     monkeypatch.delenv("MIMIR_SPAWN_MAX_CONCURRENT", raising=False)
     monkeypatch.delenv("MIMIR_SPAWN_MAX_PER_HOUR", raising=False)
     monkeypatch.delenv("MIMIR_SPAWN_MAX_DEPTH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
+        encoding="utf-8",
+    )
 
 
 def _ok_run(
