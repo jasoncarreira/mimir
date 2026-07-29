@@ -3718,6 +3718,32 @@ def test_repo_review_branch_mutations_are_exact_and_checkout_bounded(
         ).allowed is False, command
 
 
+def test_repo_review_git_argv_requires_the_mapped_scope_action(
+    tmp_path: Path,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    state = _review_state("o/r", 979, "worklink/979", str(tmp_path.resolve()))
+    without_push = replace(
+        state.action_scope,
+        allowed_operations=state.action_scope.allowed_operations
+        - {access_control.RepoPRAction.PUSH.value},
+    )
+    restricted = RepoReviewState(without_push)
+    restricted.mark_checked_out()
+
+    assert parse_service_shell_argv(
+        f"git -C {tmp_path} push origin worklink/979:worklink/979",
+        "repo_review",
+        review_state=restricted,
+    ) is None
+    assert parse_service_shell_argv(
+        f"git -C {tmp_path} status",
+        "repo_review",
+        review_state=restricted,
+    ) is not None
+
+
 def test_repo_review_metadata_writes_are_bound_to_event_repo_and_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
