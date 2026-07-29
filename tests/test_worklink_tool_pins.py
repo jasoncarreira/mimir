@@ -40,13 +40,12 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     pins = {pin.name: pin for pin in default_tool_pins()}
 
     expected = {
-        "codex", "chainlink", "mermaid-cli", "claude-code", "osv-scanner", "gogcli",
+        "codex", "chainlink", "mermaid-cli", "osv-scanner", "gogcli",
         "opencode", "opencode-feature-factory", "opencode-project-memory",
         "opencode-openai-codex-auth", "opencode-anthropic-auth",
     }
     assert set(pins) == expected
     assert pins["codex"].category == "coding-cli"
-    assert pins["claude-code"].category == "coding-cli"
     assert pins["chainlink"].category == "issue-cli"
     assert pins["mermaid-cli"].category == "renderer"
     assert pins["gogcli"].category == "integration-cli"
@@ -81,7 +80,6 @@ def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     assert f"@openai/codex@{pins['codex'].pin}" in install_text
     assert f"--tag {pins['chainlink'].pin}" in install_text
     assert f"@mermaid-js/mermaid-cli@{pins['mermaid-cli'].pin}" in install_text
-    assert f"@anthropic-ai/claude-code@{pins['claude-code'].pin}" in install_text
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text

@@ -2914,9 +2914,6 @@ class Agent:
         #     write/edit/upload during the turn).
         #   - saga_calls from TurnContext (populated by
         #     RecordingSagaClient on every recorded saga method).
-        #   - kind detection: scan events for spawn_claude_code tool
-        #     calls; bench aggregate_usage keys on this for cost
-        #     attribution (claude_code_spawn vs other).
         permission_denials: list = []
         if self._backend is not None and hasattr(self._backend, "drain_denials"):
             try:
@@ -3011,16 +3008,6 @@ class Agent:
             }
             for c in ctx.saga_calls
         ]
-        kind: str | None = None
-        for evt in events:
-            if (
-                isinstance(evt, dict)
-                and evt.get("type") == "tool_call"
-                and evt.get("name") == "spawn_claude_code"
-            ):
-                kind = "claude_code_spawn"
-                break
-
         record = TurnRecord(
             ts=_utc_now(),
             turn_id=turn_id,
@@ -3057,7 +3044,6 @@ class Agent:
             permission_denials=permission_denials,
             saga_calls=saga_calls,
             interactivity=getattr(ctx, "interactivity", None),
-            kind=kind,
             tool_call_count=ctx.tool_call_count,
             **result_fields,
         )

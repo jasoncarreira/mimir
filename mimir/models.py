@@ -892,10 +892,8 @@ class TurnRecord:
     permission_denials: list[Any] = field(default_factory=list)
     # Discriminator for synthetic, non-conversational records (chainlink #60).
     # ``None`` for ordinary agent turns (the existing case). Set to
-    # ``"claude_code_spawn"`` for records appended by ``spawn_claude_code``
-    # on completion of a spawned ``claude -p`` subprocess — the spawn's
-    # final ``total_cost_usd`` and ``modelUsage`` flow through here so
-    # ``aggregate_usage`` sees plan-window spend natively.
+    # Legacy logs may contain ``"claude_code_spawn"`` records. Keep the
+    # discriminator readable for persisted turn-log compatibility.
     kind: str | None = None
     # Inline saga call audit. Each entry is a ``SagaCallRecord.to_dict()``
     # populated by ``RecordingSagaClient`` during the turn. Empty list

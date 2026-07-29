@@ -2696,7 +2696,7 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
 def test_non_admin_human_cannot_run_code_tools(tmp_path: Path) -> None:
     registry = ToolRegistry()
     for operation in (
-        "worklink_run", "spawn_claude_code", "spawn_codex", "spawn_open_code",
+        "worklink_run", "spawn_codex", "spawn_open_code",
     ):
         decision = registry.authorize_tool(
             operation,

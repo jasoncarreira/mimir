@@ -7,8 +7,7 @@
 #
 # ── Auth: pick ONE of these at runtime via -e or compose env: ─────────
 #   A. Max plan (subscription, requires the ``claude-code`` extra and
-#      Claude Code CLI — build with
-#      ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1``):
+#      an operator-provided Claude Code CLI):
 #        Run ``claude setup-token`` ON THE HOST first, mount the
 #        credential file into the container at runtime. macOS hosts:
 #        keychain isn't portable; copy the token blob via
@@ -35,9 +34,7 @@ FROM python:3.11-slim AS base
 #     operational/debugging shell workflows. Kept in parity with the
 #     scaffold-generated image (scaffold_docker.py), which already ships
 #     jq, so clean rebuilds of this image keep the same capability (#560).
-#   - nodejs + npm: Node runtime/tooling. The Claude Code CLI is installed
-#     only when ``MIMIR_ENABLE_CLAUDE_CODE=1`` (same gate as the Python
-#     subprocess provider below).
+#   - nodejs + npm: Node runtime/tooling for optional coding tools.
 #   - poppler-utils, tesseract-ocr, tesseract-ocr-eng: PDF-ingest
 #     toolchain used by mimir's reading-queue pipeline. Tesseract's
 #     control file declares ``Depends: tesseract-ocr-eng |
@@ -45,16 +42,12 @@ FROM python:3.11-slim AS base
 #     alone — orientation detection only). Pinning ``eng`` explicitly
 #     removes that ambiguity.
 ENV NODE_VERSION=22
-ARG MIMIR_ENABLE_CLAUDE_CODE=0
 ARG MIMIR_ENABLE_OPENCODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq ripgrep xz-utils \
         poppler-utils tesseract-ocr tesseract-ocr-eng \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
-        npm install -g @anthropic-ai/claude-code@2.1.220 ; \
-    fi \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
         npm install -g opencode-ai@1.17.15 ; \
         npm install -g opencode-feature-factory@0.2.1 ; \
@@ -121,15 +114,13 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 #   discord, slack                              (bridges)
 #   mcp                                         (Model Context Protocol)
 #
-# ``MIMIR_ENABLE_CLAUDE_CODE=1`` below installs the Claude Code CLI and
-# the adapter extra together, so operators do not need to remember both.
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
-# Optional: install the Claude Code subprocess provider adapter. Set
-# ``--build-arg MIMIR_ENABLE_CLAUDE_CODE=1`` to enable; the same build
-# arg installs the npm CLI in the OS layer above.
+# Optional: install the Claude Code model-provider adapter. The CLI remains an
+# operator-provided runtime dependency and is not bundled in this image.
+ARG MIMIR_ENABLE_CLAUDE_CODE=0
 RUN if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \
         pip install --no-cache-dir "mimir-agent[claude-code]" ; \
     fi

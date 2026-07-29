@@ -1118,15 +1118,10 @@ def build_app(config: Config) -> web.Application:
     # ``buffer.append`` calls from the SDK-era pre/post hooks.
     from .history import set_global_buffer
     set_global_buffer(message_buffer)
-    # Pre-fix these setters existed but weren't called from build_app,
-    # so the four commitment_* tools all returned "no store" and
-    # spawn_claude_code had no resolved config. Wired now.
+    # Wire stores and shared coding-tool spawn configuration.
     _agent_tools.set_commitments_store(commitments_store)
-    # spawn_claude_code reads ``.get("default_cwd")`` from this dict.
-    # The current Config dataclass doesn't fit that shape; we pass a
-    # purpose-built mapping rather than refactor the tool to accept
-    # the full Config. Keep this in sync if spawn_claude_code grows
-    # additional knobs.
+    # Spawn tools read ``.get("default_cwd")`` from this purpose-built
+    # mapping rather than accepting the full Config.
     _agent_tools.set_spawn_config({"default_cwd": config.home})
     # Async shell-job tools (bash_async / bash_jobs_list / bash_job_output)
     # share the Agent's ShellJobRegistry; the on_complete bridge fires

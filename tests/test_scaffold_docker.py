@@ -324,20 +324,11 @@ def test_render_dockerfile_uses_tini_as_init():
         assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in out, mode
 
 
-def test_render_dockerfile_gates_claude_code_cli_on_build_arg():
-    """The Claude Code npm CLI should not ride along in every image.
-
-    It is only needed when the subprocess provider is enabled, so
-    generated Dockerfiles install it under the same MIMIR_ENABLE_CLAUDE_CODE
-    gate as the Python provider. Mermaid remains unconditional.
-    """
+def test_render_dockerfile_does_not_bundle_claude_code_cli():
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode)
         assert "RUN npm install -g @mermaid-js/mermaid-cli@11.16.0" in out, mode
         assert "RUN npm install -g @anthropic-ai/claude-code" not in out, mode
-        assert 'if [ "$MIMIR_ENABLE_CLAUDE_CODE" = "1" ]; then \\' in out, mode
-        assert "npm install -g @anthropic-ai/claude-code@2.1.220" in out, mode
-        assert "@anthropic-ai/claude-code@2.1.220 @mermaid-js/mermaid-cli" not in out, mode
 
 
 def test_render_dockerfile_installs_jq_in_both_modes():

@@ -101,7 +101,7 @@ async def test_overwrites_existing_flag(
 
 @pytest.mark.asyncio
 async def test_tool_is_coroutine() -> None:
-    """Sanity — same shape as spawn_claude_code (async, no sync
+    """Sanity — async-only tool shape (no sync
     fallback). Deepagents routes async tools via ``coroutine``."""
     import asyncio
     assert request_mimir_update.coroutine is not None

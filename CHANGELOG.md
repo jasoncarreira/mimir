@@ -116,7 +116,7 @@ All notable changes will land here. Format loosely follows
 ### Changed
 - Centralized `Config` → model-kwargs resolution into a single helper.
 - `shell_exec` now defaults its working directory to `MIMIR_HOME` instead of the s6 service dir, so relative-path commands run from the home.
-- Refreshed default memory-template references (`00-persona.md` → `00-identity.md`, document `spawn_codex` alongside `spawn_claude_code`, corrected the learned-behaviors lifecycle); added a core-memory lesson that per-deployment poller tuning belongs in `<home>/pollers-overrides.yaml`.
+- Refreshed default memory-template references (`00-persona.md` → `00-identity.md`, documented coding CLI tools, corrected the learned-behaviors lifecycle); added a core-memory lesson that per-deployment poller tuning belongs in `<home>/pollers-overrides.yaml`.
 
 ### Fixed
 - Offload async event-logging append IO off the loop thread (cache the events.jsonl dir creation), reducing residual scheduler loop-lag.
@@ -1013,7 +1013,7 @@ longer hard-codes container paths).
 - **The `claude-code:` model route was temporarily deprecated (#634).** Its
   tools executed inside the Claude Code subprocess, bypassing the per-turn tool
   budget and prohibited-action screen, so `_resolve_model` refused it unless
-  opted in via `MIMIR_ALLOW_CLAUDE_CODE=1`. Later releases restored this route
+  explicitly enabled the route. Later releases restored this route
   as supported once the controlled adapter and PreToolUse enforcement hook path
   were available.
 
@@ -1479,7 +1479,7 @@ post-update operator digest.
 ### Added
 
 - **`spawn_codex` tool** (chainlink #293): a Codex analogue of
-  `spawn_claude_code` — runs `codex exec <prompt>` once, async, reusing
+  the existing coding-tool spawn path — runs `codex exec <prompt>` once, async, reusing
   the shared spawn caps (per-hour / concurrency / recursion-depth).
   Registered only when the `codex` CLI is on PATH. (#505)
 - **codex CLI in codex-subscription images** (chainlink #293):
@@ -1503,7 +1503,7 @@ post-update operator digest.
   as a `ProviderSpec` table. `detect_route` (routing) and
   `build_quota_providers` (quota) consult it; adding a provider is one
   table entry. Behavior-preserving. (#501, #504)
-- **`spawn_claude_code` is gated on claude-code availability** — moved
+- **The former Claude coding tool was gated on CLI availability** — moved
   from the static tool list into a conditional registration on the
   `claude` CLI being present, mirroring `spawn_codex`. (#503)
 - **social-cli pinned to a SHA** (chainlink #188): the scaffold fragment
