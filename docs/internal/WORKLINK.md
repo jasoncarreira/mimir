@@ -924,7 +924,7 @@ even if another signal is absent.
 tool_pins:
   - name: opencode               # required: stable local tool name
     category: coding-cli         # required: coding-cli | renderer | tracker | helper
-    pin: "1.17.15"               # required: version, tag, or SHA currently expected
+    pin: "1.18.9"               # required: version, tag, or SHA currently expected
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
     package: "opencode-ai"       # optional upstream package/repo identifier

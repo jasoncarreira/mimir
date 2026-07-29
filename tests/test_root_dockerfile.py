@@ -66,7 +66,7 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     """One root-image switch should install OpenCode runtime with pinned plugins."""
     text = _text()
     assert "ARG MIMIR_ENABLE_OPENCODE=0" in text
-    assert "npm install -g opencode-ai@1.17.15" in text
+    assert "npm install -g opencode-ai@1.18.9" in text
     assert "npm install -g opencode-feature-factory@0.2.1" in text
     assert "npm install -g opencode-project-memory@0.1.0" in text
     assert "npm install -g opencode-openai-codex-auth@4.4.0" in text
