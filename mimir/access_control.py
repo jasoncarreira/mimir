@@ -1332,10 +1332,29 @@ def _repo_review_write_path(value: str, root: str) -> bool:
 
 
 def _repo_review_owned_branch(branch: str, event_branch: str) -> bool:
-    return _valid_git_branch(branch) and (
-        branch.startswith("issue/")
-        or branch.startswith("fix/")
-        or branch == event_branch and branch.startswith("worklink/")
+    """Admit only the event's own branch, inside a namespace the flow owns.
+
+    Equality is required for every namespace, not just ``worklink/``. A
+    namespace-only rule let one leaf's run push to a sibling's branch --
+    ``issue/1029-a1`` to ``refs/heads/issue/1030-a1`` -- which fast-forwards
+    commits into another leaf's PR while it is under review. Cross-leaf
+    contamination is a demonstrated failure mode here (#1019: a build wrote
+    into a concurrent sibling's worktree, twice in seven builds), and Worklink
+    runs two ``issue/*`` builds concurrently by default.
+
+    Requiring equality is safe because ``RepoReviewState`` is constructed only
+    for a single ``pr_changes_requested_stale`` item, so ``head_ref`` is the
+    one PR branch the turn exists to remediate; no flow legitimately targets a
+    different branch.
+    """
+    return (
+        _valid_git_branch(branch)
+        and branch == event_branch
+        and (
+            branch.startswith("issue/")
+            or branch.startswith("fix/")
+            or branch.startswith("worklink/")
+        )
     )
 
 

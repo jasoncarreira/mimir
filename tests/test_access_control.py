@@ -4908,3 +4908,41 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
         "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
         "run:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_repo_review_push_is_bound_to_the_event_branch_not_the_namespace() -> None:
+    """A namespace-only rule let one leaf push into a sibling leaf's PR.
+
+    `issue/1029-a1:refs/heads/issue/1030-a1` was admitted because both sides
+    matched `issue/*`. That fast-forwards commits into another leaf's branch
+    while its PR is under review — the push-layer analogue of #1019, where a
+    build wrote into a concurrent sibling's worktree. Worklink runs two
+    `issue/*` builds at once, so the sibling is normally present.
+    """
+    from mimir.access_control import _repo_review_push_refspec
+
+    event_branch = "issue/1029-a1"
+
+    assert _repo_review_push_refspec(f"{event_branch}:{event_branch}", event_branch)
+    assert _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/{event_branch}", event_branch,
+    )
+    assert _repo_review_push_refspec(
+        f"FETCH_HEAD:refs/heads/{event_branch}", event_branch,
+    )
+
+    # Same namespace, different leaf — the case that was wrongly admitted.
+    assert not _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/issue/1030-a1", event_branch,
+    )
+    assert not _repo_review_push_refspec(
+        f"{event_branch}:refs/heads/fix/anything", event_branch,
+    )
+    # Still denied for the reasons the earlier form already covered.
+    for refspec in (
+        f"{event_branch}:refs/heads/main",
+        f"+{event_branch}:refs/heads/{event_branch}",
+        f":refs/heads/{event_branch}",
+        f"{event_branch}:refs/tags/v1",
+    ):
+        assert not _repo_review_push_refspec(refspec, event_branch), refspec
