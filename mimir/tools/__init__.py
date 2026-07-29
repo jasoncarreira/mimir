@@ -75,6 +75,22 @@ from .saga_ops import (
     saga_mark_contributions,
     saga_record_skill_learning,
 )
+from .forge import (
+    pr_checks,
+    pr_comment,
+    pr_comments,
+    pr_diff,
+    pr_files,
+    pr_inline_review_comment,
+    pr_metadata,
+    pr_rerequest_review,
+    pr_review_requests,
+    pr_reviews,
+    pr_submit_review,
+    register_forge_client,
+    set_forge_client,
+    unsupported_operation,
+)
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -122,6 +138,20 @@ __all__ = [
     "saga_end_session",
     "saga_forget",
     "saga_record_skill_learning",
+    "pr_metadata",
+    "pr_files",
+    "pr_diff",
+    "pr_checks",
+    "pr_reviews",
+    "pr_comments",
+    "pr_review_requests",
+    "pr_submit_review",
+    "pr_inline_review_comment",
+    "pr_comment",
+    "pr_rerequest_review",
+    "unsupported_operation",
+    "register_forge_client",
+    "set_forge_client",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
