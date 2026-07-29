@@ -3308,3 +3308,40 @@ async def test_agent_graph_tool_call_survives_populated_auth_context():
     ]
     assert tool_messages, "tool call never executed"
     assert "unhashable" not in str(tool_messages[-1].content)
+
+
+def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> None:
+    """The admin conjunct must be load-bearing, and provably so.
+
+    Deleting `"admin" in roles` from the cross-channel allowance left every
+    other test in this file passing. A non-admin is still refused — but by
+    `ChannelResourceAdapter` (`cross_channel_scope`), not by the sink gate — so
+    admin-only silently drops from two independent layers to one. Asserting the
+    REASON is what separates them: without the conjunct the sink gate admits
+    and the refusal comes from the adapter instead.
+    """
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", content="send this elsewhere",
+    )
+    labels = _initialize_ifc_labels(event)
+    non_admin = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        roles=("user",),
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "send_message", non_admin, enforce=True,
+        target_channel="slack-C2", ifc_labels=labels,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+    # The same non-admin turn may still reply to its own channel.
+    reply = ToolRegistry().authorize_tool(
+        "send_message", non_admin, enforce=True,
+        target_channel=event.channel_id, ifc_labels=labels,
+    )
+    assert reply.allowed is True
