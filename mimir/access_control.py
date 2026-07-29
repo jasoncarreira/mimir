@@ -1124,6 +1124,32 @@ def _target_matches_chainlink_command(argv: list[str]) -> bool:
     return False
 
 
+def _chainlink_command_is_mutation(argv: list[str]) -> bool:
+    """Classify one admitted Chainlink argv without consulting IFC state."""
+    if not _target_matches_chainlink_command(argv):
+        return False
+    arguments = [
+        argument for argument in argv[1:]
+        if argument not in _CHAINLINK_OUTPUT_OPTIONS
+    ]
+    return (
+        arguments[:1] == ["issue"]
+        and len(arguments) >= 2
+        and arguments[1] in _CHAINLINK_MUTATION_SUBCOMMANDS
+    )
+
+
+def _chainlink_target_argv(target: str | None) -> list[str] | None:
+    """Parse one bounded Chainlink shell target without consulting IFC state."""
+    if not isinstance(target, str) or set(target) & _SHELL_CONTROL_CHARACTERS:
+        return None
+    try:
+        argv = shlex.split(target)
+    except ValueError:
+        return None
+    return argv if _target_matches_chainlink_command(argv) else None
+
+
 def _arguments_match_allowlist(
     arguments: list[str],
     *,
@@ -2837,6 +2863,28 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 
 _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
 
+_CHAINLINK_TAINT_REFUSAL = (
+    "this turn carries untrusted active ingest, so Chainlink tracker mutations "
+    "are unavailable for this turn. Read-only queries remain admitted: issue "
+    "show, issue list, issue search, issue ready, issue blocked, and session status."
+)
+
+
+def _live_untrusted_active_ingest(
+    auth_context: Any, fallback: Any,
+) -> bool | None:
+    """Read taint from the server-owned live IFC state, or report indeterminate."""
+    state = getattr(auth_context, "ifc_state", None)
+    predicate = getattr(state, "has_untrusted_active_ingest", None)
+    if not callable(predicate):
+        return None
+    try:
+        result = predicate(fallback)
+    except Exception:
+        log.exception("ifc_untrusted_active_ingest_evaluation_failed")
+        return None
+    return result if isinstance(result, bool) else None
+
 
 def _fixed_web_search_url() -> str | None:
     from .tools.web_search_destination import web_search_url
@@ -2872,19 +2920,33 @@ class SinkGate:
         ifc_labels: Any,
         auth_context: Any,
         service: ServicePrincipal,
-    ) -> bool:
+        target: str | None = None,
+    ) -> tuple[bool, str | None]:
         """Apply the integrity axis to one exact declared service capability."""
         if not service.has_capability(tool_name):
-            return False
+            return False, None
         capability_tier = TRIGGER_CAPABILITY_TIERS.get(
             tool_name,
             _LEGACY_SERVICE_SINK_TIERS.get(tool_name, CapabilityTier.UNBOUNDED),
         )
-        state = getattr(auth_context, "ifc_state", None)
+        if tool_name in {"shell_exec", "bash_async"}:
+            chainlink_argv = _chainlink_target_argv(target)
+            if chainlink_argv is not None:
+                live_taint = _live_untrusted_active_ingest(
+                    auth_context, getattr(auth_context, "ifc_labels", None),
+                )
+                if (
+                    _chainlink_command_is_mutation(chainlink_argv)
+                    and live_taint is not False
+                ):
+                    return False, _CHAINLINK_TAINT_REFUSAL
+                # Bounded tracker queries remain available even where the
+                # surrounding profile's shell is taint-gated.
+                return True, None
+        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
         has_untrusted_active_ingest = (
-            state.has_untrusted_active_ingest(ifc_labels)
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            live_taint
+            if live_taint is not None
             else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
         )
         # Shell is an executable sink even when argv is tightly scoped. The
@@ -2895,15 +2957,19 @@ class SinkGate:
             and tool_name in {"shell_exec", "bash_async"}
             and has_untrusted_active_ingest
         ):
-            return False
+            return False, None
         if capability_tier is CapabilityTier.CODE_EXECUTION:
-            return tool_name == "worklink_run" and not has_untrusted_active_ingest
+            return (
+                tool_name == "worklink_run" and not has_untrusted_active_ingest,
+                None,
+            )
         if capability_tier is CapabilityTier.UNBOUNDED:
             return (
                 tool_name in _TAINT_INDEPENDENT_EGRESS_TOOLS
-                or not has_untrusted_active_ingest
+                or not has_untrusted_active_ingest,
+                None,
             )
-        return True
+        return True, None
 
     @staticmethod
     def _is_trusted_operator_turn(ifc_labels: Any, auth_context: Any) -> bool:
@@ -3045,8 +3111,9 @@ class SinkGate:
                 resolved_sink_target=resolved_target,
             )
         state = getattr(auth_context, "ifc_state", None)
+        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
         has_untrusted_active_ingest = (
-            state.has_untrusted_active_ingest(ifc_labels)
+            live_taint
             if state is not None
             and callable(getattr(state, "has_untrusted_active_ingest", None))
             else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
@@ -3168,20 +3235,25 @@ class SinkGate:
             SinkCategory.NETWORK,
             SinkCategory.EXTERNAL_MCP,
         }:
-            if not cls._service_tier_allows(
-                tool_name, ifc_labels, auth_context, service,
-            ):
+            tier_allowed, tier_refusal = cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service, target,
+            )
+            if not tier_allowed:
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
                     allowed=not enforce,
-                    reason=f"ifc_label_blocked:{sink_category.value}",
+                    reason=(
+                        "chainlink_mutation_blocked_by_untrusted_ingest"
+                        if tier_refusal else f"ifc_label_blocked:{sink_category.value}"
+                    ),
                     service_principal=service,
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
                     is_shadow_decision=not enforce,
                     would_block=True,
                     resolved_sink_target=resolved_target,
+                    refusal_detail=tier_refusal,
                 )
             service_policy = service.sink_policy_for(tool_name)
             adapter = (
@@ -3376,8 +3448,9 @@ class SinkGate:
             ifc_labels, auth_context,
         )
         state = getattr(auth_context, "ifc_state", None)
+        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
         has_untrusted_active_ingest = (
-            state.has_untrusted_active_ingest(ifc_labels)
+            live_taint
             if state is not None
             and callable(getattr(state, "has_untrusted_active_ingest", None))
             else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
@@ -3431,9 +3504,10 @@ class SinkGate:
             and service_policy is None
         )
         if service is not None and not is_triggering_channel_reply:
-            if not cls._service_tier_allows(
-                tool_name, ifc_labels, auth_context, service,
-            ):
+            tier_allowed, _ = cls._service_tier_allows(
+                tool_name, ifc_labels, auth_context, service, target,
+            )
+            if not tier_allowed:
                 return frozenset()
 
         if service is not None and target is not None and category in {

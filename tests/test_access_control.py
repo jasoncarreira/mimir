@@ -4773,6 +4773,169 @@ def test_trusted_service_profiles_admit_bounded_chainlink_surface(
     assert argv[0] == str(maintenance_pinned_executables["chainlink"])
 
 
+_CHAINLINK_SERVICE_PROFILES = (
+    ("maintenance", "heartbeat"),
+    ("repo_review", "github"),
+    ("scheduler_read_only", "custom"),
+    ("upgrade_workspace", "upgrade"),
+)
+_CHAINLINK_QUERIES = (
+    "chainlink issue show 1051 --json",
+    "chainlink issue list --status all --label worklink:ready -q",
+    "chainlink issue search tracker --quiet",
+    "chainlink issue ready --json",
+    "chainlink issue blocked",
+    "chainlink session status --json",
+)
+_CHAINLINK_MUTATIONS = (
+    "chainlink issue create follow-up",
+    "chainlink issue update 1051 --title updated",
+    "chainlink issue comment 1051 note",
+    "chainlink issue label 1051 worklink:ready",
+    "chainlink issue unlabel 1051 worklink:ready",
+    "chainlink issue block 1051 1040",
+    "chainlink issue unblock 1051 1040",
+    "chainlink issue relate 1051 1040",
+    "chainlink issue unrelate 1051 1040",
+    "chainlink issue close 1051",
+    "chainlink issue reopen 1051",
+    "chainlink issue subissue 1051 leaf",
+    "chainlink issue quick investigation",
+)
+
+
+def _chainlink_service(profile: str, authority_profile: str) -> ServicePrincipal:
+    return ServicePrincipal(
+        canonical=f"test:{profile}",
+        trigger=f"test:{profile}",
+        capabilities=("shell_exec",),
+        sink_destinations=("shell_process",),
+        sink_policies=(
+            ServiceSinkPolicy("shell_exec", "shell_profile", profile),
+        ),
+        creation_path="test",
+        authority_profile=authority_profile,
+        capability_tier=CapabilityTier.SCOPE_CONTAINED,
+    )
+
+
+def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
+    source = SourceLabel(
+        principal="service:test", domain="channel", resource_id="poller:test",
+        bridge_instance="test", sensitivity="internal",
+        authorized_principals=frozenset({"service:test"}),
+        source_kind="service",
+        integrity="untrusted" if tainted else "trusted",
+        integrity_effect="active_ingest",
+    )
+    return InformationFlowLabels().with_channel("poller:test").with_source(source)
+
+
+@pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
+@pytest.mark.parametrize("command", _CHAINLINK_QUERIES)
+def test_tainted_service_profiles_keep_chainlink_queries(
+    profile: str,
+    authority_profile: str,
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=True)
+    service = _chainlink_service(profile, authority_profile)
+    auth = replace(
+        _service_auth(service, labels),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+    )
+
+    assert decision.allowed is True, (profile, command, decision.reason)
+
+
+@pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
+@pytest.mark.parametrize("command", _CHAINLINK_MUTATIONS)
+def test_tainted_service_profiles_refuse_every_chainlink_mutation(
+    profile: str,
+    authority_profile: str,
+    command: str,
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=True)
+    service = _chainlink_service(profile, authority_profile)
+    auth = replace(
+        _service_auth(service, labels),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        # A caller-supplied carrier cannot attenuate the server auth context.
+        ifc_labels=_chainlink_ifc_labels(tainted=False),
+    )
+
+    assert decision.allowed is False, (profile, command)
+    assert decision.reason == "chainlink_mutation_blocked_by_untrusted_ingest"
+    assert decision.refusal_detail is not None
+    assert "untrusted active ingest" in decision.refusal_detail
+    assert "mutations are unavailable for this turn" in decision.refusal_detail
+    assert "Read-only queries remain admitted" in decision.refusal_detail
+    assert "issue show" in decision.refusal_detail
+    assert "session status" in decision.refusal_detail
+
+
+@pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
+@pytest.mark.parametrize("command", (_CHAINLINK_QUERIES[0], _CHAINLINK_MUTATIONS[3]))
+def test_untainted_service_profiles_keep_full_bounded_chainlink_surface(
+    profile: str,
+    authority_profile: str,
+    command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=False)
+    service = _chainlink_service(profile, authority_profile)
+    auth = replace(
+        _service_auth(service, labels),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+    )
+
+    assert decision.allowed is True, (profile, command, decision.reason)
+
+
+@pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
+@pytest.mark.parametrize(
+    "ifc_state",
+    (
+        None,
+        SimpleNamespace(has_untrusted_active_ingest=lambda _labels: None),
+    ),
+    ids=("missing", "unknown"),
+)
+def test_indeterminate_ifc_state_downgrades_chainlink_to_queries(
+    profile: str,
+    authority_profile: str,
+    ifc_state: object,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=False)
+    service = _chainlink_service(profile, authority_profile)
+    auth = replace(_service_auth(service, labels), ifc_state=ifc_state)
+
+    query = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=_CHAINLINK_QUERIES[0],
+    )
+    mutation = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=_CHAINLINK_MUTATIONS[3],
+    )
+
+    assert query.allowed is True, (profile, query.reason)
+    assert mutation.allowed is False, profile
+    assert mutation.reason == "chainlink_mutation_blocked_by_untrusted_ingest"
+
+
 @pytest.mark.parametrize(
     "command",
     [
