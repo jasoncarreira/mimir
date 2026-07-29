@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from langchain.tools import ToolRuntime
-from langchain_core.tools import ToolException, tool
+from langchain_core.tools import StructuredTool, ToolException, tool
+from langchain_core.tools.base import create_schema_from_function
 
 from ..forge import ForgeClient, ForgeError, ReviewVerdict
 from ..models import AuthContext, RepoPRAction, RepoPRActionScope
@@ -283,7 +284,22 @@ def unsupported_operation(
     }
 
 
-FORGE_TOOLS = (
+def _bind_injected_runtime(forge_tool: StructuredTool) -> StructuredTool:
+    """Bind runtime before LangChain caches its raw callable annotation."""
+    if forge_tool.func is None:
+        raise RuntimeError(f"forge tool {forge_tool.name!r} has no sync callable")
+    forge_tool.func.__annotations__["runtime"] = ToolRuntime
+    forge_tool.args_schema = create_schema_from_function(
+        forge_tool.name,
+        forge_tool.func,
+        filter_args=(),
+        include_injected=True,
+    )
+    forge_tool.__dict__.pop("_injected_args_keys", None)
+    return forge_tool
+
+
+FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_metadata,
     pr_files,
     pr_diff,
@@ -296,4 +312,4 @@ FORGE_TOOLS = (
     pr_comment,
     pr_rerequest_review,
     unsupported_operation,
-)
+))

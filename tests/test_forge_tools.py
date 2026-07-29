@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
+from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException
+from langgraph.prebuilt import ToolNode
 
 import mimir.access_control as access_control
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.forge import (
+    CheckProjection,
     CommentProjection,
+    FileProjection,
     PullRequestProjection,
     ReviewProjection,
+    ReviewRequestProjection,
     ReviewVerdict,
 )
 from mimir.models import AuthContext, RepoPRAction, RepoPRActionScope
 from mimir.tools.forge import (
     FORGE_TOOLS,
+    pr_checks,
     pr_comment,
+    pr_comments,
+    pr_diff,
+    pr_files,
     pr_inline_review_comment,
     pr_metadata,
+    pr_rerequest_review,
+    pr_review_requests,
+    pr_reviews,
     pr_submit_review,
     set_forge_client,
     unsupported_operation,
@@ -46,7 +56,7 @@ def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
     )
 
 
-def _runtime(scope: RepoPRActionScope) -> SimpleNamespace:
+def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
     context = AuthContext(
         principal="service:poller",
         canonical_principal="poller",
@@ -58,7 +68,10 @@ def _runtime(scope: RepoPRActionScope) -> SimpleNamespace:
         enforcement_enabled=True,
         repo_pr_action_scope=scope,
     )
-    return SimpleNamespace(context=context)
+    return ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="forge-tool-test", store=None,
+    )
 
 
 class FakeForge:
@@ -72,6 +85,30 @@ class FakeForge:
             "a" * 40, True, "created", "updated",
         )
 
+    def list_files(self, scope):
+        self.calls.append(("files", scope))
+        return (FileProjection("src/app.py", "modified", 2, 1, 3, "@@ patch"),)
+
+    def get_diff(self, scope):
+        self.calls.append(("diff", scope))
+        return "diff --git a/src/app.py b/src/app.py"
+
+    def list_checks(self, scope):
+        self.calls.append(("checks", scope))
+        return (CheckProjection("test", "completed", "success", "now", "now"),)
+
+    def list_reviews(self, scope):
+        self.calls.append(("reviews", scope))
+        return (ReviewProjection("1", "reviewer", "approve", "LGTM", "now", "a" * 40),)
+
+    def list_comments(self, scope):
+        self.calls.append(("comments", scope))
+        return (CommentProjection("1", "reviewer", "note", "now", "now"),)
+
+    def list_review_requests(self, scope):
+        self.calls.append(("review_requests", scope))
+        return (ReviewRequestProjection("reviewer", "user"),)
+
     def submit_review(self, scope, verdict, body):
         self.calls.append(("review", scope, verdict, body))
         return ReviewProjection("1", "reviewer", verdict.value, body, "now", "a" * 40)
@@ -83,6 +120,9 @@ class FakeForge:
     def add_pull_request_comment(self, scope, body):
         self.calls.append(("comment", scope, body))
         return CommentProjection("1", "reviewer", body, "now", "now")
+
+    def rerequest_review(self, scope, reviewer):
+        self.calls.append(("rerequest", scope, reviewer))
 
 
 @pytest.fixture(autouse=True)
@@ -101,6 +141,43 @@ def test_tool_surface_has_no_repository_pr_or_request_target_selectors() -> None
             & set(properties)
         )
         assert "runtime" not in properties
+        assert forge_tool._injected_args_keys == frozenset({"runtime"})
+
+
+def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    runtime = _runtime(_scope(*RepoPRAction))
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    init_logger(home / "events.jsonl", "test")
+    invocations = (
+        (pr_metadata, {}), (pr_files, {}), (pr_diff, {}), (pr_checks, {}),
+        (pr_reviews, {}), (pr_comments, {}), (pr_review_requests, {}),
+        (pr_submit_review, {"verdict": "approve", "body": "Looks good"}),
+        (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "Fix"}),
+        (pr_comment, {"body": "Fixed"}),
+        (pr_rerequest_review, {"reviewer": "reviewer"}),
+        (unsupported_operation, {"operation": "pr.resolve_thread"}),
+    )
+
+    node = ToolNode(list(FORGE_TOOLS))
+    for index, (forge_tool, arguments) in enumerate(invocations):
+        tool_call = {
+            "name": forge_tool.name, "args": arguments,
+            "id": f"forge-{index}", "type": "tool_call",
+        }
+        injected = node._inject_tool_args(tool_call, runtime)
+        assert injected["args"]["runtime"] is runtime, forge_tool.name
+        assert forge_tool.invoke(injected["args"]) is not None, forge_tool.name
+
+    assert [call[0] for call in client.calls] == [
+        "metadata", "files", "diff", "checks", "reviews", "comments",
+        "review_requests", "review", "inline", "comment", "rerequest",
+    ]
 
 
 def test_read_uses_only_immutable_scope_target() -> None:
