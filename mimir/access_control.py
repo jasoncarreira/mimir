@@ -44,8 +44,10 @@ from .models import (
 )
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
+    framework_large_tool_results_root,
     read_target_from_arguments,
     requested_read_target_from_arguments,
+    resolve_large_tool_results_target,
 )
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
@@ -556,8 +558,9 @@ def build_trigger_service_principal(
             f"{', '.join(sorted(missing))}"
         )
     home = os.environ.get("MIMIR_HOME", "").strip()
+    artifact_root = framework_large_tool_results_root(Path(home)) if home else None
     home_data_roots = (
-        (Path(home) / "state", Path(home) / "memory") if home else ()
+        (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
     )
     is_github_activity = canonical == "poller:github-activity"
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
@@ -632,8 +635,8 @@ def build_trigger_service_principal(
         filesystem_read_roots=(
             tuple(str(root.resolve()) for root in (
                 *repo_roots, *fetch_cache_roots, *service_work_roots,
+                *((artifact_root,) if artifact_root is not None else ()),
             ))
-            if is_github_activity else ()
         ),
         creation_path=creation_path,
         authority_profile=profile,
@@ -989,11 +992,13 @@ def _static_service_write_roots() -> list[Path]:
     if not home:
         return []
     home_root = Path(home).resolve()
+    artifact_root = framework_large_tool_results_root(home_root)
     return list(dict.fromkeys([
         *(root.resolve() for root in _configured_repo_write_roots()),
         (home_root / "state").resolve(),
         (home_root / "memory").resolve(),
         (home_root / "scratch").resolve(),
+        *((artifact_root,) if artifact_root is not None else ()),
         Path("/tmp").resolve(),
     ]))
 
@@ -1075,7 +1080,11 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
     state_root = (home_root / "state").resolve()
     memory_root = (home_root / "memory").resolve()
     scratch_root = (home_root / "scratch").resolve()
-    home_write_roots = {state_root, memory_root, scratch_root}
+    artifact_root = framework_large_tool_results_root(home_root)
+    home_write_roots = {
+        state_root, memory_root, scratch_root,
+        *((artifact_root,) if artifact_root is not None else ()),
+    }
     roots = _static_service_write_roots()
     candidate = Path(target)
     if not candidate.is_absolute():
@@ -2830,18 +2839,24 @@ def _trigger_service_read_target_is_allowed(
     if not candidate.is_absolute():
         return False
     try:
-        lexical_relative = max(
+        lexical_root, lexical_relative = max(
             (
-                candidate.relative_to(root)
+                (root, candidate.relative_to(root))
                 for root in roots
                 if candidate == root or candidate.is_relative_to(root)
             ),
-            key=lambda item: len(item.parts),
+            key=lambda item: len(item[0].parts),
         )
-        if _is_trigger_service_protected_read_path(lexical_relative):
+        artifact_root = framework_large_tool_results_root()
+        lexical_is_artifact = artifact_root is not None and lexical_root == artifact_root
+        if not lexical_is_artifact and _is_trigger_service_protected_read_path(
+            lexical_relative
+        ):
             return False
         resolved = candidate.resolve(strict=True)
-        resolved_roots = tuple(root.resolve(strict=True) for root in roots)
+        # Infrastructure roots are created lazily on first use. A missing
+        # sibling root must not invalidate an otherwise valid existing scope.
+        resolved_roots = tuple(root.resolve(strict=False) for root in roots)
         root = max(
             (
                 root for root in resolved_roots
@@ -2852,6 +2867,9 @@ def _trigger_service_read_target_is_allowed(
         relative = resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
+    resolved_is_artifact = artifact_root is not None and root == artifact_root
+    if resolved_is_artifact:
+        return True
     if _is_trigger_service_protected_read_path(relative):
         return False
     if is_operator_secret_read_path(resolved):
@@ -3429,6 +3447,7 @@ class SinkGate:
             synthesis_scope_denied = (
                 service.canonical == "synthesis"
                 and sink_category is SinkCategory.FILE
+                and resolve_large_tool_results_target(target) is None
                 and not _synthesis_target_matches_session(
                     target, getattr(auth_context, "channel_id", None),
                 )

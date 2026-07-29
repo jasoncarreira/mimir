@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain_core.messages import ToolMessage
 
 from mimir.readonly_backend import (
     FileToolRouter,
@@ -26,6 +27,7 @@ from mimir.readonly_backend import (
 )
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import AuthContext
+from mimir.read_policy import framework_large_tool_results_root
 
 
 @pytest.fixture
@@ -40,6 +42,48 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestWriteGuardBackend:
+    def test_service_turn_offloads_large_result_and_reads_it_back(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        middleware = MimirFilesystemMiddleware(
+            backend=backend, tool_token_limit_before_evict=1,
+        )
+        auth = AuthContext(
+            principal="service:synthesis",
+            canonical_principal="synthesis",
+            roles=("service",),
+            event_ingress=None,
+            trigger="saga_session_end",
+            channel_id="channel",
+            interactivity=None,
+            is_service=True,
+            enforcement_enabled=True,
+        )
+        content = "offloaded service result " * 10
+
+        token = set_current_turn(SimpleNamespace(turn_id="spill", auth_context=auth))
+        try:
+            processed, evicted = middleware._process_large_message(
+                ToolMessage(content=content, tool_call_id="service-call"), backend,
+            )
+            result = backend.read(f"{middleware._large_tool_results_prefix}/service-call")
+        finally:
+            reset_current_turn(token)
+
+        artifact_root = framework_large_tool_results_root(home)
+        assert artifact_root is not None
+        assert evicted is True
+        assert str(middleware._large_tool_results_prefix) in str(processed.content)
+        assert result.error is None
+        assert result.file_data["content"] == content
+        assert (artifact_root / "service-call").read_text(encoding="utf-8") == content
+
+        sibling = artifact_root.parent / f"{artifact_root.name}-private" / "blocked.txt"
+        denied = backend.write(str(sibling), "blocked")
+        assert "Write blocked" in (denied.error or "")
+
     def test_allows_write_to_writable_root(self, home: Path) -> None:
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         r = b.write(file_path="/state/note.txt", content="hi")
@@ -257,8 +301,10 @@ class TestWriteGuardBackend:
         # A bogus folder spec ``.:rw`` (or empty after strip) used to
         # alias the root and make everything writable. We log + drop it.
         b = WriteGuardBackend(root_dir=home, writable_dirs=[".", "..", "", "state"])
-        # Only ``state`` should survive.
-        assert len(b._writable_roots) == 1
+        # Only ``state`` and the framework-owned artifact root should survive.
+        assert b._writable_roots == [
+            (home / "state").resolve(), framework_large_tool_results_root(home),
+        ]
         r = b.write(file_path="/.mimir/db.sqlite", content="no")
         assert "Write blocked" in (getattr(r, "error", "") or "")
 

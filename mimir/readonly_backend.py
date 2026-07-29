@@ -1011,6 +1011,11 @@ class WriteGuardBackend:
         self._writable_roots: list[Path] = [
             (self._root / d).resolve() for d in cleaned
         ]
+        from .read_policy import framework_large_tool_results_root
+
+        artifact_root = framework_large_tool_results_root(self._root)
+        if artifact_root is not None and artifact_root not in self._writable_roots:
+            self._writable_roots.append(artifact_root)
         # For error messages — the friendlier "/state/" form.
         self._writable_labels: list[str] = ["/" + d for d in cleaned]
         # Pre-resolved memory/core/ root for the runtime read-only gate.
