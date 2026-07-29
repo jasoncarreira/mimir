@@ -20,6 +20,11 @@ Design contract (see spec §"Post-turn commit hook contract"):
 - **Behavior gated on ``MIMIR_GIT_TRACKING_ENABLED=true``.** Default
   off so PR 4a lands inert ahead of the gitignore + secret hook in
   PR 4b. When disabled, ``commit_turn_changes`` is a no-op.
+- **Proposal cleanup status is event-log state.** Read the most recent
+  ``proposal_branch_cleanup_skipped`` event per branch from
+  ``<MIMIR_HOME>/logs/events.jsonl``. Skip-state changes re-emit, and process
+  restart clears the in-memory de-duplication map so every active skip is
+  announced again on the next successful sweep.
 
 The module is a singleton-by-coordination: ``_pending_push_task`` and
 ``_push_debounce_lock`` live at module scope so concurrent turns share
@@ -323,15 +328,6 @@ async def _cleanup_resolved_proposal_branches(*, home: Path, turn_id: str) -> No
             error=_short_err(exc),
         )
 
-
-def proposal_branch_cleanup_status(home: Path) -> dict[str, str]:
-    """Return the latest observed ``branch -> skip reason`` cleanup state.
-
-    The snapshot is refreshed after every successful cleanup sweep and can be
-    queried without relying on edge-triggered events. A copy prevents callers
-    from changing the de-duplication state.
-    """
-    return dict(_proposal_cleanup_skip_reasons.get(_home_key(home), {}))
 
 # ─── public API: commit_turn_changes ──────────────────────────────────
 
@@ -1115,7 +1111,6 @@ __all__: tuple[str, ...] = (
     "GitError",
     "GitResult",
     "commit_turn_changes",
-    "proposal_branch_cleanup_status",
     "reset_module_state",
     "DEBOUNCE_SECONDS",
     "PUSH_TIMEOUT_SECONDS",
