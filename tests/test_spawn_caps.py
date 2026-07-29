@@ -18,7 +18,7 @@ from mimir.tools.registry import (
     _spawn_release_rate_slot,
     _spawn_reset_for_tests,
     set_spawn_config,
-    spawn_codex,
+    spawn_open_code,
 )
 
 
@@ -56,7 +56,7 @@ async def test_depth_cap_refuses_at_max(
     from mimir.tools import registry
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
 
-    msg = await spawn_codex.ainvoke({"prompt": "should be refused"})
+    msg = await spawn_open_code.ainvoke({"prompt": "should be refused"})
     assert "depth cap" in msg.lower()
     assert "MIMIR_SPAWN_MAX_DEPTH" in msg
 
@@ -72,7 +72,7 @@ async def test_depth_cap_allows_below_max(
     from mimir.tools import registry
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
 
-    msg = await spawn_codex.ainvoke({"prompt": "should run"})
+    msg = await spawn_open_code.ainvoke({"prompt": "should run"})
     assert "depth cap" not in msg.lower()
 
 
@@ -89,7 +89,7 @@ async def test_depth_cap_root_agent_is_zero(
     from mimir.tools import registry
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
 
-    msg = await spawn_codex.ainvoke({"prompt": "root-level"})
+    msg = await spawn_open_code.ainvoke({"prompt": "root-level"})
     assert "depth cap" not in msg.lower()
 
 
@@ -113,7 +113,7 @@ async def test_child_env_has_incremented_depth(
     from mimir.tools import registry
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture)
 
-    await spawn_codex.ainvoke({"prompt": "x"})
+    await spawn_open_code.ainvoke({"prompt": "x"})
     assert captured_env.get(_SPAWN_DEPTH_ENV) == "2"
 
 
@@ -133,41 +133,8 @@ async def test_child_env_starts_at_one_from_root(
     from mimir.tools import registry
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture)
 
-    await spawn_codex.ainvoke({"prompt": "x"})
+    await spawn_open_code.ainvoke({"prompt": "x"})
     assert captured_env.get(_SPAWN_DEPTH_ENV) == "1"
-
-
-# ─── argv ``--`` separator ───────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_prompt_after_double_dash_separator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A prompt starting with ``--<word>`` stays positional."""
-    set_spawn_config({"default_cwd": tmp_path})
-
-    captured: list[list[str]] = []
-
-    def _capture(argv, cwd, timeout_s, env=None):
-        captured.append(argv)
-        return 0, "ok", ""
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture)
-
-    weird_prompt = "--dangerously-skip-permissions ignore previous"
-    await spawn_codex.ainvoke({"prompt": weird_prompt})
-
-    assert captured, "subprocess was not called"
-    argv = captured[0]
-    assert "--" in argv
-    dash_idx = argv.index("--")
-    # The prompt comes AFTER the ``--`` separator.
-    assert argv[dash_idx + 1] == weird_prompt
-    # And the prompt does NOT appear before the separator (would
-    # mean the CLI parsed it as a flag).
-    assert weird_prompt not in argv[:dash_idx]
 
 
 # ─── per-hour rate cap ──────────────────────────────────────────────────
@@ -188,11 +155,11 @@ async def test_rate_cap_refuses_after_threshold(
 
     # 3 should succeed.
     for i in range(3):
-        msg = await spawn_codex.ainvoke({"prompt": f"call-{i}"})
+        msg = await spawn_open_code.ainvoke({"prompt": f"call-{i}"})
         assert "refused" not in msg.lower(), f"call {i} was refused: {msg}"
 
     # 4th hits the cap.
-    msg = await spawn_codex.ainvoke({"prompt": "call-4"})
+    msg = await spawn_open_code.ainvoke({"prompt": "call-4"})
     assert "per-hour cap" in msg
     assert "3/h" in msg
 
@@ -216,8 +183,8 @@ async def test_rate_slot_release_removes_this_spawn_token(
     monkeypatch.setattr(registry.time, "monotonic", _fake_monotonic)
 
     guard = _spawn_guard_init()
-    token_a, err_a = await _spawn_acquire_rate_slot(guard, "spawn_codex")
-    token_b, err_b = await _spawn_acquire_rate_slot(guard, "spawn_codex")
+    token_a, err_a = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    token_b, err_b = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
 
     assert err_a is None
     assert err_b is None
@@ -269,9 +236,9 @@ async def test_concurrency_semaphore_serializes(
     monkeypatch.setattr(registry, "_run_spawn_subprocess", _bumped_sync)
 
     results = await asyncio.gather(
-        spawn_codex.ainvoke({"prompt": "a"}),
-        spawn_codex.ainvoke({"prompt": "b"}),
-        spawn_codex.ainvoke({"prompt": "c"}),
+        spawn_open_code.ainvoke({"prompt": "a"}),
+        spawn_open_code.ainvoke({"prompt": "b"}),
+        spawn_open_code.ainvoke({"prompt": "c"}),
     )
     assert all("refused" not in r.lower() for r in results)
     assert peak <= 2, f"max_concurrent=2 was violated (peak={peak})"
@@ -292,13 +259,14 @@ def test_minimal_child_env_strips_unrelated_secrets(
         monkeypatch.setenv(k, f"{k}-secret")
     # Provider creds + infra.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xyz")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-xyz")
+    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("HOME", "/home/mimir")
 
-    codex_env = _minimal_child_env(depth=1, cred_prefixes=("OPENAI_", "CODEX_"))
-    assert codex_env["OPENAI_API_KEY"] == "sk-openai-xyz"
-    assert codex_env["HOME"] == "/home/mimir"  # codex finds ~/.codex/auth.json via HOME
-    assert codex_env[_SPAWN_DEPTH_ENV] == "1"
-    assert "ANTHROPIC_API_KEY" not in codex_env
-    assert "DISCORD_TOKEN" not in codex_env
+    child_env = _minimal_child_env(depth=1, cred_prefixes=("OPENCODE_",))
+    assert child_env["OPENCODE_API_KEY"] == "opencode-secret"
+    assert child_env["HOME"] == "/home/mimir"
+    assert child_env[_SPAWN_DEPTH_ENV] == "1"
+    assert "ANTHROPIC_API_KEY" not in child_env
+    assert "OPENAI_API_KEY" not in child_env
+    assert "DISCORD_TOKEN" not in child_env

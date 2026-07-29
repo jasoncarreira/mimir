@@ -19,16 +19,6 @@ from .backends import ToolPin
 
 DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
-        name="codex",
-        category="coding-cli",
-        pin="0.145.0",
-        smoke="codex --version && env -u MIMIR_MODEL_SPEC uv run pytest -q tests/test_worklink_backends.py",
-        source="npm",
-        package="@openai/codex",
-        install="scaffold Dockerfiles when the codex-plus extra is selected",
-        risk="High: Worklink's first coding backend; changes can affect prompt execution, sandbox flags, transcript shape, and quota consumption.",
-    ),
-    ToolPin(
         name="chainlink",
         category="issue-cli",
         pin="chainlink-1.6.0",

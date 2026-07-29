@@ -48,7 +48,7 @@ from .registry import (
     set_identity_resolver,
     set_scheduler,
     set_spawn_config,
-    spawn_codex,
+    spawn_open_code,
     worklink_run,
 )
 from .web import (
@@ -101,7 +101,7 @@ __all__ = [
     "commitment_snooze",
     "commitment_dismiss",
     "commitment_list",
-    "spawn_codex",
+    "spawn_open_code",
     # Web tools (gated on provider; see web_tools_enabled)
     "web_search",
     "fetch_url",

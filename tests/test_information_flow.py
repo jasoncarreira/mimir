@@ -1352,7 +1352,7 @@ async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution
     ("tool_name", "target", "sink_category"),
     [
         ("shell_exec", "printf untrusted", "shell_process"),
-        ("spawn_codex", "untrusted task", "spawn"),
+        ("spawn_open_code", "untrusted task", "spawn"),
         ("worklink_run", "/operator/worklink", "spawn"),
         ("write_file", "/tmp/untrusted", "file"),
         ("submit_proposal", "proposal", "proposal"),
@@ -1528,17 +1528,17 @@ def test_generic_spawn_is_blocked_even_for_trusted_trigger(
     service = ServicePrincipal(
         canonical="poller:tier-gate",
         trigger="poller",
-        capabilities=("spawn_codex",),
+        capabilities=("spawn_open_code",),
         readable_domains=("poller_payload",),
         sink_policies=(ServiceSinkPolicy(
-            "spawn_codex", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+            "spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
         ),),
         capability_tier=CapabilityTier.CODE_EXECUTION,
     )
     auth, labels = _trigger_service_context(service, integrity="trusted")
 
     decision = SinkGate.check_sink_flow(
-        "spawn_codex", str(tmp_path), labels, auth, enforce=True,
+        "spawn_open_code", str(tmp_path), labels, auth, enforce=True,
     )
 
     assert decision.allowed is False

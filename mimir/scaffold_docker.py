@@ -299,8 +299,6 @@ RUN apt-get update \\
 # Pinned mermaid CLI (used by mermaid-diagrams skill).
 RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
 
-__CODEX_INSTALL__
-
 __OPENCODE_INSTALL__
 
 __OPENCODE_CONFIG__
@@ -397,8 +395,6 @@ RUN apt-get update \\
 # Pinned mermaid CLI (used by mermaid-diagrams skill).
 RUN npm install -g @mermaid-js/mermaid-cli@11.16.0
 
-__CODEX_INSTALL__
-
 __OPENCODE_INSTALL__
 
 __OPENCODE_CONFIG__
@@ -475,23 +471,6 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
-def _codex_install_block(install_codex: bool) -> str:
-    """Dockerfile line installing the codex CLI, or a placeholder comment.
-
-    Installed for codex-subscription deployments (the ``codex-plus``
-    extra) so ``spawn_codex`` can shell out to ``codex exec`` and Codex
-    Plus auth (``~/.codex/auth.json``) is usable.
-    """
-    if not install_codex:
-        return "# (codex CLI not installed — no codex-plus extra selected)"
-    return (
-        "# Codex CLI — codex-subscription deployments (codex-plus extra).\n"
-        "# spawn_codex shells out to ``codex exec``; Codex Plus auth lives\n"
-        "# at ~/.codex/auth.json.\n"
-        "RUN npm install -g @openai/codex@0.145.0"
-    )
-
-
 def _opencode_install_block(install_opencode: bool) -> str:
     """Dockerfile block installing OpenCode runtime when enabled.
 
@@ -522,7 +501,6 @@ def render_dockerfile(
     *,
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
-    install_codex: bool = False,
     install_opencode: bool = False,
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
@@ -555,7 +533,6 @@ def render_dockerfile(
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
-    base = base.replace("__CODEX_INSTALL__", _codex_install_block(install_codex))
     base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block(install_opencode))
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
     if not fragments:
@@ -1269,15 +1246,8 @@ def scaffold(
 
     # Dockerfile — full regen (sentinel-bounded fragments block lives
     # inside the generated content; the whole file is owned by us).
-    # Codex-subscription deployments (the ``codex-plus`` extra) need the
-    # codex CLI in the image — spawn_codex shells out to ``codex exec`` and
-    # Codex Plus auth uses it. Detect from whichever extras apply to the
-    # mode (pypi bakes mimir_extras into the image; workspace passes
-    # uv_extras to ``uv sync``).
-    _mode_extras = (mimir_extras if mode == "pypi" else uv_extras) or []
-    install_codex = "codex-plus" in _mode_extras
     df_text = render_dockerfile(
-        fragments, mode=mode, mimir_extras=mimir_extras, install_codex=install_codex,
+        fragments, mode=mode, mimir_extras=mimir_extras,
         install_opencode=install_opencode,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
