@@ -760,6 +760,12 @@ def reattach_inflight_worklink_runs(
 
 
 def build_app(config: Config) -> web.Application:
+    process_session_id = make_process_session_id()
+    worklink_agent_id = f"mimir-worklink:{process_session_id}"
+    # Detached controllers inherit this process generation. The Chainlink
+    # tracker identity stays static; structured claim ownership does not.
+    os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id
+
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
     # well past 1MB. Bridges read attachment bytes from disk via filesystem
@@ -838,7 +844,7 @@ def build_app(config: Config) -> web.Application:
 
     init_logger(
         config.events_log,
-        make_process_session_id(),
+        process_session_id,
         max_events=config.max_events_kept,
         agent_id=config.agent_id,
     )
@@ -1957,6 +1963,7 @@ def build_app(config: Config) -> web.Application:
             )
 
     async def _on_cleanup(app: web.Application) -> None:
+        cleanup_started = time.monotonic()
         # Mark this stop as clean as the VERY FIRST action — before ANY await.
         # Reaching _on_cleanup means we received SIGTERM/SIGINT and are tearing
         # down in order (an intended stop). mark_clean_shutdown is a fast, sync,
@@ -1969,11 +1976,28 @@ def build_app(config: Config) -> web.Application:
         # chainlink #507.
         from .liveness import mark_clean_shutdown
         mark_clean_shutdown(config.home)
+        from .worklink.autonomy import release_claims_for_graceful_shutdown
+
+        release_timeout = 5.0
+        if config.drain_timeout_seconds > 0:
+            release_timeout = min(release_timeout, float(config.drain_timeout_seconds))
+        released = release_claims_for_graceful_shutdown(
+            config.home,
+            agent_id=worklink_agent_id,
+            timeout_s=release_timeout,
+        )
+        await log_event(
+            "worklink_shutdown_claims_released",
+            issue_ids=[record.issue_id for record in released],
+        )
         await log_event("shutdown", reason="cleanup")
         # chainlink #510: bounded graceful drain — finish in-flight turns up to
         # the configured timeout, then exit. Keeps a deploy SIGTERM from killing
         # live turns while staying within the compose stop_grace_period.
-        await dispatcher.drain(timeout=config.drain_timeout_seconds)
+        drain_timeout = config.drain_timeout_seconds
+        if drain_timeout > 0:
+            drain_timeout = max(0.0, drain_timeout - (time.monotonic() - cleanup_started))
+        await dispatcher.drain(timeout=drain_timeout)
         scheduler.stop()
         await sessions.shutdown()
         await indexer.stop()

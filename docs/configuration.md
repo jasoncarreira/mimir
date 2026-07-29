@@ -261,6 +261,7 @@ authenticate transport only; they do not create a named requester.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
+| `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
 | `MIMIR_SCRATCH_TTL_DAYS` | int | `1` | Age (newest contained mtime, days) before a scratch entry is swept; the recency check keeps in-use checkouts. `<= 0` disables the janitor. |

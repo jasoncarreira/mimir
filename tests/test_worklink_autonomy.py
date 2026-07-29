@@ -118,6 +118,34 @@ def test_active_worklink_lock_count_reads_locks_json() -> None:
     assert claims.issue_ids_with_label("worklink:ready") == []
 
 
+def test_shutdown_release_timeout_is_fail_soft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        autonomy.subprocess,
+        "run",
+        lambda args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args, 0.01)),
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.worklink.claims"):
+        released = autonomy.release_claims_for_graceful_shutdown(
+            tmp_path,
+            agent_id="mimir-worklink:process-a",
+            timeout_s=0.01,
+        )
+
+    assert released == []
+    assert "shutdown claim discovery failed" in caplog.text
+
+
+def test_worklink_runner_uses_process_scoped_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.worklink.orchestrator import WorklinkRunner
+
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:process-a")
+    runner = WorklinkRunner(home=Path("/tmp/home"), repo=Path("/tmp/repo"))
+    assert runner.agent_id == "mimir-worklink:process-a"
+
+
 def test_issue_ids_with_label_tolerates_bad_json() -> None:
     # Best-effort DISCOVERY path: a garbled list just means "nothing this cycle".
     claims = ChainlinkClaims(agent_id="t", runner=lambda a: cp(stdout="not json"))

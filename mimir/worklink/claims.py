@@ -35,6 +35,10 @@ CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
 #: exists to prevent. After this many, the cap re-asserts permanently and the leaf
 #: needs a human decision rather than another retry.
 MAX_CLAIM_RESETS = 2
+SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
+# A planned restart must not consume the ordinary retry budget, but repeated
+# restarts must not turn max_attempts into an infinite-retry loophole.
+MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -53,6 +57,9 @@ class ClaimRecord:
     agent_id: str
     claimed_at: datetime
     heartbeat_at: datetime | None = None
+    # Unique attempt ordinals can exceed the charged budget after a forgiven
+    # shutdown. Kept on the wire so terminal transitions use the right budget.
+    budget_attempt: int | None = None
     # How many honoured ``WORKLINK_CLAIM_RESET`` markers precede this record.
     # Derived from position in the comment history rather than carried on the
     # wire, so ``to_comment`` stays byte-identical. A reset restarts attempt
@@ -73,6 +80,8 @@ class ClaimRecord:
             "claimed_at": self.claimed_at.isoformat(),
             "heartbeat_at": self.heartbeat_at.isoformat() if self.heartbeat_at else None,
         }
+        if self.budget_attempt is not None:
+            payload["budget_attempt"] = self.budget_attempt
         return CLAIM_PREFIX + json.dumps(payload, sort_keys=True)
 
     @classmethod
@@ -83,6 +92,43 @@ class ClaimRecord:
             agent_id=str(payload["agent_id"]),
             claimed_at=_parse_dt(str(payload["claimed_at"])),
             heartbeat_at=_parse_dt(str(payload["heartbeat_at"])) if payload.get("heartbeat_at") else None,
+            budget_attempt=(
+                int(payload["budget_attempt"])
+                if payload.get("budget_attempt") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ShutdownAbortRecord:
+    issue_id: int
+    attempt: int
+    agent_id: str
+    claimed_at: datetime
+    aborted_at: datetime
+    generation: int = 0
+
+    def to_comment(self) -> str:
+        return SHUTDOWN_ABORT_PREFIX + json.dumps(
+            {
+                "issue_id": self.issue_id,
+                "attempt": self.attempt,
+                "agent_id": self.agent_id,
+                "claimed_at": self.claimed_at.isoformat(),
+                "aborted_at": self.aborted_at.isoformat(),
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ShutdownAbortRecord":
+        return cls(
+            issue_id=int(payload["issue_id"]),
+            attempt=int(payload["attempt"]),
+            agent_id=str(payload["agent_id"]),
+            claimed_at=_parse_dt(str(payload["claimed_at"])),
+            aborted_at=_parse_dt(str(payload["aborted_at"])),
         )
 
 
@@ -107,7 +153,9 @@ def _parse_dt(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
+def _scan_claim_history(
+    comments: Iterable[str],
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], int]:
     """Parse every claim record with its reset generation, plus the final one.
 
     Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
@@ -126,6 +174,8 @@ def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], in
     budget is fresh.
     """
     records: list[ClaimRecord] = []
+    aborts: list[ShutdownAbortRecord] = []
+    seen_claims: set[tuple[int, int, str, datetime]] = set()
     generation = 0
     for comment in comments:
         for line in comment.splitlines():
@@ -134,12 +184,37 @@ def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], in
                     generation += 1
                 continue
             if not line.startswith(CLAIM_PREFIX):
+                if not line.startswith(SHUTDOWN_ABORT_PREFIX):
+                    continue
+                try:
+                    abort = ShutdownAbortRecord.from_payload(
+                        json.loads(line[len(SHUTDOWN_ABORT_PREFIX) :])
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                abort_key = (
+                    abort.issue_id,
+                    abort.attempt,
+                    abort.agent_id,
+                    abort.claimed_at,
+                )
+                if abort_key not in seen_claims:
+                    continue
+                aborts.append(replace(abort, generation=generation))
                 continue
             try:
                 record = ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :]))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             records.append(replace(record, generation=generation))
+            seen_claims.add(
+                (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            )
+    return records, aborts, generation
+
+
+def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
+    records, _aborts, generation = _scan_claim_history(comments)
     return records, generation
 
 
@@ -235,6 +310,7 @@ class ChainlinkClaims:
         labels have drifted. ``worklink:in-progress`` remains admissible for
         legitimate reattach scenarios.
         """
+        comments = list(comments)
         label_set = self._issue_labels(issue_id)
         if labels is not None:
             label_set.update(labels)
@@ -290,9 +366,10 @@ class ChainlinkClaims:
         # duplicate did exactly that to run 15's healthy attempt-3 claim).
         # Reaching here means we genuinely own the (fresh or stolen) lock.
         attempt = self.next_attempt(comments)
-        if attempt > self.max_attempts:
+        attempts_used = self.attempts_used(comments)
+        if attempts_used >= self.max_attempts:
             self.release_issue(issue_id)
-            self._attempts_exhausted(issue_id, attempt - 1)
+            self._attempts_exhausted(issue_id, attempts_used)
             return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
         if max_active_locks is not None:
@@ -316,6 +393,7 @@ class ChainlinkClaims:
             attempt=attempt,
             agent_id=self.agent_id,
             claimed_at=self.clock(),
+            budget_attempt=attempts_used + 1,
         )
         try:
             self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
@@ -355,6 +433,60 @@ class ChainlinkClaims:
         """Release the Chainlink lock for ``issue_id`` best-effort."""
         self._run("locks", "release", str(issue_id), check=False)
 
+    def release_owned_claims_for_shutdown(self) -> list[ClaimRecord]:
+        """Return this process's in-flight claims to ready, best-effort.
+
+        Ownership is taken only from the latest structured claim comment. A
+        different process/host therefore cannot be released even when both use
+        the same underlying Chainlink tracker identity.
+        """
+        released: list[ClaimRecord] = []
+        try:
+            issue_ids = self._list_issue_ids("worklink:in-progress")
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            log.warning("Worklink shutdown claim discovery failed: %s", exc)
+            return released
+
+        for issue_id in issue_ids:
+            try:
+                latest: ClaimRecord | None = None
+                for record in claim_records_from_comments(self._issue_comments(issue_id)):
+                    if record.issue_id != issue_id:
+                        continue
+                    if latest is None or _claim_is_newer(record, latest):
+                        latest = record
+                if latest is None or latest.agent_id != self.agent_id:
+                    continue
+
+                abort = ShutdownAbortRecord(
+                    issue_id=issue_id,
+                    attempt=latest.attempt,
+                    agent_id=latest.agent_id,
+                    claimed_at=latest.claimed_at,
+                    aborted_at=self.clock(),
+                )
+                # Keep the issue dispatchable throughout partial failure: first
+                # record forgiveness, then add ready, release the lock, and only
+                # then remove in-progress. No forceful lock steal is used here.
+                self._run("issue", "comment", str(issue_id), abort.to_comment())
+                self._run("issue", "label", str(issue_id), "worklink:ready")
+                lock = self._run("locks", "release", str(issue_id), check=False)
+                if lock.returncode != 0:
+                    raise RuntimeError(
+                        (lock.stderr or lock.stdout).strip() or "chainlink lock release failed"
+                    )
+                self._run("issue", "unlabel", str(issue_id), "worklink:in-progress")
+                released.append(latest)
+            except Exception as exc:  # noqa: BLE001 - one claim cannot hang shutdown
+                log.warning(
+                    "Worklink shutdown claim release failed: issue_id=%s error=%s",
+                    issue_id,
+                    exc,
+                )
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    break
+        return released
+
     def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
         """Append a refreshed claim record so the TTL reaper sees liveness."""
         updated = ClaimRecord(
@@ -363,6 +495,7 @@ class ChainlinkClaims:
             agent_id=record.agent_id,
             claimed_at=record.claimed_at,
             heartbeat_at=self.clock(),
+            budget_attempt=record.budget_attempt,
         )
         self._run("issue", "comment", str(record.issue_id), updated.to_comment(), check=False)
         return updated
@@ -416,6 +549,33 @@ class ChainlinkClaims:
             return 1
         return max(attempts) + 1
 
+    def attempts_used(self, comments: Iterable[str]) -> int:
+        """Charged attempts in the active reset generation.
+
+        The first bounded set of valid shutdown markers across the leaf's
+        history forgive their matching claims. Attempt ordinals still advance,
+        preventing checkout/branch/evidence collisions.
+        """
+        records, aborts, generation = _scan_claim_history(comments)
+        claim_keys = {
+            (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            for record in records
+        }
+        forgiven: set[tuple[int, int, str, datetime]] = set()
+        for abort in aborts:
+            key = (abort.issue_id, abort.attempt, abort.agent_id, abort.claimed_at)
+            if key not in claim_keys or key in forgiven:
+                continue
+            if len(forgiven) >= MAX_SHUTDOWN_ABORT_FORGIVENESS:
+                break
+            forgiven.add(key)
+        active_claims = {
+            (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            for record in records
+            if record.generation == generation
+        }
+        return len(active_claims - forgiven)
+
     def reap_stale_claims(self, records: Iterable[ClaimRecord], *, ttl: timedelta) -> list[ClaimRecord]:
         """Release stale claims and move the issue back to ready or blocked.
 
@@ -438,7 +598,7 @@ class ChainlinkClaims:
                 continue
             self._run("locks", "release", str(record.issue_id), check=False)
             self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
-            if record.attempt >= self.max_attempts:
+            if (record.budget_attempt or record.attempt) >= self.max_attempts:
                 self._run("issue", "label", str(record.issue_id), "worklink:blocked")
                 transition = "blocked"
             else:
@@ -550,7 +710,8 @@ class ChainlinkClaims:
         if not isinstance(lock, dict):
             return True
         owner = _lock_owner(lock)
-        return owner is None or owner == record.agent_id
+        process_tracker_id = record.agent_id.split(":", 1)[0]
+        return owner is None or owner in {record.agent_id, process_tracker_id}
 
     # ---- Discovery / concurrency (slice-3 autonomy) ------------------
 

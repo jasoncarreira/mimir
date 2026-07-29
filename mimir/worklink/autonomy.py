@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Callable, Sequence
 
 from .backends import WorklinkConfig
@@ -40,6 +41,7 @@ from .worktree import prune_attempt_worktrees
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
 #: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
 DEFAULT_AGENT_ID = "mimir-worklink"
+WORKLINK_AGENT_ID_ENV = "MIMIR_WORKLINK_AGENT_ID"
 
 
 def chainlink_bin() -> str:
@@ -83,13 +85,50 @@ def worklink_repo() -> str:
     return repo
 
 
-def make_claims(home: Path, *, agent_id: str = DEFAULT_AGENT_ID) -> ChainlinkClaims:
+def current_agent_id() -> str:
+    return os.environ.get(WORKLINK_AGENT_ID_ENV) or DEFAULT_AGENT_ID
+
+
+def make_claims(home: Path, *, agent_id: str | None = None) -> ChainlinkClaims:
     return ChainlinkClaims(
         chainlink_bin=chainlink_bin(),
-        agent_id=agent_id,
+        agent_id=agent_id or current_agent_id(),
         runner=_home_runner(home),
         home_path=home,
     )
+
+
+def release_claims_for_graceful_shutdown(
+    home: Path,
+    *,
+    agent_id: str,
+    timeout_s: float,
+) -> list[ClaimRecord]:
+    """Release only ``agent_id`` claims within one wall-clock deadline."""
+    if timeout_s <= 0:
+        return []
+    deadline = time.monotonic() + timeout_s
+
+    def bounded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(args, timeout_s)
+        return subprocess.run(
+            args,
+            cwd=str(home),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=remaining,
+        )
+
+    claims = ChainlinkClaims(
+        chainlink_bin=chainlink_bin(),
+        agent_id=agent_id,
+        runner=bounded_runner,
+        home_path=home,
+    )
+    return claims.release_owned_claims_for_shutdown()
 
 
 @dataclass(frozen=True)
@@ -108,7 +147,7 @@ class ConcurrencyCheck:
 def check_concurrency(
     home: Path,
     *,
-    agent_id: str = DEFAULT_AGENT_ID,
+    agent_id: str | None = None,
     claims: ChainlinkClaims | None = None,
 ) -> ConcurrencyCheck:
     """Whether autonomous dispatch may start one more leaf right now.
@@ -191,7 +230,7 @@ def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | Non
 def reap_stale_claims_for_home(
     home: Path,
     *,
-    agent_id: str = DEFAULT_AGENT_ID,
+    agent_id: str | None = None,
     claims: ChainlinkClaims | None = None,
 ) -> list[ClaimRecord]:
     """TTL-reaper entry point: recover claims whose worker died.
