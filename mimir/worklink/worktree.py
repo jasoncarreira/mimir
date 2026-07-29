@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import fcntl
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from typing import Any, Callable, Sequence
@@ -411,20 +412,9 @@ def _fetch_base_from_origin(
     runner: Runner,
     event_logger: EventLogger | None = None,
 ) -> bool:
-    """Refresh the base, repairing dangling alternates once before failing closed."""
+    """Refresh the base, repairing reconstructible dangling refs once on failure."""
     remote_base = base.removeprefix("origin/")
     result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
-    pruned, backup = _prune_dangling_alternates(repo)
-    if pruned:
-        if event_logger is not None:
-            event_logger(
-                "worklink_base_alternates_repaired",
-                repo=str(repo),
-                base=remote_base,
-                pruned=[str(path) for path in pruned],
-                backup=str(backup),
-            )
-        result = runner(["git", "-C", str(repo), "fetch", "origin", remote_base])
     # A reclaimed alternate leaves refs behind. Pruning the alternates file removes
     # the pointer but not the refs that resolved only through it, and git refuses
     # the whole fetch on the first such ref ("fatal: bad object <ref>"). Repair that
@@ -472,6 +462,7 @@ def _prepare_fresh_base(
     """Return a fetched, locally resolvable base that contains origin's fetched tip."""
     if not base_fetch:
         raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
+    _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
         raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
 
@@ -609,32 +600,117 @@ def _prune_dangling_refs(repo: Path, *, runner: Runner) -> tuple[
     return pruned, retained
 
 
-def _prune_dangling_alternates(repo: Path) -> tuple[list[Path], Path | None]:
-    alternates, entries = _alternate_entries(repo)
-    dead = [path for _line, path in entries if not path.is_dir()]
-    if alternates is None or not dead:
-        return [], None
-
+def _alternates_backup_path(alternates: Path) -> Path:
     backup = alternates.with_name(f"{alternates.name}.worklink-backup")
     suffix = 1
     while backup.exists():
         backup = alternates.with_name(f"{alternates.name}.worklink-backup.{suffix}")
         suffix += 1
+    return backup
+
+
+def _check_without_alternates(
+    repo: Path,
+    alternates: Path,
+    *,
+    runner: Runner,
+) -> tuple[bool, list[tuple[str, str]], list[str], str]:
+    hidden = alternates.with_name(f"{alternates.name}.worklink-check")
+    suffix = 1
+    while hidden.exists():
+        hidden = alternates.with_name(f"{alternates.name}.worklink-check.{suffix}")
+        suffix += 1
+    alternates.replace(hidden)
+    try:
+        head = runner(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD^{object}"])
+        fsck = runner(["git", "-C", str(repo), "fsck", "--connectivity-only"])
+        dangling_refs = _dangling_refs(repo, runner=runner)
+    finally:
+        hidden.replace(alternates)
+
+    details = "\n".join(
+        value.strip()
+        for value in (head.stdout, head.stderr, fsck.stdout, fsck.stderr)
+        if value and value.strip()
+    )
+    object_ids = sorted({
+        *re.findall(r"(?<![0-9a-f])[0-9a-f]{40,64}(?![0-9a-f])", details.lower()),
+        *(sha for _name, sha in dangling_refs),
+    })
+    return head.returncode == 0 and fsck.returncode == 0, dangling_refs, object_ids, details
+
+
+def _repair_base_alternates(
+    repo: Path,
+    *,
+    base: str,
+    runner: Runner,
+    event_logger: EventLogger | None,
+) -> None:
+    """Remove every base-repo alternate, but only after proving it is unnecessary."""
+    alternates, entries = _alternate_entries(repo)
+    if alternates is None or not alternates.is_file():
+        return
+
+    # This probe is deliberately first. No ref, worktree registration, or alternate
+    # is pruned until Git has shown what becomes unreachable without the file.
+    safe, dangling_refs, object_ids, details = _check_without_alternates(
+        repo, alternates, runner=runner
+    )
+
+    worktree_prune = runner(["git", "-C", str(repo), "worktree", "prune", "--verbose"])
+    pruned_refs: list[tuple[str, str]] = []
+    retained_refs: list[tuple[str, str]] = []
+    for name, sha in dangling_refs:
+        if not name.startswith(_DISPOSABLE_REF_PREFIX):
+            retained_refs.append((name, sha))
+        elif runner(["git", "-C", str(repo), "update-ref", "-d", name]).returncode == 0:
+            pruned_refs.append((name, sha))
+
+    # Stale worktree reflogs and reconstructible remote refs can be the only failed
+    # roots. Recheck after those narrow repairs; local branches and tags remain.
+    if not safe or pruned_refs or _strip_for_event(worktree_prune.stdout + worktree_prune.stderr):
+        safe, dangling_refs_after, object_ids, details = _check_without_alternates(
+            repo, alternates, runner=runner
+        )
+        retained_refs = [
+            item for item in dangling_refs_after if not item[0].startswith(_DISPOSABLE_REF_PREFIX)
+        ]
+
+    retained = [str(path) for _line, path in entries]
+    if not safe:
+        if event_logger is not None:
+            event_logger(
+                "worklink_base_alternates_repair_refused",
+                repo=str(repo),
+                base=base.removeprefix("origin/"),
+                pruned=[f"{name}@{sha}" for name, sha in pruned_refs],
+                retained=retained,
+                retained_refs=[f"{name}@{sha}" for name, sha in retained_refs],
+                at_risk_objects=object_ids,
+                worktree_prune=_strip_for_event(worktree_prune.stdout + worktree_prune.stderr),
+            )
+        risks = ", ".join(object_ids) or _strip_for_event(details) or "unknown objects"
+        raise RuntimeError(
+            "base repo alternates repair refused; objects are reachable only through "
+            f"the retained alternate: {risks}"
+        )
+
+    backup = _alternates_backup_path(alternates)
     shutil.copy2(alternates, backup)
-    objects = alternates.parent.parent
-    live_lines: list[str] = []
-    for line in alternates.read_text(encoding="utf-8").splitlines(keepends=True):
-        raw = line.strip()
-        if not raw:
-            live_lines.append(line)
-            continue
-        path = Path(raw)
-        if not path.is_absolute():
-            path = objects / path
-        if path.resolve().is_dir():
-            live_lines.append(line)
-    alternates.write_text("".join(live_lines), encoding="utf-8")
-    return dead, backup
+    alternates.unlink()
+    if event_logger is not None:
+        event_logger(
+            "worklink_base_alternates_repaired",
+            repo=str(repo),
+            base=base.removeprefix("origin/"),
+            pruned=retained,
+            retained=[],
+            pruned_refs=[f"{name}@{sha}" for name, sha in pruned_refs],
+            retained_refs=[],
+            backup=str(backup),
+            worktree_prune=_strip_for_event(worktree_prune.stdout + worktree_prune.stderr),
+        )
 
 
 def _resolve_local_base(repo: Path, base: str, *, prefer_origin: bool = False, runner: Runner) -> str:

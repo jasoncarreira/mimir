@@ -336,7 +336,7 @@ def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:
     assert missing.returncode != 0
 
 
-def test_dangling_alternates_are_backed_up_pruned_and_fetch_retried(tmp_path: Path) -> None:
+def test_all_alternates_are_backed_up_and_pruned_before_fetch(tmp_path: Path) -> None:
     repo = _repo_with_main(tmp_path)
     alternates = repo / ".git" / "objects" / "info" / "alternates"
     live = tmp_path / "live-objects"
@@ -353,12 +353,78 @@ def test_dangling_alternates_are_backed_up_pruned_and_fetch_retried(tmp_path: Pa
     lease = create_worktree(repo, issue_id=967, attempt=1, runner=runner)
 
     fetches = [call for call in calls if call[:4] == ["git", "-C", str(repo), "fetch"]]
-    assert len(fetches) == 2
-    assert alternates.read_text(encoding="utf-8") == f"{live}\n"
+    assert len(fetches) == 1
+    assert not alternates.exists()
     backups = list(alternates.parent.glob("alternates.worklink-backup*"))
     assert len(backups) == 1
     assert backups[0].read_text(encoding="utf-8") == original
     assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/main")
+
+
+def test_valid_alternate_is_repaired_before_isolated_clone(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    donor = tmp_path / "donor"
+    subprocess.run(["git", "init", "-q", str(donor)], check=True)
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    alternates.write_text(f"{donor / '.git' / 'objects'}\n", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    lease = create_isolated_checkout(
+        repo,
+        issue_id=1033,
+        attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+        runner=runner,
+    )
+
+    assert not alternates.exists()
+    assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/main")
+    repaired = next(payload for name, payload in events if name == "worklink_base_alternates_repaired")
+    assert repaired["pruned"] == [str(donor / ".git" / "objects")]
+    assert repaired["retained"] == []
+    fsck_index = next(i for i, call in enumerate(calls) if "fsck" in call)
+    prune_index = next(
+        i for i, call in enumerate(calls) if call[-3:] == ["worktree", "prune", "--verbose"]
+    )
+    assert fsck_index < prune_index
+
+
+def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    donor = tmp_path / "donor"
+    subprocess.run(["git", "init", "-q", str(donor)], check=True)
+    _git(donor, "config", "user.email", "t@e.com")
+    _git(donor, "config", "user.name", "t")
+    _git(donor, "commit", "-q", "--allow-empty", "-m", "alternate only")
+    unique_sha = _git(donor, "rev-parse", "HEAD")
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    alternate_objects = donor / ".git" / "objects"
+    alternates.write_text(f"{alternate_objects}\n", encoding="utf-8")
+    _git(repo, "update-ref", "refs/heads/rescue-alternate", unique_sha)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    with pytest.raises(RuntimeError, match=unique_sha):
+        create_isolated_checkout(
+            repo,
+            issue_id=1033,
+            attempt=2,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    assert alternates.read_text(encoding="utf-8") == f"{alternate_objects}\n"
+    assert _git(repo, "rev-parse", "refs/heads/rescue-alternate") == unique_sha
+    refused = next(
+        payload for name, payload in events
+        if name == "worklink_base_alternates_repair_refused"
+    )
+    assert unique_sha in refused["at_risk_objects"]
+    assert refused["retained"] == [str(alternate_objects)]
+    assert refused["retained_refs"] == [f"refs/heads/rescue-alternate@{unique_sha}"]
 
 
 def test_stale_remote_tracking_base_fails_with_shas_and_behind_count(tmp_path: Path) -> None:
