@@ -626,6 +626,7 @@ class RepoReviewState:
     action_scope: RepoPRActionScope
     checked_out: bool = field(default=False, init=False, compare=False)
     checkout_lease: Any = field(default=None, init=False, repr=False, compare=False)
+    git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def repo(self) -> str:
@@ -659,12 +660,29 @@ class RepoReviewState:
             raise ValueError("checkout lease does not match review scope")
         object.__setattr__(self, "checkout_lease", lease)
         object.__setattr__(self, "checked_out", True)
+        object.__setattr__(self, "git_expected_head", self.action_scope.observed_head_sha.lower())
+
+    def record_git_head(self, scope_id: str, head: str) -> None:
+        """Record a typed Git mutation's new HEAD without widening its scope."""
+        lease = self.checkout_lease
+        normalized = head.lower()
+        if (
+            lease is None
+            or scope_id != self.action_scope.scope_id
+            or getattr(lease, "scope_id", None) != scope_id
+            or not getattr(lease, "is_active", False)
+            or len(normalized) != 40
+            or any(character not in "0123456789abcdef" for character in normalized)
+        ):
+            raise ValueError("Git HEAD update does not match active review scope")
+        object.__setattr__(self, "git_expected_head", normalized)
 
     def revoke_checkout_lease(self, lease: Any) -> None:
         """Revoke the exact attached lease without affecting a replacement."""
         if self.checkout_lease is lease:
             object.__setattr__(self, "checkout_lease", None)
             object.__setattr__(self, "checked_out", False)
+            object.__setattr__(self, "git_expected_head", None)
 
 
 @dataclass(frozen=True)
