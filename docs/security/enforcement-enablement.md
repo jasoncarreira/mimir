@@ -636,8 +636,8 @@ the explicit grants after it. It rejects a catch-all allow entry. Denials become
 tool errors captured in the headless run/transcript; there is no `ask` rule that
 could wedge waiting for an interactive reply.
 
-**Pinned-runtime verification (2026-07-19):** the shipped runtime is
-`opencode-ai@1.17.15`. Its config schema accepts `permission.bash` and
+**Pinned-runtime verification (2026-07-19):** the runtime shipped at that time
+was `opencode-ai@1.17.15`. Its config schema accepts `permission.bash` and
 `permission.external_directory`; its permission evaluator uses last-match-wins,
 and its external-directory guard is invoked by path-taking file tools. The
 runtime's schema and source tree contain no `permission.shell.sandbox`,
@@ -645,6 +645,28 @@ runtime's schema and source tree contain no `permission.shell.sandbox`,
 selects the shell executable, and the bash tool launches with the host user's
 filesystem, process, and network authority. There is therefore no additional
 OpenCode sandbox to wire in this version.
+
+**Pin bump re-check (2026-07-29, `opencode-ai@1.18.9`):** the pin moved from
+1.17.15 to 1.18.9. The load-bearing negative above was re-checked against the
+1.18.9 release artifact and still holds: no `permission.shell.sandbox` and no
+`shell.sandbox`, and the binary links no OS process-sandbox mechanism (no
+`sandbox-exec`, `seccomp`, `bwrap`, `bubblewrap`, `landlock`, `nsjail`, or
+`firejail`). The `permission` and `external_directory` configuration surfaces are
+still present. The `sandbox` strings that do occur were attributed and are
+unrelated to process confinement: AWS service-name maps
+(`mturk-requester-sandbox`), interface translations for a `workspace.type.sandbox`
+workspace kind, and session *sharing* (`session.unshare`). The conclusion is
+unchanged — there is still no OpenCode-provided OS sandbox to wire in.
+
+Scope of that re-check, so it is not mistaken for the full 2026-07-19 pass: the
+npm package is a four-file installer stub, so this was a strings inspection of the
+distributed platform binary rather than a source-tree read. Three 1.17.15-era
+claims were therefore **not** re-established at the original depth: that the
+permission evaluator uses last-match-wins, that the external-directory guard is
+invoked by path-taking file tools, and that the `shell` config field only selects
+the shell executable. Those are unchanged Worklink assumptions carried forward on
+the strength of the earlier pass; re-verify them at source depth before treating
+this section as current evidence for an enablement decision.
 
 These controls are **defense-in-depth for trusted code work only**, not an OS
 sandbox or a boundary for hostile payloads. File-tool path checks do not revoke
