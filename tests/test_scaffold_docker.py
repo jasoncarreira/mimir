@@ -357,7 +357,7 @@ def test_render_dockerfile_installs_opencode_when_enabled():
     """install_opencode=True adds the OpenCode runtime install to both modes."""
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_opencode=True)
-        assert "npm install -g opencode-ai@1.17.15" in out, mode
+        assert "npm install -g opencode-ai@1.18.9" in out, mode
         assert "npm install -g opencode-feature-factory@0.2.1" in out, mode
         assert "npm install -g opencode-project-memory@0.1.0" in out, mode
         assert "npm install -g opencode-openai-codex-auth@4.4.0" in out, mode
@@ -382,7 +382,7 @@ def test_scaffold_installs_opencode_when_flag_set(tmp_path: Path):
     home = tmp_path / "opencode-home"
     home.mkdir()
     scaffold(home, mode="pypi", install_opencode=True)
-    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+    assert "npm install -g opencode-ai@1.18.9" in (home / "Dockerfile").read_text()
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -395,7 +395,7 @@ def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path):
     home = tmp_path / "ws-opencode-home"
     home.mkdir()
     scaffold(home, mode="workspace", install_opencode=True)
-    assert "npm install -g opencode-ai@1.17.15" in (home / "Dockerfile").read_text()
+    assert "npm install -g opencode-ai@1.18.9" in (home / "Dockerfile").read_text()
 
 
 def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):

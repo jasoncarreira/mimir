@@ -64,7 +64,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="opencode",
         category="coding-cli",
-        pin="1.17.15",
+        pin="1.18.9",
         smoke="opencode --version",
         source="npm",
         package="opencode-ai",
