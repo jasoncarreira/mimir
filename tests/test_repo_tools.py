@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 
@@ -121,6 +122,9 @@ def test_inspection_uses_pinned_hardened_argv_and_sanitized_environment(
         assert argv[1:3] == ("-C", str(lease.path.resolve()))
         assert ("-c", "core.hooksPath=/dev/null") == argv[5:7]
         assert "credential.helper=" in argv
+        assert "http.extraHeader=" in argv
+        assert "http.proxy=" in argv
+        assert "http.followRedirects=false" in argv
         assert "protocol.allow=never" in argv
         assert "--no-pager" in argv
         assert "--no-optional-locks" in argv
@@ -318,6 +322,91 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == _git(
         state.checkout_lease.path, "rev-parse", "HEAD",
     )
+
+
+def test_https_push_uses_scope_bound_proxy_without_credential_leak(repo_tools) -> None:
+    origin, _source, scope, old_state, _tools = repo_tools
+    https_scope = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=https_scope.canonical_origin,
+        scope_id=https_scope.scope_id,
+    )
+    _git(lease.path, "remote", "set-url", "origin", https_scope.canonical_origin)
+    state = RepoReviewState(https_scope)
+    state.attach_checkout_lease(lease)
+    state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    token = "never-expose-this-token"
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    def runner(argv, *, env, timeout, output_limit):
+        calls.append((argv, env))
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(
+        state,
+        runner=runner,
+        push_proxy_factory=lambda bound_scope, head: nullcontext(str(origin)),
+    )
+    tools.execute(GitCommit(("push.txt",), "push mutation"))
+    assert tools.execute(GitPush()).ok
+
+    push = next(argv for argv, _env in calls if "push" in argv)
+    assert push[-2:] == (str(origin), f"HEAD:{https_scope.destination_ref}")
+    assert token not in "\0".join(push)
+    assert all(token not in "\0".join(env.values()) for _argv, env in calls)
+    assert "credential" not in _git(lease.path, "config", "--local", "--list")
+    assert _git(origin, "rev-parse", https_scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+
+
+def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "stranded mutation"))
+    stranded_head = _git(lease.path, "rev-parse", "HEAD")
+
+    def failed_push(argv, *, env, timeout, output_limit):
+        if "push" in argv:
+            return GitProcessResult(1, stderr="upstream diagnostic could contain sensitive data")
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=failed_push).execute(GitPush())
+
+    assert refusal.value.code == "git_failed"
+    assert str(refusal.value) == (
+        f"push failed; local commit {stranded_head} remains unpushed in preserved "
+        f"checkout lease {lease.path.resolve()}"
+    )
+    assert "upstream diagnostic" not in str(refusal.value)
+    assert lease.is_active
+    assert _git(lease.path, "rev-parse", "HEAD") == stranded_head
+
+
+def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatch) -> None:
+    _origin, _source, _scope, _state, tools = repo_tools
+    original_raw = tools._raw
+    network_seen = False
+
+    def non_ancestor(arguments, **kwargs):
+        nonlocal network_seen
+        if arguments[:2] == ("merge-base", "--is-ancestor"):
+            return GitProcessResult(1)
+        if "ls-remote" in arguments or "push" in arguments:
+            network_seen = True
+        return original_raw(arguments, **kwargs)
+
+    monkeypatch.setattr(tools, "_raw", non_ancestor)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "force_push_refused"
+    assert network_seen is False
 
 
 def test_cross_pr_checkout_is_refused(repo_tools) -> None:
