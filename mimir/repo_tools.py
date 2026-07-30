@@ -398,6 +398,7 @@ class RepoGitTools:
         network_remote: str | None = None,
         env: dict[str, str] | None = None,
         sensitive_values: tuple[str, ...] = (),
+        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         result = self._raw(
             arguments,
@@ -411,7 +412,10 @@ class RepoGitTools:
         if result.output_limited:
             raise GitRefusal("output_limit", "Git operation exceeded its output limit")
         if result.returncode != 0:
-            raise GitRefusal("git_failed", result.stderr.strip() or "Git operation failed")
+            detail = result.stderr.strip()
+            if not detail and report_stdout_on_failure:
+                detail = result.stdout.strip()
+            raise GitRefusal("git_failed", detail or "Git operation failed")
         return result
 
     def _config_overrides(self) -> tuple[str, ...]:
@@ -451,6 +455,7 @@ class RepoGitTools:
         overrides: tuple[str, ...] | None = None,
         env: dict[str, str] | None = None,
         sensitive_values: tuple[str, ...] = (),
+        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         local_overrides = self._config_overrides() if overrides is None else overrides
         prefix = local_overrides
@@ -466,6 +471,7 @@ class RepoGitTools:
             network_remote=network_remote,
             env=env,
             sensitive_values=sensitive_values,
+            report_stdout_on_failure=report_stdout_on_failure,
         )
 
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
@@ -696,9 +702,25 @@ class RepoGitTools:
             self._refresh_expected_head()
         elif isinstance(operation, GitMerge):
             self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
-            result = self._command(
-                ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha), identity=True,
-            )
+            try:
+                result = self._command(
+                    ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
+                    identity=True,
+                    report_stdout_on_failure=True,
+                )
+            except GitRefusal as exc:
+                if exc.code != "git_failed":
+                    raise
+                unmerged = self._unmerged_paths()
+                if not unmerged:
+                    raise
+                paths = ", ".join(repr(path) for path in sorted(unmerged))
+                raise GitRefusal(
+                    "merge_conflict",
+                    f"merge conflict in unmerged path(s): {paths}; inspect the unmerged "
+                    f"index with repo_unmerged, or abort the merge with repo_merge_abort; "
+                    f"Git output: {exc}",
+                ) from exc
             self._refresh_expected_head()
         elif isinstance(operation, GitMergeAbort):
             self._require(RepoPRAction.WRITE)
