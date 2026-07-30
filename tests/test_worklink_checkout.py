@@ -7,18 +7,13 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink.worktree import (
-    SliceMergeConflict,
-    SliceMergeSuccess,
-    WorktreeLease,
+from mimir.worklink.checkout import (
+    CheckoutLease,
     _assert_self_contained_checkout,
-    cleanup_worktree,
-    create_integration_branch,
+    cleanup_checkout,
     create_isolated_checkout,
-    create_slice_worktree,
     create_worktree,
-    merge_slice_into_integration,
-    prune_attempt_worktrees,
+    prune_attempt_checkouts,
 )
 
 
@@ -76,15 +71,15 @@ def test_cleanup_removes_only_successful_worktrees(tmp_path: Path) -> None:
         calls.append(list(args))
         return completed(args)
 
-    lease = WorktreeLease(439, 1, tmp_path, tmp_path / ".worklink" / "439-1", "issue/439-a1", "main")
+    lease = CheckoutLease(439, 1, tmp_path, tmp_path / ".worklink" / "439-1", "issue/439-a1", "main")
 
-    assert cleanup_worktree(lease, outcome="failed", runner=runner) is False
+    assert cleanup_checkout(lease, outcome="failed", runner=runner) is False
     assert calls == []
-    assert cleanup_worktree(lease, outcome="completed", runner=runner) is True
+    assert cleanup_checkout(lease, outcome="completed", runner=runner) is True
     assert calls == [["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(lease.path)]]
 
 
-def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
+def test_prune_attempt_checkouts_is_conservative(tmp_path: Path) -> None:
     root = tmp_path / ".worklink"
     old = root / "439-1"
     young = root / "439-2"
@@ -107,7 +102,7 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
 
         os.utime(path, (mtime, mtime))
 
-    pruned = prune_attempt_worktrees(tmp_path, older_than=timedelta(days=3), now=now, runner=runner)
+    pruned = prune_attempt_checkouts(tmp_path, older_than=timedelta(days=3), now=now, runner=runner)
 
     assert pruned == [old]
     assert old.exists()  # fake git runner did not remove it; real git would
@@ -117,7 +112,7 @@ def test_prune_attempt_worktrees_is_conservative(tmp_path: Path) -> None:
     ]
 
 
-def test_prune_attempt_worktrees_skips_active(tmp_path: Path) -> None:
+def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
     # An over-TTL attempt whose is_active() reports True is NEVER reaped — this
     # guards a live detached-factory run whose top-level attempt-dir mtime froze
     # while it works in deep subdirs (the #840 worktree-loss race).
@@ -139,7 +134,7 @@ def test_prune_attempt_worktrees_skips_active(tmp_path: Path) -> None:
     for path in (live, dead):
         os.utime(path, (old_mtime, old_mtime))
 
-    pruned = prune_attempt_worktrees(
+    pruned = prune_attempt_checkouts(
         tmp_path,
         older_than=timedelta(days=3),
         now=now,
@@ -151,7 +146,7 @@ def test_prune_attempt_worktrees_skips_active(tmp_path: Path) -> None:
     assert all("840-1" not in " ".join(c) for c in calls)  # live attempt untouched
 
 
-def test_prune_attempt_worktrees_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:
+def test_prune_attempt_checkouts_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     root = tmp_path / ".worklink" / repo.name
@@ -176,7 +171,7 @@ def test_prune_attempt_worktrees_covers_relocated_isolated_checkouts(tmp_path: P
 
         os.utime(path, (mtime, mtime))
 
-    pruned = prune_attempt_worktrees(repo, older_than=timedelta(days=3), now=now, runner=runner)
+    pruned = prune_attempt_checkouts(repo, older_than=timedelta(days=3), now=now, runner=runner)
 
     assert pruned == [old]
     assert not old.exists()
@@ -541,102 +536,6 @@ def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> Non
     assert "integration/worklink" not in local_branches
 
 
-def test_create_integration_branch_uses_fresh_origin_base(tmp_path: Path) -> None:
-    origin, repo, stale_sha, fresh_sha = _repo_with_stale_local_main(tmp_path)
-    assert origin.exists()
-    assert _git(repo, "rev-parse", "main") == stale_sha
-
-    lease = create_integration_branch(
-        repo,
-        epic_id=771,
-        base_ref="main",
-        slug="Worktree Integration Branch Ops",
-        epic_branch_prefix="integrated/",
-    )
-
-    assert lease.branch == "integrated/771-worktree-integration-branch-ops"
-    assert lease.path == repo / ".worklink" / "epics" / "771-worktree-integration-branch-ops"
-    assert lease.base_ref == "main"
-    assert lease.local_base == "origin/main"
-    assert _git(lease.path, "branch", "--show-current") == lease.branch
-    assert _git(lease.path, "rev-parse", "HEAD") == fresh_sha
-    assert _git(repo, "rev-parse", "main") == stale_sha
-
-
-def test_create_slice_worktree_starts_at_current_integration_head(tmp_path: Path) -> None:
-    repo = _repo_with_main(tmp_path)
-    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
-    (integration.path / "dep.txt").write_text("dependency\n")
-    _git(integration.path, "add", "dep.txt")
-    _git(integration.path, "commit", "-q", "-m", "dependency")
-    integration_head = _git(integration.path, "rev-parse", "HEAD")
-
-    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
-
-    assert lease.branch == "issue/772-a1"
-    assert lease.base_ref == integration.branch
-    assert lease.local_base == integration_head
-    assert _git(lease.path, "branch", "--show-current") == "issue/772-a1"
-    assert _git(lease.path, "rev-parse", "HEAD") == integration_head
-    assert (lease.path / "dep.txt").read_text() == "dependency\n"
-    assert _git(repo, "branch", "--show-current") == "main"
-
-
-def test_merge_slice_into_integration_records_merge_commit_and_cleans_worktree(
-    tmp_path: Path,
-) -> None:
-    repo = _repo_with_main(tmp_path)
-    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
-    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
-    (lease.path / "slice.txt").write_text("slice\n")
-    _git(lease.path, "add", "slice.txt")
-    _git(lease.path, "commit", "-q", "-m", "slice")
-    slice_head = _git(lease.path, "rev-parse", "HEAD")
-
-    result = merge_slice_into_integration(
-        repo,
-        slice_branch=lease.branch,
-        integration_branch=integration.branch,
-    )
-
-    assert isinstance(result, SliceMergeSuccess)
-    assert result.merge_commit == _git(integration.path, "rev-parse", "HEAD")
-    assert _git(integration.path, "rev-parse", "HEAD^2") == slice_head
-    assert (integration.path / "slice.txt").read_text() == "slice\n"
-    assert not lease.path.exists()
-    assert _git(repo, "branch", "--show-current") == "main"
-
-
-def test_merge_slice_into_integration_returns_conflict_result(tmp_path: Path) -> None:
-    repo = _repo_with_main(tmp_path)
-    integration = create_integration_branch(repo, epic_id=771, base_ref="main")
-    (integration.path / "shared.txt").write_text("integration\n")
-    _git(integration.path, "commit", "-q", "-am", "integration change")
-    integration_head = _git(integration.path, "rev-parse", "HEAD")
-    lease = create_slice_worktree(repo, slice_id=772, integration_branch=integration.branch)
-
-    (integration.path / "shared.txt").write_text("integration again\n")
-    _git(integration.path, "commit", "-q", "-am", "integration conflict side")
-    pre_merge_head = _git(integration.path, "rev-parse", "HEAD")
-
-    (lease.path / "shared.txt").write_text("slice\n")
-    _git(lease.path, "commit", "-q", "-am", "slice conflict side")
-    assert _git(lease.path, "rev-parse", "HEAD^") == integration_head
-
-    result = merge_slice_into_integration(
-        repo,
-        slice_branch=lease.branch,
-        integration_branch=integration.branch,
-    )
-
-    assert isinstance(result, SliceMergeConflict)
-    assert result.slice_branch == lease.branch
-    assert _git(integration.path, "rev-parse", "HEAD") == pre_merge_head
-    assert _git(integration.path, "status", "--short") == ""
-    assert lease.path.exists()
-    assert _git(repo, "branch", "--show-current") == "main"
-
-
 def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path: Path) -> None:
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
@@ -677,9 +576,9 @@ def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
         calls.append(list(args))
         return completed(args, returncode=1 if args[-2:] == ["-D", "issue/517-a1"] else 0)
 
-    lease = WorktreeLease(517, 1, repo, attempt, "issue/517-a1", "main", isolated_checkout=True)
+    lease = CheckoutLease(517, 1, repo, attempt, "issue/517-a1", "main", isolated_checkout=True)
 
-    assert cleanup_worktree(lease, outcome="completed", runner=runner) is True
+    assert cleanup_checkout(lease, outcome="completed", runner=runner) is True
     assert not attempt.exists()
     assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/517-a1"]]
 
@@ -797,7 +696,7 @@ def test_clone_falls_back_to_object_copy_when_hardlinks_are_refused() -> None:
     ``clone --local`` fail outright. The attempt must degrade to an object copy
     rather than dying, and must say so.
     """
-    from mimir.worklink.worktree import _clone_attempt_checkout
+    from mimir.worklink.checkout import _clone_attempt_checkout
 
     calls: list[Sequence[str]] = []
     events: list[tuple[str, dict]] = []
@@ -825,7 +724,7 @@ def test_clone_falls_back_to_object_copy_when_hardlinks_are_refused() -> None:
 def test_clone_does_not_retry_an_unrelated_failure() -> None:
     """A fallback that fires on any error would turn a real fault into 179 MB
     of copying and a confusing success. Only the hardlink error retries."""
-    from mimir.worklink.worktree import _clone_attempt_checkout
+    from mimir.worklink.checkout import _clone_attempt_checkout
 
     calls: list[Sequence[str]] = []
 
@@ -846,7 +745,7 @@ def test_clone_does_not_retry_an_unrelated_failure() -> None:
 
 def test_clone_raises_when_the_object_copy_also_fails() -> None:
     """The fallback is a degradation, not a guarantee; it must still fail loud."""
-    from mimir.worklink.worktree import _clone_attempt_checkout
+    from mimir.worklink.checkout import _clone_attempt_checkout
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if "--no-hardlinks" in args:

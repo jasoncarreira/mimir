@@ -1,7 +1,7 @@
 """Deterministic Worklink orchestration primitives.
 
 Worklink is the Mimir-native Chainlink worker rail: model-backed backends
-may edit a per-issue worktree, but claiming, worktree lifecycle, and evidence
+may edit a per-issue checkout, but claiming, checkout lifecycle, and evidence
 validation live here as plain Python.
 """
 
@@ -36,7 +36,7 @@ from .tool_pins import (
     render_bump_issue_body,
     render_bump_issue_title,
 )
-from .worktree import WorktreeLease
+from .checkout import CheckoutLease
 
 __all__ = [
     "BackendRegistry",
@@ -66,7 +66,7 @@ __all__ = [
     "WorkSpec",
     "WorklinkConfig",
     "WorklinkEvidence",
-    "WorktreeLease",
+    "CheckoutLease",
     "UpstreamVersion",
     "default_tool_pins",
     "inventory_tool_pins",

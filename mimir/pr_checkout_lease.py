@@ -13,7 +13,7 @@ from typing import Callable, Sequence
 import uuid
 
 from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
-from .worklink.worktree import _assert_self_contained_checkout, _clone_attempt_checkout
+from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_checkout
 
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]

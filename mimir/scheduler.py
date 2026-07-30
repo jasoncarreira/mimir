@@ -2343,7 +2343,7 @@ class Scheduler:
         """
         from .worklink.autonomy import (
             close_merged_chainlinks_for_home,
-            prune_stale_attempt_worktrees_for_home,
+            prune_stale_attempt_checkouts_for_home,
             reap_stale_claims_for_home,
         )
 
@@ -2351,7 +2351,7 @@ class Scheduler:
             def _reap() -> tuple[list[object], list[Path], list[object]]:
                 return (
                     reap_stale_claims_for_home(home),
-                    prune_stale_attempt_worktrees_for_home(home),
+                    prune_stale_attempt_checkouts_for_home(home),
                     close_merged_chainlinks_for_home(home),
                 )
 

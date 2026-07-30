@@ -928,7 +928,7 @@ longer hard-codes container paths).
     enforces its own staleness evidence) (#637, #638).
   - Attempt-scoped worktree lifecycle and **observed** evidence: the
     executor itself diffs `base...HEAD` + untracked files and runs the
-    test command anchored to the attempt worktree — backend
+    test command anchored to the attempt checkout — backend
     self-reports are never trusted; `completed` with an empty diff
     demotes to `failed` (#638, #641).
   - Pluggable `ToolBackend` protocol (capability declarations incl.

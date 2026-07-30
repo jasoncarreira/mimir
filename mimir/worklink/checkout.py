@@ -1,4 +1,4 @@
-"""Per-issue git worktree lifecycle for Worklink."""
+"""Per-issue checkout lifecycle for Worklink."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 
 @dataclass(frozen=True)
-class WorktreeLease:
+class CheckoutLease:
     issue_id: int
     attempt: int
     repo: Path
@@ -39,179 +39,6 @@ class WorktreeLease:
     isolated_checkout: bool = False
 
 
-@dataclass(frozen=True)
-class IntegrationBranchLease:
-    epic_id: int
-    repo: Path
-    path: Path
-    branch: str
-    base_ref: str
-    local_base: str
-
-
-@dataclass(frozen=True)
-class SliceMergeSuccess:
-    slice_branch: str
-    integration_branch: str
-    merge_commit: str
-
-
-@dataclass(frozen=True)
-class SliceMergeConflict:
-    slice_branch: str
-    integration_branch: str
-    stdout: str
-    stderr: str
-
-
-SliceMergeResult = SliceMergeSuccess | SliceMergeConflict
-
-
-def create_integration_branch(
-    repo: Path,
-    *,
-    epic_id: int,
-    base_ref: str,
-    slug: str = "integration",
-    epic_branch_prefix: str = "epic/",
-    worklink_dir: str = ".worklink",
-    base_fetch: bool = True,
-    event_logger: EventLogger | None = None,
-    runner: Runner = _default_runner,
-) -> IntegrationBranchLease:
-    """Create one epic integration branch/worktree from ``origin/<base_ref>``."""
-    branch_slug = _branch_slug(slug)
-    branch = f"{epic_branch_prefix}{epic_id}-{branch_slug}"
-    path = repo / worklink_dir / "epics" / f"{epic_id}-{branch_slug}"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    start_point = _prepare_fresh_base(
-        repo,
-        base_ref,
-        base_fetch=base_fetch,
-        runner=runner,
-        event_logger=event_logger,
-    )
-    result = runner(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            branch,
-            str(path),
-            start_point,
-        ]
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
-    return IntegrationBranchLease(
-        epic_id=epic_id,
-        repo=repo,
-        path=path,
-        branch=branch,
-        base_ref=base_ref,
-        local_base=start_point,
-    )
-
-
-def create_slice_worktree(
-    repo: Path,
-    *,
-    slice_id: int,
-    integration_branch: str,
-    worklink_dir: str = ".worklink",
-    runner: Runner = _default_runner,
-) -> WorktreeLease:
-    """Create a slice branch/worktree from the current integration branch HEAD."""
-    attempt = _next_attempt(repo, slice_id, worklink_dir=worklink_dir, runner=runner)
-    path = repo / worklink_dir / f"{slice_id}-{attempt}"
-    branch = f"issue/{slice_id}-a{attempt}"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    head = runner(["git", "-C", str(repo), "rev-parse", "--verify", integration_branch])
-    if head.returncode != 0:
-        raise RuntimeError((head.stderr or head.stdout).strip() or "git rev-parse failed")
-    start_point = head.stdout.strip()
-    result = runner(
-        [
-            "git",
-            "-C",
-            str(repo),
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            branch,
-            str(path),
-            start_point,
-        ]
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
-    return WorktreeLease(
-        issue_id=slice_id,
-        attempt=attempt,
-        repo=repo,
-        path=path,
-        branch=branch,
-        base_ref=integration_branch,
-        local_base=start_point,
-    )
-
-
-def merge_slice_into_integration(
-    repo: Path,
-    *,
-    slice_branch: str,
-    integration_branch: str,
-    runner: Runner = _default_runner,
-) -> SliceMergeResult:
-    """Serially merge ``slice_branch`` into ``integration_branch`` with ``--no-ff``."""
-    with _integration_merge_lock(repo, integration_branch, runner=runner):
-        integration_path = _worktree_path_for_branch(
-            repo, integration_branch, runner=runner
-        ) or repo
-        current = runner(["git", "-C", str(integration_path), "branch", "--show-current"])
-        if current.returncode != 0:
-            raise RuntimeError((current.stderr or current.stdout).strip() or "git branch failed")
-        if current.stdout.strip() != integration_branch:
-            raise RuntimeError(f"integration branch is not checked out: {integration_branch}")
-
-        merge = runner(
-            [
-                "git",
-                "-C",
-                str(integration_path),
-                "merge",
-                "--no-ff",
-                "--no-edit",
-                slice_branch,
-            ]
-        )
-        if merge.returncode != 0:
-            abort = runner(["git", "-C", str(integration_path), "merge", "--abort"])
-            if abort.returncode not in (0, 128):
-                raise RuntimeError((abort.stderr or abort.stdout).strip() or "git merge abort failed")
-            return SliceMergeConflict(
-                slice_branch=slice_branch,
-                integration_branch=integration_branch,
-                stdout=merge.stdout,
-                stderr=merge.stderr,
-            )
-
-        commit = runner(["git", "-C", str(integration_path), "rev-parse", "HEAD"])
-        if commit.returncode != 0:
-            raise RuntimeError((commit.stderr or commit.stdout).strip() or "git rev-parse failed")
-        _cleanup_slice_worktree(repo, slice_branch, runner=runner)
-        return SliceMergeSuccess(
-            slice_branch=slice_branch,
-            integration_branch=integration_branch,
-            merge_commit=commit.stdout.strip(),
-        )
-
-
 def create_worktree(
     repo: Path,
     *,
@@ -222,7 +49,7 @@ def create_worktree(
     base_fetch: bool = True,
     event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
-) -> WorktreeLease:
+) -> CheckoutLease:
     """Create an attempt-scoped branch/worktree from a fresh base ref."""
     path = repo / worklink_dir / f"{issue_id}-{attempt}"
     branch = f"issue/{issue_id}-a{attempt}"
@@ -255,7 +82,7 @@ def create_worktree(
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
-    return WorktreeLease(
+    return CheckoutLease(
         issue_id=issue_id,
         attempt=attempt,
         repo=repo,
@@ -337,7 +164,7 @@ def create_isolated_checkout(
     base_fetch: bool = True,
     event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
-) -> WorktreeLease:
+) -> CheckoutLease:
     """Create an attempt-scoped local clone with its own ``.git`` directory.
 
     Some coding CLIs inspect git metadata instead of honoring their process cwd.
@@ -393,7 +220,7 @@ def create_isolated_checkout(
         shutil.rmtree(path, ignore_errors=True)
         raise
 
-    return WorktreeLease(
+    return CheckoutLease(
         issue_id=issue_id,
         attempt=attempt,
         repo=repo,
@@ -804,37 +631,6 @@ def _strip_for_event(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _branch_slug(value: str) -> str:
-    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value.strip())
-    slug = "-".join(part for part in slug.split("-") if part)
-    return slug or "integration"
-
-
-def _next_attempt(repo: Path, slice_id: int, *, worklink_dir: str, runner: Runner) -> int:
-    attempt = 1
-    while True:
-        branch = f"refs/heads/issue/{slice_id}-a{attempt}"
-        path = repo / worklink_dir / f"{slice_id}-{attempt}"
-        exists = runner(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", branch])
-        if exists.returncode != 0 and not path.exists():
-            return attempt
-        attempt += 1
-
-
-def _integration_merge_lock(repo: Path, integration_branch: str, *, runner: Runner):
-    common_dir = runner(["git", "-C", str(repo), "rev-parse", "--git-common-dir"])
-    if common_dir.returncode == 0 and common_dir.stdout.strip():
-        lock_root = Path(common_dir.stdout.strip())
-        if not lock_root.is_absolute():
-            lock_root = repo / lock_root
-    else:
-        lock_root = repo / ".git"
-    lock_dir = lock_root / "worklink-integration-locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_dir / _branch_slug(integration_branch)
-    return _FileLock(lock_file)
-
-
 class _FileLock:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -849,30 +645,6 @@ class _FileLock:
             return
         fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
         self._handle.close()
-
-
-def _worktree_path_for_branch(repo: Path, branch: str, *, runner: Runner) -> Path | None:
-    result = runner(["git", "-C", str(repo), "worktree", "list", "--porcelain"])
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree list failed")
-    path: Path | None = None
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            path = Path(line.removeprefix("worktree "))
-        elif line == f"branch refs/heads/{branch}" and path is not None:
-            return path
-        elif not line:
-            path = None
-    return None
-
-
-def _cleanup_slice_worktree(repo: Path, slice_branch: str, *, runner: Runner) -> None:
-    path = _worktree_path_for_branch(repo, slice_branch, runner=runner)
-    if path is None:
-        return
-    result = runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(path)])
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree remove failed")
 
 
 def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attempt: int) -> Path:
@@ -915,7 +687,7 @@ def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
         )
 
 
-def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
+def cleanup_checkout(lease: CheckoutLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
     """Remove successful attempt checkouts; retain failed/blocked attempts for autopsy."""
     if outcome != "completed":
         return False
@@ -934,7 +706,7 @@ def cleanup_worktree(lease: WorktreeLease, *, outcome: str, runner: Runner = _de
     return True
 
 
-def prune_attempt_worktrees(
+def prune_attempt_checkouts(
     repo: Path,
     *,
     older_than: timedelta,
