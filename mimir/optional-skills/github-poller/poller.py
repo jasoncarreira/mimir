@@ -394,6 +394,60 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
 }
 
 
+#: Mimir's canonical env-boolean alphabet, mirroring ``_ENV_BOOL_TRUTHY`` /
+#: ``_ENV_BOOL_FALSY`` in ``mimir/config.py``. It is duplicated rather than
+#: imported because this poller must run under an interpreter that cannot import
+#: ``mimir`` at all (see tests/test_optional_skill_poller_entrypoints.py). A
+#: duplicated parser is exactly the kind of second copy that drifts, so
+#: tests/test_github_poller_prompt.py compares both sets against
+#: ``mimir.config`` whenever it IS importable and fails if they diverge.
+_ENV_TRUTHY = frozenset({"1", "true", "yes", "on", "y"})
+_ENV_FALSY = frozenset({"0", "false", "no", "off", "n"})
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read one env var with Mimir's canonical boolean semantics.
+
+    Unset, empty, and unrecognised values all return *default*, matching
+    ``config._env_bool`` so a typo cannot silently flip the flag.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _ENV_TRUTHY:
+        return True
+    if normalized in _ENV_FALSY:
+        return False
+    return default
+
+
+def _verification_guidance() -> str:
+    """How a remediation turn should verify its fix, given this deployment.
+
+    ``repo_test`` is only registered when ``MIMIR_CODING_ENABLED`` is true, and
+    that setting defaults to false (``mimir/config.py`` ``coding_enabled``), so
+    naming the tool unconditionally would point a default deployment at
+    something it does not have. Selector wording stays runner-neutral for the
+    same reason: ``project_tests`` passes ``path::node_id`` through to whatever
+    runner ``worklink.yaml`` configures, and only pytest-style runners accept
+    that form.
+    """
+    if not _env_flag("MIMIR_CODING_ENABLED"):
+        return (
+            "verify the fix with whatever this deployment provides, and do not "
+            "present changes as verified if you could not run its tests — say "
+            "plainly what you were unable to check"
+        )
+    return (
+        "verify with the repo_test tool, which runs the deployment's own "
+        "configured test command. Selectors are repo-relative paths that must "
+        "already exist and must not be symlinks, and carry no flags; "
+        "`path::node_id` works only when the configured runner accepts that "
+        "form, so prefer plain paths — or omit selectors to run the whole suite"
+    )
+
+
 def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> str:
     """Load and return the review skill's SKILL.md body for inlining.
 
@@ -465,8 +519,7 @@ def _emit(prompt: str, **extras: object) -> None:
         if isinstance(related_comment, str) and related_comment:
             prompt = f"{prompt}\n\nRelated PR comment:\n{related_comment}"
         prompt = prompt + _REVIEW_SUBMISSION_RULE
-        preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()
-        if preload in ("1", "true", "yes"):
+        if _env_flag("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL"):
             body = _load_review_skill_body(
                 os.environ.get("MIMIR_HOME", ""),
                 os.environ.get("MIMIR_GITHUB_REVIEW_SKILL_PATH", ""),
@@ -1549,7 +1602,8 @@ def _check_own_changes_requested(
             f"{title}\n"
             f"{reviewers} requested changes and no commits have landed "
             f"since (head {head_sha[:8]}). Address the review feedback, "
-            f"push the fixes, and re-request review.\n{url}"
+            f"{_verification_guidance()}, push the fixes, and re-request "
+            f"review.\n{url}"
         )
         _emit(
             prompt,
