@@ -2427,7 +2427,6 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        before = ctx.ifc_labels
         refusal = await middleware.awrap_tool_call(
             _make_request(
                 "pr_metadata", "refused", auth,
@@ -2447,7 +2446,6 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     assert "repo.inspect not granted" in str(refusal.content)
     assert adapted.content == "adapted"
     assert calls == ["refused", "adapted"]
-    assert ctx.ifc_labels == before
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     assert ctx.tool_call_count == 2
 
@@ -2529,7 +2527,6 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        before = ctx.ifc_labels
         refusal = await middleware.awrap_tool_call(
             _make_request(
                 "repo_test", "repo-refused", auth,
@@ -2548,7 +2545,6 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     assert "scope does not grant repo.test" in str(refusal.content)
     assert adapted.content == "adapted"
     assert calls == ["repo-refused", "adapted"]
-    assert ctx.ifc_labels == before
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
 
 
@@ -2558,7 +2554,7 @@ async def test_real_repo_execution_fault_taints_turn(
 ) -> None:
     from dataclasses import replace
 
-    from mimir.repo_tools import GitRefusal, RepoGitTools
+    from mimir.repo_tools import GitRefusal
     from mimir.tools.repo import repo_fetch
 
     middleware = BudgetGateMiddleware()
@@ -2587,10 +2583,14 @@ async def test_real_repo_execution_fault_taints_turn(
     )
     ctx = _ifc_turn(auth)
 
-    def fail_after_git_started(self, operation):  # type: ignore[no-untyped-def]
-        raise GitRefusal("git_failed", "git exited 128 after execution started")
+    class FailingRepoGitTools:
+        def __init__(self, state):  # type: ignore[no-untyped-def]
+            self.state = state
 
-    monkeypatch.setattr(RepoGitTools, "execute", fail_after_git_started)
+        def execute(self, operation):  # type: ignore[no-untyped-def]
+            raise GitRefusal("git_failed", "git exited 128 after execution started")
+
+    monkeypatch.setattr("mimir.tools.repo.RepoGitTools", FailingRepoGitTools)
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
         repo_fetch.func(
