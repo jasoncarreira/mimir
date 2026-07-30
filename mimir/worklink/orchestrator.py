@@ -540,6 +540,7 @@ class WorklinkRunner:
                 compute_result = await backend.invoke_with_startup_retry(
                     invoke_backend,
                     issue_id=issue.issue_id,
+                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner),
                     event_logger=_log_event,
                 )
             else:
@@ -2277,6 +2278,20 @@ def _dirty_paths(repo: Path, *, runner: Runner) -> list[str]:
     if status.returncode != 0:
         return []
     return _paths_from_status(status.stdout)
+
+
+def _checkout_snapshot(checkout: Path, *, runner: Runner) -> tuple[str, str]:
+    """Capture committed and working state so startup retry never repeats work."""
+    head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    status = runner([
+        "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
+    ])
+    if head.returncode != 0 or status.returncode != 0:
+        raise WorklinkError(
+            (head.stderr or status.stderr or head.stdout or status.stdout).strip()
+            or "could not snapshot Worklink checkout"
+        )
+    return head.stdout.strip(), status.stdout
 
 
 def _new_dirty_paths(paths: Sequence[str], *, before: Sequence[str]) -> list[str]:

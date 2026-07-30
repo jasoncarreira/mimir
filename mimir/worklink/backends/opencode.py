@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import time
 from typing import Awaitable, Callable, Sequence
 
 from ...config import model_spec_at_call_time
@@ -25,6 +26,7 @@ _INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
 # a genuinely stuck session store to a short delay.
 STARTUP_CONTENTION_MAX_ATTEMPTS = 5
 STARTUP_CONTENTION_INITIAL_BACKOFF_S = 0.1
+STARTUP_CONTENTION_WINDOW_S = 5.0
 STARTUP_CONTENTION_RESOURCE = "opencode_sqlite_session_store"
 STARTUP_CONTENTION_EXHAUSTED_REASON = "opencode_startup_sqlite_contention_exhausted"
 _SQLITE_CONTENTION_PATTERNS = (
@@ -36,6 +38,8 @@ log = logging.getLogger(__name__)
 
 EventLogger = Callable[..., None]
 Sleeper = Callable[[float], Awaitable[None]]
+CheckoutSnapshot = Callable[[], object]
+Clock = Callable[[], float]
 
 
 @dataclass(frozen=True)
@@ -134,19 +138,31 @@ class OpenCodeBackend:
         invoke: Callable[[], Awaitable[ComputeResult]],
         *,
         issue_id: int,
+        checkout_snapshot: CheckoutSnapshot,
         event_logger: EventLogger | None = None,
         max_attempts: int = STARTUP_CONTENTION_MAX_ATTEMPTS,
         initial_backoff_s: float = STARTUP_CONTENTION_INITIAL_BACKOFF_S,
+        startup_window_s: float = STARTUP_CONTENTION_WINDOW_S,
         sleeper: Sleeper = asyncio.sleep,
+        clock: Clock = time.monotonic,
     ) -> ComputeResult:
-        """Retry only transient SQLite contention reported by OpenCode startup."""
+        """Retry transient SQLite contention only before the run can mutate work."""
         max_attempts = max(1, max_attempts)
         initial_backoff_s = max(0.0, initial_backoff_s)
+        startup_window_s = max(0.0, startup_window_s)
+        initial_checkout = checkout_snapshot()
         result: ComputeResult | None = None
         for attempt in range(1, max_attempts + 1):
+            invoked_at = clock()
             result = await invoke()
-            if not _is_sqlite_contention(result):
-                if attempt > 1:
+            elapsed_s = max(0.0, clock() - invoked_at)
+            retryable = (
+                _is_sqlite_contention(result)
+                and elapsed_s <= startup_window_s
+                and checkout_snapshot() == initial_checkout
+            )
+            if not retryable:
+                if attempt > 1 and result.exit_code == 0:
                     _emit_startup_contention(
                         event_logger, issue_id, attempt, max_attempts, "succeeded"
                     )
@@ -223,8 +239,7 @@ class OpenCodeBackend:
 def _is_sqlite_contention(result: ComputeResult) -> bool:
     if result.exit_code == 0:
         return False
-    detail = f"{result.stderr}\n{result.stdout}"
-    return any(pattern.search(detail) for pattern in _SQLITE_CONTENTION_PATTERNS)
+    return any(pattern.search(result.stderr) for pattern in _SQLITE_CONTENTION_PATTERNS)
 
 
 def _emit_startup_contention(

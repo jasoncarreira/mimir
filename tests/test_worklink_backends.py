@@ -635,6 +635,7 @@ async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
     result = await OpenCodeBackend().invoke_with_startup_retry(
         invoke,
         issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
         event_logger=lambda event, **payload: events.append((event, payload)),
         sleeper=sleep,
     )
@@ -673,6 +674,7 @@ async def test_opencode_persistent_sqlite_contention_exhausts_with_named_reason(
     result = await backend.invoke_with_startup_retry(
         invoke,
         issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
         event_logger=lambda _event, **payload: events.append(payload),
         sleeper=sleep,
     )
@@ -711,10 +713,89 @@ async def test_opencode_non_transient_startup_failure_is_not_retried() -> None:
     result = await OpenCodeBackend().invoke_with_startup_retry(
         invoke,
         issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
         sleeper=sleep,
     )
 
     assert result.stderr == "configuration file is invalid"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_late_sqlite_failure_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    times = iter((10.0, 16.0))
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "work performed", "SqliteError: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        sleeper=sleep,
+        clock=lambda: next(times),
+    )
+
+    assert result.stderr == "SqliteError: database is locked"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_sqlite_failure_after_checkout_mutation_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    snapshots = iter((("head", ""), ("head", " M changed.py")))
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "SqliteError: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: next(snapshots),
+        sleeper=sleep,
+    )
+
+    assert result.stderr == "SqliteError: database is locked"
+    assert attempts == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_opencode_stdout_only_sqlite_mention_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "recovered from database is locked", "other failure")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        checkout_snapshot=lambda: ("head", ""),
+        sleeper=sleep,
+    )
+
+    assert result.stdout == "recovered from database is locked"
     assert attempts == 1
     assert sleeps == []
 
