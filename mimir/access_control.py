@@ -3172,6 +3172,107 @@ def _live_untrusted_active_ingest(
     return result if isinstance(result, bool) else None
 
 
+def _source_is_triggering_channel_compatible(
+    source: Any,
+    *,
+    effective_principal: str,
+    domain: str,
+    bridge_instance: str,
+    resolved_triggering: str,
+) -> bool:
+    """Return whether one IFC source may flow to the triggering channel."""
+    if not getattr(source, "is_complete", False):
+        return False
+    # Fresh protected-result sources include the authenticated reader by
+    # construction; inherited or externally supplied labels do not, so keep
+    # this check as the fail-closed guard for those paths.
+    if effective_principal not in source.authorized_principals:
+        return False
+    source_kind = getattr(source, "source_kind", "channel")
+    if source_kind == "channel":
+        return (
+            source.principal == effective_principal
+            and source.domain == domain
+            and source.bridge_instance == bridge_instance
+            and ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    if source_kind == "service":
+        # Trusted service/derived data retains its input ACL. It may return only
+        # to the triggering channel when its channel provenance matches.
+        return not source.domain.startswith("channel") or (
+            source.bridge_instance == bridge_instance
+            and ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    if source_kind == "protected_prompt":
+        # Framework-authored prompt blocks are trusted at their server-side
+        # loader; other prompt provenance must belong to this channel.
+        return (
+            source.integrity == "trusted"
+            or ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    return source_kind == "protected_tool"
+
+
+def _ifc_blocking_source(
+    ifc_labels: Any,
+    auth_context: Any,
+    sink_category: SinkCategory,
+) -> tuple[Any | None, str]:
+    """Classify one source for an IFC refusal and the certainty of the match."""
+    from .models import InformationFlowLabels, Integrity, IntegrityEffect
+
+    current = ifc_labels
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if callable(get_current):
+        candidate = get_current(ifc_labels)
+        if isinstance(candidate, InformationFlowLabels):
+            current = candidate
+    if not isinstance(current, InformationFlowLabels):
+        raise TypeError("IFC source classifier received invalid labels")
+    if not current.sources:
+        return None, "no_sources"
+
+    if sink_category is SinkCategory.SAME_CHANNEL:
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            getattr(auth_context, "channel_id", None)
+        )
+        service = get_trusted_service_from_auth_context(auth_context)
+        effective_principal = (
+            f"service:{service.canonical}"
+            if service is not None
+            else getattr(auth_context, "canonical_principal", None)
+        )
+        domain = getattr(auth_context, "domain", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        if all((effective_principal, domain, bridge_instance, resolved_triggering)):
+            for source in current.sources:
+                if not _source_is_triggering_channel_compatible(
+                    source,
+                    effective_principal=effective_principal,
+                    domain=domain,
+                    bridge_instance=bridge_instance,
+                    resolved_triggering=resolved_triggering,
+                ):
+                    return source, "causing_source"
+
+    # This predicate is itself the gate for application egress and disables the
+    # trusted-operator exemptions for shell, file, spawn, and channel sinks.
+    for source in current.sources:
+        if (
+            source.integrity == Integrity.UNTRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        ):
+            return source, "causing_source"
+
+    # The remaining gate rules evaluate the labels as a set. Preserve a bounded
+    # example without claiming that tuple order identifies the cause.
+    return current.sources[0], "representative_source"
+
+
 def _fixed_web_search_url() -> str | None:
     from .tools.web_search_destination import web_search_url
 
@@ -3855,43 +3956,13 @@ class SinkGate:
             return frozenset()
 
         for source in sources:
-            if not getattr(source, "is_complete", False):
-                return frozenset()
-            # Fresh protected-result sources include the authenticated reader by
-            # construction; inherited or externally supplied labels do not, so
-            # keep this check as the fail-closed guard for those paths.
-            if effective_principal not in source.authorized_principals:
-                return frozenset()
-            source_kind = getattr(source, "source_kind", "channel")
-            if source_kind == "channel":
-                if source.principal != effective_principal:
-                    return frozenset()
-                if source.domain != domain or source.bridge_instance != bridge_instance:
-                    return frozenset()
-                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
-                    return frozenset()
-            elif source_kind == "service":
-                # Trusted service/derived data retains its input ACL. It may
-                # return only to the triggering channel when the effective
-                # destination principal remains in that intersection.
-                if source.domain.startswith("channel"):
-                    if source.bridge_instance != bridge_instance:
-                        return frozenset()
-                    if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
-                        return frozenset()
-            elif source_kind == "protected_prompt":
-                # Framework-authored prompt blocks are marked trusted at their
-                # server-side loader; model output cannot set this provenance.
-                source_is_trusted_self_authored = source.integrity == "trusted"
-                if (
-                    not source_is_trusted_self_authored
-                    and ChannelResourceAdapter._resolve_channel(source.resource_id)
-                    != resolved_triggering
-                ):
-                    return frozenset()
-            elif source_kind != "protected_tool":
-                # Other derived/tool sources require their own destination adapter;
-                # an ACL alone must not silently widen arbitrary provenance kinds.
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                domain=domain,
+                bridge_instance=bridge_instance,
+                resolved_triggering=resolved_triggering,
+            ):
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
             return frozenset()
@@ -5069,6 +5140,8 @@ class ToolRegistry:
         target: str | None = None,
         requested_target: Any = None,
         arguments: dict[str, Any] | None = None,
+        ifc_labels: Any = None,
+        sink_category: SinkCategory | None = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -5113,6 +5186,33 @@ class ToolRegistry:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
+
+            if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
+                try:
+                    if sink_category is None:
+                        raise ValueError("IFC sink category was not supplied by gate")
+                    source, scope = _ifc_blocking_source(
+                        ifc_labels,
+                        auth_context,
+                        sink_category,
+                    )
+                    fields["ifc_source_scope"] = scope
+                    if source is not None:
+                        resource_id = redact_payload(source.resource_id)
+                        fields["ifc_source"] = {
+                            "source_kind": source.source_kind,
+                            "domain": source.domain,
+                            "integrity": source.integrity,
+                            "integrity_effect": source.integrity_effect,
+                            "resource_id": (
+                                str(resource_id)[:_MAX_REQUESTED_TARGET_LENGTH]
+                                if resource_id is not None else None
+                            ),
+                        }
+                except Exception as exc:
+                    # Diagnostics are best-effort and cannot affect authorization.
+                    fields["ifc_source_scope"] = "classification_failed"
+                    log.warning("IFC source audit classification failed: %s", exc)
 
             fields.update({
                 # Shadow decisions cover both compatibility bypasses and trusted
@@ -5162,6 +5262,8 @@ class ToolRegistry:
         checks (chainlink #871).
         """
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
+            if ifc_labels is None and auth_context is not None:
+                ifc_labels = getattr(auth_context, "ifc_labels", None)
             auth = MCPResourceAdapter.authorize_call(
                 tool_name,
                 mcp_tool,
@@ -5174,6 +5276,8 @@ class ToolRegistry:
                 self._emit_shadow_decision(
                     auth, auth_context=auth_context, target=target_channel,
                     requested_target=target_channel,
+                    ifc_labels=ifc_labels,
+                    sink_category=SinkCategory.EXTERNAL_MCP,
                 )
             return auth
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
@@ -5275,6 +5379,8 @@ class ToolRegistry:
                 self._emit_shadow_decision(
                     sink_check, auth_context=auth_context, target=sink_target,
                     requested_target=target_channel,
+                    ifc_labels=ifc_labels,
+                    sink_category=sink_category,
                 )
 
         decision = preliminary_decision

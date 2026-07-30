@@ -3254,6 +3254,237 @@ async def test_admin_required_shadow_denial_marks_targetless_request_explicitly(
     assert captured[0]["requested_target"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "target", "reason"),
+    [
+        ("shell_exec", "printf test", "ifc_label_blocked:shell_process"),
+        ("write_file", "/tmp/result.txt", "ifc_label_blocked:file"),
+        ("send_message", "slack-C1", "ifc_label_blocked:same_channel"),
+        ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn"),
+    ],
+)
+async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
+    tool_name: str,
+    target: str,
+    reason: str,
+) -> None:
+    compatible = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), source_kind="channel",
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    causing = SourceLabel(
+        principal="activity", domain="recent_activity",
+        resource_id="slack-C2?token=secret-value&padding=" + "x" * 1200,
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="protected_prompt", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(compatible).with_source(causing)
+    auth = replace(
+        _write_auth(),
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        shadow = registry.authorize_tool(
+            tool_name, auth, enforce=False, target_channel=target, ifc_labels=labels,
+        )
+        await asyncio.sleep(0)
+
+    events = [event for event in captured if event["reason"] == reason]
+    assert len(events) == 1
+    event = events[0]
+    assert event["ifc_source_scope"] == "causing_source"
+    assert event["ifc_source"] == {
+        "source_kind": "protected_prompt",
+        "domain": "recent_activity",
+        "integrity": "untrusted",
+        "integrity_effect": "active_ingest",
+        "resource_id": (
+            "slack-C2?token=[REDACTED]&padding=" + "x" * 1200
+        )[:1024],
+    }
+    assert "secret-value" not in repr(event)
+    assert len(event["ifc_source"]["resource_id"]) == 1024
+    assert shadow.allowed is True
+    shadow_sink = SinkGate.check_sink_flow(
+        tool_name, target, labels, auth, enforce=False,
+    )
+    enforced_sink = SinkGate.check_sink_flow(
+        tool_name, target, labels, auth, enforce=True,
+    )
+    assert shadow_sink.allowed is True
+    assert enforced_sink.allowed is False
+    assert shadow_sink.reason == enforced_sink.reason == reason
+
+
+@pytest.mark.asyncio
+async def test_same_channel_event_selects_incompatible_source_not_first_source() -> None:
+    compatible = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), source_kind="channel",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    incompatible = replace(
+        compatible,
+        principal="mallory",
+        resource_id="slack-C2",
+        integrity="untrusted",
+    )
+    labels = InformationFlowLabels().with_source(compatible).with_source(incompatible)
+    auth = replace(
+        _write_auth(), domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", ifc_labels=labels,
+    )
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry.authorize_tool(
+            "send_message", auth, enforce=False, target_channel="slack-C1",
+            ifc_labels=labels,
+        )
+        await asyncio.sleep(0)
+
+    event = next(
+        item for item in captured
+        if item["reason"] == "ifc_label_blocked:same_channel"
+    )
+    assert event["ifc_source_scope"] == "causing_source"
+    assert event["ifc_source"]["resource_id"] == "slack-C2"
+
+
+@pytest.mark.asyncio
+async def test_ifc_shadow_denial_marks_sourceless_labels_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "MIMIR_EGRESS_APPROVED_URLS", "https://example.invalid/hook",
+    )
+    labels = InformationFlowLabels(labels=frozenset({"private"}))
+    auth = replace(_write_auth(), ifc_labels=labels)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry.authorize_tool(
+            "http_request", auth, enforce=False,
+            target_channel="https://example.invalid/hook", ifc_labels=labels,
+        )
+        await asyncio.sleep(0)
+
+    event = next(
+        item for item in captured
+        if item["reason"] == "ifc_label_blocked:http_webhook"
+    )
+    assert event["ifc_source_scope"] == "no_sources"
+    assert "ifc_source" not in event
+
+
+@pytest.mark.asyncio
+async def test_ifc_shadow_denial_labels_fallback_as_representative() -> None:
+    source = SourceLabel(
+        principal="alice", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), source_kind="channel",
+        integrity="trusted", integrity_effect="informational",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(_write_auth(), ifc_labels=labels)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry.authorize_tool(
+            "write_file", auth, enforce=False,
+            target_channel="/tmp/result.txt", ifc_labels=labels,
+        )
+        await asyncio.sleep(0)
+
+    event = next(
+        item for item in captured
+        if item["reason"] == "ifc_label_blocked:file"
+    )
+    assert event["ifc_source_scope"] == "representative_source"
+    assert event["ifc_source"]["resource_id"] == "slack-C1"
+
+
+@pytest.mark.asyncio
+async def test_ifc_source_recording_failure_cannot_change_live_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = SourceLabel(
+        principal="activity", domain="recent_activity", resource_id="slack-C2",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="protected_prompt", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(_write_auth(), ifc_labels=labels)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[dict[str, object]] = []
+
+    async def capture(_kind: str, **fields: object) -> None:
+        captured.append(fields)
+
+    monkeypatch.setattr(
+        access_control,
+        "_ifc_blocking_source",
+        lambda *_args: (_ for _ in ()).throw(ValueError("audit failed")),
+    )
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+
+    shadow = registry.authorize_tool(
+        "send_message", auth, enforce=False, target_channel="slack-C1",
+        ifc_labels=labels,
+    )
+    enforced = registry.authorize_tool(
+        "send_message", auth, enforce=True, target_channel="slack-C1",
+        ifc_labels=labels,
+    )
+    await asyncio.sleep(0)
+
+    assert shadow.allowed is True
+    assert shadow.reason == "same_scope_channel"
+    assert captured[0]["reason"] == enforced.reason == "ifc_label_blocked:same_channel"
+    assert captured[0]["ifc_source_scope"] == "classification_failed"
+    assert "ifc_source" not in captured[0]
+    assert enforced.allowed is False
+
+
 def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
     service = get_service_principal("scheduled_tick")
     assert service is not None
