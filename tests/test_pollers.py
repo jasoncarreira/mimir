@@ -458,7 +458,10 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         )
         for target in home_protected_targets:
             read_result = backend.read(str(target))
-            assert read_result.error == "Read denied: protected file", target
+            assert read_result.error == (
+                "Read denied: protected_read_target. For published PR content, "
+                "use pr_files or pr_diff."
+            ), target
     finally:
         reset_current_turn(token)
     assert len(hard_denials) == len(home_protected_targets)

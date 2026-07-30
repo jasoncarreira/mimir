@@ -342,8 +342,55 @@ def file_contains_secret(path: Path) -> bool:
     return text_contains_secret(text, path=path)
 
 
+def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
+    """Allow published content only in the service turn's exact active PR lease."""
+    from ._context import get_current_turn
+    from .models import RepoPRActionScope, RepoReviewState
+    from .pr_checkout_lease import PRCheckoutLease
+    from .repo_tools import GitRefusal, RepoGitTools
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    state = getattr(auth_context, "repo_review_state", None)
+    scope = getattr(auth_context, "repo_pr_action_scope", None)
+    if (
+        not getattr(auth_context, "is_service", False)
+        or not isinstance(state, RepoReviewState)
+        or not isinstance(scope, RepoPRActionScope)
+        or state.action_scope is not scope
+        or state.checkout_lease is None
+        or not isinstance(state.checkout_lease, PRCheckoutLease)
+    ):
+        return False
+
+    lease = state.checkout_lease
+    if (
+        lease.scope_id != scope.scope_id
+        or lease.owner != scope.principal
+        or not lease.is_active
+    ):
+        return False
+    try:
+        lease_root = Path(lease.lease_root).resolve(strict=True)
+        checkout = Path(lease.path).resolve(strict=True)
+        if checkout.parent != lease_root or checkout == lease_root:
+            return False
+        if not path.is_absolute() or path.is_symlink():
+            return False
+        path.relative_to(checkout)
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(checkout):
+            return False
+        return RepoGitTools(state).is_tracked_file(path)
+    except (GitRefusal, OSError, RuntimeError, ValueError):
+        return False
+
+
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
-    """Check a result at its read boundary without re-reading supplied text."""
+    """Check a result, exempting only published files in an authorized PR lease.
+
+    Git index membership is the publication proof. Untracked and ignored files
+    remain protected, as do protected path names even when they are tracked.
+    """
     if is_large_tool_results_path(path):
         return False
     service_scoped = is_current_service_scoped_read_path(path)
@@ -352,9 +399,12 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
         or is_current_service_protected_read_path(path)
     ):
         return True
-    if text is not None:
-        return text_contains_secret(text, path=path)
-    return path.is_file() and file_contains_secret(path)
+    contains_protected_content = (
+        text_contains_secret(text, path=path)
+        if text is not None
+        else path.is_file() and file_contains_secret(path)
+    )
+    return contains_protected_content and not is_tracked_file_in_current_pr_lease(path)
 
 
 def configured_non_admin_read_roots() -> tuple[Path, ...]:
