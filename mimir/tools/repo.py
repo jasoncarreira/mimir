@@ -83,8 +83,13 @@ def _execute(
     operation: Any,
 ) -> dict[str, Any]:
     try:
+        state = _state(runtime, repository, pull_request)
+        context = getattr(runtime, "context", None) if runtime is not None else None
         return asdict(
-            RepoGitTools(_state(runtime, repository, pull_request)).execute(operation)
+            RepoGitTools(
+                state,
+                enforce=bool(getattr(context, "enforcement_enabled", False)),
+            ).execute(operation)
         )
     except (GitRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "repository_operation_failed")

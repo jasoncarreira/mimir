@@ -5067,17 +5067,22 @@ def authorize_repo_pr_tool(
     service_principal: ServicePrincipal | None,
     enforce: bool,
     flow_direction: ToolFlowDirection,
+    required_actions: tuple[str, ...] | None = None,
 ) -> ToolAuthorization:
     """Make the sole policy decision for one typed PR/repository action."""
     if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS:
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
-    required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
+    report_required_actions = required_actions is not None
+    if required_actions is None:
+        required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
+        required_actions = () if required_action is None else (required_action,)
+    granted_actions = getattr(scope, "allowed_operations", frozenset())
+    missing_actions = tuple(
+        action for action in required_actions if action not in granted_actions
+    )
     in_scope = (
         scope is not None
-        and (
-            required_action is None
-            or required_action in getattr(scope, "allowed_operations", frozenset())
-        )
+        and not missing_actions
     )
     return ToolAuthorization(
         tool_name=tool_name,
@@ -5089,6 +5094,11 @@ def authorize_repo_pr_tool(
         enforcement_enabled=enforce,
         is_shadow_decision=not enforce and not in_scope,
         would_block=not in_scope,
+        refusal_detail=(
+            f"scope does not grant {', '.join(missing_actions)}"
+            if report_required_actions and missing_actions
+            else None
+        ),
         flow_direction=flow_direction,
         repo_pr_action_scope=scope,
     )
