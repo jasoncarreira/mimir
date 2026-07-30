@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import pytest
 import asyncio
@@ -472,6 +473,54 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
+    _reset_logger_for_tests()
+
+
+def test_executor_crash_records_model_and_stderr_without_running_gate(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink-crash")
+    repo = tmp_path / "repo"
+    worktree = repo / ".worklink" / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree, files_stdout="")
+
+    class CrashBackend(FakeBackend):
+        def work_spec(self, *args: Any, **kwargs: Any) -> WorkSpec:
+            spec = super().work_spec(*args, **kwargs)
+            return replace(spec, backend_config={"model": "openai/gpt-5.6-sol"})
+
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            return RawResult(
+                1,
+                order.transcript_root / "opencode-crash.json",
+                "failed",
+                "j.split is not a function",
+            )
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(CrashBackend(write_change=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "j.split is not a function"
+    assert "echo ok" not in calls
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["model"] == "openai/gpt-5.6-sol"
+    assert evidence["failure_reason"] == "j.split is not a function"
+    assert evidence["tests"]["skipped_reason"] == "executor exited nonzero before the test gate"
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    evidence_event = next(record for record in records if record["type"] == "worklink_evidence")
+    assert evidence_event["model"] == "openai/gpt-5.6-sol"
+    assert evidence_event["failure_reason"] == "j.split is not a function"
     _reset_logger_for_tests()
 
 

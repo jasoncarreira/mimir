@@ -73,7 +73,7 @@ routes:
 backends:
   opencode:
     bin: /opt/bin/opencode
-    args: [--model, openai/gpt-5.6-sol]
+    args: [--verbose]
   feature_factory:
     bin: /opt/bin/feature-factory
     args: [--verbose]
@@ -96,7 +96,7 @@ backends:
     opencode = registry.get("opencode")
     assert isinstance(opencode, OpenCodeBackend)
     assert opencode.bin == "/opt/bin/opencode"
-    assert opencode.extra_args == ("--model", "openai/gpt-5.6-sol")
+    assert opencode.extra_args == ("--verbose",)
     feature_factory = registry.get("feature_factory")
     assert isinstance(feature_factory, FeatureFactoryBackend)
     assert feature_factory.bin == "/opt/bin/feature-factory"
@@ -636,6 +636,9 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         "opencode", "run", "--dir", str(order.worktree),
         "-m", "openai/gpt-5.6-luna", "--", "-starts with dash"
     )
+    assert calls[0]["args"].count("-m") == 1
+    assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
+    assert spec.backend_config["model_diverged"] is False
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
     assert permission == {
         "external_directory": {"/**": "deny"},
@@ -647,44 +650,54 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert transcript["backend"] == "opencode"
 
 
-def test_opencode_backend_uses_same_native_model_and_blocks_oauth_key_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_opencode_backend_rejects_direct_duplicate_model_flag() -> None:
+    with pytest.raises(ValueError, match=r"cannot contain '--model'.*remove it"):
+        OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
+
+
+def test_opencode_backend_logs_native_model_divergence_from_home_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    config = tmp_path / "opencode.jsonc"
-    config.write_text('{"model":"openai/gpt-configured"}', encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "MIMIR_MODEL_SPEC=codex-plus:gpt-agent\n", encoding="utf-8"
+    )
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"openai/gpt-native"}', encoding="utf-8")
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("OPENCODE_CONFIG", str(config))
-    monkeypatch.setenv("OPENAI_API_KEY", "metered")
-    backend = OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
     order = WorkOrder(
-        issue_id=1039,
-        worktree=tmp_path,
+        issue_id=1063,
+        worktree=tmp_path / "worktree",
         prompt="p",
         rules=None,
         timeout_s=30,
-        env={},
+        env={"MIMIR_HOME": str(tmp_path)},
     )
 
-    spec = backend.work_spec(
-        order,
-        attempt=1,
-        repo_url="u",
-        base_ref="main",
-        branch="issue/1039-a1",
-        test_command="true",
-    )
+    with caplog.at_level("WARNING", logger="mimir.worklink.backends.opencode"):
+        spec = OpenCodeBackend().work_spec(
+            order,
+            attempt=1,
+            repo_url="u",
+            base_ref="main",
+            branch="issue/1063-a1",
+            test_command="true",
+        )
 
-    assert spec.local_argv is not None
-    assert tuple(spec.local_argv)[-4:-2] == ("-m", "openai/gpt-configured")
-    assert spec.env["OPENAI_API_KEY"] == ""
-    assert spec.env["OPENCODE_CONFIG"] == str(config)
+    assert spec.backend_config["model"] == "openai/gpt-native"
+    assert spec.backend_config["configured_model"] == "openai/gpt-agent"
+    assert spec.backend_config["model_diverged"] is True
+    assert "differs from configured agent model" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -786,13 +799,30 @@ async def test_opencode_backend_transcript_filename_contract(
 def test_registry_builds_opencode_backend_with_settings() -> None:
     config = WorklinkConfig(backend_settings={"opencode": {
         "bin": "/usr/local/bin/opencode",
-        "args": ["--model", "openai/gpt-5.5"],
+        "args": ["--verbose"],
         "bash_allowlist": ["git *", "npm *"],
     }})
     backend = BackendRegistry(config).get("opencode")
     assert backend.bin == "/usr/local/bin/opencode"
-    assert backend.extra_args == ("--model", "openai/gpt-5.5")
+    assert backend.extra_args == ("--verbose",)
     assert backend.bash_allowlist == ("git *", "npm *")
+
+
+@pytest.mark.parametrize(
+    "args, flag",
+    [
+        (["--model", "openai/gpt-5.5"], "--model"),
+        (["-m", "openai/gpt-5.5"], "-m"),
+        (["--model=openai/gpt-5.5"], "--model=openai/gpt-5.5"),
+        (["--dir", "/tmp/other"], "--dir"),
+    ],
+)
+def test_registry_rejects_opencode_injected_flags(args: list[str], flag: str) -> None:
+    config = WorklinkConfig(backend_settings={"opencode": {"args": args}})
+
+    with pytest.raises(ValueError, match=r"cannot contain .*remove it") as exc_info:
+        BackendRegistry(config)
+    assert repr(flag) in str(exc_info.value)
 
 
 @pytest.mark.parametrize("allowlist", ["git *", [""], ["*"]])

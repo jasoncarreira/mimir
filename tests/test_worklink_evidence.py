@@ -192,6 +192,42 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
     assert result.evidence.tests.exit_code == 0
 
 
+def test_executor_crash_skips_gate_and_preserves_stderr_reason(tmp_path: Path) -> None:
+    commands: list[Sequence[str] | str] = []
+
+    def runner(
+        args: Sequence[str] | str, *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        assert args != "pytest -q"
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    result = observe_evidence(
+        issue=1063,
+        attempt=1,
+        backend="opencode",
+        branch="issue/1063-a1",
+        worktree=tmp_path,
+        started_at=datetime(2026, 7, 30, 12, 20, 5, tzinfo=UTC),
+        base_ref="main",
+        backend_status="failed",
+        test_command="pytest -q",
+        model="openai/gpt-5.6-sol",
+        failure_reason="j.split is not a function",
+        skip_test_reason="executor exited nonzero before the test gate",
+        runner=runner,
+    )
+
+    assert "pytest -q" not in commands
+    assert result.status == "failed"
+    assert result.reasons == ("j.split is not a function",)
+    assert result.evidence.failure_reason == "j.split is not a function"
+    assert result.evidence.model == "openai/gpt-5.6-sol"
+    assert result.evidence.tests == TestResult(
+        "pytest -q", skipped_reason="executor exited nonzero before the test gate"
+    )
+
+
 def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

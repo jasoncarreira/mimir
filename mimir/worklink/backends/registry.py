@@ -15,7 +15,7 @@ from ..compute import (
 )
 from .base import ToolBackend
 from .feature_factory import FeatureFactoryBackend
-from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend
+from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend, validate_extra_args
 
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
@@ -530,6 +530,7 @@ class BackendRegistry:
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink opencode args must be a list of strings")
+        validate_extra_args(args)
         bash_allowlist = settings.get("bash_allowlist", list(DEFAULT_BASH_ALLOWLIST))
         if not isinstance(bash_allowlist, list) or not all(
             isinstance(pattern, str) and pattern for pattern in bash_allowlist

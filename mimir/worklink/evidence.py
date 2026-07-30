@@ -43,6 +43,8 @@ class WorklinkEvidence:
     tests: TestResult | None
     pr_url: str | None
     status: str
+    model: str | None = None
+    failure_reason: str | None = None
     blocked_reason: str | None = None
     transcript: str | None = None
     diff_observed: bool = True
@@ -85,6 +87,9 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
 
     if status == "blocked":
         return EvidenceValidation(status="blocked", review_ready=False, reasons=tuple(reasons), evidence=evidence)
+
+    if status == "failed" and evidence.failure_reason:
+        reasons.append(evidence.failure_reason)
 
     if status == "completed" and not evidence.files_changed:
         reasons.append("completed_empty_diff")
@@ -138,6 +143,9 @@ def observe_evidence(
     transcript: str | None = None,
     pr_url: str | None = None,
     blocked_reason: str | None = None,
+    model: str | None = None,
+    failure_reason: str | None = None,
+    skip_test_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
     """Build evidence by observing a worktree after a backend run."""
@@ -155,6 +163,9 @@ def observe_evidence(
         transcript=transcript,
         pr_url=pr_url,
         blocked_reason=blocked_reason,
+        model=model,
+        failure_reason=failure_reason,
+        skip_test_reason=skip_test_reason,
         runner=runner,
         include_worktree_status=True,
     )
@@ -176,6 +187,9 @@ def _observe_evidence_from_ref(
     transcript: str | None,
     pr_url: str | None,
     blocked_reason: str | None,
+    model: str | None,
+    failure_reason: str | None,
+    skip_test_reason: str | None,
     runner: Run | None,
     include_worktree_status: bool,
     checkout_ref: str | None = None,
@@ -223,7 +237,9 @@ def _observe_evidence_from_ref(
                 f"git checkout --detach {checkout_ref}", checkout.returncode, _summarize(checkout)
             )
         )
-    if test_command:
+    if test_command and skip_test_reason:
+        tests = TestResult(test_command, skipped_reason=skip_test_reason)
+    elif test_command:
         if checkout is not None and checkout.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
@@ -245,6 +261,8 @@ def _observe_evidence_from_ref(
         tests=tests,
         pr_url=pr_url,
         status=_common_status(backend_status),
+        model=model,
+        failure_reason=failure_reason,
         blocked_reason=blocked_reason,
         transcript=transcript,
         diff_observed=pre_observed

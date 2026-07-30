@@ -480,6 +480,23 @@ class WorklinkRunner:
                 branch=lease.branch,
                 test_command=test_cmd,
             )
+            invocation_model = spec.backend_config.get("model")
+            _log_event(
+                "worklink_backend_invocation",
+                issue_id=issue.issue_id,
+                attempt=record.attempt,
+                backend=selected_name,
+                model=invocation_model,
+            )
+            if spec.backend_config.get("model_diverged"):
+                _log_event(
+                    "worklink_model_divergence",
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    backend=selected_name,
+                    model=invocation_model,
+                    configured_model=spec.backend_config.get("configured_model"),
+                )
             handle = None
             try:
                 handle = await compute.launch(spec)
@@ -595,6 +612,8 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        invocation_model = spec.backend_config.get("model")
+        executor_failed = raw.exit_code != 0
         if raw.output_overflow:
             _log_event(
                 "worklink_output_overflow",
@@ -620,6 +639,9 @@ class WorklinkRunner:
             test_command=test_cmd,
             transcript=str(raw.transcript_path) if raw.transcript_path else None,
             blocked_reason=raw.blocked_reason,
+            model=invocation_model,
+            failure_reason=raw.error if executor_failed else None,
+            skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
         )
         validation = _with_outside_worktree_detection(
@@ -651,6 +673,11 @@ class WorklinkRunner:
                     test_command=test_cmd,
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
                     blocked_reason=raw.blocked_reason,
+                    model=invocation_model,
+                    failure_reason=raw.error if executor_failed else None,
+                    skip_test_reason=(
+                        "executor exited nonzero before the test gate" if executor_failed else None
+                    ),
                     runner=runner,
                 )
                 validation = _with_outside_worktree_detection(
@@ -699,11 +726,13 @@ class WorklinkRunner:
             status=validation.status,
             review_ready=validation.review_ready,
             reasons=list(validation.reasons),
+            model=validation.evidence.model,
+            failure_reason=validation.evidence.failure_reason,
         )
         transition_status = "blocked" if raw.output_overflow else validation.status
         transition_reason = (
             raw.error
-            if raw.output_overflow
+            if raw.exit_code != 0
             else validation.evidence.blocked_reason
             if validation.status == "blocked"
             else (", ".join(validation.reasons) if validation.reasons else None)
@@ -739,7 +768,11 @@ class WorklinkRunner:
             evidence_path=evidence_path,
             worktree=lease.path,
             branch=lease.branch,
-            reason=f"post-transition cleanup failed: {cleanup_error}" if cleanup_error else None,
+            reason=(
+                f"post-transition cleanup failed: {cleanup_error}"
+                if cleanup_error
+                else raw.error if raw.exit_code != 0 else None
+            ),
         )
 
     async def reattach(self, issue_id: int) -> WorklinkRunResult:
