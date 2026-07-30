@@ -3,9 +3,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import shutil
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -5225,6 +5225,22 @@ def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> Non
         "blocked", "cascade", "list", "next", "ready", "related", "search",
         "show", "tree",
     }
+
+
+def test_chainlink_query_and_mutation_subcommands_are_disjoint() -> None:
+    assert access_control._CHAINLINK_QUERY_SUBCOMMANDS.isdisjoint(
+        access_control._CHAINLINK_MUTATION_SUBCOMMANDS,
+    )
+
+
+@pytest.mark.parametrize("command", _CHAINLINK_MUTATIONS)
+def test_every_declared_chainlink_mutation_classifies_as_mutation(
+    command: str,
+) -> None:
+    argv = shlex.split(command)
+
+    assert access_control._target_matches_chainlink_command(argv)
+    assert access_control._chainlink_command_is_mutation(argv)
 
 
 def test_chainlink_top_level_help_has_an_explicit_scope_decision() -> None:

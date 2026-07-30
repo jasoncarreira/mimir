@@ -59,6 +59,47 @@ jobs:
       - name: Skill conformance + catalog tests
         run: uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v
 
+  chainlink-cli-audit:
+    # Exercise the real pinned CLI help exactly once in CI. The full-suite jobs
+    # intentionally skip these two live audits when Chainlink is absent; this
+    # dedicated gate keeps upstream command drift executable without compiling
+    # the Rust CLI three times across the Python/enforcement matrix.
+    needs: skill-conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with dev extras)
+        run: uv sync --extra dev
+
+      - name: Install pinned Chainlink CLI
+        # Keep this pin in sync with mimir/skills/chainlink/dockerfile.fragment.
+        run: |
+          cargo install \
+            --git https://github.com/dollspace-gay/chainlink.git \
+            --tag chainlink-1.6.0 \
+            --root "$RUNNER_TEMP/chainlink" \
+            chainlink-tracker
+          echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
+
+      - name: Audit live Chainlink command surface
+        run: |
+          chainlink --version
+          uv run pytest -q tests/test_access_control.py \
+            -k 'chainlink_issue_help_has_an_explicit_read_or_mutation_decision or chainlink_top_level_help_has_an_explicit_scope_decision'
+
   pytest:
     # Full mimir test suite under py 3.11 + 3.12 matrix. ``needs:
     # skill-conformance`` makes the fast gate fail-fast PRs that bust
