@@ -49,6 +49,21 @@ def set_forge_client(client: ForgeClient | None) -> None:
     _default_client = client
 
 
+def initialize_github_forge_identity() -> None:
+    """Bind the deployment's declared GitHub identity before serving tools."""
+    declared_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if not declared_login:
+        return
+    from ..forge.github import GitHubForgeClient
+
+    client = GitHubForgeClient()
+    try:
+        client.verify_identity(declared_login)
+    except ForgeError as exc:
+        raise RuntimeError(f"github identity verification failed: {exc}") from exc
+    set_forge_client(client)
+
+
 def _scope(
     runtime: ToolRuntime[AuthContext] | None,
     repository: str,

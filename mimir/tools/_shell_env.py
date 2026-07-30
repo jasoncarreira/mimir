@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shlex
 import sys
+import tempfile
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -22,6 +23,9 @@ _TRUSTED_PATH_DIRS = (
     "/bin",
 )
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
+_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
+Path(_GH_CONFIG_DIR).chmod(0o500)
+_ALTERNATE_GITHUB_ENV = ("GH_TOKEN", "GH_HOST")
 _DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
     "mimir_direct_exec_argv", default=None,
 )
@@ -61,6 +65,29 @@ def _is_git_argv(argv: list[str] | None) -> bool:
     return bool(argv) and argv[0] == "/usr/bin/git"
 
 
+def _is_gh_argv(argv: list[str] | None) -> bool:
+    # Authorization replaces the command with an operator-pinned absolute path,
+    # which may differ from the image default used in production.
+    return bool(argv) and Path(argv[0]).name == "gh"
+
+
+def _gh_has_account_effect(argv: list[str] | None) -> bool:
+    if not _is_gh_argv(argv) or argv is None:
+        return False
+    arguments = argv[1:]
+    if len(arguments) >= 2 and arguments[0] in {"pr", "issue"}:
+        return arguments[1] in {
+            "close", "comment", "create", "edit", "merge", "ready", "reopen", "review",
+        }
+    if arguments[:1] == ["api"]:
+        for index, argument in enumerate(arguments[1:]):
+            if argument in {"--method", "-X"} and index + 2 < len(arguments):
+                return arguments[index + 2].upper() != "GET"
+            if argument.startswith("--method="):
+                return argument.partition("=")[2].upper() != "GET"
+    return False
+
+
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
@@ -70,6 +97,19 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     from operator configuration rather than language-specific inference here.
     """
     env = os.environ.copy()
+    for key in _ALTERNATE_GITHUB_ENV:
+        env.pop(key, None)
+    if _is_gh_argv(argv):
+        env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
+        if _gh_has_account_effect(argv):
+            from ..forge.github import confirm_github_identity
+
+            confirm_github_identity(
+                os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                env.get("GITHUB_TOKEN", ""),
+            )
+    else:
+        env.pop("GH_CONFIG_DIR", None)
     if _is_git_argv(argv):
         # The maintenance profile binds Git to a configured -C root and injects
         # config-neutralizing argv. Inherited GIT_* variables must not select a
@@ -92,6 +132,9 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     ``ShellJobRegistry`` overlays values onto its own inherited environment.
     """
     overlay: dict[str, str | None] = direct_exec_env(argv)
+    for key in (*_ALTERNATE_GITHUB_ENV, "GH_CONFIG_DIR"):
+        if key in os.environ and key not in overlay:
+            overlay[key] = None
     if _is_git_argv(argv):
         for key in os.environ:
             if key.startswith("GIT_") and key not in overlay:

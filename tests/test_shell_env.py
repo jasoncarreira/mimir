@@ -6,7 +6,10 @@ import os
 import shutil
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
+
+import pytest
 
 from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
@@ -132,3 +135,52 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch)
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["GIT_PAGER"] == "cat"
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
+    monkeypatch.setenv("GH_TOKEN", "stray-token")
+    monkeypatch.setenv("GH_HOST", "attacker.invalid")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
+
+    env = direct_exec_env(["/usr/bin/gh", "api", "user"])
+    overlay = direct_exec_env_overlay(["/usr/bin/gh", "api", "user"])
+
+    assert env["GITHUB_TOKEN"] == "declared-token"
+    assert "GH_TOKEN" not in env
+    assert "GH_HOST" not in env
+    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert env["GH_CONFIG_DIR"] != "/tmp/stray-gh-config"
+    assert Path(env["GH_CONFIG_DIR"]).stat().st_mode & 0o777 == 0o500
+    assert overlay["GH_TOKEN"] is None
+    assert overlay["GH_HOST"] is None
+
+
+def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
+    monkeypatch.setenv("GH_TOKEN", "stray-token")
+    monkeypatch.setenv("GH_HOST", "attacker.invalid")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
+
+    env = direct_exec_env(["/bin/echo", "status"])
+    overlay = direct_exec_env_overlay(["/bin/echo", "status"])
+
+    assert all(key not in env for key in ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR"))
+    assert all(overlay[key] is None for key in ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR"))
+
+
+def test_mutating_gh_command_requires_cached_declared_identity(monkeypatch) -> None:
+    from mimir.forge import github as github_module
+    from mimir.forge import ForgeError
+
+    monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "_verified_identity", None)
+    argv = ["/usr/bin/gh", "pr", "review", "17", "--approve"]
+
+    with pytest.raises(ForgeError, match="cache is empty"):
+        direct_exec_env(argv)
+
+    monkeypatch.setattr(github_module, "_verified_identity", (
+        "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
+    ))
+    assert direct_exec_env(argv)["GITHUB_TOKEN"] == "declared-token"

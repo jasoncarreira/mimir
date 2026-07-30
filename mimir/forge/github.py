@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -30,6 +32,33 @@ _MAX_DIFF_BYTES = 524_288
 _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
+# Identity bindings intentionally expire only with the process. Effects never
+# refresh this cache, so a changed or missing credential fails closed.
+GITHUB_IDENTITY_CACHE_TTL_SECONDS: None = None
+_identity_lock = threading.Lock()
+_verified_identity: tuple[str, str] | None = None
+
+
+def _credential_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def confirm_github_identity(principal: str, token: str | None = None) -> str:
+    """Confirm *principal* against the process-cached authenticated identity."""
+    credential = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
+    fingerprint = _credential_fingerprint(credential.strip())
+    with _identity_lock:
+        verified = _verified_identity
+    if verified is None:
+        raise ForgeError("github identity verification cache is empty")
+    login, verified_fingerprint = verified
+    if fingerprint != verified_fingerprint:
+        raise ForgeError("github identity verification cache does not match active credential")
+    if login.casefold() != principal.strip().casefold():
+        raise ForgeError(
+            f"github acting identity mismatch: authenticated as {login}, scope principal is {principal}"
+        )
+    return login
 
 
 class GitHubForgeClient:
@@ -42,12 +71,12 @@ class GitHubForgeClient:
         session: requests.Session | None = None,
         timeout: float = 20.0,
     ) -> None:
-        self._token = token
+        self._token = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
         self._session = session or requests.Session()
         self._timeout = timeout
 
     def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
-        token = self._token if self._token is not None else os.environ.get("GITHUB_TOKEN", "")
+        token = self._token
         headers = {
             "Accept": accept,
             "X-GitHub-Api-Version": "2022-11-28",
@@ -56,6 +85,39 @@ class GitHubForgeClient:
         if token.strip():
             headers["Authorization"] = f"Bearer {token.strip()}"
         return headers
+
+    def verify_identity(self, declared_login: str) -> str:
+        """Resolve and process-cache the token owner, refusing any mismatch."""
+        expected = declared_login.strip()
+        if not expected:
+            raise ForgeError("github declared identity is empty")
+        fingerprint = _credential_fingerprint(self._token.strip())
+        global _verified_identity
+        with _identity_lock:
+            if _verified_identity is not None:
+                login, cached_fingerprint = _verified_identity
+                if cached_fingerprint != fingerprint:
+                    raise ForgeError(
+                        "github identity verification cache does not match active credential"
+                    )
+                if login.casefold() != expected.casefold():
+                    raise ForgeError(
+                        f"github identity mismatch: authenticated as {login}, declared as {expected}"
+                    )
+                return login
+            data = self._request("GET", "/user")
+            login = str(data.get("login", "")).strip() if isinstance(data, Mapping) else ""
+            if _REVIEWER.fullmatch(login) is None:
+                raise ForgeError("github identity verification returned an invalid login")
+            if login.casefold() != expected.casefold():
+                raise ForgeError(
+                    f"github identity mismatch: authenticated as {login}, declared as {expected}"
+                )
+            _verified_identity = (login, fingerprint)
+            return login
+
+    def _confirm_effect_identity(self, scope: RepoPRActionScope) -> None:
+        confirm_github_identity(scope.principal, self._token)
 
     @staticmethod
     def _target(scope: RepoPRActionScope) -> tuple[str, int]:
@@ -335,6 +397,7 @@ class GitHubForgeClient:
             ReviewVerdict.COMMENT: "COMMENT",
             ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES",
         }
+        self._confirm_effect_identity(scope)
         data = self._request(
             "POST",
             f"/repos/{repository}/pulls/{number}/reviews",
@@ -352,6 +415,7 @@ class GitHubForgeClient:
         body = self._body(body)
         if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= 10_000_000:
             raise ForgeError("invalid line")
+        self._confirm_effect_identity(scope)
         data = self._request(
             "POST",
             f"/repos/{repository}/pulls/{number}/comments",
@@ -372,6 +436,7 @@ class GitHubForgeClient:
     ) -> CommentProjection:
         repository, number = self._target(scope)
         body = self._body(body)
+        self._confirm_effect_identity(scope)
         data = self._request(
             "POST", f"/repos/{repository}/issues/{number}/comments", body={"body": body},
         )
@@ -383,6 +448,7 @@ class GitHubForgeClient:
         repository, number = self._target(scope)
         if _REVIEWER.fullmatch(reviewer) is None:
             raise ForgeError("invalid reviewer")
+        self._confirm_effect_identity(scope)
         self._request(
             "POST",
             f"/repos/{repository}/pulls/{number}/requested_reviewers",

@@ -764,6 +764,10 @@ def build_app(config: Config) -> web.Application:
     # into coding gets an immediate startup failure when OpenCode is missing,
     # rather than a broken tool appearing on the first turn.
     from .tools import all_mimir_tools
+    if getattr(config, "coding_enabled", False):
+        from .tools.forge import initialize_github_forge_identity
+
+        initialize_github_forge_identity()
     all_mimir_tools(coding_enabled=getattr(config, "coding_enabled", False))
 
     process_session_id = make_process_session_id()

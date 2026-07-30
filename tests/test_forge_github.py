@@ -6,7 +6,9 @@ import pytest
 
 from mimir.forge import ForgeError, ForgeResponseTooLarge, ReviewVerdict
 from mimir.forge.github import GitHubForgeClient
+from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
+from mimir.tools.forge import initialize_github_forge_identity
 
 
 def _scope() -> RepoPRActionScope:
@@ -52,6 +54,11 @@ class Session:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
         return self.responses.pop(0)
+
+
+@pytest.fixture(autouse=True)
+def reset_verified_identity(monkeypatch) -> None:
+    monkeypatch.setattr(github_module, "_verified_identity", None)
 
 
 def test_metadata_target_and_auth_are_adapter_constructed() -> None:
@@ -103,15 +110,16 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
 
 
 def test_submit_review_uses_json_transport_and_scope_head() -> None:
-    session = Session([Response({
+    session = Session([Response({"login": "reviewer"}), Response({
         "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
         "body": "body", "commit_id": "a" * 40,
     })])
     client = GitHubForgeClient(session=session)
+    client.verify_identity("reviewer")
 
     client.submit_review(_scope(), ReviewVerdict.APPROVE, 'body "quoted"\nnext')
 
-    method, url, kwargs = session.calls[0]
+    method, url, kwargs = session.calls[1]
     assert method == "POST"
     assert url.endswith("/repos/owner/repo/pulls/17/reviews")
     assert kwargs["json"] == {
@@ -119,6 +127,83 @@ def test_submit_review_uses_json_transport_and_scope_head() -> None:
         "event": "APPROVE",
         "body": 'body "quoted"\nnext',
     }
+
+
+def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None:
+    session = Session([Response({"login": "other-bot"})])
+    client = GitHubForgeClient(token="secret", session=session)
+
+    with pytest.raises(
+        ForgeError,
+        match="authenticated as other-bot, declared as reviewer",
+    ):
+        client.verify_identity("reviewer")
+    with pytest.raises(ForgeError, match="cache is empty"):
+        client.submit_review(_scope(), ReviewVerdict.APPROVE, "body")
+
+    assert [(method, url.rsplit("/", 1)[-1]) for method, url, _ in session.calls] == [
+        ("GET", "user"),
+    ]
+
+
+def test_matching_identity_is_cached_for_multiple_effects() -> None:
+    session = Session([
+        Response({"login": "reviewer"}),
+        Response({
+            "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
+            "body": "body", "commit_id": "a" * 40,
+        }),
+        Response({
+            "id": 10, "user": {"login": "reviewer"}, "body": "comment",
+            "created_at": "now", "updated_at": "now",
+        }),
+    ])
+    client = GitHubForgeClient(token="secret", session=session)
+
+    assert client.verify_identity("reviewer") == "reviewer"
+    client.submit_review(_scope(), ReviewVerdict.APPROVE, "body")
+    client.add_pull_request_comment(_scope(), "comment")
+
+    assert [url for method, url, _ in session.calls if method == "GET"] == [
+        "https://api.github.com/user",
+    ]
+
+
+def test_startup_identity_verification_refuses_mismatch(monkeypatch) -> None:
+    class MismatchedClient:
+        def verify_identity(self, declared_login):
+            raise ForgeError(
+                f"github identity mismatch: authenticated as other-bot, declared as {declared_login}"
+            )
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "GitHubForgeClient", MismatchedClient)
+
+    with pytest.raises(
+        RuntimeError,
+        match="github identity verification failed:.*other-bot.*reviewer",
+    ):
+        initialize_github_forge_identity()
+
+
+def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:
+    verified: list[str] = []
+    registered: list[object] = []
+
+    class MatchingClient:
+        def verify_identity(self, declared_login):
+            verified.append(declared_login)
+            return declared_login
+
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(github_module, "GitHubForgeClient", MatchingClient)
+    monkeypatch.setattr("mimir.tools.forge.set_forge_client", registered.append)
+
+    initialize_github_forge_identity()
+
+    assert verified == ["reviewer"]
+    assert len(registered) == 1
+    assert isinstance(registered[0], MatchingClient)
 
 
 def test_invalid_scope_cannot_construct_account_or_cross_repo_target() -> None:

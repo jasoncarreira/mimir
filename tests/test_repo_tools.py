@@ -499,6 +499,10 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     token = "never-expose-this-token"
     monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setattr(
+        "mimir.forge.github.confirm_github_identity",
+        lambda principal, credential: principal,
+    )
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
     def runner(argv, *, env, timeout, output_limit):
@@ -571,6 +575,33 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
         assert _git(origin, "rev-parse", https_scope.destination_ref) == _git(
             lease.path, "rev-parse", "HEAD",
         )
+
+
+def test_https_push_refuses_when_acting_identity_is_unverified(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    https_scope = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=https_scope.canonical_origin,
+        scope_id=https_scope.scope_id,
+    )
+    state = RepoReviewState(https_scope)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    def refuse(_principal, _token):
+        raise ForgeError("github identity verification cache is empty")
+
+    from mimir.forge import ForgeError
+
+    monkeypatch.setattr("mimir.forge.github.confirm_github_identity", refuse)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)._push_remote()
+
+    assert refusal.value.code == "push_identity_unverified"
+    assert "cache is empty" in str(refusal.value)
 
 
 def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) -> None:
