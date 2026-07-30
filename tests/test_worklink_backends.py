@@ -24,6 +24,7 @@ from mimir.worklink.backends import (
     WorklinkDefaults,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
+from mimir.worklink.backends.registry import SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 import mimir.worklink.compute as compute_module
 
@@ -385,6 +386,13 @@ def test_registry_resolves_only_shipping_backends() -> None:
         registry.get("codex")
     with pytest.raises(KeyError, match="unknown Worklink backend: claude_cli"):
         registry.get("claude_cli")
+
+
+def test_shipping_backend_names_match_constructed_registries() -> None:
+    registry = BackendRegistry()
+
+    assert set(registry._backends) == SHIPPING_BACKENDS
+    assert set(registry._compute_backends) == SHIPPING_COMPUTE_BACKENDS
 
 
 @pytest.mark.parametrize("name", ["codex", "claude_cli"])
