@@ -192,7 +192,7 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
     assert result.evidence.tests.exit_code == 0
 
 
-def test_executor_crash_skips_gate_and_preserves_stderr_reason(tmp_path: Path) -> None:
+def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_path: Path) -> None:
     commands: list[Sequence[str] | str] = []
 
     def runner(
@@ -202,6 +202,7 @@ def test_executor_crash_skips_gate_and_preserves_stderr_reason(tmp_path: Path) -
         assert args != "pytest -q"
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
+    unsafe_reason = "ignored earlier line\nprovider token=top-secret " + ("x" * 1200)
     result = observe_evidence(
         issue=1063,
         attempt=1,
@@ -213,15 +214,18 @@ def test_executor_crash_skips_gate_and_preserves_stderr_reason(tmp_path: Path) -
         backend_status="failed",
         test_command="pytest -q",
         model="openai/gpt-5.6-sol",
-        failure_reason="j.split is not a function",
+        failure_reason=unsafe_reason,
         skip_test_reason="executor exited nonzero before the test gate",
         runner=runner,
     )
 
     assert "pytest -q" not in commands
     assert result.status == "failed"
-    assert result.reasons == ("j.split is not a function",)
-    assert result.evidence.failure_reason == "j.split is not a function"
+    assert result.evidence.failure_reason is not None
+    assert result.reasons == (result.evidence.failure_reason,)
+    assert result.evidence.failure_reason.startswith("provider token=[REDACTED] ")
+    assert len(result.evidence.failure_reason) == 1000
+    assert "top-secret" not in result.evidence.failure_reason
     assert result.evidence.model == "openai/gpt-5.6-sol"
     assert result.evidence.tests == TestResult(
         "pytest -q", skipped_reason="executor exited nonzero before the test gate"

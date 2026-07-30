@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Sequence
 
+from .dispatch_failures import terminal_error
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -76,6 +78,12 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     """
     reasons: list[str] = []
     status = evidence.status
+
+    if evidence.failure_reason:
+        evidence = replace(
+            evidence,
+            failure_reason=terminal_error(evidence.failure_reason),
+        )
 
     if status not in {"completed", "blocked", "failed"}:
         reasons.append("invalid_status")

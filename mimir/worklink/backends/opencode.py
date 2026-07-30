@@ -18,7 +18,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
-_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir")
+_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
 log = logging.getLogger(__name__)
 
 

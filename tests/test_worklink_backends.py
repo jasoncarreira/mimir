@@ -875,6 +875,7 @@ def test_registry_builds_opencode_backend_with_settings() -> None:
         (["-m", "openai/gpt-5.5"], "-m"),
         (["--model=openai/gpt-5.5"], "--model=openai/gpt-5.5"),
         (["--dir", "/tmp/other"], "--dir"),
+        (["--"], "--"),
     ],
 )
 def test_registry_rejects_opencode_injected_flags(args: list[str], flag: str) -> None:

@@ -730,7 +730,7 @@ class WorklinkRunner:
         )
         transition_status = "blocked" if raw.output_overflow else validation.status
         transition_reason = (
-            raw.error
+            validation.evidence.failure_reason
             if raw.exit_code != 0
             else validation.evidence.blocked_reason
             if validation.status == "blocked"
@@ -770,7 +770,7 @@ class WorklinkRunner:
             reason=(
                 f"post-transition cleanup failed: {cleanup_error}"
                 if cleanup_error
-                else raw.error if raw.exit_code != 0 else None
+                else validation.evidence.failure_reason if raw.exit_code != 0 else None
             ),
         )
 

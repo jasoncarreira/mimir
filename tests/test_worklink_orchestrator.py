@@ -595,13 +595,14 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
-def test_executor_crash_records_model_and_stderr_without_running_gate(tmp_path: Path) -> None:
+def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
     init_logger(events, session_id="test-worklink-crash")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree, files_stdout="")
+    unsafe_reason = "ignored earlier line\nprovider token=top-secret " + ("x" * 1200)
 
     class CrashBackend(FakeBackend):
         def work_spec(self, *args: Any, **kwargs: Any) -> WorkSpec:
@@ -613,7 +614,7 @@ def test_executor_crash_records_model_and_stderr_without_running_gate(tmp_path: 
                 1,
                 order.transcript_root / "opencode-crash.json",
                 "failed",
-                "j.split is not a function",
+                unsafe_reason,
             )
 
     registry = BackendRegistry(WorklinkConfig())
@@ -626,7 +627,10 @@ def test_executor_crash_records_model_and_stderr_without_running_gate(tmp_path: 
     )
 
     assert result.status == "failed"
-    assert result.reason == "j.split is not a function"
+    assert result.reason is not None
+    assert result.reason.startswith("provider token=[REDACTED] ")
+    assert len(result.reason) == 1000
+    assert "top-secret" not in result.reason
     assert "echo ok" not in calls
     evidence = json.loads(
         (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
@@ -634,12 +638,21 @@ def test_executor_crash_records_model_and_stderr_without_running_gate(tmp_path: 
         )
     )
     assert evidence["model"] == "openai/gpt-5.6-sol"
-    assert evidence["failure_reason"] == "j.split is not a function"
+    assert evidence["failure_reason"] == result.reason
     assert evidence["tests"]["skipped_reason"] == "executor exited nonzero before the test gate"
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     evidence_event = next(record for record in records if record["type"] == "worklink_evidence")
     assert evidence_event["model"] == "openai/gpt-5.6-sol"
-    assert evidence_event["failure_reason"] == "j.split is not a function"
+    assert evidence_event["failure_reason"] == result.reason
+    published_comments = [
+        call[-1]
+        for call in calls
+        if isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
+    ]
+    assert any(result.reason in comment for comment in published_comments)
+    assert "top-secret" not in json.dumps(evidence)
+    assert "top-secret" not in json.dumps(records)
+    assert "top-secret" not in "\n".join(published_comments)
     _reset_logger_for_tests()
 
 
