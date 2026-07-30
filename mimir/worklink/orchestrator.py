@@ -393,6 +393,7 @@ class WorklinkRunner:
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
+            event_logger=_log_event,
         )
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
@@ -407,6 +408,11 @@ class WorklinkRunner:
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            _log_event(
+                "worklink_claim_failed",
+                issue_id=issue.issue_id,
+                reason=claim.reason or "claim_failed",
+            )
             return WorklinkRunResult(
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
@@ -757,6 +763,7 @@ class WorklinkRunner:
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
+            event_logger=_log_event,
         )
         review_ready = claims.review_ready_evidence(issue_id)
         if review_ready is not None:
@@ -1029,6 +1036,11 @@ class WorklinkRunner:
             _log_event("worklink_epic_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            _log_event(
+                "worklink_epic_claim_failed",
+                issue_id=issue.issue_id,
+                reason=claim.reason or "claim_failed",
+            )
             return WorklinkRunResult(
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )

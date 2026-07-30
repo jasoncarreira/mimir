@@ -594,6 +594,52 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> None:
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink-contention")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, base_runner = _orchestrator_runner(repo, worktree)
+    claim_calls = 0
+
+    def runner(
+        args: Sequence[str] | str, *, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            claim_calls += 1
+            if claim_calls == 1:
+                return cp(
+                    args,
+                    returncode=128,
+                    stderr=(
+                        "fatal: Unable to create '/mimir-home/.git/worktrees/"
+                        "-locks-cache/index.lock': File exists."
+                    ),
+                )
+        return base_runner(args, cwd=cwd)
+
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.attempt == 1
+    assert claim_calls == 2
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    contention = [record for record in records if record["type"] == "worklink_claim_contention"]
+    assert [record["outcome"] for record in contention] == ["retrying", "succeeded"]
+    assert all(record["resource"] == "chainlink_locks_worktree" for record in contention)
+    _reset_logger_for_tests()
+
+
 def test_isolated_checkout_cleanup_does_not_use_git_worktree_remove(
     tmp_path: Path,
 ) -> None:
