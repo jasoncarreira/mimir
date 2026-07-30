@@ -86,6 +86,7 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
         channel_id="poller:forge",
         interactivity=None,
         enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
         repo_pr_scope_registry=RepoPRScopeRegistry(states),
         repo_review_state=states[0] if len(states) == 1 else None,
         repo_pr_action_scope=scopes[0] if len(scopes) == 1 else None,
