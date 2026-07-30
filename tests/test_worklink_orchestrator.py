@@ -268,6 +268,29 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     _reset_logger_for_tests()
 
 
+def test_preclaim_multiline_git_contention_does_not_persist_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import load_failure_state
+
+    state_dir = tmp_path / "state"
+
+    async def contended_preclaim(self: WorklinkRunner, issue_id: int, **_: object):
+        raise RuntimeError(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.\n"
+            "Another git process seems to be running in this repository."
+        )
+
+    monkeypatch.setenv("STATE_DIR", str(state_dir))
+    monkeypatch.setattr(WorklinkRunner, "run", contended_preclaim)
+
+    with pytest.raises(RuntimeError, match="Unable to create"):
+        run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
+
+    assert load_failure_state(state_dir)["issues"] == {}
+
+
 def test_postclaim_failure_emits_same_failure_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,6 +315,34 @@ def test_postclaim_failure_emits_same_failure_event(
     assert failure["attempt_consumed"] is True
     assert failure["terminal_error"] == "backend exploded api_key=[REDACTED]"
     _reset_logger_for_tests()
+
+
+def test_manual_success_clears_autonomous_failure_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import load_failure_state, record_failure
+
+    state_dir = tmp_path / "state"
+    record_failure(
+        state_dir,
+        issue_id=441,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+
+    async def successful_manual_run(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(issue_id, 2, "completed")
+
+    monkeypatch.setenv("STATE_DIR", str(state_dir))
+    monkeypatch.setattr(WorklinkRunner, "run", successful_manual_run)
+
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=False)
+
+    assert result.status == "completed"
+    assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:

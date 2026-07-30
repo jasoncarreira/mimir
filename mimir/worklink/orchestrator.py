@@ -1795,7 +1795,7 @@ def run_worklink(
             exit_status=1,
             autonomous=autonomous,
         )
-    elif autonomous and result.status in {"completed", "blocked"}:
+    elif result.status in {"completed", "blocked"}:
         _record_run_success(issue_id)
     return result
 
@@ -1827,7 +1827,7 @@ def _record_run_failure(
                 issue_id=issue_id,
                 attempt=attempt,
                 exit_status=exit_status,
-                error=safe_error,
+                error=error,
                 log_path=os.environ.get("WORKLINK_RUN_LOG"),
             )
         except OSError:

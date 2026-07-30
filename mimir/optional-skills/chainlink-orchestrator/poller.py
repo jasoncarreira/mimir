@@ -118,10 +118,7 @@ from mimir.worklink.backends.feature_factory import (
 )
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.continuation import consume_worklink_budget_continuations
-from mimir.worklink.dispatch_failures import (
-    failure_state_transaction,
-    parse_time,
-)
+from mimir.worklink.dispatch_failures import mark_failure_notified, pending_failure_alerts
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 LIFECYCLE_RECONCILIATION_NAME = "worklink-lifecycle-reconciliation"
@@ -966,49 +963,6 @@ def _run_lifecycle_reconciliation(
     return all_alerts
 
 
-def _reconcile_dispatch_failures(
-    state_dir: Path, *, now: datetime | None = None
-) -> tuple[set[int], list[dict[str, object]]]:
-    """Return issues still backing off and one alert per new error signature."""
-    now = now or datetime.now(UTC)
-    backed_off: set[int] = set()
-    alerts: list[dict[str, object]] = []
-    with failure_state_transaction(state_dir) as state:
-        for entry in state["issues"].values():
-            if not isinstance(entry, dict) or entry.get("active") is not True:
-                continue
-            try:
-                issue_id = int(entry["issue_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            retry_after = parse_time(entry.get("retry_after"))
-            if retry_after is not None and now < retry_after:
-                backed_off.add(issue_id)
-            signature = str(entry.get("signature") or "")
-            notified = entry.get("notified_signatures")
-            notified = list(notified) if isinstance(notified, list) else []
-            if signature and signature not in notified:
-                alerts.append({
-                    "signal": "worklink_run_failure_escalated",
-                    "source_id": f"worklink-run-failure:{issue_id}:{signature}",
-                    "issue_id": issue_id,
-                    "attempt": entry.get("attempt"),
-                    "attempt_consumed": entry.get("attempt_consumed"),
-                    "exit_status": entry.get("exit_status"),
-                    "terminal_error": entry.get("terminal_error"),
-                    "error_signature": signature,
-                    "log": entry.get("log_path"),
-                    "retry_after": entry.get("retry_after"),
-                    "routing_instructions": (
-                        "Notify the operator that a detached Worklink run failed. "
-                        "Include the run-log path and terminal error."
-                    ),
-                })
-                notified.append(signature)
-                entry["notified_signatures"] = notified
-    return backed_off, alerts
-
-
 def main() -> int:
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
@@ -1021,9 +975,15 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        backed_off_ids, failure_alerts = _reconcile_dispatch_failures(state_dir)
+        backed_off_ids, failure_alerts = pending_failure_alerts(state_dir)
         for alert in failure_alerts:
             _emit(alert)
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
     except OSError as exc:
         backed_off_ids = set()
         _emit({

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,12 @@ from ..redaction import redact_text
 STATE_FILE = "dispatch_failures.json"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
+MAX_NOTIFIED_SIGNATURES = 32
+_TRANSIENT_CONTENTION_MARKERS = (
+    ("unable to create", "index.lock"),
+    ("cannot lock ref",),
+    ("could not write new index file",),
+)
 
 
 def terminal_error(value: BaseException | str) -> str:
@@ -55,9 +62,21 @@ def failure_state_transaction(state_dir: Path):
         state = load_failure_state(state_dir)
         try:
             yield state
-        finally:
+        except Exception:
+            raise
+        else:
             save_failure_state(state_dir, state)
+        finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def is_transient_contention(error: str) -> bool:
+    """Return whether a pre-claim failure is short-lived Git lock contention."""
+    normalized = error.casefold()
+    return any(
+        all(marker in normalized for marker in markers)
+        for markers in _TRANSIENT_CONTENTION_MARKERS
+    )
 
 
 def record_failure(
@@ -66,13 +85,29 @@ def record_failure(
     issue_id: int,
     attempt: int | None,
     exit_status: int,
-    error: str,
+    error: BaseException | str,
     log_path: str | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
+    full_error = redact_text(str(error))[:4000]
     safe_error = terminal_error(error)
     signature = error_signature(safe_error)
+    if attempt is None and is_transient_contention(full_error):
+        return {
+            "active": False,
+            "issue_id": issue_id,
+            "attempt": None,
+            "attempt_consumed": False,
+            "exit_status": exit_status,
+            "terminal_error": safe_error,
+            "signature": signature,
+            "transient_contention": True,
+            "failed_at": now.isoformat(),
+            "retry_after": None,
+            "log_path": redact_text(log_path or ""),
+            "notified_signatures": [],
+        }
     with failure_state_transaction(state_dir) as state:
         key = str(issue_id)
         prior = state["issues"].get(key)
@@ -94,14 +129,82 @@ def record_failure(
             "exit_status": exit_status,
             "terminal_error": safe_error,
             "signature": signature,
+            "occurrence_id": uuid.uuid4().hex,
             "consecutive": consecutive,
             "failed_at": now.isoformat(),
             "retry_after": (now + timedelta(minutes=delay)).isoformat(),
             "log_path": redact_text(log_path or ""),
-            "notified_signatures": list(prior.get("notified_signatures") or []),
+            "notified_signatures": list(prior.get("notified_signatures") or [])[
+                -MAX_NOTIFIED_SIGNATURES:
+            ],
         }
         state["issues"][key] = entry
     return entry
+
+
+def pending_failure_alerts(
+    state_dir: Path, *, now: datetime | None = None
+) -> tuple[set[int], list[dict[str, object]]]:
+    """Return active backoffs and undelivered alerts without mutating delivery state."""
+    now = now or datetime.now(UTC)
+    backed_off: set[int] = set()
+    alerts: list[dict[str, object]] = []
+    with failure_state_transaction(state_dir) as state:
+        for entry in state["issues"].values():
+            if not isinstance(entry, dict) or entry.get("active") is not True:
+                continue
+            try:
+                issue_id = int(entry["issue_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            retry_after = parse_time(entry.get("retry_after"))
+            if retry_after is not None and now < retry_after:
+                backed_off.add(issue_id)
+            signature = str(entry.get("signature") or "")
+            notified = entry.get("notified_signatures")
+            notified = list(notified) if isinstance(notified, list) else []
+            if signature and signature not in notified:
+                alerts.append({
+                    "signal": "worklink_run_failure_escalated",
+                    "source_id": f"worklink-run-failure:{issue_id}:{signature}",
+                    "issue_id": issue_id,
+                    "attempt": entry.get("attempt"),
+                    "attempt_consumed": entry.get("attempt_consumed"),
+                    "exit_status": entry.get("exit_status"),
+                    "terminal_error": entry.get("terminal_error"),
+                    "error_signature": signature,
+                    "failure_occurrence_id": entry.get("occurrence_id"),
+                    "log": entry.get("log_path"),
+                    "retry_after": entry.get("retry_after"),
+                    "routing_instructions": (
+                        "Notify the operator that a detached Worklink run failed. "
+                        "Include the run-log path and terminal error."
+                    ),
+                })
+    return backed_off, alerts
+
+
+def mark_failure_notified(
+    state_dir: Path,
+    issue_id: int,
+    signature: str,
+    occurrence_id: str | None,
+) -> None:
+    """Record delivery only if the emitted failure occurrence remains current."""
+    with failure_state_transaction(state_dir) as state:
+        entry = state["issues"].get(str(issue_id))
+        if (
+            not isinstance(entry, dict)
+            or entry.get("active") is not True
+            or entry.get("signature") != signature
+            or entry.get("occurrence_id") != occurrence_id
+        ):
+            return
+        notified = entry.get("notified_signatures")
+        notified = list(notified) if isinstance(notified, list) else []
+        if signature not in notified:
+            notified.append(signature)
+        entry["notified_signatures"] = notified[-MAX_NOTIFIED_SIGNATURES:]
 
 
 def record_success(state_dir: Path, issue_id: int) -> None:
@@ -111,6 +214,7 @@ def record_success(state_dir: Path, issue_id: int) -> None:
             return
         entry["active"] = False
         entry["consecutive"] = 0
+        entry["notified_signatures"] = []
 
 
 def parse_time(value: Any) -> datetime | None:
