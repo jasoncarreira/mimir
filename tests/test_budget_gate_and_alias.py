@@ -2534,6 +2534,72 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
 
 
 @pytest.mark.asyncio
+async def test_real_repo_execution_fault_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.repo_tools import GitRefusal, RepoGitTools
+    from mimir.tools.repo import repo_fetch
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+
+    def fail_after_git_started(self, operation):  # type: ignore[no-untyped-def]
+        raise GitRefusal("git_failed", "git exited 128 after execution started")
+
+    monkeypatch.setattr(RepoGitTools, "execute", fail_after_git_started)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        repo_fetch.func(
+            repository="owner/repo",
+            pull_request=17,
+            runtime=Runtime(context=auth),
+        )
+        raise AssertionError("repo_fetch should have raised")
+
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_fetch", "repo-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "repository operation rejected (git_failed)" in str(result.content)
+    assert ctx.ifc_labels.has_untrusted_active_ingest is True
+
+
+@pytest.mark.asyncio
 async def test_unexpected_tool_fault_still_fails_the_turn_boundary() -> None:
     middleware = BudgetGateMiddleware()
 
