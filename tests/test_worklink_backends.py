@@ -63,10 +63,10 @@ defaults:
   compute_backend: local_subprocess
   timeout_s: 45
   backend_by_category:
-    renderer: mermaid
+    renderer: feature_factory
 routes:
   - label: render
-    backend: mermaid
+    backend: feature_factory
     compute_backend: local_subprocess
   - repo: jasoncarreira/mimir
     backend: opencode
@@ -83,13 +83,13 @@ backends:
     config = WorklinkConfig.load(config_path)
 
     assert config.defaults.timeout_s == 45
-    assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "mermaid"
+    assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "feature_factory"
     assert config.select_backend_name(labels={"worklink"}, repo="jasoncarreira/mimir") == "opencode"
     assert (
         config.select_backend_name(
             labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer"
         )
-        == "mermaid"
+        == "feature_factory"
     )
     assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo") == "opencode"
     registry = BackendRegistry(config)
@@ -231,14 +231,13 @@ compute_backends:
     image: mimirbot-mimirbot
 """.strip()
     )
-    with pytest.raises(ValueError, match="unknown Worklink compute backend config: docker_sibling"):
-        BackendRegistry(WorklinkConfig.load(config_path))
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
-    # select_compute() with no compute_backends block returns the built-in
-    # local_subprocess; with an unknown one selected it must fail clean.
+    # A selected unknown name remains fatal without a matching settings block.
     config_path.write_text("defaults:\n  compute_backend: docker_sibling\n")
-    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
-        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
 
 def test_worklink_config_rejects_retired_ecs_runtask_compute_backend(tmp_path: Path) -> None:
@@ -256,12 +255,12 @@ compute_backends:
     subnets: [subnet-a]
 """.strip()
     )
-    with pytest.raises(ValueError, match="unknown Worklink compute backend config: ecs_runtask"):
-        BackendRegistry(WorklinkConfig.load(config_path))
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
     config_path.write_text("defaults:\n  compute_backend: ecs_runtask\n")
-    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
-        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
 
 def test_worklink_config_rejects_local_subprocess_with_settings(tmp_path: Path) -> None:
@@ -400,6 +399,59 @@ def test_registry_rejects_retired_selected_backend(name: str) -> None:
     registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(backend=name)))
     with pytest.raises(KeyError, match=f"unknown Worklink backend: {name}"):
         registry.select()
+
+
+def test_config_ignores_unreferenced_stale_backend_settings_with_actionable_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        "backends:\n  codex:\n    bin: codex\n"
+        "compute_backends:\n  docker-sibling:\n    image: old\n",
+        encoding="utf-8",
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.backend_settings == {}
+    assert config.compute_backend_settings == {}
+    assert f"unreferenced unknown Worklink backend config 'codex' in {config_path}" in caplog.text
+    assert f"remove backends.codex from {config_path}" in caplog.text
+    assert (
+        f"unreferenced unknown Worklink compute backend config 'docker-sibling' in {config_path}"
+        in caplog.text
+    )
+    assert f"remove compute_backends.docker-sibling from {config_path}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "reference"),
+    [
+        ("defaults:\n  backend: codex\n", "defaults.backend"),
+        (
+            "defaults:\n  backend_by_category:\n    coding-cli: codex\n",
+            "defaults.backend_by_category.coding-cli",
+        ),
+        ("routes:\n  - label: legacy\n    backend: codex\n", "routes[0].backend"),
+        (
+            "routes:\n  - label: remote\n    backend: opencode\n    compute_backend: docker-sibling\n",
+            "routes[0].compute_backend",
+        ),
+    ],
+)
+def test_config_rejects_every_referenced_unknown_backend_with_path_and_fix(
+    tmp_path: Path, yaml_text: str, reference: str
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        WorklinkConfig.load(config_path)
+
+    message = str(raised.value)
+    assert f"referenced by {reference}" in message
+    assert str(config_path) in message
+    assert f"change {reference}" in message
 
 
 @pytest.mark.asyncio

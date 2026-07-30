@@ -116,7 +116,7 @@ from mimir.worklink.backends.feature_factory import (
     factory_run_dir,
     read_factory_run_state,
 )
-from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.continuation import consume_worklink_budget_continuations
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
@@ -968,6 +968,16 @@ def main() -> int:
         _emit({"signal": "worklink_poller_misconfigured", "reason": "MIMIR_HOME unset"})
         return 0
     home = Path(home_env)
+
+    config_path = home / "worklink.yaml"
+    try:
+        BackendRegistry(WorklinkConfig.load(config_path))
+    except Exception as exc:
+        _emit({
+            "signal": "worklink_poller_misconfigured",
+            "reason": f"invalid Worklink config {config_path}: {exc}",
+        })
+        return 0
 
     repo = os.environ.get("WORKLINK_REPO")
     state_dir = Path(os.environ.get("STATE_DIR") or (home / "state" / "pollers" / POLLER_NAME))

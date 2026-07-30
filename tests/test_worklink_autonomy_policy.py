@@ -95,11 +95,12 @@ def _run(
 ):
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
-    # The gate reads the authoritative <home>/worklink.yaml (not the injected
-    # registry's config), so write the operator policy there.
+    # The gate reads the safety opt-in from the authoritative worklink.yaml.
+    # Fake compute selection remains an in-memory registry extension; file-backed
+    # config intentionally rejects backend names unavailable in shipped code.
     (tmp_path / "worklink.yaml").write_text(
         "defaults:\n"
-        f"  compute_backend: {compute_name}\n"
+        "  compute_backend: local_subprocess\n"
         f"  allow_autonomous_local_subprocess: {'true' if allow_local else 'false'}\n",
         encoding="utf-8",
     )
