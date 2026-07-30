@@ -9,7 +9,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..models import AuthContext, RepoPRScopeRegistry, RepoReviewState
+from ..models import AuthContext, RepoReviewState
 from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
@@ -36,19 +36,13 @@ def _state(
     repository: str,
     pull_request: int,
 ) -> RepoReviewState:
-    context = getattr(runtime, "context", None)
-    registry = getattr(context, "repo_pr_scope_registry", None)
-    if not isinstance(registry, RepoPRScopeRegistry) or not registry.review_states:
-        raise ToolException(
-            "repository operation rejected: this turn carries no authorized pull requests"
-        )
-    state = registry.resolve(repository, pull_request)
-    if state is None:
-        raise ToolException(
-            "repository operation rejected: requested pull request is not authorized "
-            "for this turn"
-        )
-    return state
+    from .forge import resolve_review_state
+
+    try:
+        return resolve_review_state(runtime, repository, pull_request)
+    except ToolException as exc:
+        detail = str(exc).removeprefix("pull-request operation rejected: ")
+        raise ToolException(f"repository operation rejected: {detail}") from exc
 
 
 def _execute(

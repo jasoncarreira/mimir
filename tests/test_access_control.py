@@ -4352,7 +4352,6 @@ def _github_scope_test_setup(
     ("field", "value"),
     [
         ("repo", "attacker/other"),
-        ("event_type", "pr_review"),
         ("author", "someone-else"),
         ("head_repo", "fork/r"),
         ("head_remote", "upstream"),
@@ -4494,9 +4493,17 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
         assert access_control.create_server_discovered_heartbeat_scope(
             "o/r", candidate, event_type="pr_changes_requested_stale",
         ) is None
-    assert access_control.create_server_discovered_heartbeat_scope(
+    review = access_control.create_server_discovered_heartbeat_scope(
         "o/r", pr, event_type="pr_review",
-    ) is None
+    )
+    assert review is not None
+    assert review.allowed_operations == frozenset({
+        access_control.RepoPRAction.INSPECT.value,
+        access_control.RepoPRAction.CHECKOUT.value,
+        access_control.RepoPRAction.TEST.value,
+        access_control.RepoPRAction.PR_REVIEW.value,
+        access_control.RepoPRAction.PR_COMMENT.value,
+    })
 
 
 def test_heartbeat_scope_rejects_raw_provider_payload(

@@ -784,7 +784,10 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
 })
 _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
     RepoPRAction.PR_REVIEW.value,
+    RepoPRAction.PR_COMMENT.value,
 })
 _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_metadata": RepoPRAction.INSPECT.value,
@@ -826,6 +829,15 @@ _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 def _configured_scope_github_repos() -> frozenset[str]:
     return frozenset(
         f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
+    )
+
+
+def is_configured_github_repo(repo: object) -> bool:
+    """Return whether a model-supplied selector names server configuration."""
+    return (
+        isinstance(repo, str)
+        and _GITHUB_REPO_PATTERN.fullmatch(repo) is not None
+        and repo.lower() in _configured_scope_github_repos()
     )
 
 
@@ -876,15 +888,12 @@ def _repo_pr_scope(
     head_sha: object,
     base_ref: object,
     base_sha: object,
-    requested_reviewer: object = None,
 ) -> Any:
     """Validate a complete observed PR snapshot and issue its closed scope."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     is_remediation = event_type == "pr_changes_requested_stale"
-    is_review = event_type == "pr_review_requested" and requested_reviewer == self_login
     if (
-        not (is_remediation or is_review)
-        or not self_login
+        not self_login
         or (is_remediation and principal != self_login)
         or not isinstance(repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
@@ -895,7 +904,7 @@ def _repo_pr_scope(
         or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
         or (is_remediation and head_repo.lower() != repo.lower())
         or (is_remediation and head_remote != "origin")
-        or (is_review and head_remote != "source")
+        or (not is_remediation and head_remote not in {"origin", "source"})
         or not _valid_git_branch(head_ref)
         or not _valid_git_branch(base_ref)
         or not isinstance(head_sha, str)
@@ -924,11 +933,12 @@ def _repo_pr_scope(
         ),
         pr_number=number,
         head_repo=head_repo,
-        head_remote=head_remote,
+        head_remote=head_remote if is_remediation else "origin",
         destination_ref=f"refs/heads/{head_ref}",
         observed_head_sha=head_sha.lower(),
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
+        checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
     )
 
 
@@ -949,6 +959,31 @@ def create_server_discovered_heartbeat_scope(
         repo=repo,
         principal=pull_request.author,
         event_type=event_type,
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+    )
+
+
+def create_server_discovered_review_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+) -> Any:
+    """Issue standing review authority from a provider-normalized live PR."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return None
+    return _repo_pr_scope(
+        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        repo=repo,
+        principal=pull_request.author,
+        event_type="pr_review",
         number=pull_request.number,
         head_repo=pull_request.head_repo,
         head_remote=pull_request.head_remote,
@@ -989,7 +1024,6 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             head_sha=item.get("head_sha"),
             base_ref=item.get("base_ref"),
             base_sha=item.get("base_sha"),
-            requested_reviewer=item.get("requested_reviewer"),
         )
         if scope is None:
             continue
@@ -5218,6 +5252,20 @@ class ToolRegistry:
                     if registry is not None and hasattr(registry, "resolve")
                     else None
                 )
+                if state is None:
+                    discovered = getattr(
+                        auth_context, "server_discovered_pr_states", None,
+                    )
+                    state = (
+                        discovered.resolve(
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                        if discovered is not None
+                        and isinstance(tool_arguments.get("repository"), str)
+                        and isinstance(tool_arguments.get("pull_request"), int)
+                        else None
+                    )
                 repo_pr_action_scope = (
                     state.action_scope if state is not None else None
                 )
@@ -5321,6 +5369,11 @@ class ToolRegistry:
                     and (
                         required_action is None
                         or required_action in getattr(scope, "allowed_operations", frozenset())
+                        or (
+                            tool_name == "pr_rerequest_review"
+                            and RepoPRAction.PR_REVIEW.value
+                            in getattr(scope, "allowed_operations", frozenset())
+                        )
                     )
                 )
                 allowed = in_scope or not enforce

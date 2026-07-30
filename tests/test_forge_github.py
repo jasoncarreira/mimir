@@ -76,6 +76,32 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+def test_live_snapshot_normalizes_all_authority_facts() -> None:
+    session = Session([Response({
+        "number": 17, "state": "open", "user": {"login": "author"},
+        "base": {"ref": "main", "sha": "b" * 40},
+        "head": {
+            "ref": "feature", "sha": "a" * 40,
+            "repo": {"full_name": "contributor/fork"},
+        },
+    })])
+
+    snapshot = GitHubForgeClient(session=session).get_pull_request_snapshot(
+        "owner/repo", 17,
+    )
+
+    assert snapshot.state == "open"
+    assert snapshot.number == 17
+    assert snapshot.author == "author"
+    assert snapshot.head_repo == "contributor/fork"
+    assert snapshot.head_remote == "source"
+    assert snapshot.head_ref == "feature"
+    assert snapshot.head_sha == "a" * 40
+    assert snapshot.base_ref == "main"
+    assert snapshot.base_sha == "b" * 40
+    assert session.calls[0][1].endswith("/repos/owner/repo/pulls/17")
+
+
 def test_submit_review_uses_json_transport_and_scope_head() -> None:
     session = Session([Response({
         "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",

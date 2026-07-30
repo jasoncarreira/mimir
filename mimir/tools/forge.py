@@ -15,7 +15,9 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
 from ..forge import ForgeClient, ForgeError, ReviewVerdict
-from ..models import AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry
+from ..models import (
+    AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+)
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
@@ -47,26 +49,75 @@ def _scope(
     repository: str,
     pull_request: int,
 ) -> RepoPRActionScope:
-    context = getattr(runtime, "context", None)
-    registry = getattr(context, "repo_pr_scope_registry", None)
-    if not isinstance(registry, RepoPRScopeRegistry) or not registry.review_states:
-        raise ToolException(
-            "pull-request operation rejected: this turn carries no authorized pull requests"
-        )
-    state = registry.resolve(repository, pull_request)
-    if state is None:
-        raise ToolException(
-            "pull-request operation rejected: requested pull request is not authorized "
-            "for this turn"
-        )
+    state = resolve_review_state(runtime, repository, pull_request)
     scope = state.action_scope
     if action is not None and action.value not in scope.allowed_operations:
         raise ToolException(f"pull-request operation rejected: {action.value} not granted")
     return scope
 
 
+def resolve_review_state(
+    runtime: ToolRuntime[AuthContext] | None,
+    repository: str,
+    pull_request: int,
+) -> Any:
+    """Resolve existing narrow authority or derive standing live review authority."""
+    context = getattr(runtime, "context", None)
+    return resolve_review_state_for_context(context, repository, pull_request)
+
+
+def resolve_review_state_for_context(
+    context: AuthContext | None,
+    repository: str,
+    pull_request: int,
+) -> RepoReviewState:
+    """Context-level variant used by authorization before tool invocation."""
+    registry = getattr(context, "repo_pr_scope_registry", None)
+    state = registry.resolve(repository, pull_request) if isinstance(
+        registry, RepoPRScopeRegistry,
+    ) else None
+    if state is not None:
+        return state
+    if (
+        not isinstance(repository, str)
+        or not isinstance(pull_request, int)
+        or isinstance(pull_request, bool)
+        or pull_request < 1
+    ):
+        raise ToolException("pull-request operation rejected: invalid pull-request selector")
+    from ..access_control import (
+        create_server_discovered_review_scope,
+        is_configured_github_repo,
+    )
+
+    if not is_configured_github_repo(repository):
+        raise ToolException(
+            "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
+        )
+    cache = getattr(context, "server_discovered_pr_states", None)
+    cached = cache.resolve(repository, pull_request) if cache is not None else None
+    if cached is not None:
+        return cached
+    client = _client_for_repository(repository)
+    try:
+        snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
+    except ForgeError as exc:
+        raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    scope = create_server_discovered_review_scope(repository, snapshot)
+    if scope is None or scope.pr_number != pull_request:
+        raise ToolException(
+            "pull-request operation rejected: live pull request is closed or invalid"
+        )
+    state = RepoReviewState(scope)
+    return cache.remember(state) if cache is not None else state
+
+
 def _client(scope: RepoPRActionScope) -> ForgeClient:
-    client = _clients.get(scope.canonical_repo.lower()) or _default_client
+    return _client_for_repository(scope.canonical_repo)
+
+
+def _client_for_repository(repository: str) -> ForgeClient:
+    client = _clients.get(repository.lower()) or _default_client
     if client is None:
         from ..forge.github import GitHubForgeClient
 
@@ -239,7 +290,10 @@ def pr_rerequest_review(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Re-request one reviewer on the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
+    scope = _scope(runtime, None, repository, pull_request)
+    if not ({RepoPRAction.PR_REVIEW.value, RepoPRAction.PR_REREQUEST.value}
+            & scope.allowed_operations):
+        raise ToolException("pull-request operation rejected: review rerequest not granted")
     if _REVIEWER.fullmatch(reviewer) is None:
         raise ToolException("reviewer is invalid")
     _call(lambda: _client(scope).rerequest_review(scope, reviewer))

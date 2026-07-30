@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from ..models import RepoPRActionScope
+from ..models import NormalizedPullRequestSnapshot, RepoPRActionScope
 from .client import (
     CheckProjection,
     CommentProjection,
@@ -166,6 +166,42 @@ class GitHubForgeClient:
     def _user(payload: Mapping[str, Any]) -> str:
         user = payload.get("user")
         return str(user.get("login", "")) if isinstance(user, Mapping) else ""
+
+    def get_pull_request_snapshot(
+        self, repository: str, number: int,
+    ) -> NormalizedPullRequestSnapshot:
+        """Fetch and normalize all authority-bearing PR facts server-side."""
+        if (
+            _REPOSITORY.fullmatch(repository) is None
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or number < 1
+        ):
+            raise ForgeError("invalid pull-request selector")
+        data = self._request("GET", f"/repos/{repository}/pulls/{number}")
+        if not isinstance(data, Mapping):
+            raise ForgeError("forge returned invalid pull-request metadata")
+        observed_number = data.get("number")
+        if (
+            not isinstance(observed_number, int)
+            or isinstance(observed_number, bool)
+            or observed_number != number
+        ):
+            raise ForgeError("forge returned invalid pull-request metadata")
+        base = data.get("base") if isinstance(data.get("base"), Mapping) else {}
+        head = data.get("head") if isinstance(data.get("head"), Mapping) else {}
+        head_repo = head.get("repo") if isinstance(head.get("repo"), Mapping) else {}
+        return NormalizedPullRequestSnapshot(
+            state=str(data.get("state", "")),
+            number=observed_number,
+            author=self._user(data),
+            head_repo=str(head_repo.get("full_name", "")),
+            head_remote="source",
+            head_ref=str(head.get("ref", "")),
+            head_sha=str(head.get("sha", "")),
+            base_ref=str(base.get("ref", "")),
+            base_sha=str(base.get("sha", "")),
+        )
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection:
         repository, number = self._target(scope)

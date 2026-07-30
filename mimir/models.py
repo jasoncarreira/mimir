@@ -584,6 +584,9 @@ class RepoPRActionScope:
     observed_head_sha: str
     base_ref: str
     observed_base_sha: str
+    # A provider-owned immutable ref used only to obtain the observed head.
+    # Write scopes leave this unset and continue to fetch/push destination_ref.
+    checkout_ref: str | None = None
     scope_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -612,6 +615,8 @@ class RepoPRActionScope:
             "base_ref": self.base_ref,
             "observed_base_sha": self.observed_base_sha,
         }
+        if self.checkout_ref is not None:
+            authority["checkout_ref"] = self.checkout_ref
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
         object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
 
@@ -726,6 +731,25 @@ class RepoPRScopeRegistry:
         )
 
 
+@dataclass
+class ServerDiscoveredPRStates:
+    """Per-turn cache of review states derived from live provider snapshots."""
+
+    _states: dict[tuple[str, int], RepoReviewState] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
+        with self._lock:
+            return self._states.get((repository.lower(), pull_request))
+
+    def remember(self, state: RepoReviewState) -> RepoReviewState:
+        target = (state.repo.lower(), state.pr_number)
+        with self._lock:
+            return self._states.setdefault(target, state)
+
+
 @dataclass(frozen=True)
 class AuthContext:
     """Frozen, server-created authorization context (chainlink #864).
@@ -786,6 +810,11 @@ class AuthContext:
     )
     repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
+    )
+    # Standing review authority is resolved lazily from a live server fetch.
+    # This cache is per turn and stores only immutable server-issued scopes.
+    server_discovered_pr_states: ServerDiscoveredPRStates = field(
+        default_factory=ServerDiscoveredPRStates, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.

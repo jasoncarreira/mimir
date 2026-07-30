@@ -81,34 +81,34 @@ def _auth(scope: RepoPRActionScope, *additional: RepoPRActionScope) -> AuthConte
     )
 
 
-def test_repo_wrapper_refuses_missing_immutable_scope() -> None:
+def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
     runtime = SimpleNamespace(context=AuthContext(
         principal=None, canonical_principal=None, roles=(), event_ingress=None,
         trigger="scheduled_tick", channel_id="scheduler:heartbeat",
         interactivity=None,
     ))
 
-    with pytest.raises(ToolException, match="no authorized pull requests"):
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
         repo_status.func(
             repository="owner/repo", pull_request=7, runtime=runtime,
         )
 
-    with pytest.raises(ToolException, match="no authorized pull requests"):
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
         repo_test.func(
             repository="owner/repo", pull_request=7, runtime=runtime,
         )
 
 
-def test_repo_wrapper_refuses_unlisted_pull_request() -> None:
+def test_repo_wrapper_refuses_unconfigured_unlisted_pull_request() -> None:
     inspect = _scope(RepoPRAction.INSPECT)
     context = _auth(inspect)
 
-    with pytest.raises(ToolException, match="not authorized for this turn"):
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
         repo_status.func(
             repository="owner/repo", pull_request=8,
             runtime=SimpleNamespace(context=context),
         )
-    with pytest.raises(ToolException, match="not authorized for this turn"):
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
         repo_test.func(
             repository="owner/repo", pull_request=8,
             runtime=SimpleNamespace(context=context),

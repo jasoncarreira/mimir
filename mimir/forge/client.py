@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
-from ..models import RepoPRActionScope
+from ..models import NormalizedPullRequestSnapshot, RepoPRActionScope
 
 
 class ForgeError(RuntimeError):
@@ -86,6 +86,10 @@ class ReviewRequestProjection:
 
 class ForgeClient(Protocol):
     """Narrow adapter contract; every target comes from an immutable scope."""
+
+    def get_pull_request_snapshot(
+        self, repository: str, number: int,
+    ) -> NormalizedPullRequestSnapshot: ...
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection: ...
 

@@ -40,7 +40,13 @@ _OPERATION_ACTION = {
     "repo_commit": RepoPRAction.COMMIT.value,
     "repo_push": RepoPRAction.PUSH.value,
 }
-_REVIEW_ACTIONS = frozenset({RepoPRAction.INSPECT.value, RepoPRAction.PR_REVIEW.value})
+_REVIEW_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
+    RepoPRAction.PR_REVIEW.value,
+    RepoPRAction.PR_COMMENT.value,
+})
 _REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,
@@ -131,7 +137,13 @@ def evaluate_typed_shadow(probe: ParityProbe) -> TypedProjection:
         return TypedProjection("escalate", "unsupported_operation", ("escalation",))
 
     actions = _REVIEW_ACTIONS if probe.workflow == "review" else _REMEDIATION_ACTIONS
-    if _OPERATION_ACTION[probe.operation] not in actions:
+    if (
+        _OPERATION_ACTION[probe.operation] not in actions
+        and not (
+            probe.operation == "pr_rerequest_review"
+            and RepoPRAction.PR_REVIEW.value in actions
+        )
+    ):
         return TypedProjection("refuse", "scope_action_denied")
     if probe.operation == "repo_push" and not probe.head_is_current:
         return TypedProjection("refuse", "stale_scope")
