@@ -9,6 +9,11 @@ import pytest
 
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import PRCheckoutLease, create_pr_checkout_lease
+from mimir.project_tests import (
+    ProjectTestProcessResult,
+    ProjectTestRefusal,
+    RepoProjectTests,
+)
 from mimir.repo_tools import (
     GitCommit,
     GitDiff,
@@ -657,6 +662,143 @@ def test_constructor_refuses_unbounded_execution_and_untrusted_git_pins(tmp_path
     not_executable.write_text("not git\n", encoding="utf-8")
     with pytest.raises(ValueError, match="not executable"):
         RepoGitTools(state, git_executable=not_executable)
+
+
+def _configure_worklink_test(home: Path, command: str = "env -u MIMIR_MODEL_SPEC /usr/bin/true -q") -> None:
+    home.mkdir(exist_ok=True)
+    (home / "worklink.yaml").write_text(
+        f"defaults:\n  test_command: {command}\n",
+        encoding="utf-8",
+    )
+
+
+def test_project_tests_use_fixed_command_checkout_and_environment(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_never_pass_to_tests")
+    calls = []
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        calls.append((argv, cwd, env, timeout, output_limit))
+        return ProjectTestProcessResult(0, stdout=f"ok {cwd}")
+
+    result = RepoProjectTests(state, runner=runner).execute(("tracked.txt::case",))
+
+    assert result.ok is True
+    assert result.code == "tests_passed"
+    assert result.stdout == "ok <checkout>"
+    argv, cwd, env, timeout, output_limit = calls[0]
+    assert argv == ("/usr/bin/true", "-q", "tracked.txt::case")
+    assert cwd == state.checkout_lease.path.resolve()
+    assert "GITHUB_TOKEN" not in env
+    assert "MIMIR_MODEL_SPEC" not in env
+    assert timeout == 300.0
+    assert output_limit == 64 * 1024
+
+
+def test_project_test_failure_is_actionable_and_output_is_scrubbed(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home, "/usr/bin/false")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz"
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        return ProjectTestProcessResult(
+            3, stdout=f"failure in {cwd}\n{secret}", stderr=f"token={secret}",
+        )
+
+    result = RepoProjectTests(state, runner=runner).execute()
+
+    assert result.ok is False
+    assert result.code == "tests_failed"
+    assert result.returncode == 3
+    assert str(state.checkout_lease.path.resolve()) not in result.stdout
+    assert secret not in result.stdout + result.stderr
+    assert "[REDACTED]" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("selector", ["--flag", "../outside", "tracked.txt;id", "/tmp/test"])
+def test_project_test_selector_injection_is_refused(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selector: str,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        RepoProjectTests(state).execute((selector,))
+    assert refusal.value.code in {"test_selector_invalid", "test_selector_outside_checkout"}
+
+
+def test_project_test_resolves_selector_before_checkout_containment(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    outside = tmp_path / "outside-test"
+    outside.write_text("outside\n", encoding="utf-8")
+    (state.checkout_lease.path / "escaped-test").symlink_to(outside)
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        RepoProjectTests(state).execute(("escaped-test",))
+    assert refusal.value.code == "test_selector_outside_checkout"
+
+    internal_target = state.checkout_lease.path / "tracked.txt"
+    (state.checkout_lease.path / "internal-test-link").symlink_to(internal_target)
+    with pytest.raises(ProjectTestRefusal) as internal:
+        RepoProjectTests(state).execute(("internal-test-link",))
+    assert internal.value.code == "test_selector_outside_checkout"
+
+
+def test_project_test_scope_action_and_active_lease_guards_are_pinned(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    denied_scope = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.TEST.value},
+    )
+    denied_state = RepoReviewState(denied_scope)
+    with pytest.raises(ProjectTestRefusal) as denied:
+        RepoProjectTests(denied_state).execute()
+    assert denied.value.code == "scope_action_denied"
+
+    object.__setattr__(state, "checkout_lease", replace(state.checkout_lease, revoked=True))
+    with pytest.raises(ProjectTestRefusal) as inactive:
+        RepoProjectTests(state).execute()
+    assert inactive.value.code == "inactive_checkout"
+
+
+def test_project_test_output_limit_returns_no_partial_unredactable_output(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        return ProjectTestProcessResult(
+            -9, stdout="possibly-partial-secret", output_limited=True,
+        )
+
+    result = RepoProjectTests(state, runner=runner).execute()
+    assert result.code == "test_output_limit"
+    assert result.stdout == result.stderr == ""
 
 
 @pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])

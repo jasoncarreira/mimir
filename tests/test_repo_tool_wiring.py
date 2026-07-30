@@ -22,7 +22,7 @@ from mimir.models import (
     RepoReviewState,
     SourceLabel,
 )
-from mimir.tools.repo import repo_checkout, repo_cleanup, repo_status
+from mimir.tools.repo import repo_checkout, repo_cleanup, repo_status, repo_test
 
 
 def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
@@ -93,6 +93,11 @@ def test_repo_wrapper_refuses_missing_immutable_scope() -> None:
             repository="owner/repo", pull_request=7, runtime=runtime,
         )
 
+    with pytest.raises(ToolException, match="no authorized pull requests"):
+        repo_test.func(
+            repository="owner/repo", pull_request=7, runtime=runtime,
+        )
+
 
 def test_repo_wrapper_refuses_unlisted_pull_request() -> None:
     inspect = _scope(RepoPRAction.INSPECT)
@@ -100,6 +105,11 @@ def test_repo_wrapper_refuses_unlisted_pull_request() -> None:
 
     with pytest.raises(ToolException, match="not authorized for this turn"):
         repo_status.func(
+            repository="owner/repo", pull_request=8,
+            runtime=SimpleNamespace(context=context),
+        )
+    with pytest.raises(ToolException, match="not authorized for this turn"):
+        repo_test.func(
             repository="owner/repo", pull_request=8,
             runtime=SimpleNamespace(context=context),
         )

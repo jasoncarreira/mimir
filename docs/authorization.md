@@ -442,12 +442,22 @@ working directory must resolve inside `MIMIR_FILE_TOOL_ROOTS`; a model-supplied
 this setting, and ordinary `python -c`, `node -e`, `ruby -e`, `sh -c`, and
 equivalent service requests remain outside every profile.
 
-Configured tests run only through synchronous `shell_exec`, directly with
-`shell=False`. `bash_async` refuses them as `project_test_async_refused`, keeping
+The shell compatibility path runs configured tests only through synchronous
+`shell_exec`, directly with `shell=False`. `bash_async` refuses them as
+`project_test_async_refused`, keeping
 the existing 60-second wall-clock bound. Expiry returns the named
 `project_test_timeout` refusal; returned stdout and stderr are capped at 4,000
 and 2,000 characters respectively. With the setting unset, no test command is
 added to a trusted-service profile.
+
+Remediation turns use the narrower `repo_test` capability. Its command comes
+from the same deployment's `worklink.yaml` `defaults.test_command`; the model
+supplies no command, flags, environment, or working directory. The server
+executes the resolved command without a shell in the active checkout lease for
+the named authorized PR. Optional selectors must name existing non-symlink
+paths inside that checkout after canonical resolution. Test output is captured
+under hard byte limits, credential-shaped values and the lease path are
+redacted, and nonzero suites return `tests_failed` rather than a shell error.
 
 ## How to extend
 

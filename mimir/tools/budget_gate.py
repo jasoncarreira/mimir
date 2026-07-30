@@ -332,7 +332,7 @@ def _extract_sink_target(
     if tool_name in {
         "pr_submit_review", "pr_inline_review_comment", "pr_comment",
         "pr_rerequest_review", "unsupported_operation", "repo_checkout",
-        "repo_cleanup", "repo_fetch", "repo_stage", "repo_commit", "repo_merge",
+        "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge",
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
         "repo_revert_abort", "repo_push",
     }:

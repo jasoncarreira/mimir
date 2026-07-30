@@ -233,6 +233,19 @@ def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
         assert {"repository", "pull_request"} <= set(properties), (name, properties)
 
 
+def test_repo_test_schema_exposes_no_execution_authority() -> None:
+    from mimir.tools import all_mimir_tools
+
+    tools = {
+        tool.name: tool
+        for tool in all_mimir_tools(
+            coding_enabled=True, require_coding_available=False,
+        )
+    }
+    properties = tools["repo_test"].tool_call_schema.model_json_schema()["properties"]
+    assert set(properties) == {"repository", "pull_request", "selectors"}
+
+
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     from mimir.server import build_app
 

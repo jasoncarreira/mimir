@@ -11,6 +11,7 @@ from langchain_core.tools.base import create_schema_from_function
 
 from ..models import AuthContext, RepoPRScopeRegistry, RepoReviewState
 from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
+from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
     GitCommit,
     GitDiff,
@@ -125,6 +126,23 @@ def repo_status(
 ) -> dict[str, Any]:
     """Read porcelain status from the active bound checkout."""
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
+
+
+@tool
+def repo_test(
+    repository: str,
+    pull_request: int,
+    selectors: tuple[str, ...] = (),
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Run the deployment-configured tests in the active bound PR checkout."""
+    try:
+        return asdict(
+            RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors)
+        )
+    except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+        code = getattr(exc, "code", "project_test_failed")
+        raise ToolException(f"project test rejected ({code}): {exc}") from exc
 
 
 @tool
@@ -252,6 +270,7 @@ REPO_TOOLS = tuple(_bind_injected_runtime(repo_tool) for repo_tool in (
     repo_cleanup,
     repo_fetch,
     repo_status,
+    repo_test,
     repo_diff,
     repo_unmerged,
     repo_stage,
