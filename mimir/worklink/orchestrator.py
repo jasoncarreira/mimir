@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from .backends import (
     BackendRegistry,
     CheckoutShape,
+    OpenCodeBackend,
     ToolBackend,
     WorkOrder,
     WorklinkConfig,
@@ -496,43 +497,54 @@ class WorklinkRunner:
                     model=invocation_model,
                     configured_model=spec.backend_config.get("configured_model"),
                 )
-            handle = None
-            try:
-                handle = await compute.launch(spec)
-                # #561: persist the worker handle so a fresh controller can
-                # reattach after a container restart. local_subprocess work dies
-                # with the controller, so nothing is persisted today; the
-                # reaper remains the recovery net. After #832 no live compute
-                # substrate is persistent, so this branch is dormant.
-                if compute.capabilities().persistent_after_disconnect:
-                    _persist_run_state(
-                        self.home,
-                        issue=issue,
-                        attempt=record.attempt,
-                        backend_name=selected_name,
-                        compute=compute,
-                        handle=handle,
-                        lease=lease,
-                        repo=self.repo,
-                        repo_url=repo_url,
-                        test_command=test_cmd,
-                        started_at=started,
+            async def invoke_backend() -> ComputeResult:
+                handle = None
+                try:
+                    handle = await compute.launch(spec)
+                    # #561: persist the worker handle so a fresh controller can
+                    # reattach after a container restart. local_subprocess work dies
+                    # with the controller, so nothing is persisted today; the
+                    # reaper remains the recovery net. After #832 no live compute
+                    # substrate is persistent, so this branch is dormant.
+                    if compute.capabilities().persistent_after_disconnect:
+                        _persist_run_state(
+                            self.home,
+                            issue=issue,
+                            attempt=record.attempt,
+                            backend_name=selected_name,
+                            compute=compute,
+                            handle=handle,
+                            lease=lease,
+                            repo=self.repo,
+                            repo_url=repo_url,
+                            test_command=test_cmd,
+                            started_at=started,
+                        )
+                    return await _heartbeat_while(
+                        compute.wait(handle, spec.timeout_s),
+                        claims=claims,
+                        record=record,
                     )
-                compute_result = await _heartbeat_while(
-                    compute.wait(handle, spec.timeout_s),
-                    claims=claims,
-                    record=record,
+                except ComputeLaunchError as exc:
+                    return ComputeResult(
+                        exit_code=-1,
+                        stdout="",
+                        stderr=str(exc),
+                        launch_error=str(exc),
+                    )
+                finally:
+                    if handle is not None:
+                        await compute.cleanup(handle)
+
+            if isinstance(backend, OpenCodeBackend):
+                compute_result = await backend.invoke_with_startup_retry(
+                    invoke_backend,
+                    issue_id=issue.issue_id,
+                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner),
+                    event_logger=_log_event,
                 )
-            except ComputeLaunchError as exc:
-                compute_result = ComputeResult(
-                    exit_code=-1,
-                    stdout="",
-                    stderr=str(exc),
-                    launch_error=str(exc),
-                )
-            finally:
-                if handle is not None:
-                    await compute.cleanup(handle)
+            else:
+                compute_result = await invoke_backend()
             return await self._finalize(
                 issue=issue,
                 claims=claims,
@@ -2266,6 +2278,20 @@ def _dirty_paths(repo: Path, *, runner: Runner) -> list[str]:
     if status.returncode != 0:
         return []
     return _paths_from_status(status.stdout)
+
+
+def _checkout_snapshot(checkout: Path, *, runner: Runner) -> tuple[str, str]:
+    """Capture committed and working state so startup retry never repeats work."""
+    head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    status = runner([
+        "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
+    ])
+    if head.returncode != 0 or status.returncode != 0:
+        raise WorklinkError(
+            (head.stderr or status.stderr or head.stdout or status.stdout).strip()
+            or "could not snapshot Worklink checkout"
+        )
+    return head.stdout.strip(), status.stdout
 
 
 def _new_dirty_paths(paths: Sequence[str], *, before: Sequence[str]) -> list[str]:
