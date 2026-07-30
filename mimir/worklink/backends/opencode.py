@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import logging
 import os
 from pathlib import Path
 import re
-from typing import Sequence
+from typing import Awaitable, Callable, Sequence
 
 from ...config import model_spec_at_call_time
 from ...opencode_config import opencode_model_from_agent_spec, resolve_opencode_invocation
@@ -19,7 +20,22 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
 _INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
+# Five total attempts wait 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds. That
+# comfortably spans the observed sub-second SQLite startup lock while bounding
+# a genuinely stuck session store to a short delay.
+STARTUP_CONTENTION_MAX_ATTEMPTS = 5
+STARTUP_CONTENTION_INITIAL_BACKOFF_S = 0.1
+STARTUP_CONTENTION_RESOURCE = "opencode_sqlite_session_store"
+STARTUP_CONTENTION_EXHAUSTED_REASON = "opencode_startup_sqlite_contention_exhausted"
+_SQLITE_CONTENTION_PATTERNS = (
+    re.compile(r"\bdatabase(?: table)? is locked\b", re.IGNORECASE),
+    re.compile(r"\bdatabase is busy\b", re.IGNORECASE),
+    re.compile(r"\bSQLITE_BUSY\b", re.IGNORECASE),
+)
 log = logging.getLogger(__name__)
+
+EventLogger = Callable[..., None]
+Sleeper = Callable[[float], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,46 @@ class OpenCodeBackend:
             local_checkout=order.checkout,
             local_argv=_local_argv(self.bin, args, order.checkout, prompt),
         )
+
+    async def invoke_with_startup_retry(
+        self,
+        invoke: Callable[[], Awaitable[ComputeResult]],
+        *,
+        issue_id: int,
+        event_logger: EventLogger | None = None,
+        max_attempts: int = STARTUP_CONTENTION_MAX_ATTEMPTS,
+        initial_backoff_s: float = STARTUP_CONTENTION_INITIAL_BACKOFF_S,
+        sleeper: Sleeper = asyncio.sleep,
+    ) -> ComputeResult:
+        """Retry only transient SQLite contention reported by OpenCode startup."""
+        max_attempts = max(1, max_attempts)
+        initial_backoff_s = max(0.0, initial_backoff_s)
+        result: ComputeResult | None = None
+        for attempt in range(1, max_attempts + 1):
+            result = await invoke()
+            if not _is_sqlite_contention(result):
+                if attempt > 1:
+                    _emit_startup_contention(
+                        event_logger, issue_id, attempt, max_attempts, "succeeded"
+                    )
+                return result
+
+            if attempt < max_attempts:
+                _emit_startup_contention(
+                    event_logger, issue_id, attempt, max_attempts, "retrying"
+                )
+                await sleeper(initial_backoff_s * (2 ** (attempt - 1)))
+
+        assert result is not None
+        _emit_startup_contention(
+            event_logger, issue_id, max_attempts, max_attempts, "exhausted"
+        )
+        detail = result.stderr.rstrip()
+        stderr = f"{detail}\n{STARTUP_CONTENTION_EXHAUSTED_REASON}" if detail else (
+            STARTUP_CONTENTION_EXHAUSTED_REASON
+        )
+        return replace(result, stderr=stderr)
+
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("OpenCodeBackend.interpret expects ComputeResult")
@@ -162,6 +218,33 @@ class OpenCodeBackend:
             blocked_reason,
             output_overflow=result.output_overflow,
         )
+
+
+def _is_sqlite_contention(result: ComputeResult) -> bool:
+    if result.exit_code == 0:
+        return False
+    detail = f"{result.stderr}\n{result.stdout}"
+    return any(pattern.search(detail) for pattern in _SQLITE_CONTENTION_PATTERNS)
+
+
+def _emit_startup_contention(
+    event_logger: EventLogger | None,
+    issue_id: int,
+    attempt: int,
+    max_attempts: int,
+    outcome: str,
+) -> None:
+    if event_logger is None:
+        return
+    event_logger(
+        "worklink_backend_startup_contention",
+        issue_id=issue_id,
+        backend="opencode",
+        resource=STARTUP_CONTENTION_RESOURCE,
+        retry_attempt=attempt,
+        max_attempts=max_attempts,
+        outcome=outcome,
+    )
 
 
 def validate_extra_args(args: Sequence[str]) -> None:

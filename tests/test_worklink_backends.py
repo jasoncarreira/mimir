@@ -616,6 +616,109 @@ def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> N
     assert raw.error == "design requires raw docker.sock access"
 
 
+@pytest.mark.asyncio
+async def test_opencode_retries_transient_sqlite_startup_contention() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return ComputeResult(1, "", "SqliteError: database is locked")
+        return ComputeResult(0, "completed", "")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        sleeper=sleep,
+    )
+
+    assert result.exit_code == 0
+    assert attempts == 3
+    assert sleeps == [0.1, 0.2]
+    assert [(event, payload["outcome"]) for event, payload in events] == [
+        ("worklink_backend_startup_contention", "retrying"),
+        ("worklink_backend_startup_contention", "retrying"),
+        ("worklink_backend_startup_contention", "succeeded"),
+    ]
+    assert all(
+        payload["resource"] == "opencode_sqlite_session_store"
+        for _event, payload in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_persistent_sqlite_contention_exhausts_with_named_reason(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    events: list[dict[str, object]] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "SqliteError: SQLITE_BUSY: database is locked")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    backend = OpenCodeBackend()
+    result = await backend.invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        event_logger=lambda _event, **payload: events.append(payload),
+        sleeper=sleep,
+    )
+    order = WorkOrder(1085, tmp_path, "p", None, 30, transcript_root=tmp_path / "t")
+    raw = await backend.interpret(order, result)
+
+    assert attempts == 5
+    assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert raw.error == "opencode_startup_sqlite_contention_exhausted"
+    assert [event["outcome"] for event in events] == [
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "exhausted",
+    ]
+    assert events[-1]["max_attempts"] == 5
+    assert raw.transcript_path is not None
+    transcript = json.loads(raw.transcript_path.read_text(encoding="utf-8"))
+    assert "SQLITE_BUSY" in transcript["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_non_transient_startup_failure_is_not_retried() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def invoke() -> ComputeResult:
+        nonlocal attempts
+        attempts += 1
+        return ComputeResult(1, "", "configuration file is invalid")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke,
+        issue_id=1085,
+        sleeper=sleep,
+    )
+
+    assert result.stderr == "configuration file is invalid"
+    assert attempts == 1
+    assert sleeps == []
+
+
 def test_blocked_reason_from_output_requires_final_line_marker() -> None:
     # No marker → no block.
     assert blocked_reason_from_output("did the work\n", "") is None
