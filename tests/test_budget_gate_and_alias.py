@@ -35,7 +35,16 @@ from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
-from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    RepoPRAction,
+    RepoPRActionScope,
+    RepoPRScopeRegistry,
+    RepoReviewState,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -779,6 +788,23 @@ def _ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
         interactivity=None,
         enforcement_enabled=True,
         ifc_labels=labels,
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+
+
+def _untainted_ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=roles,
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
         domain="channel",
         resource_id="ch-1",
         bridge_instance="test",
@@ -2357,6 +2383,258 @@ async def test_middleware_emits_tool_error_for_budget_denial(
     assert len(denied_errors) == 1
     assert denied_errors[0]["tool"] == "shell_exec"
     assert denied_errors[0]["paired_tool_call"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    middleware = BudgetGateMiddleware()
+    calls: list[str] = []
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    from dataclasses import replace
+
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        if request.tool_call["id"] == "refused":
+            raise ToolPolicyRefusal("pull-request operation rejected: repo.inspect not granted")
+        return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
+
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+    token = set_current_turn(ctx)
+    try:
+        refusal = await middleware.awrap_tool_call(
+            _make_request(
+                "pr_metadata", "refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        adapted = await middleware.awrap_tool_call(
+            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(refusal, ToolMessage)
+    assert refusal.status == "error"
+    assert "repo.inspect not granted" in str(refusal.content)
+    assert adapted.content == "adapted"
+    assert calls == ["refused", "adapted"]
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+    assert ctx.tool_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_real_repo_test_policy_refusal_does_not_taint_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools.repo import repo_test
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset({RepoPRAction.INSPECT.value}),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    calls: list[str] = []
+
+    original_authorize = ToolRegistry.authorize_tool
+
+    def authorize_without_action_gate(
+        self,
+        tool_name,
+        auth_context=None,
+        *,
+        enforce=False,
+        target_channel=None,
+        ifc_labels=None,
+        mcp_tool=None,
+        arguments=None,
+    ):  # type: ignore[no-untyped-def]
+        decision = original_authorize(
+            self,
+            tool_name,
+            auth_context,
+            enforce=enforce,
+            target_channel=target_channel,
+            ifc_labels=ifc_labels,
+            mcp_tool=mcp_tool,
+            arguments=arguments,
+        )
+        if tool_name != "repo_test":
+            return decision
+        return replace(decision, allowed=True, reason=None)
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize_without_action_gate)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        if request.tool_call["id"] == "repo-refused":
+            repo_test.func(
+                repository="owner/repo",
+                pull_request=17,
+                runtime=Runtime(context=auth),
+            )
+        return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
+
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+    token = set_current_turn(ctx)
+    try:
+        refusal = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_test", "repo-refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        adapted = await middleware.awrap_tool_call(
+            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert refusal.status == "error"
+    assert "scope does not grant repo.test" in str(refusal.content)
+    assert adapted.content == "adapted"
+    assert calls == ["repo-refused", "adapted"]
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+
+
+@pytest.mark.asyncio
+async def test_real_repo_execution_fault_taints_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.repo_tools import GitRefusal
+    from mimir.tools.repo import repo_fetch
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _untainted_ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+
+    class FailingRepoGitTools:
+        def __init__(self, state):  # type: ignore[no-untyped-def]
+            self.state = state
+
+        def execute(self, operation):  # type: ignore[no-untyped-def]
+            raise GitRefusal("git_failed", "git exited 128 after execution started")
+
+    monkeypatch.setattr("mimir.tools.repo.RepoGitTools", FailingRepoGitTools)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        repo_fetch.func(
+            repository="owner/repo",
+            pull_request=17,
+            runtime=Runtime(context=auth),
+        )
+        raise AssertionError("repo_fetch should have raised")
+
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_fetch", "repo-fault", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "repository operation rejected (git_failed)" in str(result.content)
+    assert ctx.ifc_labels.has_untrusted_active_ingest is True
+
+
+@pytest.mark.asyncio
+async def test_unexpected_tool_fault_still_fails_the_turn_boundary() -> None:
+    middleware = BudgetGateMiddleware()
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        raise RuntimeError("internal invariant broke")
+
+    ctx = _make_ctx()
+    token = set_current_turn(ctx)
+    try:
+        with pytest.raises(RuntimeError, match="internal invariant broke"):
+            await middleware.awrap_tool_call(
+                _make_request("memory_query", "fault"), handler,
+            )
+    finally:
+        reset_current_turn(token)
 
 
 def test_admin_sensitive_tool_matches_mcp_name_variants():

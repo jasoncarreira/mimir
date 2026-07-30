@@ -9,7 +9,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..models import AuthContext, RepoReviewState
+from ..models import AuthContext, RepoPRAction, RepoReviewState
 from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
@@ -29,6 +29,36 @@ from ..repo_tools import (
     GitUnmerged,
     RepoGitTools,
 )
+from .refusals import ToolPolicyRefusal
+
+
+_GIT_EXECUTION_REFUSAL_CODES = frozenset({
+    "git_failed",
+    "invalid_git_output",
+    "output_limit",
+    "timeout",
+})
+_PROJECT_TEST_EXECUTION_REFUSAL_CODES = frozenset({
+    "test_execution_failed",
+    "test_output_limit",
+    "test_timeout",
+    "tests_failed",
+})
+
+
+def _tool_refusal(
+    message: str,
+    exc: BaseException,
+    *,
+    code: str | None = None,
+    execution_codes: frozenset[str] = frozenset(),
+) -> ToolException:
+    """Preserve pre-execution policy refusals without downgrading execution faults."""
+    if isinstance(exc, ToolPolicyRefusal) or (
+        code is not None and code not in execution_codes
+    ):
+        return ToolPolicyRefusal(message)
+    return ToolException(message)
 
 
 def _state(
@@ -42,7 +72,8 @@ def _state(
         return resolve_review_state(runtime, repository, pull_request)
     except ToolException as exc:
         detail = str(exc).removeprefix("pull-request operation rejected: ")
-        raise ToolException(f"repository operation rejected: {detail}") from exc
+        message = f"repository operation rejected: {detail}"
+        raise _tool_refusal(message, exc) from exc
 
 
 def _execute(
@@ -57,7 +88,10 @@ def _execute(
         )
     except (GitRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "repository_operation_failed")
-        raise ToolException(f"repository operation rejected ({code}): {exc}") from exc
+        message = f"repository operation rejected ({code}): {exc}"
+        raise _tool_refusal(
+            message, exc, code=code, execution_codes=_GIT_EXECUTION_REFUSAL_CODES,
+        ) from exc
 
 
 @tool
@@ -68,6 +102,8 @@ def repo_checkout(
 ) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
     state = _state(runtime, repository, pull_request)
+    if RepoPRAction.CHECKOUT.value not in state.action_scope.allowed_operations:
+        raise ToolPolicyRefusal("repository checkout rejected: scope does not grant PR checkout")
     try:
         lease = create_pr_checkout_lease(
             state.action_scope,
@@ -75,7 +111,7 @@ def repo_checkout(
             review_state=state,
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ToolException(f"repository checkout rejected: {exc}") from exc
+        raise ToolPolicyRefusal(f"repository checkout rejected: {exc}") from exc
     return {
         "status": "checked_out",
         "path": str(lease.path),
@@ -94,11 +130,11 @@ def repo_cleanup(
     state = _state(runtime, repository, pull_request)
     lease = state.checkout_lease
     if lease is None:
-        raise ToolException("repository cleanup rejected: no active checkout lease")
+        raise ToolPolicyRefusal("repository cleanup rejected: no active checkout lease")
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ToolException(f"repository cleanup rejected: {exc}") from exc
+        raise ToolPolicyRefusal(f"repository cleanup rejected: {exc}") from exc
     return {"status": "cleaned", "removed": removed, "scope_id": state.action_scope.scope_id}
 
 
@@ -136,7 +172,13 @@ def repo_test(
         )
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "project_test_failed")
-        raise ToolException(f"project test rejected ({code}): {exc}") from exc
+        message = f"project test rejected ({code}): {exc}"
+        raise _tool_refusal(
+            message,
+            exc,
+            code=code,
+            execution_codes=_PROJECT_TEST_EXECUTION_REFUSAL_CODES,
+        ) from exc
 
 
 @tool

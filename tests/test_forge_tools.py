@@ -191,7 +191,10 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
         (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "Fix"}),
         (pr_comment, {"body": "Fixed"}),
         (pr_rerequest_review, {"reviewer": "reviewer"}),
-        (unsupported_operation, {"operation": "pr.resolve_thread"}),
+        (unsupported_operation, {
+            "description": "Resolve an inline review thread",
+            "attempted_operations": ["Listed review comments", "Looked for a resolve tool"],
+        }),
     )
 
     node = ToolNode(list(FORGE_TOOLS))
@@ -485,21 +488,79 @@ def test_unsupported_operation_is_durable_and_deduped(
 
     first = unsupported_operation.func(
         repository="owner/repo", pull_request=17,
-        operation="pr.resolve_thread", runtime=runtime,
+        description="Resolve an inline review thread",
+        attempted_operations=["pr_comments", "pr_inline_review_comment"],
+        runtime=runtime,
     )
     second = unsupported_operation.func(
         repository="owner/repo", pull_request=17,
-        operation="pr.resolve_thread", runtime=runtime,
+        description="Resolve an inline review thread",
+        attempted_operations=["pr_comments", "pr_inline_review_comment"],
+        runtime=runtime,
     )
 
     assert first["status"] == "unsupported_operation"
     assert first["escalated"] is True
     assert second["escalated"] is False
+    assert first["description"] == "Resolve an inline review thread"
+    assert first["attempted_operations"] == ["pr_comments", "pr_inline_review_comment"]
+    assert first["operation"].startswith("resolve_an_inline_review_thread:")
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert len(records) == 1
     assert records[0] | {
         "repository": "owner/repo",
         "pull_request": 17,
-        "operation": "pr.resolve_thread",
+        "operation": first["operation"],
+        "description": "Resolve an inline review thread",
+        "attempted_operations": ["pr_comments", "pr_inline_review_comment"],
         "operator_visible": True,
     } == records[0]
+
+
+def test_malformed_escalation_is_normalized_bounded_and_non_fatal(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events = home / "events.jsonl"
+    init_logger(events, "test")
+
+    result = unsupported_operation.func(
+        repository="owner/repo",
+        pull_request=17,
+        description=None,
+        attempted_operations={"bad\nfield": "ghp_abcdefghijklmnopqrstuvwxyz"},
+        runtime=_runtime(_scope(RepoPRAction.INSPECT)),
+    )
+
+    assert result["escalated"] is True
+    assert result["description"].startswith("The caller did not provide")
+    assert "\n" not in result["attempted_operations"][0]
+    assert "ghp_" not in result["attempted_operations"][0]
+    record = json.loads(events.read_text())
+    assert len(record["description"].encode()) <= 4_096
+    assert len(record["attempted_operations"][0].encode()) <= 512
+
+
+def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    init_logger(home / "events.jsonl", "test")
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+
+    first = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        description="Resolve thread after submitting a review alpha",
+        runtime=runtime,
+    )
+    second = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        description="Resolve thread after submitting a review beta",
+        runtime=runtime,
+    )
+
+    assert first["escalated"] is True
+    assert second["escalated"] is True
+    assert first["operation"] != second["operation"]
