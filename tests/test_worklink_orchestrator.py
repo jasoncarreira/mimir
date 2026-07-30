@@ -599,7 +599,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
     events = tmp_path / "logs" / "events.jsonl"
     init_logger(events, session_id="test-worklink-contention")
     repo = tmp_path / "repo"
-    worktree = repo / ".worklink" / "441-1"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
     _, base_runner = _orchestrator_runner(repo, worktree)
     claim_calls = 0
 
