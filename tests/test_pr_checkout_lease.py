@@ -34,7 +34,14 @@ from mimir.readonly_backend import WriteGuardBackend
 
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+        [
+            "git", "-C", str(cwd),
+            "-c", "user.name=test", "-c", "user.email=test@example.com",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return result.stdout.strip()
 
