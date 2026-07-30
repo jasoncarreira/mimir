@@ -71,23 +71,6 @@ def _is_gh_argv(argv: list[str] | None) -> bool:
     return bool(argv) and Path(argv[0]).name == "gh"
 
 
-def _gh_has_account_effect(argv: list[str] | None) -> bool:
-    if not _is_gh_argv(argv) or argv is None:
-        return False
-    arguments = argv[1:]
-    if len(arguments) >= 2 and arguments[0] in {"pr", "issue"}:
-        return arguments[1] in {
-            "close", "comment", "create", "edit", "merge", "ready", "reopen", "review",
-        }
-    if arguments[:1] == ["api"]:
-        for index, argument in enumerate(arguments[1:]):
-            if argument in {"--method", "-X"} and index + 2 < len(arguments):
-                return arguments[index + 2].upper() != "GET"
-            if argument.startswith("--method="):
-                return argument.partition("=")[2].upper() != "GET"
-    return False
-
-
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
@@ -101,13 +84,12 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         env.pop(key, None)
     if _is_gh_argv(argv):
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
-        if _gh_has_account_effect(argv):
-            from ..forge.github import confirm_github_identity
+        from ..forge.github import confirm_github_identity
 
-            confirm_github_identity(
-                os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
-                env.get("GITHUB_TOKEN", ""),
-            )
+        confirm_github_identity(
+            os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+            env.get("GITHUB_TOKEN", ""),
+        )
     else:
         env.pop("GH_CONFIG_DIR", None)
     if _is_git_argv(argv):

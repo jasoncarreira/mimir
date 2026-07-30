@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -138,10 +138,16 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch)
 
 
 def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatch) -> None:
+    from mimir.forge import github as github_module
+
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("GH_TOKEN", "stray-token")
     monkeypatch.setenv("GH_HOST", "attacker.invalid")
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
+    monkeypatch.setattr(github_module, "_verified_identity", (
+        "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
+    ))
 
     env = direct_exec_env(["/usr/bin/gh", "api", "user"])
     overlay = direct_exec_env_overlay(["/usr/bin/gh", "api", "user"])
@@ -168,14 +174,19 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
     assert all(overlay[key] is None for key in ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR"))
 
 
-def test_mutating_gh_command_requires_cached_declared_identity(monkeypatch) -> None:
+@pytest.mark.parametrize("arguments", [
+    ["api", "user"],
+    ["pr", "view", "17"],
+    ["pr", "review", "17", "--approve"],
+])
+def test_every_gh_command_requires_cached_declared_identity(monkeypatch, arguments) -> None:
     from mimir.forge import github as github_module
     from mimir.forge import ForgeError
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(github_module, "_verified_identity", None)
-    argv = ["/usr/bin/gh", "pr", "review", "17", "--approve"]
+    argv = ["/usr/bin/gh", *arguments]
 
     with pytest.raises(ForgeError, match="cache is empty"):
         direct_exec_env(argv)
