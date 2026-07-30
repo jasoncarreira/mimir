@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import subprocess
+import threading
+import time
 from typing import Sequence
 
 import pytest
@@ -64,6 +66,146 @@ def test_claim_issue_records_attempt_and_labels_transition() -> None:
     assert ["chainlink", "issue", "label", "439", "worklink:in-progress"] in calls
     comment_calls = [call for call in calls if call[:3] == ["chainlink", "issue", "comment"]]
     assert comment_calls and "WORKLINK_CLAIM" in comment_calls[0][-1]
+
+
+def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> None:
+    start = threading.Barrier(2)
+    runner_guard = threading.Lock()
+    claim_active = False
+    overlap_detected = False
+    results = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_active, overlap_detected
+        call = list(args)
+        if call[1:3] != ["locks", "claim"]:
+            return completed(call)
+        with runner_guard:
+            if claim_active:
+                overlap_detected = True
+            claim_active = True
+        time.sleep(0.05)
+        with runner_guard:
+            claim_active = False
+        return completed(call)
+
+    def claim(issue_id: int) -> None:
+        claims = ChainlinkClaims(agent_id=f"worker-{issue_id}", runner=runner, home_path=tmp_path)
+        start.wait()
+        results.append(claims.claim_issue(issue_id, labels=["worklink:ready"]))
+
+    threads = [threading.Thread(target=claim, args=(issue_id,)) for issue_id in (1064, 1065)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert overlap_detected is False
+    assert len(results) == 2
+    assert all(result.claimed and result.record is not None for result in results)
+
+
+def test_claim_contention_retries_with_backoff_and_emits_outcomes(tmp_path: Path) -> None:
+    claim_calls = 0
+    sleeps: list[float] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            if claim_calls == 1:
+                return subprocess.CompletedProcess(
+                    call,
+                    128,
+                    stdout="",
+                    stderr=(
+                        "fatal: Unable to create '/mimir-home/.git/worktrees/"
+                        "-locks-cache/index.lock': File exists."
+                    ),
+                )
+        return completed(call)
+
+    claims = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        sleeper=sleeps.append,
+    )
+    result = claims.claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert result.record is not None and result.record.attempt == 1
+    assert claim_calls == 2
+    assert sleeps == [0.1]
+    assert [(event, payload["outcome"]) for event, payload in events] == [
+        ("worklink_claim_contention", "retrying"),
+        ("worklink_claim_contention", "succeeded"),
+    ]
+    assert all(payload["resource"] == "chainlink_locks_worktree" for _, payload in events)
+
+
+def test_real_claim_denial_is_not_retried(tmp_path: Path) -> None:
+    claim_calls = 0
+    sleeps: list[float] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            return subprocess.CompletedProcess(
+                call, 1, stdout="", stderr="issue #1064 is locked by another-agent"
+            )
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        sleeper=sleeps.append,
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "issue #1064 is locked by another-agent"
+    assert claim_calls == 1
+    assert sleeps == []
+
+
+def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
+    claim_calls = 0
+    events: list[dict[str, object]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            claim_calls += 1
+            return subprocess.CompletedProcess(
+                call,
+                128,
+                stdout="",
+                stderr="fatal: Another git process seems to be running in this repository.",
+            )
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=runner,
+        home_path=tmp_path,
+        event_logger=lambda _event, **payload: events.append(payload),
+        contention_max_attempts=3,
+        sleeper=lambda _delay: None,
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is False
+    assert result.reason == "claim_contention_exhausted"
+    assert claim_calls == 3
+    assert [event["outcome"] for event in events] == ["retrying", "retrying", "exhausted"]
+    assert events[-1]["max_attempts"] == 3
 
 
 def test_heartbeat_issue_appends_fresh_claim_record() -> None:
