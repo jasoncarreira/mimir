@@ -394,6 +394,33 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
 }
 
 
+def _verification_guidance() -> str:
+    """How a remediation turn should verify its fix, given this deployment.
+
+    ``repo_test`` is only registered when ``MIMIR_CODING_ENABLED`` is true, and
+    that setting defaults to false (``mimir/config.py`` ``coding_enabled``), so
+    naming the tool unconditionally would point a default deployment at
+    something it does not have. Selector wording stays runner-neutral for the
+    same reason: ``project_tests`` passes ``path::node_id`` through to whatever
+    runner ``worklink.yaml`` configures, and only pytest-style runners accept
+    that form.
+    """
+    enabled = os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower()
+    if enabled not in ("1", "true", "yes"):
+        return (
+            "verify the fix with whatever this deployment provides, and do not "
+            "present changes as verified if you could not run its tests — say "
+            "plainly what you were unable to check"
+        )
+    return (
+        "verify with the repo_test tool, which runs the deployment's own "
+        "configured test command. Selectors are repo-relative paths that must "
+        "already exist and must not be symlinks, and carry no flags; "
+        "`path::node_id` works only when the configured runner accepts that "
+        "form, so prefer plain paths — or omit selectors to run the whole suite"
+    )
+
+
 def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> str:
     """Load and return the review skill's SKILL.md body for inlining.
 
@@ -1549,11 +1576,8 @@ def _check_own_changes_requested(
             f"{title}\n"
             f"{reviewers} requested changes and no commits have landed "
             f"since (head {head_sha[:8]}). Address the review feedback, "
-            f"verify with the repo_test tool (not shell — this profile "
-            f"refuses test-runner commands; it runs the deployment's own "
-            f"configured test command. Selectors are repo-relative paths, "
-            f"optionally path::node_id, with no flags — or omit them to run "
-            f"the whole suite), push the fixes, and re-request review.\n{url}"
+            f"{_verification_guidance()}, push the fixes, and re-request "
+            f"review.\n{url}"
         )
         _emit(
             prompt,
