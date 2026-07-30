@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ from mimir.access_control import (
     SinkGate,
     ToolAuthorization,
     ToolFlowDirection,
+    ToolRegistry,
     classify_protected_result,
 )
 from mimir.models import (
@@ -203,3 +206,52 @@ def test_mixed_repo_input_denies_bound_forge_sink() -> None:
     )
     assert denied.allowed is False
     assert denied.reason == "ifc_label_blocked:forge"
+
+
+@pytest.mark.asyncio
+async def test_pr_scope_policy_shadows_then_enforces_with_the_same_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope(RepoPRAction.PR_COMMENT)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    arguments = {"repository": "owner/repo", "pull_request": 7}
+    shadow = registry.authorize_tool(
+        "pr_metadata",
+        replace(_auth(scope), enforcement_enabled=False),
+        enforce=False,
+        arguments=arguments,
+    )
+    await asyncio.sleep(0)
+    enforced = registry.authorize_tool(
+        "pr_metadata",
+        _auth(scope),
+        enforce=True,
+        arguments=arguments,
+    )
+
+    assert shadow.allowed is True
+    assert shadow.would_block is True
+    assert enforced.allowed is False
+    assert shadow.reason == enforced.reason == "repo_pr_scope_denied"
+    events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
+    assert len(events) == 1
+    assert events[0]["reason"] == enforced.reason
+    assert events[0]["would_block"] is True
+
+
+def test_tool_modules_do_not_decide_pr_scope_policy_locally() -> None:
+    tools_root = Path(__file__).parents[1] / "mimir" / "tools"
+    offenders = {
+        path.relative_to(tools_root).as_posix()
+        for path in tools_root.rglob("*.py")
+        if "allowed_operations" in path.read_text(encoding="utf-8")
+    }
+
+    assert offenders == set()

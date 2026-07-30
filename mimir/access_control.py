@@ -5060,6 +5060,40 @@ class ToolAuthorization:
         }
 
 
+def authorize_repo_pr_tool(
+    tool_name: str,
+    scope: Any,
+    *,
+    service_principal: ServicePrincipal | None,
+    enforce: bool,
+    flow_direction: ToolFlowDirection,
+) -> ToolAuthorization:
+    """Make the sole policy decision for one typed PR/repository action."""
+    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS:
+        raise ValueError(f"not a typed pull-request tool: {tool_name}")
+    required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
+    in_scope = (
+        scope is not None
+        and (
+            required_action is None
+            or required_action in getattr(scope, "allowed_operations", frozenset())
+        )
+    )
+    return ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=in_scope or not enforce,
+        reason=None if in_scope else "repo_pr_scope_denied",
+        service_principal=service_principal,
+        required_tier=AccessTier.USER,
+        enforcement_enabled=enforce,
+        is_shadow_decision=not enforce and not in_scope,
+        would_block=not in_scope,
+        flow_direction=flow_direction,
+        repo_pr_action_scope=scope,
+    )
+
+
 def _consume_task_exception(task: Any) -> None:
     """Retrieve background logging failures so asyncio does not warn."""
     if task.cancelled():
@@ -5468,28 +5502,12 @@ class ToolRegistry:
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
-                scope = repo_pr_action_scope
-                required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
-                in_scope = (
-                    scope is not None
-                    and (
-                        required_action is None
-                        or required_action in getattr(scope, "allowed_operations", frozenset())
-                    )
-                )
-                allowed = in_scope or not enforce
-                forge_auth = ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=decision,
-                    allowed=allowed,
-                    reason=None if in_scope else "repo_pr_scope_denied",
+                forge_auth = authorize_repo_pr_tool(
+                    tool_name,
+                    repo_pr_action_scope,
                     service_principal=service_principal,
-                    required_tier=AccessTier.USER,
-                    enforcement_enabled=enforce,
-                    is_shadow_decision=not enforce and not in_scope,
-                    would_block=not in_scope,
+                    enforce=enforce,
                     flow_direction=flow_direction,
-                    repo_pr_action_scope=scope,
                 )
                 if forge_auth.is_shadow_decision:
                     self._emit_shadow_decision(

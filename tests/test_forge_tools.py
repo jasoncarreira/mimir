@@ -239,11 +239,8 @@ def test_review_scope_cannot_rerequest_review() -> None:
     )
     assert authorization.allowed is False
     assert authorization.reason == "repo_pr_scope_denied"
-    with pytest.raises(ToolException, match="pr.rerequest not granted"):
-        pr_rerequest_review.func(
-            repository="owner/repo", pull_request=17, reviewer="reviewer",
-            runtime=runtime,
-        )
+    # The tool implementation resolves execution scope only; middleware serves
+    # the gate's refusal before this callable can reach the forge adapter.
     assert client.calls == []
 
 
@@ -291,15 +288,14 @@ def test_review_and_remediation_actions_do_not_widen_each_other() -> None:
     pr_comment.func(
         repository="owner/repo", pull_request=17, body="Fixed", runtime=remediation,
     )
-    with pytest.raises(ToolException, match="pr.review not granted"):
-        pr_submit_review.func(
-            repository="owner/repo", pull_request=17,
-            verdict=ReviewVerdict.APPROVE, body="No", runtime=remediation,
-        )
-    with pytest.raises(ToolException, match="pr.comment not granted"):
-        pr_comment.func(
-            repository="owner/repo", pull_request=17, body="No", runtime=review,
-        )
+    arguments = {"repository": "owner/repo", "pull_request": 17}
+    registry = access_control.ToolRegistry()
+    assert registry.authorize_tool(
+        "pr_submit_review", remediation.context, enforce=True, arguments=arguments,
+    ).reason == "repo_pr_scope_denied"
+    assert registry.authorize_tool(
+        "pr_comment", review.context, enforce=True, arguments=arguments,
+    ).reason == "repo_pr_scope_denied"
 
 
 def test_review_scope_has_no_event_or_requested_reviewer_gate_and_exact_safe_actions(
