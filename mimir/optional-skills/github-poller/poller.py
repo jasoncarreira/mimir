@@ -1549,7 +1549,10 @@ def _check_own_changes_requested(
             f"{title}\n"
             f"{reviewers} requested changes and no commits have landed "
             f"since (head {head_sha[:8]}). Address the review feedback, "
-            f"push the fixes, and re-request review.\n{url}"
+            f"verify with the repo_test tool (not shell — this profile "
+            f"refuses pytest/uv; selectors are relative paths or "
+            f"path::node_id with no flags, or omit them to run the whole "
+            f"suite), push the fixes, and re-request review.\n{url}"
         )
         _emit(
             prompt,
