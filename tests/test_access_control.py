@@ -5213,6 +5213,14 @@ def _chainlink_help_commands(*arguments: str) -> set[str]:
     return commands
 
 
+def _assert_chainlink_commands_audited(
+    *arguments: str,
+    audited: set[str] | frozenset[str],
+) -> None:
+    unknown = _chainlink_help_commands(*arguments) - audited
+    assert not unknown, f"unaudited Chainlink commands: {sorted(unknown)}"
+
+
 def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> None:
     audited = (
         access_control._CHAINLINK_QUERY_SUBCOMMANDS
@@ -5220,11 +5228,32 @@ def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> Non
         | set(access_control._CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS)
     )
 
-    assert audited == _chainlink_help_commands("issue")
+    # The deployed source surface is forward-compatible with the pinned 1.6.0
+    # CLI (``cascade``/``falsify`` arrived later). Every command exposed by the
+    # installed pin must still have an explicit decision; extra source-side
+    # decisions keep rolling deployments safe without making the older pin fail.
+    _assert_chainlink_commands_audited("issue", audited=audited)
     assert access_control._CHAINLINK_QUERY_SUBCOMMANDS == {
         "blocked", "cascade", "list", "next", "ready", "related", "search",
         "show", "tree",
     }
+
+
+def test_chainlink_issue_audit_rejects_an_unknown_live_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        __name__ + "._chainlink_help_commands",
+        lambda *arguments: {"show", "new-upstream-command"},
+    )
+    audited = (
+        access_control._CHAINLINK_QUERY_SUBCOMMANDS
+        | access_control._CHAINLINK_MUTATION_SUBCOMMANDS
+        | set(access_control._CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS)
+    )
+
+    with pytest.raises(AssertionError, match="new-upstream-command"):
+        _assert_chainlink_commands_audited("issue", audited=audited)
 
 
 def test_chainlink_query_and_mutation_subcommands_are_disjoint() -> None:
@@ -5248,8 +5277,23 @@ def test_chainlink_top_level_help_has_an_explicit_scope_decision() -> None:
         access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS
     )
 
-    assert audited == _chainlink_help_commands()
+    _assert_chainlink_commands_audited(audited=audited)
     assert all(access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS.values())
+
+
+def test_chainlink_top_level_audit_rejects_an_unknown_live_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        __name__ + "._chainlink_help_commands",
+        lambda *arguments: {"issue", "new-upstream-command"},
+    )
+    audited = {"issue", "session"} | set(
+        access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS
+    )
+
+    with pytest.raises(AssertionError, match="new-upstream-command"):
+        _assert_chainlink_commands_audited(audited=audited)
 
 
 def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
