@@ -566,6 +566,44 @@ def test_fetch_ref_mismatch_is_named_stale_scope(repo_tools, monkeypatch) -> Non
     assert refusal.value.code == "stale_scope"
 
 
+def test_fetch_refuses_base_advanced_mid_remediation_with_actionable_reason(repo_tools) -> None:
+    _origin, source, _scope, state, tools = repo_tools
+    checked_out_base = state.checkout_lease.base_sha
+    _git(source, "checkout", "-q", "main")
+    (source / "advanced.txt").write_text("new base work\n", encoding="utf-8")
+    _git(source, "add", "advanced.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+
+    assert refusal.value.code == "base_advanced"
+    assert checked_out_base in str(refusal.value)
+    assert advanced_base in str(refusal.value)
+    assert "restart checkout before rebasing" in str(refusal.value)
+
+
+def test_fetch_refuses_rewritten_base_mid_remediation_with_both_shas(repo_tools) -> None:
+    _origin, source, _scope, state, tools = repo_tools
+    checked_out_base = state.checkout_lease.base_sha
+    _git(source, "checkout", "-q", "--orphan", "replacement-main")
+    _git(source, "rm", "-q", "-rf", ".")
+    (source / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+    _git(source, "add", "replacement.txt")
+    _git(source, "commit", "-q", "-m", "rewrite base")
+    rewritten_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "--force", "origin", "HEAD:main")
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitFetch())
+
+    assert refusal.value.code == "base_history_rewritten"
+    assert checked_out_base in str(refusal.value)
+    assert rewritten_base in str(refusal.value)
+
+
 def test_shape_message_and_commit_id_validations_are_pinned(repo_tools) -> None:
     tools = repo_tools[-1]
     cases = (

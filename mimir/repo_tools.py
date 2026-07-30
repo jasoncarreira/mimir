@@ -557,9 +557,10 @@ class RepoGitTools:
 
         if isinstance(operation, GitFetch):
             self._require(RepoPRAction.CHECKOUT)
-            for ref, expected in (
-                (self._scope.destination_ref, self._scope.observed_head_sha),
-                (f"refs/heads/{self._scope.base_ref}", self._scope.observed_base_sha),
+            lease = self._state.checkout_lease
+            for ref, expected, identity in (
+                (self._scope.destination_ref, self._scope.observed_head_sha, "head"),
+                (f"refs/heads/{self._scope.base_ref}", lease.base_sha, "base"),
             ):
                 self._command((
                     "fetch", "--no-tags", "--no-recurse-submodules",
@@ -567,7 +568,27 @@ class RepoGitTools:
                 ), network=True)
                 actual = self._command(("rev-parse", "--verify", "FETCH_HEAD^{commit}")).stdout.strip()
                 if actual.lower() != expected.lower():
-                    raise GitRefusal("stale_scope", "fetched ref no longer matches immutable scope")
+                    if identity == "head":
+                        raise GitRefusal(
+                            "stale_scope",
+                            f"PR head advanced: scoped head {expected.lower()} is stale; "
+                            f"fetched head is {actual.lower()}",
+                        )
+                    ancestry = self._raw((
+                        "merge-base", "--is-ancestor", expected.lower(), actual.lower(),
+                    ))
+                    if ancestry.returncode == 0:
+                        raise GitRefusal(
+                            "base_advanced",
+                            f"PR base advanced during remediation: checked-out base "
+                            f"{expected.lower()} is stale; fetched base is {actual.lower()}; "
+                            "restart checkout before rebasing",
+                        )
+                    raise GitRefusal(
+                        "base_history_rewritten",
+                        f"PR base history was rewritten during remediation: checked-out base "
+                        f"{expected.lower()} is stale; fetched base is {actual.lower()}",
+                    )
             return GitOperationResult(True, "ok")
 
         if isinstance(operation, GitStatus):
@@ -583,7 +604,7 @@ class RepoGitTools:
             if operation.mode == "staged":
                 revisions = ("--cached",)
             elif operation.mode == "base":
-                revisions = (f"{self._scope.observed_base_sha}...HEAD",)
+                revisions = (f"{self._state.checkout_lease.base_sha}...HEAD",)
             pathspecs = tuple(_validate_path(path) for path in paths)
             separator = ("--", *pathspecs) if pathspecs else ()
             result = self._command((
@@ -624,7 +645,7 @@ class RepoGitTools:
         elif isinstance(operation, GitMerge):
             self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
             result = self._command(
-                ("merge", "--no-edit", "--", self._scope.observed_base_sha), identity=True,
+                ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha), identity=True,
             )
             self._refresh_expected_head()
         elif isinstance(operation, GitMergeAbort):
@@ -633,7 +654,7 @@ class RepoGitTools:
         elif isinstance(operation, GitRebase):
             self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
             result = self._command(
-                ("rebase", "--", self._scope.observed_base_sha), identity=True,
+                ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
             )
             self._refresh_expected_head()
         elif isinstance(operation, GitRebaseAbort):
@@ -644,7 +665,7 @@ class RepoGitTools:
             if not _SHA_RE.fullmatch(operation.commit):
                 raise GitRefusal("invalid_commit", "revert requires one full commit id")
             allowed = set(filter(None, self._command((
-                "rev-list", "HEAD", f"^{self._scope.observed_base_sha}", "--",
+                "rev-list", "HEAD", f"^{self._state.checkout_lease.base_sha}", "--",
             )).stdout.splitlines()))
             if operation.commit.lower() not in {commit.lower() for commit in allowed}:
                 raise GitRefusal("invalid_revert_ancestry", "revert commit is outside head ^base")
