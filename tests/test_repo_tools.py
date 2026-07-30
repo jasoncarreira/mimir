@@ -325,7 +325,11 @@ def test_checked_failure_stdout_is_redacted_but_commands_must_opt_in(repo_tools)
     with pytest.raises(GitRefusal, match="Git operation failed"):
         tools._command(("status",), sensitive_values=(secret,))
     with pytest.raises(GitRefusal) as refusal:
-        tools._checked(("status",), sensitive_values=(secret,))
+        tools._checked(
+            ("status",),
+            sensitive_values=(secret,),
+            report_stdout_on_failure=True,
+        )
 
     assert str(refusal.value) == "diagnostic [REDACTED]"
 

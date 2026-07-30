@@ -398,7 +398,7 @@ class RepoGitTools:
         network_remote: str | None = None,
         env: dict[str, str] | None = None,
         sensitive_values: tuple[str, ...] = (),
-        report_stdout_on_failure: bool = True,
+        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         result = self._raw(
             arguments,
