@@ -955,7 +955,7 @@ def create_server_discovered_heartbeat_scope(
 
 
 def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None) -> Any:
-    """Derive one immutable own-PR scope from a trusted single poller item."""
+    """Derive exactly the valid immutable PR scopes in a trusted poller payload."""
     if (
         service is None
         or service.authority_profile != "github"
@@ -964,25 +964,43 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
     ):
         return None
     items = event.extra.get("items")
-    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+    if not isinstance(items, list):
         return None
-    item = items[0]
-    from .models import RepoReviewState
-    scope = _repo_pr_scope(
-        provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
-        repo=item.get("repo"),
-        principal=item.get("author"),
-        event_type=item.get("event_type"),
-        number=item.get("number"),
-        head_repo=item.get("head_repo"),
-        head_remote=item.get("head_remote"),
-        head_ref=item.get("head_ref"),
-        head_sha=item.get("head_sha"),
-        base_ref=item.get("base_ref"),
-        base_sha=item.get("base_sha"),
-        requested_reviewer=item.get("requested_reviewer"),
+    from .models import RepoPRScopeRegistry, RepoReviewState
+
+    by_target: dict[tuple[str, int], RepoReviewState | None] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        scope = _repo_pr_scope(
+            provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
+            repo=item.get("repo"),
+            principal=item.get("author"),
+            event_type=item.get("event_type"),
+            number=item.get("number"),
+            head_repo=item.get("head_repo"),
+            head_remote=item.get("head_remote"),
+            head_ref=item.get("head_ref"),
+            head_sha=item.get("head_sha"),
+            base_ref=item.get("base_ref"),
+            base_sha=item.get("base_sha"),
+            requested_reviewer=item.get("requested_reviewer"),
+        )
+        if scope is None:
+            continue
+        target = (scope.canonical_repo, scope.pr_number)
+        previous = by_target.get(target)
+        if previous is None and target in by_target:
+            continue
+        if previous is not None and previous.action_scope.scope_id != scope.scope_id:
+            # Never choose between conflicting trusted snapshots of one target.
+            by_target[target] = None
+        elif previous is None:
+            by_target[target] = RepoReviewState(scope)
+    states = tuple(
+        state for _target, state in sorted(by_target.items()) if state is not None
     )
-    return RepoReviewState(scope) if scope is not None else None
+    return RepoPRScopeRegistry(states) if states else None
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -1745,9 +1763,9 @@ def _repo_review_owned_branch(branch: str, event_branch: str) -> bool:
     into a concurrent sibling's worktree, twice in seven builds), and Worklink
     runs two ``issue/*`` builds concurrently by default.
 
-    Requiring equality is safe because ``RepoReviewState`` is constructed only
-    for a single ``pr_changes_requested_stale`` item, so ``head_ref`` is the
-    one PR branch the turn exists to remediate; no flow legitimately targets a
+    Requiring equality is safe because each ``RepoReviewState`` is constructed
+    for one ``pr_changes_requested_stale`` item, so ``head_ref`` is the one PR
+    branch that state can remediate; no selected state legitimately targets a
     different branch.
     """
     return (
@@ -5182,10 +5200,26 @@ class ToolRegistry:
             if auth_context is not None
             else None
         )
-        repo_pr_action_scope = (
-            getattr(auth_context, "repo_pr_action_scope", None)
-            if auth_context is not None else None
-        )
+        repo_pr_action_scope = None
+        if auth_context is not None:
+            if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+                registry = getattr(auth_context, "repo_pr_scope_registry", None)
+                tool_arguments = arguments or {}
+                state = (
+                    registry.resolve(
+                        tool_arguments.get("repository"),
+                        tool_arguments.get("pull_request"),
+                    )
+                    if registry is not None and hasattr(registry, "resolve")
+                    else None
+                )
+                repo_pr_action_scope = (
+                    state.action_scope if state is not None else None
+                )
+            else:
+                repo_pr_action_scope = getattr(
+                    auth_context, "repo_pr_action_scope", None,
+                )
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -6743,7 +6777,10 @@ def create_auth_context(
     - ContextVar fallback heuristics
     - Single-active-turn heuristics
     """
-    from .models import AuthContext, RepoPRActionScope, RepoReviewState, TurnInteractivity
+    from .models import (
+        AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+        TurnInteractivity,
+    )
 
     author = event.author
     canonical = author
@@ -6789,7 +6826,7 @@ def create_auth_context(
     ):
         bridge_instance = f"service:{registered_service.canonical}"
 
-    repo_review_state = _repo_review_state_from_event(event, registered_service)
+    repo_pr_scope_registry = _repo_review_state_from_event(event, registered_service)
     carried_scope = event.repo_pr_action_scope
     if not (
         isinstance(carried_scope, RepoPRActionScope)
@@ -6802,11 +6839,15 @@ def create_auth_context(
         and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
     ):
         carried_scope = None
-    if repo_review_state is None and carried_scope is not None:
-        repo_review_state = RepoReviewState(carried_scope)
-    action_scope = (
-        repo_review_state.action_scope if repo_review_state is not None else None
+    if repo_pr_scope_registry is None and carried_scope is not None:
+        repo_pr_scope_registry = RepoPRScopeRegistry((RepoReviewState(carried_scope),))
+    single_state = (
+        repo_pr_scope_registry.review_states[0]
+        if repo_pr_scope_registry is not None
+        and len(repo_pr_scope_registry.review_states) == 1
+        else None
     )
+    action_scope = single_state.action_scope if single_state is not None else None
 
     return AuthContext(
         principal=author,
@@ -6823,7 +6864,8 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         service_authority=registered_service if is_service else None,
-        repo_review_state=repo_review_state,
+        repo_pr_scope_registry=repo_pr_scope_registry,
+        repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
         enforcement_enabled=enforce,
         source_session_acl=(

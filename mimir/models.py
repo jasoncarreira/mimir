@@ -491,7 +491,7 @@ class AgentEvent:
     # Public ingress never copies this object from request data.
     service_authority: Any = None
     # Optional server-discovered heartbeat authority. Poller scopes are always
-    # rebuilt from their one trusted payload item and never accepted here.
+    # rebuilt from their trusted payload items and never accepted here.
     repo_pr_action_scope: "RepoPRActionScope | None" = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
@@ -686,6 +686,46 @@ class RepoReviewState:
 
 
 @dataclass(frozen=True)
+class RepoPRScopeRegistry:
+    """Immutable per-turn registry of independently checked-out PR scopes."""
+
+    review_states: tuple[RepoReviewState, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.review_states, tuple):
+            raise TypeError("review_states must be a tuple")
+        targets: set[tuple[str, int]] = set()
+        for state in self.review_states:
+            if not isinstance(state, RepoReviewState):
+                raise TypeError("review_states must contain RepoReviewState values")
+            target = (state.repo.lower(), state.pr_number)
+            if target in targets:
+                raise ValueError("duplicate pull-request scope target")
+            targets.add(target)
+
+    @property
+    def action_scopes(self) -> tuple[RepoPRActionScope, ...]:
+        return tuple(state.action_scope for state in self.review_states)
+
+    def resolve(self, repository: object, pull_request: object) -> RepoReviewState | None:
+        if (
+            not isinstance(repository, str)
+            or not repository
+            or not isinstance(pull_request, int)
+            or isinstance(pull_request, bool)
+        ):
+            return None
+        target = (repository.lower(), pull_request)
+        return next(
+            (
+                state for state in self.review_states
+                if (state.repo.lower(), state.pr_number) == target
+            ),
+            None,
+        )
+
+
+@dataclass(frozen=True)
 class AuthContext:
     """Frozen, server-created authorization context (chainlink #864).
 
@@ -733,9 +773,13 @@ class AuthContext:
     egress_state: EgressSessionState = field(
         default_factory=EgressSessionState, repr=False, compare=False,
     )
-    # Present only on a server-created github poller turn for one own-PR
-    # remediation event. The mutable bit is monotonic and records successful
-    # checkout; the authority-bearing scope itself remains frozen.
+    # Server-created immutable registry for all valid PR items in one trusted
+    # poller payload. Each state carries its own monotonic checkout proof.
+    repo_pr_scope_registry: RepoPRScopeRegistry | None = field(
+        default=None, repr=False, compare=False,
+    )
+    # Single-scope aliases retained for callers whose trusted event can only
+    # carry one PR (notably server-discovered heartbeat turns).
     repo_review_state: RepoReviewState | None = field(
         default=None, repr=False, compare=False,
     )

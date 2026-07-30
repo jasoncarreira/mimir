@@ -18,7 +18,10 @@ from mimir.forge import (
     ReviewRequestProjection,
     ReviewVerdict,
 )
-from mimir.models import AuthContext, RepoPRAction, RepoPRActionScope
+from mimir.models import (
+    AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+    RepoReviewState,
+)
 from mimir.tools.forge import (
     FORGE_TOOLS,
     pr_checks,
@@ -37,7 +40,11 @@ from mimir.tools.forge import (
 )
 
 
-def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
+def _scope(
+    *actions: RepoPRAction,
+    number: int = 17,
+    head_sha: str = "a" * 40,
+) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo="owner/repo",
@@ -46,17 +53,22 @@ def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
         principal="reviewer",
         event_type="pr_review_requested",
         allowed_operations=frozenset(action.value for action in actions),
-        pr_number=17,
+        pr_number=number,
         head_repo="contributor/repo",
         head_remote="source",
         destination_ref="refs/heads/change",
-        observed_head_sha="a" * 40,
+        observed_head_sha=head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
     )
 
 
 def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
+    return _runtime_for_scopes(scope)
+
+
+def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
+    states = tuple(RepoReviewState(scope) for scope in scopes)
     context = AuthContext(
         principal="service:poller",
         canonical_principal="poller",
@@ -66,7 +78,9 @@ def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
         channel_id="poller:forge",
         interactivity=None,
         enforcement_enabled=True,
-        repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+        repo_review_state=states[0] if len(states) == 1 else None,
+        repo_pr_action_scope=scopes[0] if len(scopes) == 1 else None,
     )
     return ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
@@ -133,13 +147,11 @@ def _reset_client() -> None:
     _reset_logger_for_tests()
 
 
-def test_tool_surface_has_no_repository_pr_or_request_target_selectors() -> None:
+def test_tool_surface_requires_exact_repository_and_pr_selectors() -> None:
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
-        assert not (
-            {"repository", "repo", "pull_request", "pr_number", "url", "host"}
-            & set(properties)
-        )
+        assert {"repository", "pull_request"} <= set(properties)
+        assert not ({"repo", "pr_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
 
@@ -166,6 +178,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     node = ToolNode(list(FORGE_TOOLS))
     for index, (forge_tool, arguments) in enumerate(invocations):
+        arguments = {"repository": "owner/repo", "pull_request": 17, **arguments}
         tool_call = {
             "name": forge_tool.name, "args": arguments,
             "id": f"forge-{index}", "type": "tool_call",
@@ -185,10 +198,45 @@ def test_read_uses_only_immutable_scope_target() -> None:
     set_forge_client(client)
     scope = _scope(RepoPRAction.INSPECT)
 
-    result = pr_metadata.func(runtime=_runtime(scope))
+    result = pr_metadata.func(
+        repository="owner/repo", pull_request=17, runtime=_runtime(scope),
+    )
 
     assert result["number"] == 17
     assert client.calls == [("metadata", scope)]
+
+
+def test_batched_turn_resolves_each_exact_scope_and_refuses_unlisted_pr() -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    first = _scope(RepoPRAction.INSPECT)
+    second = _scope(RepoPRAction.INSPECT, number=18, head_sha="c" * 40)
+    runtime = _runtime_for_scopes(first, second)
+
+    pr_metadata.func(repository="OWNER/REPO", pull_request=17, runtime=runtime)
+    pr_metadata.func(repository="owner/repo", pull_request=18, runtime=runtime)
+    with pytest.raises(ToolException, match="not authorized for this turn") as denied:
+        pr_metadata.func(repository="owner/repo", pull_request=19, runtime=runtime)
+
+    assert [call[1] for call in client.calls] == [first, second]
+    assert "owner/repo" not in str(denied.value)
+    assert "19" not in str(denied.value)
+
+
+def test_forge_refusal_distinguishes_turn_with_no_authorized_prs() -> None:
+    context = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="poller", channel_id="poller:forge", interactivity=None,
+    )
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="forge-no-scope", store=None,
+    )
+
+    with pytest.raises(ToolException, match="this turn carries no authorized pull requests"):
+        pr_metadata.func(
+            repository="owner/repo", pull_request=17, runtime=runtime,
+        )
 
 
 def test_review_and_remediation_actions_do_not_widen_each_other() -> None:
@@ -200,15 +248,21 @@ def test_review_and_remediation_actions_do_not_widen_each_other() -> None:
     )
 
     pr_submit_review.func(
+        repository="owner/repo", pull_request=17,
         verdict=ReviewVerdict.APPROVE, body="Looks good", runtime=review,
     )
-    pr_comment.func(body="Fixed", runtime=remediation)
+    pr_comment.func(
+        repository="owner/repo", pull_request=17, body="Fixed", runtime=remediation,
+    )
     with pytest.raises(ToolException, match="pr.review not granted"):
         pr_submit_review.func(
+            repository="owner/repo", pull_request=17,
             verdict=ReviewVerdict.APPROVE, body="No", runtime=remediation,
         )
     with pytest.raises(ToolException, match="pr.comment not granted"):
-        pr_comment.func(body="No", runtime=review)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17, body="No", runtime=review,
+        )
 
 
 def test_review_request_scope_grants_read_and_review_only(
@@ -250,13 +304,20 @@ def test_body_and_inline_path_injection_are_rejected_before_adapter() -> None:
     runtime = _runtime(_scope(RepoPRAction.PR_REVIEW, RepoPRAction.PR_COMMENT))
 
     with pytest.raises(ToolException, match="65536-byte"):
-        pr_comment.func(body="x" * 65_537, runtime=runtime)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17,
+            body="x" * 65_537, runtime=runtime,
+        )
     with pytest.raises(ToolException, match="relative repository path"):
         pr_inline_review_comment.func(
+            repository="owner/repo", pull_request=17,
             path="../../secret", line=1, body="x", runtime=runtime,
         )
     with pytest.raises(ToolException, match="null byte"):
-        pr_comment.func(body="hello\x00world", runtime=runtime)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17,
+            body="hello\x00world", runtime=runtime,
+        )
     assert client.calls == []
 
 
@@ -270,8 +331,14 @@ def test_unsupported_operation_is_durable_and_deduped(
     init_logger(events, "test")
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
 
-    first = unsupported_operation.func(operation="pr.resolve_thread", runtime=runtime)
-    second = unsupported_operation.func(operation="pr.resolve_thread", runtime=runtime)
+    first = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        operation="pr.resolve_thread", runtime=runtime,
+    )
+    second = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        operation="pr.resolve_thread", runtime=runtime,
+    )
 
     assert first["status"] == "unsupported_operation"
     assert first["escalated"] is True

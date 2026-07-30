@@ -4294,6 +4294,8 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
     auth = create_auth_context(event, enforce=True)
 
     assert auth.repo_review_state is not None
+    assert auth.repo_pr_scope_registry is not None
+    assert auth.repo_pr_scope_registry.review_states == (auth.repo_review_state,)
     assert auth.repo_review_state.repo == "o/r"
     assert auth.repo_review_state.pr_number == 42
     assert auth.repo_review_state.head_ref == "worklink/42"
@@ -4375,7 +4377,7 @@ def test_poller_scope_forged_or_wrong_authority_fields_fail_closed(
     assert create_auth_context(event, enforce=True).repo_pr_action_scope is None
 
 
-def test_poller_scope_requires_single_isolated_item_and_configured_repo(
+def test_poller_scope_derives_each_valid_batched_item_and_requires_configured_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
@@ -4383,12 +4385,36 @@ def test_poller_scope_requires_single_isolated_item_and_configured_repo(
         trigger="poller", channel_id="poller:github-activity",
         service_principal=authority.canonical, service_authority=authority,
     )
-    mixed = AgentEvent(**base, extra={"items": [item, dict(item)]})
+    second = {
+        **item, "number": 43, "head_ref": "worklink/43", "head_sha": "c" * 40,
+    }
+    mixed = AgentEvent(**base, extra={"items": [item, "malformed", second]})
+    auth = create_auth_context(mixed, enforce=True)
+    assert auth.repo_pr_scope_registry is not None
+    assert [
+        (scope.canonical_repo, scope.pr_number)
+        for scope in auth.repo_pr_scope_registry.action_scopes
+    ] == [("o/r", 42), ("o/r", 43)]
+    assert auth.repo_review_state is None
+    assert auth.repo_pr_action_scope is None
+
     monkeypatch.setenv("GITHUB_REPOS", "other/repo")
     unconfigured = AgentEvent(**base, extra={"items": [item]})
 
-    assert create_auth_context(mixed, enforce=True).repo_pr_action_scope is None
-    assert create_auth_context(unconfigured, enforce=True).repo_pr_action_scope is None
+    assert create_auth_context(unconfigured, enforce=True).repo_pr_scope_registry is None
+
+
+def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"items": [item, {**item, "head_sha": "c" * 40}]},
+    )
+
+    assert create_auth_context(event, enforce=True).repo_pr_scope_registry is None
 
 
 def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
@@ -4419,6 +4445,10 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
     assert access_control.RepoPRAction.PR_REVIEW.value not in first.allowed_operations
     with pytest.raises(FrozenInstanceError):
         first.destination_ref = "refs/heads/main"
+    registry = create_auth_context(event, enforce=True).repo_pr_scope_registry
+    assert registry is not None
+    with pytest.raises(FrozenInstanceError):
+        registry.review_states = ()
     with pytest.raises(ValueError, match="unsupported repo/PR action"):
         replace(first, allowed_operations=frozenset({"repo.push", "repo.anything"}))
     fields = access_control.ToolAuthorization(

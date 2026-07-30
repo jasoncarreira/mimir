@@ -336,9 +336,15 @@ def _extract_sink_target(
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
         "repo_revert_abort", "repo_push",
     }:
-        scope = getattr(auth_context, "repo_pr_action_scope", None)
-        if scope is None:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        state = (
+            registry.resolve(args.get("repository"), args.get("pull_request"))
+            if registry is not None and hasattr(registry, "resolve")
+            else None
+        )
+        if state is None:
             return None
+        scope = state.action_scope
         return (
             f"{scope.canonical_repo}#pull/{scope.pr_number}"
             f"@{scope.observed_head_sha}:{scope.scope_id}"
