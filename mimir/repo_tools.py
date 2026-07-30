@@ -538,6 +538,14 @@ class RepoGitTools:
             raise GitRefusal("git_failed", "Git tracked-file inspection failed")
         return result.stdout == f"{relative}\x00"
 
+    def validated_checkout_root(self) -> Path:
+        """Revalidate the lease and Git identity immediately before non-Git use."""
+        root = self._validate_lease()
+        if root != self._root:
+            raise GitRefusal("cross_pr_checkout", "checkout lease changed during access")
+        self._assert_checkout_identity()
+        return root
+
     def _stage(self, paths: tuple[str, ...]) -> None:
         unmerged = self._unmerged_paths()
         if unmerged and not set(paths).issubset(unmerged):

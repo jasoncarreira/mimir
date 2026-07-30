@@ -33,6 +33,7 @@ class RepoPRAction(StrEnum):
 
     INSPECT = "repo.inspect"
     CHECKOUT = "repo.checkout"
+    TEST = "repo.test"
     WRITE = "repo.write"
     COMMIT = "repo.commit"
     PUSH = "repo.push"

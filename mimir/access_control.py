@@ -203,6 +203,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_checkout": SinkCategory.FORGE,
     "repo_cleanup": SinkCategory.FORGE,
     "repo_fetch": SinkCategory.FORGE,
+    "repo_test": SinkCategory.FORGE,
     "repo_stage": SinkCategory.FORGE,
     "repo_commit": SinkCategory.FORGE,
     "repo_merge": SinkCategory.FORGE,
@@ -313,6 +314,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "repo_cleanup": ToolFlowDirection.SINK,
     "repo_fetch": ToolFlowDirection.BOTH,
     "repo_status": ToolFlowDirection.SOURCE,
+    "repo_test": ToolFlowDirection.BOTH,
     "repo_diff": ToolFlowDirection.SOURCE,
     "repo_unmerged": ToolFlowDirection.SOURCE,
     "repo_stage": ToolFlowDirection.SINK,
@@ -448,6 +450,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_cleanup": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_fetch": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_test": CapabilityTier.CODE_EXECUTION,
     "repo_status": CapabilityTier.SCOPE_CONTAINED,
     "repo_diff": CapabilityTier.SCOPE_CONTAINED,
     "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
@@ -503,7 +506,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -520,7 +523,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -771,6 +774,7 @@ def _valid_git_branch(value: object) -> bool:
 _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
     RepoPRAction.WRITE.value,
     RepoPRAction.COMMIT.value,
     RepoPRAction.PUSH.value,
@@ -801,6 +805,7 @@ _REPO_TOOL_ACTIONS: dict[str, str] = {
     "repo_cleanup": RepoPRAction.CHECKOUT.value,
     "repo_fetch": RepoPRAction.CHECKOUT.value,
     "repo_status": RepoPRAction.INSPECT.value,
+    "repo_test": RepoPRAction.TEST.value,
     "repo_diff": RepoPRAction.INSPECT.value,
     "repo_unmerged": RepoPRAction.INSPECT.value,
     "repo_stage": RepoPRAction.WRITE.value,
@@ -5489,6 +5494,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_checkout": "repository",
     "repo_fetch": "repository",
     "repo_status": "repository",
+    "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
 }
@@ -5524,6 +5530,7 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_checkout",
     "repo_fetch",
     "repo_status",
+    "repo_test",
     "repo_diff",
     "repo_unmerged",
 })
@@ -5789,7 +5796,7 @@ def classify_protected_result(
     if tool_name in {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged",
     }:
         scope = getattr(auth_context, "repo_pr_action_scope", None)
         if scope is None or failed:
@@ -6192,6 +6199,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "repo_checkout": "bound_pull_request",
     "repo_cleanup": "bound_pull_request",
     "repo_fetch": "bound_pull_request",
+    "repo_test": "bound_pull_request",
     "repo_stage": "bound_pull_request",
     "repo_commit": "bound_pull_request",
     "repo_merge": "bound_pull_request",

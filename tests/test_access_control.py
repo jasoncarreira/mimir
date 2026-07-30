@@ -4434,7 +4434,8 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
     assert first.canonical_origin == "git@github.com:o/r.git"
     assert first.allowed_operations == frozenset({
         access_control.RepoPRAction.INSPECT.value,
-        access_control.RepoPRAction.CHECKOUT.value,
+            access_control.RepoPRAction.CHECKOUT.value,
+            access_control.RepoPRAction.TEST.value,
         access_control.RepoPRAction.WRITE.value,
         access_control.RepoPRAction.COMMIT.value,
         access_control.RepoPRAction.PUSH.value,
