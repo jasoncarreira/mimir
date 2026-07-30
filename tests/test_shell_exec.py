@@ -15,7 +15,10 @@ silently revert to the shlex+shell=False path that broke it.
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -181,6 +184,65 @@ def test_shell_exec_surfaces_bash_syntax_error():
     result = shell_exec.invoke({"command": "echo \"unterminated"})
     assert "exit=0" not in result  # bash reports the syntax error
     assert "shell-parse error" not in result  # the shlex path is gone
+
+
+def test_configured_project_test_timeout_is_named_and_output_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir.tools._shell_env import bind_direct_exec_argv, reset_direct_exec_argv
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    executable = maintenance_pinned_executables["uv"]
+    argv = [str(executable), "test"]
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    monkeypatch.setenv(
+        "MIMIR_PROJECT_TEST_COMMAND",
+        json.dumps({"argv": argv, "cwd": str(repo)}),
+    )
+    token = bind_direct_exec_argv(argv)
+    try:
+        monkeypatch.setattr(
+            extra,
+            "_run_bounded_project_test",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(argv, 60)
+            ),
+        )
+        timeout = shell_exec.invoke({"command": f"{executable} test"})
+
+        monkeypatch.setattr(
+            extra,
+            "_run_bounded_project_test",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=1, stdout=b"o" * 5000, stderr=b"e" * 3000,
+            ),
+        )
+        output = shell_exec.invoke({"command": f"{executable} test"})
+    finally:
+        reset_direct_exec_argv(token)
+
+    assert "project_test_timeout" in timeout
+    assert "shell stdout truncated" in output
+    assert "shell stderr truncated" in output
+    assert len(output) < 7000
+
+
+def test_project_test_capture_discards_output_past_hard_byte_cap(tmp_path: Path) -> None:
+    completed = extra._run_bounded_project_test(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
+        cwd=tmp_path,
+        timeout=5,
+        env=dict(os.environ),
+    )
+
+    assert completed.returncode == 0
+    assert len(completed.stdout) == extra._PROJECT_TEST_CAPTURE_BYTES
 
 
 # ─── trusted system tools + venv-bin fallback on PATH ────────────────

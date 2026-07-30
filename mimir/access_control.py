@@ -1435,57 +1435,6 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     )
 
 
-def _target_matches_pytest_command(arguments: list[str]) -> bool:
-    """Admit bounded pytest selection/reporting options and relative test paths.
-
-    Pytest executes repository test code by design, but its wider option surface
-    can also import arbitrary plugins, redirect configuration, or open an
-    interactive debugger. Keep that control plane out of autonomous reviews.
-    """
-    flag_options = frozenset({
-        "-q", "-x", "-s", "-v", "-vv", "--collect-only",
-        "--disable-warnings", "--exitfirst", "--failed-first", "--last-failed",
-        "--no-header", "--no-summary", "--quiet", "--strict-config",
-        "--strict-markers", "--verbose",
-    })
-    value_options = frozenset({
-        "-k", "-m", "--capture", "--color", "--durations",
-        "--durations-min", "--maxfail", "--show-capture", "--tb",
-    })
-    option_prefixes = (
-        "--capture=", "--color=", "--durations=", "--durations-min=",
-        "--maxfail=", "--show-capture=", "--tb=",
-    )
-
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
-        # Pytest expands ``@file`` response operands after authorization. A
-        # response file could therefore smuggle any denied option into argv.
-        if argument.startswith("@"):
-            return False
-        if argument in flag_options or argument.startswith(option_prefixes):
-            index += 1
-            continue
-        if argument in value_options:
-            if index + 1 >= len(arguments):
-                return False
-            index += 2
-            continue
-        if argument == "--" or argument.startswith("-"):
-            return False
-
-        # Collection operands may include a node id after ``::``. Keep their
-        # filesystem component lexical and relative so pytest cannot discover
-        # config/conftest/plugin code from an unrelated host tree.
-        path_text = argument.split("::", 1)[0]
-        path = Path(path_text)
-        if path.is_absolute() or ".." in path.parts:
-            return False
-        index += 1
-    return True
-
-
 def _target_matches_npm_ci_command(arguments: list[str]) -> bool:
     """Require a script-free clean install with no operands or option terminator."""
     allowed_options = frozenset({
@@ -2060,17 +2009,7 @@ def _target_matches_repo_review_shell_command(
     if argv[0] == "npm":
         if argv[1:2] == ["ci"]:
             return _target_matches_npm_ci_command(argv[2:])
-        if argv[1:2] == ["test"] or argv[1:3] == ["run", "test"]:
-            return _arguments_match_allowlist(
-                argv[2:] if argv[1] == "test" else argv[3:],
-                exact_options=frozenset({"--if-present", "--ignore-scripts"}),
-            )
         return False
-
-    if argv[0] == "pytest":
-        return _target_matches_pytest_command(argv[1:])
-    if argv[:3] == ["uv", "run", "pytest"]:
-        return _target_matches_pytest_command(argv[3:])
     return False
 
 
@@ -2079,9 +2018,6 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "gh": Path("/usr/bin/gh"),
     "npm": Path("/usr/lib/node_modules/npm/bin/npm-cli.js"),
     "node": Path("/usr/bin/node"),
-    # Invoke pytest as a module through the already-running, resolved Python
-    # interpreter.  Its old .venv entry-point was itself service-writable.
-    "pytest": Path(sys.executable).resolve(),
     "uv": Path("/usr/local/bin/uv"),
     "ls": Path("/usr/bin/ls"),
     "grep": Path("/usr/bin/grep"),
@@ -2371,8 +2307,6 @@ def _maintenance_pinned_execution_argv_with_reason(
                 f"the script {command!r} could not be resolved to a trusted path."
             )
         return [str(interpreter), str(expected), *argv[1:]], ""
-    if command == "pytest":
-        return [str(expected), "-m", "pytest", *argv[1:]], ""
     return [str(expected), *argv[1:]], ""
 
 
@@ -2432,6 +2366,128 @@ _SHELL_PROFILE_SINGLE_ARGV_HINT = (
     "--body-file <path beneath the agent scratch root>') rather than an inline "
     "multi-line value or a heredoc."
 )
+
+
+_PROJECT_TEST_CONFIG_ENV = "MIMIR_PROJECT_TEST_COMMAND"
+_PROJECT_TEST_MAX_SELECTORS = 32
+_PROJECT_TEST_MAX_SELECTOR_LENGTH = 256
+_PROJECT_TEST_MAX_SELECTOR_BYTES = 4096
+_PROJECT_TEST_MAX_COMMAND_ARGS = 16
+_PROJECT_TEST_MAX_COMMAND_ARG_LENGTH = 512
+_PROJECT_TEST_SELECTOR_PATTERN = re.compile(r"[A-Za-z0-9._/,:+=-]+", re.ASCII)
+_PROJECT_TEST_INTERPRETER_PATTERN = re.compile(
+    r"(?:python(?:\d+(?:\.\d+)*)?|pypy\d*|node|ruby|perl|php|lua|luajit|"
+    r"[bdkz]?sh|fish|rscript|java|env)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ProjectTestCommand:
+    argv: tuple[str, ...]
+    cwd: Path
+
+
+def _configured_project_test_command() -> tuple[_ProjectTestCommand | None, str]:
+    """Load the operator-owned fixed test argv and project root from process config."""
+    raw = os.environ.get(_PROJECT_TEST_CONFIG_ENV, "").strip()
+    if not raw:
+        return None, "project_test_not_configured"
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "project_test_config_invalid_json"
+    if not isinstance(value, dict) or set(value) != {"argv", "cwd"}:
+        return None, "project_test_config_invalid_shape"
+    argv = value.get("argv")
+    cwd_text = value.get("cwd")
+    if (
+        not isinstance(argv, list)
+        or not 1 <= len(argv) <= _PROJECT_TEST_MAX_COMMAND_ARGS
+        or any(
+            not isinstance(argument, str)
+            or not argument
+            or len(argument) > _PROJECT_TEST_MAX_COMMAND_ARG_LENGTH
+            or "\x00" in argument
+            or "\n" in argument
+            or "\r" in argument
+            for argument in argv
+        )
+        or not isinstance(cwd_text, str)
+        or not cwd_text
+    ):
+        return None, "project_test_config_invalid_shape"
+    executable = Path(argv[0])
+    if not executable.is_absolute():
+        return None, "project_test_config_executable_not_absolute"
+    if any(
+        _PROJECT_TEST_INTERPRETER_PATTERN.fullmatch(Path(argument).name)
+        for argument in argv
+    ):
+        return None, "project_test_config_interpreter_refused"
+    try:
+        resolved_executable = executable.resolve(strict=True)
+        cwd = Path(cwd_text).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "project_test_config_path_unavailable"
+    if (
+        resolved_executable != executable
+        or not resolved_executable.is_file()
+        or not os.access(resolved_executable, os.X_OK)
+        or _maintenance_pin_is_service_writable(resolved_executable)
+    ):
+        return None, "project_test_config_executable_untrusted"
+    if not cwd.is_dir():
+        return None, "project_test_config_path_unavailable"
+    try:
+        roots = tuple(root.resolve(strict=True) for root in _configured_repo_roots())
+    except (OSError, RuntimeError):
+        return None, "project_test_config_root_unauthorized"
+    if not any(cwd == root or cwd.is_relative_to(root) for root in roots):
+        return None, "project_test_config_root_unauthorized"
+    return _ProjectTestCommand((str(resolved_executable), *argv[1:]), cwd), ""
+
+
+def _project_test_execution_argv(
+    argv: list[str],
+) -> tuple[list[str] | None, str | None, bool]:
+    """Return a configured test argv, refusal name, and whether its prefix matched."""
+    configured, config_reason = _configured_project_test_command()
+    if configured is None:
+        return None, config_reason, False
+    prefix = list(configured.argv)
+    requested_prefix = [str(Path(argv[0]).resolve(strict=False)), *argv[1:len(prefix)]]
+    if len(argv) < len(prefix) or requested_prefix != prefix:
+        return None, None, False
+    selectors = argv[len(prefix):]
+    if len(selectors) > _PROJECT_TEST_MAX_SELECTORS:
+        return None, "project_test_selector_count_exceeded", True
+    if sum(len(selector.encode("utf-8")) for selector in selectors) > _PROJECT_TEST_MAX_SELECTOR_BYTES:
+        return None, "project_test_selectors_too_large", True
+    for selector in selectors:
+        if len(selector) > _PROJECT_TEST_MAX_SELECTOR_LENGTH:
+            return None, "project_test_selector_too_long", True
+        path_text = selector.split("::", 1)[0]
+        if ".." in Path(path_text).parts:
+            return None, "project_test_selector_traversal", True
+        if (
+            not selector.isascii()
+            or not _PROJECT_TEST_SELECTOR_PATTERN.fullmatch(selector)
+            or selector.startswith(("-", "/", "@"))
+            or selector in {".", ".."}
+            or (selector.startswith(".") and not selector.startswith("./"))
+        ):
+            return None, "project_test_selector_invalid", True
+    return [*prefix, *selectors], "", True
+
+
+def configured_project_test_cwd(argv: list[str]) -> str | None:
+    """Return the operator-selected cwd only for an admitted configured test argv."""
+    execution_argv, _reason, matched = _project_test_execution_argv(argv)
+    if not matched or execution_argv is None:
+        return None
+    configured, _reason = _configured_project_test_command()
+    return str(configured.cwd) if configured is not None else None
 
 
 # Display-only vocabulary for refusal messages. A token is echoed back to the
@@ -2583,6 +2639,12 @@ def parse_service_shell_argv_with_reason(
 
     if argv[0] == "/usr/local/bin/chainlink":
         argv[0] = "chainlink"
+
+    test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
+    if test_matched:
+        if test_argv is None:
+            return None, f"configured project test refused: {test_reason}"
+        return test_argv, ""
 
     allowed = False
     if destination == "scheduler_read_only":
