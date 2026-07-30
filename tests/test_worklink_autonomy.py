@@ -982,6 +982,35 @@ def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> 
     ] == [10, 11]
 
 
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_degrades_before_dispatch_for_invalid_backend_reference(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "worklink.yaml"
+    config_path.write_text(
+        "defaults:\n  backend_by_category:\n    coding-cli: codex\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[10], active_locks=[])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+
+    assert not [event for event in events if event.get("signal") == "worklink_dispatched"]
+    invalid = [
+        event for event in events if event.get("signal") == "worklink_poller_misconfigured"
+    ]
+    assert len(invalid) == 1
+    assert str(config_path) in invalid[0]["reason"]
+    assert "defaults.backend_by_category.coding-cli" in invalid[0]["reason"]
+    assert "change defaults.backend_by_category.coding-cli" in invalid[0]["reason"]
+
+
 def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
