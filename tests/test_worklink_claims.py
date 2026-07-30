@@ -106,6 +106,24 @@ def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> 
     assert all(result.claimed and result.record is not None for result in results)
 
 
+def test_missing_home_path_emits_serialization_unavailable(caplog: pytest.LogCaptureFixture) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    result = ChainlinkClaims(
+        agent_id="worker",
+        runner=lambda args: completed(args),
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.claimed is True
+    assert [event for event, _payload in events] == [
+        "worklink_claim_serialization_unavailable"
+    ]
+    assert events[0][1]["reason"] == "home_path_missing"
+    assert events[0][1]["resource"] == "chainlink_locks_worktree"
+    assert "Worklink claim serialization unavailable" in caplog.text
+
+
 def test_claim_contention_retries_with_backoff_and_emits_outcomes(tmp_path: Path) -> None:
     claim_calls = 0
     sleeps: list[float] = []
@@ -192,20 +210,27 @@ def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
             )
         return completed(call)
 
+    sleeps: list[float] = []
     result = ChainlinkClaims(
         agent_id="worker",
         runner=runner,
         home_path=tmp_path,
         event_logger=lambda _event, **payload: events.append(payload),
-        contention_max_attempts=3,
-        sleeper=lambda _delay: None,
+        sleeper=sleeps.append,
     ).claim_issue(1064, labels=["worklink:ready"])
 
     assert result.claimed is False
     assert result.reason == "claim_contention_exhausted"
-    assert claim_calls == 3
-    assert [event["outcome"] for event in events] == ["retrying", "retrying", "exhausted"]
-    assert events[-1]["max_attempts"] == 3
+    assert claim_calls == 5
+    assert sleeps == [0.1, 0.2, 0.4, 0.8]
+    assert [event["outcome"] for event in events] == [
+        "retrying",
+        "retrying",
+        "retrying",
+        "retrying",
+        "exhausted",
+    ]
+    assert events[-1]["max_attempts"] == 5
 
 
 def test_heartbeat_issue_appends_fresh_claim_record() -> None:

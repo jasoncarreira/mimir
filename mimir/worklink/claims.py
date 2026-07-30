@@ -45,8 +45,10 @@ MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 
 # Retrying remains useful even with Mimir's mutex: another Chainlink caller may
-# not participate in it. This is a total-attempt bound, including the first call.
-CLAIM_CONTENTION_MAX_ATTEMPTS = 3
+# not participate in it. Five total attempts (including the first call) sleep for
+# 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds, long enough to absorb a short external
+# Chainlink fetch while keeping genuine persistent contention bounded.
+CLAIM_CONTENTION_MAX_ATTEMPTS = 5
 CLAIM_CONTENTION_INITIAL_BACKOFF_S = 0.1
 CLAIM_CONTENDED_RESOURCE = "chainlink_locks_worktree"
 
@@ -445,13 +447,30 @@ class ChainlinkClaims:
         self, issue_id: int, *, home_path: Path | None
     ) -> subprocess.CompletedProcess[str]:
         """Run only the Chainlink claim under the shared-worktree mutex."""
+        lock_path: Path | None = None
+        if home_path is None:
+            log.warning(
+                "Worklink claim serialization unavailable: issue_id=%s reason=home_path_missing",
+                issue_id,
+            )
+            if self.event_logger is not None:
+                self.event_logger(
+                    "worklink_claim_serialization_unavailable",
+                    issue_id=issue_id,
+                    resource=CLAIM_CONTENDED_RESOURCE,
+                    reason="home_path_missing",
+                )
+        else:
+            lock_dir = home_path / "state" / "worklink"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / "chainlink-claim.lock"
+
+        result: subprocess.CompletedProcess[str] | None = None
         for attempt in range(1, self.contention_max_attempts + 1):
-            if home_path is None:
+            if lock_path is None:
                 result = self._run("locks", "claim", str(issue_id), check=False)
             else:
-                lock_dir = home_path / "state" / "worklink"
-                lock_dir.mkdir(parents=True, exist_ok=True)
-                with (lock_dir / "chainlink-claim.lock").open("a", encoding="utf-8") as handle:
+                with lock_path.open("a", encoding="utf-8") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
                         result = self._run("locks", "claim", str(issue_id), check=False)
@@ -463,14 +482,13 @@ class ChainlinkClaims:
                     self._emit_claim_contention(issue_id, attempt, "succeeded")
                 return result
 
-            if attempt >= self.contention_max_attempts:
-                self._emit_claim_contention(issue_id, attempt, "exhausted")
-                return result
+            if attempt < self.contention_max_attempts:
+                self._emit_claim_contention(issue_id, attempt, "retrying")
+                self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
 
-            self._emit_claim_contention(issue_id, attempt, "retrying")
-            self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
-
-        raise AssertionError("unreachable claim contention retry state")
+        assert result is not None
+        self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
+        return result
 
     def _emit_claim_contention(self, issue_id: int, attempt: int, outcome: str) -> None:
         if self.event_logger is None:
