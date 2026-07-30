@@ -753,7 +753,10 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     emit_hard_read_denial(
                         "read_file", str(resolved), "protected_read_target",
                     )
-                    return ReadResult(error="Read denied: protected file")
+                    return ReadResult(error=(
+                        "Read denied: protected_read_target. For published PR content, "
+                        "use pr_files or pr_diff."
+                    ))
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial
 
@@ -781,7 +784,10 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     emit_hard_read_denial(
                         "read_file", str(resolved), "protected_read_target",
                     )
-                    return ReadResult(error="Read denied: protected file")
+                    return ReadResult(error=(
+                        "Read denied: protected_read_target. For published PR content, "
+                        "use pr_files or pr_diff."
+                    ))
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial
 

@@ -203,6 +203,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_checkout": SinkCategory.FORGE,
     "repo_cleanup": SinkCategory.FORGE,
     "repo_fetch": SinkCategory.FORGE,
+    "repo_test": SinkCategory.FORGE,
     "repo_stage": SinkCategory.FORGE,
     "repo_commit": SinkCategory.FORGE,
     "repo_merge": SinkCategory.FORGE,
@@ -313,6 +314,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "repo_cleanup": ToolFlowDirection.SINK,
     "repo_fetch": ToolFlowDirection.BOTH,
     "repo_status": ToolFlowDirection.SOURCE,
+    "repo_test": ToolFlowDirection.BOTH,
     "repo_diff": ToolFlowDirection.SOURCE,
     "repo_unmerged": ToolFlowDirection.SOURCE,
     "repo_stage": ToolFlowDirection.SINK,
@@ -448,6 +450,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_cleanup": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_fetch": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "repo_test": CapabilityTier.CODE_EXECUTION,
     "repo_status": CapabilityTier.SCOPE_CONTAINED,
     "repo_diff": CapabilityTier.SCOPE_CONTAINED,
     "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
@@ -503,7 +506,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -520,7 +523,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -771,6 +774,7 @@ def _valid_git_branch(value: object) -> bool:
 _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
     RepoPRAction.WRITE.value,
     RepoPRAction.COMMIT.value,
     RepoPRAction.PUSH.value,
@@ -780,7 +784,10 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
 })
 _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
     RepoPRAction.PR_REVIEW.value,
+    RepoPRAction.PR_COMMENT.value,
 })
 _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_metadata": RepoPRAction.INSPECT.value,
@@ -801,6 +808,7 @@ _REPO_TOOL_ACTIONS: dict[str, str] = {
     "repo_cleanup": RepoPRAction.CHECKOUT.value,
     "repo_fetch": RepoPRAction.CHECKOUT.value,
     "repo_status": RepoPRAction.INSPECT.value,
+    "repo_test": RepoPRAction.TEST.value,
     "repo_diff": RepoPRAction.INSPECT.value,
     "repo_unmerged": RepoPRAction.INSPECT.value,
     "repo_stage": RepoPRAction.WRITE.value,
@@ -821,6 +829,15 @@ _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 def _configured_scope_github_repos() -> frozenset[str]:
     return frozenset(
         f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
+    )
+
+
+def is_configured_github_repo(repo: object) -> bool:
+    """Return whether a model-supplied selector names server configuration."""
+    return (
+        isinstance(repo, str)
+        and _GITHUB_REPO_PATTERN.fullmatch(repo) is not None
+        and repo.lower() in _configured_scope_github_repos()
     )
 
 
@@ -871,15 +888,12 @@ def _repo_pr_scope(
     head_sha: object,
     base_ref: object,
     base_sha: object,
-    requested_reviewer: object = None,
 ) -> Any:
     """Validate a complete observed PR snapshot and issue its closed scope."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     is_remediation = event_type == "pr_changes_requested_stale"
-    is_review = event_type == "pr_review_requested" and requested_reviewer == self_login
     if (
-        not (is_remediation or is_review)
-        or not self_login
+        not self_login
         or (is_remediation and principal != self_login)
         or not isinstance(repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
@@ -890,7 +904,7 @@ def _repo_pr_scope(
         or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
         or (is_remediation and head_repo.lower() != repo.lower())
         or (is_remediation and head_remote != "origin")
-        or (is_review and head_remote != "source")
+        or (not is_remediation and head_remote not in {"origin", "source"})
         or not _valid_git_branch(head_ref)
         or not _valid_git_branch(base_ref)
         or not isinstance(head_sha, str)
@@ -919,11 +933,12 @@ def _repo_pr_scope(
         ),
         pr_number=number,
         head_repo=head_repo,
-        head_remote=head_remote,
+        head_remote=head_remote if is_remediation else "origin",
         destination_ref=f"refs/heads/{head_ref}",
         observed_head_sha=head_sha.lower(),
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
+        checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
     )
 
 
@@ -954,8 +969,33 @@ def create_server_discovered_heartbeat_scope(
     )
 
 
+def create_server_discovered_review_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+) -> Any:
+    """Issue standing review authority from a provider-normalized live PR."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return None
+    return _repo_pr_scope(
+        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        repo=repo,
+        principal=pull_request.author,
+        event_type="pr_review",
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+    )
+
+
 def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal | None) -> Any:
-    """Derive one immutable own-PR scope from a trusted single poller item."""
+    """Derive exactly the valid immutable PR scopes in a trusted poller payload."""
     if (
         service is None
         or service.authority_profile != "github"
@@ -964,25 +1004,42 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
     ):
         return None
     items = event.extra.get("items")
-    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+    if not isinstance(items, list):
         return None
-    item = items[0]
-    from .models import RepoReviewState
-    scope = _repo_pr_scope(
-        provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
-        repo=item.get("repo"),
-        principal=item.get("author"),
-        event_type=item.get("event_type"),
-        number=item.get("number"),
-        head_repo=item.get("head_repo"),
-        head_remote=item.get("head_remote"),
-        head_ref=item.get("head_ref"),
-        head_sha=item.get("head_sha"),
-        base_ref=item.get("base_ref"),
-        base_sha=item.get("base_sha"),
-        requested_reviewer=item.get("requested_reviewer"),
+    from .models import RepoPRScopeRegistry, RepoReviewState
+
+    by_target: dict[tuple[str, int], RepoReviewState | None] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        scope = _repo_pr_scope(
+            provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
+            repo=item.get("repo"),
+            principal=item.get("author"),
+            event_type=item.get("event_type"),
+            number=item.get("number"),
+            head_repo=item.get("head_repo"),
+            head_remote=item.get("head_remote"),
+            head_ref=item.get("head_ref"),
+            head_sha=item.get("head_sha"),
+            base_ref=item.get("base_ref"),
+            base_sha=item.get("base_sha"),
+        )
+        if scope is None:
+            continue
+        target = (scope.canonical_repo, scope.pr_number)
+        previous = by_target.get(target)
+        if previous is None and target in by_target:
+            continue
+        if previous is not None and previous.action_scope.scope_id != scope.scope_id:
+            # Never choose between conflicting trusted snapshots of one target.
+            by_target[target] = None
+        elif previous is None:
+            by_target[target] = RepoReviewState(scope)
+    states = tuple(
+        state for _target, state in sorted(by_target.items()) if state is not None
     )
-    return RepoReviewState(scope) if scope is not None else None
+    return RepoPRScopeRegistry(states) if states else None
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -1745,9 +1802,9 @@ def _repo_review_owned_branch(branch: str, event_branch: str) -> bool:
     into a concurrent sibling's worktree, twice in seven builds), and Worklink
     runs two ``issue/*`` builds concurrently by default.
 
-    Requiring equality is safe because ``RepoReviewState`` is constructed only
-    for a single ``pr_changes_requested_stale`` item, so ``head_ref`` is the
-    one PR branch the turn exists to remediate; no flow legitimately targets a
+    Requiring equality is safe because each ``RepoReviewState`` is constructed
+    for one ``pr_changes_requested_stale`` item, so ``head_ref`` is the one PR
+    branch that state can remediate; no selected state legitimately targets a
     different branch.
     """
     return (
@@ -3149,6 +3206,107 @@ def _live_untrusted_active_ingest(
     return result if isinstance(result, bool) else None
 
 
+def _source_is_triggering_channel_compatible(
+    source: Any,
+    *,
+    effective_principal: str,
+    domain: str,
+    bridge_instance: str,
+    resolved_triggering: str,
+) -> bool:
+    """Return whether one IFC source may flow to the triggering channel."""
+    if not getattr(source, "is_complete", False):
+        return False
+    # Fresh protected-result sources include the authenticated reader by
+    # construction; inherited or externally supplied labels do not, so keep
+    # this check as the fail-closed guard for those paths.
+    if effective_principal not in source.authorized_principals:
+        return False
+    source_kind = getattr(source, "source_kind", "channel")
+    if source_kind == "channel":
+        return (
+            source.principal == effective_principal
+            and source.domain == domain
+            and source.bridge_instance == bridge_instance
+            and ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    if source_kind == "service":
+        # Trusted service/derived data retains its input ACL. It may return only
+        # to the triggering channel when its channel provenance matches.
+        return not source.domain.startswith("channel") or (
+            source.bridge_instance == bridge_instance
+            and ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    if source_kind == "protected_prompt":
+        # Framework-authored prompt blocks are trusted at their server-side
+        # loader; other prompt provenance must belong to this channel.
+        return (
+            source.integrity == "trusted"
+            or ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    return source_kind == "protected_tool"
+
+
+def _ifc_blocking_source(
+    ifc_labels: Any,
+    auth_context: Any,
+    sink_category: SinkCategory,
+) -> tuple[Any | None, str]:
+    """Classify one source for an IFC refusal and the certainty of the match."""
+    from .models import InformationFlowLabels, Integrity, IntegrityEffect
+
+    current = ifc_labels
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if callable(get_current):
+        candidate = get_current(ifc_labels)
+        if isinstance(candidate, InformationFlowLabels):
+            current = candidate
+    if not isinstance(current, InformationFlowLabels):
+        raise TypeError("IFC source classifier received invalid labels")
+    if not current.sources:
+        return None, "no_sources"
+
+    if sink_category is SinkCategory.SAME_CHANNEL:
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            getattr(auth_context, "channel_id", None)
+        )
+        service = get_trusted_service_from_auth_context(auth_context)
+        effective_principal = (
+            f"service:{service.canonical}"
+            if service is not None
+            else getattr(auth_context, "canonical_principal", None)
+        )
+        domain = getattr(auth_context, "domain", None)
+        bridge_instance = getattr(auth_context, "bridge_instance", None)
+        if all((effective_principal, domain, bridge_instance, resolved_triggering)):
+            for source in current.sources:
+                if not _source_is_triggering_channel_compatible(
+                    source,
+                    effective_principal=effective_principal,
+                    domain=domain,
+                    bridge_instance=bridge_instance,
+                    resolved_triggering=resolved_triggering,
+                ):
+                    return source, "causing_source"
+
+    # This predicate is itself the gate for application egress and disables the
+    # trusted-operator exemptions for shell, file, spawn, and channel sinks.
+    for source in current.sources:
+        if (
+            source.integrity == Integrity.UNTRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        ):
+            return source, "causing_source"
+
+    # The remaining gate rules evaluate the labels as a set. Preserve a bounded
+    # example without claiming that tuple order identifies the cause.
+    return current.sources[0], "representative_source"
+
+
 def _fixed_web_search_url() -> str | None:
     from .tools.web_search_destination import web_search_url
 
@@ -3832,43 +3990,13 @@ class SinkGate:
             return frozenset()
 
         for source in sources:
-            if not getattr(source, "is_complete", False):
-                return frozenset()
-            # Fresh protected-result sources include the authenticated reader by
-            # construction; inherited or externally supplied labels do not, so
-            # keep this check as the fail-closed guard for those paths.
-            if effective_principal not in source.authorized_principals:
-                return frozenset()
-            source_kind = getattr(source, "source_kind", "channel")
-            if source_kind == "channel":
-                if source.principal != effective_principal:
-                    return frozenset()
-                if source.domain != domain or source.bridge_instance != bridge_instance:
-                    return frozenset()
-                if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
-                    return frozenset()
-            elif source_kind == "service":
-                # Trusted service/derived data retains its input ACL. It may
-                # return only to the triggering channel when the effective
-                # destination principal remains in that intersection.
-                if source.domain.startswith("channel"):
-                    if source.bridge_instance != bridge_instance:
-                        return frozenset()
-                    if ChannelResourceAdapter._resolve_channel(source.resource_id) != resolved_triggering:
-                        return frozenset()
-            elif source_kind == "protected_prompt":
-                # Framework-authored prompt blocks are marked trusted at their
-                # server-side loader; model output cannot set this provenance.
-                source_is_trusted_self_authored = source.integrity == "trusted"
-                if (
-                    not source_is_trusted_self_authored
-                    and ChannelResourceAdapter._resolve_channel(source.resource_id)
-                    != resolved_triggering
-                ):
-                    return frozenset()
-            elif source_kind != "protected_tool":
-                # Other derived/tool sources require their own destination adapter;
-                # an ACL alone must not silently widen arbitrary provenance kinds.
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                domain=domain,
+                bridge_instance=bridge_instance,
+                resolved_triggering=resolved_triggering,
+            ):
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
             return frozenset()
@@ -5046,6 +5174,8 @@ class ToolRegistry:
         target: str | None = None,
         requested_target: Any = None,
         arguments: dict[str, Any] | None = None,
+        ifc_labels: Any = None,
+        sink_category: SinkCategory | None = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -5090,6 +5220,33 @@ class ToolRegistry:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
+
+            if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
+                try:
+                    if sink_category is None:
+                        raise ValueError("IFC sink category was not supplied by gate")
+                    source, scope = _ifc_blocking_source(
+                        ifc_labels,
+                        auth_context,
+                        sink_category,
+                    )
+                    fields["ifc_source_scope"] = scope
+                    if source is not None:
+                        resource_id = redact_payload(source.resource_id)
+                        fields["ifc_source"] = {
+                            "source_kind": source.source_kind,
+                            "domain": source.domain,
+                            "integrity": source.integrity,
+                            "integrity_effect": source.integrity_effect,
+                            "resource_id": (
+                                str(resource_id)[:_MAX_REQUESTED_TARGET_LENGTH]
+                                if resource_id is not None else None
+                            ),
+                        }
+                except Exception as exc:
+                    # Diagnostics are best-effort and cannot affect authorization.
+                    fields["ifc_source_scope"] = "classification_failed"
+                    log.warning("IFC source audit classification failed: %s", exc)
 
             fields.update({
                 # Shadow decisions cover both compatibility bypasses and trusted
@@ -5139,6 +5296,8 @@ class ToolRegistry:
         checks (chainlink #871).
         """
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX) and mcp_tool is not None:
+            if ifc_labels is None and auth_context is not None:
+                ifc_labels = getattr(auth_context, "ifc_labels", None)
             auth = MCPResourceAdapter.authorize_call(
                 tool_name,
                 mcp_tool,
@@ -5151,6 +5310,8 @@ class ToolRegistry:
                 self._emit_shadow_decision(
                     auth, auth_context=auth_context, target=target_channel,
                     requested_target=target_channel,
+                    ifc_labels=ifc_labels,
+                    sink_category=SinkCategory.EXTERNAL_MCP,
                 )
             return auth
         if tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
@@ -5182,10 +5343,40 @@ class ToolRegistry:
             if auth_context is not None
             else None
         )
-        repo_pr_action_scope = (
-            getattr(auth_context, "repo_pr_action_scope", None)
-            if auth_context is not None else None
-        )
+        repo_pr_action_scope = None
+        if auth_context is not None:
+            if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+                registry = getattr(auth_context, "repo_pr_scope_registry", None)
+                tool_arguments = arguments or {}
+                state = (
+                    registry.resolve(
+                        tool_arguments.get("repository"),
+                        tool_arguments.get("pull_request"),
+                    )
+                    if registry is not None and hasattr(registry, "resolve")
+                    else None
+                )
+                if state is None:
+                    discovered = getattr(
+                        auth_context, "server_discovered_pr_states", None,
+                    )
+                    state = (
+                        discovered.resolve(
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                        if discovered is not None
+                        and isinstance(tool_arguments.get("repository"), str)
+                        and isinstance(tool_arguments.get("pull_request"), int)
+                        else None
+                    )
+                repo_pr_action_scope = (
+                    state.action_scope if state is not None else None
+                )
+            else:
+                repo_pr_action_scope = getattr(
+                    auth_context, "repo_pr_action_scope", None,
+                )
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -5236,6 +5427,8 @@ class ToolRegistry:
                 self._emit_shadow_decision(
                     sink_check, auth_context=auth_context, target=sink_target,
                     requested_target=target_channel,
+                    ifc_labels=ifc_labels,
+                    sink_category=sink_category,
                 )
 
         decision = preliminary_decision
@@ -5455,6 +5648,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_checkout": "repository",
     "repo_fetch": "repository",
     "repo_status": "repository",
+    "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
 }
@@ -5490,6 +5684,7 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_checkout",
     "repo_fetch",
     "repo_status",
+    "repo_test",
     "repo_diff",
     "repo_unmerged",
 })
@@ -5755,7 +5950,7 @@ def classify_protected_result(
     if tool_name in {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-        "repo_status", "repo_diff", "repo_unmerged",
+        "repo_status", "repo_test", "repo_diff", "repo_unmerged",
     }:
         scope = getattr(auth_context, "repo_pr_action_scope", None)
         if scope is None or failed:
@@ -6158,6 +6353,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "repo_checkout": "bound_pull_request",
     "repo_cleanup": "bound_pull_request",
     "repo_fetch": "bound_pull_request",
+    "repo_test": "bound_pull_request",
     "repo_stage": "bound_pull_request",
     "repo_commit": "bound_pull_request",
     "repo_merge": "bound_pull_request",
@@ -6743,7 +6939,10 @@ def create_auth_context(
     - ContextVar fallback heuristics
     - Single-active-turn heuristics
     """
-    from .models import AuthContext, RepoPRActionScope, RepoReviewState, TurnInteractivity
+    from .models import (
+        AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+        TurnInteractivity,
+    )
 
     author = event.author
     canonical = author
@@ -6789,7 +6988,7 @@ def create_auth_context(
     ):
         bridge_instance = f"service:{registered_service.canonical}"
 
-    repo_review_state = _repo_review_state_from_event(event, registered_service)
+    repo_pr_scope_registry = _repo_review_state_from_event(event, registered_service)
     carried_scope = event.repo_pr_action_scope
     if not (
         isinstance(carried_scope, RepoPRActionScope)
@@ -6802,11 +7001,15 @@ def create_auth_context(
         and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
     ):
         carried_scope = None
-    if repo_review_state is None and carried_scope is not None:
-        repo_review_state = RepoReviewState(carried_scope)
-    action_scope = (
-        repo_review_state.action_scope if repo_review_state is not None else None
+    if repo_pr_scope_registry is None and carried_scope is not None:
+        repo_pr_scope_registry = RepoPRScopeRegistry((RepoReviewState(carried_scope),))
+    single_state = (
+        repo_pr_scope_registry.review_states[0]
+        if repo_pr_scope_registry is not None
+        and len(repo_pr_scope_registry.review_states) == 1
+        else None
     )
+    action_scope = single_state.action_scope if single_state is not None else None
 
     return AuthContext(
         principal=author,
@@ -6823,7 +7026,8 @@ def create_auth_context(
         policy_version=policy_version,
         is_service=is_service,
         service_authority=registered_service if is_service else None,
-        repo_review_state=repo_review_state,
+        repo_pr_scope_registry=repo_pr_scope_registry,
+        repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
         enforcement_enabled=enforce,
         source_session_acl=(

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 import pytest
 from langchain.tools import ToolRuntime
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
 from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
 
 import mimir.access_control as access_control
 from mimir.event_logger import _reset_logger_for_tests, init_logger
@@ -18,7 +22,12 @@ from mimir.forge import (
     ReviewRequestProjection,
     ReviewVerdict,
 )
-from mimir.models import AuthContext, RepoPRAction, RepoPRActionScope
+from mimir.models import (
+    AuthContext, InformationFlowLabels, NormalizedPullRequestSnapshot,
+    RepoPRAction, RepoPRActionScope,
+    RepoPRScopeRegistry,
+    RepoReviewState,
+)
 from mimir.tools.forge import (
     FORGE_TOOLS,
     pr_checks,
@@ -35,9 +44,15 @@ from mimir.tools.forge import (
     set_forge_client,
     unsupported_operation,
 )
+from mimir.tools.repo import repo_test
+from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
-def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
+def _scope(
+    *actions: RepoPRAction,
+    number: int = 17,
+    head_sha: str = "a" * 40,
+) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo="owner/repo",
@@ -46,17 +61,22 @@ def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
         principal="reviewer",
         event_type="pr_review_requested",
         allowed_operations=frozenset(action.value for action in actions),
-        pr_number=17,
+        pr_number=number,
         head_repo="contributor/repo",
         head_remote="source",
         destination_ref="refs/heads/change",
-        observed_head_sha="a" * 40,
+        observed_head_sha=head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
     )
 
 
 def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
+    return _runtime_for_scopes(scope)
+
+
+def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
+    states = tuple(RepoReviewState(scope) for scope in scopes)
     context = AuthContext(
         principal="service:poller",
         canonical_principal="poller",
@@ -66,7 +86,10 @@ def _runtime(scope: RepoPRActionScope) -> ToolRuntime[AuthContext]:
         channel_id="poller:forge",
         interactivity=None,
         enforcement_enabled=True,
-        repo_pr_action_scope=scope,
+        ifc_labels=InformationFlowLabels(),
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+        repo_review_state=states[0] if len(states) == 1 else None,
+        repo_pr_action_scope=scopes[0] if len(scopes) == 1 else None,
     )
     return ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
@@ -83,6 +106,15 @@ class FakeForge:
         return PullRequestProjection(
             17, "Title", "open", "author", False, "main", "change",
             "a" * 40, True, "created", "updated",
+        )
+
+    def get_pull_request_snapshot(self, repository, number):
+        self.calls.append(("snapshot", repository, number))
+        return NormalizedPullRequestSnapshot(
+            state="open", number=number, author="untrusted-author",
+            head_repo="contributor/repo", head_remote="source",
+            head_ref="server-head", head_sha="c" * 40,
+            base_ref="server-base", base_sha="d" * 40,
         )
 
     def list_files(self, scope):
@@ -133,13 +165,11 @@ def _reset_client() -> None:
     _reset_logger_for_tests()
 
 
-def test_tool_surface_has_no_repository_pr_or_request_target_selectors() -> None:
+def test_tool_surface_requires_exact_repository_and_pr_selectors() -> None:
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
-        assert not (
-            {"repository", "repo", "pull_request", "pr_number", "url", "host"}
-            & set(properties)
-        )
+        assert {"repository", "pull_request"} <= set(properties)
+        assert not ({"repo", "pr_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
 
@@ -166,6 +196,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     node = ToolNode(list(FORGE_TOOLS))
     for index, (forge_tool, arguments) in enumerate(invocations):
+        arguments = {"repository": "owner/repo", "pull_request": 17, **arguments}
         tool_call = {
             "name": forge_tool.name, "args": arguments,
             "id": f"forge-{index}", "type": "tool_call",
@@ -185,10 +216,61 @@ def test_read_uses_only_immutable_scope_target() -> None:
     set_forge_client(client)
     scope = _scope(RepoPRAction.INSPECT)
 
-    result = pr_metadata.func(runtime=_runtime(scope))
+    result = pr_metadata.func(
+        repository="owner/repo", pull_request=17, runtime=_runtime(scope),
+    )
 
     assert result["number"] == 17
     assert client.calls == [("metadata", scope)]
+
+
+def test_review_scope_cannot_rerequest_review() -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    scope = _scope(RepoPRAction.INSPECT, RepoPRAction.PR_REVIEW)
+    runtime = _runtime(scope)
+
+    authorization = access_control.ToolRegistry().authorize_tool(
+        "pr_rerequest_review", runtime.context, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 17},
+    )
+    assert authorization.allowed is False
+    assert authorization.reason == "repo_pr_scope_denied"
+    with pytest.raises(ToolException, match="pr.rerequest not granted"):
+        pr_rerequest_review.func(
+            repository="owner/repo", pull_request=17, reviewer="reviewer",
+            runtime=runtime,
+        )
+    assert client.calls == []
+
+
+def test_batched_turn_resolves_each_exact_existing_scope() -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    first = _scope(RepoPRAction.INSPECT)
+    second = _scope(RepoPRAction.INSPECT, number=18, head_sha="c" * 40)
+    runtime = _runtime_for_scopes(first, second)
+
+    pr_metadata.func(repository="OWNER/REPO", pull_request=17, runtime=runtime)
+    pr_metadata.func(repository="owner/repo", pull_request=18, runtime=runtime)
+
+    assert [call[1] for call in client.calls] == [first, second]
+
+
+def test_forge_refusal_names_unconfigured_repository() -> None:
+    context = AuthContext(
+        principal=None, canonical_principal=None, roles=(), event_ingress=None,
+        trigger="poller", channel_id="poller:forge", interactivity=None,
+    )
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="forge-no-scope", store=None,
+    )
+
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
+        pr_metadata.func(
+            repository="owner/repo", pull_request=17, runtime=runtime,
+        )
 
 
 def test_review_and_remediation_actions_do_not_widen_each_other() -> None:
@@ -200,18 +282,24 @@ def test_review_and_remediation_actions_do_not_widen_each_other() -> None:
     )
 
     pr_submit_review.func(
+        repository="owner/repo", pull_request=17,
         verdict=ReviewVerdict.APPROVE, body="Looks good", runtime=review,
     )
-    pr_comment.func(body="Fixed", runtime=remediation)
+    pr_comment.func(
+        repository="owner/repo", pull_request=17, body="Fixed", runtime=remediation,
+    )
     with pytest.raises(ToolException, match="pr.review not granted"):
         pr_submit_review.func(
+            repository="owner/repo", pull_request=17,
             verdict=ReviewVerdict.APPROVE, body="No", runtime=remediation,
         )
     with pytest.raises(ToolException, match="pr.comment not granted"):
-        pr_comment.func(body="No", runtime=review)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17, body="No", runtime=review,
+        )
 
 
-def test_review_request_scope_grants_read_and_review_only(
+def test_review_scope_has_no_event_or_requested_reviewer_gate_and_exact_safe_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
@@ -235,13 +323,131 @@ def test_review_request_scope_grants_read_and_review_only(
     )
 
     scope = access_control._repo_pr_scope(
-        **fields, requested_reviewer="reviewer",
+        **fields,
     )
 
-    assert scope.allowed_operations == frozenset({"repo.inspect", "pr.review"})
-    assert access_control._repo_pr_scope(
-        **fields, requested_reviewer="attacker",
-    ) is None
+    assert scope.allowed_operations == frozenset({
+        "repo.inspect", "repo.checkout", "repo.test", "pr.review", "pr.comment",
+    })
+    for denied in (
+        RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH,
+        RepoPRAction.PR_EDIT, RepoPRAction.PR_REREQUEST,
+    ):
+        assert denied.value not in scope.allowed_operations
+
+    for event_type in ("pr_review", "pr_opened", "pr_synchronize"):
+        candidate = access_control._repo_pr_scope(**{**fields, "event_type": event_type})
+        assert candidate is not None
+        assert candidate.allowed_operations == scope.allowed_operations
+
+
+@dataclass(frozen=True)
+class _TestResult:
+    status: str
+
+
+def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding",
+        lambda repo: ("/server/configured/repo", "git@github.com:owner/repo.git"),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.repo.RepoProjectTests",
+        lambda state: type("Tests", (), {"execute": lambda self, selectors: _TestResult("ok")})(),
+    )
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+    )
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="operator-review", store=None,
+    )
+
+    assert repo_test.func(
+        repository="OWNER/REPO", pull_request=1291, runtime=runtime,
+    ) == {"status": "ok"}
+    state = context.server_discovered_pr_states.resolve("owner/repo", 1291)
+    assert state is not None
+    scope = state.action_scope
+    assert scope.provenance == "server_discovered"
+    assert scope.principal == "reviewer"
+    assert scope.head_repo == "contributor/repo"
+    assert scope.head_ref == "server-head"
+    assert scope.observed_head_sha == "c" * 40
+    assert scope.base_ref == "server-base"
+    assert scope.observed_base_sha == "d" * 40
+    assert scope.checkout_ref == "refs/pull/1291/head"
+    assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+def test_standing_review_refuses_unconfigured_repo_before_live_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+    )
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="operator-review", store=None,
+    )
+
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
+        pr_metadata.func(
+            repository="attacker/other", pull_request=1, runtime=runtime,
+        )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_enforced_middleware_resolves_standing_review_before_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding",
+        lambda repo: ("/server/configured/repo", "git@github.com:owner/repo.git"),
+    )
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+        enforcement_enabled=True, ifc_labels=InformationFlowLabels(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "repo_test",
+            "args": {"repository": "owner/repo", "pull_request": 1291},
+            "id": "standing-review", "type": "tool_call",
+        },
+        tool=None, state=None, runtime=Runtime(context=context),
+    )
+    called = False
+
+    async def handler(request):
+        nonlocal called
+        called = True
+        return ToolMessage(content="tested", tool_call_id="standing-review")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert result.status != "error"
+    assert called is True
+    assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is not None
+    assert client.calls == [("snapshot", "owner/repo", 1291)]
 
 
 def test_body_and_inline_path_injection_are_rejected_before_adapter() -> None:
@@ -250,13 +456,20 @@ def test_body_and_inline_path_injection_are_rejected_before_adapter() -> None:
     runtime = _runtime(_scope(RepoPRAction.PR_REVIEW, RepoPRAction.PR_COMMENT))
 
     with pytest.raises(ToolException, match="65536-byte"):
-        pr_comment.func(body="x" * 65_537, runtime=runtime)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17,
+            body="x" * 65_537, runtime=runtime,
+        )
     with pytest.raises(ToolException, match="relative repository path"):
         pr_inline_review_comment.func(
+            repository="owner/repo", pull_request=17,
             path="../../secret", line=1, body="x", runtime=runtime,
         )
     with pytest.raises(ToolException, match="null byte"):
-        pr_comment.func(body="hello\x00world", runtime=runtime)
+        pr_comment.func(
+            repository="owner/repo", pull_request=17,
+            body="hello\x00world", runtime=runtime,
+        )
     assert client.calls == []
 
 
@@ -270,8 +483,14 @@ def test_unsupported_operation_is_durable_and_deduped(
     init_logger(events, "test")
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
 
-    first = unsupported_operation.func(operation="pr.resolve_thread", runtime=runtime)
-    second = unsupported_operation.func(operation="pr.resolve_thread", runtime=runtime)
+    first = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        operation="pr.resolve_thread", runtime=runtime,
+    )
+    second = unsupported_operation.func(
+        repository="owner/repo", pull_request=17,
+        operation="pr.resolve_thread", runtime=runtime,
+    )
 
     assert first["status"] == "unsupported_operation"
     assert first["escalated"] is True

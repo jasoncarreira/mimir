@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,7 +19,11 @@ from .feature_factory import FeatureFactoryBackend
 from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend, validate_extra_args
 
 
+log = logging.getLogger(__name__)
+
 WORKLINK_MERGED_LABEL = "worklink:merged"
+SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})
+SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess"})
 
 DEFAULT_HIGH_RISK_SCOPE_PATTERNS: tuple[str, ...] = (
     "**/migrations/**",
@@ -69,7 +74,7 @@ class WorklinkDefaults:
     test_command: str = "uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
-    # Branch that attempt worktrees are cut from and that leaf PRs target. Point
+    # Branch that attempt checkouts are cut from and that leaf PRs target. Point
     # it at a long-running integration/feature branch to stack Worklink leaves
     # there instead of opening every PR straight against main.
     base_branch: str = "main"
@@ -209,23 +214,65 @@ class WorklinkConfig:
         )
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
-        backends = data.get("backends") or {}
-        if not isinstance(backends, dict):
+        raw_backends = data.get("backends") or {}
+        if not isinstance(raw_backends, dict):
             raise ValueError("worklink backends must be a mapping")
-        compute_backends = data.get("compute_backends") or {}
-        if not isinstance(compute_backends, dict):
+        raw_compute_backends = data.get("compute_backends") or {}
+        if not isinstance(raw_compute_backends, dict):
             raise ValueError("worklink compute_backends must be a mapping")
-        normalized_compute_backends = {
-            _normalize_compute_backend_name(str(name)): _expect_mapping(
-                settings, f"worklink compute_backends.{name}"
-            )
-            for name, settings in compute_backends.items()
-        }
+        backend_references = [(defaults.backend, "defaults.backend")]
+        backend_references.extend(
+            (name, f"defaults.backend_by_category.{category}")
+            for category, name in defaults.backend_by_category.items()
+        )
+        backend_references.extend(
+            (route.backend, f"routes[{index}].backend")
+            for index, route in enumerate(routes)
+        )
+        compute_backend_references = [(defaults.compute_backend, "defaults.compute_backend")]
+        compute_backend_references.extend(
+            (route.compute_backend, f"routes[{index}].compute_backend")
+            for index, route in enumerate(routes)
+            if route.compute_backend is not None
+        )
+        _reject_unknown_references(
+            path,
+            references=backend_references,
+            known_names=SHIPPING_BACKENDS,
+            kind="backend",
+        )
+        _reject_unknown_references(
+            path,
+            references=compute_backend_references,
+            known_names=SHIPPING_COMPUTE_BACKENDS,
+            kind="compute backend",
+        )
+        backends = _drop_unreferenced_unknown_settings(
+            path,
+            settings=raw_backends,
+            known_names=SHIPPING_BACKENDS,
+            section="backends",
+            kind="backend",
+        )
+        normalized_compute_backends = _drop_unreferenced_unknown_settings(
+            path,
+            settings=raw_compute_backends,
+            known_names=SHIPPING_COMPUTE_BACKENDS,
+            section="compute_backends",
+            kind="compute backend",
+            normalize_compute_names=True,
+        )
         return cls(
             defaults=defaults,
             routes=routes,
-            backend_settings=backends,
-            compute_backend_settings=normalized_compute_backends,
+            backend_settings={
+                name: _expect_mapping(settings, f"worklink backends.{name}")
+                for name, settings in backends.items()
+            },
+            compute_backend_settings={
+                name: _expect_mapping(settings, f"worklink compute_backends.{name}")
+                for name, settings in normalized_compute_backends.items()
+            },
             tool_pins=tool_pins,
         )
 
@@ -331,6 +378,51 @@ def _expect_mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a mapping")
     return value
+
+
+def _reject_unknown_references(
+    path: Path,
+    *,
+    references: list[tuple[str, str]],
+    known_names: frozenset[str],
+    kind: str,
+) -> None:
+    for name, setting in references:
+        if name not in known_names:
+            choices = ", ".join(sorted(known_names))
+            raise ValueError(
+                f"unknown Worklink {kind} '{name}' referenced by {setting} in {path}; "
+                f"change {setting} in {path} to one of: {choices}"
+            )
+
+
+def _drop_unreferenced_unknown_settings(
+    path: Path,
+    *,
+    settings: Mapping[Any, Any],
+    known_names: frozenset[str],
+    section: str,
+    kind: str,
+    normalize_compute_names: bool = False,
+) -> dict[str, Any]:
+    retained: dict[str, Any] = {}
+    for raw_name, value in settings.items():
+        yaml_name = str(raw_name)
+        name = _normalize_compute_backend_name(yaml_name) if normalize_compute_names else yaml_name
+        if name in known_names:
+            retained[name] = value
+            continue
+        log.warning(
+            "Ignoring unreferenced unknown Worklink %s config '%s' in %s; "
+            "remove %s.%s from %s",
+            kind,
+            yaml_name,
+            path,
+            section,
+            yaml_name,
+            path,
+        )
+    return retained
 
 
 _TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
@@ -451,10 +543,7 @@ def _parse_route(value: Any) -> WorklinkRoute:
 class BackendRegistry:
     def __init__(self, config: WorklinkConfig | None = None) -> None:
         self.config = config or WorklinkConfig()
-        unknown_backend_configs = self.config.backend_settings.keys() - {
-            "feature_factory",
-            "opencode",
-        }
+        unknown_backend_configs = self.config.backend_settings.keys() - SHIPPING_BACKENDS
         if unknown_backend_configs:
             name = sorted(unknown_backend_configs)[0]
             raise ValueError(f"unknown Worklink backend config: {name}")

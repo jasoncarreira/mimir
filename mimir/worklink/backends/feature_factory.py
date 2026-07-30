@@ -30,7 +30,7 @@ import shlex
 from typing import ClassVar
 
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, RawResult, WorkOrder
+from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
 FACTORY_DIR = ".opencode/factory"
@@ -355,6 +355,7 @@ class FeatureFactoryBackend:
     bin: str = "feature-factory"
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     name: str = "feature_factory"
+    checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
     heartbeat_interval_s: int = 60
     poll_interval_s: int = 10
     ready_for_review: bool = True
@@ -368,7 +369,6 @@ class FeatureFactoryBackend:
             persistent_sessions=True,
             json_output=False,
             native_pr_creation=False,
-            worktree_safe=False,
             quota_pool=None,
         )
 
@@ -382,9 +382,9 @@ class FeatureFactoryBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        factory_path = order.worktree / FACTORY_DIR
+        factory_path = order.checkout / FACTORY_DIR
         run_json_path = factory_path / RUN_JSON
-        command = self._factory_command(order.worktree, order.prompt, order.issue_id)
+        command = self._factory_command(order.checkout, order.prompt, order.issue_id)
 
         return WorkSpec(
             issue_id=order.issue_id,
@@ -404,17 +404,17 @@ class FeatureFactoryBackend:
                 "factory_path": str(factory_path),
                 "run_json_path": str(run_json_path),
             },
-            local_worktree=order.worktree,
+            local_checkout=order.checkout,
             local_argv=command,
         )
 
     def _bin_tokens(self) -> tuple[str, ...]:
         return tuple(shlex.split(self.bin)) if self.bin.strip() else ()
 
-    def _factory_command(self, worktree: Path, prompt: str, issue_id: int) -> tuple[str, ...]:
+    def _factory_command(self, checkout: Path, prompt: str, issue_id: int) -> tuple[str, ...]:
         """Autonomous DETACHED factory START argv.
 
-        ``<bin...> factory start --autonomous --detached --repo <worktree>
+        ``<bin...> factory start --autonomous --detached --repo <checkout>
         --run-id chainlink-<issue> [extra_args] [--ready] [--reviewer <name>]
         <prompt>``. ``--run-id`` is an argv boundary (not prompt text) so the factory
         namespaces its control plane under the expected ``.opencode/factory/<run-id>/``
@@ -438,7 +438,7 @@ class FeatureFactoryBackend:
             "--autonomous",
             "--detached",
             "--repo",
-            str(worktree),
+            str(checkout),
             "--run-id",
             run_id,
             *self.extra_args,
@@ -450,8 +450,8 @@ class FeatureFactoryBackend:
         argv.append(prompt)
         return tuple(argv)
 
-    def _read_run_json(self, worktree: Path, run_id: str) -> FactoryRunState | None:
-        return read_factory_run_state(worktree, run_id)
+    def _read_run_json(self, checkout: Path, run_id: str) -> FactoryRunState | None:
+        return read_factory_run_state(checkout, run_id)
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
@@ -461,7 +461,7 @@ class FeatureFactoryBackend:
             return RawResult(-1, None, "backend_error", result.launch_error)
 
         expected_run_id = epic_run_id(order.issue_id)
-        state = self._read_run_json(order.worktree, expected_run_id)
+        state = self._read_run_json(order.checkout, expected_run_id)
         if state is None:
             return RawResult(-1, None, "failed", "factory run.json not found")
         if state.is_stale:
@@ -506,7 +506,7 @@ def factory_run_dir(repo_path: Path, run_id: str) -> Path:
 
 
 def read_factory_run_state(repo_path: Path, run_id: str) -> FactoryRunState | None:
-    """Read the factory run state for ``run_id`` from a repository/worktree.
+    """Read the factory run state for ``run_id`` from a repository checkout.
 
     Standalone so the orchestrator/poller can inspect factory state without
     launching a backend. Returns None if run.json is absent or unreadable.

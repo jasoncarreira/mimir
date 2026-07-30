@@ -9,8 +9,9 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..models import AuthContext, RepoPRActionScope, RepoReviewState
+from ..models import AuthContext, RepoReviewState
 from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
+from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
     GitCommit,
     GitDiff,
@@ -30,31 +31,43 @@ from ..repo_tools import (
 )
 
 
-def _state(runtime: ToolRuntime[AuthContext] | None) -> RepoReviewState:
-    context = getattr(runtime, "context", None)
-    state = getattr(context, "repo_review_state", None)
-    scope = getattr(context, "repo_pr_action_scope", None)
-    if (
-        not isinstance(state, RepoReviewState)
-        or not isinstance(scope, RepoPRActionScope)
-        or state.action_scope.scope_id != scope.scope_id
-    ):
-        raise ToolException("repository operation rejected: no immutable review scope")
-    return state
+def _state(
+    runtime: ToolRuntime[AuthContext] | None,
+    repository: str,
+    pull_request: int,
+) -> RepoReviewState:
+    from .forge import resolve_review_state
 
-
-def _execute(runtime: ToolRuntime[AuthContext] | None, operation: Any) -> dict[str, Any]:
     try:
-        return asdict(RepoGitTools(_state(runtime)).execute(operation))
+        return resolve_review_state(runtime, repository, pull_request)
+    except ToolException as exc:
+        detail = str(exc).removeprefix("pull-request operation rejected: ")
+        raise ToolException(f"repository operation rejected: {detail}") from exc
+
+
+def _execute(
+    runtime: ToolRuntime[AuthContext] | None,
+    repository: str,
+    pull_request: int,
+    operation: Any,
+) -> dict[str, Any]:
+    try:
+        return asdict(
+            RepoGitTools(_state(runtime, repository, pull_request)).execute(operation)
+        )
     except (GitRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "repository_operation_failed")
         raise ToolException(f"repository operation rejected ({code}): {exc}") from exc
 
 
 @tool
-def repo_checkout(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_checkout(
+    repository: str,
+    pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
-    state = _state(runtime)
+    state = _state(runtime, repository, pull_request)
     try:
         lease = create_pr_checkout_lease(
             state.action_scope,
@@ -72,9 +85,13 @@ def repo_checkout(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  
 
 
 @tool
-def repo_cleanup(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_cleanup(
+    repository: str,
+    pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Revoke and remove this turn's exact active checkout lease."""
-    state = _state(runtime)
+    state = _state(runtime, repository, pull_request)
     lease = state.checkout_lease
     if lease is None:
         raise ToolException("repository cleanup rejected: no active checkout lease")
@@ -86,98 +103,149 @@ def repo_cleanup(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  #
 
 
 @tool
-def repo_fetch(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_fetch(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Fetch only the immutable head and base refs bound to this turn."""
-    return _execute(runtime, GitFetch())
+    return _execute(runtime, repository, pull_request, GitFetch())
 
 
 @tool
 def repo_status(
+    repository: str,
+    pull_request: int,
     include_untracked: bool = True,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Read porcelain status from the active bound checkout."""
-    return _execute(runtime, GitStatus(include_untracked))
+    return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
+
+
+@tool
+def repo_test(
+    repository: str,
+    pull_request: int,
+    selectors: tuple[str, ...] = (),
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Run the deployment-configured tests in the active bound PR checkout."""
+    try:
+        return asdict(
+            RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors)
+        )
+    except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+        code = getattr(exc, "code", "project_test_failed")
+        raise ToolException(f"project test rejected ({code}): {exc}") from exc
 
 
 @tool
 def repo_diff(
+    repository: str,
+    pull_request: int,
     mode: Literal["working", "staged", "base"] = "working",
     paths: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Read a bounded working, staged, or base diff from the bound checkout."""
-    return _execute(runtime, GitDiff(mode, paths))
+    return _execute(runtime, repository, pull_request, GitDiff(mode, paths))
 
 
 @tool
-def repo_unmerged(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_unmerged(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Read unmerged-index records from the bound checkout."""
-    return _execute(runtime, GitUnmerged())
+    return _execute(runtime, repository, pull_request, GitUnmerged())
 
 
 @tool
 def repo_stage(
+    repository: str,
+    pull_request: int,
     paths: tuple[str, ...],
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Stage only explicit repository-relative paths in the bound checkout."""
-    return _execute(runtime, GitStage(paths))
+    return _execute(runtime, repository, pull_request, GitStage(paths))
 
 
 @tool
 def repo_commit(
+    repository: str,
+    pull_request: int,
     paths: tuple[str, ...],
     message: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Stage explicit paths and commit them with server-owned Git identity."""
-    return _execute(runtime, GitCommit(paths, message))
+    return _execute(runtime, repository, pull_request, GitCommit(paths, message))
 
 
 @tool
-def repo_merge(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_merge(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Merge the immutable observed base commit into the bound checkout."""
-    return _execute(runtime, GitMerge())
+    return _execute(runtime, repository, pull_request, GitMerge())
 
 
 @tool
-def repo_merge_abort(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_merge_abort(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Abort an in-progress merge in the bound checkout."""
-    return _execute(runtime, GitMergeAbort())
+    return _execute(runtime, repository, pull_request, GitMergeAbort())
 
 
 @tool
-def repo_rebase(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_rebase(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Rebase the bound head onto the immutable observed base commit."""
-    return _execute(runtime, GitRebase())
+    return _execute(runtime, repository, pull_request, GitRebase())
 
 
 @tool
-def repo_rebase_abort(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_rebase_abort(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Abort an in-progress rebase in the bound checkout."""
-    return _execute(runtime, GitRebaseAbort())
+    return _execute(runtime, repository, pull_request, GitRebaseAbort())
 
 
 @tool
 def repo_revert(
+    repository: str,
+    pull_request: int,
     commit: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Revert one full commit ID proven to be within bound head minus base."""
-    return _execute(runtime, GitRevert(commit))
+    return _execute(runtime, repository, pull_request, GitRevert(commit))
 
 
 @tool
-def repo_revert_abort(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_revert_abort(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Abort an in-progress revert in the bound checkout."""
-    return _execute(runtime, GitRevertAbort())
+    return _execute(runtime, repository, pull_request, GitRevertAbort())
 
 
 @tool
-def repo_push(runtime: ToolRuntime[AuthContext] = None) -> dict[str, Any]:  # type: ignore[assignment]
+def repo_push(
+    repository: str, pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """Push HEAD to the one destination ref in the immutable PR scope."""
-    return _execute(runtime, GitPush())
+    return _execute(runtime, repository, pull_request, GitPush())
 
 
 def _bind_injected_runtime(repo_tool: StructuredTool) -> StructuredTool:
@@ -196,6 +264,7 @@ REPO_TOOLS = tuple(_bind_injected_runtime(repo_tool) for repo_tool in (
     repo_cleanup,
     repo_fetch,
     repo_status,
+    repo_test,
     repo_diff,
     repo_unmerged,
     repo_stage,

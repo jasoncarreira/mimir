@@ -9,7 +9,14 @@ from ..compute import (
     LocalSubprocessComputeBackend,
     WorkSpec,
 )
-from .base import Caps, RawResult, ToolBackend, WorkOrder
+from .base import (
+    Caps,
+    CheckoutShape,
+    RawResult,
+    ToolBackend,
+    WorkOrder,
+    checkout_shape_for_backend,
+)
 from .feature_factory import FeatureFactoryBackend
 from .opencode import OpenCodeBackend
 from .registry import (
@@ -25,6 +32,7 @@ from .registry import (
 __all__ = [
     "BackendRegistry",
     "Caps",
+    "CheckoutShape",
     "FeatureFactoryBackend",
     "OpenCodeBackend",
     "ComputeBackend",
@@ -43,4 +51,5 @@ __all__ = [
     "WorklinkConfig",
     "WorklinkDefaults",
     "WorklinkRoute",
+    "checkout_shape_for_backend",
 ]

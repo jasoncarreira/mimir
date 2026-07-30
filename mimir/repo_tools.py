@@ -7,7 +7,8 @@ configuration overrides, and environment are supplied by the server.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import base64
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -15,10 +16,11 @@ import selectors
 import signal
 import subprocess
 import time
-from typing import Callable, Literal, Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
+from urllib.parse import urlsplit
 
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from .models import RepoPRAction, RepoReviewState
+from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
 
 
 _DEFAULT_GIT = Path("/usr/bin/git")
@@ -37,6 +39,9 @@ _BASE_CONFIG = (
     "-c", "core.pager=cat",
     "-c", "diff.external=",
     "-c", "credential.helper=",
+    "-c", "http.extraHeader=",
+    "-c", "http.proxy=",
+    "-c", "http.followRedirects=false",
     "-c", "commit.gpgSign=false",
     "-c", "merge.gpgSign=false",
     "-c", "push.pushOption=",
@@ -340,12 +345,23 @@ class RepoGitTools:
         if missing:
             raise GitRefusal("scope_action_denied", f"scope does not grant {', '.join(missing)}")
 
-    def _raw(self, arguments: tuple[str, ...], *, network: bool = False) -> GitProcessResult:
+    def _raw(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        network: bool = False,
+        network_remote: str | None = None,
+        env: dict[str, str] | None = None,
+        sensitive_values: tuple[str, ...] = (),
+    ) -> GitProcessResult:
         transport: tuple[str, ...] = ()
         if network:
-            origin = self._scope.canonical_origin
+            origin = network_remote or self._scope.canonical_origin
             if origin.startswith(("https://", "http://")):
-                transport = ("-c", "protocol.https.allow=always")
+                transport = (
+                    "-c", "protocol.https.allow=always",
+                    "-c", "protocol.http.allow=always",
+                )
             elif origin.startswith(("ssh://", "git@")):
                 transport = ("-c", "protocol.ssh.allow=always", "-c", "core.sshCommand=/usr/bin/ssh")
             elif origin.startswith("file://") or Path(origin).is_absolute():
@@ -357,21 +373,49 @@ class RepoGitTools:
             "--no-pager", "--no-optional-locks", *arguments,
         )
         try:
-            return self._runner(
-                argv, env=self._env.copy(), timeout=self._timeout,
+            child_env = self._env.copy()
+            if env:
+                child_env.update(env)
+            result = self._runner(
+                argv, env=child_env, timeout=self._timeout,
                 output_limit=self._output_limit,
             )
+            for value in sorted(filter(None, sensitive_values), key=len, reverse=True):
+                result = replace(
+                    result,
+                    stdout=result.stdout.replace(value, "[REDACTED]"),
+                    stderr=result.stderr.replace(value, "[REDACTED]"),
+                )
+            return result
         except (OSError, subprocess.SubprocessError) as exc:
             raise GitRefusal("git_failed", "pinned Git execution failed") from exc
 
-    def _checked(self, arguments: tuple[str, ...], *, network: bool = False) -> GitProcessResult:
-        result = self._raw(arguments, network=network)
+    def _checked(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        network: bool = False,
+        network_remote: str | None = None,
+        env: dict[str, str] | None = None,
+        sensitive_values: tuple[str, ...] = (),
+        report_stdout_on_failure: bool = False,
+    ) -> GitProcessResult:
+        result = self._raw(
+            arguments,
+            network=network,
+            network_remote=network_remote,
+            env=env,
+            sensitive_values=sensitive_values,
+        )
         if result.timed_out:
             raise GitRefusal("timeout", "Git operation exceeded its time limit")
         if result.output_limited:
             raise GitRefusal("output_limit", "Git operation exceeded its output limit")
         if result.returncode != 0:
-            raise GitRefusal("git_failed", result.stderr.strip() or "Git operation failed")
+            detail = result.stderr.strip()
+            if not detail and report_stdout_on_failure:
+                detail = result.stdout.strip()
+            raise GitRefusal("git_failed", detail or "Git operation failed")
         return result
 
     def _config_overrides(self) -> tuple[str, ...]:
@@ -405,9 +449,13 @@ class RepoGitTools:
         arguments: tuple[str, ...],
         *,
         network: bool = False,
+        network_remote: str | None = None,
         diff: bool = False,
         identity: bool = False,
         overrides: tuple[str, ...] | None = None,
+        env: dict[str, str] | None = None,
+        sensitive_values: tuple[str, ...] = (),
+        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         local_overrides = self._config_overrides() if overrides is None else overrides
         prefix = local_overrides
@@ -417,7 +465,14 @@ class RepoGitTools:
                 "-c", f"user.email={DEFAULT_USER_EMAIL}",
             )
         suffix = ("--no-ext-diff", "--no-textconv") if diff else ()
-        return self._checked((*prefix, *arguments, *suffix), network=network)
+        return self._checked(
+            (*prefix, *arguments, *suffix),
+            network=network,
+            network_remote=network_remote,
+            env=env,
+            sensitive_values=sensitive_values,
+            report_stdout_on_failure=report_stdout_on_failure,
+        )
 
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
         top = self._command(("rev-parse", "--show-toplevel")).stdout.strip()
@@ -435,6 +490,61 @@ class RepoGitTools:
         self._expected_head = self._command(("rev-parse", "--verify", "HEAD")).stdout.strip().lower()
         self._state.record_git_head(self._scope.scope_id, self._expected_head)
 
+    def _stranded_work_message(self) -> str:
+        if self._expected_head == self._scope.observed_head_sha.lower():
+            return "the checkout lease was preserved for retry"
+        return (
+            f"local commit {self._expected_head} remains unpushed in preserved "
+            f"checkout lease {self._root}"
+        )
+
+    def _push_remote(self) -> tuple[str, dict[str, str], tuple[str, ...]]:
+        origin = self._scope.canonical_origin
+        if origin.startswith("https://"):
+            parsed = urlsplit(origin)
+            try:
+                port = parsed.port
+            except ValueError:
+                port = -1
+            expected_paths = {
+                f"/{self._scope.canonical_repo}",
+                f"/{self._scope.canonical_repo}.git",
+            }
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "github.com"
+                or parsed.path not in expected_paths
+                or parsed.username
+                or parsed.password
+                or port
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise GitRefusal(
+                    "push_auth_unavailable",
+                    f"push credential is unavailable for the scoped origin; "
+                    f"{self._stranded_work_message()}",
+                )
+            token = os.environ.get("GITHUB_TOKEN", "").strip()
+            if not token:
+                raise GitRefusal(
+                    "push_auth_unavailable",
+                    f"push credential is unavailable; {self._stranded_work_message()}",
+                )
+            encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            authorization = f"Authorization: Basic {encoded}"
+            return origin, {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"http.{origin}.extraheader",
+                "GIT_CONFIG_VALUE_0": authorization,
+            }, (authorization, encoded, token)
+        if origin.startswith("http://"):
+            raise GitRefusal(
+                "push_auth_unavailable",
+                f"authenticated pushes require HTTPS; {self._stranded_work_message()}",
+            )
+        return origin, {}, ()
+
     def _unmerged_paths(self) -> set[str]:
         output = self._command(("ls-files", "--unmerged", "-z")).stdout
         paths: set[str] = set()
@@ -445,6 +555,46 @@ class RepoGitTools:
                     raise GitRefusal("invalid_git_output", "malformed unmerged index output")
                 paths.add(path)
         return paths
+
+    def is_tracked_file(self, path: Path) -> bool:
+        """Return whether ``path`` is an index entry in this exact active lease."""
+        root = self._validate_lease()
+        if root != self._root:
+            raise GitRefusal("cross_pr_checkout", "checkout lease changed during Git access")
+        try:
+            if not path.is_absolute() or path.is_symlink():
+                return False
+            path.relative_to(root)
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not resolved.is_file():
+            return False
+
+        self._assert_checkout_identity()
+        pathspec = _validate_path(relative)
+        overrides = self._config_overrides()
+        result = self._raw((
+            *overrides, "ls-files", "--cached", "--error-unmatch", "-z", "--", pathspec,
+        ))
+        if result.timed_out:
+            raise GitRefusal("timeout", "Git tracked-file inspection exceeded its time limit")
+        if result.output_limited:
+            raise GitRefusal("output_limit", "Git tracked-file inspection exceeded its output limit")
+        if result.returncode == 1 and not result.stdout:
+            return False
+        if result.returncode != 0:
+            raise GitRefusal("git_failed", "Git tracked-file inspection failed")
+        return result.stdout == f"{relative}\x00"
+
+    def validated_checkout_root(self) -> Path:
+        """Revalidate the lease and Git identity immediately before non-Git use."""
+        root = self._validate_lease()
+        if root != self._root:
+            raise GitRefusal("cross_pr_checkout", "checkout lease changed during access")
+        self._assert_checkout_identity()
+        return root
 
     def _stage(self, paths: tuple[str, ...]) -> None:
         unmerged = self._unmerged_paths()
@@ -465,9 +615,11 @@ class RepoGitTools:
 
         if isinstance(operation, GitFetch):
             self._require(RepoPRAction.CHECKOUT)
-            for ref, expected in (
-                (self._scope.destination_ref, self._scope.observed_head_sha),
-                (f"refs/heads/{self._scope.base_ref}", self._scope.observed_base_sha),
+            lease = self._state.checkout_lease
+            for ref, expected, identity in (
+                (self._scope.checkout_ref or self._scope.destination_ref,
+                 self._scope.observed_head_sha, "head"),
+                (f"refs/heads/{self._scope.base_ref}", lease.base_sha, "base"),
             ):
                 self._command((
                     "fetch", "--no-tags", "--no-recurse-submodules",
@@ -475,7 +627,27 @@ class RepoGitTools:
                 ), network=True)
                 actual = self._command(("rev-parse", "--verify", "FETCH_HEAD^{commit}")).stdout.strip()
                 if actual.lower() != expected.lower():
-                    raise GitRefusal("stale_scope", "fetched ref no longer matches immutable scope")
+                    if identity == "head":
+                        raise GitRefusal(
+                            "stale_scope",
+                            f"PR head advanced: scoped head {expected.lower()} is stale; "
+                            f"fetched head is {actual.lower()}",
+                        )
+                    ancestry = self._raw((
+                        "merge-base", "--is-ancestor", expected.lower(), actual.lower(),
+                    ))
+                    if ancestry.returncode == 0:
+                        raise GitRefusal(
+                            "base_advanced",
+                            f"PR base advanced during remediation: checked-out base "
+                            f"{expected.lower()} is stale; fetched base is {actual.lower()}; "
+                            "restart checkout before rebasing",
+                        )
+                    raise GitRefusal(
+                        "base_history_rewritten",
+                        f"PR base history was rewritten during remediation: checked-out base "
+                        f"{expected.lower()} is stale; fetched base is {actual.lower()}",
+                    )
             return GitOperationResult(True, "ok")
 
         if isinstance(operation, GitStatus):
@@ -491,7 +663,7 @@ class RepoGitTools:
             if operation.mode == "staged":
                 revisions = ("--cached",)
             elif operation.mode == "base":
-                revisions = (f"{self._scope.observed_base_sha}...HEAD",)
+                revisions = (f"{self._state.checkout_lease.base_sha}...HEAD",)
             pathspecs = tuple(_validate_path(path) for path in paths)
             separator = ("--", *pathspecs) if pathspecs else ()
             result = self._command((
@@ -531,9 +703,25 @@ class RepoGitTools:
             self._refresh_expected_head()
         elif isinstance(operation, GitMerge):
             self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
-            result = self._command(
-                ("merge", "--no-edit", "--", self._scope.observed_base_sha), identity=True,
-            )
+            try:
+                result = self._command(
+                    ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
+                    identity=True,
+                    report_stdout_on_failure=True,
+                )
+            except GitRefusal as exc:
+                if exc.code != "git_failed":
+                    raise
+                unmerged = self._unmerged_paths()
+                if not unmerged:
+                    raise
+                paths = ", ".join(repr(path) for path in sorted(unmerged))
+                raise GitRefusal(
+                    "merge_conflict",
+                    f"merge conflict in unmerged path(s): {paths}; inspect the unmerged "
+                    f"index with repo_unmerged, or abort the merge with repo_merge_abort; "
+                    f"Git output: {exc}",
+                ) from exc
             self._refresh_expected_head()
         elif isinstance(operation, GitMergeAbort):
             self._require(RepoPRAction.WRITE)
@@ -541,7 +729,7 @@ class RepoGitTools:
         elif isinstance(operation, GitRebase):
             self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
             result = self._command(
-                ("rebase", "--", self._scope.observed_base_sha), identity=True,
+                ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
             )
             self._refresh_expected_head()
         elif isinstance(operation, GitRebaseAbort):
@@ -552,7 +740,7 @@ class RepoGitTools:
             if not _SHA_RE.fullmatch(operation.commit):
                 raise GitRefusal("invalid_commit", "revert requires one full commit id")
             allowed = set(filter(None, self._command((
-                "rev-list", "HEAD", f"^{self._scope.observed_base_sha}", "--",
+                "rev-list", "HEAD", f"^{self._state.checkout_lease.base_sha}", "--",
             )).stdout.splitlines()))
             if operation.commit.lower() not in {commit.lower() for commit in allowed}:
                 raise GitRefusal("invalid_revert_ancestry", "revert commit is outside head ^base")
@@ -564,22 +752,40 @@ class RepoGitTools:
         elif isinstance(operation, GitPush):
             self._require(RepoPRAction.PUSH)
             overrides = self._config_overrides()
-            remote = self._command((
-                "ls-remote", "--heads", self._scope.canonical_origin,
-                self._scope.destination_ref,
-            ), network=True, overrides=overrides).stdout
-            records = [line.split("\t", 1) for line in remote.splitlines() if line]
-            if (
-                len(records) != 1
-                or len(records[0]) != 2
-                or records[0][0].lower() != self._scope.observed_head_sha.lower()
-                or records[0][1] != self._scope.destination_ref
-            ):
-                return GitOperationResult(False, "stale_scope")
-            result = self._command((
-                "push", "--porcelain", self._scope.canonical_origin,
-                f"HEAD:{self._scope.destination_ref}",
-            ), network=True, overrides=overrides)
+            ancestry = self._raw((
+                "merge-base", "--is-ancestor", self._scope.observed_head_sha,
+                self._expected_head,
+            ))
+            if ancestry.returncode != 0:
+                raise GitRefusal("force_push_refused", "push would not be a fast-forward")
+            try:
+                push_remote, auth_env, sensitive_values = self._push_remote()
+                remote = self._command((
+                    "ls-remote", "--heads", push_remote,
+                    self._scope.destination_ref,
+                ), network=True, network_remote=push_remote, overrides=overrides,
+                    env=auth_env, sensitive_values=sensitive_values).stdout
+                records = [line.split("\t", 1) for line in remote.splitlines() if line]
+                if (
+                    len(records) != 1
+                    or len(records[0]) != 2
+                    or records[0][0].lower() != self._scope.observed_head_sha.lower()
+                    or records[0][1] != self._scope.destination_ref
+                ):
+                    return GitOperationResult(
+                        False, "stale_scope", stderr=self._stranded_work_message(),
+                    )
+                result = self._command((
+                    "push", "--porcelain", push_remote,
+                    f"HEAD:{self._scope.destination_ref}",
+                ), network=True, network_remote=push_remote, overrides=overrides,
+                    env=auth_env, sensitive_values=sensitive_values)
+            except GitRefusal as exc:
+                if exc.code == "git_failed":
+                    raise GitRefusal(
+                        "git_failed", f"push failed: {exc}; {self._stranded_work_message()}",
+                    ) from exc
+                raise
         else:
             raise GitRefusal("invalid_shape", "unsupported typed Git operation")
         return GitOperationResult(True, "ok", result.stdout, result.stderr)

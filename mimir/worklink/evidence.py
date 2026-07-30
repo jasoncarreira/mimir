@@ -34,7 +34,7 @@ class WorklinkEvidence:
     attempt: int
     backend: str
     branch: str
-    worktree: str
+    checkout: str
     started_at: str
     finished_at: str
     files_changed: list[str]
@@ -135,7 +135,7 @@ def observe_evidence(
     attempt: int,
     backend: str,
     branch: str,
-    worktree: Path,
+    checkout: Path,
     started_at: datetime,
     base_ref: str,
     backend_status: str,
@@ -148,13 +148,13 @@ def observe_evidence(
     skip_test_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
-    """Build evidence by observing a worktree after a backend run."""
+    """Build evidence by observing a checkout after a backend run."""
     return _observe_evidence_from_ref(
         issue=issue,
         attempt=attempt,
         backend=backend,
         branch=branch,
-        worktree=worktree,
+        checkout=checkout,
         started_at=started_at,
         base_ref=base_ref,
         head_ref="HEAD",
@@ -167,7 +167,7 @@ def observe_evidence(
         failure_reason=failure_reason,
         skip_test_reason=skip_test_reason,
         runner=runner,
-        include_worktree_status=True,
+        include_checkout_status=True,
     )
 
 
@@ -178,7 +178,7 @@ def _observe_evidence_from_ref(
     attempt: int,
     backend: str,
     branch: str,
-    worktree: Path,
+    checkout: Path,
     started_at: datetime,
     base_ref: str,
     head_ref: str,
@@ -191,21 +191,21 @@ def _observe_evidence_from_ref(
     failure_reason: str | None,
     skip_test_reason: str | None,
     runner: Run | None,
-    include_worktree_status: bool,
+    include_checkout_status: bool,
     checkout_ref: str | None = None,
     pre_commands: list[CommandResult] | None = None,
     pre_observed: bool = True,
 ) -> EvidenceValidation:
     runner = runner or _run
     range_ref = f"{base_ref}...{head_ref}"
-    committed = runner(["git", "-C", str(worktree), "diff", "--name-only", range_ref])
-    stat = runner(["git", "-C", str(worktree), "diff", "--stat", range_ref])
+    committed = runner(["git", "-C", str(checkout), "diff", "--name-only", range_ref])
+    stat = runner(["git", "-C", str(checkout), "diff", "--stat", range_ref])
     status = None
-    if include_worktree_status:
+    if include_checkout_status:
         status = runner([
             "git",
             "-C",
-            str(worktree),
+            str(checkout),
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
@@ -229,21 +229,23 @@ def _observe_evidence_from_ref(
         )
 
     tests: TestResult | None = None
-    checkout = None
+    checkout_result = None
     if checkout_ref:
-        checkout = runner(["git", "-C", str(worktree), "checkout", "--detach", checkout_ref])
+        checkout_result = runner(["git", "-C", str(checkout), "checkout", "--detach", checkout_ref])
         commands.append(
             CommandResult(
-                f"git checkout --detach {checkout_ref}", checkout.returncode, _summarize(checkout)
+                f"git checkout --detach {checkout_ref}",
+                checkout_result.returncode,
+                _summarize(checkout_result),
             )
         )
     if test_command and skip_test_reason:
         tests = TestResult(test_command, skipped_reason=skip_test_reason)
     elif test_command:
-        if checkout is not None and checkout.returncode != 0:
+        if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            test = runner(test_command, cwd=worktree)
+            test = runner(test_command, cwd=checkout)
             tests = TestResult(test_command, test.returncode, _summarize_test_output(test))
             commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
@@ -252,7 +254,7 @@ def _observe_evidence_from_ref(
         attempt=attempt,
         backend=backend,
         branch=branch,
-        worktree=str(worktree),
+        checkout=str(checkout),
         started_at=started_at.astimezone(UTC).isoformat(),
         finished_at=datetime.now(UTC).isoformat(),
         files_changed=files_changed,

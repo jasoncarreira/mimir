@@ -36,7 +36,7 @@ from typing import Callable, Sequence
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
-from .worktree import prune_attempt_worktrees
+from .checkout import prune_attempt_checkouts
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
 #: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
@@ -200,7 +200,7 @@ def _attempt_is_active(child: Path) -> bool:
         return True
 
 
-def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
+def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
     """Prune retained Worklink attempt checkouts past the reaper TTL (#613).
 
     The claim reaper recovers Chainlink labels/locks, but failed or blocked
@@ -219,7 +219,7 @@ def prune_stale_attempt_worktrees_for_home(home: Path, *, repo: Path | str | Non
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     if not repo_raw:
         return []
-    return prune_attempt_worktrees(
+    return prune_attempt_checkouts(
         Path(repo_raw),
         older_than=timedelta(seconds=defaults.reaper_ttl_s),
         now=datetime.now(timezone.utc),

@@ -33,6 +33,7 @@ class RepoPRAction(StrEnum):
 
     INSPECT = "repo.inspect"
     CHECKOUT = "repo.checkout"
+    TEST = "repo.test"
     WRITE = "repo.write"
     COMMIT = "repo.commit"
     PUSH = "repo.push"
@@ -491,7 +492,7 @@ class AgentEvent:
     # Public ingress never copies this object from request data.
     service_authority: Any = None
     # Optional server-discovered heartbeat authority. Poller scopes are always
-    # rebuilt from their one trusted payload item and never accepted here.
+    # rebuilt from their trusted payload items and never accepted here.
     repo_pr_action_scope: "RepoPRActionScope | None" = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
@@ -583,6 +584,9 @@ class RepoPRActionScope:
     observed_head_sha: str
     base_ref: str
     observed_base_sha: str
+    # A provider-owned immutable ref used only to obtain the observed head.
+    # Write scopes leave this unset and continue to fetch/push destination_ref.
+    checkout_ref: str | None = None
     scope_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -611,6 +615,8 @@ class RepoPRActionScope:
             "base_ref": self.base_ref,
             "observed_base_sha": self.observed_base_sha,
         }
+        if self.checkout_ref is not None:
+            authority["checkout_ref"] = self.checkout_ref
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
         object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
 
@@ -686,6 +692,65 @@ class RepoReviewState:
 
 
 @dataclass(frozen=True)
+class RepoPRScopeRegistry:
+    """Immutable per-turn registry of independently checked-out PR scopes."""
+
+    review_states: tuple[RepoReviewState, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.review_states, tuple):
+            raise TypeError("review_states must be a tuple")
+        targets: set[tuple[str, int]] = set()
+        for state in self.review_states:
+            if not isinstance(state, RepoReviewState):
+                raise TypeError("review_states must contain RepoReviewState values")
+            target = (state.repo.lower(), state.pr_number)
+            if target in targets:
+                raise ValueError("duplicate pull-request scope target")
+            targets.add(target)
+
+    @property
+    def action_scopes(self) -> tuple[RepoPRActionScope, ...]:
+        return tuple(state.action_scope for state in self.review_states)
+
+    def resolve(self, repository: object, pull_request: object) -> RepoReviewState | None:
+        if (
+            not isinstance(repository, str)
+            or not repository
+            or not isinstance(pull_request, int)
+            or isinstance(pull_request, bool)
+        ):
+            return None
+        target = (repository.lower(), pull_request)
+        return next(
+            (
+                state for state in self.review_states
+                if (state.repo.lower(), state.pr_number) == target
+            ),
+            None,
+        )
+
+
+@dataclass
+class ServerDiscoveredPRStates:
+    """Per-turn cache of review states derived from live provider snapshots."""
+
+    _states: dict[tuple[str, int], RepoReviewState] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
+        with self._lock:
+            return self._states.get((repository.lower(), pull_request))
+
+    def remember(self, state: RepoReviewState) -> RepoReviewState:
+        target = (state.repo.lower(), state.pr_number)
+        with self._lock:
+            return self._states.setdefault(target, state)
+
+
+@dataclass(frozen=True)
 class AuthContext:
     """Frozen, server-created authorization context (chainlink #864).
 
@@ -733,14 +798,23 @@ class AuthContext:
     egress_state: EgressSessionState = field(
         default_factory=EgressSessionState, repr=False, compare=False,
     )
-    # Present only on a server-created github poller turn for one own-PR
-    # remediation event. The mutable bit is monotonic and records successful
-    # checkout; the authority-bearing scope itself remains frozen.
+    # Server-created immutable registry for all valid PR items in one trusted
+    # poller payload. Each state carries its own monotonic checkout proof.
+    repo_pr_scope_registry: RepoPRScopeRegistry | None = field(
+        default=None, repr=False, compare=False,
+    )
+    # Single-scope aliases retained for callers whose trusted event can only
+    # carry one PR (notably server-discovered heartbeat turns).
     repo_review_state: RepoReviewState | None = field(
         default=None, repr=False, compare=False,
     )
     repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
+    )
+    # Standing review authority is resolved lazily from a live server fetch.
+    # This cache is per turn and stores only immutable server-issued scopes.
+    server_discovered_pr_states: ServerDiscoveredPRStates = field(
+        default_factory=ServerDiscoveredPRStates, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.

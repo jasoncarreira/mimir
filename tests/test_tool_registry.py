@@ -216,7 +216,7 @@ def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
     assert sinks <= set(_OPERATION_SINK_DESTINATION)
 
 
-def test_typed_repo_pr_schemas_cannot_name_a_repository_or_pull_request() -> None:
+def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
     from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
     from mimir.tools import all_mimir_tools
 
@@ -226,10 +226,24 @@ def test_typed_repo_pr_schemas_cannot_name_a_repository_or_pull_request() -> Non
             coding_enabled=True, require_coding_available=False,
         )
     }
-    forbidden = {"repo", "repository", "pr", "pull_request", "url", "host"}
+    forbidden = {"repo", "pr", "pr_number", "url", "host"}
     for name in _TYPED_REPO_PR_TOOL_ACTIONS:
         properties = tools[name].tool_call_schema.model_json_schema()["properties"]
         assert forbidden.isdisjoint(properties), (name, properties)
+        assert {"repository", "pull_request"} <= set(properties), (name, properties)
+
+
+def test_repo_test_schema_exposes_no_execution_authority() -> None:
+    from mimir.tools import all_mimir_tools
+
+    tools = {
+        tool.name: tool
+        for tool in all_mimir_tools(
+            coding_enabled=True, require_coding_available=False,
+        )
+    }
+    properties = tools["repo_test"].tool_call_schema.model_json_schema()["properties"]
+    assert set(properties) == {"repository", "pull_request", "selectors"}
 
 
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:

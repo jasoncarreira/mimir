@@ -2,13 +2,14 @@
 
 Backends own CLI session semantics only: rendering the tool-specific work spec,
 capturing transcripts, and mapping tool-specific failures into common status
-strings. Claiming, compute launch/wait/cancel/cleanup, worktree lifecycle,
+strings. Claiming, compute launch/wait/cancel/cleanup, checkout lifecycle,
 evidence validation, and state transitions stay in shared Worklink plumbing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -21,14 +22,19 @@ class Caps:
     persistent_sessions: bool
     json_output: bool
     native_pr_creation: bool
-    worktree_safe: bool
     quota_pool: str | None
+
+
+class CheckoutShape(StrEnum):
+    """Server-owned containment shape for a backend attempt checkout."""
+
+    ISOLATED_CLONE = "isolated_clone"
 
 
 @dataclass(frozen=True)
 class WorkOrder:
     issue_id: int
-    worktree: Path
+    checkout: Path
     prompt: str
     rules: str | None
     timeout_s: int
@@ -95,6 +101,7 @@ class RawResult:
 
 class ToolBackend(Protocol):
     name: str
+    checkout_shape: CheckoutShape
 
     def capabilities(self) -> Caps: ...
 
@@ -110,3 +117,8 @@ class ToolBackend(Protocol):
     ) -> WorkSpec: ...
 
     async def interpret(self, order: WorkOrder, result: ComputeResult) -> RawResult: ...
+
+
+def checkout_shape_for_backend(backend: ToolBackend) -> CheckoutShape:
+    """Return a backend's shape, failing safely for older or third-party backends."""
+    return getattr(backend, "checkout_shape", CheckoutShape.ISOLATED_CLONE)

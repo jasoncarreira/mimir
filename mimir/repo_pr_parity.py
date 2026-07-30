@@ -32,6 +32,7 @@ _WRITE_OPERATIONS = frozenset({
 _OPERATION_ACTION = {
     "pr_metadata": RepoPRAction.INSPECT.value,
     "repo_status": RepoPRAction.INSPECT.value,
+    "repo_test": RepoPRAction.TEST.value,
     "pr_submit_review": RepoPRAction.PR_REVIEW.value,
     "pr_comment": RepoPRAction.PR_COMMENT.value,
     "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
@@ -39,10 +40,17 @@ _OPERATION_ACTION = {
     "repo_commit": RepoPRAction.COMMIT.value,
     "repo_push": RepoPRAction.PUSH.value,
 }
-_REVIEW_ACTIONS = frozenset({RepoPRAction.INSPECT.value, RepoPRAction.PR_REVIEW.value})
+_REVIEW_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
+    RepoPRAction.PR_REVIEW.value,
+    RepoPRAction.PR_COMMENT.value,
+})
 _REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
     RepoPRAction.WRITE.value,
     RepoPRAction.COMMIT.value,
     RepoPRAction.PUSH.value,

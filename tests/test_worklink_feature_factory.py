@@ -463,7 +463,7 @@ def test_work_spec_carries_autonomous_command_and_worktree(tmp_path: Path) -> No
     backend = FeatureFactoryBackend(bin="feature-factory", reviewer="mimir-carreira")
     order = WorkOrder(
         issue_id=ISSUE_ID,
-        worktree=tmp_path / "wt",
+        checkout=tmp_path / "wt",
         prompt="Build chainlink #834: x",
         rules=None,
         timeout_s=1800,
@@ -472,8 +472,8 @@ def test_work_spec_carries_autonomous_command_and_worktree(tmp_path: Path) -> No
         order, attempt=1, repo_url="git@github.com:o/r.git", base_ref="main",
         branch="issue/834-a1", test_command="pytest",
     )
-    assert spec.local_worktree == order.worktree
-    assert tuple(spec.local_argv) == backend._factory_command(order.worktree, order.prompt, order.issue_id)
+    assert spec.local_checkout == order.checkout
+    assert tuple(spec.local_argv) == backend._factory_command(order.checkout, order.prompt, order.issue_id)
     assert "--autonomous" in spec.local_argv and "--detached" in spec.local_argv
     assert "--run-id" in spec.local_argv
     assert "--ready" in spec.local_argv
@@ -867,7 +867,7 @@ class FakeFactoryCompute:
         self.specs.append(spec)
         self.launch_argvs.append([str(a) for a in (spec.local_argv or [])])
         if not self.passive:
-            wt = spec.local_worktree
+            wt = spec.local_checkout
             _write_factory_run(wt, self.states[0])
             if self.write_process_log:
                 _touch_process_log(wt)
@@ -952,7 +952,7 @@ def _drive(
     home.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
-    worktree = repo / ".worklink" / f"{ISSUE_ID}-1"
+    worktree = repo.parent / ".worklink" / repo.name / f"{ISSUE_ID}-1"
     gh_calls: list[list[str]] = []
     comments: list[list[str]] = []
 
@@ -960,6 +960,16 @@ def _drive(
         if isinstance(args, str):
             return _cp()
         args = list(args)
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            worktree.mkdir(parents=True, exist_ok=True)
+            (worktree / ".git" / "objects" / "info").mkdir(parents=True)
+            return _cp()
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return _cp(stdout="abc123\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
+            return _cp(stdout=f"{worktree}\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:
+            return _cp(stdout=f"{worktree / '.git'}\n")
         if args[:3] == ["chainlink", "issue", "show"]:
             return _cp(stdout=_issue_json())
         if args[:3] == ["chainlink", "issue", "comment"]:
@@ -967,9 +977,6 @@ def _drive(
             return _cp()
         if args[:2] == ["gh", "pr"]:
             gh_calls.append(args)
-            return _cp()
-        if args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
-            worktree.mkdir(parents=True, exist_ok=True)
             return _cp()
         if args[:4] == ["git", "-C", str(repo), "config"]:
             return _cp(stdout="git@github.com:o/r.git\n")
@@ -1366,7 +1373,7 @@ def test_interpret_run_id_mismatch_fails_closed(tmp_path: Path) -> None:
     worktree = tmp_path / "wt"
     order = WorkOrder(
         issue_id=834,
-        worktree=worktree,
+        checkout=worktree,
         prompt="prompt",
         rules=None,
         timeout_s=1800,
@@ -1387,7 +1394,7 @@ def test_interpret_completed_without_pr_url_fails_closed(tmp_path: Path) -> None
     worktree = tmp_path / "wt"
     order = WorkOrder(
         issue_id=834,
-        worktree=worktree,
+        checkout=worktree,
         prompt="prompt",
         rules=None,
         timeout_s=1800,
@@ -1408,7 +1415,7 @@ def test_interpret_invalid_pr_url_fails_closed(tmp_path: Path) -> None:
     worktree = tmp_path / "wt"
     order = WorkOrder(
         issue_id=834,
-        worktree=worktree,
+        checkout=worktree,
         prompt="prompt",
         rules=None,
         timeout_s=1800,
@@ -1429,7 +1436,7 @@ def test_interpret_malformed_run_json_fails_closed(tmp_path: Path) -> None:
     worktree = tmp_path / "wt"
     order = WorkOrder(
         issue_id=834,
-        worktree=worktree,
+        checkout=worktree,
         prompt="prompt",
         rules=None,
         timeout_s=1800,
@@ -1452,7 +1459,7 @@ def test_interpret_run_json_as_list_fails_closed(tmp_path: Path) -> None:
     worktree = tmp_path / "wt"
     order = WorkOrder(
         issue_id=834,
-        worktree=worktree,
+        checkout=worktree,
         prompt="prompt",
         rules=None,
         timeout_s=1800,

@@ -145,6 +145,11 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except WorklinkError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except Exception as exc:  # The run boundary already emitted scrubbed failure telemetry.
+        from ..redaction import redact_text
+
+        print(f"error: {redact_text(f'{type(exc).__name__}: {exc}')}", file=sys.stderr)
+        return 1
 
     if result.dry_run:
         return 0

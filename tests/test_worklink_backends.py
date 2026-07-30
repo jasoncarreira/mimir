@@ -24,6 +24,7 @@ from mimir.worklink.backends import (
     WorklinkDefaults,
 )
 from mimir.worklink.backends.base import blocked_reason_from_output
+from mimir.worklink.backends.registry import SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS
 from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
 import mimir.worklink.compute as compute_module
 
@@ -63,10 +64,10 @@ defaults:
   compute_backend: local_subprocess
   timeout_s: 45
   backend_by_category:
-    renderer: mermaid
+    renderer: feature_factory
 routes:
   - label: render
-    backend: mermaid
+    backend: feature_factory
     compute_backend: local_subprocess
   - repo: jasoncarreira/mimir
     backend: opencode
@@ -83,13 +84,13 @@ backends:
     config = WorklinkConfig.load(config_path)
 
     assert config.defaults.timeout_s == 45
-    assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "mermaid"
+    assert config.select_backend_name(labels={"render"}, repo="jasoncarreira/mimir") == "feature_factory"
     assert config.select_backend_name(labels={"worklink"}, repo="jasoncarreira/mimir") == "opencode"
     assert (
         config.select_backend_name(
             labels={"worklink"}, repo="elsewhere/repo", tool_category="renderer"
         )
-        == "mermaid"
+        == "feature_factory"
     )
     assert config.select_backend_name(labels={"worklink"}, repo="elsewhere/repo") == "opencode"
     registry = BackendRegistry(config)
@@ -231,14 +232,13 @@ compute_backends:
     image: mimirbot-mimirbot
 """.strip()
     )
-    with pytest.raises(ValueError, match="unknown Worklink compute backend config: docker_sibling"):
-        BackendRegistry(WorklinkConfig.load(config_path))
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
-    # select_compute() with no compute_backends block returns the built-in
-    # local_subprocess; with an unknown one selected it must fail clean.
+    # A selected unknown name remains fatal without a matching settings block.
     config_path.write_text("defaults:\n  compute_backend: docker_sibling\n")
-    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
-        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
 
 def test_worklink_config_rejects_retired_ecs_runtask_compute_backend(tmp_path: Path) -> None:
@@ -256,12 +256,12 @@ compute_backends:
     subnets: [subnet-a]
 """.strip()
     )
-    with pytest.raises(ValueError, match="unknown Worklink compute backend config: ecs_runtask"):
-        BackendRegistry(WorklinkConfig.load(config_path))
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
     config_path.write_text("defaults:\n  compute_backend: ecs_runtask\n")
-    with pytest.raises(KeyError, match="unknown Worklink compute backend"):
-        BackendRegistry(WorklinkConfig.load(config_path)).select_compute()
+    with pytest.raises(ValueError, match="referenced by defaults.compute_backend"):
+        WorklinkConfig.load(config_path)
 
 
 def test_worklink_config_rejects_local_subprocess_with_settings(tmp_path: Path) -> None:
@@ -388,6 +388,13 @@ def test_registry_resolves_only_shipping_backends() -> None:
         registry.get("claude_cli")
 
 
+def test_shipping_backend_names_match_constructed_registries() -> None:
+    registry = BackendRegistry()
+
+    assert set(registry._backends) == SHIPPING_BACKENDS
+    assert set(registry._compute_backends) == SHIPPING_COMPUTE_BACKENDS
+
+
 @pytest.mark.parametrize("name", ["codex", "claude_cli"])
 def test_registry_rejects_retired_backend_config(name: str) -> None:
     config = WorklinkConfig(backend_settings={name: {}})
@@ -400,6 +407,59 @@ def test_registry_rejects_retired_selected_backend(name: str) -> None:
     registry = BackendRegistry(WorklinkConfig(defaults=WorklinkDefaults(backend=name)))
     with pytest.raises(KeyError, match=f"unknown Worklink backend: {name}"):
         registry.select()
+
+
+def test_config_ignores_unreferenced_stale_backend_settings_with_actionable_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(
+        "backends:\n  codex:\n    bin: codex\n"
+        "compute_backends:\n  docker-sibling:\n    image: old\n",
+        encoding="utf-8",
+    )
+
+    config = WorklinkConfig.load(config_path)
+
+    assert config.backend_settings == {}
+    assert config.compute_backend_settings == {}
+    assert f"unreferenced unknown Worklink backend config 'codex' in {config_path}" in caplog.text
+    assert f"remove backends.codex from {config_path}" in caplog.text
+    assert (
+        f"unreferenced unknown Worklink compute backend config 'docker-sibling' in {config_path}"
+        in caplog.text
+    )
+    assert f"remove compute_backends.docker-sibling from {config_path}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "reference"),
+    [
+        ("defaults:\n  backend: codex\n", "defaults.backend"),
+        (
+            "defaults:\n  backend_by_category:\n    coding-cli: codex\n",
+            "defaults.backend_by_category.coding-cli",
+        ),
+        ("routes:\n  - label: legacy\n    backend: codex\n", "routes[0].backend"),
+        (
+            "routes:\n  - label: remote\n    backend: opencode\n    compute_backend: docker-sibling\n",
+            "routes[0].compute_backend",
+        ),
+    ],
+)
+def test_config_rejects_every_referenced_unknown_backend_with_path_and_fix(
+    tmp_path: Path, yaml_text: str, reference: str
+) -> None:
+    config_path = tmp_path / "worklink.yaml"
+    config_path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        WorklinkConfig.load(config_path)
+
+    message = str(raised.value)
+    assert f"referenced by {reference}" in message
+    assert str(config_path) in message
+    assert f"change {reference}" in message
 
 
 @pytest.mark.asyncio
@@ -429,7 +489,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         timeout_s=5,
         env={"PATH": "/custom/bin", "X": "1"},
         backend_config={"bin": "other", "args": ["ignored"]},
-        local_worktree=tmp_path,
+        local_checkout=tmp_path,
         local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
     )
     handle = await backend.launch(spec)
@@ -487,7 +547,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         test_command="true",
         backend="opencode",
         timeout_s=5,
-        local_worktree=tmp_path,
+        local_checkout=tmp_path,
         local_argv=("opencode", "run"),
     )
 
@@ -501,7 +561,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
 
     order = WorkOrder(
         issue_id=1,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="prompt",
         rules=None,
         timeout_s=5,
@@ -542,7 +602,7 @@ def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> N
     )
     order = WorkOrder(
         issue_id=466,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="do it",
         rules=None,
         timeout_s=30,
@@ -609,7 +669,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
         issue_id=782,
-        worktree=tmp_path / "worktree",
+        checkout=tmp_path / "worktree",
         prompt="-starts with dash",
         rules=None,
         timeout_s=30,
@@ -633,7 +693,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
-        "opencode", "run", "--dir", str(order.worktree),
+        "opencode", "run", "--dir", str(order.checkout),
         "-m", "openai/gpt-5.6-luna", "--", "-starts with dash"
     )
     assert calls[0]["args"].count("-m") == 1
@@ -677,7 +737,7 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
     monkeypatch.setenv("HOME", str(tmp_path))
     order = WorkOrder(
         issue_id=1063,
-        worktree=tmp_path / "worktree",
+        checkout=tmp_path / "worktree",
         prompt="p",
         rules=None,
         timeout_s=30,
@@ -704,7 +764,7 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
 async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> None:
     order = WorkOrder(
         issue_id=782,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="p",
         rules=None,
         timeout_s=30,
@@ -760,7 +820,7 @@ async def test_opencode_backend_transcript_filename_contract(
     issue_id = 831
     order = WorkOrder(
         issue_id=issue_id,
-        worktree=tmp_path / "worktree",
+        checkout=tmp_path / "worktree",
         prompt="Do the work",
         rules=None,
         timeout_s=30,
@@ -861,7 +921,7 @@ async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
         issue_id=782, attempt=1, repo_url="u", base_ref="main", branch="issue/782-a1",
         prompt="p", rules=None, test_command="true", backend="opencode", timeout_s=30,
         env={"MIMIR_HOME": "/mimir-home"},
-        local_worktree=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
+        local_checkout=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
     )
     compute = LocalSubprocessComputeBackend()
     handle = await compute.launch(spec)

@@ -276,9 +276,9 @@ comes first, then the blocker. Readiness comes from Chainlink's ready queue plus
 ```
 mimir/worklink/
   __init__.py
-  orchestrator.py   # claim → worktree → backend → evidence → transition
+  orchestrator.py   # claim → checkout → backend → evidence → transition
   claims.py         # lock protocol + TTL reaper (chainlink locks or O_EXCL fallback)
-  worktree.py       # per-issue git worktree lifecycle
+  checkout.py       # per-issue isolated-clone checkout lifecycle
   evidence.py       # schema, validation, observation (diff/tests run by US)
   backends/
     __init__.py     # registry + capability resolution
@@ -320,8 +320,9 @@ Per-issue flow (one `run`):
    guarantee that vague parents can't reach a coding agent.
 2. **Claim** (`claims.py`). Lock + claim comment (agent id, ts,
    attempt N).
-3. **Worktree.** `git worktree add .worklink/<issue>-<attempt> -b
-   issue/<issue>-a<attempt>` from the **configured base branch**
+3. **Checkout.** Create a self-contained sibling checkout with `git clone
+   --local`, then check out `issue/<issue>-a<attempt>` from the **configured
+   base branch**
    (`defaults.base_branch` in `worklink.yaml`, default `main`; a `mimir
    worklink run --base <branch>` flag overrides per run). The same base is the
    diff floor (`base...head`) and the PR target (`gh pr create --base
@@ -332,9 +333,9 @@ Per-issue flow (one `run`):
    a dependent leaf from its blocker's branch, resolved from the Chainlink
    `block` graph) are a deliberate follow-up — they need blocker-branch
    existence/merge ordering and rebase-on-blocker-merge handling. Names are
-   **attempt-scoped**, because failed/blocked worktrees are retained for autopsy
+   **attempt-scoped**, because failed/blocked checkouts are retained for autopsy
    (§3 step 8): with issue-scoped names the second attempt would
-   collide with the first attempt's kept worktree AND its branch, and
+   collide with the first attempt's kept checkout AND its branch, and
    `attempts < 3` could never actually run more than once. Each retry
    gets a fresh path + branch; autopsy artifacts from prior attempts
    stay untouched until the reaper prunes them. Never a long-lived
@@ -349,7 +350,7 @@ Per-issue flow (one `run`):
    same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
 6. **Observe evidence** (`evidence.py`): for shared-filesystem compute,
-   the executor itself runs `git -C <worktree> diff --stat`/`status`, runs
+   the executor itself runs `git -C <checkout> diff --stat`/`status`, runs
    the declared test command, and captures the transcript pointer; for
    non-shared/remote compute, the executor fetches `origin/<base>` and
    `origin/<attempt-branch>`, checks out the fetched attempt ref, then
@@ -360,8 +361,8 @@ Per-issue flow (one `run`):
    remote runs expect the worker to have pushed the branch and the executor
    opens the PR only after fetched-ref evidence passes. Native PR creation can
    become another backend cap later, but it must not bypass executor evidence.
-8. **Cleanup.** Remove the attempt's worktree on success; keep on
-   `failed`/`blocked` for autopsy (the reaper prunes attempt worktrees
+8. **Cleanup.** Remove the attempt's checkout on success; keep on
+   `failed`/`blocked` for autopsy (the reaper prunes attempt checkouts
    and their `issue/<issue>-a<n>` branches after N days, and on issue
    close). Release the lock.
 
@@ -377,7 +378,7 @@ summary):
   "attempt": 1,
   "backend": "opencode",
   "branch": "issue/412-a1",
-  "worktree": ".worklink/412-1",
+  "checkout": "/workspace/.worklink/mimir/412-1",
   "started_at": "...", "finished_at": "...",
   "files_changed": ["mimir/saga/triples.py", "tests/test_memory_triples.py"],
   "diff_stat": "2 files changed, 31 insertions(+), 4 deletions(-)",
@@ -390,6 +391,10 @@ summary):
   "transcript": "state/worklink/transcripts/412-1.jsonl"
 }
 ```
+
+New evidence writes only `checkout`. Continuation recovery still reads the
+historical `worktree` key when `checkout` is absent, so existing evidence files
+remain associated and do not need rewriting.
 
 Validation (orchestrator-side, after the backend exits — never
 self-reported):
@@ -413,13 +418,12 @@ class Caps:
     persistent_sessions: bool # can resume a session across invocations
     json_output: bool         # machine-readable result stream
     native_pr_creation: bool  # can open the PR itself
-    worktree_safe: bool       # tolerates --cd into an arbitrary worktree
     quota_pool: str | None    # e.g. "opencode" — see §6
 
 @dataclass(frozen=True)
 class WorkOrder:
     issue_id: int
-    worktree: Path
+    checkout: Path
     prompt: str               # rendered from mimir/prompt_templates/worklink-order.md
     rules: str | None         # backend-appropriate rules/system content
     timeout_s: int
@@ -443,7 +447,7 @@ class ToolBackend(Protocol):
 
 Adapters own **only** CLI session mechanics: how to turn a
 `WorkOrder` into a portable git-handoff `WorkSpec`, pass prompt/rules,
-and map backend-specific output/errors into the common status terms. Everything else — claiming, worktrees, compute launch/wait/cancel/cleanup, evidence, transitions —
+and map backend-specific output/errors into the common status terms. Everything else — claiming, checkouts, compute launch/wait/cancel/cleanup, evidence, transitions —
 is orchestrator code shared by every backend. Adding a backend is one
 file implementing the protocol plus a registry entry; it must never
 require touching the orchestrator.
@@ -452,7 +456,7 @@ require touching the orchestrator.
 
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
-| `opencode` | `opencode run --dir <worktree> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
+| `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
 | `feature_factory` | `feature-factory start ...` | Epic adapter that launches the external opencode feature-factory. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
@@ -481,7 +485,7 @@ class WorkSpec:
     creds_ref: dict[str, str]                    # substrate-resolved, value-blind
     env: dict[str, str]                          # explicit allowlist
     backend_config: dict[str, Any]               # tool-specific settings
-    local_worktree: Path | None                  # local-subprocess compatibility only
+    local_checkout: Path | None                  # local-subprocess compatibility only
     local_argv: tuple[str, ...] | None            # local-subprocess compatibility only
 
 @dataclass(frozen=True)
@@ -535,17 +539,17 @@ added without an orchestrator change.
 ### Backend trust model
 
 The executor always isolates **git state** by running each backend in a
-per-issue worktree, pushing only an issue/attempt branch, and requiring
+per-issue isolated checkout, pushing only an issue/attempt branch, and requiring
 normal PR review before merge. It also uses an explicit environment
 allowlist, so backend subprocesses do not inherit arbitrary ambient
 secrets by default. Those are the durable safety rails.
 
 That is **not the same as filesystem sandboxing**. A Worklink run on the sole
 `local_subprocess` compute substrate has full container filesystem access from
-the backend process. The worktree cwd limits where opencode is asked to
+the backend process. The checkout cwd limits where opencode is asked to
 work, but it does not prevent reads or writes elsewhere in `/workspace`
 or `/mimir-home` if the backend agent/tool chooses to do them. Treat
-worktree isolation as an audit/review boundary, not a security boundary.
+checkout isolation as an audit/review boundary, not a security boundary.
 
 This is acceptable for **operator-invoked** slice-1 runs on bounded issues
 because the output still lands as a review PR and the executor observes
@@ -583,7 +587,7 @@ operator/agent-private trust boundary as poller commands.
 
 After the #832 substrate cleanup the only Worklink compute substrate is
 `local_subprocess` (shared_filesystem=True), so the orchestrator always runs
-the test command on the controller in the attempt worktree. The pre-#832
+the test command on the controller in the attempt checkout. The pre-#832
 non-shared-filesystem evidence path (orchestrator fetches refs and runs `git
 diff`, but must not check out the worker branch and run `test_command` on the
 controller) is documented in #454 but is no longer reached by any shipping

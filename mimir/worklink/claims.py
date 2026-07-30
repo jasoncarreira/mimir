@@ -10,10 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+import fcntl
 import json
 import logging
 from pathlib import Path
+import re
 import subprocess
+import time
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
@@ -41,13 +44,38 @@ SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 
+# Retrying remains useful even with Mimir's mutex: another Chainlink caller may
+# not participate in it. Five total attempts (including the first call) sleep for
+# 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds, long enough to absorb a short external
+# Chainlink fetch while keeping genuine persistent contention bounded.
+CLAIM_CONTENTION_MAX_ATTEMPTS = 5
+CLAIM_CONTENTION_INITIAL_BACKOFF_S = 0.1
+CLAIM_CONTENDED_RESOURCE = "chainlink_locks_worktree"
+
+_GIT_CONTENTION_PATTERNS = (
+    re.compile(
+        r"unable to create .*[/\\]index\.lock.*file exists",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"another git process seems to be running", re.IGNORECASE),
+    re.compile(r"another process is using this repository", re.IGNORECASE),
+)
+
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+EventLogger = Callable[..., None]
 
 log = logging.getLogger(__name__)
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
+
+
+def _is_git_contention(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    detail = (result.stderr or "") + "\n" + (result.stdout or "")
+    return any(pattern.search(detail) for pattern in _GIT_CONTENTION_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -275,6 +303,10 @@ class ChainlinkClaims:
         max_attempts: int = 3,
         duplicate_freshness_s: float = 600.0,
         home_path: str | Path | None = None,
+        event_logger: EventLogger | None = None,
+        contention_max_attempts: int = CLAIM_CONTENTION_MAX_ATTEMPTS,
+        contention_initial_backoff_s: float = CLAIM_CONTENTION_INITIAL_BACKOFF_S,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.chainlink_bin = chainlink_bin
         self.agent_id = agent_id
@@ -282,6 +314,10 @@ class ChainlinkClaims:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.max_attempts = max_attempts
         self.home_path = Path(home_path) if home_path is not None else None
+        self.event_logger = event_logger
+        self.contention_max_attempts = max(1, contention_max_attempts)
+        self.contention_initial_backoff_s = max(0.0, contention_initial_backoff_s)
+        self.sleeper = sleeper
         # chainlink #822: a claim-comment heartbeat younger than this means the
         # owning process is alive (2x the max epic heartbeat interval of 300s).
         self.duplicate_freshness_s = duplicate_freshness_s
@@ -328,8 +364,11 @@ class ChainlinkClaims:
             )
             return ClaimResult(False, reason="review_ready_evidence_exists")
 
-        lock = self._run("locks", "claim", str(issue_id), check=False)
+        claim_home = Path(home_path) if home_path is not None else self.home_path
+        lock = self._claim_lock_with_retry(issue_id, home_path=claim_home)
         if lock.returncode != 0:
+            if _is_git_contention(lock):
+                return ClaimResult(False, reason="claim_contention_exhausted")
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
         if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
             # chainlink #822: the chainlink CLI treats a same-agent re-claim as
@@ -403,6 +442,65 @@ class ChainlinkClaims:
             self.release_issue(issue_id)
             raise
         return ClaimResult(True, record=record)
+
+    def _claim_lock_with_retry(
+        self, issue_id: int, *, home_path: Path | None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run only the Chainlink claim under the shared-worktree mutex."""
+        lock_path: Path | None = None
+        if home_path is None:
+            log.warning(
+                "Worklink claim serialization unavailable: issue_id=%s reason=home_path_missing",
+                issue_id,
+            )
+            if self.event_logger is not None:
+                self.event_logger(
+                    "worklink_claim_serialization_unavailable",
+                    issue_id=issue_id,
+                    resource=CLAIM_CONTENDED_RESOURCE,
+                    reason="home_path_missing",
+                )
+        else:
+            lock_dir = home_path / "state" / "worklink"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / "chainlink-claim.lock"
+
+        result: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(1, self.contention_max_attempts + 1):
+            if lock_path is None:
+                result = self._run("locks", "claim", str(issue_id), check=False)
+            else:
+                with lock_path.open("a", encoding="utf-8") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        result = self._run("locks", "claim", str(issue_id), check=False)
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+            if not _is_git_contention(result):
+                if attempt > 1:
+                    self._emit_claim_contention(issue_id, attempt, "succeeded")
+                return result
+
+            if attempt < self.contention_max_attempts:
+                self._emit_claim_contention(issue_id, attempt, "retrying")
+                self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
+
+        assert result is not None
+        self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
+        return result
+
+    def _emit_claim_contention(self, issue_id: int, attempt: int, outcome: str) -> None:
+        if self.event_logger is None:
+            return
+        self.event_logger(
+            "worklink_claim_contention",
+            issue_id=issue_id,
+            resource=CLAIM_CONTENDED_RESOURCE,
+            retry_attempt=attempt,
+            max_attempts=self.contention_max_attempts,
+            outcome=outcome,
+        )
 
     def review_ready_evidence(
         self,

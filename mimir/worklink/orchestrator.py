@@ -1,7 +1,7 @@
 """Worklink operator-run orchestrator.
 
 The orchestrator owns deterministic state transitions around an untrusted tool
-backend: validate the Chainlink leaf, claim it, create an attempt worktree,
+backend: validate the Chainlink leaf, claim it, create an attempt checkout,
 render the work order, run the backend, observe evidence ourselves, push/open a
 PR only after the evidence gate passes, then clean up and release the lock.
 """
@@ -19,7 +19,14 @@ import subprocess
 import warnings
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
-from .backends import BackendRegistry, WorkOrder, WorklinkConfig
+from .backends import (
+    BackendRegistry,
+    CheckoutShape,
+    ToolBackend,
+    WorkOrder,
+    WorklinkConfig,
+    checkout_shape_for_backend,
+)
 from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
@@ -38,7 +45,7 @@ from .run_state import (
     load_run_state,
     save_run_state,
 )
-from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
+from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
 from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -124,7 +131,7 @@ class WorklinkRunResult:
     review_ready: bool = False
     pr_url: str | None = None
     evidence_path: Path | None = None
-    worktree: Path | None = None
+    checkout: Path | None = None
     branch: str | None = None
     dry_run: bool = False
     reason: str | None = None
@@ -356,14 +363,14 @@ class WorklinkRunner:
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
-                worktree=self.repo / ".worklink" / f"{issue.issue_id}-DRYRUN",
+                checkout=self.repo / ".worklink" / f"{issue.issue_id}-DRYRUN",
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             print(_format_work_order(order, backend=selected_name))
-            print(f"\nBase branch: {base} (worktree cut from it; PR targets it)")
+            print(f"\nBase branch: {base} (checkout cut from it; PR targets it)")
             return WorklinkRunResult(issue.issue_id, None, "dry_run", dry_run=True)
 
         # Autonomy safety gate (#460): autonomous dispatch (poller / worklink_run
@@ -386,6 +393,7 @@ class WorklinkRunner:
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
+            event_logger=_log_event,
         )
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
@@ -400,6 +408,11 @@ class WorklinkRunner:
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            _log_event(
+                "worklink_claim_failed",
+                issue_id=issue.issue_id,
+                reason=claim.reason or "claim_failed",
+            )
             return WorklinkRunResult(
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
@@ -411,38 +424,24 @@ class WorklinkRunner:
             backend=selected_name,
         )
 
-        lease: WorktreeLease | None = None
+        lease: CheckoutLease | None = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 base=base,
-                backend_name=selected_name,
-                compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                backend=backend,
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
             )
-            # Coding CLIs derive project identity from git metadata. A linked
-            # worktree shares the parent's common git dir, which made OpenCode's
-            # effective project include repo/.worklink and exposed concurrent
-            # sibling attempts to repo-wide searches (#1019). Codex can similarly
-            # resolve back to the parent (#517). Shared-filesystem runs therefore
-            # need an independent repository rooted at the attempt checkout.
-            if (
-                selected_name in {"codex", "opencode"}
-                and compute.capabilities().shared_filesystem
-                and not lease.isolated_checkout
-            ):
+            if not lease.isolated_checkout:
                 _log_event(
-                    (
-                        "worklink_unsafe_codex_checkout"
-                        if selected_name == "codex"
-                        else "worklink_unsafe_opencode_checkout"
-                    ),
+                    "worklink_unsafe_backend_checkout",
                     issue_id=issue.issue_id,
                     attempt=record.attempt,
+                    backend=selected_name,
                     compute_backend=compute.name,
                 )
                 return WorklinkRunResult(
@@ -450,9 +449,9 @@ class WorklinkRunner:
                     None,
                     "blocked",
                     reason=(
-                        f"{selected_name} on a shared-filesystem compute must run in an "
-                        "isolated checkout (own .git), not a parent-pointing worktree, "
-                        "to avoid exposing other checkouts (chainlink #517/#1019)"
+                        f"{selected_name} must run in an isolated checkout (own .git), "
+                        "not a parent-pointing worktree, to avoid exposing other checkouts "
+                        "(chainlink #517/#1019)"
                     ),
                 )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
@@ -464,7 +463,7 @@ class WorklinkRunner:
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
-                worktree=lease.path,
+                checkout=lease.path,
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
@@ -574,7 +573,7 @@ class WorklinkRunner:
                 record.attempt,
                 "failed",
                 reason=str(exc),
-                worktree=lease.path if lease else None,
+                checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
             )
         finally:
@@ -596,7 +595,7 @@ class WorklinkRunner:
         compute: Any,
         compute_result: ComputeResult,
         order: WorkOrder,
-        lease: WorktreeLease,
+        lease: CheckoutLease,
         spec: Any,
         started: datetime,
         test_cmd: str | None,
@@ -632,7 +631,7 @@ class WorklinkRunner:
             attempt=attempt,
             backend=selected_name,
             branch=lease.branch,
-            worktree=lease.path,
+            checkout=lease.path,
             started_at=started,
             base_ref=lease.local_base or lease.base_ref,
             backend_status=raw.backend_status,
@@ -644,20 +643,20 @@ class WorklinkRunner:
             skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
         )
-        validation = _with_outside_worktree_detection(
+        validation = _with_outside_checkout_detection(
             validation,
             issue=issue.issue_id,
             attempt=attempt,
             root=self.repo,
-            worktree=lease.path,
+            checkout=lease.path,
             runner=runner,
             root_dirty_before=root_dirty_before,
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_worktree_changes(lease.path, issue, runner=runner)
+            _commit_checkout_changes(lease.path, issue, runner=runner)
             try:
-                _ensure_clean_worktree(lease.path, runner=runner)
+                _ensure_clean_checkout(lease.path, runner=runner)
             except WorklinkError as exc:
                 validation = _failed_validation(validation, str(exc))
             else:
@@ -666,7 +665,7 @@ class WorklinkRunner:
                     attempt=attempt,
                     backend=selected_name,
                     branch=lease.branch,
-                    worktree=lease.path,
+                    checkout=lease.path,
                     started_at=started,
                     base_ref=lease.local_base or lease.base_ref,
                     backend_status=raw.backend_status,
@@ -680,12 +679,12 @@ class WorklinkRunner:
                     ),
                     runner=runner,
                 )
-                validation = _with_outside_worktree_detection(
+                validation = _with_outside_checkout_detection(
                     validation,
                     issue=issue.issue_id,
                     attempt=attempt,
                     root=self.repo,
-                    worktree=lease.path,
+                    checkout=lease.path,
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
@@ -752,7 +751,7 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             pr_url=pr_url,
         )
-        cleanup_error = _cleanup_worktree_after_transition(
+        cleanup_error = _cleanup_checkout_after_transition(
             lease,
             outcome=validation.status,
             runner=_list_runner(runner),
@@ -766,7 +765,7 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             pr_url=pr_url,
             evidence_path=evidence_path,
-            worktree=lease.path,
+            checkout=lease.path,
             branch=lease.branch,
             reason=(
                 f"post-transition cleanup failed: {cleanup_error}"
@@ -797,6 +796,7 @@ class WorklinkRunner:
             agent_id=self.agent_id,
             runner=_list_runner(runner),
             home_path=self.home,
+            event_logger=_log_event,
         )
         review_ready = claims.review_ready_evidence(issue_id)
         if review_ready is not None:
@@ -888,7 +888,7 @@ class WorklinkRunner:
             job=state.handle_identifier,
         )
 
-        lease: WorktreeLease | None = None
+        lease: CheckoutLease | None = None
         try:
             lease = _create_observation_worktree(
                 self.repo,
@@ -908,7 +908,7 @@ class WorklinkRunner:
             )
             order = WorkOrder(
                 issue_id=issue_id,
-                worktree=lease.path,
+                checkout=lease.path,
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
@@ -1069,6 +1069,11 @@ class WorklinkRunner:
             _log_event("worklink_epic_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            _log_event(
+                "worklink_epic_claim_failed",
+                issue_id=issue.issue_id,
+                reason=claim.reason or "claim_failed",
+            )
             return WorklinkRunResult(
                 issue.issue_id, None, "failed", reason=claim.reason or "claim_failed"
             )
@@ -1086,8 +1091,7 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 base=base,
-                backend_name="feature_factory",
-                compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                backend=backend,
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
@@ -1095,7 +1099,7 @@ class WorklinkRunner:
 
             order = WorkOrder(
                 issue_id=issue.issue_id,
-                worktree=lease.path,
+                checkout=lease.path,
                 prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
@@ -1150,7 +1154,7 @@ class WorklinkRunner:
         backend: Any,
         compute: Any,
         order: WorkOrder,
-        lease: WorktreeLease,
+        lease: CheckoutLease,
         repo_url: str | None,
         test_cmd: str,
         runner: Runner,
@@ -1181,7 +1185,7 @@ class WorklinkRunner:
 
         # Resume check (before launching): a prior dispatch's detached factory may
         # already be terminal (finalize now) or still running (resume polling).
-        existing = read_factory_run_state(order.worktree, run_id)
+        existing = read_factory_run_state(order.checkout, run_id)
         if existing is not None and existing.is_terminal:
             _log_event(
                 "worklink_epic_resume_terminal", issue_id=issue.issue_id, run_id=run_id
@@ -1191,7 +1195,7 @@ class WorklinkRunner:
                 claims=claims,
                 attempt=record.attempt,
                 budget_attempt=record.budget_attempt or record.attempt,
-                worktree=order.worktree,
+                checkout=order.checkout,
                 lease=lease,
                 state=existing,
                 stuck_reason=None,
@@ -1239,7 +1243,7 @@ class WorklinkRunner:
             state, stuck_reason = await self._poll_factory_to_terminal(
                 claims=claims,
                 record=record,
-                worktree=order.worktree,
+                checkout=order.checkout,
                 run_id=run_id,
                 issue=issue,
                 poll_interval_s=float(getattr(backend, "poll_interval_s", 10) or 0),
@@ -1253,7 +1257,7 @@ class WorklinkRunner:
             claims=claims,
             attempt=record.attempt,
             budget_attempt=record.budget_attempt or record.attempt,
-            worktree=order.worktree,
+            checkout=order.checkout,
             lease=lease,
             state=state,
             stuck_reason=stuck_reason,
@@ -1265,7 +1269,7 @@ class WorklinkRunner:
         *,
         claims: ChainlinkClaims,
         record: ClaimRecord,
-        worktree: Path,
+        checkout: Path,
         run_id: str,
         issue: IssueContext,
         poll_interval_s: float,
@@ -1282,7 +1286,7 @@ class WorklinkRunner:
         (b) does probe-based liveness — a stale ``heartbeat_at`` TRIGGERS a probe,
         never an auto-fail. With ``--detached`` the launcher process is gone but
         the backgrounded factory child survives, so liveness is probed directly
-        via ``_detached_factory_alive`` (scan for the child by worktree); a live
+        via ``_detached_factory_alive`` (scan for the child by checkout); a live
         child keeps waiting even when momentarily quiet (the pre_pr review panel),
         and only if liveness can't be determined does ``_epic_stuck_reason`` fall
         back to the file-activity signal. It heartbeats the claim best-effort each
@@ -1300,7 +1304,7 @@ class WorklinkRunner:
         while True:
             state: Any = None
             try:
-                state = read_factory_run_state(worktree, run_id)
+                state = read_factory_run_state(checkout, run_id)
                 if state is not None:
                     for line in _factory_mirror_lines(state, memo):
                         _epic_comment(claims, issue.issue_id, line)
@@ -1318,13 +1322,13 @@ class WorklinkRunner:
 
             elapsed_s = max(0.0, datetime.now(UTC).timestamp() - started_at)
             # Detached: the launcher is gone, but the backgrounded factory child
-            # survives (reparented). Probe for it directly by worktree so a quiet
+            # survives (reparented). Probe for it directly by checkout so a quiet
             # review panel isn't mistaken for a hang; None (can't tell) falls back
             # to run-dir / process-log file activity.
             reason = _epic_stuck_reason(
                 state=state,
-                recent_activity_s=_run_dir_recent_activity_s(worktree, run_id),
-                job_alive=_detached_factory_alive(worktree),
+                recent_activity_s=_run_dir_recent_activity_s(checkout, run_id),
+                job_alive=_detached_factory_alive(checkout),
                 elapsed_s=elapsed_s,
                 stale_threshold_s=stale_threshold_s,
                 probe_window_s=probe_window_s,
@@ -1351,7 +1355,7 @@ class WorklinkRunner:
         claims: ChainlinkClaims,
         attempt: int,
         budget_attempt: int,
-        lease: WorktreeLease | None,
+        lease: CheckoutLease | None,
         status: str,
         reason: str | None,
         pr_url: str | None,
@@ -1374,7 +1378,7 @@ class WorklinkRunner:
             pr_url=pr_url,
         )
         if lease is not None:
-            _cleanup_worktree_after_transition(
+            _cleanup_checkout_after_transition(
                 lease,
                 outcome=status,
                 runner=_list_runner(runner),
@@ -1387,7 +1391,7 @@ class WorklinkRunner:
             status,
             review_ready=False,
             pr_url=pr_url,
-            worktree=lease.path if lease else None,
+            checkout=lease.path if lease else None,
             branch=lease.branch if lease else None,
             reason=reason,
         )
@@ -1399,8 +1403,8 @@ class WorklinkRunner:
         claims: ChainlinkClaims,
         attempt: int,
         budget_attempt: int,
-        worktree: Path,
-        lease: WorktreeLease | None,
+        checkout: Path,
+        lease: CheckoutLease | None,
         state: Any,
         stuck_reason: str | None,
         runner: Runner,
@@ -1473,9 +1477,9 @@ class WorklinkRunner:
             _log_event("worklink_epic_pr_opened", issue_id=issue.issue_id, pr_url=pr_url)
             if lease is not None:
                 # The factory already pushed the branch + opened the PR; the local
-                # attempt checkout is disposable. ``completed`` is cleanup_worktree's
+                # attempt checkout is disposable. ``completed`` is cleanup_checkout's
                 # remove-on-success sentinel (same as the leaf happy path).
-                _cleanup_worktree_after_transition(
+                _cleanup_checkout_after_transition(
                     lease,
                     outcome="completed",
                     runner=list_runner,
@@ -1488,7 +1492,7 @@ class WorklinkRunner:
                 "review_ready",
                 review_ready=True,
                 pr_url=pr_url,
-                worktree=lease.path if lease else None,
+                checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
             )
 
@@ -1598,7 +1602,7 @@ def _fmt_age(age_s: float | None) -> str:
     return "unknown" if age_s is None else f"{age_s:.0f}s ago"
 
 
-def _run_dir_recent_activity_s(worktree: Path, run_id: str) -> float | None:
+def _run_dir_recent_activity_s(checkout: Path, run_id: str) -> float | None:
     """Seconds since the most recently modified factory file. None if there is
     nothing to point to — i.e. no activity.
 
@@ -1613,9 +1617,9 @@ def _run_dir_recent_activity_s(worktree: Path, run_id: str) -> float | None:
     """
     from .backends.feature_factory import factory_run_dir
 
-    run_dir = factory_run_dir(worktree, run_id)
+    run_dir = factory_run_dir(checkout, run_id)
     # processes/ is a sibling of the per-run dir under the factory root:
-    # <worktree>/.opencode/factory/processes/ (run_dir is .../factory/<run-id>).
+    # <checkout>/.opencode/factory/processes/ (run_dir is .../factory/<run-id>).
     processes_dir = run_dir.parent / "processes"
     newest = 0.0
     try:
@@ -1642,15 +1646,15 @@ def _run_dir_recent_activity_s(worktree: Path, run_id: str) -> float | None:
 # Factory runtime whose process we scan for detached-mode liveness. With
 # ``--detached`` the launcher backgrounds this child and reparents it, so no
 # compute job handle survives; we recognise the live child by its
-# ``--dir <worktree>``.
+# ``--dir <checkout>``.
 _FACTORY_RUNTIME_HINT = "opencode"
 
 
-def _cmdline_is_factory_child(cmdline: str, worktree: str) -> bool:
+def _cmdline_is_factory_child(cmdline: str, checkout: str) -> bool:
     """True if a process command line is the detached factory runtime working in
-    ``worktree`` — the opencode child the launcher backgrounded with
-    ``--dir <worktree>``."""
-    return _FACTORY_RUNTIME_HINT in cmdline and worktree in cmdline
+    ``checkout`` - the opencode child the launcher backgrounded with
+    ``--dir <checkout>``."""
+    return _FACTORY_RUNTIME_HINT in cmdline and checkout in cmdline
 
 
 def _iter_proc_cmdlines() -> Iterator[str]:
@@ -1671,14 +1675,14 @@ def _iter_proc_cmdlines() -> Iterator[str]:
 
 
 def _detached_factory_alive(
-    worktree: Path,
+    checkout: Path,
     *,
     cmdlines: Iterable[str] | None = None,
 ) -> bool | None:
     """Liveness for a DETACHED factory child, which the launcher backgrounds and
     reparents so no compute job handle survives.
 
-    Scans process command lines for the factory runtime working in ``worktree``.
+    Scans process command lines for the factory runtime working in ``checkout``.
     Returns True when found. Returns None ("unknown") when it can't tell —
     non-Linux / no ``/proc``, or simply no match — so a scan miss is NEVER
     reported as dead (that would re-introduce the very false-positive this
@@ -1689,7 +1693,7 @@ def _detached_factory_alive(
         if not Path("/proc").is_dir():
             return None
         cmdlines = _iter_proc_cmdlines()
-    needle = str(worktree)
+    needle = str(checkout)
     for cmdline in cmdlines:
         if _cmdline_is_factory_child(cmdline, needle):
             return True
@@ -1757,8 +1761,8 @@ def _epic_stuck_reason(
     return None
 
 
-def _cleanup_worktree_after_transition(
-    lease: WorktreeLease,
+def _cleanup_checkout_after_transition(
+    lease: CheckoutLease,
     *,
     outcome: str,
     runner: Runner,
@@ -1773,7 +1777,7 @@ def _cleanup_worktree_after_transition(
     that success path and can re-dispatch duplicate work.
     """
     try:
-        cleanup_worktree(lease, outcome=outcome, runner=runner)
+        cleanup_checkout(lease, outcome=outcome, runner=runner)
     except Exception as exc:  # pragma: no cover - exact exception type is platform/git dependent.
         error = str(exc)
         _log_event(
@@ -1781,7 +1785,7 @@ def _cleanup_worktree_after_transition(
             issue_id=issue_id,
             attempt=attempt,
             outcome=outcome,
-            worktree=str(lease.path),
+            checkout=str(lease.path),
             branch=lease.branch,
             error=error,
         )
@@ -1800,16 +1804,82 @@ def run_worklink(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
-    return asyncio.run(
-        WorklinkRunner(home=home, repo=repo).run(
-            issue_id,
-            backend_name=backend,
-            dry_run=dry_run,
-            test_command=test_command,
-            base_branch=base_branch,
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=home, repo=repo).run(
+                issue_id,
+                backend_name=backend,
+                dry_run=dry_run,
+                test_command=test_command,
+                base_branch=base_branch,
+                autonomous=autonomous,
+            )
+        )
+    except Exception as exc:
+        _record_run_failure(
+            issue_id=issue_id,
+            attempt=None,
+            error=exc,
+            exit_status=2 if isinstance(exc, LeafValidationError) else 1,
             autonomous=autonomous,
         )
+        raise
+    if result.status == "failed":
+        _record_run_failure(
+            issue_id=issue_id,
+            attempt=result.attempt,
+            error=result.reason or "Worklink run failed",
+            exit_status=1,
+            autonomous=autonomous,
+        )
+    elif result.status in {"completed", "blocked"}:
+        _record_run_success(issue_id)
+    return result
+
+
+def _record_run_failure(
+    *,
+    issue_id: int,
+    attempt: int | None,
+    error: BaseException | str,
+    exit_status: int,
+    autonomous: bool,
+) -> None:
+    from .dispatch_failures import record_failure, terminal_error
+
+    safe_error = terminal_error(error)
+    _log_event(
+        "worklink_run_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        attempt_consumed=attempt is not None,
+        exit_status=exit_status,
+        terminal_error=safe_error,
     )
+    state_dir = os.environ.get("STATE_DIR")
+    if autonomous and state_dir:
+        try:
+            record_failure(
+                Path(state_dir),
+                issue_id=issue_id,
+                attempt=attempt,
+                exit_status=exit_status,
+                error=error,
+                log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            )
+        except OSError:
+            pass
+
+
+def _record_run_success(issue_id: int) -> None:
+    from .dispatch_failures import record_success
+
+    state_dir = os.environ.get("STATE_DIR")
+    if state_dir:
+        try:
+            record_success(Path(state_dir), issue_id)
+        except OSError:
+            pass
 
 
 def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:
@@ -1848,7 +1918,7 @@ def _persist_run_state(
     backend_name: str,
     compute: Any,
     handle: LaunchHandle,
-    lease: WorktreeLease,
+    lease: CheckoutLease,
     repo: Path,
     repo_url: str | None,
     test_command: str | None,
@@ -1890,7 +1960,7 @@ def _create_observation_worktree(
     local_base: str,
     branch: str,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
-) -> WorktreeLease:
+) -> CheckoutLease:
     """Throwaway detached worktree reserved for post-restart reattach (#561).
 
     After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -1910,7 +1980,7 @@ def _create_observation_worktree(
         raise WorklinkError(
             (add.stderr or add.stdout).strip() or "git worktree add (reattach observation) failed"
         )
-    return WorktreeLease(
+    return CheckoutLease(
         issue_id=issue_id,
         attempt=attempt,
         repo=repo,
@@ -1924,7 +1994,7 @@ def _create_observation_worktree(
 
 def _remove_observation_worktree(
     repo: Path,
-    lease: WorktreeLease,
+    lease: CheckoutLease,
     *,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
 ) -> None:
@@ -1976,7 +2046,7 @@ def _format_work_order(order: WorkOrder, *, backend: str) -> str:
     payload = {
         "backend": backend,
         "issue_id": order.issue_id,
-        "worktree": str(order.worktree),
+        "checkout": str(order.checkout),
         "timeout_s": order.timeout_s,
         "transcript_root": str(order.transcript_root) if order.transcript_root else None,
         "prompt": order.prompt,
@@ -2031,7 +2101,7 @@ def _comment_evidence(
     )
 
 
-def _assert_staged_diff_has_no_secret(worktree: Path, *, runner: Runner) -> None:
+def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None:
     """Refuse (raise ``WorklinkError``) if the staged diff adds a secret-shaped
     token — OR if the scan itself cannot run.
 
@@ -2053,7 +2123,7 @@ def _assert_staged_diff_has_no_secret(worktree: Path, *, runner: Runner) -> None
       false positives and would block benign generated content (a placeholder
       ``token=`` value in a doc/test).
     """
-    diff = runner(["git", "-C", str(worktree), "diff", "--cached", "-U0"])
+    diff = runner(["git", "-C", str(checkout), "diff", "--cached", "-U0"])
     if diff.returncode != 0:
         raise WorklinkError(
             "cannot scan staged Worklink changes for secrets "
@@ -2070,20 +2140,20 @@ def _assert_staged_diff_has_no_secret(worktree: Path, *, runner: Runner) -> None
             )
 
 
-def _commit_worktree_changes(worktree: Path, issue: IssueContext, *, runner: Runner) -> None:
-    add = runner(["git", "-C", str(worktree), "add", "-A"])
+def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> None:
+    add = runner(["git", "-C", str(checkout), "add", "-A"])
     if add.returncode != 0:
         raise WorklinkError((add.stderr or add.stdout).strip() or "git add failed")
-    staged = runner(["git", "-C", str(worktree), "diff", "--cached", "--quiet"])
+    staged = runner(["git", "-C", str(checkout), "diff", "--cached", "--quiet"])
     if staged.returncode == 0:
         raise WorklinkError("no staged Worklink changes to commit")
     # Fail closed before commit/push/PR if the backend staged a secret (or if
     # the scan cannot run).
-    _assert_staged_diff_has_no_secret(worktree, runner=runner)
+    _assert_staged_diff_has_no_secret(checkout, runner=runner)
     commit = runner([
         "git",
         "-C",
-        str(worktree),
+        str(checkout),
         "commit",
         "-m",
         f"worklink: issue #{issue.issue_id}",
@@ -2098,23 +2168,15 @@ def _create_backend_checkout(
     issue_id: int,
     attempt: int,
     base: str,
-    backend_name: str,
-    compute_shared_filesystem: bool,
+    backend: ToolBackend,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     base_fetch: bool = True,
     event_logger: Callable[..., None] | None = None,
-) -> WorktreeLease:
-    if backend_name in {"codex", "opencode"} and compute_shared_filesystem:
-        return create_isolated_checkout(
-            repo,
-            issue_id=issue_id,
-            attempt=attempt,
-            base=base,
-            base_fetch=base_fetch,
-            event_logger=event_logger,
-            runner=runner,
-        )
-    return create_worktree(
+) -> CheckoutLease:
+    shape = checkout_shape_for_backend(backend)
+    if shape is not CheckoutShape.ISOLATED_CLONE:
+        raise WorklinkError(f"unsupported checkout shape for backend {backend.name}: {shape}")
+    return create_isolated_checkout(
         repo,
         issue_id=issue_id,
         attempt=attempt,
@@ -2125,13 +2187,13 @@ def _create_backend_checkout(
     )
 
 
-def _with_outside_worktree_detection(
+def _with_outside_checkout_detection(
     validation: EvidenceValidation,
     *,
     issue: int,
     attempt: int,
     root: Path,
-    worktree: Path,
+    checkout: Path,
     runner: Runner,
     root_dirty_before: Sequence[str] = (),
 ) -> EvidenceValidation:
@@ -2144,20 +2206,20 @@ def _with_outside_worktree_detection(
     root_paths = _new_dirty_paths(_dirty_paths(root, runner=runner), before=root_dirty_before)
     if not root_paths:
         return validation
-    escaped = _paths_escape_worktree(root_paths, root=root, worktree=worktree)
+    escaped = _paths_escape_checkout(root_paths, root=root, checkout=checkout)
     if not escaped:
         return validation
 
     _log_event(
-        "worklink_backend_wrote_outside_worktree",
+        "worklink_backend_wrote_outside_checkout",
         issue_id=issue,
         attempt=attempt,
         root=str(root),
-        worktree=str(worktree),
+        checkout=str(checkout),
         files=escaped[:50],
     )
     stash = _quarantine_dirty_paths(root, escaped, issue=issue, attempt=attempt, runner=runner)
-    reason = "backend_wrote_outside_worktree: " + ", ".join(escaped[:10])
+    reason = "backend_wrote_outside_checkout: " + ", ".join(escaped[:10])
     if stash:
         reason += f" (quarantined to git stash '{stash}' in the repo root)"
     return _failed_validation(validation, reason)
@@ -2190,7 +2252,7 @@ def _quarantine_dirty_paths(
         )
         return None
     _log_event(
-        "worklink_quarantined_outside_worktree",
+        "worklink_quarantined_outside_checkout",
         issue_id=issue,
         attempt=attempt,
         stash=label,
@@ -2211,13 +2273,13 @@ def _new_dirty_paths(paths: Sequence[str], *, before: Sequence[str]) -> list[str
     return [path for path in paths if path not in old]
 
 
-def _paths_escape_worktree(paths: Sequence[str], *, root: Path, worktree: Path) -> list[str]:
+def _paths_escape_checkout(paths: Sequence[str], *, root: Path, checkout: Path) -> list[str]:
     root_resolved = root.resolve()
-    worktree_resolved = worktree.resolve()
+    checkout_resolved = checkout.resolve()
     escaped: list[str] = []
     for path in paths:
         absolute = (root_resolved / path).resolve()
-        if absolute == worktree_resolved or absolute.is_relative_to(worktree_resolved):
+        if absolute == checkout_resolved or absolute.is_relative_to(checkout_resolved):
             continue
         escaped.append(path)
     return escaped
@@ -2236,14 +2298,14 @@ def _paths_from_status(output: str) -> list[str]:
     return paths
 
 
-def _ensure_clean_worktree(worktree: Path, *, runner: Runner) -> None:
+def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
     status = runner([
-        "git", "-C", str(worktree), "status", "--porcelain=v1", "--untracked-files=all"
+        "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
     ])
     if status.returncode != 0:
         raise WorklinkError((status.stderr or status.stdout).strip() or "git status failed")
     if status.stdout.strip():
-        raise WorklinkError("worktree still dirty after Worklink commit")
+        raise WorklinkError("checkout still dirty after Worklink commit")
 
 
 def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
@@ -2315,11 +2377,11 @@ def _with_pr_url(validation: EvidenceValidation, pr_url: str) -> EvidenceValidat
 
 def _with_head_sha(
     validation: EvidenceValidation,
-    worktree: Path,
+    checkout: Path,
     *,
     runner: Runner,
 ) -> EvidenceValidation:
-    result = runner(["git", "-C", str(worktree), "rev-parse", "HEAD"])
+    result = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
     head_sha = result.stdout.strip() if result.returncode == 0 else ""
     if not head_sha:
         return validation
@@ -2393,7 +2455,7 @@ def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
         if isinstance(args, str):
             return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
         # Chainlink discovers its repository from cwd. Its configured home is
-        # authoritative even when a caller also supplies a backend worktree.
+        # authoritative even when a caller also supplies a backend checkout.
         command_cwd = home if args and args[0] == chainlink_bin else cwd
         return subprocess.run(list(args), cwd=command_cwd, capture_output=True, text=True, check=False)
 

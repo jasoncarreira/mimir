@@ -1816,6 +1816,23 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc)[:500],
             )
 
+        # Validate Worklink before its ready-queue poller can consume a leaf.
+        # A mismatch degrades only Worklink; the server and unrelated pollers boot.
+        worklink_config_path = config.home / "worklink.yaml"
+        if worklink_config_path.exists():
+            try:
+                from .worklink.backends.registry import BackendRegistry, WorklinkConfig
+
+                BackendRegistry(WorklinkConfig.load(worklink_config_path))
+            except Exception as exc:  # noqa: BLE001 — operator config must not abort boot
+                log.warning("Worklink disabled by invalid config %s: %s", worklink_config_path, exc)
+                await log_event(
+                    "worklink_config_invalid",
+                    path=str(worklink_config_path),
+                    error=str(exc)[:500],
+                    fix=f"correct {worklink_config_path} before Worklink dispatch can resume",
+                )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 

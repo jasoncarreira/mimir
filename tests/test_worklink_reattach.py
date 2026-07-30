@@ -149,7 +149,7 @@ class FakeBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            local_worktree=order.worktree,
+            local_checkout=order.checkout,
         )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
@@ -160,10 +160,22 @@ class FakeBackend:
 def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str]):
     """Fake runner: chainlink JSON + all git/gh routed through here (no real git)."""
 
+    checkout = repo.parent / ".worklink" / repo.name / f"{issue_id}-1"
+
     def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         calls.append(args)
         if isinstance(args, str):
             return cp(args)
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            checkout.mkdir(parents=True, exist_ok=True)
+            (checkout / ".git" / "objects" / "info").mkdir(parents=True)
+            return cp(args)
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return cp(args, stdout="abc123\n")
+        if args == ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{checkout}\n")
+        if args == ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{checkout / '.git'}\n")
         if args[:1] == ["chainlink"]:
             if args[1:3] == ["issue", "show"]:
                 return cp(args, stdout=_issue_json(issue_id, labels))
@@ -174,7 +186,7 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
             if "diff" in args and "--cached" in args and "--quiet" in args:
                 # chainlink #832: reattach finalize path now commits locally.
                 # exit 1 = "yes there are staged changes" (matches the contract
-                # WorklinkRunner's _commit_worktree_changes expects).
+                # WorklinkRunner's _commit_checkout_changes expects).
                 return cp(args, returncode=1)
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
@@ -435,8 +447,8 @@ def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None
             # Mimic a resumable compute having pushed changes by writing into the
             # reattach worktree. The local-only finalize path then commits +
             # pushes from there.
-            order.worktree.mkdir(parents=True, exist_ok=True)
-            (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
             return await super().interpret(order, result)
 
     registry = BackendRegistry(WorklinkConfig())
@@ -557,8 +569,8 @@ def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -
     class PersistentWriteBackend(FakeBackend):
         async def interpret(self, order: WorkOrder, result: object) -> RawResult:
             # Mimic a persistent resumable compute having pushed changes.
-            order.worktree.mkdir(parents=True, exist_ok=True)
-            (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
             return await super().interpret(order, result)
 
     registry = BackendRegistry(
@@ -594,19 +606,29 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
     def on_wait() -> None:
         seen["during"] = load_run_state(tmp_path, issue_id)
 
-    # Local/shared-filesystem path: build a worktree dir the backend writes into.
-    worktree = repo / ".worklink" / f"{issue_id}-1"
+    # Local/shared-filesystem path: build an isolated checkout the backend writes into.
+    worktree = repo.parent / ".worklink" / repo.name / f"{issue_id}-1"
 
     class LocalBackend(FakeBackend):
         async def interpret(self, order: WorkOrder, result: object) -> RawResult:
-            order.worktree.mkdir(parents=True, exist_ok=True)
-            (order.worktree / "changed.txt").write_text("hi\n", encoding="utf-8")
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("hi\n", encoding="utf-8")
             return RawResult(0, order.transcript_root / "fake.json", "success", None)
 
     def local_runner(args, *, cwd=None):
         calls.append(args)
         if isinstance(args, str):
             return cp(args, stdout="ok\n")
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            worktree.mkdir(parents=True, exist_ok=True)
+            (worktree / ".git" / "objects" / "info").mkdir(parents=True)
+            return cp(args)
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return cp(args, stdout="abc123\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{worktree}\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{worktree / '.git'}\n")
         if args[:1] == ["chainlink"]:
             if args[1:3] == ["issue", "show"]:
                 return cp(args, stdout=_issue_json(issue_id, ["worklink:in-progress"]))
@@ -614,9 +636,6 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
-            if "worktree" in args and "add" in args:
-                worktree.mkdir(parents=True, exist_ok=True)
-                return cp(args)
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
             if "diff" in args and "--stat" in args:

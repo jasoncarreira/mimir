@@ -15,7 +15,9 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
 from ..forge import ForgeClient, ForgeError, ReviewVerdict
-from ..models import AuthContext, RepoPRAction, RepoPRActionScope
+from ..models import (
+    AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+)
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
@@ -44,18 +46,78 @@ def set_forge_client(client: ForgeClient | None) -> None:
 def _scope(
     runtime: ToolRuntime[AuthContext] | None,
     action: RepoPRAction | None,
+    repository: str,
+    pull_request: int,
 ) -> RepoPRActionScope:
-    context = getattr(runtime, "context", None)
-    scope = getattr(context, "repo_pr_action_scope", None)
-    if not isinstance(scope, RepoPRActionScope):
-        raise ToolException("pull-request operation rejected: no immutable scope")
+    state = resolve_review_state(runtime, repository, pull_request)
+    scope = state.action_scope
     if action is not None and action.value not in scope.allowed_operations:
         raise ToolException(f"pull-request operation rejected: {action.value} not granted")
     return scope
 
 
+def resolve_review_state(
+    runtime: ToolRuntime[AuthContext] | None,
+    repository: str,
+    pull_request: int,
+) -> Any:
+    """Resolve existing narrow authority or derive standing live review authority."""
+    context = getattr(runtime, "context", None)
+    return resolve_review_state_for_context(context, repository, pull_request)
+
+
+def resolve_review_state_for_context(
+    context: AuthContext | None,
+    repository: str,
+    pull_request: int,
+) -> RepoReviewState:
+    """Context-level variant used by authorization before tool invocation."""
+    registry = getattr(context, "repo_pr_scope_registry", None)
+    state = registry.resolve(repository, pull_request) if isinstance(
+        registry, RepoPRScopeRegistry,
+    ) else None
+    if state is not None:
+        return state
+    if (
+        not isinstance(repository, str)
+        or not isinstance(pull_request, int)
+        or isinstance(pull_request, bool)
+        or pull_request < 1
+    ):
+        raise ToolException("pull-request operation rejected: invalid pull-request selector")
+    from ..access_control import (
+        create_server_discovered_review_scope,
+        is_configured_github_repo,
+    )
+
+    if not is_configured_github_repo(repository):
+        raise ToolException(
+            "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
+        )
+    cache = getattr(context, "server_discovered_pr_states", None)
+    cached = cache.resolve(repository, pull_request) if cache is not None else None
+    if cached is not None:
+        return cached
+    client = _client_for_repository(repository)
+    try:
+        snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
+    except ForgeError as exc:
+        raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    scope = create_server_discovered_review_scope(repository, snapshot)
+    if scope is None or scope.pr_number != pull_request:
+        raise ToolException(
+            "pull-request operation rejected: live pull request is closed or invalid"
+        )
+    state = RepoReviewState(scope)
+    return cache.remember(state) if cache is not None else state
+
+
 def _client(scope: RepoPRActionScope) -> ForgeClient:
-    client = _clients.get(scope.canonical_repo.lower()) or _default_client
+    return _client_for_repository(scope.canonical_repo)
+
+
+def _client_for_repository(repository: str) -> ForgeClient:
+    client = _clients.get(repository.lower()) or _default_client
     if client is None:
         from ..forge.github import GitHubForgeClient
 
@@ -95,64 +157,78 @@ def _call(operation: Any) -> Any:
 
 @tool
 def pr_metadata(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read bounded metadata for the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    """Read metadata for an exact pull request authorized by this turn."""
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return asdict(_call(lambda: _client(scope).get_pull_request(scope)))
 
 
 @tool
 def pr_files(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded file projections for the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_files(scope))]
 
 
 @tool
 def pr_diff(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Read the bounded unified diff for the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return _call(lambda: _client(scope).get_diff(scope))
 
 
 @tool
 def pr_checks(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_checks(scope))]
 
 
 @tool
 def pr_reviews(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded submitted-review projections for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_reviews(scope))]
 
 
 @tool
 def pr_comments(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded conversation and inline comments for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_comments(scope))]
 
 
 @tool
 def pr_review_requests(
+    repository: str,
+    pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded pending review requests for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT)
+    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
     return [
         asdict(item)
         for item in _call(lambda: _client(scope).list_review_requests(scope))
@@ -161,25 +237,29 @@ def pr_review_requests(
 
 @tool
 def pr_submit_review(
+    repository: str,
+    pull_request: int,
     verdict: ReviewVerdict,
     body: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Submit one approve, comment, or request-changes review on the bound PR."""
-    scope = _scope(runtime, RepoPRAction.PR_REVIEW)
+    scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).submit_review(scope, verdict, safe_body)))
 
 
 @tool
 def pr_inline_review_comment(
+    repository: str,
+    pull_request: int,
     path: str,
     line: int,
     body: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Add one inline review comment to a right-side line on the bound PR head."""
-    scope = _scope(runtime, RepoPRAction.PR_REVIEW)
+    scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
     if isinstance(line, bool) or not isinstance(line, int) or line < 1 or line > 10_000_000:
         raise ToolException("line must be a positive bounded integer")
     safe_path = _path(path)
@@ -191,22 +271,26 @@ def pr_inline_review_comment(
 
 @tool
 def pr_comment(
+    repository: str,
+    pull_request: int,
     body: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Add one conversation comment to the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.PR_COMMENT)
+    scope = _scope(runtime, RepoPRAction.PR_COMMENT, repository, pull_request)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
 
 
 @tool
 def pr_rerequest_review(
+    repository: str,
+    pull_request: int,
     reviewer: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Re-request one reviewer on the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.PR_REREQUEST)
+    scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
     if _REVIEWER.fullmatch(reviewer) is None:
         raise ToolException("reviewer is invalid")
     _call(lambda: _client(scope).rerequest_review(scope, reviewer))
@@ -267,11 +351,13 @@ def _emit_unsupported(scope: RepoPRActionScope, operation: str) -> bool:
 
 @tool
 def unsupported_operation(
+    repository: str,
+    pull_request: int,
     operation: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Escalate a real bound-PR need not represented by the closed typed API."""
-    scope = _scope(runtime, None)
+    scope = _scope(runtime, None, repository, pull_request)
     if _OPERATION.fullmatch(operation) is None:
         raise ToolException("operation must be a short stable operation name")
     emitted = _emit_unsupported(scope, operation)

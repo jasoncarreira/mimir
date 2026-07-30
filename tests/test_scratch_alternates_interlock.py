@@ -71,7 +71,7 @@ def test_janitor_refuses_to_reclaim_a_borrowed_object_store(tmp_path, monkeypatc
 
 def test_base_fetch_repairs_refs_left_dangling_by_a_reclaimed_alternate(tmp_path):
     """The fetch path recovers from the residue, not just the alternate itself."""
-    from mimir.worklink.worktree import _dangling_refs, _prune_dangling_refs
+    from mimir.worklink.checkout import _dangling_refs, _prune_dangling_refs
 
     def runner(argv):
         return subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -114,7 +114,7 @@ def test_repair_never_deletes_a_local_branch_or_tag(tmp_path):
     case, and caught in review of #1234. A remote-tracking ref under origin is
     different in kind: the next fetch that can see the remote re-creates it.
     """
-    from mimir.worklink.worktree import _prune_dangling_refs
+    from mimir.worklink.checkout import _prune_dangling_refs
 
     def runner(argv):
         return subprocess.run(argv, capture_output=True, text=True, timeout=60)

@@ -103,7 +103,7 @@ you already rely on are contained-by-construction:
   `shell`, or a provenance-tagged **memory write** to the recallable store
   (§5.3). These are bounded because the *destination* is bounded — the content
   driving them can't reach beyond it.
-- **Code work** = `worklink_run`. It has an isolated Git worktree
+- **Code work** = `worklink_run`. It has an isolated Git clone checkout
   (`create_isolated_checkout`), `observe_evidence` diff/test validation, and a
   reviewed-PR-only durable output — so its **git/review blast radius** is
   bounded. This is safe for **trusted** code work (a known contributor's PR,
@@ -117,11 +117,11 @@ you already rely on are contained-by-construction:
 >   whose only confinement is `spawn_workspace`
 >   (`_target_within_configured_write_roots` = **all of `MIMIR_HOME` + configured
 >   RW roots**), with no read-only guard and no PR postcondition.
-> - `worklink_run`'s worktree is only a **`cwd`**, not a sandbox. Its compute
+> - `worklink_run`'s checkout is only a **`cwd`**, not a sandbox. Its compute
 >   (`LocalSubprocessComputeBackend`) reports `shared_filesystem=True,
 >   network_isolated=False` and launches the CLI with `HOME` + provider creds —
->   so the child can **write outside the worktree and reach the network freely**;
->   the diff-review only inspects the *worktree's* git diff, not process side
+>   so the child can **write outside the checkout and reach the network freely**;
+>   the diff-review only inspects the checkout's git diff, not process side
 >   effects. (The registry already flags this "unsafe by caps.")
 >
 > So **neither `worklink_run` nor `spawn_*` may run untrusted code.** Untrusted
@@ -257,7 +257,7 @@ obtain this reduction.
 | Trigger | Capability set (the ceiling) | Trust / gating |
 |---|---|---|
 | **Operator / user turn** | full (subject to admin tier) | operator's typed input is trusted; untrusted content read mid-turn is tainted → can't drive Unbounded sinks without one-use approval |
-| **GitHub poller** | `worklink_run` (worktree + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
+| **GitHub poller** | `worklink_run` (isolated checkout + reviewed PR), scoped file/edit, read-only shell, `send_message` | **known contributor** (collaborator / org member) → trusted → full code-work; **unknown author, or any comment by a non-contributor** → untrusted → **notify the operator only**, no autonomous action (operator then directs the agent) |
 | **Research / RSS poller** | write memory (create atom + feedback/credit), scoped state file, scoped wiki, `send_message` — **no `fetch_url`, no `spawn`** | ingested web content is untrusted, but the capability set contains **no Unbounded sink**, so it is safe regardless — no per-author gating needed |
 | **Heartbeat** | near-full incl. `fetch_url` from an **approved exact-URL set** and `web_search` through its fixed service | internally triggered → trusted. Destination-safe egress is taint-independent, but fetched content is always untrusted active ingest. Non-approved destinations are blocked; redirects are re-checked per hop; allowlist = exact URLs, not host wildcards (§5.4). |
 | **Session-boundary turn** | session-boundary writes | internal → trusted |
@@ -638,7 +638,7 @@ application gate can enforce — so this enablement scopes the two separately:
 ### 5.5 GitHub poller code work → Worklink only; the `spawn_*` isolation contract
 
 All GitHub-poller code work — greenfield **and** "update/test from an existing
-review" — routes through **`worklink_run`** (isolated worktree, `observe_evidence`
+review" — routes through **`worklink_run`** (isolated checkout, `observe_evidence`
 diff/test validation, reviewed-PR-only durable output). Generic `spawn_*` is
 **not** used for poller code work, because it is not contained (§2/§3).
 
@@ -695,7 +695,7 @@ this section as current evidence for an enablement decision.
 These controls are **defense-in-depth for trusted code work only**, not an OS
 sandbox or a boundary for hostile payloads. File-tool path checks do not revoke
 the authority of an allowed command; command arguments can still read or write
-outside the worktree and reach the network. That residual is accepted only
+outside the checkout and reach the network. That residual is accepted only
 because Worklink is trusted-code-only. Untrusted code work remains notify-only
 and requires the future isolated-compute substrate before it may execute.
 
@@ -827,7 +827,7 @@ descending portability:
   Fargate-native way to close the network dimension.
 - **Optional, where the kernel allows (unprivileged, no namespaces):** a
   process-installed **seccomp** filter (block socket syscalls) and/or **Landlock**
-  (self-restrict writes to the worktree). Kernel-support-dependent under Fargate,
+  (self-restrict writes to the checkout). Kernel-support-dependent under Fargate,
   so defense-in-depth, not the primary control.
 - **Credential/env minimization:** no `HOME`/provider creds to the child.
 
