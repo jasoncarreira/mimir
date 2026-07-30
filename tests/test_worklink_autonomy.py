@@ -23,6 +23,15 @@ import pytest
 
 from mimir.worklink import autonomy
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.dispatch_failures import (
+    failure_state_transaction,
+    load_failure_state,
+    mark_failure_notified,
+    pending_failure_alerts,
+    record_failure,
+    record_success,
+    save_failure_state,
+)
 
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
@@ -992,6 +1001,177 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     assert dispatched[0]["issue_id"] == 201  # lowest id first
     scan = [e for e in events if e.get("signal") == "worklink_ready_scan"][-1]
     assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
+
+
+def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = tmp_path / "state"
+    log_path = state_dir / "run-201.log"
+    chainlink = _fake_chainlink_script(tmp_path, ready=[201], active_locks=[])
+    runbin = _fake_run_bin(tmp_path)
+    env = {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(chainlink),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(runbin),
+        "WORKLINK_REPO": str(repo),
+        "WORKLINK_MAX_CONCURRENT": "1",
+        "STATE_DIR": str(state_dir),
+    }
+    record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: bad config token=top-secret",
+        log_path=str(log_path),
+    )
+
+    first = _run_poller(tmp_path, env)
+    alerts = [e for e in first if e.get("signal") == "worklink_run_failure_escalated"]
+    assert len(alerts) == 1
+    assert alerts[0]["issue_id"] == 201
+    assert alerts[0]["log"] == str(log_path)
+    assert alerts[0]["terminal_error"] == "ValueError: bad config token=[REDACTED]"
+    assert alerts[0]["source_id"].endswith(alerts[0]["error_signature"])
+    assert not [e for e in first if e.get("signal") == "worklink_dispatched"]
+
+    second = _run_poller(tmp_path, env)
+    assert not [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
+    assert not [e for e in second if e.get("signal") == "worklink_dispatched"]
+
+    record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="RuntimeError: a distinct failure",
+        log_path=str(log_path),
+    )
+    distinct = _run_poller(tmp_path, env)
+    distinct_alerts = [
+        e for e in distinct if e.get("signal") == "worklink_run_failure_escalated"
+    ]
+    assert len(distinct_alerts) == 1
+    assert distinct_alerts[0]["terminal_error"] == "RuntimeError: a distinct failure"
+
+    state = load_failure_state(state_dir)
+    state["issues"]["201"]["retry_after"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    save_failure_state(state_dir, state)
+    recovered = _run_poller(tmp_path, env)
+    assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+
+
+def test_failure_alert_is_not_deduped_until_delivery_is_recorded(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+
+    first_backoff, first_alerts = pending_failure_alerts(state_dir)
+    second_backoff, second_alerts = pending_failure_alerts(state_dir)
+    assert first_backoff == second_backoff == {201}
+    assert len(first_alerts) == len(second_alerts) == 1
+
+    mark_failure_notified(
+        state_dir, 201, entry["signature"], entry["occurrence_id"]
+    )
+    _, delivered_alerts = pending_failure_alerts(state_dir)
+    assert delivered_alerts == []
+
+
+def test_transient_preclaim_git_contention_does_not_enter_backoff(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error=(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists.\n"
+            "Another git process seems to be running in this repository."
+        ),
+        log_path=None,
+    )
+
+    assert entry["transient_contention"] is True
+    assert load_failure_state(state_dir)["issues"] == {}
+
+
+def test_stale_delivery_ack_does_not_suppress_new_same_signature_failure(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    first = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+    record_success(state_dir, 201)
+    second = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+
+    mark_failure_notified(
+        state_dir, 201, first["signature"], first["occurrence_id"]
+    )
+
+    assert first["occurrence_id"] != second["occurrence_id"]
+    _, alerts = pending_failure_alerts(state_dir)
+    assert len(alerts) == 1
+    assert alerts[0]["failure_occurrence_id"] == second["occurrence_id"]
+
+
+def test_failure_transaction_does_not_persist_partial_mutation(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    save_failure_state(state_dir, {"version": 1, "issues": {}})
+
+    with pytest.raises(RuntimeError, match="abort mutation"):
+        with failure_state_transaction(state_dir) as state:
+            state["issues"]["201"] = {"active": True}
+            raise RuntimeError("abort mutation")
+
+    assert load_failure_state(state_dir)["issues"] == {}
+
+
+def test_record_success_clears_active_failure_and_notification_history(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    entry = record_failure(
+        state_dir,
+        issue_id=201,
+        attempt=None,
+        exit_status=1,
+        error="ValueError: persistent config failure",
+        log_path=None,
+    )
+    mark_failure_notified(
+        state_dir, 201, entry["signature"], entry["occurrence_id"]
+    )
+
+    record_success(state_dir, 201)
+
+    cleared = load_failure_state(state_dir)["issues"]["201"]
+    assert cleared["active"] is False
+    assert cleared["consecutive"] == 0
+    assert cleared["notified_signatures"] == []
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")

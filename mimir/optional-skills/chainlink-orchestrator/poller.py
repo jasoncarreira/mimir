@@ -118,6 +118,7 @@ from mimir.worklink.backends.feature_factory import (
 )
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.continuation import consume_worklink_budget_continuations
+from mimir.worklink.dispatch_failures import mark_failure_notified, pending_failure_alerts
 
 POLLER_NAME = os.environ.get("POLLER_NAME", "worklink-ready-queue")
 LIFECYCLE_RECONCILIATION_NAME = "worklink-lifecycle-reconciliation"
@@ -974,6 +975,23 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        backed_off_ids, failure_alerts = pending_failure_alerts(state_dir)
+        for alert in failure_alerts:
+            _emit(alert)
+            mark_failure_notified(
+                state_dir,
+                int(alert["issue_id"]),
+                str(alert["error_signature"]),
+                str(alert["failure_occurrence_id"]),
+            )
+    except OSError as exc:
+        backed_off_ids = set()
+        _emit({
+            "signal": "worklink_dispatch_failure_state_error",
+            "reason": str(exc),
+        })
+
+    try:
         continuation_actions = consume_worklink_budget_continuations(home)
         for action in continuation_actions:
             _emit({
@@ -1035,11 +1053,12 @@ def main() -> int:
         })
         return 0
     ready, labeled_ready_count, blocked_ready_count, actionable_epic_count = ready_result
+    dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
     cap = _configured_cap(home)
     active = len(active_lock_ids)
     slots = max(0, cap - active)
 
-    if not ready or slots == 0:
+    if not dispatch_ready or slots == 0:
         _emit({
             "signal": "worklink_ready_scan",
             "ready_count": len(ready),
@@ -1049,6 +1068,7 @@ def main() -> int:
             "active": active,
             "cap": cap,
             "slots": slots,
+            "backed_off": len(ready) - len(dispatch_ready),
         })
         return 0
 
@@ -1066,7 +1086,7 @@ def main() -> int:
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
 
     dispatched = 0
-    for item in ready[:slots]:
+    for item in dispatch_ready[:slots]:
         issue_id = item.issue_id
         argv = [*run_bin, "worklink", item.command, str(issue_id),
                 "--home", str(home), "--repo", repo, "--autonomous"]
@@ -1079,6 +1099,11 @@ def main() -> int:
             subprocess.Popen(
                 argv,
                 cwd=repo,
+                env={
+                    **os.environ,
+                    "STATE_DIR": str(state_dir),
+                    "WORKLINK_RUN_LOG": str(log_path),
+                },
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
@@ -1112,6 +1137,7 @@ def main() -> int:
         "active": active,
         "cap": cap,
         "dispatched": dispatched,
+        "backed_off": len(ready) - len(dispatch_ready),
     })
     return 0
 
