@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -2357,6 +2358,57 @@ async def test_middleware_emits_tool_error_for_budget_denial(
     assert len(denied_errors) == 1
     assert denied_errors[0]["tool"] == "shell_exec"
     assert denied_errors[0]["paired_tool_call"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
+    middleware = BudgetGateMiddleware()
+    calls: list[str] = []
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        if request.tool_call["id"] == "refused":
+            raise ToolException(
+                "query must be non-empty text; for example, query='release status'"
+            )
+        return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
+
+    ctx = _make_ctx(budget=5)
+    token = set_current_turn(ctx)
+    try:
+        refusal = await middleware.awrap_tool_call(
+            _make_request("memory_query", "refused"), handler,
+        )
+        adapted = await middleware.awrap_tool_call(
+            _make_request("memory_query", "adapted"), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert isinstance(refusal, ToolMessage)
+    assert refusal.status == "error"
+    assert "query must be" in str(refusal.content)
+    assert adapted.content == "adapted"
+    assert calls == ["refused", "adapted"]
+    assert ctx.tool_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_unexpected_tool_fault_still_fails_the_turn_boundary() -> None:
+    middleware = BudgetGateMiddleware()
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        raise RuntimeError("internal invariant broke")
+
+    ctx = _make_ctx()
+    token = set_current_turn(ctx)
+    try:
+        with pytest.raises(RuntimeError, match="internal invariant broke"):
+            await middleware.awrap_tool_call(
+                _make_request("memory_query", "fault"), handler,
+            )
+    finally:
+        reset_current_turn(token)
 
 
 def test_admin_sensitive_tool_matches_mcp_name_variants():

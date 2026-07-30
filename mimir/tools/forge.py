@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import threading
+import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -15,14 +17,17 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
 from ..forge import ForgeClient, ForgeError, ReviewVerdict
+from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
 )
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
-_OPERATION = re.compile(r"[a-z][a-z0-9_.:-]{0,127}")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_ESCALATION_DESCRIPTION_MAX_BYTES = 4_096
+_ESCALATION_ATTEMPT_MAX_BYTES = 512
+_ESCALATION_MAX_ATTEMPTS = 16
 _clients: dict[str, ForgeClient] = {}
 _default_client: ForgeClient | None = None
 _escalation_lock = threading.Lock()
@@ -84,7 +89,10 @@ def resolve_review_state_for_context(
         or isinstance(pull_request, bool)
         or pull_request < 1
     ):
-        raise ToolException("pull-request operation rejected: invalid pull-request selector")
+        raise ToolException(
+            "pull-request operation rejected: repository must be text and pull_request "
+            "must be a positive integer; for example, repository='owner/repo', pull_request=17"
+        )
     from ..access_control import (
         create_server_discovered_review_scope,
         is_configured_github_repo,
@@ -127,11 +135,16 @@ def _client_for_repository(repository: str) -> ForgeClient:
 
 def _body(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ToolException("body must be non-empty text")
+        raise ToolException("body must be non-empty text; for example, body='Looks good'")
     if len(value.encode("utf-8")) > _BODY_MAX_BYTES:
-        raise ToolException("body exceeds 65536-byte limit")
+        raise ToolException(
+            "body must be non-empty text within the 65536-byte UTF-8 limit; "
+            "for example, body='Looks good'"
+        )
     if "\x00" in value:
-        raise ToolException("body contains a prohibited null byte")
+        raise ToolException(
+            "body must contain text without null bytes; for example, body='Looks good'"
+        )
     return value
 
 
@@ -144,7 +157,10 @@ def _path(value: str) -> str:
         or ".." in path.parts
         or any(ord(character) < 32 for character in value)
     ):
-        raise ToolException("path must be a bounded relative repository path")
+        raise ToolException(
+            "path must be a relative repository path without '..' or control characters, "
+            "at most 4096 UTF-8 bytes; for example, path='src/app.py'"
+        )
     return value
 
 
@@ -261,7 +277,9 @@ def pr_inline_review_comment(
     """Add one inline review comment to a right-side line on the bound PR head."""
     scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
     if isinstance(line, bool) or not isinstance(line, int) or line < 1 or line > 10_000_000:
-        raise ToolException("line must be a positive bounded integer")
+        raise ToolException(
+            "line must be an integer from 1 through 10000000; for example, line=42"
+        )
     safe_path = _path(path)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).add_inline_review_comment(
@@ -292,7 +310,10 @@ def pr_rerequest_review(
     """Re-request one reviewer on the pull request bound to this turn."""
     scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
     if _REVIEWER.fullmatch(reviewer) is None:
-        raise ToolException("reviewer is invalid")
+        raise ToolException(
+            "reviewer must be a 1-39 character GitHub login containing letters, digits, "
+            "or hyphens; for example, reviewer='octocat'"
+        )
     _call(lambda: _client(scope).rerequest_review(scope, reviewer))
     return {"status": "review_rerequested", "reviewer": reviewer}
 
@@ -304,7 +325,53 @@ def _escalation_state_path() -> Path:
     return Path(home).resolve() / "state" / "unsupported_operations.json"
 
 
-def _emit_unsupported(scope: RepoPRActionScope, operation: str) -> bool:
+def _bounded_escalation_text(value: Any, *, fallback: str, max_bytes: int) -> str:
+    """Normalize untrusted prose into bounded, single-line operator-visible text."""
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value[: max_bytes * 2]
+    else:
+        text = str(value)[: max_bytes * 2]
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(" " if unicodedata.category(char).startswith("C") else char for char in text)
+    text = redact_text(" ".join(text.split())) or fallback
+    encoded = text.encode("utf-8")
+    if len(encoded) > max_bytes:
+        text = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+    return text or fallback
+
+
+def _normalize_attempts(value: Any) -> list[str]:
+    if value is None:
+        candidates: list[Any] = []
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        candidates = list(value)[:_ESCALATION_MAX_ATTEMPTS]
+    else:
+        candidates = [value]
+    return [
+        _bounded_escalation_text(
+            candidate,
+            fallback="unspecified attempt",
+            max_bytes=_ESCALATION_ATTEMPT_MAX_BYTES,
+        )
+        for candidate in candidates
+    ]
+
+
+def _operation_key(description: str) -> str:
+    words = re.findall(r"[a-z0-9]+", description.lower())
+    prefix = "_".join(words[:6])[:64].strip("_") or "unspecified_operation"
+    digest = hashlib.sha256(description.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}:{digest}"
+
+
+def _emit_unsupported(
+    scope: RepoPRActionScope,
+    operation: str,
+    description: str,
+    attempted_operations: list[str],
+) -> bool:
     key = f"{scope.scope_id}:{operation}"
     state_path = _escalation_state_path()
     with _escalation_lock:
@@ -325,6 +392,8 @@ def _emit_unsupported(scope: RepoPRActionScope, operation: str) -> bool:
                 repository=scope.canonical_repo,
                 pull_request=scope.pr_number,
                 operation=operation,
+                description=description,
+                attempted_operations=attempted_operations,
                 scope_id=scope.scope_id,
                 operator_visible=True,
             )
@@ -353,20 +422,28 @@ def _emit_unsupported(scope: RepoPRActionScope, operation: str) -> bool:
 def unsupported_operation(
     repository: str,
     pull_request: int,
-    operation: str,
+    description: Any = None,
+    attempted_operations: Any = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Escalate a real bound-PR need not represented by the closed typed API."""
+    """Escalate a bound-PR need in prose, including operations already attempted."""
     scope = _scope(runtime, None, repository, pull_request)
-    if _OPERATION.fullmatch(operation) is None:
-        raise ToolException("operation must be a short stable operation name")
-    emitted = _emit_unsupported(scope, operation)
+    safe_description = _bounded_escalation_text(
+        description,
+        fallback="The caller did not provide a description of the unsupported operation.",
+        max_bytes=_ESCALATION_DESCRIPTION_MAX_BYTES,
+    )
+    safe_attempts = _normalize_attempts(attempted_operations)
+    operation = _operation_key(safe_description)
+    emitted = _emit_unsupported(scope, operation, safe_description, safe_attempts)
     return {
         "status": "unsupported_operation",
         "escalated": emitted,
         "repository": scope.canonical_repo,
         "pull_request": scope.pr_number,
         "operation": operation,
+        "description": safe_description,
+        "attempted_operations": safe_attempts,
     }
 
 

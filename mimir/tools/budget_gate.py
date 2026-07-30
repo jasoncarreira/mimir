@@ -1128,6 +1128,16 @@ def _result_error_text(result: ToolMessage | Command) -> str | None:
     return text[:500] if text else None
 
 
+def _tool_refusal_message(request: ToolCallRequest, tool_name: str, exc: ToolException) -> ToolMessage:
+    """Return an explicit tool refusal to the model without masking faults."""
+    return ToolMessage(
+        content=str(exc),
+        tool_call_id=_tool_call_id(request),
+        name=tool_name,
+        status="error",
+    )
+
+
 def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     """Return a prohibition message if this bash call is prohibited, else None."""
     if not is_bash_tool(tool_name):
@@ -1348,6 +1358,20 @@ class BudgetGateMiddleware(AgentMiddleware):
             fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
             result = handler(execution_request)
+        except ToolException as exc:
+            end_protected_result_capture(capture_token)
+            result_labels = _result_labels_for_call(
+                tool_name, request, auth_context, authorization, failed=True,
+            )
+            _merge_result_labels(auth_context, result_labels)
+            _emit_tool_call_sync(
+                tool_name,
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error=str(exc),
+                denied=True,
+            )
+            return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
             end_protected_result_capture(capture_token)
             result_labels = _result_labels_for_call(
@@ -1579,6 +1603,20 @@ class BudgetGateMiddleware(AgentMiddleware):
             fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
             result = await handler(execution_request)
+        except ToolException as exc:
+            end_protected_result_capture(capture_token)
+            result_labels = _result_labels_for_call(
+                tool_name, request, auth_context, authorization, failed=True,
+            )
+            _merge_result_labels(auth_context, result_labels)
+            _emit_tool_call_sync(
+                tool_name,
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000.0,
+                error=str(exc),
+                denied=True,
+            )
+            return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
             end_protected_result_capture(capture_token)
             result_labels = _result_labels_for_call(
