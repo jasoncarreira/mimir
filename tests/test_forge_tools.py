@@ -223,6 +223,26 @@ def test_read_uses_only_immutable_scope_target() -> None:
     assert client.calls == [("metadata", scope)]
 
 
+def test_review_scope_cannot_rerequest_review() -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    scope = _scope(RepoPRAction.INSPECT, RepoPRAction.PR_REVIEW)
+    runtime = _runtime(scope)
+
+    authorization = access_control.ToolRegistry().authorize_tool(
+        "pr_rerequest_review", runtime.context, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 17},
+    )
+    assert authorization.allowed is False
+    assert authorization.reason == "repo_pr_scope_denied"
+    with pytest.raises(ToolException, match="pr.rerequest not granted"):
+        pr_rerequest_review.func(
+            repository="owner/repo", pull_request=17, reviewer="reviewer",
+            runtime=runtime,
+        )
+    assert client.calls == []
+
+
 def test_batched_turn_resolves_each_exact_existing_scope() -> None:
     client = FakeForge()
     set_forge_client(client)

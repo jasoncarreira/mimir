@@ -5369,11 +5369,6 @@ class ToolRegistry:
                     and (
                         required_action is None
                         or required_action in getattr(scope, "allowed_operations", frozenset())
-                        or (
-                            tool_name == "pr_rerequest_review"
-                            and RepoPRAction.PR_REVIEW.value
-                            in getattr(scope, "allowed_operations", frozenset())
-                        )
                     )
                 )
                 allowed = in_scope or not enforce

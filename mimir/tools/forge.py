@@ -290,10 +290,7 @@ def pr_rerequest_review(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Re-request one reviewer on the pull request bound to this turn."""
-    scope = _scope(runtime, None, repository, pull_request)
-    if not ({RepoPRAction.PR_REVIEW.value, RepoPRAction.PR_REREQUEST.value}
-            & scope.allowed_operations):
-        raise ToolException("pull-request operation rejected: review rerequest not granted")
+    scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
     if _REVIEWER.fullmatch(reviewer) is None:
         raise ToolException("reviewer is invalid")
     _call(lambda: _client(scope).rerequest_review(scope, reviewer))
