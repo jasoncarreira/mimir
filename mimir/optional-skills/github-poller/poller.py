@@ -394,6 +394,34 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
 }
 
 
+#: Mimir's canonical env-boolean alphabet, mirroring ``_ENV_BOOL_TRUTHY`` /
+#: ``_ENV_BOOL_FALSY`` in ``mimir/config.py``. It is duplicated rather than
+#: imported because this poller must run under an interpreter that cannot import
+#: ``mimir`` at all (see tests/test_optional_skill_poller_entrypoints.py). A
+#: duplicated parser is exactly the kind of second copy that drifts, so
+#: tests/test_github_poller_prompt.py compares both sets against
+#: ``mimir.config`` whenever it IS importable and fails if they diverge.
+_ENV_TRUTHY = frozenset({"1", "true", "yes", "on", "y"})
+_ENV_FALSY = frozenset({"0", "false", "no", "off", "n"})
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read one env var with Mimir's canonical boolean semantics.
+
+    Unset, empty, and unrecognised values all return *default*, matching
+    ``config._env_bool`` so a typo cannot silently flip the flag.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _ENV_TRUTHY:
+        return True
+    if normalized in _ENV_FALSY:
+        return False
+    return default
+
+
 def _verification_guidance() -> str:
     """How a remediation turn should verify its fix, given this deployment.
 
@@ -405,8 +433,7 @@ def _verification_guidance() -> str:
     runner ``worklink.yaml`` configures, and only pytest-style runners accept
     that form.
     """
-    enabled = os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower()
-    if enabled not in ("1", "true", "yes"):
+    if not _env_flag("MIMIR_CODING_ENABLED"):
         return (
             "verify the fix with whatever this deployment provides, and do not "
             "present changes as verified if you could not run its tests — say "
@@ -492,8 +519,7 @@ def _emit(prompt: str, **extras: object) -> None:
         if isinstance(related_comment, str) and related_comment:
             prompt = f"{prompt}\n\nRelated PR comment:\n{related_comment}"
         prompt = prompt + _REVIEW_SUBMISSION_RULE
-        preload = os.environ.get("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "").strip().lower()
-        if preload in ("1", "true", "yes"):
+        if _env_flag("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL"):
             body = _load_review_skill_body(
                 os.environ.get("MIMIR_HOME", ""),
                 os.environ.get("MIMIR_GITHUB_REVIEW_SKILL_PATH", ""),

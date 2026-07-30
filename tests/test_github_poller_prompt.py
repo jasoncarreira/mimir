@@ -35,15 +35,51 @@ def poller():
 
 
 def test_guidance_names_repo_test_only_when_coding_is_enabled(poller, monkeypatch):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
-    enabled = poller._verification_guidance()
-    assert "repo_test" in enabled
+    # Every truthy spelling registers the coding tools, so every one of them
+    # must also advertise repo_test. `on` and `y` are the two that a narrower
+    # 1/true/yes check silently got wrong.
+    for value in ("1", "true", "yes", "on", "y", "TRUE", "On", " yes "):
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
+        assert "repo_test" in poller._verification_guidance(), value
 
-    # The tool is registered only under the flag, and the flag defaults to
-    # false, so every other value must not advertise it.
-    for value in ("", "false", "0", "no", "FALSE"):
+    # ...and no falsy spelling may, since the tool is not registered.
+    for value in ("", "false", "0", "no", "FALSE", "off", "n", "Off"):
         monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
         assert "repo_test" not in poller._verification_guidance(), value
+
+    # An unrecognised value must fall back to the default rather than guess.
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "maybe")
+    assert "repo_test" not in poller._verification_guidance()
+
+
+def test_env_flag_alphabet_matches_mimir_config(poller):
+    """The duplicated boolean parser must not drift from the canonical one.
+
+    ``poller.py`` cannot import ``mimir`` in production, so the alphabet is
+    copied. This test runs where ``mimir`` IS importable and fails if the copy
+    diverges — which is how the `on`/`y` gap was found in the first place.
+    """
+    from mimir.config import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY
+
+    assert poller._ENV_TRUTHY == _ENV_BOOL_TRUTHY
+    assert poller._ENV_FALSY == _ENV_BOOL_FALSY
+
+
+def test_env_flag_agrees_with_config_env_bool(poller, monkeypatch):
+    """Same inputs, same answer — compared against the canonical parser."""
+    from mimir.config import _env_bool
+
+    for value in ("1", "true", "yes", "on", "y", "0", "false", "no", "off",
+                  "n", "", "  TRUE  ", "maybe", "2"):
+        monkeypatch.setenv("MIMIR_FLAG_UNDER_TEST", value)
+        for default in (False, True):
+            assert poller._env_flag("MIMIR_FLAG_UNDER_TEST", default) == _env_bool(
+                "MIMIR_FLAG_UNDER_TEST", default
+            ), (value, default)
+
+    monkeypatch.delenv("MIMIR_FLAG_UNDER_TEST", raising=False)
+    for default in (False, True):
+        assert poller._env_flag("MIMIR_FLAG_UNDER_TEST", default) is default
 
 
 def test_guidance_absent_flag_behaves_as_disabled(poller, monkeypatch):
