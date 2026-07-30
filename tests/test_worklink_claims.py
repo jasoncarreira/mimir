@@ -419,7 +419,7 @@ def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, c
             attempt=1,
             backend="codex",
             branch="issue/200-a1",
-            worktree=str(tmp_path / ".worklink" / "200-1"),
+            checkout=str(tmp_path / ".worklink" / "200-1"),
             started_at="2026-07-13T10:00:00+00:00",
             finished_at="2026-07-13T10:05:00+00:00",
             files_changed=["mimir/example.py"],

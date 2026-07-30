@@ -3,7 +3,7 @@
 Tool backends decide *what* backend should build a Worklink issue. Compute
 backends decide *where* that work unit runs.  After the #832 substrate
 cleanup, ``local_subprocess`` is the sole Worklink compute substrate: the
-backend runs as a local subprocess in the per-issue worktree, with the
+backend runs as a local subprocess in the per-issue checkout, with the
 shared-filesystem capabilities and (for autonomous dispatch) the explicit
 opt-in gate that the rest of the executor already enforces.
 """
@@ -34,7 +34,7 @@ class WorkSpec:
 
     The durable handoff is git-shaped: a worker can clone ``repo_url``, check out
     ``base_ref``/``branch``, run ``backend`` with ``prompt``/``rules``, execute
-    ``test_command``, and push evidence. ``local_worktree`` and ``local_argv``
+    ``test_command``, and push evidence. ``local_checkout`` and ``local_argv``
     are compatibility pointers used only by the ``local_subprocess`` substrate
     for today's manual in-container runs.
     """
@@ -52,7 +52,7 @@ class WorkSpec:
     creds_ref: Mapping[str, str] = field(default_factory=dict)
     env: Mapping[str, str] = field(default_factory=dict)
     backend_config: Mapping[str, Any] = field(default_factory=dict)
-    local_worktree: Path | None = None
+    local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
 
 
@@ -191,8 +191,8 @@ class LocalSubprocessComputeBackend:
         )
 
     async def launch(self, spec: WorkSpec) -> LaunchHandle:
-        if spec.local_worktree is None:
-            raise ComputeLaunchError("local_subprocess requires spec.local_worktree")
+        if spec.local_checkout is None:
+            raise ComputeLaunchError("local_subprocess requires spec.local_checkout")
         if spec.local_argv is None:
             raise ComputeLaunchError("local_subprocess requires spec.local_argv")
         if isinstance(spec.local_argv, (str, bytes)):
@@ -207,7 +207,7 @@ class LocalSubprocessComputeBackend:
         # MIMIR_API_KEY, ...) are NEVER passed. This was inert while docker was
         # the only autonomous substrate (creds arrived via broker policy) and
         # local_subprocess was operator-CLI-only (full env inherited); the
-        # opencode-on-worktrees pivot makes it the live path. ``spec.env`` (the
+        # opencode-on-checkouts pivot makes it the live path. ``spec.env`` (the
         # orchestrator's per-run vars, e.g. MIMIR_HOME) wins over the passthrough.
         env = _local_child_env()
         env.update(spec.env)
@@ -216,7 +216,7 @@ class LocalSubprocessComputeBackend:
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(spec.local_worktree),
+                cwd=str(spec.local_checkout),
                 env=env,
                 start_new_session=True,
             )

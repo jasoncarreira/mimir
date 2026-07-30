@@ -69,7 +69,7 @@ class WorklinkDefaults:
     test_command: str = "uv run pytest -q"
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
-    # Branch that attempt worktrees are cut from and that leaf PRs target. Point
+    # Branch that attempt checkouts are cut from and that leaf PRs target. Point
     # it at a long-running integration/feature branch to stack Worklink leaves
     # there instead of opening every PR straight against main.
     base_branch: str = "main"

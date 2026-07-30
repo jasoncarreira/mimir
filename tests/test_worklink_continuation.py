@@ -602,6 +602,33 @@ def test_untrusted_hints_do_not_drive_comment_or_path_inspection(tmp_path: Path)
     assert all(str(escape) not in " ".join(argv) for argv, _cwd in runner.calls)
 
 
+def test_evidence_checkout_reader_accepts_legacy_key_and_prefers_new_key(tmp_path: Path) -> None:
+    from mimir.worklink.continuation import _load_evidence_records
+
+    home = tmp_path / "home"
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    legacy_checkout = tmp_path / "legacy"
+    current_checkout = tmp_path / "current"
+    legacy_checkout.mkdir()
+    current_checkout.mkdir()
+
+    (evidence_dir / "740-1.json").write_text(
+        json.dumps({"worktree": str(legacy_checkout)}), encoding="utf-8"
+    )
+    (evidence_dir / "740-2.json").write_text(
+        json.dumps({"checkout": str(current_checkout), "worktree": str(legacy_checkout)}),
+        encoding="utf-8",
+    )
+
+    records = _load_evidence_records(home, 740)
+
+    assert [record.checkout for record in records] == [
+        legacy_checkout.resolve(),
+        current_checkout.resolve(),
+    ]
+
+
 def test_external_comment_schema_is_allowlisted_and_redacted(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

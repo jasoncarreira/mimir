@@ -3310,7 +3310,7 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         return [Rec(844)]
 
     monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
-    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_worktrees_for_home", fake_prune)
+    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", fake_prune)
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", fake_close)
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
@@ -3340,7 +3340,7 @@ async def test_worklink_reaper_job_silent_when_nothing_reaped(
         return True
 
     monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", lambda home: [])
-    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_worktrees_for_home", lambda home: [])
+    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
     monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True

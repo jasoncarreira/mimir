@@ -22,7 +22,7 @@ from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
 from mimir.worklink.compute import WorkSpec
-from mimir.worklink.worktree import WorktreeLease
+from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
@@ -100,13 +100,13 @@ class FakeBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            local_worktree=order.worktree,
+            local_checkout=order.checkout,
         )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         self.orders.append(order)
         if self.write_change:
-            (order.worktree / "changed.txt").write_text("hello\n", encoding="utf-8")
+            (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
         return RawResult(
             0 if self.status == "success" else 1,
             order.transcript_root / "fake.json",
@@ -183,13 +183,13 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
                 timeout_s=order.timeout_s,
                 env=order.env,
                 backend_config={"bin": "fake-tool", "args": []},
-                local_worktree=order.worktree,
+                local_checkout=order.checkout,
             )
 
         async def interpret(self, order: WorkOrder, result: object) -> RawResult:
             self.orders.append(order)
             assert isinstance(result, ComputeResult)
-            (order.worktree / "changed.txt").write_text(result.stdout + "\n", encoding="utf-8")
+            (order.checkout / "changed.txt").write_text(result.stdout + "\n", encoding="utf-8")
             return RawResult(result.exit_code, order.transcript_root / "fake.json", "success", None)
 
 
@@ -212,7 +212,7 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.specs[0].repo_url == "git@github.com:jasoncarreira/mimir.git"
     assert compute.specs[0].base_ref == "main"
     assert compute.specs[0].test_command == "echo ok"
-    assert compute.specs[0].local_worktree == worktree
+    assert compute.specs[0].local_checkout == worktree
     assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
     assert compute.cleaned == [compute.specs[0]]
 
@@ -980,7 +980,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
         registry.register(FakeBackend())
         backend_name = "fake"
     backend = registry.get(backend_name)
-    lease = WorktreeLease(
+    lease = CheckoutLease(
         issue_id=517,
         attempt=2,
         repo=tmp_path,
@@ -991,7 +991,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
     )
     calls: list[tuple[Path, dict[str, object]]] = []
 
-    def create_checkout(repo: Path, **kwargs: object) -> WorktreeLease:
+    def create_checkout(repo: Path, **kwargs: object) -> CheckoutLease:
         calls.append((repo, kwargs))
         return lease
 
@@ -1094,8 +1094,8 @@ def test_concurrent_opencode_checkouts_do_not_share_parent_git_project(tmp_path:
         ).stdout.strip() == str(origin)
 
 
-def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _with_outside_worktree_detection
+def test_outside_checkout_detection_marks_root_leak_failed(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _with_outside_checkout_detection
 
     validation = EvidenceValidation(
         status="failed",
@@ -1106,7 +1106,7 @@ def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> No
             attempt=1,
             backend="codex",
             branch="issue/517-a1",
-            worktree=str(tmp_path / ".worklink" / "517-1"),
+            checkout=str(tmp_path / ".worklink" / "517-1"),
             started_at="2026-06-16T20:00:00+00:00",
             finished_at="2026-06-16T20:05:00+00:00",
             files_changed=[],
@@ -1121,23 +1121,23 @@ def test_outside_worktree_detection_marks_root_leak_failed(tmp_path: Path) -> No
     def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args, 0, stdout=" M mimir/identities.py\n?? scratch.txt\n", stderr="")
 
-    result = _with_outside_worktree_detection(
+    result = _with_outside_checkout_detection(
         validation,
         issue=517,
         attempt=1,
         root=tmp_path,
-        worktree=tmp_path / ".worklink" / "517-1",
+        checkout=tmp_path / ".worklink" / "517-1",
         runner=runner,
     )
 
     assert result.status == "failed"
     assert result.review_ready is False
     assert "completed_empty_diff" in result.reasons
-    assert any(reason.startswith("backend_wrote_outside_worktree:") for reason in result.reasons)
+    assert any(reason.startswith("backend_wrote_outside_checkout:") for reason in result.reasons)
 
 
-def test_outside_worktree_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _dirty_paths, _with_outside_worktree_detection
+def test_outside_checkout_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _dirty_paths, _with_outside_checkout_detection
 
     def git(*args: str) -> str:
         out = subprocess.run(
@@ -1173,19 +1173,19 @@ def test_outside_worktree_leak_is_quarantined_recoverably(tmp_path: Path) -> Non
         reasons=("completed_empty_diff",),
         evidence=WorklinkEvidence(
             issue=517, attempt=1, backend="codex", branch="issue/517-a1",
-            worktree=str(worktree), started_at="2026-06-16T20:00:00+00:00",
+            checkout=str(worktree), started_at="2026-06-16T20:00:00+00:00",
             finished_at="2026-06-16T20:05:00+00:00", files_changed=[], diff_stat="",
             commands=[], tests=None, pr_url=None, status="failed",
         ),
     )
 
-    result = _with_outside_worktree_detection(
-        validation, issue=517, attempt=1, root=tmp_path, worktree=worktree,
+    result = _with_outside_checkout_detection(
+        validation, issue=517, attempt=1, root=tmp_path, checkout=worktree,
         runner=runner, root_dirty_before=root_dirty_before,
     )
 
     assert result.status == "failed"
-    assert any(r.startswith("backend_wrote_outside_worktree:") for r in result.reasons)
+    assert any(r.startswith("backend_wrote_outside_checkout:") for r in result.reasons)
     assert any("worklink-leak-517-a1" in r for r in result.reasons)
 
     # The leaked paths are gone from the working tree; pre-existing dirt survives.
@@ -1290,7 +1290,7 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
             # The factory namespaces run.json under .opencode/factory/<run-id>/
             # (run-id = chainlink-<issue_id>) inside its ``--repo`` worktree.
             factory_run = (
-                handle.local_worktree / ".opencode" / "factory" / "chainlink-700" / "run.json"
+                handle.local_checkout / ".opencode" / "factory" / "chainlink-700" / "run.json"
             )
             factory_run.parent.mkdir(parents=True, exist_ok=True)
             factory_run.write_text(
@@ -1368,7 +1368,7 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
 def _commit_runner(
     diff_stdout: str, committed: dict, *, diff_returncode: int = 0
 ) -> object:
-    """Fake runner for _commit_worktree_changes: staged changes present, with a
+    """Fake runner for _commit_checkout_changes: staged changes present, with a
     controllable `git diff --cached -U0` body/exit; records whether commit ran."""
     def runner(args: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         tail = list(args)[3:]
@@ -1385,8 +1385,8 @@ def _commit_runner(
     return runner
 
 
-def test_commit_worktree_changes_refuses_staged_secret() -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _commit_worktree_changes
+def test_commit_checkout_changes_refuses_staged_secret() -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     secret = "ghp_" + "B" * 36
@@ -1396,31 +1396,31 @@ def test_commit_worktree_changes_refuses_staged_secret() -> None:
     )
 
     with pytest.raises(WorklinkError, match="secret-shaped"):
-        _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+        _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     # Fail closed BEFORE the commit — nothing reaches a branch/PR.
     assert committed["ran"] is False
 
 
-def test_commit_worktree_changes_fails_closed_when_scan_command_fails() -> None:
+def test_commit_checkout_changes_fails_closed_when_scan_command_fails() -> None:
     # A security gate must not silently pass when it cannot verify: a non-zero
     # `git diff --cached -U0` (bad index/config/permissions) must refuse the
     # commit, not accept empty stdout as "clean".
-    from mimir.worklink.orchestrator import WorklinkError, _commit_worktree_changes
+    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
     runner = _commit_runner("", committed, diff_returncode=128)
 
     with pytest.raises(WorklinkError, match="cannot scan"):
-        _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+        _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is False
 
 
-def test_commit_worktree_changes_allows_benign_low_signal_token() -> None:
+def test_commit_checkout_changes_allows_benign_low_signal_token() -> None:
     # The scan uses high-signal, length-floored patterns (mirroring the
     # pre-commit hook), NOT the broad log redactor — so a benign placeholder
     # `token=` in generated content must not block the commit.
-    from mimir.worklink.orchestrator import _commit_worktree_changes
+    from mimir.worklink.orchestrator import _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
@@ -1428,12 +1428,12 @@ def test_commit_worktree_changes_allows_benign_low_signal_token() -> None:
         "+++ b/docs/example.md\n+Set the header: token=YOUR_TOKEN_HERE\n", committed
     )
 
-    _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is True
 
 
-def test_commit_worktree_changes_commits_clean_diff() -> None:
-    from mimir.worklink.orchestrator import _commit_worktree_changes
+def test_commit_checkout_changes_commits_clean_diff() -> None:
+    from mimir.worklink.orchestrator import _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
@@ -1441,5 +1441,5 @@ def test_commit_worktree_changes_commits_clean_diff() -> None:
         "+++ b/app.py\n+def hello():\n+    return 42\n", committed
     )
 
-    _commit_worktree_changes(Path("/tmp/wt"), issue, runner=runner)
+    _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is True

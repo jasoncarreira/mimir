@@ -2,7 +2,7 @@
 
 Backends own CLI session semantics only: rendering the tool-specific work spec,
 capturing transcripts, and mapping tool-specific failures into common status
-strings. Claiming, compute launch/wait/cancel/cleanup, worktree lifecycle,
+strings. Claiming, compute launch/wait/cancel/cleanup, checkout lifecycle,
 evidence validation, and state transitions stay in shared Worklink plumbing.
 """
 
@@ -22,7 +22,6 @@ class Caps:
     persistent_sessions: bool
     json_output: bool
     native_pr_creation: bool
-    worktree_safe: bool
     quota_pool: str | None
 
 
@@ -35,7 +34,7 @@ class CheckoutShape(StrEnum):
 @dataclass(frozen=True)
 class WorkOrder:
     issue_id: int
-    worktree: Path
+    checkout: Path
     prompt: str
     rules: str | None
     timeout_s: int

@@ -413,7 +413,7 @@ def test_worklink_priority_from_config(tmp_path: Path) -> None:
 
 
 
-def test_prune_stale_attempt_worktrees_for_home_uses_worklink_repo_env(
+def test_prune_stale_attempt_checkouts_for_home_uses_worklink_repo_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_worklink_yaml(tmp_path, timeout_s=600, reaper_ttl_s=3600)
@@ -427,20 +427,20 @@ def test_prune_stale_attempt_worktrees_for_home_uses_worklink_repo_env(
     os.utime(old, (mtime, mtime))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
 
-    pruned = autonomy.prune_stale_attempt_worktrees_for_home(tmp_path)
+    pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path)
 
     assert pruned == [old]
     assert not old.exists()
 
 
-def test_prune_stale_attempt_worktrees_for_home_silent_without_repo_env(
+def test_prune_stale_attempt_checkouts_for_home_silent_without_repo_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_worklink_yaml(tmp_path)
     monkeypatch.delenv("WORKLINK_REPO", raising=False)
     monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
 
-    assert autonomy.prune_stale_attempt_worktrees_for_home(tmp_path) == []
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path) == []
 
 
 def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:

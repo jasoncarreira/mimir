@@ -429,7 +429,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         timeout_s=5,
         env={"PATH": "/custom/bin", "X": "1"},
         backend_config={"bin": "other", "args": ["ignored"]},
-        local_worktree=tmp_path,
+        local_checkout=tmp_path,
         local_argv=("tool", "arg", "--cd", str(tmp_path), "prompt"),
     )
     handle = await backend.launch(spec)
@@ -487,7 +487,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         test_command="true",
         backend="opencode",
         timeout_s=5,
-        local_worktree=tmp_path,
+        local_checkout=tmp_path,
         local_argv=("opencode", "run"),
     )
 
@@ -501,7 +501,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
 
     order = WorkOrder(
         issue_id=1,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="prompt",
         rules=None,
         timeout_s=5,
@@ -542,7 +542,7 @@ def test_opencode_parses_structured_worklink_blocked_marker(tmp_path: Path) -> N
     )
     order = WorkOrder(
         issue_id=466,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="do it",
         rules=None,
         timeout_s=30,
@@ -609,7 +609,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
         issue_id=782,
-        worktree=tmp_path / "worktree",
+        checkout=tmp_path / "worktree",
         prompt="-starts with dash",
         rules=None,
         timeout_s=30,
@@ -633,7 +633,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
-        "opencode", "run", "--dir", str(order.worktree),
+        "opencode", "run", "--dir", str(order.checkout),
         "-m", "openai/gpt-5.6-luna", "--", "-starts with dash"
     )
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
@@ -665,7 +665,7 @@ def test_opencode_backend_uses_same_native_model_and_blocks_oauth_key_fallback(
     backend = OpenCodeBackend(extra_args=("--model", "openai/stale-worklink-setting"))
     order = WorkOrder(
         issue_id=1039,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="p",
         rules=None,
         timeout_s=30,
@@ -691,7 +691,7 @@ def test_opencode_backend_uses_same_native_model_and_blocks_oauth_key_fallback(
 async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> None:
     order = WorkOrder(
         issue_id=782,
-        worktree=tmp_path,
+        checkout=tmp_path,
         prompt="p",
         rules=None,
         timeout_s=30,
@@ -747,7 +747,7 @@ async def test_opencode_backend_transcript_filename_contract(
     issue_id = 831
     order = WorkOrder(
         issue_id=issue_id,
-        worktree=tmp_path / "worktree",
+        checkout=tmp_path / "worktree",
         prompt="Do the work",
         rules=None,
         timeout_s=30,
@@ -831,7 +831,7 @@ async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
         issue_id=782, attempt=1, repo_url="u", base_ref="main", branch="issue/782-a1",
         prompt="p", rules=None, test_command="true", backend="opencode", timeout_s=30,
         env={"MIMIR_HOME": "/mimir-home"},
-        local_worktree=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
+        local_checkout=wt, local_argv=("opencode", "run", "--dir", str(wt), "--", "p"),
     )
     compute = LocalSubprocessComputeBackend()
     handle = await compute.launch(spec)

@@ -114,7 +114,7 @@ class EvidenceMetadata:
     issue_id: int
     path: Path
     branch: str | None
-    worktree: Path | None
+    checkout: Path | None
     pr_url: str | None
     test_command: str | None
 
@@ -865,13 +865,15 @@ def _load_evidence_records(home: Path, issue_id: int | None) -> list[EvidenceMet
         if not data:
             continue
         tests = data.get("tests") if isinstance(data.get("tests"), Mapping) else {}
-        worktree_raw = data.get("worktree")
+        # New evidence uses checkout; retain read compatibility for historical
+        # evidence without dual-writing the retired key.
+        checkout_raw = data["checkout"] if "checkout" in data else data.get("worktree")
         out.append(
             EvidenceMetadata(
                 issue_id=issue_id,
                 path=path,
                 branch=_truncate_str(data.get("branch"), 200),
-                worktree=_resolve_existing_dir(Path(str(worktree_raw))) if worktree_raw else None,
+                checkout=_resolve_existing_dir(Path(str(checkout_raw))) if checkout_raw else None,
                 pr_url=_normalize_pr_url(_truncate_str(data.get("pr_url"), 400)),
                 test_command=_truncate_str(tests.get("cmd"), 400) if isinstance(tests, Mapping) else None,
             )
@@ -898,7 +900,7 @@ def _validate_issue_from_evidence(
             continue
         for record in records:
             pr_repo = _repo_from_pr_url(record.pr_url)
-            if current_worktree is not None and record.worktree == current_worktree:
+            if current_worktree is not None and record.checkout == current_worktree:
                 return issue_id, current_repo or pr_repo, record.pr_url, record.test_command
             if current_repo is not None and pr_repo == current_repo:
                 if not candidate_prs or record.pr_url in candidate_prs or record.pr_url is None:
@@ -924,7 +926,7 @@ def _validate_pr_from_evidence(
         pr_repo = _repo_from_pr_url(record.pr_url)
         if current_repo is not None and pr_repo != current_repo:
             continue
-        if current_worktree is not None and record.worktree not in (None, current_worktree):
+        if current_worktree is not None and record.checkout not in (None, current_worktree):
             continue
         if candidate_prs and record.pr_url not in candidate_prs:
             continue

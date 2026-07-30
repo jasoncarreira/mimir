@@ -26,7 +26,7 @@ class OpenCodeBackend:
     The provider-agnostic coding substrate from the #830 pivot: opencode
     routes to whichever model provider its own config selects, so per-leaf
     worklink no longer cares which subscription executes the build. Runs
-    non-interactively in the leaf worktree via ``opencode run --dir``.
+    non-interactively in the leaf checkout via ``opencode run --dir``.
     """
 
     bin: str = "opencode"
@@ -41,7 +41,6 @@ class OpenCodeBackend:
             persistent_sessions=False,
             json_output=False,
             native_pr_creation=False,
-            worktree_safe=True,
             quota_pool="opencode",
         )
 
@@ -89,8 +88,8 @@ class OpenCodeBackend:
                 "args": args,
                 "bash_allowlist": list(self.bash_allowlist),
             },
-            local_worktree=order.worktree,
-            local_argv=_local_argv(self.bin, args, order.worktree, prompt),
+            local_checkout=order.checkout,
+            local_argv=_local_argv(self.bin, args, order.checkout, prompt),
         )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
@@ -149,9 +148,9 @@ def _prompt_for_order(order: WorkOrder) -> str:
     return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
 
 
-def _local_argv(bin_name: str, args: Sequence[str], worktree: Path, prompt: str) -> tuple[str, ...]:
+def _local_argv(bin_name: str, args: Sequence[str], checkout: Path, prompt: str) -> tuple[str, ...]:
     # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
-    return (bin_name, "run", "--dir", str(worktree), *args, "--", prompt)
+    return (bin_name, "run", "--dir", str(checkout), *args, "--", prompt)
 
 
 def _permission_override(bash_allowlist: Sequence[str]) -> str:
