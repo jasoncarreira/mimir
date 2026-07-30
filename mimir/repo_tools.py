@@ -446,6 +446,38 @@ class RepoGitTools:
                 paths.add(path)
         return paths
 
+    def is_tracked_file(self, path: Path) -> bool:
+        """Return whether ``path`` is an index entry in this exact active lease."""
+        root = self._validate_lease()
+        if root != self._root:
+            raise GitRefusal("cross_pr_checkout", "checkout lease changed during Git access")
+        try:
+            if not path.is_absolute() or path.is_symlink():
+                return False
+            path.relative_to(root)
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not resolved.is_file():
+            return False
+
+        self._assert_checkout_identity()
+        pathspec = _validate_path(relative)
+        overrides = self._config_overrides()
+        result = self._raw((
+            *overrides, "ls-files", "--cached", "--error-unmatch", "-z", "--", pathspec,
+        ))
+        if result.timed_out:
+            raise GitRefusal("timeout", "Git tracked-file inspection exceeded its time limit")
+        if result.output_limited:
+            raise GitRefusal("output_limit", "Git tracked-file inspection exceeded its output limit")
+        if result.returncode == 1 and not result.stdout:
+            return False
+        if result.returncode != 0:
+            raise GitRefusal("git_failed", "Git tracked-file inspection failed")
+        return result.stdout == f"{relative}\x00"
+
     def _stage(self, paths: tuple[str, ...]) -> None:
         unmerged = self._unmerged_paths()
         if unmerged and not set(paths).issubset(unmerged):

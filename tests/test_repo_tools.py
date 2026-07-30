@@ -157,6 +157,30 @@ def test_fetch_is_typed_networked_and_uses_only_bound_refs(repo_tools) -> None:
     assert all("fetch" not in argv for argv in calls if "status" in argv or "diff" in argv)
 
 
+def test_tracked_file_query_uses_index_membership_and_refuses_untracked_or_symlink(
+    repo_tools, tmp_path: Path,
+) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    tracked = lease.path / "tracked.txt"
+    tracked.write_text("modified but still tracked\n", encoding="utf-8")
+    untracked = lease.path / "untracked.txt"
+    untracked.write_text("not published\n", encoding="utf-8")
+    ignored = lease.path / "ignored.txt"
+    ignored.write_text("not published\n", encoding="utf-8")
+    (lease.path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    escape = lease.path / "escape.txt"
+    escape.symlink_to(outside)
+
+    assert tools.is_tracked_file(tracked) is True
+    assert tools.is_tracked_file(untracked) is False
+    assert tools.is_tracked_file(ignored) is False
+    assert tools.is_tracked_file(escape) is False
+    assert tools.is_tracked_file(outside) is False
+
+
 def test_commit_stages_only_explicit_paths_and_preserves_dirty_out_of_scope_file(repo_tools) -> None:
     _origin, _source, _scope, state, tools = repo_tools
     lease = state.checkout_lease

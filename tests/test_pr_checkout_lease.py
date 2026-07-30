@@ -4,6 +4,7 @@ import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,8 @@ from mimir.pr_checkout_lease import (
     create_pr_checkout_lease,
     recover_pr_checkout_lease,
 )
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.readonly_backend import WriteGuardBackend
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -152,6 +155,134 @@ def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
             state.attach_checkout_lease(candidate)
         assert state.checkout_lease is None
         assert state.checked_out is False
+
+
+@pytest.mark.asyncio
+async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, initial_scope = _repo_and_scope(tmp_path)
+    fixture_source = Path(__file__).with_name("test_access_control.py")
+    published = repo / "tests" / "test_access_control.py"
+    published.parent.mkdir()
+    published.write_bytes(fixture_source.read_bytes())
+    tracked_protected_source = repo / ".env"
+    tracked_protected_source.write_text("TOKEN=placeholder\n", encoding="utf-8")
+    _git(repo, "add", "tests/test_access_control.py", ".env")
+    _git(repo, "commit", "-q", "-m", "add authorization tests")
+    head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+    scope = replace(initial_scope, observed_head_sha=head)
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    state = RepoReviewState(scope)
+    lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+    other_lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+    tracked = lease.path / "tests" / "test_access_control.py"
+    tracked_protected = lease.path / ".env"
+    other_tracked = other_lease.path / "tests" / "test_access_control.py"
+    assert "-----BEGIN OPENSSH PRIVATE KEY-----" in tracked.read_text(encoding="utf-8")
+
+    untracked = lease.path / "notes.txt"
+    untracked.write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nnot published\n", encoding="utf-8",
+    )
+    untracked_env = lease.path / "scratch" / ".env"
+    untracked_env.parent.mkdir()
+    untracked_env.write_text("TOKEN=ghp_" + "a" * 30 + "\n", encoding="utf-8")
+    escape = lease.path / "escaped-tests.py"
+    escape.symlink_to(repo / "tests" / "test_access_control.py")
+
+    read_roots = (str(lease.path), str(other_lease.path), str(repo))
+    auth = AuthContext(
+        principal="service:poller:github-activity",
+        canonical_principal="poller:github-activity",
+        roles=("service",),
+        event_ingress=None,
+        trigger="poller",
+        channel_id="poller:github-activity",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        is_service=True,
+        service_authority=SimpleNamespace(filesystem_read_roots=read_roots),
+        enforcement_enabled=True,
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    events = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    token = set_current_turn(SimpleNamespace(turn_id="tracked-pr-read", auth_context=auth))
+    try:
+        lease_backend = WriteGuardBackend(lease.path, [])
+        sync_result = lease_backend.read(str(tracked))
+        async_result = await lease_backend.aread(str(tracked), offset=5000, limit=20)
+        grep_result = lease_backend.grep("BEGIN OPENSSH", str(tracked))
+        glob_result = lease_backend.glob("test_access_control.py", str(tracked.parent))
+        untracked_result = lease_backend.read(str(untracked))
+        untracked_grep = lease_backend.grep("BEGIN OPENSSH", str(untracked))
+        tracked_protected_result = lease_backend.read(str(tracked_protected))
+        env_result = lease_backend.read(str(untracked_env))
+        escape_result = lease_backend.read(str(escape))
+        other_result = WriteGuardBackend(other_lease.path, []).read(str(other_tracked))
+        live_result = WriteGuardBackend(repo, []).read(str(published))
+    finally:
+        reset_current_turn(token)
+
+    assert sync_result.error is None
+    assert "-----BEGIN OPENSSH PRIVATE KEY-----" in sync_result.file_data["content"]
+    assert async_result.error is None
+    assert any(match["path"].endswith("tests/test_access_control.py") for match in grep_result.matches)
+    assert any(match["path"].endswith("tests/test_access_control.py") for match in glob_result.matches)
+    assert untracked_grep.matches == []
+    refusal = (
+        "Read denied: protected_read_target. For published PR content, "
+        "use pr_files or pr_diff."
+    )
+    assert untracked_result.error == refusal
+    assert tracked_protected_result.error == refusal
+    assert env_result.error == refusal
+    assert escape_result.error is not None
+    assert other_result.error == refusal
+    assert live_result.error == refusal
+    denied_targets = {
+        fields["target"]
+        for kind, fields in events
+        if kind == "hard_boundary_denied" and fields["reason"] == "protected_read_target"
+    }
+    assert str(untracked) in denied_targets
+    assert str(tracked_protected) in denied_targets
+    assert str(untracked_env) in denied_targets
+    assert str(other_tracked) in denied_targets
+    assert str(published) in denied_targets
+
+    for denied_auth in (
+        replace(auth, is_service=False),
+        replace(auth, repo_review_state=None, repo_pr_action_scope=None),
+        replace(auth, repo_pr_action_scope=initial_scope),
+    ):
+        token = set_current_turn(SimpleNamespace(turn_id="unauthorized-pr-read", auth_context=denied_auth))
+        try:
+            denied = WriteGuardBackend(lease.path, []).read(str(tracked))
+        finally:
+            reset_current_turn(token)
+        assert denied.error == refusal
+
+    lease.revoke()
+    token = set_current_turn(SimpleNamespace(turn_id="revoked-pr-read", auth_context=auth))
+    try:
+        revoked = WriteGuardBackend(lease.path, []).read(str(tracked))
+    finally:
+        reset_current_turn(token)
+    assert revoked.error == refusal
 
 
 def _service_auth(service) -> AuthContext:
