@@ -2435,6 +2435,105 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_repo_test_policy_refusal_does_not_taint_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.tools.repo import repo_test
+
+    middleware = BudgetGateMiddleware()
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset({RepoPRAction.INSPECT.value}),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    auth = replace(
+        _ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
+    calls: list[str] = []
+
+    original_authorize = ToolRegistry.authorize_tool
+
+    def authorize_without_action_gate(
+        self,
+        tool_name,
+        auth_context=None,
+        *,
+        enforce=False,
+        target_channel=None,
+        ifc_labels=None,
+        mcp_tool=None,
+        arguments=None,
+    ):  # type: ignore[no-untyped-def]
+        decision = original_authorize(
+            self,
+            tool_name,
+            auth_context,
+            enforce=enforce,
+            target_channel=target_channel,
+            ifc_labels=ifc_labels,
+            mcp_tool=mcp_tool,
+            arguments=arguments,
+        )
+        if tool_name != "repo_test":
+            return decision
+        return replace(decision, allowed=True, reason=None)
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize_without_action_gate)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        if request.tool_call["id"] == "repo-refused":
+            repo_test.func(
+                repository="owner/repo",
+                pull_request=17,
+                runtime=Runtime(context=auth),
+            )
+        return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        before = ctx.ifc_labels
+        refusal = await middleware.awrap_tool_call(
+            _make_request(
+                "repo_test", "repo-refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        adapted = await middleware.awrap_tool_call(
+            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert refusal.status == "error"
+    assert "scope does not grant repo.test" in str(refusal.content)
+    assert adapted.content == "adapted"
+    assert calls == ["repo-refused", "adapted"]
+    assert ctx.ifc_labels == before
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
+
+
+@pytest.mark.asyncio
 async def test_unexpected_tool_fault_still_fails_the_turn_boundary() -> None:
     middleware = BudgetGateMiddleware()
 
