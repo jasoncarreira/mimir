@@ -19,6 +19,17 @@ from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_c
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 _METADATA = ".git/mimir-pr-checkout-lease.json"
 _LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
+_CLEANUP_IDENTITY_FIELDS = (
+    "canonical_repo",
+    "canonical_origin",
+    "head_sha",
+    "destination_ref",
+    "owner",
+    "scope_id",
+    "path",
+    "lease_root",
+    "recovery_id",
+)
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -99,7 +110,10 @@ def _metadata(lease: PRCheckoutLease) -> dict[str, object]:
 def _safe_lease_path(root: Path, path: Path, *, must_exist: bool) -> Path:
     root = root.resolve(strict=True)
     if path.parent.resolve(strict=True) != root or path == root or path.is_symlink():
-        raise RuntimeError("PR checkout lease path escapes its configured root")
+        raise RuntimeError(
+            "PR checkout lease path escapes its configured root: "
+            f"expected child of {str(root)!r}; actual {str(path)!r}"
+        )
     if must_exist and not path.is_dir():
         raise RuntimeError("PR checkout lease path is missing")
     return path
@@ -319,8 +333,25 @@ def cleanup_pr_checkout_lease(
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("PR checkout lease cleanup metadata is invalid") from exc
     expected = _metadata(lease)
-    if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
-        raise RuntimeError("PR checkout lease cleanup identity mismatch")
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            "PR checkout lease cleanup metadata type mismatch: "
+            f"expected dict; actual {type(raw).__name__}"
+        )
+    for key in _CLEANUP_IDENTITY_FIELDS:
+        if key not in raw:
+            raise RuntimeError(
+                f"PR checkout lease cleanup metadata {key} mismatch: "
+                f"expected {expected[key]!r}; actual <missing>"
+            )
+    for key, value in expected.items():
+        # Version describes metadata shape, not checkout identity. Older shapes
+        # remain safe when all identity fields are present and match.
+        if key != "version" and key in raw and raw[key] != value:
+            raise RuntimeError(
+                f"PR checkout lease cleanup metadata {key} mismatch: "
+                f"expected {value!r}; actual {raw[key]!r}"
+            )
     head = _run(
         runner,
         ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
@@ -331,7 +362,29 @@ def cleanup_pr_checkout_lease(
         ["git", "-C", str(lease.path), "config", "--get", "remote.origin.url"],
         "PR checkout lease cleanup found no origin",
     )
-    if head != lease.head_sha.lower() or origin != lease.canonical_origin:
-        raise RuntimeError("PR checkout lease cleanup identity mismatch")
+    if origin != lease.canonical_origin:
+        raise RuntimeError(
+            "PR checkout lease cleanup origin mismatch: "
+            f"expected {lease.canonical_origin!r}; actual {origin!r}"
+        )
+    expected_branch = lease.destination_ref.removeprefix("refs/heads/")
+    branch_result = runner([
+        "git", "-C", str(lease.path), "symbolic-ref", "--quiet", "--short", "HEAD",
+    ])
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "<detached>"
+    if branch != expected_branch:
+        raise RuntimeError(
+            "PR checkout lease cleanup branch mismatch: "
+            f"expected {expected_branch!r}; actual {branch!r}"
+        )
+    ancestor = runner([
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
+        lease.head_sha.lower(), head,
+    ])
+    if ancestor.returncode != 0:
+        raise RuntimeError(
+            "PR checkout lease cleanup ancestry mismatch: "
+            f"expected HEAD descendant of {lease.head_sha.lower()!r}; actual {head!r}"
+        )
     shutil.rmtree(lease.path)
     return True

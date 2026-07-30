@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -33,7 +34,14 @@ from mimir.readonly_backend import WriteGuardBackend
 
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+        [
+            "git", "-C", str(cwd),
+            "-c", "user.name=test", "-c", "user.email=test@example.com",
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return result.stdout.strip()
 
@@ -101,6 +109,137 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert cleanup_pr_checkout_lease(lease, review_state=state) is True
     assert cleanup_pr_checkout_lease(lease, review_state=state) is False
     assert state.checkout_lease is None
+
+
+def test_pr_checkout_lease_cleanup_accepts_commit_on_lease_branch(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("authorized fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "fix")
+
+    assert _git(lease.path, "rev-parse", "HEAD") != lease.head_sha
+    assert cleanup_pr_checkout_lease(lease) is True
+
+
+def test_pr_checkout_lease_cleanup_refuses_mismatched_origin(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "remote", "set-url", "origin", "https://example.com/other.git")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup origin mismatch: "
+        f"expected {scope.canonical_origin!r}; actual 'https://example.com/other.git'"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_accepts_metadata_before_additive_field(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["version"] = 1
+    del metadata["scope_base_sha"]
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    assert cleanup_pr_checkout_lease(lease) is True
+
+
+def test_pr_checkout_lease_cleanup_refuses_directory_from_another_lease(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    other = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(replace(lease, path=other.path))
+
+    message = str(refusal.value)
+    assert "PR checkout lease cleanup metadata" in message
+    assert "mismatch: expected" in message
+    assert "; actual " in message
+    assert lease.path.is_dir()
+    assert other.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_refuses_wrong_branch(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "branch", "other", lease.head_sha)
+    _git(lease.path, "checkout", "-q", "other")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup branch mismatch: "
+        f"expected {scope.head_ref!r}; actual 'other'"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_refuses_unrelated_head_on_expected_branch(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "checkout", "-q", "--orphan", "unrelated")
+    _git(lease.path, "rm", "-q", "-rf", ".")
+    (lease.path / "replacement.txt").write_text("unrelated\n", encoding="utf-8")
+    _git(lease.path, "add", "replacement.txt")
+    _git(lease.path, "commit", "-q", "-m", "unrelated history")
+    unrelated_head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "branch", "-M", scope.head_ref)
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup ancestry mismatch: "
+        f"expected HEAD descendant of {lease.head_sha!r}; actual {unrelated_head!r}"
+    )
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_refuses_missing_required_identity_field(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del metadata["recovery_id"]
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as refusal:
+        cleanup_pr_checkout_lease(lease)
+
+    assert str(refusal.value) == (
+        "PR checkout lease cleanup metadata recovery_id mismatch: "
+        f"expected {lease.recovery_id!r}; actual <missing>"
+    )
+    assert lease.path.is_dir()
 
 
 def test_pr_checkout_lease_fails_closed_on_moved_head(tmp_path: Path) -> None:
