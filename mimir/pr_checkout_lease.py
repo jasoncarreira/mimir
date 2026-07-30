@@ -30,6 +30,7 @@ class PRCheckoutLease:
     canonical_repo: str
     canonical_origin: str
     source_root: Path
+    scope_base_sha: str
     base_sha: str
     head_sha: str
     destination_ref: str
@@ -77,10 +78,11 @@ def _run(runner: Runner, args: list[str], failure: str) -> str:
 
 def _metadata(lease: PRCheckoutLease) -> dict[str, object]:
     return {
-        "version": 1,
+        "version": 2,
         "canonical_repo": lease.canonical_repo,
         "canonical_origin": lease.canonical_origin,
         "source_root": str(lease.source_root),
+        "scope_base_sha": lease.scope_base_sha,
         "base_sha": lease.base_sha,
         "head_sha": lease.head_sha,
         "destination_ref": lease.destination_ref,
@@ -141,21 +143,6 @@ def create_pr_checkout_lease(
         raise RuntimeError("PR checkout lease collision")
 
     now = datetime.now(UTC)
-    lease = PRCheckoutLease(
-        canonical_repo=scope.canonical_repo,
-        canonical_origin=scope.canonical_origin,
-        source_root=source,
-        base_sha=scope.observed_base_sha,
-        head_sha=scope.observed_head_sha,
-        destination_ref=scope.destination_ref,
-        owner=owner,
-        scope_id=scope.scope_id,
-        path=path,
-        lease_root=root,
-        created_at=now,
-        expires_at=now + ttl,
-        recovery_id=recovery_id,
-    )
     try:
         _clone_attempt_checkout(source, staging, runner=runner, event_logger=None)
         _run(
@@ -173,7 +160,10 @@ def create_pr_checkout_lease(
             "fetched PR head is missing",
         ).lower()
         if actual_head != scope.observed_head_sha.lower():
-            raise RuntimeError("fetched PR head does not match immutable scope")
+            raise RuntimeError(
+                f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
+                f"fetched head is {actual_head}"
+            )
         _run(
             runner,
             ["git", "-C", str(staging), "fetch", "--no-tags", "origin", scope.base_ref],
@@ -183,8 +173,41 @@ def create_pr_checkout_lease(
             runner, ["git", "-C", str(staging), "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
             "fetched PR base is missing",
         ).lower()
-        if actual_base != scope.observed_base_sha.lower():
-            raise RuntimeError("fetched PR base does not match immutable scope")
+        merge_base_result = runner([
+            "git", "-C", str(staging), "merge-base", actual_head, actual_base,
+        ])
+        merge_base = (
+            merge_base_result.stdout.strip().lower()
+            if merge_base_result.returncode == 0 else "none"
+        )
+        scoped_base = scope.observed_base_sha.lower()
+        if merge_base == actual_head:
+            raise RuntimeError(
+                "PR base already contains the authorized head: fetched base "
+                f"{actual_base}; authorized head {actual_head} is stale as an open PR"
+            )
+        if actual_base != scoped_base and merge_base != scoped_base:
+            raise RuntimeError(
+                "PR base history rewritten: scoped base "
+                f"{scoped_base} is stale; fetched base {actual_base} has merge-base "
+                f"{merge_base} with the authorized PR head"
+            )
+        lease = PRCheckoutLease(
+            canonical_repo=scope.canonical_repo,
+            canonical_origin=scope.canonical_origin,
+            source_root=source,
+            scope_base_sha=scoped_base,
+            base_sha=actual_base,
+            head_sha=scope.observed_head_sha,
+            destination_ref=scope.destination_ref,
+            owner=owner,
+            scope_id=scope.scope_id,
+            path=path,
+            lease_root=root,
+            created_at=now,
+            expires_at=now + ttl,
+            recovery_id=recovery_id,
+        )
         _run(
             runner,
             ["git", "-C", str(staging), "checkout", "-B", scope.head_ref, actual_head],
@@ -231,7 +254,7 @@ def recover_pr_checkout_lease(
         "canonical_repo": scope.canonical_repo,
         "canonical_origin": scope.canonical_origin,
         "source_root": str(Path(scope.canonical_root).resolve(strict=True)),
-        "base_sha": scope.observed_base_sha,
+        "scope_base_sha": scope.observed_base_sha,
         "head_sha": scope.observed_head_sha,
         "destination_ref": scope.destination_ref,
         "owner": owner,
@@ -241,11 +264,17 @@ def recover_pr_checkout_lease(
     }
     if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
         raise RuntimeError("PR checkout lease recovery scope mismatch")
+    base_sha = raw.get("base_sha")
+    if not isinstance(base_sha, str) or len(base_sha) != 40 or any(
+        character not in "0123456789abcdef" for character in base_sha.lower()
+    ):
+        raise RuntimeError("PR checkout lease recovery metadata is invalid")
     try:
         lease = PRCheckoutLease(
             **{
                 **expected,
                 "source_root": Path(str(expected["source_root"])),
+                "base_sha": base_sha.lower(),
                 "path": path,
                 "lease_root": root,
             },

@@ -87,6 +87,7 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert lease.path.parent == lease_root.resolve()
     assert lease.path != repo
     assert lease.destination_ref == scope.destination_ref
+    assert lease.scope_base_sha == scope.observed_base_sha
     assert lease.base_sha == scope.observed_base_sha
     assert _git(lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
     assert state.root == str(lease.path)
@@ -103,17 +104,82 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
 
 
 def test_pr_checkout_lease_fails_closed_on_moved_head(tmp_path: Path) -> None:
-    _repo, scope = _repo_and_scope(tmp_path)
+    repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
+    (repo / "head-moved.txt").write_text("new head\n", encoding="utf-8")
+    _git(repo, "add", "head-moved.txt")
+    _git(repo, "commit", "-q", "-m", "move head")
+    moved_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
 
-    with pytest.raises(RuntimeError, match="head does not match immutable scope"):
+    with pytest.raises(RuntimeError) as refusal:
         create_pr_checkout_lease(
-            replace(scope, observed_head_sha="f" * 40),
+            scope,
             owner="mimir-bot",
             lease_root=lease_root,
         )
 
+    assert "PR head advanced" in str(refusal.value)
+    assert scope.observed_head_sha in str(refusal.value)
+    assert moved_head in str(refusal.value)
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_accepts_base_advanced_by_unrelated_merge(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "checkout", "-q", "main")
+    (repo / "unrelated.txt").write_text("merged work\n", encoding="utf-8")
+    _git(repo, "add", "unrelated.txt")
+    _git(repo, "commit", "-q", "-m", "unrelated merge")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    assert lease.scope_base_sha == scope.observed_base_sha
+    assert lease.base_sha == advanced_base
+    assert _git(lease.path, "merge-base", lease.head_sha, lease.base_sha) == scope.observed_base_sha
+
+
+def test_pr_checkout_lease_refuses_rewritten_base_with_both_identities(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "checkout", "-q", "--orphan", "rewritten-main")
+    _git(repo, "rm", "-q", "-rf", ".")
+    (repo / "replacement.txt").write_text("replacement history\n", encoding="utf-8")
+    _git(repo, "add", "replacement.txt")
+    _git(repo, "commit", "-q", "-m", "replace main history")
+    rewritten_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "--force", "origin", "HEAD:main")
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    message = str(refusal.value)
+    assert "PR base history rewritten" in message
+    assert f"scoped base {scope.observed_base_sha} is stale" in message
+    assert f"fetched base {rewritten_base}" in message
+    assert "merge-base none" in message
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_refuses_base_that_already_contains_head(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _git(repo, "push", "-q", "origin", f"{scope.observed_head_sha}:main")
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+
+    message = str(refusal.value)
+    assert "PR base already contains the authorized head" in message
+    assert f"fetched base {scope.observed_head_sha}" in message
+    assert f"authorized head {scope.observed_head_sha} is stale as an open PR" in message
     assert list(lease_root.iterdir()) == []
 
 
@@ -326,7 +392,8 @@ def test_github_activity_write_grant_is_exactly_active_lease_path(
     now = datetime.now(UTC)
     lease = PRCheckoutLease(
         canonical_repo="o/r", canonical_origin=scope.canonical_origin,
-        source_root=source.resolve(), base_sha="b" * 40, head_sha="a" * 40,
+        source_root=source.resolve(), scope_base_sha="b" * 40,
+        base_sha="b" * 40, head_sha="a" * 40,
         destination_ref=scope.destination_ref, owner="mimir-bot", scope_id=scope.scope_id,
         path=lease_path, lease_root=lease_root, created_at=now,
         expires_at=now + timedelta(hours=1), recovery_id="recovery",
