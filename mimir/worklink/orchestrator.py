@@ -1767,16 +1767,82 @@ def run_worklink(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
-    return asyncio.run(
-        WorklinkRunner(home=home, repo=repo).run(
-            issue_id,
-            backend_name=backend,
-            dry_run=dry_run,
-            test_command=test_command,
-            base_branch=base_branch,
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=home, repo=repo).run(
+                issue_id,
+                backend_name=backend,
+                dry_run=dry_run,
+                test_command=test_command,
+                base_branch=base_branch,
+                autonomous=autonomous,
+            )
+        )
+    except Exception as exc:
+        _record_run_failure(
+            issue_id=issue_id,
+            attempt=None,
+            error=exc,
+            exit_status=2 if isinstance(exc, LeafValidationError) else 1,
             autonomous=autonomous,
         )
+        raise
+    if result.status == "failed":
+        _record_run_failure(
+            issue_id=issue_id,
+            attempt=result.attempt,
+            error=result.reason or "Worklink run failed",
+            exit_status=1,
+            autonomous=autonomous,
+        )
+    elif autonomous and result.status in {"completed", "blocked"}:
+        _record_run_success(issue_id)
+    return result
+
+
+def _record_run_failure(
+    *,
+    issue_id: int,
+    attempt: int | None,
+    error: BaseException | str,
+    exit_status: int,
+    autonomous: bool,
+) -> None:
+    from .dispatch_failures import record_failure, terminal_error
+
+    safe_error = terminal_error(error)
+    _log_event(
+        "worklink_run_failed",
+        issue_id=issue_id,
+        attempt=attempt,
+        attempt_consumed=attempt is not None,
+        exit_status=exit_status,
+        terminal_error=safe_error,
     )
+    state_dir = os.environ.get("STATE_DIR")
+    if autonomous and state_dir:
+        try:
+            record_failure(
+                Path(state_dir),
+                issue_id=issue_id,
+                attempt=attempt,
+                exit_status=exit_status,
+                error=safe_error,
+                log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            )
+        except OSError:
+            pass
+
+
+def _record_run_success(issue_id: int) -> None:
+    from .dispatch_failures import record_success
+
+    state_dir = os.environ.get("STATE_DIR")
+    if state_dir:
+        try:
+            record_success(Path(state_dir), issue_id)
+        except OSError:
+            pass
 
 
 def run_worklink_reattach(*, home: Path, repo: Path, issue_id: int) -> WorklinkRunResult:

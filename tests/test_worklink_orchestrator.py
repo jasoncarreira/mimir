@@ -23,6 +23,7 @@ from mimir.worklink.orchestrator import (
     WorklinkRunner,
     _demote_template_invalid_ready_leaf,
     render_decomposition_prompt,
+    run_worklink,
     validate_leaf,
 )
 
@@ -228,6 +229,69 @@ ISSUE_JSON = '''{
   "parent_id": 380,
   "comments": []
 }'''
+
+
+def test_preclaim_registry_crash_emits_scrubbed_failure_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink")
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
+            return cp(args, stdout=ISSUE_JSON)
+        return cp(args)
+
+    class CrashingRegistry:
+        def __init__(self, _config: WorklinkConfig) -> None:
+            raise ValueError("unknown Worklink backend config: codex password=hunter2")
+
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", CrashingRegistry)
+
+    with pytest.raises(ValueError, match="unknown Worklink backend config"):
+        run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
+
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    failure = next(record for record in records if record["type"] == "worklink_run_failed")
+    assert failure["issue_id"] == 441
+    assert failure["attempt"] is None
+    assert failure["attempt_consumed"] is False
+    assert failure["exit_status"] == 1
+    assert failure["terminal_error"] == (
+        "ValueError: unknown Worklink backend config: codex password=[REDACTED]"
+    )
+    assert "hunter2" not in events.read_text(encoding="utf-8")
+    _reset_logger_for_tests()
+
+
+def test_postclaim_failure_emits_same_failure_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink")
+
+    async def failed_after_claim(self: WorklinkRunner, issue_id: int, **_: object):
+        return orchestrator.WorklinkRunResult(
+            issue_id, 2, "failed", reason="backend exploded api_key=super-secret"
+        )
+
+    monkeypatch.setattr(WorklinkRunner, "run", failed_after_claim)
+    result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
+
+    assert result.status == "failed"
+    records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+    failure = next(record for record in records if record["type"] == "worklink_run_failed")
+    assert failure["attempt"] == 2
+    assert failure["attempt_consumed"] is True
+    assert failure["terminal_error"] == "backend exploded api_key=[REDACTED]"
+    _reset_logger_for_tests()
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:
