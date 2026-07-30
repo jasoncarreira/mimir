@@ -3083,11 +3083,155 @@ async def test_shadow_denial_records_bounded_redacted_requested_target(
     assert shadow.reason == enforced.reason == reason
     assert len(captured) == 1
     fields = captured[0][1]
-    assert fields["target"] is None
+    # ``target`` is the policy-resolved path and is environment-dependent:
+    # resolution can fail in CI while succeeding against a configured local root.
+    # The caller spelling is the stable contract this test pins.
+    if reason != "read_scope":
+        assert fields["target"] is None
     assert fields["requested_target"] == requested_target.replace(
         "token=secret-value", "token=[REDACTED]",
     )[:1024]
+    if reason == "read_scope":
+        assert "/outside?token=[REDACTED]&part=" in str(fields["requested_target"])
+        assert str(fields["requested_target"]).endswith("x")
     assert len(str(fields["requested_target"])) <= 1024
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "requested_suffix", "resolved_suffix"),
+    [
+        (
+            "read_file",
+            {"file_path": "/memory/token=secret-value/note.txt"},
+            "/memory/token=[REDACTED]",
+            "memory/token=[REDACTED]",
+        ),
+        (
+            "ls",
+            {"path": "/memory/token=secret-value"},
+            "/memory/token=[REDACTED]",
+            "memory/token=[REDACTED]",
+        ),
+        (
+            "glob",
+            {"path": "/memory/token=secret-value", "pattern": "*.txt"},
+            "/memory/token=[REDACTED]",
+            "memory/token=[REDACTED]",
+        ),
+        (
+            "grep",
+            {"path": "/memory/token=secret-value", "pattern": "needle"},
+            "/memory/token=[REDACTED]",
+            "memory/token=[REDACTED]",
+        ),
+        (
+            "file_search",
+            {
+                "query": "needle",
+                "scope": "memory",
+                "path_prefix": "token=secret-value",
+            },
+            "token=[REDACTED]",
+            "memory/token=[REDACTED]",
+        ),
+    ],
+)
+async def test_read_scope_shadow_event_records_requested_and_resolved_target_via_middleware(
+    tool_name: str,
+    arguments: dict[str, object],
+    requested_suffix: str,
+    resolved_suffix: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "mimir-home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    auth = replace(_read_auth(), enforcement_enabled=False)
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None,
+    )
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _tool_request(auth, tool_name=tool_name, args=arguments), handler,
+    )
+    await asyncio.sleep(0)
+
+    assert result.status != "error"
+    assert handler_calls == 1
+    events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["reason"] == "read_scope"
+    assert event["would_block"] is True
+    assert event["requested_target"] == requested_suffix
+    assert event["target"] == str(home / resolved_suffix)
+    assert "secret-value" not in repr(event)
+
+
+@pytest.mark.asyncio
+async def test_read_scope_audit_resolution_failure_cannot_change_live_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    home = tmp_path / "mimir-home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(
+        access_control,
+        "resolved_read_target_from_arguments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("audit failed")),
+    )
+    monkeypatch.setattr("mimir.event_logger.log_event", lambda *_args, **_kwargs: asyncio.sleep(0))
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None,
+    )
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    middleware = BudgetGateMiddleware()
+    arguments = {"file_path": "/memory/private.txt"}
+    shadow = await middleware.awrap_tool_call(
+        _tool_request(
+            replace(_read_auth(), enforcement_enabled=False),
+            tool_name="read_file",
+            args=arguments,
+        ),
+        handler,
+    )
+    enforced = await middleware.awrap_tool_call(
+        _tool_request(_read_auth(), tool_name="read_file", args=arguments), handler,
+    )
+
+    assert shadow.status != "error"
+    assert enforced.status == "error"
+    assert "read_scope" in str(enforced.content)
+    assert handler_calls == 1
 
 
 @pytest.mark.asyncio

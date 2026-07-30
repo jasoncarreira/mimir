@@ -48,6 +48,7 @@ from .read_policy import (
     framework_large_tool_results_root,
     read_target_from_arguments,
     requested_read_target_from_arguments,
+    resolved_read_target_from_arguments,
     resolve_large_tool_results_target,
 )
 
@@ -5044,6 +5045,7 @@ class ToolRegistry:
         auth_context: "AuthContext | None" = None,
         target: str | None = None,
         requested_target: Any = None,
+        arguments: dict[str, Any] | None = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -5064,11 +5066,28 @@ class ToolRegistry:
                 resolved_target = resolve_sink_target(
                     auth.tool_name, category, target, service,
                 )
+            if auth.reason == "read_scope":
+                requested_target = requested_read_target_from_arguments(
+                    auth.tool_name, arguments,
+                )
+                try:
+                    resolved_target = resolved_read_target_from_arguments(
+                        auth.tool_name, arguments,
+                    )
+                except Exception as exc:
+                    # Audit diagnostics must never change the completed decision.
+                    log.warning("read target audit resolution failed: %s", exc)
+                    resolved_target = None
             from .redaction import redact_payload
 
             redacted_requested_target = redact_payload(requested_target)
             if redacted_requested_target is not None:
                 redacted_requested_target = str(redacted_requested_target)[
+                    :_MAX_REQUESTED_TARGET_LENGTH
+                ]
+            redacted_resolved_target = redact_payload(resolved_target)
+            if redacted_resolved_target is not None:
+                redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
 
@@ -5077,7 +5096,7 @@ class ToolRegistry:
                 # service-capability grants. Bypasses carry the denial reason
                 # that enforcement would apply; capability grants do not.
                 "would_block": auth.would_block,
-                "target": redact_payload(resolved_target),
+                "target": redacted_resolved_target,
                 # Caller input is evidence only. It is never resolved, compared
                 # with policy, or fed back into an authorization decision.
                 "requested_target": redacted_requested_target,
@@ -5396,7 +5415,7 @@ class ToolRegistry:
             )
             self._emit_shadow_decision(
                 auth, auth_context=auth_context, target=sink_target,
-                requested_target=requested_target,
+                requested_target=requested_target, arguments=arguments,
             )
 
         return auth

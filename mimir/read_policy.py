@@ -95,6 +95,46 @@ def requested_read_target_from_arguments(
     return None
 
 
+def resolved_read_target_from_arguments(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> str | None:
+    """Resolve a read selector for diagnostics without applying read policy."""
+    args = arguments if isinstance(arguments, dict) else {}
+    home = _resolved_mimir_home()
+    if home is None:
+        return None
+
+    if tool_name == "file_search":
+        prefix = args.get("path_prefix")
+        scope = str(args.get("scope") or "all").strip().lower()
+        raw_path = prefix if isinstance(prefix, str) and prefix.strip() else scope
+        if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+            return None
+        candidate = Path(raw_path.strip())
+        if candidate.is_absolute():
+            return str(candidate.resolve(strict=False))
+        if scope in {"memory", "state"} and candidate.parts[:1] != (scope,):
+            candidate = Path(scope) / candidate
+        return str((home / candidate).resolve(strict=False))
+
+    raw_path = requested_read_target_from_arguments(tool_name, args)
+    if not isinstance(raw_path, str) or not raw_path.strip() or "\x00" in raw_path:
+        return None
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        return str((home / candidate).resolve(strict=False))
+
+    # Composite filesystem routes preserve configured absolute paths. Other
+    # absolute spellings are backend-virtual paths rooted at MIMIR_HOME.
+    if candidate == home or candidate.is_relative_to(home):
+        return str(candidate.resolve(strict=False))
+    for root in configured_non_admin_read_roots():
+        if candidate == root or candidate.is_relative_to(root):
+            return str(candidate.resolve(strict=False))
+    return str((home / raw_path.lstrip("/")).resolve(strict=False))
+
+
 def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
     """Record a protected result that the backend actually withheld."""
     from .tools.budget_gate import _emit_hard_boundary_denied
