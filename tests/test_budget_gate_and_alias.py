@@ -794,6 +794,23 @@ def _ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
     )
 
 
+def _untainted_ifc_auth(*, roles: tuple[str, ...] = ("admin",)) -> AuthContext:
+    return AuthContext(
+        principal="slack-U1",
+        canonical_principal="user-1",
+        roles=roles,
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-1",
+        interactivity=None,
+        enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+        domain="channel",
+        resource_id="ch-1",
+        bridge_instance="test",
+    )
+
+
 def _ifc_turn(auth: AuthContext) -> TurnContext:
     ctx = _make_ctx()
     ctx.auth_context = auth
@@ -2394,7 +2411,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     from dataclasses import replace
 
     auth = replace(
-        _ifc_auth(),
+        _untainted_ifc_auth(),
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state,
         repo_pr_action_scope=scope,
@@ -2407,6 +2424,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
             raise ToolPolicyRefusal("pull-request operation rejected: repo.inspect not granted")
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
         before = ctx.ifc_labels
@@ -2461,7 +2479,7 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     )
     state = RepoReviewState(scope)
     auth = replace(
-        _ifc_auth(),
+        _untainted_ifc_auth(),
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state,
         repo_pr_action_scope=scope,
@@ -2508,6 +2526,7 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
             )
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
         before = ctx.ifc_labels
@@ -2561,7 +2580,7 @@ async def test_real_repo_execution_fault_taints_turn(
     )
     state = RepoReviewState(scope)
     auth = replace(
-        _ifc_auth(),
+        _untainted_ifc_auth(),
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state,
         repo_pr_action_scope=scope,
@@ -2581,6 +2600,7 @@ async def test_real_repo_execution_fault_taints_turn(
         )
         raise AssertionError("repo_fetch should have raised")
 
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
         result = await middleware.awrap_tool_call(
