@@ -265,6 +265,71 @@ def test_invalid_revert_ancestry_is_refused(repo_tools) -> None:
     assert refusal.value.code == "invalid_revert_ancestry"
 
 
+def test_merge_conflict_names_unmerged_path_and_recovery_operations(tmp_path: Path) -> None:
+    origin, source, scope, _old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=advanced_base)
+    leases = tmp_path / "merge-leases"
+    leases.mkdir()
+    state = RepoReviewState(scope)
+    create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=leases, review_state=state)
+    tools = RepoGitTools(state)
+
+    with pytest.raises(GitRefusal) as conflict:
+        tools.execute(GitMerge())
+
+    assert conflict.value.code == "merge_conflict"
+    assert "tracked.txt" in str(conflict.value)
+    assert "merge conflict" in str(conflict.value)
+    assert "repo_unmerged" in str(conflict.value)
+    assert "repo_merge_abort" in str(conflict.value)
+    assert "CONFLICT (content)" in str(conflict.value)
+    assert tools.execute(GitMergeAbort()).ok
+
+
+def test_merge_non_conflict_failure_preserves_git_stderr(repo_tools) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    unknown_sha = "f" * 40
+    object.__setattr__(
+        state,
+        "checkout_lease",
+        replace(state.checkout_lease, base_sha=unknown_sha),
+    )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitMerge())
+
+    assert refusal.value.code == "git_failed"
+    assert str(refusal.value) != "Git operation failed"
+    assert unknown_sha in str(refusal.value)
+    assert "repo_unmerged" not in str(refusal.value)
+    assert "repo_merge_abort" not in str(refusal.value)
+
+
+def test_checked_failure_stdout_is_redacted_but_commands_must_opt_in(repo_tools) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    secret = "stdout-secret"
+
+    def failed_runner(argv, *, env, timeout, output_limit):
+        if "status" in argv:
+            return GitProcessResult(1, stdout=f"diagnostic {secret}")
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    tools = RepoGitTools(state, runner=failed_runner)
+    with pytest.raises(GitRefusal, match="Git operation failed"):
+        tools._command(("status",), sensitive_values=(secret,))
+    with pytest.raises(GitRefusal) as refusal:
+        tools._checked(("status",), sensitive_values=(secret,))
+
+    assert str(refusal.value) == "diagnostic [REDACTED]"
+
+
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:
     origin, source, scope, _old_state = _repo_scope_and_state(tmp_path)
     _git(source, "checkout", "-q", "main")
