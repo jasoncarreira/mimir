@@ -95,7 +95,7 @@ def resolve_opencode_invocation(
         model = configured_model.strip()
         source = "opencode_config"
     else:
-        model = _agent_model_to_opencode(
+        model = opencode_model_from_agent_spec(
             values.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
         )
         source = "agent_model"
@@ -121,7 +121,7 @@ def _home(env: Mapping[str, str]) -> Path:
     return Path(env.get("HOME", str(Path.home()))).expanduser()
 
 
-def _agent_model_to_opencode(model_spec: str) -> str:
+def opencode_model_from_agent_spec(model_spec: str) -> str:
     route, separator, model = model_spec.strip().partition(":")
     if not separator or not route or not model:
         raise OpenCodeConfigError(

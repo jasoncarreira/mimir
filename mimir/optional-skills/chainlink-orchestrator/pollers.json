@@ -16,6 +16,7 @@
       ],
       "pass_env": [
         "MIMIR_HOME",
+        "MIMIR_MODEL_SPEC",
         "MIMIR_SOURCE_DIR",
         "CHAINLINK_BIN",
         "WORKLINK_RUN_BIN",

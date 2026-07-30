@@ -5,18 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
 import re
 from typing import Sequence
 
 from ...config import model_spec_at_call_time
-from ...opencode_config import resolve_opencode_invocation
+from ...opencode_config import opencode_model_from_agent_spec, resolve_opencode_invocation
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from_output
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
+_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,9 @@ class OpenCodeBackend:
     bash_allowlist: Sequence[str] = field(default_factory=lambda: DEFAULT_BASH_ALLOWLIST)
     name: str = "opencode"
     checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
+
+    def __post_init__(self) -> None:
+        validate_extra_args(self.extra_args)
 
     def capabilities(self) -> Caps:
         return Caps(
@@ -58,9 +64,20 @@ class OpenCodeBackend:
         args = list(self.extra_args)
         env = dict(order.env)
         model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
-        model_spec_at_call_time(model_home)
-        invocation = resolve_opencode_invocation(env={**os.environ, **env})
+        dotenv_model_spec = model_spec_at_call_time(model_home)
+        configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
+        resolution_env = {**os.environ, **env}
+        resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
+        invocation = resolve_opencode_invocation(env=resolution_env)
         args.extend(("-m", invocation.model))
+        configured_model = opencode_model_from_agent_spec(configured_model_spec)
+        model_diverged = invocation.model != configured_model
+        if model_diverged:
+            log.warning(
+                "Worklink OpenCode model %s differs from configured agent model %s",
+                invocation.model,
+                configured_model,
+            )
         if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
             env["OPENCODE_CONFIG"] = str(invocation.config_path)
         for key in invocation.pass_env:
@@ -87,11 +104,14 @@ class OpenCodeBackend:
                 "bin": self.bin,
                 "args": args,
                 "bash_allowlist": list(self.bash_allowlist),
+                "model": invocation.model,
+                "configured_model": configured_model,
+                "model_diverged": model_diverged,
+                "model_source": invocation.model_source,
             },
             local_checkout=order.checkout,
             local_argv=_local_argv(self.bin, args, order.checkout, prompt),
         )
-
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("OpenCodeBackend.interpret expects ComputeResult")
@@ -142,6 +162,18 @@ class OpenCodeBackend:
             blocked_reason,
             output_overflow=result.output_overflow,
         )
+
+
+def validate_extra_args(args: Sequence[str]) -> None:
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in _INJECTED_FLAGS or (
+            flag == arg and arg.startswith("-m") and not arg.startswith("--") and arg != "-m"
+        ):
+            raise ValueError(
+                f"worklink opencode args cannot contain {arg!r}: the backend injects "
+                f"{flag!r} itself; remove it from backends.opencode.args"
+            )
 
 
 def _prompt_for_order(order: WorkOrder) -> str:
