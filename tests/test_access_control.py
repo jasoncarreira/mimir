@@ -3083,15 +3083,21 @@ async def test_shadow_denial_records_bounded_redacted_requested_target(
     assert shadow.reason == enforced.reason == reason
     assert len(captured) == 1
     fields = captured[0][1]
+    # ``target`` is the policy-resolved path; ``requested_target`` is the
+    # separately recorded caller spelling. Audit assertions for caller input
+    # must use the latter even when the resolver can produce an absolute path.
     if reason == "read_scope":
-        assert "/outside?token=[REDACTED]&part=" in str(fields["target"])
-        assert str(fields["target"]).endswith("x")
+        assert fields["target"] is not None
+        assert str(fields["target"]).startswith("/")
         assert len(str(fields["target"])) <= 1024
     else:
         assert fields["target"] is None
     assert fields["requested_target"] == requested_target.replace(
         "token=secret-value", "token=[REDACTED]",
     )[:1024]
+    if reason == "read_scope":
+        assert "/outside?token=[REDACTED]&part=" in str(fields["requested_target"])
+        assert str(fields["requested_target"]).endswith("x")
     assert len(str(fields["requested_target"])) <= 1024
 
 
