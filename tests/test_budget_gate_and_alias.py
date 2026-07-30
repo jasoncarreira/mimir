@@ -31,12 +31,20 @@ from typing import Any
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
-from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnContext
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    RepoPRAction,
+    RepoPRActionScope,
+    RepoPRScopeRegistry,
+    RepoReviewState,
+    SourceLabel,
+    TurnContext,
+)
 from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
@@ -2362,34 +2370,67 @@ async def test_middleware_emits_tool_error_for_budget_denial(
 
 @pytest.mark.asyncio
 async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
+    from mimir.tools.refusals import ToolPolicyRefusal
+
     middleware = BudgetGateMiddleware()
     calls: list[str] = []
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root="/srv/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    from dataclasses import replace
+
+    auth = replace(
+        _ifc_auth(),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    ctx = _ifc_turn(auth)
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
         if request.tool_call["id"] == "refused":
-            raise ToolException(
-                "query must be non-empty text; for example, query='release status'"
-            )
+            raise ToolPolicyRefusal("pull-request operation rejected: repo.inspect not granted")
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
-    ctx = _make_ctx(budget=5)
     token = set_current_turn(ctx)
     try:
+        before = ctx.ifc_labels
         refusal = await middleware.awrap_tool_call(
-            _make_request("memory_query", "refused"), handler,
+            _make_request(
+                "pr_metadata", "refused", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
         )
         adapted = await middleware.awrap_tool_call(
-            _make_request("memory_query", "adapted"), handler,
+            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+            handler,
         )
     finally:
         reset_current_turn(token)
 
     assert isinstance(refusal, ToolMessage)
     assert refusal.status == "error"
-    assert "query must be" in str(refusal.content)
+    assert "repo.inspect not granted" in str(refusal.content)
     assert adapted.content == "adapted"
     assert calls == ["refused", "adapted"]
+    assert ctx.ifc_labels == before
+    assert ctx.ifc_labels.has_untrusted_active_ingest is False
     assert ctx.tool_call_count == 2
 
 

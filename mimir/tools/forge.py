@@ -21,6 +21,7 @@ from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
 )
+from .refusals import ToolPolicyRefusal
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
@@ -57,7 +58,7 @@ def _scope(
     state = resolve_review_state(runtime, repository, pull_request)
     scope = state.action_scope
     if action is not None and action.value not in scope.allowed_operations:
-        raise ToolException(f"pull-request operation rejected: {action.value} not granted")
+        raise ToolPolicyRefusal(f"pull-request operation rejected: {action.value} not granted")
     return scope
 
 
@@ -89,7 +90,7 @@ def resolve_review_state_for_context(
         or isinstance(pull_request, bool)
         or pull_request < 1
     ):
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "pull-request operation rejected: repository must be text and pull_request "
             "must be a positive integer; for example, repository='owner/repo', pull_request=17"
         )
@@ -99,7 +100,7 @@ def resolve_review_state_for_context(
     )
 
     if not is_configured_github_repo(repository):
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
         )
     cache = getattr(context, "server_discovered_pr_states", None)
@@ -113,7 +114,7 @@ def resolve_review_state_for_context(
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
     scope = create_server_discovered_review_scope(repository, snapshot)
     if scope is None or scope.pr_number != pull_request:
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "pull-request operation rejected: live pull request is closed or invalid"
         )
     state = RepoReviewState(scope)
@@ -135,14 +136,14 @@ def _client_for_repository(repository: str) -> ForgeClient:
 
 def _body(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ToolException("body must be non-empty text; for example, body='Looks good'")
+        raise ToolPolicyRefusal("body must be non-empty text; for example, body='Looks good'")
     if len(value.encode("utf-8")) > _BODY_MAX_BYTES:
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "body must be non-empty text within the 65536-byte UTF-8 limit; "
             "for example, body='Looks good'"
         )
     if "\x00" in value:
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "body must contain text without null bytes; for example, body='Looks good'"
         )
     return value
@@ -157,7 +158,7 @@ def _path(value: str) -> str:
         or ".." in path.parts
         or any(ord(character) < 32 for character in value)
     ):
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "path must be a relative repository path without '..' or control characters, "
             "at most 4096 UTF-8 bytes; for example, path='src/app.py'"
         )
@@ -168,6 +169,8 @@ def _call(operation: Any) -> Any:
     try:
         return operation()
     except ForgeError as exc:
+        # The adapter may have contacted the forge before failing, so this is a
+        # fault rather than a proven pre-execution policy refusal.
         raise ToolException(str(exc)) from exc
 
 
@@ -277,7 +280,7 @@ def pr_inline_review_comment(
     """Add one inline review comment to a right-side line on the bound PR head."""
     scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
     if isinstance(line, bool) or not isinstance(line, int) or line < 1 or line > 10_000_000:
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "line must be an integer from 1 through 10000000; for example, line=42"
         )
     safe_path = _path(path)
@@ -310,7 +313,7 @@ def pr_rerequest_review(
     """Re-request one reviewer on the pull request bound to this turn."""
     scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
     if _REVIEWER.fullmatch(reviewer) is None:
-        raise ToolException(
+        raise ToolPolicyRefusal(
             "reviewer must be a 1-39 character GitHub login containing letters, digits, "
             "or hyphens; for example, reviewer='octocat'"
         )
@@ -321,7 +324,7 @@ def pr_rerequest_review(
 def _escalation_state_path() -> Path:
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
-        raise ToolException("unsupported operation escalation requires MIMIR_HOME")
+        raise ToolPolicyRefusal("unsupported operation escalation requires MIMIR_HOME")
     return Path(home).resolve() / "state" / "unsupported_operations.json"
 
 

@@ -48,6 +48,7 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from ..models import AuthContext
+from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
     OperationDecision,
@@ -1359,11 +1360,17 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             result = handler(execution_request)
         except ToolException as exc:
-            end_protected_result_capture(capture_token)
-            result_labels = _result_labels_for_call(
-                tool_name, request, auth_context, authorization, failed=True,
-            )
-            _merge_result_labels(auth_context, result_labels)
+            provenance = end_protected_result_capture(capture_token)
+            if not isinstance(exc, ToolPolicyRefusal):
+                result_labels = _result_labels_for_call(
+                    tool_name,
+                    request,
+                    auth_context,
+                    authorization,
+                    provenance=provenance,
+                    failed=True,
+                )
+                _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -1604,11 +1611,17 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             result = await handler(execution_request)
         except ToolException as exc:
-            end_protected_result_capture(capture_token)
-            result_labels = _result_labels_for_call(
-                tool_name, request, auth_context, authorization, failed=True,
-            )
-            _merge_result_labels(auth_context, result_labels)
+            provenance = end_protected_result_capture(capture_token)
+            if not isinstance(exc, ToolPolicyRefusal):
+                result_labels = _result_labels_for_call(
+                    tool_name,
+                    request,
+                    auth_context,
+                    authorization,
+                    provenance=provenance,
+                    failed=True,
+                )
+                _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
