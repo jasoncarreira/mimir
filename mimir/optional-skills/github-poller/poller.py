@@ -1550,9 +1550,10 @@ def _check_own_changes_requested(
             f"{reviewers} requested changes and no commits have landed "
             f"since (head {head_sha[:8]}). Address the review feedback, "
             f"verify with the repo_test tool (not shell — this profile "
-            f"refuses pytest/uv; selectors are relative paths or "
-            f"path::node_id with no flags, or omit them to run the whole "
-            f"suite), push the fixes, and re-request review.\n{url}"
+            f"refuses test-runner commands; it runs the deployment's own "
+            f"configured test command. Selectors are repo-relative paths, "
+            f"optionally path::node_id, with no flags — or omit them to run "
+            f"the whole suite), push the fixes, and re-request review.\n{url}"
         )
         _emit(
             prompt,
