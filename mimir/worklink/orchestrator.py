@@ -19,7 +19,14 @@ import subprocess
 import warnings
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
-from .backends import BackendRegistry, WorkOrder, WorklinkConfig
+from .backends import (
+    BackendRegistry,
+    CheckoutShape,
+    ToolBackend,
+    WorkOrder,
+    WorklinkConfig,
+    checkout_shape_for_backend,
+)
 from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
@@ -38,7 +45,7 @@ from .run_state import (
     load_run_state,
     save_run_state,
 )
-from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout, create_worktree
+from .worktree import WorktreeLease, cleanup_worktree, create_isolated_checkout
 from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -418,31 +425,17 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 base=base,
-                backend_name=selected_name,
-                compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                backend=backend,
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
             )
-            # Coding CLIs derive project identity from git metadata. A linked
-            # worktree shares the parent's common git dir, which made OpenCode's
-            # effective project include repo/.worklink and exposed concurrent
-            # sibling attempts to repo-wide searches (#1019). Codex can similarly
-            # resolve back to the parent (#517). Shared-filesystem runs therefore
-            # need an independent repository rooted at the attempt checkout.
-            if (
-                selected_name in {"codex", "opencode"}
-                and compute.capabilities().shared_filesystem
-                and not lease.isolated_checkout
-            ):
+            if not lease.isolated_checkout:
                 _log_event(
-                    (
-                        "worklink_unsafe_codex_checkout"
-                        if selected_name == "codex"
-                        else "worklink_unsafe_opencode_checkout"
-                    ),
+                    "worklink_unsafe_backend_checkout",
                     issue_id=issue.issue_id,
                     attempt=record.attempt,
+                    backend=selected_name,
                     compute_backend=compute.name,
                 )
                 return WorklinkRunResult(
@@ -450,9 +443,9 @@ class WorklinkRunner:
                     None,
                     "blocked",
                     reason=(
-                        f"{selected_name} on a shared-filesystem compute must run in an "
-                        "isolated checkout (own .git), not a parent-pointing worktree, "
-                        "to avoid exposing other checkouts (chainlink #517/#1019)"
+                        f"{selected_name} must run in an isolated checkout (own .git), "
+                        "not a parent-pointing worktree, to avoid exposing other checkouts "
+                        "(chainlink #517/#1019)"
                     ),
                 )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
@@ -1053,8 +1046,7 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 attempt=record.attempt,
                 base=base,
-                backend_name="feature_factory",
-                compute_shared_filesystem=compute.capabilities().shared_filesystem,
+                backend=backend,
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
@@ -2065,23 +2057,15 @@ def _create_backend_checkout(
     issue_id: int,
     attempt: int,
     base: str,
-    backend_name: str,
-    compute_shared_filesystem: bool,
+    backend: ToolBackend,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     base_fetch: bool = True,
     event_logger: Callable[..., None] | None = None,
 ) -> WorktreeLease:
-    if backend_name in {"codex", "opencode"} and compute_shared_filesystem:
-        return create_isolated_checkout(
-            repo,
-            issue_id=issue_id,
-            attempt=attempt,
-            base=base,
-            base_fetch=base_fetch,
-            event_logger=event_logger,
-            runner=runner,
-        )
-    return create_worktree(
+    shape = checkout_shape_for_backend(backend)
+    if shape is not CheckoutShape.ISOLATED_CLONE:
+        raise WorklinkError(f"unsupported checkout shape for backend {backend.name}: {shape}")
+    return create_isolated_checkout(
         repo,
         issue_id=issue_id,
         attempt=attempt,

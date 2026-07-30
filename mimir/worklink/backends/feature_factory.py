@@ -30,7 +30,7 @@ import shlex
 from typing import ClassVar
 
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, RawResult, WorkOrder
+from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
 FACTORY_DIR = ".opencode/factory"
@@ -355,6 +355,7 @@ class FeatureFactoryBackend:
     bin: str = "feature-factory"
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     name: str = "feature_factory"
+    checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
     heartbeat_interval_s: int = 60
     poll_interval_s: int = 10
     ready_for_review: bool = True

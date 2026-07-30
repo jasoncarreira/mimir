@@ -160,10 +160,22 @@ class FakeBackend:
 def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str]):
     """Fake runner: chainlink JSON + all git/gh routed through here (no real git)."""
 
+    checkout = repo.parent / ".worklink" / repo.name / f"{issue_id}-1"
+
     def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         calls.append(args)
         if isinstance(args, str):
             return cp(args)
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            checkout.mkdir(parents=True, exist_ok=True)
+            (checkout / ".git" / "objects" / "info").mkdir(parents=True)
+            return cp(args)
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return cp(args, stdout="abc123\n")
+        if args == ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{checkout}\n")
+        if args == ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{checkout / '.git'}\n")
         if args[:1] == ["chainlink"]:
             if args[1:3] == ["issue", "show"]:
                 return cp(args, stdout=_issue_json(issue_id, labels))
@@ -594,8 +606,8 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
     def on_wait() -> None:
         seen["during"] = load_run_state(tmp_path, issue_id)
 
-    # Local/shared-filesystem path: build a worktree dir the backend writes into.
-    worktree = repo / ".worklink" / f"{issue_id}-1"
+    # Local/shared-filesystem path: build an isolated checkout the backend writes into.
+    worktree = repo.parent / ".worklink" / repo.name / f"{issue_id}-1"
 
     class LocalBackend(FakeBackend):
         async def interpret(self, order: WorkOrder, result: object) -> RawResult:
@@ -607,6 +619,16 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
         calls.append(args)
         if isinstance(args, str):
             return cp(args, stdout="ok\n")
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            worktree.mkdir(parents=True, exist_ok=True)
+            (worktree / ".git" / "objects" / "info").mkdir(parents=True)
+            return cp(args)
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return cp(args, stdout="abc123\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{worktree}\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{worktree / '.git'}\n")
         if args[:1] == ["chainlink"]:
             if args[1:3] == ["issue", "show"]:
                 return cp(args, stdout=_issue_json(issue_id, ["worklink:in-progress"]))
@@ -614,9 +636,6 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
-            if "worktree" in args and "add" in args:
-                worktree.mkdir(parents=True, exist_ok=True)
-                return cp(args)
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
             if "diff" in args and "--stat" in args:

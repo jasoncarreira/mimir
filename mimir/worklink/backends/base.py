@@ -9,6 +9,7 @@ evidence validation, and state transitions stay in shared Worklink plumbing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
@@ -23,6 +24,12 @@ class Caps:
     native_pr_creation: bool
     worktree_safe: bool
     quota_pool: str | None
+
+
+class CheckoutShape(StrEnum):
+    """Server-owned containment shape for a backend attempt checkout."""
+
+    ISOLATED_CLONE = "isolated_clone"
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,7 @@ class RawResult:
 
 class ToolBackend(Protocol):
     name: str
+    checkout_shape: CheckoutShape
 
     def capabilities(self) -> Caps: ...
 
@@ -110,3 +118,8 @@ class ToolBackend(Protocol):
     ) -> WorkSpec: ...
 
     async def interpret(self, order: WorkOrder, result: ComputeResult) -> RawResult: ...
+
+
+def checkout_shape_for_backend(backend: ToolBackend) -> CheckoutShape:
+    """Return a backend's shape, failing safely for older or third-party backends."""
+    return getattr(backend, "checkout_shape", CheckoutShape.ISOLATED_CLONE)
