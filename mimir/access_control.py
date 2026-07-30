@@ -3149,6 +3149,84 @@ def _live_untrusted_active_ingest(
     return result if isinstance(result, bool) else None
 
 
+def _ifc_blocking_source(
+    ifc_labels: Any,
+    auth_context: Any,
+    sink_category: SinkCategory,
+) -> Any:
+    """Return one source whose presence causes the recorded IFC refusal."""
+    from .models import InformationFlowLabels, Integrity, IntegrityEffect
+
+    current = ifc_labels
+    state = getattr(auth_context, "ifc_state", None)
+    get_current = getattr(state, "current", None)
+    if callable(get_current):
+        candidate = get_current(ifc_labels)
+        if isinstance(candidate, InformationFlowLabels):
+            current = candidate
+    if not isinstance(current, InformationFlowLabels) or not current.sources:
+        return None
+
+    if sink_category is SinkCategory.SAME_CHANNEL:
+        triggering = ChannelResourceAdapter._resolve_channel(
+            getattr(auth_context, "channel_id", None)
+        )
+        service = get_trusted_service_from_auth_context(auth_context)
+        effective_principal = (
+            f"service:{service.canonical}"
+            if service is not None
+            else getattr(auth_context, "canonical_principal", None)
+        )
+        domain = getattr(auth_context, "domain", None)
+        bridge = getattr(auth_context, "bridge_instance", None)
+        for source in current.sources:
+            incompatible = (
+                not source.is_complete
+                or effective_principal not in source.authorized_principals
+            )
+            if source.source_kind == "channel":
+                incompatible = incompatible or (
+                    source.principal != effective_principal
+                    or source.domain != domain
+                    or source.bridge_instance != bridge
+                    or ChannelResourceAdapter._resolve_channel(source.resource_id)
+                    != triggering
+                )
+            elif (
+                source.source_kind == "service"
+                and isinstance(source.domain, str)
+                and source.domain.startswith("channel")
+            ):
+                incompatible = incompatible or (
+                    source.bridge_instance != bridge
+                    or ChannelResourceAdapter._resolve_channel(source.resource_id)
+                    != triggering
+                )
+            elif source.source_kind == "protected_prompt":
+                incompatible = incompatible or (
+                    source.integrity != Integrity.TRUSTED
+                    and ChannelResourceAdapter._resolve_channel(source.resource_id)
+                    != triggering
+                )
+            elif source.source_kind not in {"service", "protected_tool"}:
+                incompatible = True
+            if incompatible:
+                return source
+
+    # This predicate is itself the gate for application egress and disables the
+    # trusted-operator exemptions for shell, file, spawn, and channel sinks.
+    for source in current.sources:
+        if (
+            source.integrity == Integrity.UNTRUSTED
+            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        ):
+            return source
+
+    # For other label-gated sinks, any one source is sufficient to introduce
+    # the label that makes the otherwise-unlabelled flow subject to the gate.
+    return current.sources[0]
+
+
 def _fixed_web_search_url() -> str | None:
     from .tools.web_search_destination import web_search_url
 
@@ -5046,6 +5124,7 @@ class ToolRegistry:
         target: str | None = None,
         requested_target: Any = None,
         arguments: dict[str, Any] | None = None,
+        ifc_labels: Any = None,
     ) -> None:
         """Emit shadow-decision audit log (when enabled)."""
         if not self._shadow_logging_enabled:
@@ -5090,6 +5169,30 @@ class ToolRegistry:
                 redacted_resolved_target = str(redacted_resolved_target)[
                     :_MAX_REQUESTED_TARGET_LENGTH
                 ]
+
+            if auth.reason and auth.reason.startswith("ifc_label_blocked:"):
+                try:
+                    source = _ifc_blocking_source(
+                        ifc_labels,
+                        auth_context,
+                        get_sink_category(auth.tool_name),
+                    )
+                    if source is not None:
+                        resource_id = redact_payload(source.resource_id)
+                        fields["ifc_source_scope"] = "causing_source"
+                        fields["ifc_source"] = {
+                            "source_kind": source.source_kind,
+                            "domain": source.domain,
+                            "integrity": source.integrity,
+                            "integrity_effect": source.integrity_effect,
+                            "resource_id": (
+                                str(resource_id)[:_MAX_REQUESTED_TARGET_LENGTH]
+                                if resource_id is not None else None
+                            ),
+                        }
+                except Exception as exc:
+                    # Diagnostics are best-effort and cannot affect authorization.
+                    log.warning("IFC source audit classification failed: %s", exc)
 
             fields.update({
                 # Shadow decisions cover both compatibility bypasses and trusted
@@ -5236,6 +5339,7 @@ class ToolRegistry:
                 self._emit_shadow_decision(
                     sink_check, auth_context=auth_context, target=sink_target,
                     requested_target=target_channel,
+                    ifc_labels=ifc_labels,
                 )
 
         decision = preliminary_decision
