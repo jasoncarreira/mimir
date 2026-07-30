@@ -9,7 +9,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..models import AuthContext, RepoPRAction, RepoReviewState
+from ..models import AuthContext, RepoReviewState
 from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
@@ -102,8 +102,6 @@ def repo_checkout(
 ) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
     state = _state(runtime, repository, pull_request)
-    if RepoPRAction.CHECKOUT.value not in state.action_scope.allowed_operations:
-        raise ToolPolicyRefusal("repository checkout rejected: scope does not grant PR checkout")
     try:
         lease = create_pr_checkout_lease(
             state.action_scope,

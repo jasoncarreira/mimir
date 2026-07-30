@@ -19,7 +19,7 @@ from langchain_core.tools.base import create_schema_from_function
 from ..forge import ForgeClient, ForgeError, ReviewVerdict
 from ..redaction import redact_text
 from ..models import (
-    AuthContext, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+    AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
 )
 from .refusals import ToolPolicyRefusal
 
@@ -51,15 +51,12 @@ def set_forge_client(client: ForgeClient | None) -> None:
 
 def _scope(
     runtime: ToolRuntime[AuthContext] | None,
-    action: RepoPRAction | None,
     repository: str,
     pull_request: int,
 ) -> RepoPRActionScope:
-    state = resolve_review_state(runtime, repository, pull_request)
-    scope = state.action_scope
-    if action is not None and action.value not in scope.allowed_operations:
-        raise ToolPolicyRefusal(f"pull-request operation rejected: {action.value} not granted")
-    return scope
+    # PR action policy is enforced by access_control.authorize_repo_pr_tool.
+    # This layer only resolves the server-issued scope used for safe execution.
+    return resolve_review_state(runtime, repository, pull_request).action_scope
 
 
 def resolve_review_state(
@@ -181,7 +178,7 @@ def pr_metadata(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Read metadata for an exact pull request authorized by this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return asdict(_call(lambda: _client(scope).get_pull_request(scope)))
 
 
@@ -192,7 +189,7 @@ def pr_files(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded file projections for the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_files(scope))]
 
 
@@ -203,7 +200,7 @@ def pr_diff(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Read the bounded unified diff for the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return _call(lambda: _client(scope).get_diff(scope))
 
 
@@ -214,7 +211,7 @@ def pr_checks(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_checks(scope))]
 
 
@@ -225,7 +222,7 @@ def pr_reviews(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded submitted-review projections for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_reviews(scope))]
 
 
@@ -236,7 +233,7 @@ def pr_comments(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded conversation and inline comments for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return [asdict(item) for item in _call(lambda: _client(scope).list_comments(scope))]
 
 
@@ -247,7 +244,7 @@ def pr_review_requests(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
     """List bounded pending review requests for the bound pull request."""
-    scope = _scope(runtime, RepoPRAction.INSPECT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     return [
         asdict(item)
         for item in _call(lambda: _client(scope).list_review_requests(scope))
@@ -263,7 +260,7 @@ def pr_submit_review(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Submit one approve, comment, or request-changes review on the bound PR."""
-    scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).submit_review(scope, verdict, safe_body)))
 
@@ -278,7 +275,7 @@ def pr_inline_review_comment(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Add one inline review comment to a right-side line on the bound PR head."""
-    scope = _scope(runtime, RepoPRAction.PR_REVIEW, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     if isinstance(line, bool) or not isinstance(line, int) or line < 1 or line > 10_000_000:
         raise ToolPolicyRefusal(
             "line must be an integer from 1 through 10000000; for example, line=42"
@@ -298,7 +295,7 @@ def pr_comment(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Add one conversation comment to the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.PR_COMMENT, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
 
@@ -311,7 +308,7 @@ def pr_rerequest_review(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Re-request one reviewer on the pull request bound to this turn."""
-    scope = _scope(runtime, RepoPRAction.PR_REREQUEST, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     if _REVIEWER.fullmatch(reviewer) is None:
         raise ToolPolicyRefusal(
             "reviewer must be a 1-39 character GitHub login containing letters, digits, "
@@ -430,7 +427,7 @@ def unsupported_operation(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Escalate a bound-PR need in prose, including operations already attempted."""
-    scope = _scope(runtime, None, repository, pull_request)
+    scope = _scope(runtime, repository, pull_request)
     safe_description = _bounded_escalation_text(
         description,
         fallback="The caller did not provide a description of the unsupported operation.",
