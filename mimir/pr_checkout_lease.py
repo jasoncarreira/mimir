@@ -166,7 +166,8 @@ def create_pr_checkout_lease(
         )
         _run(
             runner,
-            ["git", "-C", str(staging), "fetch", "--no-tags", "origin", scope.destination_ref],
+            ["git", "-C", str(staging), "fetch", "--no-tags", "origin",
+             scope.checkout_ref or scope.destination_ref],
             "PR head fetch failed",
         )
         actual_head = _run(

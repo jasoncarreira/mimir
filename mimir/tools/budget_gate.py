@@ -44,6 +44,7 @@ from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from ..models import AuthContext
@@ -66,6 +67,33 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
 
 log = logging.getLogger(__name__)
+
+_STANDING_REVIEW_TOOLS = frozenset({
+    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_comments", "pr_review_requests", "pr_submit_review",
+    "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+    "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
+    "repo_diff", "repo_unmerged",
+})
+
+
+def _resolve_standing_review(
+    tool_name: str,
+    auth_context: AuthContext | None,
+    arguments: dict[str, Any],
+) -> str | None:
+    """Resolve safe review authority before resource and IFC authorization."""
+    if tool_name not in _STANDING_REVIEW_TOOLS or auth_context is None:
+        return None
+    from .forge import resolve_review_state_for_context
+
+    try:
+        resolve_review_state_for_context(
+            auth_context, arguments.get("repository"), arguments.get("pull_request"),
+        )
+    except ToolException as exc:
+        return str(exc)
+    return None
 
 
 # Tools exempt from the per-turn cap. They neither consume a slot nor
@@ -342,6 +370,15 @@ def _extract_sink_target(
             if registry is not None and hasattr(registry, "resolve")
             else None
         )
+        if state is None:
+            discovered = getattr(auth_context, "server_discovered_pr_states", None)
+            state = (
+                discovered.resolve(args.get("repository"), args.get("pull_request"))
+                if discovered is not None
+                and isinstance(args.get("repository"), str)
+                and isinstance(args.get("pull_request"), int)
+                else None
+            )
         if state is None:
             return None
         scope = state.action_scope
@@ -1145,9 +1182,18 @@ class BudgetGateMiddleware(AgentMiddleware):
             request, tool_name, auth_context,
         )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+        validated_arguments = _validated_arguments(request)
+        review_denial = _resolve_standing_review(
+            tool_name, auth_context, validated_arguments,
+        )
+        if review_denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=review_denial, denied=True)
+            return ToolMessage(
+                content=review_denial, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
+            )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
-        validated_arguments = _validated_arguments(request)
 
         for target_channel in target_channels:
             authorization, admin_denial = _authorize_tool_call(
@@ -1361,9 +1407,18 @@ class BudgetGateMiddleware(AgentMiddleware):
             request, tool_name, auth_context,
         )
         request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+        validated_arguments = _validated_arguments(request)
+        review_denial = await asyncio.to_thread(
+            _resolve_standing_review, tool_name, auth_context, validated_arguments,
+        )
+        if review_denial is not None:
+            _emit_tool_call_sync(tool_name, ok=False, error=review_denial, denied=True)
+            return ToolMessage(
+                content=review_denial, tool_call_id=_tool_call_id(request),
+                name=tool_name, status="error",
+            )
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
-        validated_arguments = _validated_arguments(request)
 
         for target_channel in target_channels:
             authorization, admin_denial = _authorize_tool_call(

@@ -68,6 +68,7 @@ def test_offline_canary_covers_all_scenarios_and_has_observed_primary_evidence()
         ({"same_repository": False}, "refuse", "fork_refused"),
         ({"operation": "repo_push", "head_is_current": False}, "refuse", "stale_scope"),
         ({"operation": "pr_submit_review"}, "refuse", "scope_action_denied"),
+        ({"workflow": "review", "operation": "pr_rerequest_review"}, "refuse", "scope_action_denied"),
         ({"operation": "pr_resolve_thread", "supported": False}, "escalate", "unsupported_operation"),
         ({"operation": "repo_stage", "conflict_paths": ("conflict.py",), "requested_paths": ("other.py",)}, "refuse", "unproven_conflict_path"),
     ],

@@ -40,7 +40,13 @@ _OPERATION_ACTION = {
     "repo_commit": RepoPRAction.COMMIT.value,
     "repo_push": RepoPRAction.PUSH.value,
 }
-_REVIEW_ACTIONS = frozenset({RepoPRAction.INSPECT.value, RepoPRAction.PR_REVIEW.value})
+_REVIEW_ACTIONS = frozenset({
+    RepoPRAction.INSPECT.value,
+    RepoPRAction.CHECKOUT.value,
+    RepoPRAction.TEST.value,
+    RepoPRAction.PR_REVIEW.value,
+    RepoPRAction.PR_COMMENT.value,
+})
 _REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,

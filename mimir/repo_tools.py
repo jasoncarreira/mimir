@@ -617,7 +617,8 @@ class RepoGitTools:
             self._require(RepoPRAction.CHECKOUT)
             lease = self._state.checkout_lease
             for ref, expected, identity in (
-                (self._scope.destination_ref, self._scope.observed_head_sha, "head"),
+                (self._scope.checkout_ref or self._scope.destination_ref,
+                 self._scope.observed_head_sha, "head"),
                 (f"refs/heads/{self._scope.base_ref}", lease.base_sha, "base"),
             ):
                 self._command((
