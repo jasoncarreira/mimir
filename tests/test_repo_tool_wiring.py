@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,13 +18,14 @@ from mimir.models import (
     InformationFlowLabels,
     RepoPRAction,
     RepoPRActionScope,
+    RepoPRScopeRegistry,
     RepoReviewState,
     SourceLabel,
 )
-from mimir.tools.repo import repo_cleanup, repo_status
+from mimir.tools.repo import repo_checkout, repo_cleanup, repo_status
 
 
-def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
+def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo="owner/repo",
@@ -32,7 +34,7 @@ def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
         principal="mimir-bot",
         event_type="pr_changes_requested_stale",
         allowed_operations=frozenset(action.value for action in actions),
-        pr_number=7,
+        pr_number=number,
         head_repo="owner/repo",
         head_remote="origin",
         destination_ref="refs/heads/fix",
@@ -42,8 +44,9 @@ def _scope(*actions: RepoPRAction) -> RepoPRActionScope:
     )
 
 
-def _auth(scope: RepoPRActionScope) -> AuthContext:
-    state = RepoReviewState(scope)
+def _auth(scope: RepoPRActionScope, *additional: RepoPRActionScope) -> AuthContext:
+    states = tuple(RepoReviewState(item) for item in (scope, *additional))
+    state = states[0]
     labels = InformationFlowLabels().with_source(SourceLabel(
         principal="service:heartbeat",
         domain="channel",
@@ -72,8 +75,9 @@ def _auth(scope: RepoPRActionScope) -> AuthContext:
         service_authority=service,
         enforcement_enabled=True,
         ifc_labels=labels,
-        repo_review_state=state,
-        repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+        repo_review_state=state if len(states) == 1 else None,
+        repo_pr_action_scope=scope if len(states) == 1 else None,
     )
 
 
@@ -84,25 +88,60 @@ def test_repo_wrapper_refuses_missing_immutable_scope() -> None:
         interactivity=None,
     ))
 
-    with pytest.raises(ToolException, match="no immutable review scope"):
-        repo_status.func(runtime=runtime)
+    with pytest.raises(ToolException, match="no authorized pull requests"):
+        repo_status.func(
+            repository="owner/repo", pull_request=7, runtime=runtime,
+        )
 
 
-def test_repo_wrapper_refuses_mismatched_state_and_scope() -> None:
+def test_repo_wrapper_refuses_unlisted_pull_request() -> None:
     inspect = _scope(RepoPRAction.INSPECT)
-    other = _scope(RepoPRAction.INSPECT, RepoPRAction.CHECKOUT)
     context = _auth(inspect)
-    object.__setattr__(context, "repo_pr_action_scope", other)
 
-    with pytest.raises(ToolException, match="no immutable review scope"):
-        repo_status.func(runtime=SimpleNamespace(context=context))
+    with pytest.raises(ToolException, match="not authorized for this turn"):
+        repo_status.func(
+            repository="owner/repo", pull_request=8,
+            runtime=SimpleNamespace(context=context),
+        )
 
 
 def test_repo_cleanup_refuses_without_active_lease() -> None:
     context = _auth(_scope(RepoPRAction.CHECKOUT))
 
     with pytest.raises(ToolException, match="no active checkout lease"):
-        repo_cleanup.func(runtime=SimpleNamespace(context=context))
+        repo_cleanup.func(
+            repository="owner/repo", pull_request=7,
+            runtime=SimpleNamespace(context=context),
+        )
+
+
+def test_checkout_proof_is_isolated_to_named_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _scope(RepoPRAction.CHECKOUT, RepoPRAction.INSPECT)
+    second = _scope(RepoPRAction.CHECKOUT, RepoPRAction.INSPECT, number=8)
+    context = _auth(first, second)
+    registry = context.repo_pr_scope_registry
+    assert registry is not None
+
+    def fake_checkout(scope, *, owner, review_state):
+        lease = SimpleNamespace(
+            path=tmp_path / str(scope.pr_number), scope_id=scope.scope_id,
+            head_sha=scope.observed_head_sha, owner=owner, is_active=True,
+        )
+        review_state.attach_checkout_lease(lease)
+        return lease
+
+    monkeypatch.setattr("mimir.tools.repo.create_pr_checkout_lease", fake_checkout)
+    runtime = SimpleNamespace(context=context)
+    repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
+
+    first_state = registry.resolve("owner/repo", 7)
+    second_state = registry.resolve("owner/repo", 8)
+    assert first_state is not None and first_state.checked_out is True
+    assert second_state is not None and second_state.checked_out is False
+    with pytest.raises(ToolException, match="inactive_checkout"):
+        repo_status.func(repository="owner/repo", pull_request=8, runtime=runtime)
 
 
 def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink() -> None:
