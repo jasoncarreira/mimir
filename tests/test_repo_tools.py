@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
-from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 
@@ -353,7 +353,10 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     )
 
 
-def test_https_push_uses_scope_bound_proxy_without_credential_leak(repo_tools) -> None:
+@pytest.mark.parametrize("push_fails", [False, True])
+def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
+    repo_tools, monkeypatch: pytest.MonkeyPatch, push_fails: bool,
+) -> None:
     origin, _source, scope, old_state, _tools = repo_tools
     https_scope = replace(scope, canonical_origin="https://github.com/owner/repo.git")
     lease = replace(
@@ -367,28 +370,73 @@ def test_https_push_uses_scope_bound_proxy_without_credential_leak(repo_tools) -
     state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
     (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     token = "never-expose-this-token"
+    monkeypatch.setenv("GITHUB_TOKEN", token)
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
     def runner(argv, *, env, timeout, output_limit):
         calls.append((argv, env))
+        if "push" in argv and push_fails:
+            return GitProcessResult(1, stderr=f"upstream rejected {token}")
+        local_argv = tuple(
+            str(origin)
+            if arg == https_scope.canonical_origin
+            else "protocol.file.allow=always"
+            if arg == "protocol.allow=never"
+            else arg
+            for arg in argv
+        )
         return _bounded_subprocess_runner(
-            argv, env=env, timeout=timeout, output_limit=output_limit,
+            local_argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
-    tools = RepoGitTools(
-        state,
-        runner=runner,
-        push_proxy_factory=lambda bound_scope, head: nullcontext(str(origin)),
-    )
+    tools = RepoGitTools(state, runner=runner)
     tools.execute(GitCommit(("push.txt",), "push mutation"))
-    assert tools.execute(GitPush()).ok
+    error = ""
+    events: list[str] = []
+    try:
+        result = tools.execute(GitPush())
+        assert push_fails is False
+        assert result.ok
+        events.append(repr(result))
+    except GitRefusal as exc:
+        assert push_fails is True
+        error = str(exc)
+        events.append(error)
+        assert exc.code == "git_failed"
+        assert "upstream rejected [REDACTED]" in error
 
-    push = next(argv for argv, _env in calls if "push" in argv)
-    assert push[-2:] == (str(origin), f"HEAD:{https_scope.destination_ref}")
-    assert token not in "\0".join(push)
-    assert all(token not in "\0".join(env.values()) for _argv, env in calls)
+    network_calls = [(argv, env) for argv, env in calls if "ls-remote" in argv or "push" in argv]
+    assert ["ls-remote" in argv for argv, _env in network_calls] == [True, False]
+    authorization = "Authorization: Basic " + base64.b64encode(
+        f"x-access-token:{token}".encode(),
+    ).decode()
+    for argv, env in network_calls:
+        assert https_scope.canonical_origin in argv
+        assert token not in "\0".join(argv)
+        assert "credential.helper=" in argv
+        assert "http.followRedirects=false" in argv
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == (
+            f"http.{https_scope.canonical_origin}.extraheader"
+        )
+        assert env["GIT_CONFIG_VALUE_0"] == authorization
+        assert env["GIT_ASKPASS"] == "/bin/false"
+    assert all(
+        "GIT_CONFIG_COUNT" not in env
+        for argv, env in calls
+        if "ls-remote" not in argv and "push" not in argv
+    )
+    assert token not in error
+    assert all(token not in event for event in events)
     assert "credential" not in _git(lease.path, "config", "--local", "--list")
-    assert _git(origin, "rev-parse", https_scope.destination_ref) == _git(lease.path, "rev-parse", "HEAD")
+    if push_fails:
+        assert _git(origin, "rev-parse", https_scope.destination_ref) != _git(
+            lease.path, "rev-parse", "HEAD",
+        )
+    else:
+        assert _git(origin, "rev-parse", https_scope.destination_ref) == _git(
+            lease.path, "rev-parse", "HEAD",
+        )
 
 
 def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) -> None:
@@ -410,12 +458,43 @@ def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) ->
 
     assert refusal.value.code == "git_failed"
     assert str(refusal.value) == (
-        f"push failed; local commit {stranded_head} remains unpushed in preserved "
+        "push failed: upstream diagnostic could contain sensitive data; "
+        f"local commit {stranded_head} remains unpushed in preserved "
         f"checkout lease {lease.path.resolve()}"
     )
-    assert "upstream diagnostic" not in str(refusal.value)
+    assert "upstream diagnostic" in str(refusal.value)
     assert lease.is_active
     assert _git(lease.path, "rev-parse", "HEAD") == stranded_head
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/other/repo.git",
+        "https://example.com/owner/repo.git",
+        "https://user@github.com/owner/repo.git",
+        "https://github.com:443/owner/repo.git",
+        "https://github.com/owner/repo.git?redirect=attacker",
+    ],
+)
+def test_push_credential_is_available_only_for_exact_canonical_github_origin(
+    repo_tools, monkeypatch: pytest.MonkeyPatch, origin: str,
+) -> None:
+    _local_origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, canonical_origin=origin)
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=origin,
+        scope_id=altered.scope_id,
+    )
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state)._push_remote()
+
+    assert refusal.value.code == "push_auth_unavailable"
 
 
 def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatch) -> None:
@@ -521,6 +600,28 @@ def test_repo_url_rewrite_config_is_refused_before_network(repo_tools) -> None:
     _git(state.checkout_lease.path, "config", "url.file:///tmp/attacker.insteadOf", "unused:")
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitFetch())
+    assert refusal.value.code == "unsafe_repo_config"
+
+
+def test_repo_url_rewrite_config_is_refused_before_authenticated_push(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(scope, canonical_origin="https://github.com/owner/repo.git")
+    lease = replace(
+        old_state.checkout_lease,
+        canonical_origin=altered.canonical_origin,
+        scope_id=altered.scope_id,
+    )
+    _git(lease.path, "remote", "set-url", "origin", altered.canonical_origin)
+    _git(lease.path, "config", "url.https://attacker.invalid/.insteadOf", altered.canonical_origin)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state).execute(GitPush())
+
     assert refusal.value.code == "unsafe_repo_config"
 
 
