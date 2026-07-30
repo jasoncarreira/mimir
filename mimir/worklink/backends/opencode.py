@@ -13,7 +13,7 @@ from typing import Sequence
 from ...config import model_spec_at_call_time
 from ...opencode_config import resolve_opencode_invocation
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, RawResult, WorkOrder, blocked_reason_from_output
+from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from_output
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
@@ -33,6 +33,7 @@ class OpenCodeBackend:
     extra_args: Sequence[str] = field(default_factory=tuple)
     bash_allowlist: Sequence[str] = field(default_factory=lambda: DEFAULT_BASH_ALLOWLIST)
     name: str = "opencode"
+    checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
 
     def capabilities(self) -> Caps:
         return Caps(

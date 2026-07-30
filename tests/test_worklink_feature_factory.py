@@ -952,7 +952,7 @@ def _drive(
     home.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
-    worktree = repo / ".worklink" / f"{ISSUE_ID}-1"
+    worktree = repo.parent / ".worklink" / repo.name / f"{ISSUE_ID}-1"
     gh_calls: list[list[str]] = []
     comments: list[list[str]] = []
 
@@ -960,6 +960,16 @@ def _drive(
         if isinstance(args, str):
             return _cp()
         args = list(args)
+        if args[:4] == ["git", "clone", "--local", "--quiet"]:
+            worktree.mkdir(parents=True, exist_ok=True)
+            (worktree / ".git" / "objects" / "info").mkdir(parents=True)
+            return _cp()
+        if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
+            return _cp(stdout="abc123\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
+            return _cp(stdout=f"{worktree}\n")
+        if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:
+            return _cp(stdout=f"{worktree / '.git'}\n")
         if args[:3] == ["chainlink", "issue", "show"]:
             return _cp(stdout=_issue_json())
         if args[:3] == ["chainlink", "issue", "comment"]:
@@ -967,9 +977,6 @@ def _drive(
             return _cp()
         if args[:2] == ["gh", "pr"]:
             gh_calls.append(args)
-            return _cp()
-        if args[:5] == ["git", "-C", str(repo), "worktree", "add"]:
-            worktree.mkdir(parents=True, exist_ok=True)
             return _cp()
         if args[:4] == ["git", "-C", str(repo), "config"]:
             return _cp(stdout="git@github.com:o/r.git\n")
