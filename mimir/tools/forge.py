@@ -92,8 +92,8 @@ def resolve_review_state_for_context(
             "must be a positive integer; for example, repository='owner/repo', pull_request=17"
         )
     from ..access_control import (
-        create_server_discovered_review_scope,
         is_configured_github_repo,
+        resolve_server_discovered_review_scope,
     )
 
     if not is_configured_github_repo(repository):
@@ -109,11 +109,12 @@ def resolve_review_state_for_context(
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
-    scope = create_server_discovered_review_scope(repository, snapshot)
+    resolution = resolve_server_discovered_review_scope(repository, snapshot)
+    scope = resolution.scope
     if scope is None or scope.pr_number != pull_request:
-        raise ToolPolicyRefusal(
+        raise ToolPolicyRefusal(resolution.refusal_reason or (
             "pull-request operation rejected: live pull request is closed or invalid"
-        )
+        ))
     state = RepoReviewState(scope)
     return cache.remember(state) if cache is not None else state
 

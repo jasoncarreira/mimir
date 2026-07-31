@@ -36,7 +36,7 @@ from .http_ingress import strip_bridge_authority_extra
 from .identities import IdentityResolver
 from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
-from .access_control import builtin_trigger_service_principal
+from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
@@ -1307,6 +1307,8 @@ def build_app(config: Config) -> web.Application:
     web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
+        for alert in await asyncio.to_thread(repo_binding_startup_alerts):
+            await log_event("github_repo_binding_attention_required", **alert)
         if activity_panel is not None:
             activity_panel.start()
         # PR 4b (docs/internal/MIMIR_HOME_GIT_TRACKING.md): idempotent bootstrap. Runs

@@ -304,8 +304,10 @@ def test_review_scope_has_no_event_or_requested_reviewer_gate_and_exact_safe_act
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(
         access_control,
-        "_canonical_repo_binding",
-        lambda repo: ("/tmp/repo", "ssh://forge.invalid/owner/repo"),
+        "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            ("/tmp/repo", "ssh://forge.invalid/owner/repo"), ("/tmp/repo",), 1,
+        ),
     )
     fields = dict(
         provenance="poller_payload",
@@ -353,8 +355,11 @@ def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(
-        access_control, "_canonical_repo_binding",
-        lambda repo: ("/server/configured/repo", "git@github.com:owner/repo.git"),
+        access_control, "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            ("/server/configured/repo", "git@github.com:owner/repo.git"),
+            ("/server/configured/repo",), 1,
+        ),
     )
     monkeypatch.setattr(
         "mimir.tools.repo.RepoProjectTests",
@@ -418,8 +423,11 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(
-        access_control, "_canonical_repo_binding",
-        lambda repo: ("/server/configured/repo", "git@github.com:owner/repo.git"),
+        access_control, "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            ("/server/configured/repo", "git@github.com:owner/repo.git"),
+            ("/server/configured/repo",), 1,
+        ),
     )
     context = AuthContext(
         principal="operator", canonical_principal="operator", roles=("admin",),
@@ -447,6 +455,132 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
     assert called is True
     assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is not None
     assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+@pytest.mark.parametrize(
+    ("match_count", "mode"),
+    [(0, "zero roots matched"), (2, "ambiguous: 2 roots matched")],
+)
+def test_standing_review_distinguishes_repo_binding_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    match_count: int,
+    mode: str,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control,
+        "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            None, ("/configured/root-a", "/configured/root-b"), match_count,
+        ),
+    )
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+    )
+    runtime = ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="binding-refusal", store=None,
+    )
+
+    with pytest.raises(ToolException) as refused:
+        pr_metadata.func(
+            repository="owner/repo", pull_request=1300, runtime=runtime,
+        )
+
+    reason = str(refused.value)
+    assert "no unique writable root matched repository 'owner/repo'" in reason
+    assert mode in reason
+    assert "MIMIR_FILE_TOOL_ROOTS" in reason
+    assert "checkout directory itself, not its parent" in reason
+    assert "/configured/" not in reason
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        NormalizedPullRequestSnapshot(
+            state="closed", number=1300, author="author",
+            head_repo="contributor/repo", head_remote="source",
+            head_ref="change", head_sha="a" * 40,
+            base_ref="main", base_sha="b" * 40,
+        ),
+        NormalizedPullRequestSnapshot(
+            state="open", number=1300, author="author",
+            head_repo="contributor/repo", head_remote="source",
+            head_ref="invalid..branch", head_sha="a" * 40,
+            base_ref="main", base_sha="b" * 40,
+        ),
+    ],
+    ids=["closed", "field-predicate"],
+)
+def test_pr_state_failures_keep_existing_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: NormalizedPullRequestSnapshot,
+) -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control,
+        "_canonical_repo_binding_resolution",
+        lambda _repo: pytest.fail("PR-state failure reached repository binding"),
+    )
+
+    resolution = access_control.resolve_server_discovered_review_scope(
+        "owner/repo", snapshot,
+    )
+
+    assert resolution.scope is None
+    assert resolution.refusal_reason == (
+        "pull-request operation rejected: live pull request is closed or invalid"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_refusal_event_identifies_repository_and_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control,
+        "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(None, ("/configured",), 0),
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator",
+        interactivity=None, enforcement_enabled=True,
+        ifc_labels=InformationFlowLabels(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": "pr_reviews",
+            "args": {"repository": "owner/repo", "pull_request": 1300},
+            "id": "binding-refusal", "type": "tool_call",
+        },
+        tool=None, state=None, runtime=Runtime(context=context),
+    )
+
+    async def handler(_request):
+        pytest.fail("refused request reached handler")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert result.status == "error"
+    tool_call = next(fields for kind, fields in events if kind == "tool_call")
+    assert tool_call["repository"] == "owner/repo"
+    assert tool_call["pull_request"] == 1300
+    assert tool_call["denied"] is True
 
 
 def test_body_and_inline_path_injection_are_rejected_before_adapter() -> None:

@@ -826,6 +826,19 @@ _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
 
+@dataclass(frozen=True)
+class RepoBindingResolution:
+    binding: tuple[str, str] | None
+    configured_roots: tuple[str, ...]
+    match_count: int
+
+
+@dataclass(frozen=True)
+class RepoPRScopeResolution:
+    scope: Any = None
+    refusal_reason: str | None = None
+
+
 def _configured_scope_github_repos() -> frozenset[str]:
     return frozenset(
         f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
@@ -841,16 +854,17 @@ def is_configured_github_repo(repo: object) -> bool:
     )
 
 
-def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
-    """Resolve one configured GitHub repo to its unique writable root and origin."""
+def _canonical_repo_binding_resolution(repo: str) -> RepoBindingResolution:
+    """Probe configured writable roots without exposing unconfigured paths."""
     repo = repo.lower()
+    configured_roots = tuple(str(root) for root in _configured_repo_write_roots())
     if repo not in _configured_scope_github_repos():
-        return None
+        return RepoBindingResolution(None, configured_roots, 0)
     git = _maintenance_resolved_pin("git")
     if git is None:
-        return None
+        return RepoBindingResolution(None, configured_roots, 0)
     matching_roots: list[tuple[Path, str]] = []
-    for configured in _configured_repo_write_roots():
+    for configured in map(Path, configured_roots):
         try:
             root = configured.resolve(strict=True)
             result = subprocess.run(
@@ -870,12 +884,30 @@ def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
         if result.returncode == 0 and remote_repo is not None and remote_repo.lower() == repo:
             matching_roots.append((root, observed_origin))
     if len(matching_roots) != 1:
-        return None
+        return RepoBindingResolution(None, configured_roots, len(matching_roots))
     root, observed_origin = matching_roots[0]
-    return str(root), observed_origin
+    return RepoBindingResolution((str(root), observed_origin), configured_roots, 1)
 
 
-def _repo_pr_scope(
+def _canonical_repo_binding(repo: str) -> tuple[str, str] | None:
+    """Resolve one configured GitHub repo to its unique writable root and origin."""
+    return _canonical_repo_binding_resolution(repo).binding
+
+
+def _repo_binding_refusal_reason(repo: str, match_count: int) -> str:
+    mode = (
+        "zero roots matched"
+        if match_count == 0
+        else f"ambiguous: {match_count} roots matched"
+    )
+    return (
+        f"pull-request operation rejected: no unique writable root matched repository "
+        f"'{repo}' in MIMIR_FILE_TOOL_ROOTS ({mode}); configure exactly one :rw "
+        "entry for the checkout directory itself, not its parent"
+    )
+
+
+def _repo_pr_scope_resolution(
     *,
     provenance: str,
     repo: object,
@@ -888,8 +920,8 @@ def _repo_pr_scope(
     head_sha: object,
     base_ref: object,
     base_sha: object,
-) -> Any:
-    """Validate a complete observed PR snapshot and issue its closed scope."""
+) -> RepoPRScopeResolution:
+    """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     is_remediation = event_type == "pr_changes_requested_stale"
     if (
@@ -912,16 +944,22 @@ def _repo_pr_scope(
         or not isinstance(base_sha, str)
         or _GITHUB_SHA_PATTERN.fullmatch(base_sha) is None
     ):
-        return None
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
     repo = repo.lower()
     head_repo = head_repo.lower()
-    binding = _canonical_repo_binding(repo)
-    if binding is None:
-        return None
-    root, origin = binding
+    binding_resolution = _canonical_repo_binding_resolution(repo)
+    if binding_resolution.binding is None:
+        return RepoPRScopeResolution(
+            refusal_reason=_repo_binding_refusal_reason(
+                repo, binding_resolution.match_count,
+            )
+        )
+    root, origin = binding_resolution.binding
     from .models import RepoPRActionScope
 
-    return RepoPRActionScope(
+    return RepoPRScopeResolution(scope=RepoPRActionScope(
         provenance=provenance,
         canonical_repo=repo,
         canonical_root=root,
@@ -939,7 +977,29 @@ def _repo_pr_scope(
         base_ref=base_ref,
         observed_base_sha=base_sha.lower(),
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
-    )
+    ))
+
+
+def _repo_pr_scope(**kwargs: Any) -> Any:
+    """Compatibility wrapper returning only an issued scope or ``None``."""
+    return _repo_pr_scope_resolution(**kwargs).scope
+
+
+def repo_binding_startup_alerts() -> tuple[dict[str, Any], ...]:
+    """Return one non-fatal operator alert for each unbound configured repo."""
+    alerts: list[dict[str, Any]] = []
+    for repo in sorted(_configured_scope_github_repos()):
+        resolution = _canonical_repo_binding_resolution(repo)
+        if resolution.binding is not None:
+            continue
+        alerts.append({
+            "repository": repo,
+            "probed_roots": list(resolution.configured_roots),
+            "match_count": resolution.match_count,
+            "error": _repo_binding_refusal_reason(repo, resolution.match_count),
+            "operator_visible": True,
+        })
+    return tuple(alerts)
 
 
 def create_server_discovered_heartbeat_scope(
@@ -980,6 +1040,33 @@ def create_server_discovered_review_scope(
     ):
         return None
     return _repo_pr_scope(
+        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        repo=repo,
+        principal=pull_request.author,
+        event_type="pr_review",
+        number=pull_request.number,
+        head_repo=pull_request.head_repo,
+        head_remote=pull_request.head_remote,
+        head_ref=pull_request.head_ref,
+        head_sha=pull_request.head_sha,
+        base_ref=pull_request.base_ref,
+        base_sha=pull_request.base_sha,
+    )
+
+
+def resolve_server_discovered_review_scope(
+    repo: str,
+    pull_request: NormalizedPullRequestSnapshot,
+) -> RepoPRScopeResolution:
+    """Resolve standing review authority with an operator-actionable refusal."""
+    if (
+        not isinstance(pull_request, NormalizedPullRequestSnapshot)
+        or pull_request.state != "open"
+    ):
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
+    return _repo_pr_scope_resolution(
         provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
         repo=repo,
         principal=pull_request.author,
