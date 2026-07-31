@@ -58,7 +58,12 @@ class Session:
 
 @pytest.fixture(autouse=True)
 def reset_verified_identity(monkeypatch) -> None:
+    from mimir.tools import forge as forge_tools
+
     monkeypatch.setattr(github_module, "_verified_identity", None)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_callback", None)
 
 
 def test_metadata_target_and_auth_are_adapter_constructed() -> None:
@@ -146,6 +151,22 @@ def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None
     ]
 
 
+def test_midflight_forge_identity_change_returns_policy_refusal_and_latches(monkeypatch) -> None:
+    from mimir.tools import forge as forge_tools
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    error = github_module.GitHubIdentityVerificationError(
+        "github identity verification cache does not match active credential",
+        declared_login="reviewer",
+        authenticated_login="reviewer",
+    )
+
+    with pytest.raises(ToolPolicyRefusal, match="active credential"):
+        forge_tools._call(lambda: (_ for _ in ()).throw(error))
+
+    assert forge_tools.github_identity_is_degraded() is True
+
+
 def test_matching_identity_is_cached_for_multiple_effects() -> None:
     session = Session([
         Response({"login": "reviewer"}),
@@ -169,24 +190,32 @@ def test_matching_identity_is_cached_for_multiple_effects() -> None:
     ]
 
 
-def test_startup_identity_verification_refuses_mismatch(monkeypatch) -> None:
+def test_startup_identity_verification_degrades_coding_on_mismatch(monkeypatch) -> None:
+    from mimir.tools import forge as forge_tools
+
     class MismatchedClient:
         def verify_identity(self, declared_login):
             raise ForgeError(
                 f"github identity mismatch: authenticated as other-bot, declared as {declared_login}"
             )
 
+    observed: list[str] = []
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(github_module, "GitHubForgeClient", MismatchedClient)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    forge_tools.set_github_identity_degraded_callback(lambda exc: observed.append(str(exc)))
 
-    with pytest.raises(
-        RuntimeError,
-        match="github identity verification failed:.*other-bot.*reviewer",
-    ):
-        initialize_github_forge_identity()
+    assert initialize_github_forge_identity() is False
+    assert forge_tools.github_identity_is_degraded() is True
+    assert observed == ["github identity mismatch: authenticated as other-bot, declared as reviewer"]
 
 
 def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:
+    from mimir.tools import forge as forge_tools
+
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
     verified: list[str] = []
     registered: list[object] = []
 
@@ -199,7 +228,7 @@ def test_startup_identity_verification_registers_matching_client(monkeypatch) ->
     monkeypatch.setattr(github_module, "GitHubForgeClient", MatchingClient)
     monkeypatch.setattr("mimir.tools.forge.set_forge_client", registered.append)
 
-    initialize_github_forge_identity()
+    assert initialize_github_forge_identity() is True
 
     assert verified == ["reviewer"]
     assert len(registered) == 1

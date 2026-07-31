@@ -148,6 +148,9 @@ def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatc
     monkeypatch.setattr(github_module, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
+    from mimir.tools import forge as forge_tools
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
 
     env = direct_exec_env(["/usr/bin/gh", "api", "user"])
     overlay = direct_exec_env_overlay(["/usr/bin/gh", "api", "user"])
@@ -181,17 +184,22 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
 ])
 def test_every_gh_command_requires_cached_declared_identity(monkeypatch, arguments) -> None:
     from mimir.forge import github as github_module
-    from mimir.forge import ForgeError
+    from mimir.tools import forge as forge_tools
+    from mimir.tools.refusals import ToolPolicyRefusal
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(github_module, "_verified_identity", None)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
     argv = ["/usr/bin/gh", *arguments]
 
-    with pytest.raises(ForgeError, match="cache is empty"):
+    with pytest.raises(ToolPolicyRefusal, match="cache is empty"):
         direct_exec_env(argv)
+    assert forge_tools.github_identity_is_degraded() is True
 
     monkeypatch.setattr(github_module, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
-    assert direct_exec_env(argv)["GITHUB_TOKEN"] == "declared-token"
+    with pytest.raises(ToolPolicyRefusal, match="disabled until restart"):
+        direct_exec_env(argv)

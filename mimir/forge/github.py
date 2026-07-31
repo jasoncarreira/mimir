@@ -39,24 +39,49 @@ _identity_lock = threading.Lock()
 _verified_identity: tuple[str, str] | None = None
 
 
+class GitHubIdentityVerificationError(ForgeError):
+    """A safe, pre-effect failure to bind credentials to a declared login."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        declared_login: str = "",
+        authenticated_login: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.declared_login = declared_login
+        self.authenticated_login = authenticated_login
+
+
 def _credential_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def confirm_github_identity(principal: str, token: str | None = None) -> str:
     """Confirm *principal* against the process-cached authenticated identity."""
+    expected = principal.strip()
     credential = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
     fingerprint = _credential_fingerprint(credential.strip())
     with _identity_lock:
         verified = _verified_identity
     if verified is None:
-        raise ForgeError("github identity verification cache is empty")
+        raise GitHubIdentityVerificationError(
+            "github identity verification cache is empty",
+            declared_login=expected,
+        )
     login, verified_fingerprint = verified
     if fingerprint != verified_fingerprint:
-        raise ForgeError("github identity verification cache does not match active credential")
-    if login.casefold() != principal.strip().casefold():
-        raise ForgeError(
-            f"github acting identity mismatch: authenticated as {login}, scope principal is {principal}"
+        raise GitHubIdentityVerificationError(
+            "github identity verification cache does not match active credential",
+            declared_login=expected,
+            authenticated_login=login,
+        )
+    if login.casefold() != expected.casefold():
+        raise GitHubIdentityVerificationError(
+            f"github acting identity mismatch: authenticated as {login}, scope principal is {principal}",
+            declared_login=expected,
+            authenticated_login=login,
         )
     return login
 
@@ -90,28 +115,37 @@ class GitHubForgeClient:
         """Resolve and process-cache the token owner, refusing any mismatch."""
         expected = declared_login.strip()
         if not expected:
-            raise ForgeError("github declared identity is empty")
+            raise GitHubIdentityVerificationError("github declared identity is empty")
         fingerprint = _credential_fingerprint(self._token.strip())
         global _verified_identity
         with _identity_lock:
             if _verified_identity is not None:
                 login, cached_fingerprint = _verified_identity
                 if cached_fingerprint != fingerprint:
-                    raise ForgeError(
-                        "github identity verification cache does not match active credential"
+                    raise GitHubIdentityVerificationError(
+                        "github identity verification cache does not match active credential",
+                        declared_login=expected,
+                        authenticated_login=login,
                     )
                 if login.casefold() != expected.casefold():
-                    raise ForgeError(
-                        f"github identity mismatch: authenticated as {login}, declared as {expected}"
+                    raise GitHubIdentityVerificationError(
+                        f"github identity mismatch: authenticated as {login}, declared as {expected}",
+                        declared_login=expected,
+                        authenticated_login=login,
                     )
                 return login
             data = self._request("GET", "/user")
             login = str(data.get("login", "")).strip() if isinstance(data, Mapping) else ""
             if _REVIEWER.fullmatch(login) is None:
-                raise ForgeError("github identity verification returned an invalid login")
+                raise GitHubIdentityVerificationError(
+                    "github identity verification returned an invalid login",
+                    declared_login=expected,
+                )
             if login.casefold() != expected.casefold():
-                raise ForgeError(
-                    f"github identity mismatch: authenticated as {login}, declared as {expected}"
+                raise GitHubIdentityVerificationError(
+                    f"github identity mismatch: authenticated as {login}, declared as {expected}",
+                    declared_login=expected,
+                    authenticated_login=login,
                 )
             _verified_identity = (login, fingerprint)
             return login

@@ -262,6 +262,9 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # values, or filing rules. Negative so the algedonic block makes the
     # degradation visible every turn until the operator can restore the files.
     "core_prompt_degraded": ("negative", "core_prompt_degraded"),
+    # The active GitHub credential does not match the operator-declared bot
+    # login. Coding is latched off until restart; surface the security state.
+    "github_identity_degraded": ("negative", "github_identity_degraded"),
     # A home file read into the system prompt (core block / memory index) has a
     # non-UTF-8 byte. read_text_lossy keeps the turn alive by replacement-decoding,
     # but the stray byte (mojibake / cp1252 paste / mid-write artifact) silently

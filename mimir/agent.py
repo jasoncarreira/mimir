@@ -1336,6 +1336,7 @@ class Agent:
         self._agent_tools: list[Any] | None = None
         self._agent_middleware: tuple[Any, ...] | None = None
         self._cached_skill_catalog_fingerprint: str | None = None
+        self._cached_coding_enabled: bool | None = None
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -1546,6 +1547,11 @@ class Agent:
         system_prompt = self._current_system_prompt(emit_health_events=False)
         skill_sources = self._current_skill_sources()
         skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+        coding_enabled = self._config.coding_enabled
+        if coding_enabled:
+            from .tools.forge import github_identity_is_degraded
+
+            coding_enabled = not github_identity_is_degraded()
         if self._agent is not None and self._cached_system_prompt is None:
             # Unit tests inject a fake graph directly to avoid constructing
             # deepagents. Production-built graphs always set
@@ -1556,6 +1562,7 @@ class Agent:
             self._agent is not None
             and system_prompt == self._cached_system_prompt
             and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+            and coding_enabled == self._cached_coding_enabled
         ):
             return self._agent
 
@@ -1568,10 +1575,16 @@ class Agent:
             system_prompt = self._current_system_prompt(emit_health_events=False)
             skill_sources = self._current_skill_sources()
             skill_catalog_fingerprint = self._skill_catalog_fingerprint(skill_sources)
+            coding_enabled = self._config.coding_enabled
+            if coding_enabled:
+                from .tools.forge import github_identity_is_degraded
+
+                coding_enabled = not github_identity_is_degraded()
             if (
                 self._agent is not None
                 and system_prompt == self._cached_system_prompt
                 and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
+                and coding_enabled == self._cached_coding_enabled
             ):
                 return self._agent
 
@@ -1585,6 +1598,7 @@ class Agent:
                     and system_prompt == self._cached_system_prompt
                     and skill_catalog_fingerprint
                     == self._cached_skill_catalog_fingerprint
+                    and coding_enabled == self._cached_coding_enabled
                 ):
                     return self._agent
 
@@ -1644,12 +1658,10 @@ class Agent:
                     rate_limit_callback=codex_plus_callback,
                 )
 
-            if self._agent_tools is None:
-                self._agent_tools = (
-                    all_mimir_tools(coding_enabled=True)
-                    if self._config.coding_enabled
-                    else all_mimir_tools()
-                )
+            if self._agent_tools is None or (
+                self._config.coding_enabled and not coding_enabled
+            ):
+                self._agent_tools = all_mimir_tools(coding_enabled=coding_enabled)
 
             # Skills surfaced via SkillsMiddleware: pass operator +
             # bundled source paths as discovery sources. The framework
@@ -1716,6 +1728,7 @@ class Agent:
             )
             self._cached_system_prompt = system_prompt
             self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
+            self._cached_coding_enabled = coding_enabled
             return self._agent
 
     async def run_turn(self, event: AgentEvent) -> TurnRecord:

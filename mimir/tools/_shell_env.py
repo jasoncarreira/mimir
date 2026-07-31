@@ -84,9 +84,9 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         env.pop(key, None)
     if _is_gh_argv(argv):
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
-        from ..forge.github import confirm_github_identity
+        from .forge import confirm_github_tool_identity
 
-        confirm_github_identity(
+        confirm_github_tool_identity(
             os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
             env.get("GITHUB_TOKEN", ""),
         )

@@ -2396,6 +2396,9 @@ def all_mimir_tools(
         if fetch_url_on:
             tools.append(fetch_url)
     if coding_enabled:
+        from .forge import github_identity_is_degraded
+        coding_enabled = not github_identity_is_degraded()
+    if coding_enabled:
         if require_coding_available:
             from ..providers import opencode_available
             if not opencode_available():
