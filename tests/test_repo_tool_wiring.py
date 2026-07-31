@@ -232,6 +232,7 @@ def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink() -> None:
     target = f"owner/repo#pull/7@{'a' * 40}:{scope.scope_id}"
     allowed = SinkGate.check_sink_flow(
         "pr_comment", target, merged, auth, enforce=True,
+        repo_pr_action_scope=scope,
     )
     assert allowed.allowed is True
 

@@ -31,6 +31,7 @@ from mimir.access_control import (
     authorize_action,
     authorize_inbound,
     build_trigger_service_principal,
+    classify_protected_result,
     create_auth_context,
     get_service_principal,
     parse_service_shell_argv,
@@ -4762,6 +4763,96 @@ def test_poller_scope_derives_each_valid_batched_item_and_requires_configured_re
     unconfigured = AgentEvent(**base, extra={"items": [item]})
 
     assert create_auth_context(unconfigured, enforce=True).repo_pr_scope_registry is None
+
+
+def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, first_item = _github_scope_test_setup(tmp_path, monkeypatch)
+    authority = replace(
+        authority, capabilities=(*authority.capabilities, "pr_comment"),
+    )
+    second_item = {
+        **first_item, "number": 43, "head_ref": "worklink/43",
+        "head_sha": "c" * 40,
+    }
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [first_item, second_item]},
+    )
+    auth = create_auth_context(event, enforce=True)
+    assert auth.repo_pr_action_scope is None
+    channel_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="service:poller:github-activity",
+        domain="service",
+        resource_id="poller:github-activity",
+        bridge_instance="service:poller:github-activity",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+    )).with_channel("poller:github-activity")
+    auth = replace(auth, ifc_labels=channel_labels)
+
+    registry = ToolRegistry()
+    first_args = {"repository": "o/r", "pull_request": 42}
+    second_args = {"repository": "o/r", "pull_request": 43}
+    first_authorization = registry.authorize_tool(
+        "pr_diff", auth, enforce=True, arguments=first_args,
+    )
+    second_authorization = registry.authorize_tool(
+        "pr_diff", auth, enforce=True, arguments=second_args,
+    )
+    first_labels = classify_protected_result(
+        "pr_diff", first_args, auth, first_authorization,
+    )
+    second_labels = classify_protected_result(
+        "pr_diff", second_args, auth, second_authorization,
+    )
+    assert first_labels is not None and second_labels is not None
+    assert {source.resource_id for source in first_labels.sources} == {
+        f"o/r#pull/42@{'a' * 40}",
+    }
+    assert {source.resource_id for source in second_labels.sources} == {
+        f"o/r#pull/43@{'c' * 40}",
+    }
+
+    labels_from_first = channel_labels
+    for source in first_labels.sources:
+        labels_from_first = labels_from_first.with_source(source)
+    second_scope = second_authorization.repo_pr_action_scope
+    second_target = (
+        f"{second_scope.canonical_repo}#pull/{second_scope.pr_number}"
+        f"@{second_scope.observed_head_sha}:{second_scope.scope_id}"
+    )
+    denied = registry.authorize_tool(
+        "pr_comment", auth, enforce=True, target_channel=second_target,
+        ifc_labels=labels_from_first, arguments=second_args,
+    )
+    assert denied.allowed is False
+    assert denied.reason == "ifc_label_blocked:forge"
+    assert denied.refusal_detail is not None
+    assert "o/r#42" in denied.refusal_detail
+    assert "o/r#43" in denied.refusal_detail
+
+    first_scope = first_authorization.repo_pr_action_scope
+    first_target = (
+        f"{first_scope.canonical_repo}#pull/{first_scope.pr_number}"
+        f"@{first_scope.observed_head_sha}:{first_scope.scope_id}"
+    )
+    same_pr = SinkGate.check_sink_flow(
+        "pr_comment", first_target, labels_from_first, auth, enforce=True,
+        repo_pr_action_scope=replace(first_scope),
+    )
+    assert same_pr.allowed is True
+
+    stale_head_scope = replace(first_scope, observed_head_sha="b" * 40)
+    stale_head = SinkGate.check_sink_flow(
+        "pr_comment", first_target, labels_from_first, auth, enforce=True,
+        repo_pr_action_scope=stale_head_scope,
+    )
+    assert stale_head.allowed is False
+    assert stale_head.reason == "ifc_label_blocked:forge"
+    assert stale_head.refusal_detail is not None
 
 
 def _attach_test_checkout_lease(
