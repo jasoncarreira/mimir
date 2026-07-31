@@ -237,6 +237,40 @@ async def test_reconcile_records_hard_refusal_without_charging_attempt(tmp_path:
     assert entry["outcome_reason"] == "service_scope_denied"
 
 
+async def test_reconcile_completed_hard_refusal_without_charging_attempt(
+    tmp_path: Path,
+):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
+    _write_outcome(
+        events,
+        type_="turn_completed",
+        channel_id="poller:github-activity",
+        source_id="sid-refused",
+        ts=_ts(5),
+        attempt_disposition="exempt_hard_refusal",
+        attempt_reason="service_scope_denied",
+        hard_refusals=[{"boundary": "service_scope", "reason": "service_scope_denied"}],
+    )
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-refused"]
+    assert entry["attempts"] == 0
+    assert entry["outcome_disposition"] == "exempt_hard_refusal"
+    assert entry["outcome_reason"] == "service_scope_denied"
+    assert entry["hard_refusals"] == [
+        {"boundary": "service_scope", "reason": "service_scope_denied"}
+    ]
+
+
 async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Path):
     """Budget exhaustion is a failed turn for telemetry, but replaying the
     same poller item under the unchanged budget would deterministically fail

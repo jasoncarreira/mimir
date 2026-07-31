@@ -418,6 +418,7 @@ async def reconcile_failed_turns(
     ``source_id`` is still in-flight:
       * ``turn_completed`` → drop it for generic recovery; retain and charge it
         for live-state pollers, which verify the external transition themselves.
+        A hard-boundary-refusal disposition remains exempt from that charge.
       * ``turn_failed`` with ``result_subtype=tool_budget_exhausted`` →
         drop it without retry. The failure is deterministic under an
         unchanged budget, so replay would repeat partial work and spend
@@ -479,6 +480,20 @@ async def reconcile_failed_turns(
                 entry["last_outcome_at"] = ts
             if otype == "turn_completed":
                 summary["completed"] += 1
+                if rec.get("attempt_disposition") == "exempt_hard_refusal":
+                    # Successful turns can include denied tool calls. Preserve
+                    # the same attempt decision as the former failed event.
+                    reason = rec.get("attempt_reason")
+                    entry["outcome_disposition"] = "exempt_hard_refusal"
+                    entry["outcome_reason"] = (
+                        reason if isinstance(reason, str) else "hard_boundary_refusal"
+                    )
+                    entry["hard_refusals"] = rec.get("hard_refusals", [])
+                    if recover_failed_turns:
+                        del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 if not recover_failed_turns and poller_name == "github-activity":
                     # Live-state pollers decide success from the next external
                     # snapshot. If the requested state transition did not occur,

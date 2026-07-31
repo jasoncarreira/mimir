@@ -1912,7 +1912,10 @@ async def test_framework_marks_hard_boundary_refusal_unchargeable(tmp_path: Path
         if event.get("type") in {"turn_failed", "turn_completed"}
     ]
     assert len(outcomes) == 1
-    assert outcomes[0]["type"] == "turn_failed"
+    assert outcomes[0]["type"] == "turn_completed"
+    assert outcomes[0]["result_subtype"] == "success"
+    assert outcomes[0]["result_is_error"] is False
+    assert outcomes[0].get("error") != outcomes[0]["result_subtype"]
     assert outcomes[0]["attempt_disposition"] == "exempt_hard_refusal"
     assert outcomes[0]["attempt_reason"] == "service_scope_denied"
     assert outcomes[0]["hard_refusals"] == [{
