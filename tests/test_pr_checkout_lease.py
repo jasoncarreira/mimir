@@ -236,6 +236,56 @@ def test_acquire_reports_all_divergent_unpublished_candidates(tmp_path: Path) ->
     assert all(candidate in str(refusal.value) for candidate in candidates)
 
 
+def test_acquire_refuses_and_reports_foreign_scope_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    current = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+    foreign_scope = replace(scope, event_type="pr_review_requested")
+    assert foreign_scope.scope_id != scope.scope_id
+    foreign = create_pr_checkout_lease(
+        foreign_scope, owner=foreign_scope.principal, lease_root=lease_root,
+    )
+    assert not foreign.path.name.startswith(scope.scope_id[:16])
+
+    candidates = []
+    for lease, name in ((current, "current"), (foreign, "foreign")):
+        (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
+        _git(lease.path, "add", f"{name}.txt")
+        _git(lease.path, "commit", "-q", "-m", f"{name} fix")
+        candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope") as refusal:
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert all(candidate in str(refusal.value) for candidate in candidates)
+    assert events == [
+        (
+            "pr_checkout_lease_scope_conflict",
+            {
+                "repository": scope.canonical_repo,
+                "pull_request": scope.pr_number,
+                "scope_id": scope.scope_id,
+                "candidates": [
+                    {"commit": candidates[0], "path": str(current.path)},
+                    {"commit": candidates[1], "path": str(foreign.path)},
+                ],
+            },
+        ),
+    ]
+
+
 def test_pr_checkout_lease_cleanup_accepts_commit_on_lease_branch(tmp_path: Path) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
