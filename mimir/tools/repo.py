@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 from typing import Any, Literal
 
@@ -30,6 +31,9 @@ from ..repo_tools import (
     RepoGitTools,
 )
 from .refusals import ToolPolicyRefusal
+
+
+log = logging.getLogger(__name__)
 
 
 _GIT_EXECUTION_REFUSAL_CODES = frozenset({
@@ -76,6 +80,38 @@ def _state(
         raise _tool_refusal(message, exc) from exc
 
 
+def _enforcement_enabled(
+    runtime: ToolRuntime[AuthContext] | None,
+    *,
+    repository: str,
+    pull_request: int,
+) -> bool:
+    """Resolve the central flag, failing closed and reporting unknown state."""
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    enforcement = getattr(context, "enforcement_enabled", None)
+    if isinstance(enforcement, bool):
+        return enforcement
+
+    try:
+        from ..event_logger import log_event_sync
+
+        log_event_sync(
+            "repo_enforcement_state_unknown",
+            repository=repository,
+            pull_request=pull_request,
+            fallback_enforcement=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must not alter the decision
+        log.warning(
+            "repo_enforcement_state_unknown: repository=%s pull_request=%s; "
+            "failing closed (event logging failed: %s)",
+            repository,
+            pull_request,
+            exc,
+        )
+    return True
+
+
 def _execute(
     runtime: ToolRuntime[AuthContext] | None,
     repository: str,
@@ -83,8 +119,16 @@ def _execute(
     operation: Any,
 ) -> dict[str, Any]:
     try:
+        state = _state(runtime, repository, pull_request)
         return asdict(
-            RepoGitTools(_state(runtime, repository, pull_request)).execute(operation)
+            RepoGitTools(
+                state,
+                enforce=_enforcement_enabled(
+                    runtime,
+                    repository=repository,
+                    pull_request=pull_request,
+                ),
+            ).execute(operation)
         )
     except (GitRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "repository_operation_failed")

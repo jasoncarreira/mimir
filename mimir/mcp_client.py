@@ -1191,6 +1191,11 @@ class MCPAdapterRegistration:
     policy_version: str
     classify: MCPAdapterClassifier
     flow_direction: str = "unknown"
+    server_config_id: str = ""
+    server_name: str = ""
+    config_digest: str = ""
+    adapter_digest: str = ""
+    adapter_definition: tuple[tuple[str, str], ...] = ()
 
 
 def register_mcp_adapter(
@@ -1200,6 +1205,11 @@ def register_mcp_adapter(
     classify: MCPAdapterClassifier,
     *,
     flow_direction: str = "unknown",
+    server_config_id: str = "",
+    server_name: str = "",
+    config_digest: str = "",
+    adapter_digest: str = "",
+    adapter_definition: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Register a classifier for MCP tools carrying ``adapter_name`` provenance."""
     if not callable(classify):
@@ -1211,6 +1221,11 @@ def register_mcp_adapter(
         policy_version=policy_version,
         classify=classify,
         flow_direction=flow_direction,
+        server_config_id=server_config_id,
+        server_name=server_name,
+        config_digest=config_digest,
+        adapter_digest=adapter_digest,
+        adapter_definition=adapter_definition,
     )
 
 
@@ -1280,21 +1295,61 @@ def register_configured_mcp_adapters(configs: list[MCPServerConfig]) -> None:
     """Register only explicit operator-configured adapter definitions."""
     for server in configs:
         for adapter in server.adapters:
+            adapter_definition = {
+                "name": adapter.name,
+                "version": adapter.version,
+                "policy_version": adapter.policy_version,
+                "resource_argument": adapter.resource_argument,
+                "owner_argument": adapter.owner_argument,
+                "flow_direction": adapter.flow_direction,
+            }
+            config_digest = _canonical_config_digest(server)
+            adapter_digest = _schema_digest(adapter_definition)
             existing = get_mcp_adapter_info(adapter.name)
             if existing is not None:
-                if (
-                    existing.version != adapter.version
-                    or existing.policy_version != adapter.policy_version
-                ):
-                    log.warning("MCP adapter configuration conflict: name=%s", adapter.name)
-                else:
+                identity = (
+                    server.server_config_id,
+                    config_digest,
+                    adapter_digest,
+                )
+                existing_identity = (
+                    existing.server_config_id,
+                    existing.config_digest,
+                    existing.adapter_digest,
+                )
+                if identity == existing_identity:
                     continue
+
+                existing_definition = dict(existing.adapter_definition)
+                differing_fields = [
+                    field for field, value in adapter_definition.items()
+                    if existing_definition.get(field) != value
+                ]
+                if existing.server_config_id != server.server_config_id:
+                    differing_fields.insert(0, "server_config_id")
+                if existing.config_digest != config_digest:
+                    differing_fields.insert(0, "server_config")
+                if not existing.adapter_definition:
+                    differing_fields.append("registration_source")
+                fields = ", ".join(dict.fromkeys(differing_fields))
+                raise ValueError(
+                    f"duplicate MCP adapter name {adapter.name!r} for server configurations "
+                    f"{existing.server_config_id or '<unconfigured>'!r} "
+                    f"({existing.server_name or '<unconfigured>'!r}) and "
+                    f"{server.server_config_id!r} ({server.name!r}); "
+                    f"differing fields: {fields}"
+                )
             register_mcp_adapter(
                 adapter.name,
                 adapter.version,
                 adapter.policy_version,
                 _configured_resource_classifier(adapter),
                 flow_direction=adapter.flow_direction,
+                server_config_id=server.server_config_id,
+                server_name=server.name,
+                config_digest=config_digest,
+                adapter_digest=adapter_digest,
+                adapter_definition=tuple(sorted(adapter_definition.items())),
             )
 
 

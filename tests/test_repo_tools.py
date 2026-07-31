@@ -567,7 +567,8 @@ def test_push_credential_is_available_only_for_exact_canonical_github_origin(
 
 
 def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatch) -> None:
-    _origin, _source, _scope, _state, tools = repo_tools
+    _origin, _source, _scope, state, _tools = repo_tools
+    tools = RepoGitTools(state, enforce=False)
     original_raw = tools._raw
     network_seen = False
 
@@ -587,7 +588,8 @@ def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatc
 
 
 def test_cross_pr_checkout_is_refused(repo_tools) -> None:
-    _origin, _source, _scope, state, tools = repo_tools
+    _origin, _source, _scope, state, _tools = repo_tools
+    tools = RepoGitTools(state, enforce=False)
     _git(state.checkout_lease.path, "checkout", "-q", "-b", "other-pr")
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitStatus())
@@ -653,14 +655,14 @@ def test_checkout_symlink_and_root_escape_are_refused(repo_tools, tmp_path: Path
     alias.symlink_to(lease.path, target_is_directory=True)
     object.__setattr__(state, "checkout_lease", replace(lease, path=alias))
     with pytest.raises(GitRefusal) as symlink_refusal:
-        RepoGitTools(state)
+        RepoGitTools(state, enforce=False)
     assert symlink_refusal.value.code == "invalid_checkout"
 
     outside = tmp_path / "outside-checkout"
     outside.mkdir()
     object.__setattr__(state, "checkout_lease", replace(lease, path=outside))
     with pytest.raises(GitRefusal) as escape_refusal:
-        RepoGitTools(state)
+        RepoGitTools(state, enforce=False)
     assert escape_refusal.value.code == "invalid_checkout"
 
 
@@ -726,7 +728,7 @@ def test_malformed_unmerged_index_output_is_refused(repo_tools, monkeypatch) -> 
 
 
 def test_fetch_ref_mismatch_is_named_stale_scope(repo_tools, monkeypatch) -> None:
-    tools = repo_tools[-1]
+    tools = RepoGitTools(repo_tools[-2], enforce=False)
     original = tools._command
 
     def stale(arguments, **kwargs):
@@ -868,6 +870,161 @@ def test_project_tests_use_fixed_command_checkout_and_environment(
     assert "MIMIR_MODEL_SPEC" not in env
     assert timeout == 300.0
     assert output_limit == 64 * 1024
+
+
+def test_project_test_home_is_writable_and_fresh_per_execution(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HOME must be writable, and a different directory each execution.
+
+    Observed live on 2026-07-31: the configured runner
+    ``env -u MIMIR_MODEL_SPEC uv run pytest -q`` failed before reaching pytest
+    because uv could not create ``$HOME/.cache/uv`` under ``/nonexistent``.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    seen: list[Path] = []
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        run_home = Path(env["HOME"])
+        seen.append(run_home)
+        assert run_home.is_dir(), "HOME must exist so a runner can create its cache"
+        (run_home / ".cache").mkdir(parents=True, exist_ok=True)
+        assert run_home != Path("/nonexistent")
+        assert run_home != Path.home(), "the operator's real dotfiles stay unreachable"
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    tests = RepoProjectTests(state, runner=runner)
+    tests.execute(())
+    tests.execute(())
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1], "each execution must get its own HOME"
+    for run_home in seen:
+        assert not run_home.exists(), "each HOME must be removed after the execution"
+
+
+def test_project_test_home_does_not_carry_state_between_executions(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State planted by one execution must not be visible to the next.
+
+    The tests that run in this HOME are PR-controlled, so a shared directory
+    would let one PR plant ambient config -- a .npmrc, a pip.conf; only Git
+    configuration is neutralised -- for a later PR to pick up.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    observed: list[bool] = []
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        planted = Path(env["HOME"]) / ".npmrc"
+        observed.append(planted.exists())
+        planted.write_text("registry=http://attacker.invalid\n", encoding="utf-8")
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    tests = RepoProjectTests(state, runner=runner)
+    tests.execute(())
+    tests.execute(())
+
+    assert observed == [False, False], "planted config leaked into the next execution"
+
+
+def test_project_test_parent_swap_during_run_cannot_delete_outside_tree(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent swapped mid-run must not redirect cleanup outside the home.
+
+    The tests executing in the per-run HOME are PR-controlled. If cleanup resolved
+    the home by pathname, replacing the parent with a symlink during the run would
+    make rmtree traverse the swap and delete a matching tree elsewhere. Creation
+    and deletion are both descriptor-relative, so the swap is inert.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    # A tree outside the home that must survive, containing a same-named entry so
+    # a pathname-based delete would actually hit something.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    treasure = outside / "keep.txt"
+    treasure.write_text("must survive\n", encoding="utf-8")
+
+    parent = home.resolve() / "scratch" / "project-test-homes"
+
+    captured: dict[str, str] = {}
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        run_home = Path(env["HOME"])
+        captured["name"] = run_home.name
+        # Mirror the run directory's name inside the outside tree, then swap the
+        # parent for a symlink to it -- exactly what PR-controlled test code could
+        # do while executing.
+        decoy = outside / run_home.name
+        decoy.mkdir()
+        (decoy / "keep.txt").write_text("decoy\n", encoding="utf-8")
+        import shutil as _shutil
+        _shutil.rmtree(parent)
+        parent.symlink_to(outside, target_is_directory=True)
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    RepoProjectTests(state, runner=runner).execute(())
+
+    # The decoy is what a pathname-based cleanup destroys: after the swap,
+    # parent/<run-name> resolves to outside/<run-name>. Descriptor-relative
+    # deletion never resolves that pathname, so the decoy must be untouched.
+    decoy = outside / captured["name"]
+    assert decoy.is_dir(), "cleanup followed the swapped parent and deleted outside the home"
+    assert (decoy / "keep.txt").read_text(encoding="utf-8") == "decoy\n"
+    assert treasure.read_text(encoding="utf-8") == "must survive\n"
+
+
+@pytest.mark.parametrize("depth", ["scratch", "project-test-homes"])
+def test_project_test_refuses_symlinked_ancestor_at_any_depth(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: str,
+) -> None:
+    """A symlink at ANY component below MIMIR_HOME must refuse, not be followed.
+
+    O_NOFOLLOW guards only the final component, so a symlink planted at the
+    intermediate ``scratch`` level -- with a real ``project-test-homes`` inside the
+    target -- would otherwise be followed by both mkdir(parents=True) and
+    os.open(parent, O_NOFOLLOW), placing HOME outside the home tree and restoring
+    the cross-run ambient-state channel.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    outside = tmp_path / "outside"
+    if depth == "scratch":
+        # The target contains a REAL final component, so a final-component-only
+        # check would succeed here.
+        (outside / "project-test-homes").mkdir(parents=True)
+        (home / "scratch").symlink_to(outside, target_is_directory=True)
+    else:
+        outside.mkdir()
+        (home / "scratch").mkdir(parents=True, exist_ok=True)
+        (home / "scratch" / "project-test-homes").symlink_to(
+            outside, target_is_directory=True,
+        )
+
+    def runner(argv, *, cwd, env, timeout, output_limit):  # pragma: no cover
+        raise AssertionError("runner must not be reached")
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        RepoProjectTests(state, runner=runner).execute(())
+    assert refusal.value.code == "test_cache_home_unavailable"
+    # Nothing may have been created through the symlink.
+    assert not any(outside.rglob("run-*")), "an execution home was created outside the home tree"
 
 
 def test_project_test_failure_is_actionable_and_output_is_scrubbed(
@@ -1024,6 +1181,21 @@ def test_every_typed_operation_pins_its_scope_authority_check(
         tools.execute(operation)
 
     assert refusal.value.code == "scope_action_denied"
+
+
+def test_scope_action_check_is_shadowed_when_enforcement_is_disabled(repo_tools) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.WRITE.value},
+    )
+    lease = replace(old_state.checkout_lease, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+
+    result = RepoGitTools(state, enforce=False).execute(GitStage(("tracked.txt",)))
+
+    assert result.ok is True
 
 
 @pytest.mark.parametrize(
