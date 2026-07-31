@@ -651,9 +651,13 @@ autonomously touch code at all.
 runtime a final `OPENCODE_PERMISSION` override containing
 `external_directory: {"/**": "deny"}` and `bash: {"*": "deny", ...allowlist}`.
 The allowlist is operator-configurable at
-`backends.opencode.bash_allowlist`; its Mimir-repository default permits the
-needed `git *` and `uv *` command families. Pure command launchers such as
-`env *` are deliberately excluded because they would bypass the allowlist.
+`backends.opencode.bash_allowlist`; the built-in Python-oriented default permits
+the needed `git *` and `uv *` command families. When omitted, the effective
+default is derived from operator-owned `defaults.test_command` as `git *` plus
+only its approved build runner. Pure command launchers such as `env *`, `bash
+*`, and `make *` are deliberately excluded from derivation because they would
+bypass the allowlist. An explicit allowlist replaces derivation and is checked
+against the test command at configuration load.
 OpenCode evaluates the
 last matching permission rule, so Worklink emits the catch-all denial first and
 the explicit grants after it. It rejects a catch-all allow entry. Denials become

@@ -262,6 +262,46 @@ authenticate transport only; they do not create a named requester.
 
 ## Worklink / chainlink / factory
 
+Worklink reads deployment settings from `<MIMIR_HOME>/worklink.yaml`. The test
+gate and OpenCode executor shell policy must agree. When
+`backends.opencode.bash_allowlist` is omitted, Worklink conservatively derives
+the effective default as `git *` plus only the approved build runner named by
+`defaults.test_command`. The built-in Python-oriented configuration is therefore
+`test_command: "uv run pytest -q"` with `bash_allowlist: ["git *", "uv *"]`.
+Supported derived runners are `uv`, `npm`, `pnpm`, `yarn`, `bun`, `mvn`, Maven
+Wrapper, `gradle`, Gradle Wrapper, `cargo`, and `go`. General launchers such as
+`bash`, `sh`, `env`, `make`, and language interpreters are not derived.
+
+An operator-set allowlist replaces the derived default and must admit the
+configured test command. Empty lists deny all executor shell commands and thus
+fail configuration reconciliation for a non-empty test command. The catch-all
+`"*"` is always rejected. Startup logs the effective list; a refused command
+reports `backends.opencode.bash_allowlist` and those effective patterns.
+
+Node deployment:
+
+```yaml
+defaults:
+  test_command: "npm test"
+backends:
+  opencode:
+    bash_allowlist: ["git *", "npm *"]
+```
+
+Java deployment using Gradle Wrapper:
+
+```yaml
+defaults:
+  test_command: "./gradlew test"
+backends:
+  opencode:
+    bash_allowlist: ["git *", "./gradlew *"]
+```
+
+Both examples use explicit lists for auditability; omitting `bash_allowlist`
+derives the same two patterns. The setting is operator configuration only:
+repository files and model-generated values never add permission entries.
+
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
