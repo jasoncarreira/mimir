@@ -24,6 +24,7 @@ from mimir.models import (
 )
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
+    acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
     recover_pr_checkout_lease,
@@ -109,6 +110,180 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert cleanup_pr_checkout_lease(lease, review_state=state) is True
     assert cleanup_pr_checkout_lease(lease, review_state=state) is False
     assert state.checkout_lease is None
+
+
+def test_second_attempt_resumes_unpushed_commit(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (first.path / "fix.txt").write_text("retained fix\n", encoding="utf-8")
+    _git(first.path, "add", "fix.txt")
+    _git(first.path, "commit", "-q", "-m", "retained fix")
+    fix_head = _git(first.path, "rev-parse", "HEAD")
+    state = RepoReviewState(scope)
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+    )
+
+    assert resumed.path == first.path
+    assert resumed.recovered is True
+    assert candidates == (fix_head,)
+    assert state.checkout_lease is resumed
+    assert state.git_expected_head == fix_head
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+def test_expired_lease_with_unpushed_work_is_named_and_renewed(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (first.path / "fix.txt").write_text("expired retained fix\n", encoding="utf-8")
+    _git(first.path, "add", "fix.txt")
+    _git(first.path, "commit", "-q", "-m", "expired retained fix")
+    fix_head = _git(first.path, "rev-parse", "HEAD")
+    metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    resumed, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert resumed.path == first.path
+    assert resumed.is_active
+    assert candidates == (fix_head,)
+    renewed = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert datetime.fromisoformat(renewed["expires_at"]) > datetime.now(UTC)
+
+
+def test_expired_lease_refuses_resume_after_pr_head_moves(tmp_path: Path) -> None:
+    repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("stale fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "stale fix")
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expired_at = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    metadata["expires_at"] = expired_at
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    (repo / "new-head.txt").write_text("new head\n", encoding="utf-8")
+    _git(repo, "add", "new-head.txt")
+    _git(repo, "commit", "-q", "-m", "move PR head")
+    _git(repo, "push", "-q", "origin", "HEAD:worklink/7")
+
+    with pytest.raises(RuntimeError, match="PR head advanced"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    retained = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert retained["expires_at"] == expired_at
+    assert lease.path.is_dir()
+
+
+def test_acquire_refuses_scope_without_current_checkout_authority(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    unauthorized = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.CHECKOUT.value},
+    )
+
+    with pytest.raises(RuntimeError, match="does not grant PR checkout"):
+        acquire_pr_checkout_lease(
+            unauthorized, owner=unauthorized.principal, lease_root=lease_root,
+        )
+
+
+def test_acquire_refuses_scope_mismatch_in_matching_lease_slot(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["scope_id"] = "f" * 64
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="scope mismatch"):
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+
+
+def test_acquire_reports_all_divergent_unpublished_candidates(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    candidates = []
+    for name in ("first", "second"):
+        lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+        (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
+        _git(lease.path, "add", f"{name}.txt")
+        _git(lease.path, "commit", "-q", "-m", f"{name} fix")
+        candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+
+    with pytest.raises(RuntimeError, match="refusing implicit selection") as refusal:
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert all(candidate in str(refusal.value) for candidate in candidates)
+
+
+def test_acquire_refuses_and_reports_foreign_scope_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    current = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+    foreign_scope = replace(scope, event_type="pr_review_requested")
+    assert foreign_scope.scope_id != scope.scope_id
+    foreign = create_pr_checkout_lease(
+        foreign_scope, owner=foreign_scope.principal, lease_root=lease_root,
+    )
+    assert not foreign.path.name.startswith(scope.scope_id[:16])
+
+    candidates = []
+    for lease, name in ((current, "current"), (foreign, "foreign")):
+        (lease.path / f"{name}.txt").write_text(f"{name} fix\n", encoding="utf-8")
+        _git(lease.path, "add", f"{name}.txt")
+        _git(lease.path, "commit", "-q", "-m", f"{name} fix")
+        candidates.append(_git(lease.path, "rev-parse", "HEAD"))
+
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    with pytest.raises(RuntimeError, match="include another scope") as refusal:
+        acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+
+    assert all(candidate in str(refusal.value) for candidate in candidates)
+    assert events == [
+        (
+            "pr_checkout_lease_scope_conflict",
+            {
+                "repository": scope.canonical_repo,
+                "pull_request": scope.pr_number,
+                "scope_id": scope.scope_id,
+                "candidates": [
+                    {"commit": candidates[0], "path": str(current.path)},
+                    {"commit": candidates[1], "path": str(foreign.path)},
+                ],
+            },
+        ),
+    ]
 
 
 def test_pr_checkout_lease_cleanup_accepts_commit_on_lease_branch(tmp_path: Path) -> None:

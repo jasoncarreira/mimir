@@ -11,7 +11,7 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
 from ..models import AuthContext, RepoReviewState
-from ..pr_checkout_lease import cleanup_pr_checkout_lease, create_pr_checkout_lease
+from ..pr_checkout_lease import acquire_pr_checkout_lease, cleanup_pr_checkout_lease
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
     GitCommit,
@@ -148,7 +148,7 @@ def repo_checkout(
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
     state = _state(runtime, repository, pull_request)
     try:
-        lease = create_pr_checkout_lease(
+        lease, candidates = acquire_pr_checkout_lease(
             state.action_scope,
             owner=state.action_scope.principal,
             review_state=state,
@@ -156,10 +156,11 @@ def repo_checkout(
     except (OSError, RuntimeError, ValueError) as exc:
         raise ToolPolicyRefusal(f"repository checkout rejected: {exc}") from exc
     return {
-        "status": "checked_out",
+        "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),
         "scope_id": lease.scope_id,
         "head_sha": lease.head_sha,
+        "candidate_commits": candidates,
     }
 
 
