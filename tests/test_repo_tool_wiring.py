@@ -193,9 +193,9 @@ def test_checkout_proof_is_isolated_to_named_pr(
             head_sha=scope.observed_head_sha, owner=owner, is_active=True,
         )
         review_state.attach_checkout_lease(lease)
-        return lease
+        return lease, ()
 
-    monkeypatch.setattr("mimir.tools.repo.create_pr_checkout_lease", fake_checkout)
+    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
     runtime = SimpleNamespace(context=context)
     repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
 
