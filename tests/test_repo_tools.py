@@ -870,53 +870,83 @@ def test_project_tests_use_fixed_command_checkout_and_environment(
     assert output_limit == 64 * 1024
 
 
-def test_project_test_home_is_writable_so_runners_can_cache(
+def test_project_test_home_is_writable_and_fresh_per_execution(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """HOME must be a writable directory, not /nonexistent.
+    """HOME must be writable, and a different directory each execution.
 
     Observed live on 2026-07-31: the configured runner
     ``env -u MIMIR_MODEL_SPEC uv run pytest -q`` failed before reaching pytest
-    because uv could not create ``$HOME/.cache/uv`` under ``/nonexistent``. That
-    left a remediation turn with no way to verify its own fix.
+    because uv could not create ``$HOME/.cache/uv`` under ``/nonexistent``.
     """
     _origin, _source, _scope, state, _tools = repo_tools
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    captured: dict[str, str] = {}
+    seen: list[Path] = []
 
     def runner(argv, *, cwd, env, timeout, output_limit):
-        captured.update(env)
+        run_home = Path(env["HOME"])
+        seen.append(run_home)
+        assert run_home.is_dir(), "HOME must exist so a runner can create its cache"
+        (run_home / ".cache").mkdir(parents=True, exist_ok=True)
+        assert run_home != Path("/nonexistent")
+        assert run_home != Path.home(), "the operator's real dotfiles stay unreachable"
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
         return ProjectTestProcessResult(0, stdout="ok")
 
-    RepoProjectTests(state, runner=runner).execute(())
+    tests = RepoProjectTests(state, runner=runner)
+    tests.execute(())
+    tests.execute(())
 
-    home_value = Path(captured["HOME"])
-    assert home_value.is_dir(), "HOME must exist so a runner can create its cache"
-    assert home_value != Path("/nonexistent")
-    probe = home_value / ".cache" / "probe"
-    probe.mkdir(parents=True, exist_ok=True)
-    assert probe.is_dir(), "HOME must be writable"
-    # The operator's real dotfiles must still be out of reach -- that was the
-    # point of /nonexistent and it is preserved by using a dedicated directory.
-    assert home_value != Path.home()
-    assert captured["GIT_CONFIG_GLOBAL"] == "/dev/null"
-    assert captured["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert len(seen) == 2
+    assert seen[0] != seen[1], "each execution must get its own HOME"
+    for run_home in seen:
+        assert not run_home.exists(), "each HOME must be removed after the execution"
 
 
-def test_project_test_refuses_when_cache_home_cannot_be_created(
+def test_project_test_home_does_not_carry_state_between_executions(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unusable cache home refuses with a named reason rather than running."""
+    """State planted by one execution must not be visible to the next.
+
+    The tests that run in this HOME are PR-controlled, so a shared directory
+    would let one PR plant ambient config -- a .npmrc, a pip.conf; only Git
+    configuration is neutralised -- for a later PR to pick up.
+    """
     _origin, _source, _scope, state, _tools = repo_tools
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    # Occupy the cache-home path with a file so mkdir cannot succeed.
+    observed: list[bool] = []
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        planted = Path(env["HOME"]) / ".npmrc"
+        observed.append(planted.exists())
+        planted.write_text("registry=http://attacker.invalid\n", encoding="utf-8")
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    tests = RepoProjectTests(state, runner=runner)
+    tests.execute(())
+    tests.execute(())
+
+    assert observed == [False, False], "planted config leaked into the next execution"
+
+
+def test_project_test_refuses_symlinked_home_parent(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A symlinked parent could redirect every HOME outside the home tree."""
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
     scratch = home / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / "project-test-home").write_text("not a directory\n", encoding="utf-8")
+    (scratch / "project-test-homes").symlink_to(elsewhere, target_is_directory=True)
 
     def runner(argv, *, cwd, env, timeout, output_limit):  # pragma: no cover
         raise AssertionError("runner must not be reached")
@@ -924,7 +954,6 @@ def test_project_test_refuses_when_cache_home_cannot_be_created(
     with pytest.raises(ProjectTestRefusal) as refusal:
         RepoProjectTests(state, runner=runner).execute(())
     assert refusal.value.code == "test_cache_home_unavailable"
-    assert "project-test-home" in str(refusal.value)
 
 
 def test_project_test_failure_is_actionable_and_output_is_scrubbed(

@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from typing import Protocol
 
@@ -149,34 +150,18 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     if not words:
         raise ProjectTestRefusal("test_not_configured", "project test command is empty")
 
-    # A writable HOME is required, not optional. Every mainstream test runner
-    # initialises a cache under it -- uv wants $HOME/.cache/uv, npm/cargo/gradle
-    # want their own -- so "/nonexistent" made the runner fail before reaching the
-    # tests at all: `Permission denied` creating /nonexistent/.cache/uv. That broke
-    # the only verification path a remediation turn has, and the turn then either
-    # pushed unverified or escalated.
-    #
-    # The point of "/nonexistent" was to keep the operator's real dotfiles
-    # unreachable, and a dedicated cache directory preserves that: it is not the
-    # real home, so ~/.ssh, ~/.netrc and friends stay out of reach. Git config is
-    # separately neutralised by GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM below,
-    # so pointing HOME somewhere writable does not reopen it.
-    #
-    # The path is stable rather than per-run so resolver caches survive between
-    # runs; a cold cache is only a slow test, and the scratch janitor may reclaim
-    # it at any time.
-    cache_home = Path(home) / "scratch" / "project-test-home"
-    try:
-        cache_home.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ProjectTestRefusal(
-            "test_cache_home_unavailable",
-            f"project test cache home is not writable: {cache_home}",
-        ) from exc
-
     env = {
         "PATH": _PATH,
-        "HOME": str(cache_home),
+        # HOME is deliberately absent here. A writable HOME is required -- every
+        # mainstream runner initialises a cache under it, and "/nonexistent" made
+        # uv fail before reaching pytest ("Permission denied" creating
+        # /nonexistent/.cache/uv) -- but it must be created FRESH PER EXECUTION and
+        # removed afterwards, so ``execute`` owns it rather than this function.
+        #
+        # A shared HOME would be a channel between executions: the tests running in
+        # it are PR-controlled, so one PR could plant ambient config (a .npmrc, a
+        # pip.conf -- only Git configuration is neutralised below) for a later PR to
+        # pick up. Caching is not worth a cross-PR write channel.
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "CI": "1",
@@ -214,6 +199,31 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable")
     return (str(resolved), *words[1:]), env
+
+
+def _project_test_home_parent() -> Path:
+    """Resolve the parent for per-execution test homes, refusing a symlinked path."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
+    base = Path(home).resolve()
+    parent = base / "scratch" / "project-test-homes"
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        resolved = parent.resolve(strict=True)
+    except OSError as exc:
+        raise ProjectTestRefusal(
+            "test_cache_home_unavailable",
+            f"project test home parent is not usable: {parent}",
+        ) from exc
+    # A symlinked parent could redirect every execution's HOME outside the home
+    # tree, so refuse rather than follow it.
+    if resolved != parent or not resolved.is_dir():
+        raise ProjectTestRefusal(
+            "test_cache_home_unavailable",
+            f"project test home parent is not a real directory: {parent}",
+        )
+    return resolved
 
 
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
@@ -291,6 +301,18 @@ class RepoProjectTests:
             raise ProjectTestRefusal(exc.code, str(exc)) from exc
         command, env = _configured_command()
         selected = _validated_selectors(root, selectors)
+        # Fresh HOME per execution, removed afterwards. mkdtemp creates a new
+        # 0o700 directory and fails rather than reusing an existing path, so a
+        # planted symlink cannot capture it.
+        parent = _project_test_home_parent()
+        try:
+            run_home = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+        except OSError as exc:
+            raise ProjectTestRefusal(
+                "test_cache_home_unavailable",
+                f"project test home could not be created under {parent}",
+            ) from exc
+        env["HOME"] = str(run_home)
         try:
             result = self._runner(
                 (*command, *selected), cwd=root, env=env.copy(),
@@ -298,6 +320,11 @@ class RepoProjectTests:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProjectTestRefusal("test_execution_failed", "configured test runner could not start") from exc
+        finally:
+            # Best-effort: a leaked directory costs disk, not isolation, because
+            # the next execution gets its own mkdtemp path regardless. rmtree
+            # unlinks symlinks rather than following them out of the tree.
+            shutil.rmtree(run_home, ignore_errors=True)
         if result.timed_out:
             return ProjectTestResult(False, "test_timeout", None)
         if result.output_limited:
