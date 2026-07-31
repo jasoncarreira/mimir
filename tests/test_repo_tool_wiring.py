@@ -25,7 +25,13 @@ from mimir.models import (
     RepoReviewState,
     SourceLabel,
 )
-from mimir.tools.repo import repo_checkout, repo_cleanup, repo_status, repo_test
+from mimir.tools.repo import (
+    _enforcement_enabled,
+    repo_checkout,
+    repo_cleanup,
+    repo_status,
+    repo_test,
+)
 
 
 def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
@@ -82,6 +88,50 @@ def _auth(scope: RepoPRActionScope, *additional: RepoPRActionScope) -> AuthConte
         repo_review_state=state if len(states) == 1 else None,
         repo_pr_action_scope=scope if len(states) == 1 else None,
     )
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [None, SimpleNamespace(), SimpleNamespace(context=SimpleNamespace())],
+)
+def test_unknown_repo_enforcement_state_fails_closed_and_emits_event(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: object | None,
+) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", capture)
+
+    assert _enforcement_enabled(
+        runtime,  # type: ignore[arg-type]
+        repository="owner/repo",
+        pull_request=7,
+    ) is True
+
+    assert captured == [(
+        "repo_enforcement_state_unknown",
+        {
+            "repository": "owner/repo",
+            "pull_request": 7,
+            "fallback_enforcement": True,
+        },
+    )]
+
+
+def test_repo_enforcement_state_preserves_explicit_flag() -> None:
+    assert _enforcement_enabled(
+        SimpleNamespace(context=SimpleNamespace(enforcement_enabled=False)),
+        repository="owner/repo",
+        pull_request=7,
+    ) is False
+    assert _enforcement_enabled(
+        SimpleNamespace(context=SimpleNamespace(enforcement_enabled=True)),
+        repository="owner/repo",
+        pull_request=7,
+    ) is True
 
 
 def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
