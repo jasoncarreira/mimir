@@ -19,6 +19,7 @@ import time
 from typing import Literal, Protocol, TypeAlias
 from urllib.parse import urlsplit
 
+from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
 
@@ -273,6 +274,7 @@ class RepoGitTools:
         runner: GitRunner = _bounded_subprocess_runner,
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         output_limit: int = _DEFAULT_OUTPUT_BYTES,
+        enforce: bool = True,
     ) -> None:
         if timeout <= 0 or output_limit <= 0:
             raise ValueError("Git timeout and output limit must be positive")
@@ -290,6 +292,7 @@ class RepoGitTools:
         self._runner = runner
         self._timeout = timeout
         self._output_limit = output_limit
+        self._enforce = enforce
         self._env = _sanitized_git_env()
         self._root = self._validate_lease()
         self._validate_scope()
@@ -340,10 +343,20 @@ class RepoGitTools:
             raise GitRefusal("invalid_checkout", "checkout lease escapes its server root")
         return root
 
-    def _require(self, *actions: RepoPRAction) -> None:
-        missing = [action.value for action in actions if action.value not in self._scope.allowed_operations]
-        if missing:
-            raise GitRefusal("scope_action_denied", f"scope does not grant {', '.join(missing)}")
+    def _require(self, tool_name: str, *actions: RepoPRAction) -> None:
+        decision = authorize_repo_pr_tool(
+            tool_name,
+            self._scope,
+            service_principal=None,
+            enforce=self._enforce,
+            flow_direction=ToolFlowDirection.UNKNOWN,
+            required_actions=tuple(action.value for action in actions),
+        )
+        if not decision.allowed:
+            raise GitRefusal(
+                "scope_action_denied",
+                decision.refusal_detail or "scope does not grant the required action",
+            )
 
     def _raw(
         self,
@@ -614,7 +627,7 @@ class RepoGitTools:
         ))
 
         if isinstance(operation, GitFetch):
-            self._require(RepoPRAction.CHECKOUT)
+            self._require("repo_fetch", RepoPRAction.CHECKOUT)
             lease = self._state.checkout_lease
             for ref, expected, identity in (
                 (self._scope.checkout_ref or self._scope.destination_ref,
@@ -651,11 +664,11 @@ class RepoGitTools:
             return GitOperationResult(True, "ok")
 
         if isinstance(operation, GitStatus):
-            self._require(RepoPRAction.INSPECT)
+            self._require("repo_status", RepoPRAction.INSPECT)
             untracked = "all" if operation.include_untracked else "no"
             result = self._command(("status", "--porcelain=v2", "-z", f"--untracked-files={untracked}"))
         elif isinstance(operation, GitDiff):
-            self._require(RepoPRAction.INSPECT)
+            self._require("repo_diff", RepoPRAction.INSPECT)
             paths = _validated_paths(operation.paths, required=False)
             if operation.mode not in {"working", "staged", "base"}:
                 raise GitRefusal("invalid_shape", "unsupported diff mode")
@@ -671,15 +684,15 @@ class RepoGitTools:
                 *revisions, *separator,
             ))
         elif isinstance(operation, GitUnmerged):
-            self._require(RepoPRAction.INSPECT)
+            self._require("repo_unmerged", RepoPRAction.INSPECT)
             result = self._command(("ls-files", "--unmerged", "-z"))
         elif isinstance(operation, GitStage):
-            self._require(RepoPRAction.WRITE)
+            self._require("repo_stage", RepoPRAction.WRITE)
             paths = _validated_paths(operation.paths, required=True)
             self._stage(paths)
             result = GitProcessResult(0)
         elif isinstance(operation, GitCommit):
-            self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            self._require("repo_commit", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             paths = _validated_paths(operation.paths, required=True)
             if (
                 not isinstance(operation.message, str)
@@ -702,7 +715,7 @@ class RepoGitTools:
             result = self._command(("commit", "-m", operation.message), identity=True)
             self._refresh_expected_head()
         elif isinstance(operation, GitMerge):
-            self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            self._require("repo_merge", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             try:
                 result = self._command(
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
@@ -724,19 +737,19 @@ class RepoGitTools:
                 ) from exc
             self._refresh_expected_head()
         elif isinstance(operation, GitMergeAbort):
-            self._require(RepoPRAction.WRITE)
+            self._require("repo_merge_abort", RepoPRAction.WRITE)
             result = self._command(("merge", "--abort"))
         elif isinstance(operation, GitRebase):
-            self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             result = self._command(
                 ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
             )
             self._refresh_expected_head()
         elif isinstance(operation, GitRebaseAbort):
-            self._require(RepoPRAction.WRITE)
+            self._require("repo_rebase_abort", RepoPRAction.WRITE)
             result = self._command(("rebase", "--abort"))
         elif isinstance(operation, GitRevert):
-            self._require(RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            self._require("repo_revert", RepoPRAction.WRITE, RepoPRAction.COMMIT)
             if not _SHA_RE.fullmatch(operation.commit):
                 raise GitRefusal("invalid_commit", "revert requires one full commit id")
             allowed = set(filter(None, self._command((
@@ -747,10 +760,10 @@ class RepoGitTools:
             result = self._command(("revert", "--no-edit", operation.commit), identity=True)
             self._refresh_expected_head()
         elif isinstance(operation, GitRevertAbort):
-            self._require(RepoPRAction.WRITE)
+            self._require("repo_revert_abort", RepoPRAction.WRITE)
             result = self._command(("revert", "--abort"))
         elif isinstance(operation, GitPush):
-            self._require(RepoPRAction.PUSH)
+            self._require("repo_push", RepoPRAction.PUSH)
             overrides = self._config_overrides()
             ancestry = self._raw((
                 "merge-base", "--is-ancestor", self._scope.observed_head_sha,

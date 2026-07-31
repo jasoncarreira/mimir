@@ -2584,7 +2584,7 @@ async def test_real_repo_execution_fault_taints_turn(
     ctx = _ifc_turn(auth)
 
     class FailingRepoGitTools:
-        def __init__(self, state):  # type: ignore[no-untyped-def]
+        def __init__(self, state, *, enforce=True):  # type: ignore[no-untyped-def]
             self.state = state
 
         def execute(self, operation):  # type: ignore[no-untyped-def]

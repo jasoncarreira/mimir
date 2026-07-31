@@ -25,7 +25,13 @@ from mimir.models import (
     RepoReviewState,
     SourceLabel,
 )
-from mimir.tools.repo import repo_checkout, repo_cleanup, repo_status, repo_test
+from mimir.tools.repo import (
+    _enforcement_enabled,
+    repo_checkout,
+    repo_cleanup,
+    repo_status,
+    repo_test,
+)
 
 
 def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
@@ -82,6 +88,50 @@ def _auth(scope: RepoPRActionScope, *additional: RepoPRActionScope) -> AuthConte
         repo_review_state=state if len(states) == 1 else None,
         repo_pr_action_scope=scope if len(states) == 1 else None,
     )
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [None, SimpleNamespace(), SimpleNamespace(context=SimpleNamespace())],
+)
+def test_unknown_repo_enforcement_state_fails_closed_and_emits_event(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: object | None,
+) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", capture)
+
+    assert _enforcement_enabled(
+        runtime,  # type: ignore[arg-type]
+        repository="owner/repo",
+        pull_request=7,
+    ) is True
+
+    assert captured == [(
+        "repo_enforcement_state_unknown",
+        {
+            "repository": "owner/repo",
+            "pull_request": 7,
+            "fallback_enforcement": True,
+        },
+    )]
+
+
+def test_repo_enforcement_state_preserves_explicit_flag() -> None:
+    assert _enforcement_enabled(
+        SimpleNamespace(context=SimpleNamespace(enforcement_enabled=False)),
+        repository="owner/repo",
+        pull_request=7,
+    ) is False
+    assert _enforcement_enabled(
+        SimpleNamespace(context=SimpleNamespace(enforcement_enabled=True)),
+        repository="owner/repo",
+        pull_request=7,
+    ) is True
 
 
 def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
@@ -246,6 +296,48 @@ async def test_pr_scope_policy_shadows_then_enforces_with_the_same_reason(
     assert events[0]["would_block"] is True
 
 
+@pytest.mark.asyncio
+async def test_repo_scope_policy_shadows_then_enforces_with_the_same_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope(RepoPRAction.INSPECT)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    arguments = {"repository": "owner/repo", "pull_request": 7}
+    shadow_context = replace(
+        _auth(scope),
+        enforcement_enabled=False,
+        ifc_labels=InformationFlowLabels(),
+    )
+    enforced_context = replace(_auth(scope), ifc_labels=InformationFlowLabels())
+    shadow = registry.authorize_tool(
+        "repo_stage",
+        shadow_context,
+        enforce=False,
+        arguments=arguments,
+    )
+    await asyncio.sleep(0)
+    enforced = registry.authorize_tool(
+        "repo_stage", enforced_context, enforce=True, arguments=arguments,
+    )
+
+    assert shadow.allowed is True
+    assert shadow.would_block is True
+    assert enforced.allowed is False
+    assert shadow.reason == enforced.reason == "repo_pr_scope_denied"
+    events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
+    assert len(events) == 1
+    assert events[0]["tool"] == "repo_stage"
+    assert events[0]["reason"] == enforced.reason
+    assert events[0]["would_block"] is True
+
+
 def test_tool_modules_do_not_decide_pr_scope_policy_locally() -> None:
     tools_root = Path(__file__).parents[1] / "mimir" / "tools"
     offenders = {
@@ -255,3 +347,12 @@ def test_tool_modules_do_not_decide_pr_scope_policy_locally() -> None:
     }
 
     assert offenders == set()
+
+
+def test_repo_tools_does_not_decide_pr_scope_policy_locally() -> None:
+    source = (Path(__file__).parents[1] / "mimir" / "repo_tools.py").read_text(
+        encoding="utf-8",
+    )
+
+    assert "allowed_operations" not in source
+    assert "authorize_repo_pr_tool(" in source

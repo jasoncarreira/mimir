@@ -567,7 +567,8 @@ def test_push_credential_is_available_only_for_exact_canonical_github_origin(
 
 
 def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatch) -> None:
-    _origin, _source, _scope, _state, tools = repo_tools
+    _origin, _source, _scope, state, _tools = repo_tools
+    tools = RepoGitTools(state, enforce=False)
     original_raw = tools._raw
     network_seen = False
 
@@ -587,7 +588,8 @@ def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatc
 
 
 def test_cross_pr_checkout_is_refused(repo_tools) -> None:
-    _origin, _source, _scope, state, tools = repo_tools
+    _origin, _source, _scope, state, _tools = repo_tools
+    tools = RepoGitTools(state, enforce=False)
     _git(state.checkout_lease.path, "checkout", "-q", "-b", "other-pr")
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitStatus())
@@ -653,14 +655,14 @@ def test_checkout_symlink_and_root_escape_are_refused(repo_tools, tmp_path: Path
     alias.symlink_to(lease.path, target_is_directory=True)
     object.__setattr__(state, "checkout_lease", replace(lease, path=alias))
     with pytest.raises(GitRefusal) as symlink_refusal:
-        RepoGitTools(state)
+        RepoGitTools(state, enforce=False)
     assert symlink_refusal.value.code == "invalid_checkout"
 
     outside = tmp_path / "outside-checkout"
     outside.mkdir()
     object.__setattr__(state, "checkout_lease", replace(lease, path=outside))
     with pytest.raises(GitRefusal) as escape_refusal:
-        RepoGitTools(state)
+        RepoGitTools(state, enforce=False)
     assert escape_refusal.value.code == "invalid_checkout"
 
 
@@ -726,7 +728,7 @@ def test_malformed_unmerged_index_output_is_refused(repo_tools, monkeypatch) -> 
 
 
 def test_fetch_ref_mismatch_is_named_stale_scope(repo_tools, monkeypatch) -> None:
-    tools = repo_tools[-1]
+    tools = RepoGitTools(repo_tools[-2], enforce=False)
     original = tools._command
 
     def stale(arguments, **kwargs):
@@ -1024,6 +1026,21 @@ def test_every_typed_operation_pins_its_scope_authority_check(
         tools.execute(operation)
 
     assert refusal.value.code == "scope_action_denied"
+
+
+def test_scope_action_check_is_shadowed_when_enforcement_is_disabled(repo_tools) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    altered = replace(
+        scope,
+        allowed_operations=scope.allowed_operations - {RepoPRAction.WRITE.value},
+    )
+    lease = replace(old_state.checkout_lease, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+
+    result = RepoGitTools(state, enforce=False).execute(GitStage(("tracked.txt",)))
+
+    assert result.ok is True
 
 
 @pytest.mark.parametrize(
