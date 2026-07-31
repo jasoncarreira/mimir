@@ -253,7 +253,9 @@ def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
     assert rows[2].disagreement == "worklink:in-progress label present but run state absent"
 
 
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_stop_clears_state_claim_and_label_and_missing_is_noop(tmp_path: Path) -> None:
+    # A verified stop requires Linux's stable process birth marker from /proc.
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
@@ -285,7 +287,9 @@ def test_stop_clears_state_claim_and_label_and_missing_is_noop(tmp_path: Path) -
         proc.wait()
 
 
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_stop_refuses_reused_pid_without_mutation(tmp_path: Path) -> None:
+    # PID-reuse refusal depends on comparing Linux /proc process birth markers.
     calls: list[list[str]] = []
     _state(
         tmp_path,
