@@ -4664,6 +4664,9 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
     assert auth.repo_review_state.root == str(root.resolve())
     assert auth.repo_pr_action_scope is auth.repo_review_state.action_scope
     assert auth.repo_pr_action_scope.provenance == "poller_payload"
+    assert access_control.RepoPRAction.WRITE.value in (
+        auth.repo_pr_action_scope.allowed_operations
+    )
 
     steered = replace(
         event,
@@ -4880,6 +4883,119 @@ def _attach_test_checkout_lease(
     )
     state.attach_checkout_lease(lease)
     return checkout
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    outside = tmp_path / "outside"
+    for path in (home, source, lease_root, outside):
+        path.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
+
+    state = _review_state("o/r", 42, "worklink/42", str(source))
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
+    )
+    other_checkout = lease_root / f"{state.action_scope.scope_id[:16]}-lease-b"
+    other_checkout.mkdir()
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(tool_name,),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+    registry = ToolRegistry()
+
+    admitted = registry.authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "mimir" / "access_control.py"),
+    )
+    assert admitted.allowed is True
+    assert admitted.would_block is False
+
+    for target in (
+        other_checkout / "tests" / "test_access_control.py",
+        source / "mimir" / "access_control.py",
+    ):
+        denied = registry.authorize_tool(
+            tool_name, auth, enforce=True, target_channel=str(target),
+        )
+        assert denied.allowed is False
+        assert denied.reason == "repo_pr_target_outside_active_lease"
+
+    unconfigured = registry.authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(outside / "unconfigured.py"),
+    )
+    assert unconfigured.allowed is False
+    assert unconfigured.reason == "service_sink_destination_denied"
+
+    (checkout / "escape").symlink_to(outside, target_is_directory=True)
+    escaped = registry.authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "escape" / "escaped.py"),
+    )
+    assert escaped.allowed is False
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_github_review_scope_cannot_write_inside_its_active_lease(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    for path in (home, source, lease_root):
+        path.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
+
+    remediation = _review_state("o/r", 42, "worklink/42", str(source))
+    review_scope = replace(
+        remediation.action_scope,
+        event_type="pr_review_requested",
+        allowed_operations=frozenset({
+            access_control.RepoPRAction.INSPECT.value,
+            access_control.RepoPRAction.CHECKOUT.value,
+            access_control.RepoPRAction.TEST.value,
+            access_control.RepoPRAction.PR_REVIEW.value,
+            access_control.RepoPRAction.PR_COMMENT.value,
+        }),
+    )
+    assert access_control.RepoPRAction.WRITE.value not in review_scope.allowed_operations
+    state = RepoReviewState(review_scope)
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{review_scope.scope_id[:16]}-review",
+    )
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(tool_name,),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+
+    denied = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True,
+        target_channel=str(checkout / "review-cannot-edit.py"),
+    )
+    assert denied.allowed is False
+    assert denied.reason == "repo_pr_write_not_granted"
 
 
 def test_batched_pr_reads_resolve_each_exact_checkout_lease(
