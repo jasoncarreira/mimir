@@ -8,6 +8,7 @@ configuration overrides, and environment are supplied by the server.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,7 @@ import re
 import selectors
 import signal
 import subprocess
+import threading
 import time
 from typing import Literal, Protocol, TypeAlias
 from urllib.parse import urlsplit
@@ -33,6 +35,32 @@ _SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 _REF_RE = re.compile(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _FILTER_KEY_RE = re.compile(r"filter\.([^.\x00]+)\.(clean|smudge|process)")
 _MERGE_KEY_RE = re.compile(r"merge\.([^.\x00]+)\.driver")
+_RECENT_AGENT_PUSH_LIMIT = 1024
+_recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
+_recent_agent_pushes_lock = threading.Lock()
+
+
+def _record_agent_push(scope: RepoPRActionScope, pushed_head: str) -> None:
+    if scope.event_type != "pr_changes_requested_stale":
+        return
+    key = (
+        scope.canonical_repo.lower(), scope.pr_number,
+        scope.observed_head_sha.lower(), pushed_head.lower(),
+    )
+    with _recent_agent_pushes_lock:
+        _recent_agent_pushes[key] = None
+        _recent_agent_pushes.move_to_end(key)
+        while len(_recent_agent_pushes) > _RECENT_AGENT_PUSH_LIMIT:
+            _recent_agent_pushes.popitem(last=False)
+
+
+def was_agent_push(
+    repository: str, pull_request: int, previous_head: str, current_head: str,
+) -> bool:
+    """Return whether this process verified the exact remediation push."""
+    key = (repository.lower(), pull_request, previous_head.lower(), current_head.lower())
+    with _recent_agent_pushes_lock:
+        return key in _recent_agent_pushes
 
 _BASE_CONFIG = (
     "-c", "core.fsmonitor=",
@@ -837,6 +865,7 @@ class RepoGitTools:
                         "git_failed",
                         reachability.stderr.strip() or "push reachability verification failed",
                     )
+                _record_agent_push(self._scope, observed)
             except GitRefusal as exc:
                 if exc.code == "git_failed":
                     raise GitRefusal(
@@ -853,4 +882,5 @@ __all__ = [
     "GitOperation", "GitOperationResult", "GitProcessResult", "GitPush",
     "GitRebase", "GitRebaseAbort", "GitRefusal", "GitRevert",
     "GitRevertAbort", "GitStage", "GitStatus", "GitUnmerged", "RepoGitTools",
+    "was_agent_push",
 ]

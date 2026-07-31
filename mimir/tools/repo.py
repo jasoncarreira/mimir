@@ -146,7 +146,14 @@ def repo_checkout(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
-    state = _state(runtime, repository, pull_request)
+    from .forge import remediation_checkout_preflight
+
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    state, stopped = remediation_checkout_preflight(context, repository, pull_request)
+    if stopped is not None:
+        return {"status": "stopped", "message": stopped}
+    if state is None:
+        raise ToolPolicyRefusal("repository checkout rejected: no authorized pull request state")
     try:
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope,

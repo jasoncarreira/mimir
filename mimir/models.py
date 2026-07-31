@@ -772,6 +772,9 @@ class ServerDiscoveredPRStates:
         default_factory=dict, init=False, repr=False,
     )
     _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+    _remint_attempts: set[tuple[str, int]] = field(
+        default_factory=set, init=False, repr=False,
+    )
 
     def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
         with self._lock:
@@ -780,6 +783,31 @@ class ServerDiscoveredPRStates:
     def remember(self, state: RepoReviewState) -> RepoReviewState:
         target = (state.repo.lower(), state.pr_number)
         with self._lock:
+            return self._states.setdefault(target, state)
+
+    def begin_remint(self, repository: str, pull_request: int) -> bool:
+        """Reserve the sole live-snapshot remediation re-mint for a turn."""
+        target = (repository.lower(), pull_request)
+        with self._lock:
+            if target in self._remint_attempts:
+                return False
+            self._remint_attempts.add(target)
+            return True
+
+    def remember_remint(self, original: RepoReviewState, state: RepoReviewState) -> RepoReviewState:
+        """Install newly derived authority without altering the poller scope."""
+        target = (original.repo.lower(), original.pr_number)
+        replacement_target = (state.repo.lower(), state.pr_number)
+        if (
+            target != replacement_target
+            or original.action_scope.event_type != "pr_changes_requested_stale"
+            or state.action_scope.event_type != original.action_scope.event_type
+            or state.action_scope.provenance != RepoPRScopeProvenance.SERVER_DISCOVERED
+        ):
+            raise ValueError("reminted review scope does not match original remediation target")
+        with self._lock:
+            if target not in self._remint_attempts:
+                raise ValueError("reminted review scope was not reserved")
             return self._states.setdefault(target, state)
 
 

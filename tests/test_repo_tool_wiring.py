@@ -19,12 +19,15 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
+    NormalizedPullRequestSnapshot,
     RepoPRAction,
     RepoPRActionScope,
     RepoPRScopeRegistry,
     RepoReviewState,
     SourceLabel,
 )
+from mimir.forge import ReviewProjection
+from mimir.tools.forge import set_forge_client
 from mimir.tools.repo import (
     _enforcement_enabled,
     repo_checkout,
@@ -34,9 +37,21 @@ from mimir.tools.repo import (
 )
 
 
-def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
+@pytest.fixture(autouse=True)
+def _reset_forge_client() -> None:
+    set_forge_client(None)
+    yield
+    set_forge_client(None)
+
+
+def _scope(
+    *actions: RepoPRAction,
+    number: int = 7,
+    head_sha: str = "a" * 40,
+    provenance: str = "server_discovered",
+) -> RepoPRActionScope:
     return RepoPRActionScope(
-        provenance="server_discovered",
+        provenance=provenance,
         canonical_repo="owner/repo",
         canonical_root="/srv/repo",
         canonical_origin="https://github.com/owner/repo.git",
@@ -47,7 +62,7 @@ def _scope(*actions: RepoPRAction, number: int = 7) -> RepoPRActionScope:
         head_repo="owner/repo",
         head_remote="origin",
         destination_ref="refs/heads/fix",
-        observed_head_sha="a" * 40,
+        observed_head_sha=head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
     )
@@ -205,6 +220,207 @@ def test_checkout_proof_is_isolated_to_named_pr(
     assert second_state is not None and second_state.checked_out is False
     with pytest.raises(ToolException, match="inactive_checkout"):
         repo_status.func(repository="owner/repo", pull_request=8, runtime=runtime)
+
+
+class _RemediationForge:
+    def __init__(self, *snapshots: NormalizedPullRequestSnapshot) -> None:
+        self.snapshots = list(snapshots)
+        self.snapshot_calls = 0
+        self.review_calls = 0
+        self.reviews = (
+            ReviewProjection("1", "reviewer", "CHANGES_REQUESTED", "fix", "now", "a" * 40),
+        )
+
+    def get_pull_request_snapshot(self, repository, number):  # type: ignore[no-untyped-def]
+        self.snapshot_calls += 1
+        return self.snapshots.pop(0)
+
+    def list_reviews(self, scope):  # type: ignore[no-untyped-def]
+        self.review_calls += 1
+        return self.reviews
+
+
+def _snapshot(head_sha: str, *, state: str = "open") -> NormalizedPullRequestSnapshot:
+    return NormalizedPullRequestSnapshot(
+        state=state,
+        number=7,
+        author="mimir-bot",
+        head_repo="owner/repo",
+        head_remote="origin",
+        head_ref="fix",
+        head_sha=head_sha,
+        base_ref="main",
+        base_sha="b" * 40,
+    )
+
+
+def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationForge):
+    old_scope = _scope(
+        *RepoPRAction,
+        provenance="poller_payload",
+    )
+    context = _auth(old_scope)
+    set_forge_client(client)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+
+    def mint(repository, snapshot, *, event_type):  # type: ignore[no-untyped-def]
+        assert event_type == "pr_changes_requested_stale"
+        return replace(
+            old_scope,
+            provenance="server_discovered",
+            observed_head_sha=snapshot.head_sha,
+        )
+
+    monkeypatch.setattr(
+        "mimir.access_control.create_server_discovered_heartbeat_scope", mint,
+    )
+    return old_scope, context, SimpleNamespace(context=context)
+
+
+def test_stale_own_remediation_head_is_reminted_and_checked_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh_head = "c" * 40
+    old_scope, context, runtime = _remediation_runtime(
+        monkeypatch, _RemediationForge(_snapshot(fresh_head)),
+    )
+    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: True)
+    checked_out: list[RepoPRActionScope] = []
+
+    def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
+        checked_out.append(scope)
+        lease = SimpleNamespace(
+            path=tmp_path / "fresh", scope_id=scope.scope_id,
+            head_sha=scope.observed_head_sha, owner=owner, is_active=True,
+        )
+        review_state.attach_checkout_lease(lease)
+        return lease, ()
+
+    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
+
+    result = repo_checkout.func(
+        repository="owner/repo", pull_request=7, runtime=runtime,
+    )
+
+    assert result["head_sha"] == fresh_head
+    assert checked_out[0].provenance.value == "server_discovered"
+    assert context.repo_pr_scope_registry.resolve("owner/repo", 7).action_scope is old_scope
+    assert context.server_discovered_pr_states.resolve(
+        "owner/repo", 7,
+    ).action_scope is checked_out[0]
+
+
+def test_merged_remediation_pr_stops_before_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _old_scope, _context, runtime = _remediation_runtime(
+        monkeypatch, _RemediationForge(_snapshot("c" * 40, state="closed")),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.repo.acquire_pr_checkout_lease",
+        lambda *_args, **_kwargs: pytest.fail("closed PR reached checkout"),
+    )
+
+    result = repo_checkout.func(
+        repository="owner/repo", pull_request=7, runtime=runtime,
+    )
+
+    assert result == {
+        "status": "stopped",
+        "message": "pull request is closed or merged",
+    }
+
+
+def test_remediation_head_advancing_twice_does_not_remint_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_head = "c" * 40
+    third_head = "d" * 40
+    client = _RemediationForge(_snapshot(second_head), _snapshot(third_head))
+    _old_scope, context, runtime = _remediation_runtime(monkeypatch, client)
+    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: True)
+    calls = 0
+
+    def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError(
+                f"PR head advanced: scoped head {second_head} is stale; fetched head is {third_head}"
+            )
+        lease = SimpleNamespace(
+            path=tmp_path / "fresh", scope_id=scope.scope_id,
+            head_sha=scope.observed_head_sha, owner=owner, is_active=True,
+        )
+        review_state.attach_checkout_lease(lease)
+        return lease, ()
+
+    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
+    repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
+
+    with pytest.raises(ToolException) as raised:
+        repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
+
+    assert str(raised.value) == (
+        f"repository checkout rejected: PR head advanced: scoped head {second_head} "
+        f"is stale; fetched head is {third_head}"
+    )
+    assert context.server_discovered_pr_states.resolve(
+        "owner/repo", 7,
+    ).action_scope.observed_head_sha == second_head
+
+
+def test_failed_remint_preserves_existing_stale_head_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh_head = "c" * 40
+    old_scope, _context, runtime = _remediation_runtime(
+        monkeypatch, _RemediationForge(_snapshot(fresh_head)),
+    )
+    monkeypatch.setattr(
+        "mimir.access_control.create_server_discovered_heartbeat_scope",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def stale_checkout(scope, **_kwargs):  # type: ignore[no-untyped-def]
+        assert scope is old_scope
+        raise RuntimeError(
+            f"PR head advanced: scoped head {scope.observed_head_sha} is stale; "
+            f"fetched head is {fresh_head}"
+        )
+
+    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", stale_checkout)
+
+    with pytest.raises(ToolException) as raised:
+        repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
+
+    assert str(raised.value) == (
+        f"repository checkout rejected: PR head advanced: scoped head "
+        f"{old_scope.observed_head_sha} is stale; fetched head is {fresh_head}"
+    )
+
+
+def test_external_head_advance_rereads_review_state_before_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _RemediationForge(_snapshot("c" * 40))
+    client.reviews = (
+        ReviewProjection("2", "reviewer", "APPROVED", "ok", "later", "c" * 40),
+    )
+    _old_scope, _context, runtime = _remediation_runtime(monkeypatch, client)
+    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: False)
+    monkeypatch.setattr(
+        "mimir.tools.repo.acquire_pr_checkout_lease",
+        lambda *_args, **_kwargs: pytest.fail("cleared review reached checkout"),
+    )
+
+    result = repo_checkout.func(
+        repository="owner/repo", pull_request=7, runtime=runtime,
+    )
+
+    assert result["status"] == "stopped"
+    assert "no longer has a blocking" in result["message"]
+    assert client.review_calls == 1
 
 
 def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink() -> None:
