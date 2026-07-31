@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from mimir.opencode_config import OpenCodeInvocation
 from mimir.worklink.backends import (
     WORKLINK_MERGED_LABEL,
     BackendRegistry,
@@ -1095,8 +1096,18 @@ def test_registry_keeps_and_logs_python_default_bash_allowlist(
     [("npm test", "npm *"), ("./gradlew test", "./gradlew *")],
 )
 def test_registry_derives_only_configured_non_python_runner(
-    test_command: str, runner_pattern: str
+    monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str
 ) -> None:
+    monkeypatch.setattr(
+        "mimir.worklink.backends.opencode.resolve_opencode_invocation",
+        lambda **_: OpenCodeInvocation(
+            model="openai/test-model",
+            provider="openai",
+            model_source="test",
+            config_path=Path("/nonexistent/opencode.jsonc"),
+            auth_type=None,
+        ),
+    )
     config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
 
     backend = BackendRegistry(config).get("opencode")
