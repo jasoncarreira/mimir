@@ -816,7 +816,7 @@ The breaker has caught real runaway loops in open-strix benchmark runs; defaults
 The agent uses these for all filesystem work (memory editing, reorganizing dirs, running scripts, etc.).
 
 **Synchronous shell:**
-- `shell_exec(command: str)` — execute a shell command via `shlex.split` (no shell expansion). Returns `exit=N\nstdout: ...\nstderr: ...`. Path confinement is enforced against the agent home and operator-configured roots. Runs in `<home>` by convention.
+- `shell_exec(command: str)` — user/admin calls execute through `bash -lc`, including normal shell expansion and composition. Trusted-service calls are separately reduced to a server-authorized exact argv and run with `shell=False`. Returns `exit=N\nstdout: ...\nstderr: ...` and defaults to `<home>` as its working directory. File-tool roots do not sandbox ordinary user/admin shell commands.
 
 **Async background shell:**
 - `bash_async(command: str, session_id: str)` — spawn command in background; returns immediately with a `job_id`. Fires `shell_job_complete` event (with exit code + tail output) when done — that event triggers a fresh turn so the agent can process the result.
@@ -829,7 +829,7 @@ The agent uses these for all filesystem work (memory editing, reorganizing dirs,
 - `edit_file(path: str, old_string: str, new_string: str)`
 - `glob_files(pattern: str)`
 
-All paths must stay under the agent home or an operator-configured `MIMIR_FILE_TOOL_ROOTS` entry. Extra roots use comma-separated `/absolute/path[:ro|:rw]` entries and are rejected if they contain traversal, overlap the home, do not name an existing directory, or name/resolve to a denylisted system root (`/`, `/bin`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`). Symlink and `..` escapes outside the effective roots are rejected at use time.
+File-operation paths (`read_file`, `write_file`, `edit_file`, and `glob_files`) must stay under the agent home, derived `/tmp` root, or an operator-configured `MIMIR_FILE_TOOL_ROOTS` entry. Extra roots use comma-separated `/absolute/path[:ro|:rw]` entries and are rejected if they contain traversal, overlap the home, do not name an existing directory, or name/resolve to a denylisted system root (`/`, `/bin`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`). Symlink and `..` escapes outside the effective roots are rejected at use time. This is a denylist-backed configurable-root model, not a fixed allowlist of deployment mount names, and it does not confine ordinary user/admin shell commands; trusted-service shell confinement uses separate exact-argv and working-directory policy.
 
 ### 7.4 Web
 

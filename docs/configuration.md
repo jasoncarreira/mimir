@@ -2,13 +2,12 @@
 
 Every configuration environment variable mimir reads, with its type, default,
 and what it does. **This is the complete list**, enforced by
-`tests/test_config_docs_complete.py` — an AST scan of the core runtime asserts
-every env read is documented here (or on the explicit exclusion allowlist), so
-the list can't silently drift out of date. The scan resolves string-literal
-reads *and* reads via a module-level string constant (e.g.
-`os.environ.get(_WEBHOOK_ENV)`); the only unenforced shape is a name computed at
-runtime from a non-constant value (a helper parameter, a cross-module import, an
-f-string), which is plumbing rather than an operator flag.
+`tests/test_config_docs_complete.py`. The gate scans exact `MIMIR_*` string
+literals in core Python code, so new names must gain a reference entry. Prefixes
+and regular expressions do not match the exact-name shape and are excluded by
+construction rather than by an ignore list. A second AST scan covers non-Mimir
+environment reads and explicitly excludes variables owned by the OS or an
+external process.
 [`.env.example`](../.env.example) is a copy-paste starter that covers the common
 ones; this file is the exhaustive reference.
 
@@ -277,6 +276,134 @@ authenticate transport only; they do not create a named requester.
 | `MIMIR_FACTORY_PROBE_WINDOW_S` | float | `300` (floor 1) | Interval the orchestrator re-probes a running factory job's state. |
 | `MIMIR_FACTORY_REVIEWER` | str | `mimir-carreira` | Reviewer the factory requests on the PR it opens (`--reviewer <name>`); empty omits the flag. |
 | `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
+| `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
+| `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
+
+## Worklink YAML
+
+Worklink reads `<MIMIR_HOME>/worklink.yaml`. This is separate from `.env`: YAML
+selects Worklink execution behavior and backends, while the environment table
+above configures the Mimir process. Omitted keys use the defaults below.
+
+| Top-level key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults` | mapping | `{}` | Holds routing, execution, autonomy, and compatibility defaults described below. | `defaults: {backend: opencode}` |
+| `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
+| `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
+| `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
+| `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.9", smoke: "opencode --version"}]` |
+
+### Defaults
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults.backend` | backend name | `opencode` | Selects the tool backend when no route or category override matches. | `backend: opencode` |
+| `defaults.timeout_s` | int | `1800` | Maximum seconds allowed for the backend/compute run. | `timeout_s: 3600` |
+| `defaults.priority` | str | `normal` | Priority supplied to the autonomous arbiter. | `priority: low` |
+| `defaults.test_command` | command string | `uv run pytest -q` | Command Worklink uses for observed test evidence. Granting the typed `repo_test` capability lets a remediation turn run this same configured command, shell-free, in its authorized PR checkout lease. | `test_command: "/usr/bin/npm test"` |
+| `defaults.backend_by_category` | mapping | `{}` | Selects a backend by tool category after no route matches. | `backend_by_category: {coding-cli: opencode}` |
+| `defaults.category_defaults` | mapping | `{}` | Compatibility alias for `backend_by_category`; ignored when that key is non-empty. | `category_defaults: {coding-cli: opencode}` |
+| `defaults.compute_backend` | compute name | `local_subprocess` | Selects where the tool backend runs. The shipping value is unsandboxed. | `compute_backend: local_subprocess` |
+| `defaults.compute` | compute name | `local_subprocess` | Compatibility alias for `compute_backend`; ignored when that key is present. | `compute: local-subprocess` |
+| `defaults.base_branch` | str | `main` | Branch attempt checkouts are based on and leaf PRs target. | `base_branch: release/0.7` |
+| `defaults.base_fetch` | bool | `true` | Refreshes `origin/<base_branch>` before creating an attempt checkout without moving the source checkout. | `base_fetch: false` |
+| `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
+| `defaults.reaper_ttl_s` | positive int | `7200` | Age in seconds after which the reaper may recover a claim or retained checkout with no heartbeat. Keep it above twice `timeout_s`. | `reaper_ttl_s: 10800` |
+| `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.7.0 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.7.0 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.7.0 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.7.0 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
+
+`defaults.trusted_test_retries` is **retired**, not an operator setting in
+0.7.0. It belonged to the removed distributed trusted-test runner. A value in
+YAML has no effect and must not be used as a retry guarantee; for example,
+remove `trusted_test_retries: 1` from an older deployment file.
+
+The remediation parser for `defaults.test_command` uses POSIX argument splitting
+and a fixed system `PATH`; it does not run a shell. Use an executable available
+there or an absolute path. Pipelines, redirects, glob expansion, `&&`, and
+environment assignments are not interpreted. A leading `env -u NAME` (or
+`env --unset NAME`) is supported, but `env NAME=value` is not. Thus this is a
+valid non-Python configuration:
+
+```yaml
+defaults:
+  test_command: "env -u NODE_OPTIONS /usr/bin/npm test -- --runInBand"
+```
+
+### Tiered review compatibility fields
+
+These keys are parsed for old deployment files but are currently inert. If a
+list is supplied, it replaces rather than extends the framework default.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `defaults.tiered_review.high_risk_scope_patterns` | list[str] | migration/schema, auth/credential, generated/lockfile, workflow/Docker/Terraform globs | Retains the old high-risk path patterns for config compatibility; no current reviewer consumes them. | `high_risk_scope_patterns: ["src/auth/**"]` |
+| `defaults.tiered_review.high_risk_labels` | list[str] | `risk:high`, `security`, `auth`, `migration`, `prod-data`, `generated-code`, `hotspot` | Retains the old high-risk labels for config compatibility; no current reviewer consumes them. | `high_risk_labels: ["security"]` |
+| `defaults.tiered_review.multi_vote_reviewer_count` | positive int | `3` | Retains the old reviewer count for config compatibility; no current reviewer consumes it. | `multi_vote_reviewer_count: 5` |
+
+### Routes
+
+`routes` defaults to `[]`; entries are evaluated in order and the first match
+wins. Each route needs `backend` and at least one selector to be useful.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `routes[].backend` | backend name | required | Tool backend selected by this route. | `backend: feature_factory` |
+| `routes[].label` | str | unset | Matches when the issue has this label. | `label: worklink:epic` |
+| `routes[].repo` | str | unset | Matches this `owner/repo`. | `repo: acme/service` |
+| `routes[].tool_category` | str | unset | Matches the requested backend tool category. | `tool_category: coding-cli` |
+| `routes[].compute_backend` | compute name | `defaults.compute_backend` | Overrides the compute backend for this route. | `compute_backend: local_subprocess` |
+
+Example:
+
+```yaml
+routes:
+  - label: worklink:epic
+    backend: feature_factory
+    compute_backend: local_subprocess
+```
+
+### Backend blocks
+
+`backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
+0.7.0. An unknown referenced backend fails configuration loading; stale settings
+for an unreferenced backend are warned and dropped.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `backends.opencode.bin` | str | `opencode` | Executable used for `opencode run`. | `bin: /usr/local/bin/opencode` |
+| `backends.opencode.args` | list[str] | `[]` | Adds arguments not owned by Worklink. `-m`/`--model`, `--dir`, and `--` are rejected because Worklink supplies them. | `args: ["--format", "json"]` |
+| `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
+| `backends.feature_factory.bin` | command string | `feature-factory` | Factory executable; unlike the OpenCode binary, this may contain multiple shell-split tokens. | `bin: "node /opt/factory/cli.js"` |
+| `backends.feature_factory.args` | list[str] | `[]` | Extra arguments appended to the factory invocation. | `args: ["--verbose"]` |
+| `backends.feature_factory.ready` | bool | `true` | Adds `--ready` when true. Use a YAML boolean; quoted `"false"` is truthy to the current parser. | `ready: false` |
+| `backends.feature_factory.reviewer` | str | `MIMIR_FACTORY_REVIEWER` or `mimir-carreira` | Adds `--reviewer`; an empty string omits it. | `reviewer: release-team` |
+
+`compute_backends` defaults to `{}`. The sole shipping block is
+`compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized
+to the same name), it defaults to `{}`, and it accepts no child settings.
+Example: `compute_backends: {local_subprocess: {}}`.
+
+### Tool pins
+
+`tool_pins` defaults to `[]`. It is operator inventory for drift/bump tooling,
+not an installer. Every item needs `name`, `category`, `pin`, and `smoke`; the
+remaining fields are optional and default to unset.
+
+| Key | Type | Default | Effect | Example |
+|---|---|---|---|---|
+| `tool_pins[].name` | str | required | Stable local tool name. | `name: opencode` |
+| `tool_pins[].category` | str | required | Tool class used in maintenance output. | `category: coding-cli` |
+| `tool_pins[].pin` | str | required | Expected version, tag, or SHA. | `pin: "1.18.9"` |
+| `tool_pins[].smoke` | str | required | Command recorded as bump evidence; issue rendering does not execute it. | `smoke: "opencode --version"` |
+| `tool_pins[].source` | str | unset | Upstream lookup strategy. | `source: npm` |
+| `tool_pins[].package` | str | unset | Upstream package identifier. | `package: opencode-ai` |
+| `tool_pins[].repo` | str | unset | Upstream repository identifier. | `repo: anomalyco/opencode` |
+| `tool_pins[].install` | str | unset | Human-readable install surface. | `install: scaffold Dockerfile` |
+| `tool_pins[].risk` | str | unset | Human-readable upgrade risk. | `risk: high` |
 
 ## Optional-skill pollers (gmail / social / github)
 
@@ -340,7 +467,19 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 | `MIMIR_GIT_URL` | str | `https://github.com/jasoncarreira/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Scaffold/build arg: `1` installs and configures the OpenCode runtime and bundled plugins. It is not read by the Python runtime. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
+| `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
+
+The following code-visible names are explicitly **internal, not operator
+environment variables**:
+
+| Name | Classification |
+|---|---|
+| `MIMIR_HOME_GIT_TRACKING` | Historical internal design-document/implementation label; runtime configuration is `MIMIR_GIT_TRACKING_ENABLED`. |
+| `MIMIR_COMPATIBILITY` | Optional model-adapter module attribute inspected with `getattr`; it is not read from the environment. |
+| `MIMIR_CONFIG` | Reserved future alias mentioned by the internal SAGA loader; it is not implemented. Use `SAGA_CONFIG`. |
+| `MIMIR_SPAWN_DEPTH` | Harness-owned recursion-depth marker set on child processes; it is not an operator setting. |
 
 > `MIMIR_GIT_USER_NAME` / `MIMIR_GIT_USER_EMAIL` appear in scaffold comments as
 > committer-identity overrides, but are **not currently wired to an env read** —

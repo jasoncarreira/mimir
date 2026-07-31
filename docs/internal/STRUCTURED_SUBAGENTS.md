@@ -10,4 +10,4 @@ If a non-LLM controller needs parsed objects, it should invoke a compiled child 
 
 ## Permissions boundary
 
-`critic-structured` uses a read-only DeepAgents filesystem permission profile: built-in filesystem write operations are denied. This is accidental-overreach protection, not a security sandbox. It does not secure arbitrary shell/process execution, so the role does not receive shell/process tools by default; strong isolation belongs in Worklink-style worktree/container execution.
+`critic-structured` uses a read-only DeepAgents filesystem permission profile: built-in filesystem write operations are denied. This is accidental-overreach protection, not a security sandbox. It does not secure arbitrary shell/process execution, so the role does not receive shell/process tools by default. Strong isolation requires an isolated container/task or compute substrate; a Worklink checkout is an audit and Git-state boundary, not a security sandbox.
