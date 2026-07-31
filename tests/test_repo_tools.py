@@ -934,6 +934,57 @@ def test_project_test_home_does_not_carry_state_between_executions(
     assert observed == [False, False], "planted config leaked into the next execution"
 
 
+def test_project_test_parent_swap_during_run_cannot_delete_outside_tree(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent swapped mid-run must not redirect cleanup outside the home.
+
+    The tests executing in the per-run HOME are PR-controlled. If cleanup resolved
+    the home by pathname, replacing the parent with a symlink during the run would
+    make rmtree traverse the swap and delete a matching tree elsewhere. Creation
+    and deletion are both descriptor-relative, so the swap is inert.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    # A tree outside the home that must survive, containing a same-named entry so
+    # a pathname-based delete would actually hit something.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    treasure = outside / "keep.txt"
+    treasure.write_text("must survive\n", encoding="utf-8")
+
+    parent = home.resolve() / "scratch" / "project-test-homes"
+
+    captured: dict[str, str] = {}
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        run_home = Path(env["HOME"])
+        captured["name"] = run_home.name
+        # Mirror the run directory's name inside the outside tree, then swap the
+        # parent for a symlink to it -- exactly what PR-controlled test code could
+        # do while executing.
+        decoy = outside / run_home.name
+        decoy.mkdir()
+        (decoy / "keep.txt").write_text("decoy\n", encoding="utf-8")
+        import shutil as _shutil
+        _shutil.rmtree(parent)
+        parent.symlink_to(outside, target_is_directory=True)
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    RepoProjectTests(state, runner=runner).execute(())
+
+    # The decoy is what a pathname-based cleanup destroys: after the swap,
+    # parent/<run-name> resolves to outside/<run-name>. Descriptor-relative
+    # deletion never resolves that pathname, so the decoy must be untouched.
+    decoy = outside / captured["name"]
+    assert decoy.is_dir(), "cleanup followed the swapped parent and deleted outside the home"
+    assert (decoy / "keep.txt").read_text(encoding="utf-8") == "decoy\n"
+    assert treasure.read_text(encoding="utf-8") == "must survive\n"
+
+
 def test_project_test_refuses_symlinked_home_parent(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

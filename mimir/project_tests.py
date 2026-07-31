@@ -10,8 +10,8 @@ import selectors as io_selectors
 import shlex
 import shutil
 import signal
+import secrets
 import subprocess
-import tempfile
 import time
 from typing import Protocol
 
@@ -201,29 +201,52 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     return (str(resolved), *words[1:]), env
 
 
-def _project_test_home_parent() -> Path:
-    """Resolve the parent for per-execution test homes, refusing a symlinked path."""
+def _open_project_test_home_parent() -> tuple[int, Path]:
+    """Open the per-execution home parent, returning a descriptor and its path.
+
+    The descriptor is the point. Validating the parent by pathname and then
+    cleaning up by pathname is a time-of-check/time-of-use gap: the tests running
+    inside the home are PR-controlled, so between creation and cleanup they can
+    replace the parent directory with a symlink, and a later pathname-based
+    ``rmtree`` would resolve through the swap and delete a matching tree outside
+    the home. Holding a descriptor means every subsequent operation is relative to
+    the directory we actually created in, so a swapped pathname is irrelevant.
+    """
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
-    base = Path(home).resolve()
-    parent = base / "scratch" / "project-test-homes"
+    parent = Path(home).resolve() / "scratch" / "project-test-homes"
     try:
         parent.mkdir(parents=True, exist_ok=True)
-        resolved = parent.resolve(strict=True)
+        # O_NOFOLLOW refuses to open the parent at all if it is a symlink, so a
+        # parent planted before this call cannot redirect the home either.
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
         raise ProjectTestRefusal(
             "test_cache_home_unavailable",
             f"project test home parent is not usable: {parent}",
         ) from exc
-    # A symlinked parent could redirect every execution's HOME outside the home
-    # tree, so refuse rather than follow it.
-    if resolved != parent or not resolved.is_dir():
-        raise ProjectTestRefusal(
-            "test_cache_home_unavailable",
-            f"project test home parent is not a real directory: {parent}",
-        )
-    return resolved
+    return parent_fd, parent
+
+
+def _make_project_test_home(parent_fd: int, parent: Path) -> tuple[str, Path]:
+    """Create a fresh 0o700 home relative to *parent_fd*; never reuse a path."""
+    for _ in range(8):
+        name = f"run-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise ProjectTestRefusal(
+                "test_cache_home_unavailable",
+                f"project test home could not be created under {parent}",
+            ) from exc
+        return name, parent / name
+    raise ProjectTestRefusal(
+        "test_cache_home_unavailable",
+        f"project test home could not be created under {parent}",
+    )
 
 
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
@@ -304,14 +327,12 @@ class RepoProjectTests:
         # Fresh HOME per execution, removed afterwards. mkdtemp creates a new
         # 0o700 directory and fails rather than reusing an existing path, so a
         # planted symlink cannot capture it.
-        parent = _project_test_home_parent()
+        parent_fd, parent = _open_project_test_home_parent()
         try:
-            run_home = Path(tempfile.mkdtemp(prefix="run-", dir=parent))
-        except OSError as exc:
-            raise ProjectTestRefusal(
-                "test_cache_home_unavailable",
-                f"project test home could not be created under {parent}",
-            ) from exc
+            run_name, run_home = _make_project_test_home(parent_fd, parent)
+        except ProjectTestRefusal:
+            os.close(parent_fd)
+            raise
         env["HOME"] = str(run_home)
         try:
             result = self._runner(
@@ -321,10 +342,14 @@ class RepoProjectTests:
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProjectTestRefusal("test_execution_failed", "configured test runner could not start") from exc
         finally:
-            # Best-effort: a leaked directory costs disk, not isolation, because
-            # the next execution gets its own mkdtemp path regardless. rmtree
-            # unlinks symlinks rather than following them out of the tree.
-            shutil.rmtree(run_home, ignore_errors=True)
+            # Delete relative to the descriptor, never by pathname: rmtree(dir_fd=)
+            # resolves run_name inside the directory we created it in, so replacing
+            # the parent mid-run cannot redirect the deletion. A leaked directory
+            # costs disk, not isolation -- the next execution mints a new name.
+            try:
+                shutil.rmtree(run_name, dir_fd=parent_fd, ignore_errors=True)
+            finally:
+                os.close(parent_fd)
         if result.timed_out:
             return ProjectTestResult(False, "test_timeout", None)
         if result.output_limited:
