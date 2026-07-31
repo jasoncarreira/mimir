@@ -965,6 +965,66 @@ class TestMCPAdapterRegistry:
 
         assert get_mcp_adapter_info("nonexistent") is None
 
+    def test_configured_adapter_flow_direction_conflict_fails(self) -> None:
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            register_configured_mcp_adapters,
+        )
+
+        def config(server_id: str, direction: str) -> MCPServerConfig:
+            return MCPServerConfig.from_dict({
+                "name": server_id,
+                "command": "mcp-server",
+                "server_config_id": server_id,
+                "adapters": [{
+                    "name": "shared-policy",
+                    "version": "v1",
+                    "policy_version": "p1",
+                    "owner_argument": "owner",
+                    "resource_argument": "repository",
+                    "direction": direction,
+                }],
+            })
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"duplicate MCP adapter name 'shared-policy'.*"
+                r"'server-source'.*'server-sink'.*flow_direction"
+            ),
+        ):
+            register_configured_mcp_adapters([
+                config("server-source", "source"),
+                config("server-sink", "sink"),
+            ])
+
+    def test_identical_configured_adapter_registration_is_idempotent(self) -> None:
+        from mimir.mcp_client import (
+            MCPServerConfig,
+            get_mcp_adapter_info,
+            register_configured_mcp_adapters,
+        )
+
+        config = MCPServerConfig.from_dict({
+            "name": "github",
+            "command": "mcp-server",
+            "server_config_id": "github-production",
+            "adapters": [{
+                "name": "github-policy",
+                "version": "v1",
+                "policy_version": "p1",
+                "owner_argument": "owner",
+                "resource_argument": "repository",
+                "direction": "source",
+            }],
+        })
+
+        register_configured_mcp_adapters([config])
+        first = get_mcp_adapter_info("github-policy")
+        register_configured_mcp_adapters([config])
+
+        assert get_mcp_adapter_info("github-policy") is first
+
     @pytest.mark.parametrize(
         ("source", "sink", "expected"),
         [(True, False, "source"), (False, True, "sink"),
