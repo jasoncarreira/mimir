@@ -370,6 +370,7 @@ def _parse_file_tool_roots(
     home: Path,
     *,
     always_rw: tuple[str, ...] | None = None,
+    log_effective: bool = False,
 ) -> tuple[tuple[str, str], ...]:
     """Parse ``MIMIR_FILE_TOOL_ROOTS`` into validated ``(abs_path, mode)`` pairs.
 
@@ -391,60 +392,90 @@ def _parse_file_tool_roots(
     _log = logging.getLogger(__name__)
     home_resolved = Path(home).resolve()
     out: dict[str, str] = {}
+    origins: dict[str, str] = {}
+    expected = "expected /absolute/path[:ro|:rw], comma-separated"
 
-    def _consider(rawpath: str, mode: str) -> None:
+    def _reject(entry: str, reason: str) -> None:
+        _log.warning(
+            "MIMIR_FILE_TOOL_ROOTS: ignoring entry %r (%s; %s)",
+            entry,
+            reason,
+            expected,
+        )
+
+    def _consider(rawpath: str, mode: str, entry: str, origin: str) -> None:
         rawpath = rawpath.strip()
         if not rawpath:
+            _reject(entry, "path is empty")
             return
         if "~" in rawpath or ".." in Path(rawpath).parts:
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (~ or .. not allowed)", rawpath)
+            _reject(entry, "~ and .. are not allowed")
             return
         p = Path(rawpath)
         if not p.is_absolute():
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (not an absolute path)", rawpath)
+            _reject(entry, "path is not absolute")
             return
         if rawpath.rstrip("/") in _FILE_TOOL_FORBIDDEN_ROOTS:
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring forbidden root %r", rawpath)
+            _reject(entry, "path is a forbidden system root")
             return
         try:
             resolved = p.resolve()
             is_dir = resolved.is_dir()
-        except OSError as exc:
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (%s)", rawpath, exc)
+        except (OSError, RuntimeError) as exc:
+            _reject(entry, f"path cannot be resolved: {exc}")
             return
         if not is_dir:
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring %r (not an existing directory)", rawpath)
+            _reject(entry, "path is not an existing directory")
             return
         if str(resolved) in _FILE_TOOL_FORBIDDEN_ROOTS:
-            _log.warning("MIMIR_FILE_TOOL_ROOTS: ignoring forbidden root %r", rawpath)
+            _reject(entry, "path resolves to a forbidden system root")
             return
         if (
             resolved == home_resolved
             or resolved.is_relative_to(home_resolved)
             or home_resolved.is_relative_to(resolved)
         ):
-            _log.warning(
-                "MIMIR_FILE_TOOL_ROOTS: ignoring %r (overlaps the agent home %s)",
-                rawpath, home_resolved,
-            )
+            _reject(entry, f"path overlaps the agent home {home_resolved}")
             return
         key = str(resolved)
         if key not in out:  # first wins; explicit entries are parsed before always_rw
             out[key] = mode
+            origins[key] = origin
 
-    for entry in (raw or "").split(","):
+    for entry in (raw or "").split(",") if raw else ():
         entry = entry.strip()
         if not entry:
+            _reject(entry, "entry is empty")
+            continue
+        if entry.count(":") > 1:
+            _reject(entry, "colon is only valid as the optional mode delimiter")
             continue
         path_part, sep, mode_part = entry.rpartition(":")
-        if sep and mode_part.strip().lower() in ("ro", "rw"):
-            _consider(path_part, mode_part.strip().lower())
+        if sep:
+            mode = mode_part.strip().lower()
+            if mode not in ("ro", "rw"):
+                _reject(entry, f"unknown mode {mode_part!r}")
+                continue
+            _consider(path_part, mode, entry, "configured")
         else:
-            _consider(entry, "rw")
+            _consider(entry, "rw", entry, "configured")
 
     for ap in always_rw:
         if Path(ap).is_dir():
-            _consider(ap, "rw")
+            _consider(ap, "rw", ap, "derived")
+
+    if log_effective:
+        _log.info(
+            "effective file root path=%r mode=rw origin=derived-home",
+            str(home_resolved),
+        )
+        for path, mode in out.items():
+            _log.info(
+                "effective file root path=%r mode=%s origin=%s",
+                path,
+                mode,
+                origins[path],
+            )
 
     return tuple(out.items())
 
@@ -645,15 +676,6 @@ class Config:
     # only catches a genuine runaway — not Hermes' 90, which would clip ~1% of
     # legitimate heavy turns. 0 disables the cap entirely.
     max_turn_iterations: int
-
-    # Additional file-op roots beyond ``home``. File-op tools (Read,
-    # Glob, Grep, Edit, Write, MultiEdit, NotebookEdit) accept paths
-    # inside any of these. Useful for deployments where the agent
-    # operates on sibling mounts: mimirbot reads/edits its own source
-    # at ``/workspace/mimir`` and the bench harness at ``/benchmark``.
-    # Configured via ``MIMIR_FILE_OP_ROOTS`` (colon-separated paths);
-    # empty by default (just ``home``).
-    file_op_extra_roots: list[Path]
 
     # Per-directory write permissions under ``home``. Subdir name →
     # ``"rw"`` or ``"ro"``. ``WriteGuardBackend`` enforces this at the
@@ -1081,13 +1103,10 @@ class Config:
             send_loop_similarity=_env_float("MIMIR_SEND_LOOP_SIMILARITY", 0.9),
             tool_call_budget=_env_int("MIMIR_TOOL_CALL_BUDGET", 200),
             max_turn_iterations=_env_int("MIMIR_MAX_TURN_ITERATIONS", 200),
-            file_op_extra_roots=[
-                Path(p)
-                for p in (_env("MIMIR_FILE_OP_ROOTS", "") or "").split(":")
-                if p.strip()
-            ],
             folders=_parse_folders(_env("MIMIR_FOLDERS", "") or ""),
-            file_tool_roots=_parse_file_tool_roots(_env("MIMIR_FILE_TOOL_ROOTS", ""), home),
+            file_tool_roots=_parse_file_tool_roots(
+                _env("MIMIR_FILE_TOOL_ROOTS", ""), home, log_effective=True
+            ),
             mcp_servers=_load_mcp_servers_from_env(),
 
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
