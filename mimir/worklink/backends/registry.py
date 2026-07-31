@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,7 +18,11 @@ from ..compute import (
 )
 from .base import ToolBackend
 from .feature_factory import FeatureFactoryBackend
-from .opencode import DEFAULT_BASH_ALLOWLIST, OpenCodeBackend, validate_extra_args
+from .opencode import (
+    DERIVABLE_TEST_RUNNERS,
+    OpenCodeBackend,
+    validate_extra_args,
+)
 
 
 log = logging.getLogger(__name__)
@@ -552,7 +558,8 @@ class BackendRegistry:
                 self.config.backend_settings.get("feature_factory", {})
             ),
             "opencode": self._build_opencode(
-                self.config.backend_settings.get("opencode", {})
+                self.config.backend_settings.get("opencode", {}),
+                test_command=self.config.defaults.test_command,
             ),
         }
         self._compute_backends: dict[str, ComputeBackend] = {
@@ -614,24 +621,44 @@ class BackendRegistry:
         raise ValueError(f"unknown Worklink compute backend config: {name}")
 
     @staticmethod
-    def _build_opencode(settings: Mapping[str, Any]) -> OpenCodeBackend:
+    def _build_opencode(
+        settings: Mapping[str, Any], *, test_command: str
+    ) -> OpenCodeBackend:
         bin_name = str(settings.get("bin", "opencode"))
         args = settings.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ValueError("worklink opencode args must be a list of strings")
         validate_extra_args(args)
-        bash_allowlist = settings.get("bash_allowlist", list(DEFAULT_BASH_ALLOWLIST))
+        operator_allowlist = "bash_allowlist" in settings
+        bash_allowlist = settings.get("bash_allowlist")
+        if bash_allowlist is None and not operator_allowlist:
+            bash_allowlist = list(_derive_bash_allowlist(test_command))
         if not isinstance(bash_allowlist, list) or not all(
             isinstance(pattern, str) and pattern for pattern in bash_allowlist
         ):
             raise ValueError("worklink opencode bash_allowlist must be a list of non-empty strings")
         if "*" in bash_allowlist:
             raise ValueError("worklink opencode bash_allowlist cannot contain the catch-all '*'")
+        if operator_allowlist and not any(
+            _opencode_pattern_matches(pattern, test_command) for pattern in bash_allowlist
+        ):
+            raise ValueError(
+                "defaults.test_command is refused by "
+                "backends.opencode.bash_allowlist: "
+                f"test_command={test_command!r}, bash_allowlist={bash_allowlist!r}"
+            )
+        source = "operator configuration" if operator_allowlist else "defaults.test_command"
+        log.info(
+            "Worklink OpenCode effective bash allowlist from %s: %s",
+            source,
+            bash_allowlist,
+        )
         return OpenCodeBackend(
             bin=bin_name,
             extra_args=tuple(args),
             bash_allowlist=tuple(bash_allowlist),
         )
+
     @staticmethod
     def _build_feature_factory(settings: Mapping[str, Any]) -> FeatureFactoryBackend:
         bin_name = str(settings.get("bin", "feature-factory"))
@@ -646,3 +673,39 @@ class BackendRegistry:
         if "reviewer" in settings:
             kwargs["reviewer"] = str(settings["reviewer"] or "")
         return FeatureFactoryBackend(**kwargs)
+
+
+def _derive_bash_allowlist(test_command: str) -> tuple[str, ...]:
+    try:
+        argv = shlex.split(test_command, posix=True)
+    except ValueError as exc:
+        raise ValueError(
+            "cannot derive backends.opencode.bash_allowlist from "
+            f"defaults.test_command={test_command!r}: invalid shell syntax; configure "
+            "backends.opencode.bash_allowlist explicitly"
+        ) from exc
+    if not argv:
+        raise ValueError(
+            "cannot derive backends.opencode.bash_allowlist from empty "
+            "defaults.test_command; configure backends.opencode.bash_allowlist explicitly"
+        )
+    runner = argv[0]
+    runner_name = runner.rsplit("/", 1)[-1]
+    if runner_name not in DERIVABLE_TEST_RUNNERS or any(char in runner for char in "*?"):
+        choices = ", ".join(sorted(DERIVABLE_TEST_RUNNERS))
+        raise ValueError(
+            "cannot derive backends.opencode.bash_allowlist from "
+            f"defaults.test_command={test_command!r}: runner {runner!r} is not a "
+            f"derivable build runner ({choices}); configure "
+            "backends.opencode.bash_allowlist explicitly"
+        )
+    return ("git *", f"{runner} *")
+
+
+def _opencode_pattern_matches(pattern: str, command: str) -> bool:
+    # OpenCode permission globs support only '*' and '?' and are anchored. Its
+    # trailing " *" convention also admits the bare executable.
+    expression = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    if pattern.endswith(" *"):
+        expression = expression[:-4] + r"(?: .*)?"
+    return re.fullmatch(expression, command, flags=re.DOTALL) is not None

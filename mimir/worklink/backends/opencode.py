@@ -20,6 +20,19 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
+DERIVABLE_TEST_RUNNERS: frozenset[str] = frozenset({
+    "bun",
+    "cargo",
+    "go",
+    "gradle",
+    "gradlew",
+    "mvn",
+    "mvnw",
+    "npm",
+    "pnpm",
+    "uv",
+    "yarn",
+})
 _INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
 # Five total attempts wait 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds. That
 # comfortably spans the observed sub-second SQLite startup lock while bounding
@@ -202,17 +215,22 @@ class OpenCodeBackend:
             return RawResult(-1, transcript_path, "backend_error", result.launch_error)
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
+        permission_refusal = _permission_refusal_reason(
+            result.stdout, result.stderr, self.bash_allowlist
+        )
         status = "output_overflow" if result.output_overflow else (
             "blocked" if blocked_reason else (
-                "timeout" if result.timed_out else _status_from_output(
-                    result.exit_code, result.stdout, result.stderr
+                "failed" if permission_refusal else (
+                    "timeout" if result.timed_out else _status_from_output(
+                        result.exit_code, result.stdout, result.stderr
+                    )
                 )
             )
         )
         error = (
             "backend output exceeded configured Worklink limit"
             if result.output_overflow
-            else blocked_reason or _error_from_status(
+            else blocked_reason or permission_refusal or _error_from_status(
                 status, result.stdout, result.stderr, result.command
             )
         )
@@ -292,6 +310,23 @@ def _permission_override(bash_allowlist: Sequence[str]) -> str:
         "external_directory": {"/**": "deny"},
         "bash": bash,
     }, separators=(",", ":"))
+
+
+def _permission_refusal_reason(
+    stdout: str, stderr: str, bash_allowlist: Sequence[str]
+) -> str | None:
+    output = f"{stdout}\n{stderr}"
+    if not re.search(
+        r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
+        output,
+        re.IGNORECASE,
+    ):
+        return None
+    return (
+        "OpenCode refused an executor shell command because it is not allowed by "
+        "backends.opencode.bash_allowlist; effective patterns: "
+        f"{list(bash_allowlist)!r}"
+    )
 
 
 def _transcript_path(transcript_root: Path | None, issue_id: int) -> Path:

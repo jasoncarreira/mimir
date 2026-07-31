@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from mimir.opencode_config import OpenCodeInvocation
 from mimir.worklink.backends import (
     WORKLINK_MERGED_LABEL,
     BackendRegistry,
@@ -1041,11 +1042,14 @@ async def test_opencode_backend_transcript_filename_contract(
 
 
 def test_registry_builds_opencode_backend_with_settings() -> None:
-    config = WorklinkConfig(backend_settings={"opencode": {
-        "bin": "/usr/local/bin/opencode",
-        "args": ["--verbose"],
-        "bash_allowlist": ["git *", "npm *"],
-    }})
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {
+            "bin": "/usr/local/bin/opencode",
+            "args": ["--verbose"],
+            "bash_allowlist": ["git *", "npm *"],
+        }},
+    )
     backend = BackendRegistry(config).get("opencode")
     assert backend.bin == "/usr/local/bin/opencode"
     assert backend.extra_args == ("--verbose",)
@@ -1075,6 +1079,108 @@ def test_registry_rejects_invalid_opencode_bash_allowlist(allowlist: object) -> 
     config = WorklinkConfig(backend_settings={"opencode": {"bash_allowlist": allowlist}})
     with pytest.raises(ValueError, match="bash_allowlist"):
         BackendRegistry(config)
+
+
+def test_registry_keeps_and_logs_python_default_bash_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("INFO", logger="mimir.worklink.backends.registry"):
+        backend = BackendRegistry().get("opencode")
+
+    assert backend.bash_allowlist == ("git *", "uv *")
+    assert "effective bash allowlist from defaults.test_command: ['git *', 'uv *']" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("test_command", "runner_pattern"),
+    [("npm test", "npm *"), ("./gradlew test", "./gradlew *")],
+)
+def test_registry_derives_only_configured_non_python_runner(
+    monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str
+) -> None:
+    monkeypatch.setattr(
+        "mimir.worklink.backends.opencode.resolve_opencode_invocation",
+        lambda **_: OpenCodeInvocation(
+            model="openai/test-model",
+            provider="openai",
+            model_source="test",
+            config_path=Path("/nonexistent/opencode.jsonc"),
+            auth_type=None,
+        ),
+    )
+    config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
+
+    backend = BackendRegistry(config).get("opencode")
+    permission = json.loads(
+        backend.work_spec(
+            WorkOrder(1, Path("/tmp/worktree"), "p", None, 30, {}),
+            attempt=1,
+            repo_url="u",
+            base_ref="main",
+            branch="issue/1-a1",
+            test_command=test_command,
+        ).env["OPENCODE_PERMISSION"]
+    )
+
+    assert backend.bash_allowlist == ("git *", runner_pattern)
+    assert permission["bash"] == {"*": "deny", "git *": "allow", runner_pattern: "allow"}
+    assert "uv *" not in permission["bash"]
+    assert "rm *" not in permission["bash"]
+
+
+def test_operator_bash_allowlist_beats_derivation() -> None:
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {"bash_allowlist": ["npm test"]}},
+    )
+
+    backend = BackendRegistry(config).get("opencode")
+
+    assert backend.bash_allowlist == ("npm test",)
+
+
+@pytest.mark.parametrize("test_command", ["bash -c 'npm test'", "make test"])
+def test_registry_refuses_nonderivable_test_runner(test_command: str) -> None:
+    config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
+
+    with pytest.raises(ValueError, match=r"defaults\.test_command=.*runner.*not a derivable"):
+        BackendRegistry(config)
+
+
+def test_registry_reports_explicit_allowlist_mismatch_with_both_values() -> None:
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(test_command="npm test"),
+        backend_settings={"opencode": {"bash_allowlist": ["git *", "uv *"]}},
+    )
+
+    with pytest.raises(ValueError, match=r"test_command='npm test'.*bash_allowlist=.*uv"):
+        BackendRegistry(config)
+
+
+def test_empty_operator_allowlist_fails_closed() -> None:
+    config = WorklinkConfig(
+        backend_settings={"opencode": {"bash_allowlist": []}},
+    )
+
+    with pytest.raises(ValueError, match=r"test_command=.*bash_allowlist=\[\]"):
+        BackendRegistry(config)
+
+
+@pytest.mark.asyncio
+async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: Path) -> None:
+    backend = OpenCodeBackend(bash_allowlist=("git *", "npm *"))
+    order = WorkOrder(1, tmp_path, "p", None, 30, {}, transcript_root=tmp_path / "t")
+
+    result = await backend.interpret(
+        order,
+        ComputeResult(0, "Error: permission denied for bash command rm -rf build", ""),
+    )
+
+    assert result.backend_status == "failed"
+    assert result.error == (
+        "OpenCode refused an executor shell command because it is not allowed by "
+        "backends.opencode.bash_allowlist; effective patterns: ['git *', 'npm *']"
+    )
 
 
 @pytest.mark.asyncio
