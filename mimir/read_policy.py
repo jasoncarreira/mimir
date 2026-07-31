@@ -345,13 +345,18 @@ def file_contains_secret(path: Path) -> bool:
 def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
     """Allow published content only in the service turn's exact active PR lease."""
     from ._context import get_current_turn
-    from .models import RepoPRActionScope, RepoReviewState
+    from .models import RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
     from .pr_checkout_lease import PRCheckoutLease
     from .repo_tools import GitRefusal, RepoGitTools
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
-    state = getattr(auth_context, "repo_review_state", None)
-    scope = getattr(auth_context, "repo_pr_action_scope", None)
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    if isinstance(registry, RepoPRScopeRegistry):
+        state = registry.resolve_checkout_path(path)
+        scope = getattr(state, "action_scope", None)
+    else:
+        state = getattr(auth_context, "repo_review_state", None)
+        scope = getattr(auth_context, "repo_pr_action_scope", None)
     if (
         not getattr(auth_context, "is_service", False)
         or not isinstance(state, RepoReviewState)

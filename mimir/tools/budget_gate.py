@@ -63,6 +63,7 @@ from ..access_control import (
     get_trusted_service_from_auth_context,
     normalize_sink_destination,
     parse_service_shell_argv_with_reason,
+    resolve_repository_review_state,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -510,10 +511,15 @@ def _record_repo_review_checkout(
     request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
 ) -> None:
     """Record only a successfully executed checkout of this turn's bound head."""
-    state = getattr(auth_context, "repo_review_state", None)
+    args = request.tool_call.get("args") or {}
+    state, _ = resolve_repository_review_state(
+        auth_context,
+        command=args.get("command"),
+        cwd=args.get("cwd"),
+    )
     if failed or state is None:
         return
-    argv = (request.tool_call.get("args") or {}).get("mimir_direct_argv")
+    argv = args.get("mimir_direct_argv")
     if not isinstance(argv, list):
         return
     if argv[-7:] == [
@@ -629,11 +635,17 @@ def _request_for_authorized_execution(
     if not isinstance(target, str):
         return sanitized_request
     if policy.destination == "repo_review":
+        review_state, state_refusal = resolve_repository_review_state(
+            auth_context, command=target, cwd=args.get("cwd"),
+        )
         argv, refusal = parse_service_shell_argv_with_reason(
             target,
             policy.destination,
-            review_state=getattr(auth_context, "repo_review_state", None),
+            review_state=review_state,
         )
+        if state_refusal is not None:
+            argv = None
+            refusal = state_refusal
     else:
         argv, refusal = parse_service_shell_argv_with_reason(
             target, policy.destination,
@@ -732,7 +744,9 @@ def _request_with_resolved_service_write_path(
     if not isinstance(raw_path, str) or not raw_path:
         return request
     try:
-        review_state = getattr(auth_context, "repo_review_state", None)
+        review_state, _ = resolve_repository_review_state(
+            auth_context, path=raw_path,
+        )
         if _target_within_active_pr_checkout_lease(raw_path, review_state):
             args[argument_name] = str(Path(raw_path).resolve(strict=False))
         else:

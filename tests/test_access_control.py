@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
@@ -43,12 +44,14 @@ from mimir.models import (
     InformationFlowState,
     NormalizedPullRequestSnapshot,
     RepoPRActionScope,
+    RepoPRScopeRegistry,
     RepoReviewState,
     SessionACL,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
 )
+from mimir.pr_checkout_lease import PRCheckoutLease
 
 
 def test_every_denial_sets_would_block() -> None:
@@ -4632,6 +4635,147 @@ def test_poller_scope_derives_each_valid_batched_item_and_requires_configured_re
     unconfigured = AgentEvent(**base, extra={"items": [item]})
 
     assert create_auth_context(unconfigured, enforce=True).repo_pr_scope_registry is None
+
+
+def _attach_test_checkout_lease(
+    state: RepoReviewState, lease_root: Path, name: str,
+) -> Path:
+    checkout = lease_root / name
+    checkout.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    now = datetime.now(UTC)
+    lease = PRCheckoutLease(
+        canonical_repo=state.repo,
+        canonical_origin=state.action_scope.canonical_origin,
+        source_root=Path(state.action_scope.canonical_root),
+        scope_base_sha=state.action_scope.observed_base_sha,
+        base_sha=state.action_scope.observed_base_sha,
+        head_sha=state.action_scope.observed_head_sha,
+        destination_ref=state.action_scope.destination_ref,
+        owner=state.action_scope.principal,
+        scope_id=state.action_scope.scope_id,
+        path=checkout,
+        lease_root=lease_root,
+        created_at=now,
+        expires_at=now + timedelta(hours=1),
+        recovery_id=name,
+    )
+    state.attach_checkout_lease(lease)
+    return checkout
+
+
+def test_batched_pr_reads_resolve_each_exact_checkout_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import result_is_protected
+
+    source = tmp_path / "source"
+    lease_root = tmp_path / "leases"
+    source.mkdir()
+    lease_root.mkdir()
+    states = (
+        _review_state("o/r", 42, "worklink/42", str(source)),
+        _review_state("o/r", 43, "worklink/43", str(source)),
+    )
+    checkouts = tuple(
+        _attach_test_checkout_lease(state, lease_root, f"pr-{state.pr_number}")
+        for state in states
+    )
+    files = tuple(checkout / "published.txt" for checkout in checkouts)
+    for path in files:
+        path.write_text("-----BEGIN PRIVATE KEY-----\nprotected\n", encoding="utf-8")
+
+    class TrackedRepoGitTools:
+        def __init__(self, state: RepoReviewState) -> None:
+            self.state = state
+
+        def is_tracked_file(self, path: Path) -> bool:
+            return path.parent == Path(self.state.checkout_lease.path)
+
+    monkeypatch.setattr("mimir.repo_tools.RepoGitTools", TrackedRepoGitTools)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+    )
+    token = set_current_turn(_turn("batch-read", "batch-read", auth))
+    try:
+        assert all(not result_is_protected(path) for path in files)
+        assert result_is_protected(
+            lease_root / "neither" / "published.txt",
+            text="-----BEGIN PRIVATE KEY-----\nprotected\n",
+        )
+        symlink = checkouts[0] / "linked.txt"
+        symlink.symlink_to(files[0])
+        assert result_is_protected(symlink)
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    source = tmp_path / "source"
+    lease_root = tmp_path / "leases"
+    outside = tmp_path / "outside"
+    home = tmp_path / "home"
+    for path in (source, lease_root, outside, home):
+        path.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw")
+    states = (
+        _review_state("o/r", 42, "worklink/42", str(source)),
+        _review_state("o/r", 43, "worklink/43", str(source)),
+    )
+    checkouts = tuple(
+        _attach_test_checkout_lease(state, lease_root, f"pr-{state.pr_number}")
+        for state in states
+    )
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_pr_scope_registry=RepoPRScopeRegistry(states),
+    )
+    seen: list[list[str]] = []
+
+    async def handler(request):  # type: ignore[no-untyped-def]
+        seen.append(request.tool_call["args"]["mimir_direct_argv"])
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    middleware = BudgetGateMiddleware()
+    for checkout in checkouts:
+        command = f"git -C {checkout} status"
+        call_auth = replace(auth, ifc_state=InformationFlowState())
+        result = await middleware.awrap_tool_call(
+            _tool_request(call_auth, args={"command": command}),
+            handler,
+        )
+        assert result.status != "error"
+    refused_auth = replace(auth, ifc_state=InformationFlowState())
+    refused = await middleware.awrap_tool_call(
+        _tool_request(refused_auth, args={"command": f"git -C {outside} status"}),
+        handler,
+    )
+
+    assert [argv[-1] for argv in seen] == ["status", "status"]
+    assert refused.status == "error"
+    assert "no matching checkout lease was found" in str(refused.content)
 
 
 def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
