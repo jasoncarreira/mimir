@@ -816,7 +816,7 @@ The breaker has caught real runaway loops in open-strix benchmark runs; defaults
 The agent uses these for all filesystem work (memory editing, reorganizing dirs, running scripts, etc.).
 
 **Synchronous shell:**
-- `shell_exec(command: str)` — execute a shell command via `shlex.split` (no shell expansion). Returns `exit=N\nstdout: ...\nstderr: ...`. Path-confinement enforced by allowlist prefix check. Runs in `<home>` by convention.
+- `shell_exec(command: str)` — execute a shell command via `shlex.split` (no shell expansion). Returns `exit=N\nstdout: ...\nstderr: ...`. Path confinement is enforced against the agent home and operator-configured roots. Runs in `<home>` by convention.
 
 **Async background shell:**
 - `bash_async(command: str, session_id: str)` — spawn command in background; returns immediately with a `job_id`. Fires `shell_job_complete` event (with exit code + tail output) when done — that event triggers a fresh turn so the agent can process the result.
@@ -829,7 +829,7 @@ The agent uses these for all filesystem work (memory editing, reorganizing dirs,
 - `edit_file(path: str, old_string: str, new_string: str)`
 - `glob_files(pattern: str)`
 
-All paths must stay under the path-confinement allowlist (`/mimir-home`, `/workspace`, `/benchmark`, `/mimir-results`). Absolute `..`-escape paths are rejected.
+All paths must stay under the agent home or an operator-configured `MIMIR_FILE_TOOL_ROOTS` entry. Extra roots use comma-separated `/absolute/path[:ro|:rw]` entries and are rejected if they contain traversal, overlap the home, do not name an existing directory, or name/resolve to a denylisted system root (`/`, `/bin`, `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/sbin`, `/sys`, `/usr`, `/var`). Symlink and `..` escapes outside the effective roots are rejected at use time.
 
 ### 7.4 Web
 

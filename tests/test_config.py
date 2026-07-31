@@ -9,7 +9,7 @@ Coverage map:
 - ``_turns_cap``         — default, normal, ceiling clamp
 - ``_events_cap``        — default, normal, ceiling clamp
 - ``Config.from_env``    — defaults, MIMIR_HOME, MIMIR_AGENT_ID, MIMIR_WEB_PORT,
-                           MIMIR_MODEL, MIMIR_FILE_OP_ROOTS, MIMIR_PROMPTS_DIR,
+                           MIMIR_MODEL, MIMIR_PROMPTS_DIR,
                            MIMIR_TURNS_ARCHIVE_DIR, MIMIR_RECENT_SOURCES,
                            MIMIR_TOOL_CALL_BUDGET
 - ``Config`` properties  — logs_dir, turns_log, events_log, commitments_log,
@@ -404,19 +404,67 @@ class TestConfigFromEnv:
         assert config.access_control_enforced is True
         assert config.coding_enabled is True
 
-    def test_file_op_extra_roots_empty_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._base(monkeypatch)
+    def test_startup_logs_effective_file_roots_with_origin(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:ro")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.INFO):
+            Config.from_env()
+
+        assert f"path='{home.resolve()}' mode=rw origin=derived-home" in caplog.text
+        assert f"path='{repo.resolve()}' mode=ro origin=configured" in caplog.text
+
+    def test_removed_file_op_roots_warns_without_configuring_roots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+        monkeypatch.setenv("MIMIR_FILE_OP_ROOTS", f"{repo}:rw")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.WARNING):
+            config = Config.from_env()
+
+        assert str(repo.resolve()) not in dict(config.file_tool_roots)
+        assert "MIMIR_FILE_OP_ROOTS is retired and ignored" in caplog.text
+        assert "migrate its required roots to MIMIR_FILE_TOOL_ROOTS" in caplog.text
+
+    def test_removed_file_op_roots_absence_does_not_warn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
         monkeypatch.delenv("MIMIR_FILE_OP_ROOTS", raising=False)
         from mimir.config import Config
-        cfg = Config.from_env()
-        assert cfg.file_op_extra_roots == []
 
-    def test_file_op_extra_roots_colon_separated(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._base(monkeypatch)
-        monkeypatch.setenv("MIMIR_FILE_OP_ROOTS", "/workspace/mimir:/benchmark")
-        from mimir.config import Config
-        cfg = Config.from_env()
-        assert cfg.file_op_extra_roots == [Path("/workspace/mimir"), Path("/benchmark")]
+        with caplog.at_level(logging.WARNING):
+            Config.from_env()
+
+        assert "MIMIR_FILE_OP_ROOTS is retired and ignored" not in caplog.text
 
     def test_prompts_dir_none_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)

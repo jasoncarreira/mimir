@@ -2132,7 +2132,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     monkeypatch.setenv("MIMIR_PUBLIC_BARE_VALUE", "ghp_adminconfigbaretoken")
     config = Config.from_env()
     config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
-    config.file_op_extra_roots = [tmp_path / "private-extra-root"]
+    config.file_tool_roots = ((str(tmp_path / "private-extra-root"), "ro"),)
 
     (tmp_path / "scheduler.yaml").write_text(
         "- name: heartbeat\n"
@@ -2201,7 +2201,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     )
     assert env_by_name["MIMIR_PUBLIC_BARE_VALUE"]["value"] == "[REDACTED]"
     assert "resend_nudge_channels" not in data["raw_config"]
-    assert "file_op_extra_roots" not in data["raw_config"]
+    assert "file_tool_roots" not in data["raw_config"]
 
 
 @pytest.mark.asyncio

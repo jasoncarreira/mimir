@@ -394,7 +394,7 @@ operator-managed access fields.
 These settings do not grant a requester role. They change which resources or
 egress paths exist and therefore must be reviewed with the catalog/adapters:
 
-- `MIMIR_FOLDERS`, `MIMIR_FILE_TOOL_ROOTS`, and `MIMIR_FILE_OP_ROOTS` constrain
+- `MIMIR_FOLDERS` and `MIMIR_FILE_TOOL_ROOTS` constrain
   filesystem reachability; they do not replace operation authorization.
 - `MIMIR_MCP_SERVERS_JSON` and `MIMIR_MCP_SERVERS_PATH` add external tools.
   Missing or unapproved provenance remains admin-required.

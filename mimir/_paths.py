@@ -2,11 +2,9 @@
 roots (SPEC §7.3).
 
 The default root is ``<home>`` — the agent's runtime state directory.
-Additional roots can be configured via ``MIMIR_FILE_OP_ROOTS`` (colon-
-separated paths) for deployments where the agent needs to operate on
-sibling directories — e.g., mimirbot dev-iteration mode where the
-agent reads/edits ``/workspace/mimir`` (its own source) and
-``/benchmark`` (the bench harness).
+Additional roots are validated from the comma-separated
+``MIMIR_FILE_TOOL_ROOTS`` ``path[:ro|:rw]`` entries before callers pass
+them here.
 
 Accepts both relative paths (resolved against the *first* root —
 typically ``home``) and absolute paths (accepted only if they resolve
