@@ -870,6 +870,63 @@ def test_project_tests_use_fixed_command_checkout_and_environment(
     assert output_limit == 64 * 1024
 
 
+def test_project_test_home_is_writable_so_runners_can_cache(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HOME must be a writable directory, not /nonexistent.
+
+    Observed live on 2026-07-31: the configured runner
+    ``env -u MIMIR_MODEL_SPEC uv run pytest -q`` failed before reaching pytest
+    because uv could not create ``$HOME/.cache/uv`` under ``/nonexistent``. That
+    left a remediation turn with no way to verify its own fix.
+    """
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    captured: dict[str, str] = {}
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        captured.update(env)
+        return ProjectTestProcessResult(0, stdout="ok")
+
+    RepoProjectTests(state, runner=runner).execute(())
+
+    home_value = Path(captured["HOME"])
+    assert home_value.is_dir(), "HOME must exist so a runner can create its cache"
+    assert home_value != Path("/nonexistent")
+    probe = home_value / ".cache" / "probe"
+    probe.mkdir(parents=True, exist_ok=True)
+    assert probe.is_dir(), "HOME must be writable"
+    # The operator's real dotfiles must still be out of reach -- that was the
+    # point of /nonexistent and it is preserved by using a dedicated directory.
+    assert home_value != Path.home()
+    assert captured["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert captured["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_project_test_refuses_when_cache_home_cannot_be_created(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unusable cache home refuses with a named reason rather than running."""
+    _origin, _source, _scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    # Occupy the cache-home path with a file so mkdir cannot succeed.
+    scratch = home / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    (scratch / "project-test-home").write_text("not a directory\n", encoding="utf-8")
+
+    def runner(argv, *, cwd, env, timeout, output_limit):  # pragma: no cover
+        raise AssertionError("runner must not be reached")
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        RepoProjectTests(state, runner=runner).execute(())
+    assert refusal.value.code == "test_cache_home_unavailable"
+    assert "project-test-home" in str(refusal.value)
+
+
 def test_project_test_failure_is_actionable_and_output_is_scrubbed(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

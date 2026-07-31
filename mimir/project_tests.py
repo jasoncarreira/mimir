@@ -149,9 +149,34 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     if not words:
         raise ProjectTestRefusal("test_not_configured", "project test command is empty")
 
+    # A writable HOME is required, not optional. Every mainstream test runner
+    # initialises a cache under it -- uv wants $HOME/.cache/uv, npm/cargo/gradle
+    # want their own -- so "/nonexistent" made the runner fail before reaching the
+    # tests at all: `Permission denied` creating /nonexistent/.cache/uv. That broke
+    # the only verification path a remediation turn has, and the turn then either
+    # pushed unverified or escalated.
+    #
+    # The point of "/nonexistent" was to keep the operator's real dotfiles
+    # unreachable, and a dedicated cache directory preserves that: it is not the
+    # real home, so ~/.ssh, ~/.netrc and friends stay out of reach. Git config is
+    # separately neutralised by GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM below,
+    # so pointing HOME somewhere writable does not reopen it.
+    #
+    # The path is stable rather than per-run so resolver caches survive between
+    # runs; a cold cache is only a slow test, and the scratch janitor may reclaim
+    # it at any time.
+    cache_home = Path(home) / "scratch" / "project-test-home"
+    try:
+        cache_home.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ProjectTestRefusal(
+            "test_cache_home_unavailable",
+            f"project test cache home is not writable: {cache_home}",
+        ) from exc
+
     env = {
         "PATH": _PATH,
-        "HOME": "/nonexistent",
+        "HOME": str(cache_home),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "CI": "1",
