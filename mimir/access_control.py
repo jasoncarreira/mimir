@@ -782,6 +782,9 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.PR_EDIT.value,
     RepoPRAction.PR_REREQUEST.value,
 })
+_REPO_PR_CONFLICT_DIAGNOSIS_ACTIONS = (
+    _REPO_PR_REMEDIATION_ACTIONS - {RepoPRAction.PUSH.value}
+)
 _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
     RepoPRAction.CHECKOUT.value,
@@ -923,7 +926,11 @@ def _repo_pr_scope_resolution(
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
-    is_remediation = event_type == "pr_changes_requested_stale"
+    is_remediation = event_type in {
+        "pr_changes_requested_stale",
+        "pr_mergeability_rebase",
+        "pr_mergeability_conflicting",
+    }
     if (
         not self_login
         or (is_remediation and principal != self_login)
@@ -967,7 +974,11 @@ def _repo_pr_scope_resolution(
         principal=self_login,
         event_type=event_type,
         allowed_operations=(
-            _REPO_PR_REMEDIATION_ACTIONS if is_remediation else _REPO_PR_REVIEW_ACTIONS
+            _REPO_PR_CONFLICT_DIAGNOSIS_ACTIONS
+            if event_type == "pr_mergeability_conflicting"
+            else _REPO_PR_REMEDIATION_ACTIONS
+            if is_remediation
+            else _REPO_PR_REVIEW_ACTIONS
         ),
         pr_number=number,
         head_repo=head_repo,

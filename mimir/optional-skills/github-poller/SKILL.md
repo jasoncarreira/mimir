@@ -116,6 +116,19 @@ For each repo in `GITHUB_REPOS`:
   bounded attempt series and a one-shot give-up signal; because queued emissions
   are not proof of delivery, an unchanged unresolved PR starts a fresh series
   after a 24-hour backstop rather than staying silent forever.
+- **Mergeability of your own PRs** — GitHub's per-PR `mergeable` result is
+  reconciled with the declared base/head comparison. A clean branch behind its
+  base emits `pr_mergeability_rebase`, which uses the existing scoped checkout,
+  rebases onto the declared base, runs tests, and pushes with a lease against the
+  observed head. The automatic path is restricted to PRs with no blocking
+  `CHANGES_REQUESTED` review, so moving the head cannot silently discharge
+  unaddressed feedback. A conflict emits `pr_mergeability_conflicting`; its
+  scope cannot push and the turn must reproduce the conflict, name all unmerged
+  paths and the base SHA, then abort and escalate. A `null` mergeability result
+  is asynchronous/unknown and is never acted upon. Attempts use hourly backoff,
+  are bounded per PR/head/reason, and end in the named
+  `pr_mergeability_rebase_gave_up` signal. At most one such attempt is emitted
+  across all repositories in a poll cycle. This path never merges a PR.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
@@ -148,6 +161,8 @@ Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-in
 The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_reminded_at": ISO-8601 UTC timestamp, "attempts": count}}}`. It tracks unresolved own-PR stale states, the hourly reminder floor, and bounded attempt series while the live snapshot remains semantically blocked. Attempts are charged from framework-written turn outcomes, not reminder emission. Authorization and tool-boundary refusals are reported but exempt from the content-failure budget and retry only at the 24-hour backstop, preventing a permanent configuration fault from firing at poll cadence. At the cap it emits one `pr_changes_requested_gave_up` signal with the charged outcome reasons; a head change re-arms immediately, and an unchanged parked entry re-arms after the same 24-hour delivery-loss backstop. Closed, unblocked, or substantively changed PRs drop out. Pre-cadence bare-string and structured-without-`attempts` entries migrate quietly as attempt 1 with `last_reminded_at` set to that poll's time, preventing an upgrade-time emit storm.
 
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
+
+The `pr_mergeability` key maps `{repo: {pr_number: {head_sha, reason, last_attempt_at, attempts}}}`. A new head or changed failure reason starts a fresh bounded series; current and closed PRs drop out during snapshot rebuild.
 
 ## Disabling temporarily
 

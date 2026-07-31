@@ -172,6 +172,7 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
+MERGEABILITY_RETRY_INTERVAL = timedelta(hours=1)
 
 
 def _utc_now_iso() -> str:
@@ -1728,6 +1729,202 @@ def _check_own_changes_requested(
     return count, new
 
 
+def _blocking_reviewers(reviews: list, me: str) -> list[str]:
+    """Return reviewers whose latest substantive review is blocking."""
+    latest: dict[str, tuple[str, str]] = {}
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        login = (review.get("user") or {}).get("login") or ""
+        state = str(review.get("state") or "").upper()
+        submitted = review.get("submitted_at") or ""
+        if not login or login == me or not submitted:
+            continue
+        if state not in ("APPROVED", "CHANGES_REQUESTED"):
+            continue
+        current = latest.get(login)
+        if current is None or submitted > current[0]:
+            latest[login] = (submitted, state)
+    return sorted(
+        login for login, (_submitted, state) in latest.items()
+        if state == "CHANGES_REQUESTED"
+    )
+
+
+def _check_own_mergeability(
+    repo: str,
+    token: str,
+    me: str,
+    prior: dict[str, object],
+    *,
+    now: datetime | None = None,
+    attempt_budget: list[int] | None = None,
+    retry_interval: timedelta = MERGEABILITY_RETRY_INTERVAL,
+) -> tuple[int, dict[str, object]]:
+    """Reconcile non-review merge failures on the agent's own open PRs.
+
+    Only a computed boolean ``mergeable`` is actionable. Attempts are bounded
+    per (PR, head, reason), and ``attempt_budget`` limits the whole poll cycle.
+    """
+    if not me:
+        return 0, {}
+    budget = attempt_budget if attempt_budget is not None else [1]
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+    observed_iso = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    prs = _gh_api(
+        f"repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100",
+        token,
+    )
+    if not isinstance(prs, list):
+        return 0, dict(prior)
+
+    count = 0
+    new: dict[str, object] = {}
+    for listed_pr in prs:
+        if (listed_pr.get("user") or {}).get("login") != me:
+            continue
+        number = listed_pr.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        key = str(number)
+        pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
+        if not isinstance(pr, dict):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        head_sha = head.get("sha") or ""
+        base_sha = base.get("sha") or ""
+        mergeable = pr.get("mergeable")
+        if not head_sha or not base_sha or not isinstance(mergeable, bool):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        compare = _compare_data(repo, base_sha, head_sha, token)
+        if compare is None:
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        behind_by = compare.get("behind_by")
+        if not isinstance(behind_by, int) or isinstance(behind_by, bool):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        if mergeable and behind_by <= 0:
+            continue
+
+        reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
+        if not isinstance(reviews, list):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        if mergeable and _blocking_reviewers(reviews, me):
+            # Moving the head could make an unaddressed blocking review appear
+            # stale. The changes-requested reconciler owns this PR until cleared.
+            continue
+
+        reason = "conflicting" if not mergeable else "behind_base"
+        attempts = 0
+        last_attempt: datetime | None = None
+        entry = prior.get(key)
+        if (
+            isinstance(entry, dict)
+            and entry.get("head_sha") == head_sha
+            and entry.get("reason") == reason
+        ):
+            raw_attempts = entry.get("attempts")
+            if isinstance(raw_attempts, int) and not isinstance(raw_attempts, bool):
+                attempts = max(raw_attempts, 0)
+            raw_last = entry.get("last_attempt_at")
+            if isinstance(raw_last, str):
+                last_attempt = _parse_utc_datetime(raw_last)
+        if last_attempt is not None and observed_at - last_attempt < retry_interval:
+            new[key] = entry
+            continue
+        if attempts > REVIEW_REQUEST_MAX_ATTEMPTS:
+            new[key] = entry
+            continue
+        if not budget or budget[0] <= 0:
+            if entry is not None:
+                new[key] = entry
+            continue
+        if attempts == REVIEW_REQUEST_MAX_ATTEMPTS:
+            _emit_signal(
+                "pr_mergeability_rebase_gave_up",
+                repo=repo,
+                number=number,
+                url=pr.get("html_url", ""),
+                head_sha=head_sha,
+                base_sha=base_sha,
+                reason=reason,
+                attempts=attempts,
+            )
+            new[key] = {
+                "head_sha": head_sha,
+                "reason": reason,
+                "last_attempt_at": observed_iso,
+                "attempts": attempts + 1,
+            }
+            budget[0] -= 1
+            count += 1
+            continue
+
+        attempt = attempts + 1
+        title = pr.get("title", "")
+        url = pr.get("html_url", "")
+        common = dict(
+            repo=repo,
+            number=number,
+            url=url,
+            head_sha=head_sha,
+            head_repo=((head.get("repo") or {}).get("full_name")),
+            head_remote="origin",
+            head_ref=head.get("ref"),
+            base_ref=base.get("ref"),
+            base_sha=base_sha,
+            author=(pr.get("user") or {}).get("login"),
+            attempt=attempt,
+            max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+        )
+        if mergeable:
+            prompt = (
+                f"Your PR #{number} on {repo} is {behind_by} commit(s) behind its "
+                f"declared base {base.get('ref')} at {base_sha}: {title}\n"
+                "It has no blocking CHANGES_REQUESTED review and GitHub reports the "
+                "merge as clean. Use the scoped PR checkout, rebase onto the lease's "
+                "declared base commit, run the repository tests, then repo_push. The "
+                f"push must retain its lease against starting head {head_sha}; if the "
+                "lease is stale, do not retry or overwrite the concurrent push. Do not "
+                f"merge the PR.\n{url}"
+            )
+            event_type = "pr_mergeability_rebase"
+        else:
+            prompt = (
+                f"Your PR #{number} on {repo} conflicts with its declared base "
+                f"{base.get('ref')} at {base_sha}: {title}\n"
+                "Use the scoped PR checkout and repo_rebase only to reproduce the "
+                "conflict, collect every path with repo_unmerged, then repo_rebase_abort. "
+                "Never resolve, complete, or push this automatic rebase. Escalate with "
+                f"the conflicting paths, base commit {base_sha}, and instructions to "
+                f"resolve and test a manual rebase before pushing. Do not merge.\n{url}"
+            )
+            event_type = "pr_mergeability_conflicting"
+        _emit(prompt, event_type=event_type, behind_by=behind_by, **common)
+        new[key] = {
+            "head_sha": head_sha,
+            "reason": reason,
+            "last_attempt_at": observed_iso,
+            "attempts": attempt,
+        }
+        budget[0] -= 1
+        count += 1
+    return count, new
+
+
 def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -1864,6 +2061,9 @@ def main() -> None:
     # unresolved own-PR remediation attempts, rate-limited by elapsed time.
     cr_all: dict = cursor.get("pr_changes_requested", {}) or {}
     new_cr_all: dict[str, dict[str, object]] = {}
+    mergeability_all: dict = cursor.get("pr_mergeability", {}) or {}
+    new_mergeability_all: dict[str, dict[str, object]] = {}
+    mergeability_attempt_budget = [1]
     untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
     new_untrusted_all: dict[str, list[str]] = {}
     trust_cache: dict[tuple[str, object], object] = {}
@@ -1915,11 +2115,19 @@ def main() -> None:
         )
         total += cr_count
         new_cr_all[repo] = new_repo_cr
+        repo_mergeability = mergeability_all.get(repo, {}) or {}
+        mergeability_count, new_repo_mergeability = _check_own_mergeability(
+            repo, token, me, repo_mergeability,
+            attempt_budget=mergeability_attempt_budget,
+        )
+        total += mergeability_count
+        new_mergeability_all[repo] = new_repo_mergeability
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
     cursor["pr_changes_requested"] = new_cr_all
+    cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
     _save_cursor(cursor)
     print(

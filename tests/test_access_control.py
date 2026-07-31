@@ -5108,6 +5108,12 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     assert scope.provenance == "server_discovered"
     assert scope.canonical_root == str(root.resolve())
     assert scope.canonical_origin == "git@github.com:o/r.git"
+    conflict_scope = access_control.create_server_discovered_heartbeat_scope(
+        "o/r", pr, event_type="pr_mergeability_conflicting",
+    )
+    assert conflict_scope is not None
+    assert access_control.RepoPRAction.COMMIT.value in conflict_scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value not in conflict_scope.allowed_operations
     for change in (
         {"state": "closed"},
         {"author": "someone-else"},
