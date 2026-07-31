@@ -120,6 +120,11 @@ class OpenCodeBackend:
             # WorkSpec overrides an allowlisted parent environment; an empty
             # value is required here because omission would inherit it again.
             env[key] = ""
+        # Model selection is consumed above by the backend. Do not expose it to
+        # the executor or repository-controlled test processes it launches.
+        from ...tools._shell_env import scrub_model_selection_env
+
+        scrub_model_selection_env(env)
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         return WorkSpec(
             issue_id=order.issue_id,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 import subprocess
 from typing import Callable, Sequence
@@ -293,11 +294,19 @@ def _common_status(status: str) -> str:
 
 
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    from ..tools._shell_env import scrub_model_selection_env
+
+    env = os.environ.copy()
+    scrub_model_selection_env(env)
     if isinstance(args, str):
         # Operator-configured test commands are trusted input, equivalent to
         # poller.command; backend-generated text is never routed here.
-        return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
-    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            args, shell=True, cwd=cwd, env=env, capture_output=True, text=True, check=False
+        )
+    return subprocess.run(
+        list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False
+    )
 
 
 def _merge_paths(*groups: list[str]) -> list[str]:

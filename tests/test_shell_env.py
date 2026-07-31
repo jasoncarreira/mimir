@@ -169,12 +169,14 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
     monkeypatch.setenv("GH_TOKEN", "stray-token")
     monkeypatch.setenv("GH_HOST", "attacker.invalid")
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:agent-model")
 
     env = direct_exec_env(["/bin/echo", "status"])
     overlay = direct_exec_env_overlay(["/bin/echo", "status"])
 
-    assert all(key not in env for key in ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR"))
-    assert all(overlay[key] is None for key in ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR"))
+    scrubbed = ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "MIMIR_MODEL_SPEC")
+    assert all(key not in env for key in scrubbed)
+    assert all(overlay[key] is None for key in scrubbed)
 
 
 @pytest.mark.parametrize("arguments", [

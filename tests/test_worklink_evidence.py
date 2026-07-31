@@ -129,6 +129,29 @@ def test_gate_test_summary_keeps_output_tail_not_head() -> None:
     assert len(summary) <= 6000
 
 
+def test_evidence_test_command_uses_bare_command_without_model_spec(
+    monkeypatch,
+) -> None:
+    from mimir.worklink.evidence import _run
+
+    captured: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args, 0, stdout="passed", stderr="")
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:agent-model")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _run("uv run pytest -q", cwd=Path("/tmp/checkout"))
+
+    assert captured["args"] == "uv run pytest -q"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert "MIMIR_MODEL_SPEC" not in kwargs["env"]
+
+
 def test_gate_command_not_found_is_not_tests_failed() -> None:
     """chainlink #820: exit 127 = the gate command itself cannot run — an
     environment error, distinct from failing tests."""

@@ -26,6 +26,7 @@ _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
 _GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
 Path(_GH_CONFIG_DIR).chmod(0o500)
 _ALTERNATE_GITHUB_ENV = ("GH_TOKEN", "GH_HOST")
+_MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
 _DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
     "mimir_direct_exec_argv", default=None,
 )
@@ -43,6 +44,11 @@ def reset_direct_exec_argv(token: Token[tuple[str, ...] | None]) -> None:
 def bound_direct_exec_argv() -> list[str] | None:
     argv = _DIRECT_EXEC_ARGV.get()
     return list(argv) if argv is not None else None
+
+
+def scrub_model_selection_env(env: dict[str, str]) -> None:
+    """Keep Mimir's model selection out of repository-controlled children."""
+    env.pop(_MODEL_SELECTION_ENV, None)
 
 
 def login_shell_command(command: str) -> str:
@@ -80,6 +86,7 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     from operator configuration rather than language-specific inference here.
     """
     env = os.environ.copy()
+    scrub_model_selection_env(env)
     for key in _ALTERNATE_GITHUB_ENV:
         env.pop(key, None)
     if _is_gh_argv(argv):
@@ -114,7 +121,7 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     ``ShellJobRegistry`` overlays values onto its own inherited environment.
     """
     overlay: dict[str, str | None] = direct_exec_env(argv)
-    for key in (*_ALTERNATE_GITHUB_ENV, "GH_CONFIG_DIR"):
+    for key in (*_ALTERNATE_GITHUB_ENV, "GH_CONFIG_DIR", _MODEL_SELECTION_ENV):
         if key in os.environ and key not in overlay:
             overlay[key] = None
     if _is_git_argv(argv):
@@ -131,4 +138,5 @@ __all__ = [
     "direct_exec_env_overlay",
     "login_shell_command",
     "reset_direct_exec_argv",
+    "scrub_model_selection_env",
 ]
