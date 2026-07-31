@@ -458,6 +458,10 @@ the named authorized PR. Optional selectors must name existing non-symlink
 paths inside that checkout after canonical resolution. Test output is captured
 under hard byte limits, credential-shaped values and the lease path are
 redacted, and nonzero suites return `tests_failed` rather than a shell error.
+Granting `repo_test` therefore grants execution of the operator-configured test
+command, not arbitrary shell access. See the
+[`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
+default, supported command syntax, and non-Python examples.
 
 ## How to extend
 

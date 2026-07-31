@@ -74,8 +74,8 @@ storage) and is served by the worst-fit transport for either.
 
 ## Non-goals
 
-- **Replacing VirtioFS for `/workspace/mimir` (the source clone) or
-  `/benchmark`.** Those are already first-class git repos with their
+- **Replacing VirtioFS for operator-mounted source or benchmark repositories.**
+  Those are already first-class git repos with their
   own remote and human-driven commit cadence. PR #23's health probe
   covers their stale-inode case for as long as the host runs a
   vulnerable VirtioFS.
@@ -670,7 +670,7 @@ End-to-end smoke (manual, gated on operator):
 6. **Decommission PR #23 health probe gate** — once 4c is stable on
    the volume layout, the probe's firing rate on `/mimir-home` should
    drop to zero. Probe stays in for `/workspace/mimir` and
-   `/benchmark` coverage (those remain VirtioFS bind-mounts); narrow
+   separately configured source-mount coverage (those remain VirtioFS bind-mounts); narrow
    the gate to "any VirtioFS mount that is not `/mimir-home`".
 
 Each of 4a / 4b / 4c is independently shippable and reviewable. PR 4a

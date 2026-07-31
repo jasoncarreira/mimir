@@ -1,9 +1,11 @@
 """Completeness contract for ``docs/configuration.md``.
 
-A static (AST) scan of the mimir core runtime finds every environment variable
-read, and asserts each is either documented in ``docs/configuration.md`` or on
-the explicit exclusion allowlist below. This keeps the doc's "complete" claim
-honest and makes it a regression: a new flag added without a doc row fails CI.
+A static (AST) scan of the mimir core finds every exact ``MIMIR_*`` name in a
+Python string literal and asserts each has a reference entry in
+``docs/configuration.md``. This includes runtime reads, generated settings, and
+internal compatibility markers. Prefix and regex constants are excluded by the
+exact-name match itself, not a hand-maintained ignore list. A second scan keeps
+covering non-Mimir environment reads with an explicit ownership allowlist.
 
 Motivation: #1046 / #1047 proposed rebuilding capabilities that already existed
 behind undocumented flags. The doc closes that discoverability gap; this test
@@ -54,6 +56,9 @@ ALLOWLIST = {
 }
 
 _ENV_ACCESSOR_HINT = "env"  # substring identifying env-reading helper callees
+# Double-underscore suffixes are namespace prefixes (for example
+# ``MIMIR_EXTRAS__``), not environment-variable names.
+_MIMIR_NAME = re.compile(r"MIMIR_(?![A-Z0-9_]*__$)[A-Z0-9_]+")
 
 
 def _module_str_constants(tree: ast.Module) -> dict[str, str]:
@@ -120,6 +125,21 @@ def _env_names_from_source(src: str) -> set[str]:
     return names
 
 
+def _mimir_names_from_source(src: str) -> set[str]:
+    """Exact MIMIR names present as Python string literals in ``src``."""
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return set()
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and _MIMIR_NAME.fullmatch(node.value)
+    }
+
+
 def _env_names_in(path: Path) -> set[str]:
     try:
         return _env_names_from_source(path.read_text(encoding="utf-8"))
@@ -138,6 +158,19 @@ def _scan_core() -> set[str]:
     return {n for n in found if n.isupper() and ("_" in n or n == "HOME")}
 
 
+def _scan_core_mimir_names() -> set[str]:
+    found: set[str] = set()
+    for path in MIMIR.rglob("*.py"):
+        parts = path.relative_to(MIMIR.parent).parts
+        if "tests" in parts or parts[1:2] == ("optional-skills",):
+            continue
+        try:
+            found |= _mimir_names_from_source(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+    return found
+
+
 def _documented_names() -> set[str]:
     """Backtick names in the doc's TABLE ROWS (prose mentions don't count)."""
     names: set[str] = set()
@@ -153,6 +186,14 @@ def test_every_core_env_var_is_documented():
         "Environment variables read by mimir core runtime but absent from "
         "docs/configuration.md. Add a table row there, or add it to ALLOWLIST "
         f"in this test if it is not a mimir config flag: {missing}"
+    )
+
+
+def test_every_core_mimir_name_has_a_reference_entry():
+    missing = sorted(_scan_core_mimir_names() - _documented_names())
+    assert not missing, (
+        "Exact MIMIR_* names reachable from core Python code but absent from "
+        f"docs/configuration.md table entries: {missing}"
     )
 
 
@@ -187,3 +228,12 @@ def test_scanner_covers_the_known_indirect_reads():
     scanned = _scan_core()
     for name in ("MIMIR_WATCHDOG_WEBHOOK_URL", "MIMIR_DEFAULTS_UPGRADE_AUTO_SUBMIT_CLEAN"):
         assert name in scanned, f"{name} (a constant-backed read) not discovered"
+
+
+def test_mimir_name_scanner_excludes_prefixes_and_regexes_by_shape():
+    src = '''
+EXACT = "MIMIR_UNDOCUMENTED_FIXTURE_EXACT"
+PREFIX = "MIMIR_EXTRAS__"
+REGEX = r"^MIMIR_MODEL_SPEC_LINE_RE=.*$"
+'''
+    assert _mimir_names_from_source(src) == {"MIMIR_UNDOCUMENTED_FIXTURE_EXACT"}

@@ -20,8 +20,9 @@ the feature-factory), never a run path in mimir.
 The **planner/decomposer contract** (the leaf template in §2.5) is enforced: a
 leaf missing the required sections is auto-demoted to `worklink:blocked` with a
 `WORKLINK_BLOCKED` reason before dispatch (re-plan → re-add `worklink:ready`).
-Execution is isolated in per-leaf worktrees via the configured compute backend
-(§5). **The only Worklink compute substrate is `local_subprocess`** (chainlink
+Execution uses self-contained per-leaf attempt checkouts via the configured
+compute backend (§5). **The only Worklink compute substrate is
+`local_subprocess`** (chainlink
 #832 — `docker_sibling` and `ecs_runtask` were retired); autonomous dispatch
 needs `defaults.allow_autonomous_local_subprocess: true` in `worklink.yaml` to
 opt into the unsandboxed blast radius. The current mimirbot deployment runs
@@ -52,7 +53,8 @@ epic #783 arc concluded (every failure was distribution tax in that layer).
 Epics are built by the external **opencode feature-factory**
 (`~/projects/odin/opencode-feature-factory`): a session-driven `/feature`
 workflow that owns its own decomposition (`.opencode/factory/<run>/plan/
-slices.json`), human/scripted approval gates, worktrees, and one draft PR — and
+slices.json`), human/scripted approval gates, genuine Git worktrees created by
+the external factory, and one draft PR — and
 knows nothing about Chainlink. The **feature-factory adapter** (#833) connects
 the two:
 
@@ -154,7 +156,7 @@ vague parent issue can never be handed directly to a coding agent:
 | Role | Who | Intelligence | Output |
 |---|---|---|---|
 | **Planner / decomposer** | mimir, in LLM turns | mimir's model | Ready *leaf* issues: acceptance criteria, dependency edges, review criteria, labels |
-| **Executor** | `mimir/worklink/` — deterministic machinery (no model calls of its own) | opencode's own agent loop | A claimed issue → worktree → backend run → **observed** evidence bundle → state transition |
+| **Executor** | `mimir/worklink/` — deterministic machinery (no model calls of its own) | opencode's own agent loop | A claimed issue → isolated checkout → backend run → **observed** evidence bundle → state transition |
 
 The executor is a process supervisor. It claims, prepares, spawns,
 observes, and reports. All building intelligence lives inside the
@@ -167,7 +169,7 @@ Why the split is load-bearing:
 
 - **State transitions never depend on a model following instructions.**
   Claim/evidence/transition is plain Python; the model can only affect
-  the worktree contents.
+  the checkout contents.
 - **Evidence is observed, not self-reported.** The executor runs
   `git diff` and the test command itself after the backend exits. A
   backend that claims success over a failing suite produces evidence
@@ -621,7 +623,7 @@ content verbatim into acceptance criteria.
   shipped installs. A low-priority maintenance poller inventories pins
   vs upstream and **files chainlink bump issues** with changelog/risk
   notes; those flow through this same pipeline (planner refines →
-  executor bumps in a worktree → the smoke command is the evidence).
+  executor bumps in an isolated checkout → the smoke command is the evidence).
   Version-drift checks are a tool-class concern, not a coding-CLI
   special case.
 
@@ -697,7 +699,7 @@ defaults:
   timeout_s: 1800
   priority: normal
   test_command: "uv run pytest -q"
-  base_branch: main          # worktrees cut from + PRs target this branch
+  base_branch: main          # checkouts cut from + PRs target this branch
 
 backends:
   opencode:
@@ -706,7 +708,7 @@ backends:
     # OpenCode evaluates the last matching pattern. Worklink always installs a
     # leading "*": deny rule, then these grants; "*" itself is rejected.
     bash_allowlist: ["git *", "uv *"]
-    args: ["--model", "openai/gpt-5.6-sol"]
+    args: []                 # Worklink injects the configured model and --dir
   feature_factory:
     bin: feature-factory
 ```
@@ -727,7 +729,7 @@ uv run mimir worklink run <issue-id> --home /mimir-home --dry-run
 ```
 
 A dry run is a prompt/config validation step only. It does not create a claim,
-worktree, evidence bundle, branch, or PR.
+checkout, evidence bundle, branch, or PR.
 
 ### Real run
 
@@ -766,7 +768,7 @@ The load-bearing fields are:
 - `files_changed` and `diff_stat`: collected with git by the executor.
 - `commands`: observed command summaries, including diff/status checks.
 - `tests`: the exact test command, exit code, and captured summary.
-- `transcript`: path to the backend JSON transcript outside the worktree.
+- `transcript`: path to the backend JSON transcript outside the checkout.
 - `pr_url`: review PR if the evidence gate passed.
 
 Do not treat a backend's prose as evidence when these fields disagree. Empty
@@ -785,7 +787,7 @@ Current slice-1 recovery is manual:
   `chainlink locks release <issue-id>`. Use `locks steal` only after independent
   TTL/heartbeat evidence; Chainlink can report a fresh lock as stale when no
   heartbeat has been written yet.
-- **Retained failed worktree/branch:** failed or blocked attempts are retained
+- **Retained failed checkout/branch:** failed or blocked attempts are retained
   for autopsy under `.worklink/<issue>-<attempt>` with branch
   `issue/<issue>-a<attempt>`. Remove them only after evidence has been copied
   or is no longer needed. Successful attempts are cleaned up automatically.
@@ -861,7 +863,7 @@ routes:                     # first match wins
 backends:                   # ToolBackend adapters — WHAT builds
   opencode:
     bin: opencode
-    args: ["--model", "openai/gpt-5.6-sol"]
+    args: []                 # -m/--model, --dir, and -- are backend-owned
   feature_factory:
     bin: feature-factory
 
@@ -900,7 +902,8 @@ OpenCode process. An allowed command and its arguments still have the host
 user's filesystem and network authority, so untrusted code work remains
 notify-only until Worklink has an isolated compute substrate.
 
-`tiered_review` and the inert `epic_branch_prefix`/`reviewer_backend` settings
+`tiered_review` and the inert `epic_branch_prefix`/`reviewer_backend`,
+`max_review_retries`, and `max_claim_attempts` settings
 live under `defaults`. Since #830 removed the integrated-epic runner these are
 retained only for config back-compat (no code consumes them; the
 `tiered_review` risk classifier went with the epic reviewer). The fields are
@@ -950,7 +953,7 @@ tool_pins:
    atomicity across processes; decide claim mechanism; document in this
    spec.
 2. **Slice 1 — vertical, operator-invoked.** `mimir worklink run
-   <issue>`: validate-leaf → claim → worktree → coding adapter →
+   <issue>`: validate-leaf → claim → isolated checkout → coding adapter →
    observed evidence → transitions → PR. Dry-run on one non-critical
    issue (an adversarial-review LOW is a good guinea pig).
 3. **Slice 2 — planner.** `mimir/prompt_templates/decompose.md` +
@@ -980,6 +983,6 @@ tool_pins:
 | Backend session brittleness | Start operator-invoked (slice 1); autonomy only after dry-run |
 | Unsandboxed backend filesystem access | Verified in-container seccomp/userns profile confines bwrap `workspace-write` (#452, `docs/internal/seccomp-userns.json`); `local_subprocess` (the only built-in compute substrate after #832, today's `--sandbox danger-full-access`) is the explicit accept-the-risk fallback, gated before slice-3 autonomous dispatch |
 | Evidence gaming by the backend agent | Orchestrator observes diff/tests itself; empty-diff demotion |
-| Worktree cost under concurrency | Worktrees are per-issue and short-lived; cap concurrent claims (default 2) |
+| Checkout cost under concurrency | Attempt checkouts are per-issue and short-lived; cap concurrent claims (default 2) |
 | Shared quota exhaustion | `quota_pool` + arbiter gating; operator runs bypass |
 | Stale claims wedging issues | TTL reaper + `locks steal` + attempts cap |

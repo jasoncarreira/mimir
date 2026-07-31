@@ -235,7 +235,7 @@ test runner.
   surface in the next turn's prompt, which is sufficient. Adding an
   out-of-band alert is a separate plumbing problem (operator alert
   channel — already filed in v0.4 §6).
-- **Probing other bind mounts** (`/workspace`, `/benchmark`, etc.).
+- **Probing other source or benchmark bind mounts.**
   Those don't carry critical agent state; let them fail loudly via
   their natural failure mode rather than adding probes for each.
 - **Switching to named volumes** — alternative mitigation, separate

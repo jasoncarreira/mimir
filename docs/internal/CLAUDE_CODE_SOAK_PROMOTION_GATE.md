@@ -71,7 +71,8 @@ Result: blocked in the Worklink container. No live `claude-code:*` model call wa
 
 ## 2026-07-02 Local Operator-Container Soak
 
-Local run from a #739 worktree rebased onto `origin/main` passed the source-level
+Local run from an operator-created Git worktree for #739, rebased onto
+`origin/main`, passed the source-level
 preflight and live Claude Code probes:
 
 - `git rev-parse HEAD` = `2145b60c50164be213e5ccb8bca466f00d72072d`, with
