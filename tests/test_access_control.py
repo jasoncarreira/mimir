@@ -4845,6 +4845,15 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
     )
     assert same_pr.allowed is True
 
+    stale_head_scope = replace(first_scope, observed_head_sha="b" * 40)
+    stale_head = SinkGate.check_sink_flow(
+        "pr_comment", first_target, labels_from_first, auth, enforce=True,
+        repo_pr_action_scope=stale_head_scope,
+    )
+    assert stale_head.allowed is False
+    assert stale_head.reason == "ifc_label_blocked:forge"
+    assert stale_head.refusal_detail is not None
+
 
 def _attach_test_checkout_lease(
     state: RepoReviewState, lease_root: Path, name: str,
