@@ -162,6 +162,7 @@ _RECOVERY_STATE_FILE = ".recovery.json"
 _REVIEW_TURN_EVENT_TYPES = frozenset({
     "pr_opened", "pr_synchronize", "pr_review_requested",
 })
+_CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 
 # Unresolved review feedback is re-reminded on elapsed time rather than poll
 # count. A one-minute jitter allowance absorbs small per-run timestamp drift
@@ -223,9 +224,15 @@ def _coerce_review_requests(value: object) -> dict[str, int]:
 
 
 def _review_recovery_state(
-    repo: str, number: str,
-) -> tuple[int, bool, bool, bool] | None:
-    """Return ``(started, pending, found, canonical)`` from recovery state.
+    repo: str,
+    number: str,
+    *,
+    event_types: frozenset[str] = _REVIEW_TURN_EVENT_TYPES,
+    after: str = "",
+    head_sha: str = "",
+    pending_before: str = "",
+) -> tuple[int, bool, bool, bool, list[str], str, list[str]] | None:
+    """Return charged/pending/refusal details from framework recovery state.
 
     ``None`` means recovery state is unavailable, for example when this script is
     run directly outside the poller framework. Completed turns are removed by
@@ -247,6 +254,9 @@ def _review_recovery_state(
     pending = False
     found = False
     canonical = False
+    attempt_reasons: list[str] = []
+    latest_refusal_at = ""
+    refusal_reasons: list[str] = []
     for entry in inflight.values():
         if not isinstance(entry, dict):
             continue
@@ -260,28 +270,53 @@ def _review_recovery_state(
             for item in items
             if (
                 isinstance(item, dict)
-                and item.get("event_type") in _REVIEW_TURN_EVENT_TYPES
+                and item.get("event_type") in event_types
                 and item.get("repo") == repo
                 and str(item.get("number")) == number
+                and (not head_sha or item.get("head_sha") == head_sha)
             )
         }
         if not matching_types:
             continue
         found = True
         canonical = canonical or bool(matching_types & {"pr_opened", "pr_synchronize"})
+        outcome_at = entry.get("last_outcome_at")
+        if after and isinstance(outcome_at, str) and outcome_at <= after:
+            continue
         attempts = entry.get("attempts", 0)
         attempts = (
             attempts
             if isinstance(attempts, int) and not isinstance(attempts, bool)
             else 0
         )
-        if entry.get("last_outcome_at"):
+        if outcome_at:
+            if entry.get("outcome_disposition") == "exempt_hard_refusal":
+                if isinstance(outcome_at, str) and outcome_at >= latest_refusal_at:
+                    latest_refusal_at = outcome_at
+                    raw_reason = entry.get("outcome_reason")
+                    refusal_reasons = [
+                        raw_reason if isinstance(raw_reason, str) else "hard_boundary_refusal"
+                    ]
+                continue
             # Pre-fix persisted failures may still say attempts=0. The durable
             # outcome proves that turn started even when the old counter did not.
             started += max(attempts, 1)
+            raw_reasons = entry.get("attempt_reasons")
+            if isinstance(raw_reasons, list):
+                attempt_reasons.extend(str(reason)[:240] for reason in raw_reasons)
+            else:
+                attempt_reasons.append(str(entry.get("outcome_reason") or "turn_failed")[:240])
         else:
-            pending = True
-    return started, pending, found, canonical
+            queued_at = entry.get("enqueued_at") or entry.get("stashed_at")
+            pending = pending or not (
+                pending_before
+                and isinstance(queued_at, str)
+                and queued_at <= pending_before
+            )
+    return (
+        started, pending, found, canonical, attempt_reasons,
+        latest_refusal_at, refusal_reasons,
+    )
 
 
 def _resolve_token() -> str:
@@ -1119,7 +1154,9 @@ def _check_pr_pushes(
                     recovery = _review_recovery_state(repo, key)
                     recovery_available = recovery is not None
                     if recovery is not None:
-                        started, pending, found, canonical = recovery
+                        (
+                            started, pending, found, canonical, _, _, _,
+                        ) = recovery
                         if found:
                             prior_attempts = max(
                                 started,
@@ -1502,6 +1539,8 @@ def _check_own_changes_requested(
         last_reminded_at = ""
         last_reminded: datetime | None = None
         prior_attempts = 0
+        attempt_reasons: list[str] = []
+        recovery_after = ""
         head_changed = False
         if isinstance(prior_entry, dict):
             prior_head = prior_entry.get("head_sha")
@@ -1515,7 +1554,11 @@ def _check_own_changes_requested(
                     "attempts": 1,
                 }
                 continue
-            if not isinstance(raw_attempts, int) or raw_attempts < 1:
+            if (
+                not isinstance(raw_attempts, int)
+                or isinstance(raw_attempts, bool)
+                or raw_attempts < 0
+            ):
                 # Quiet repair for malformed structured state.
                 new[key] = {
                     "head_sha": head_sha,
@@ -1530,6 +1573,9 @@ def _check_own_changes_requested(
                 head_changed = True
             else:
                 prior_attempts = raw_attempts
+                raw_after = prior_entry.get("rearmed_at")
+                if isinstance(raw_after, str):
+                    recovery_after = raw_after
             value = prior_entry.get("last_reminded_at")
             if not head_changed and isinstance(value, str):
                 last_reminded_at = value
@@ -1542,6 +1588,53 @@ def _check_own_changes_requested(
                     last_reminded = last_reminded.astimezone(timezone.utc)
                 except ValueError:
                     last_reminded = None
+
+        recovery = _review_recovery_state(
+            repo,
+            key,
+            event_types=_CHANGES_REQUESTED_TURN_EVENT_TYPES,
+            after=recovery_after,
+            head_sha=head_sha,
+            pending_before=(
+                observed_at - CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            ).isoformat(),
+        )
+        recovery_available = recovery is not None
+        latest_refusal_at = ""
+        refusal_reasons: list[str] = []
+        if recovery is not None:
+            (
+                charged, pending, found, _, attempt_reasons,
+                latest_refusal_at, refusal_reasons,
+            ) = recovery
+            if found and prior_attempts <= REVIEW_REQUEST_MAX_ATTEMPTS:
+                # Recovery is authoritative over legacy emission-count cursors.
+                prior_attempts = charged
+            if pending:
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": last_reminded_at or observed_at_iso,
+                    "attempts": prior_attempts,
+                    **({"rearmed_at": recovery_after} if recovery_after else {}),
+                }
+                continue
+
+        if latest_refusal_at:
+            refused_at = _parse_utc_datetime(latest_refusal_at)
+            if (
+                refused_at is not None
+                and observed_at - refused_at < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            ):
+                # A deterministic boundary refusal is operator-visible in the
+                # terminal outcome. Do not hammer it every poll/hour; the 24h
+                # backstop is the time-based ceiling for permanent config faults.
+                new[key] = {
+                    "head_sha": head_sha,
+                    "last_reminded_at": last_reminded_at or observed_at_iso,
+                    "attempts": prior_attempts,
+                    **({"rearmed_at": recovery_after} if recovery_after else {}),
+                }
+                continue
 
         eligible_after = max(
             timedelta(0),
@@ -1575,6 +1668,7 @@ def _check_own_changes_requested(
                     url=url,
                     head_sha=head_sha,
                     attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+                    attempt_reasons=attempt_reasons,
                 )
                 count += 1
                 prior_attempts += 1
@@ -1594,6 +1688,7 @@ def _check_own_changes_requested(
             # an in-memory queue without any turn running. Re-arm after a long
             # backstop so the cap limits noise but cannot silence the PR forever.
             prior_attempts = 0
+            recovery_after = observed_at_iso if recovery_available else ""
 
         attempt = prior_attempts + 1
         reviewers = ", ".join(f"@{login}" for login in sorted(blocking))
@@ -1621,12 +1716,14 @@ def _check_own_changes_requested(
             author=(pr.get("user") or {}).get("login"),
             attempt=attempt,
             max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
+            prior_refusal_reasons=refusal_reasons,
         )
         count += 1
         new[key] = {
             "head_sha": head_sha,
             "last_reminded_at": observed_at_iso,
-            "attempts": attempt,
+            "attempts": prior_attempts if recovery_available else attempt,
+            **({"rearmed_at": recovery_after} if recovery_after else {}),
         }
     return count, new
 

@@ -1798,6 +1798,7 @@ async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     assert ev.get("trigger") == "poller"  # fires for ANY turn kind
     assert ev.get("channel_id") == "ch-1"
     assert "codex 503 boom" in (ev.get("error") or "")
+    assert ev["attempt_disposition"] == "charge"
 
 
 # ── turn-outcome item identity for poller recovery (chainlink #262) ──
@@ -1876,6 +1877,47 @@ async def test_turn_completed_emitted_for_successful_poller_turn(tmp_path: Path)
     assert ev.get("items") == items
     # Success ⇒ no failure event.
     assert [e for e in evs if e.get("type") == "turn_failed"] == []
+
+
+async def test_framework_marks_hard_boundary_refusal_unchargeable(tmp_path: Path):
+    class _RefusingAgent(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            from mimir.tools.budget_gate import _emit_hard_boundary_denied
+
+            _emit_hard_boundary_denied(
+                tool="bash",
+                boundary="service_scope",
+                reason="service_scope_denied",
+            )
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_RefusingAgent([AIMessage(content="I could not push")]),
+        fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    await agent.run_turn(AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="fix PR",
+        source_id="changes-requested:1",
+    ))
+
+    outcomes = [
+        event for event in _read_events(tmp_path)
+        if event.get("type") in {"turn_failed", "turn_completed"}
+    ]
+    assert len(outcomes) == 1
+    assert outcomes[0]["type"] == "turn_failed"
+    assert outcomes[0]["attempt_disposition"] == "exempt_hard_refusal"
+    assert outcomes[0]["attempt_reason"] == "service_scope_denied"
+    assert outcomes[0]["hard_refusals"] == [{
+        "tool": "bash", "boundary": "service_scope", "reason": "service_scope_denied",
+    }]
 
 
 async def test_context_window_exceeded_emits_failed_poller_outcome(tmp_path: Path):

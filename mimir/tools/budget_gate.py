@@ -222,11 +222,18 @@ def _emit_hard_boundary_denied(
     turn_context: Any | None = None,
 ) -> None:
     """Record an action that an always-on boundary actually refused."""
+    active_turn = turn_context or _get_current_turn_context()
+    if active_turn is not None:
+        denials = getattr(active_turn, "hard_boundary_denials", None)
+        denial = {"tool": tool, "boundary": boundary, "reason": reason}
+        if isinstance(denials, list):
+            denials.append(denial)
+        else:
+            active_turn.hard_boundary_denials = [denial]
     if auth_context is None and turn_context is not None:
         candidate = getattr(turn_context, "auth_context", None)
         auth_context = candidate if isinstance(candidate, AuthContext) else None
     if auth_context is None:
-        active_turn = _get_current_turn_context()
         candidate = getattr(active_turn, "auth_context", None)
         auth_context = candidate if isinstance(candidate, AuthContext) else None
 

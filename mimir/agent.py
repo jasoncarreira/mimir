@@ -2841,12 +2841,32 @@ class Agent:
         # Result fields drive both terminal events and the TurnRecord, so derive
         # them before finalization and reuse the exact classification.
         result_fields = derive_result_fields(messages, context=ctx)
-        outcome_is_error = bool(error or result_fields["result_is_error"])
+        hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
+        outcome_is_error = bool(
+            error or result_fields["result_is_error"] or hard_refusals
+        )
         outcome_fields = {
             "result_subtype": result_fields["result_subtype"],
             "result_is_error": result_fields["result_is_error"],
             "stop_reason": result_fields["stop_reason"],
             "tool_call_count": ctx.tool_call_count,
+            # This is framework-authored from boundary middleware state, never
+            # inferred from model text or a tool error message.
+            "attempt_disposition": (
+                "exempt_hard_refusal" if hard_refusals else "charge"
+            ),
+            "attempt_reason": (
+                ", ".join(
+                    sorted({
+                        str(item.get("reason") or item.get("boundary"))
+                        for item in hard_refusals
+                        if isinstance(item, dict)
+                    })
+                )
+                if hard_refusals
+                else (error[:240] if error else result_fields["result_subtype"])
+            ),
+            "hard_refusals": hard_refusals,
         }
 
         # Algedonic: surface EVERY turn failure as an event so a dropped

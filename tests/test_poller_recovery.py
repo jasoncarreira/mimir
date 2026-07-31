@@ -22,12 +22,13 @@ def _ts(seconds_ago: float) -> str:
 
 def _write_outcome(events_path: Path, *, type_: str, channel_id: str,
                    source_id: str, ts: str,
-                   result_subtype: str | None = None) -> None:
+                   result_subtype: str | None = None, **fields) -> None:
     events_path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"type": type_, "timestamp": ts,
            "channel_id": channel_id, "source_id": source_id}
     if result_subtype is not None:
         rec["result_subtype"] = result_subtype
+    rec.update(fields)
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
@@ -131,6 +132,34 @@ async def test_reconcile_drops_completed(tmp_path: Path):
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
 
 
+async def test_reconcile_retains_completed_outcome_for_live_state_accounting(
+    tmp_path: Path,
+):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-completed"))
+    _write_outcome(
+        events,
+        type_="turn_completed",
+        channel_id="poller:github-activity",
+        source_id="sid-completed",
+        ts=_ts(5),
+    )
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-completed"]
+    assert entry["attempts"] == 1
+    assert entry["outcome_disposition"] == "charge"
+    assert entry["attempt_reasons"] == ["turn_completed_without_state_change"]
+
+
 async def test_reconcile_reenqueues_failed(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
@@ -176,6 +205,36 @@ async def test_reconcile_counts_failure_when_reenqueue_is_disabled(tmp_path: Pat
     entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-1"]
     assert entry["attempts"] == 1
     assert entry["last_outcome_at"] == outcome_at
+
+
+async def test_reconcile_records_hard_refusal_without_charging_attempt(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
+    outcome_at = _ts(5)
+    _write_outcome(
+        events,
+        type_="turn_failed",
+        channel_id="poller:github-activity",
+        source_id="sid-refused",
+        ts=outcome_at,
+        attempt_disposition="exempt_hard_refusal",
+        attempt_reason="service_scope_denied",
+        hard_refusals=[{"boundary": "service_scope", "reason": "service_scope_denied"}],
+    )
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events,
+        enqueue=_FakeEnqueue(),
+        recover_failed_turns=False,
+    )
+
+    entry = poller_recovery._load_state(tmp_path)["inflight"]["sid-refused"]
+    assert entry["attempts"] == 0
+    assert entry["outcome_disposition"] == "exempt_hard_refusal"
+    assert entry["outcome_reason"] == "service_scope_denied"
 
 
 async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Path):
