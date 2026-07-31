@@ -3438,6 +3438,43 @@ def _fixed_web_search_url() -> str | None:
     )
 
 
+_REPOSITORY_RESULT_RESOURCE = re.compile(
+    r"^(?P<repo>.+)#pull/(?P<pr>[1-9][0-9]*)@(?P<head>[0-9a-fA-F]{40})$",
+)
+
+
+def _forge_repository_scope_mismatch(
+    ifc_labels: Any,
+    scope: Any,
+) -> tuple[str, str] | None:
+    """Return the first repository result that is outside a forge sink scope."""
+    expected_repo = getattr(scope, "canonical_repo", None)
+    expected_pr = getattr(scope, "pr_number", None)
+    expected_head = getattr(scope, "observed_head_sha", None)
+    for source in getattr(ifc_labels, "sources", ()):
+        if getattr(source, "domain", None) != "repository":
+            continue
+        resource_id = getattr(source, "resource_id", None)
+        match = (
+            _REPOSITORY_RESULT_RESOURCE.fullmatch(resource_id)
+            if isinstance(resource_id, str) else None
+        )
+        if match is None:
+            return str(resource_id or "unknown"), "unknown"
+        source_repo = match.group("repo")
+        source_pr = int(match.group("pr"))
+        source_head = match.group("head")
+        if not (
+            isinstance(expected_repo, str)
+            and source_repo.casefold() == expected_repo.casefold()
+            and source_pr == expected_pr
+            and isinstance(expected_head, str)
+            and source_head.casefold() == expected_head.casefold()
+        ):
+            return source_repo, str(source_pr)
+    return None
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -3558,6 +3595,7 @@ class SinkGate:
         allow_untrusted_active_ingest: bool = False,
         repo_review_state: Any = None,
         repo_review_state_refusal: str | None = None,
+        repo_pr_action_scope: Any = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -3906,6 +3944,36 @@ class SinkGate:
                 enforcement_enabled=enforce,
                 resolved_sink_target=resolved_target,
             )
+
+        if sink_category is SinkCategory.FORGE:
+            mismatch = _forge_repository_scope_mismatch(
+                ifc_labels, repo_pr_action_scope,
+            )
+            if mismatch is not None:
+                source_repo, source_pr = mismatch
+                destination_repo = getattr(
+                    repo_pr_action_scope, "canonical_repo", "unknown",
+                )
+                destination_pr = getattr(
+                    repo_pr_action_scope, "pr_number", "unknown",
+                )
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason="ifc_label_blocked:forge",
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=(
+                        f"repository result from {source_repo}#{source_pr} cannot "
+                        f"flow to {destination_repo}#{destination_pr}: repository, "
+                        "pull request, and observed head must match"
+                    ),
+                )
 
         allowed_sinks = cls._get_allowed_sinks(
             tool_name,
@@ -5616,6 +5684,7 @@ class ToolRegistry:
                 enforce=enforce,
                 repo_review_state=repo_review_state,
                 repo_review_state_refusal=repo_review_state_refusal,
+                repo_pr_action_scope=repo_pr_action_scope,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
@@ -6133,7 +6202,7 @@ def classify_protected_result(
         "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged",
     }:
-        scope = getattr(auth_context, "repo_pr_action_scope", None)
+        scope = authorization.repo_pr_action_scope
         if scope is None or failed:
             return _incomplete_protected_result("repository", args)
         principal = getattr(auth_context, "canonical_principal", None)
