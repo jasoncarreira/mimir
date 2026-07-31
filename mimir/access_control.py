@@ -1891,6 +1891,14 @@ def _repo_review_gh_issue_view_arguments(arguments: list[str]) -> bool:
 
 
 def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bool:
+    # This allowlist is intentionally local-only. In particular, ls-remote is
+    # excluded even though it is read-only: it contacts a remote and would need
+    # a separate authenticated-network policy instead of INSPECT's disabled
+    # credential helper.
+    #
+    # Options such as grep's ``-c`` are parsed only after the subcommand has
+    # already been selected. They cannot become Git's top-level ``-c`` config
+    # injection form.
     if subcommand == "log":
         before_separator, separator, pathspecs = arguments, [], []
         if "--" in arguments:

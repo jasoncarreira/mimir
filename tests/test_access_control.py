@@ -4038,6 +4038,15 @@ def test_repo_review_git_retains_execution_and_write_capable_refusals(
     assert "git rev-list --count" in reason
 
 
+def test_repo_review_git_deliberately_excludes_ls_remote() -> None:
+    argv, reason = parse_service_shell_argv_with_reason(
+        "git ls-remote origin refs/pull/1300/head", "repo_review",
+    )
+
+    assert argv is None
+    assert "contact a remote" in reason
+
+
 def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
