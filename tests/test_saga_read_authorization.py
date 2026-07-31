@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -538,7 +539,7 @@ def _store_with_access_event(
     conn.execute(
         "INSERT INTO access_events (atom_id, session_id, ts, source) "
         "VALUES (?, ?, ?, ?)",
-        (atom_id, "test-session", "2026-07-01T00:00:00+00:00", source),
+        (atom_id, "test-session", datetime.now(UTC).isoformat(), source),
     )
     conn.commit()
     return atom_id

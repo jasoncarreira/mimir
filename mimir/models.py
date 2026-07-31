@@ -13,6 +13,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 
@@ -729,6 +730,38 @@ class RepoPRScopeRegistry:
             ),
             None,
         )
+
+    def resolve_checkout_path(self, path: object) -> RepoReviewState | None:
+        """Resolve the active lease that exactly contains an absolute path."""
+        if not isinstance(path, (str, Path)):
+            return None
+        candidate = Path(path)
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            return None
+        try:
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return None
+
+        for state in self.review_states:
+            lease = state.checkout_lease
+            if (
+                lease is None
+                or not getattr(lease, "is_active", False)
+                or getattr(lease, "scope_id", None) != state.action_scope.scope_id
+                or getattr(lease, "owner", None) != state.action_scope.principal
+            ):
+                continue
+            try:
+                lease_root = Path(lease.lease_root).resolve(strict=True)
+                checkout = Path(lease.path).resolve(strict=True)
+                if checkout.parent != lease_root or checkout == lease_root:
+                    continue
+                resolved.relative_to(checkout)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            return state
+        return None
 
 
 @dataclass

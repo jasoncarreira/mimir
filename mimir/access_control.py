@@ -2921,6 +2921,50 @@ def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> b
     )
 
 
+def resolve_repository_review_state(
+    auth_context: Any,
+    *,
+    command: object = None,
+    cwd: object = None,
+    path: object = None,
+) -> tuple[Any, str | None]:
+    """Resolve one request's PR state without relying on a batched singleton."""
+    from .models import RepoPRScopeRegistry
+
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    if not isinstance(registry, RepoPRScopeRegistry):
+        return getattr(auth_context, "repo_review_state", None), None
+
+    if path is not None:
+        state = registry.resolve_checkout_path(path)
+        return state, None if state is not None else "no matching checkout lease was found for the requested path"
+
+    argv: list[str] = []
+    if isinstance(command, str):
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+    if argv[:2] == ["gh", "pr"] and len(argv) >= 4:
+        try:
+            pull_request = int(argv[3])
+        except ValueError:
+            pull_request = None
+        repository = _option_value(argv[4:], "--repo") or _option_value(argv[4:], "-R")
+        state = registry.resolve(repository, pull_request)
+        if state is not None:
+            return state, None
+    if argv[:2] == ["git", "-C"] and len(argv) >= 3:
+        state = registry.resolve_checkout_path(argv[2])
+        return state, None if state is not None else "no matching checkout lease was found for the repository command"
+    if cwd is not None:
+        state = registry.resolve_checkout_path(cwd)
+        return state, None if state is not None else "no matching checkout lease was found for the repository command"
+    if len(registry.review_states) == 1:
+        return registry.review_states[0], None
+    return None, "no matching checkout lease was found for the repository command"
+
+
 def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
     """Prevent one session boundary from mutating another channel's memory."""
     home = os.environ.get("MIMIR_HOME", "").strip()
@@ -3434,6 +3478,8 @@ class SinkGate:
         enforce: bool = False,
         sink_category: SinkCategory | None = None,
         allow_untrusted_active_ingest: bool = False,
+        repo_review_state: Any = None,
+        repo_review_state_refusal: str | None = None,
     ) -> "ToolAuthorization":
         """Check if IFC labels permit flow to the given sink.
 
@@ -3682,18 +3728,25 @@ class SinkGate:
                 if service_policy is not None
                 else None
             )
-            review_state = getattr(auth_context, "repo_review_state", None)
+            review_state = (
+                repo_review_state
+                if repo_review_state is not None
+                else getattr(auth_context, "repo_review_state", None)
+            )
             service_target_allowed = False
             if service_policy is not None and adapter is not None:
                 if (
                     adapter is _target_matches_shell_profile
                     and service_policy.destination == "repo_review"
                 ):
-                    service_target_allowed = parse_service_shell_argv(
-                        target,
-                        service_policy.destination,
-                        review_state=review_state,
-                    ) is not None
+                    service_target_allowed = (
+                        repo_review_state_refusal is None
+                        and parse_service_shell_argv(
+                            target,
+                            service_policy.destination,
+                            review_state=review_state,
+                        ) is not None
+                    )
                 else:
                     service_target_allowed = adapter(
                         target, service_policy.destination,
@@ -3759,7 +3812,7 @@ class SinkGate:
                     is_shadow_decision=not enforce,
                     would_block=True,
                     resolved_sink_target=resolved_target,
-                    refusal_detail=_service_shell_refusal_detail(
+                    refusal_detail=repo_review_state_refusal or _service_shell_refusal_detail(
                         target, service_policy, review_state,
                     ),
                     repo_pr_action_scope=scope,
@@ -5378,6 +5431,8 @@ class ToolRegistry:
             else None
         )
         repo_pr_action_scope = None
+        repo_review_state = None
+        repo_review_state_refusal = None
         if auth_context is not None:
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 registry = getattr(auth_context, "repo_pr_scope_registry", None)
@@ -5411,6 +5466,24 @@ class ToolRegistry:
                 repo_pr_action_scope = getattr(
                     auth_context, "repo_pr_action_scope", None,
                 )
+            if tool_name in {"shell_exec", "bash_async"}:
+                repo_review_state, repo_review_state_refusal = (
+                    resolve_repository_review_state(
+                        auth_context,
+                        command=target_channel,
+                        cwd=(arguments or {}).get("cwd"),
+                    )
+                )
+                if repo_review_state is not None:
+                    repo_pr_action_scope = repo_review_state.action_scope
+            elif tool_name in {"write_file", "edit_file"}:
+                repo_review_state, repo_review_state_refusal = (
+                    resolve_repository_review_state(
+                        auth_context, path=target_channel,
+                    )
+                )
+                if repo_review_state is not None:
+                    repo_pr_action_scope = repo_review_state.action_scope
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
@@ -5453,6 +5526,8 @@ class ToolRegistry:
                 ifc_labels,
                 auth_context,
                 enforce=enforce,
+                repo_review_state=repo_review_state,
+                repo_review_state_refusal=repo_review_state_refusal,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
