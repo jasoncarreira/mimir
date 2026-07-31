@@ -77,6 +77,11 @@ _STANDING_REVIEW_TOOLS = frozenset({
     "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
     "repo_diff", "repo_unmerged",
 })
+_PULL_REQUEST_TOOLS = _STANDING_REVIEW_TOOLS | frozenset({
+    "unsupported_operation", "repo_stage", "repo_commit", "repo_merge",
+    "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
+    "repo_revert_abort", "repo_push",
+})
 
 
 def _resolve_standing_review(
@@ -1078,8 +1083,12 @@ def _emit_tool_call_sync(
     duration_ms: float | None = None,
     error: str | None = None,
     denied: bool = False,
+    arguments: dict[str, Any] | None = None,
 ) -> None:
     payload = {"tool": tool_name, "ok": ok}
+    if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
+        payload["repository"] = arguments.get("repository")
+        payload["pull_request"] = arguments.get("pull_request")
     if duration_ms is not None:
         payload["duration_ms"] = round(duration_ms, 3)
     if error:
@@ -1089,6 +1098,9 @@ def _emit_tool_call_sync(
     _emit_event_sync("tool_call", **payload)
     if not ok:
         error_payload = {"tool": tool_name}
+        if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
+            error_payload["repository"] = arguments.get("repository")
+            error_payload["pull_request"] = arguments.get("pull_request")
         if error:
             error_payload["error"] = error[:500]
         if denied:
@@ -1219,7 +1231,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name, auth_context, validated_arguments,
         )
         if review_denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=review_denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=review_denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
@@ -1239,7 +1254,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             if admin_denial is not None:
                 break
         if admin_denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=admin_denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=admin_denial,
                 tool_call_id=_tool_call_id(request),
@@ -1249,7 +1267,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         if tool_name == "approve_declassification":
             denial = _check_and_increment_or_deny(tool_name)
             if denial is not None:
-                _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=denial, denied=True,
+                    arguments=validated_arguments,
+                )
                 return ToolMessage(
                     content=denial,
                     tool_call_id=_tool_call_id(request),
@@ -1281,6 +1302,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
+                arguments=validated_arguments,
             )
             return ToolMessage(
                 content=prohibition,
@@ -1295,7 +1317,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             auth_context=auth_context,
         )
         if denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
@@ -1326,6 +1351,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         if service_shell_refusal is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
+                arguments=validated_arguments,
             )
             return ToolMessage(
                 content=service_shell_refusal,
@@ -1341,7 +1367,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 _current_ifc_labels(auth_context),
             ):
                 refusal = "file write refused: integrity metadata could not be persisted"
-                _emit_tool_call_sync(tool_name, ok=False, error=refusal, denied=True)
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=refusal, denied=True,
+                    arguments=validated_arguments,
+                )
                 return ToolMessage(
                     content=refusal, tool_call_id=_tool_call_id(request),
                     name=tool_name, status="error",
@@ -1398,6 +1427,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
                 denied=True,
+                arguments=validated_arguments,
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
@@ -1464,7 +1494,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             _resolve_standing_review, tool_name, auth_context, validated_arguments,
         )
         if review_denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=review_denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=review_denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
@@ -1484,7 +1517,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             if admin_denial is not None:
                 break
         if admin_denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=admin_denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=admin_denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=admin_denial,
                 tool_call_id=_tool_call_id(request),
@@ -1494,7 +1530,10 @@ class BudgetGateMiddleware(AgentMiddleware):
         if tool_name == "approve_declassification":
             denial = _check_and_increment_or_deny(tool_name)
             if denial is not None:
-                _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=denial, denied=True,
+                    arguments=validated_arguments,
+                )
                 return ToolMessage(
                     content=denial,
                     tool_call_id=_tool_call_id(request),
@@ -1526,6 +1565,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=prohibition, denied=True,
+                arguments=validated_arguments,
             )
             return ToolMessage(
                 content=prohibition,
@@ -1540,7 +1580,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             auth_context=auth_context,
         )
         if denial is not None:
-            _emit_tool_call_sync(tool_name, ok=False, error=denial, denied=True)
+            _emit_tool_call_sync(
+                tool_name, ok=False, error=denial, denied=True,
+                arguments=validated_arguments,
+            )
             return ToolMessage(
                 content=denial,
                 tool_call_id=_tool_call_id(request),
@@ -1571,6 +1614,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         if service_shell_refusal is not None:
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
+                arguments=validated_arguments,
             )
             return ToolMessage(
                 content=service_shell_refusal,
@@ -1588,7 +1632,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             if not recorded:
                 refusal = "file write refused: integrity metadata could not be persisted"
-                _emit_tool_call_sync(tool_name, ok=False, error=refusal, denied=True)
+                _emit_tool_call_sync(
+                    tool_name, ok=False, error=refusal, denied=True,
+                    arguments=validated_arguments,
+                )
                 return ToolMessage(
                     content=refusal, tool_call_id=_tool_call_id(request),
                     name=tool_name, status="error",
@@ -1649,6 +1696,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
                 denied=True,
+                arguments=validated_arguments,
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:

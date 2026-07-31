@@ -4963,6 +4963,37 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
     assert fields["refusal_reason"] == "repo_pr_scope_denied"
 
 
+def test_repo_binding_startup_alert_names_only_configured_probed_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        access_control,
+        "_configured_scope_github_repos",
+        lambda: frozenset({"owner/repo"}),
+    )
+    monkeypatch.setattr(
+        access_control,
+        "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            None, ("/workspace", "/benchmark"), 0,
+        ),
+    )
+
+    alerts = access_control.repo_binding_startup_alerts()
+
+    assert alerts == ({
+        "repository": "owner/repo",
+        "probed_roots": ["/workspace", "/benchmark"],
+        "match_count": 0,
+        "error": (
+            "pull-request operation rejected: no unique writable root matched repository "
+            "'owner/repo' in MIMIR_FILE_TOOL_ROOTS (zero roots matched); configure "
+            "exactly one :rw entry for the checkout directory itself, not its parent"
+        ),
+        "operator_visible": True,
+    },)
+
+
 def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfork_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
