@@ -32,6 +32,41 @@ _ESCALATION_MAX_ATTEMPTS = 16
 _clients: dict[str, ForgeClient] = {}
 _default_client: ForgeClient | None = None
 _escalation_lock = threading.Lock()
+_github_identity_degraded = False
+_github_identity_degraded_error: ForgeError | None = None
+_github_identity_degraded_lock = threading.Lock()
+_github_identity_degraded_callback: Any | None = None
+
+
+def set_github_identity_degraded_callback(
+    callback: Any | None, *, notify_current: bool = False,
+) -> None:
+    """Install the process callback that emits the degraded event and alert."""
+    global _github_identity_degraded_callback
+    _github_identity_degraded_callback = callback
+    if notify_current and callback is not None:
+        with _github_identity_degraded_lock:
+            current = _github_identity_degraded_error
+        if current is not None:
+            callback(current)
+
+
+def github_identity_is_degraded() -> bool:
+    """Return whether GitHub identity verification latched coding off."""
+    with _github_identity_degraded_lock:
+        return _github_identity_degraded
+
+
+def _latch_github_identity_degraded(exc: ForgeError) -> None:
+    global _github_identity_degraded, _github_identity_degraded_error
+    with _github_identity_degraded_lock:
+        if _github_identity_degraded:
+            return
+        _github_identity_degraded = True
+        _github_identity_degraded_error = exc
+    callback = _github_identity_degraded_callback
+    if callback is not None:
+        callback(exc)
 
 
 def register_forge_client(client: ForgeClient, *, repositories: tuple[str, ...]) -> None:
@@ -47,6 +82,42 @@ def set_forge_client(client: ForgeClient | None) -> None:
     """Set the fallback adapter used when no repository registration exists."""
     global _default_client
     _default_client = client
+
+
+def initialize_github_forge_identity() -> bool:
+    """Bind the declared GitHub identity, degrading coding on any mismatch."""
+    if github_identity_is_degraded():
+        return False
+    declared_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if not declared_login:
+        return True
+    from ..forge.github import GitHubForgeClient
+
+    client = GitHubForgeClient()
+    try:
+        client.verify_identity(declared_login)
+    except ForgeError as exc:
+        _latch_github_identity_degraded(exc)
+        return False
+    set_forge_client(client)
+    return True
+
+
+def confirm_github_tool_identity(principal: str, token: str | None = None) -> str:
+    """Refuse safely and latch coding off when the process binding no longer holds."""
+    if github_identity_is_degraded():
+        raise ToolPolicyRefusal(
+            "coding capability is disabled until restart after GitHub identity verification failed"
+        )
+    from ..forge.github import confirm_github_identity
+
+    try:
+        return confirm_github_identity(principal, token)
+    except ForgeError as exc:
+        _latch_github_identity_degraded(exc)
+        raise ToolPolicyRefusal(
+            f"coding capability disabled: GitHub identity verification failed: {exc}"
+        ) from exc
 
 
 def _scope(
@@ -167,6 +238,13 @@ def _call(operation: Any) -> Any:
     try:
         return operation()
     except ForgeError as exc:
+        from ..forge.github import GitHubIdentityVerificationError
+
+        if isinstance(exc, GitHubIdentityVerificationError):
+            _latch_github_identity_degraded(exc)
+            raise ToolPolicyRefusal(
+                f"coding capability disabled: GitHub identity verification failed: {exc}"
+            ) from exc
         # The adapter may have contacted the forge before failing, so this is a
         # fault rather than a proven pre-execution policy refusal.
         raise ToolException(str(exc)) from exc

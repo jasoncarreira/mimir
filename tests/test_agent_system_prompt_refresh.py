@@ -82,6 +82,30 @@ async def test_build_agent_reuses_graph_when_prompt_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    agent._config.coding_enabled = True
+    capture = _stub_deepagent_build(monkeypatch)
+    requested: list[bool] = []
+    monkeypatch.setattr(
+        "mimir.tools.all_mimir_tools",
+        lambda **kwargs: requested.append(kwargs.get("coding_enabled", False)) or [],
+    )
+    from mimir.tools import forge as forge_tools
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+
+    first = await agent._build_agent_if_needed()
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
+    second = await agent._build_agent_if_needed()
+
+    assert first is not second
+    assert requested == [True, False]
+    assert agent._cached_coding_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_build_agent_registers_structured_subagents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

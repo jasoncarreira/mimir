@@ -124,6 +124,28 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
     assert "spawn_open_code" in names
 
 
+def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import all_mimir_tools
+    from mimir.tools import forge as forge_tools
+
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
+    names = {
+        tool.name
+        for tool in all_mimir_tools(
+            coding_enabled=True,
+            require_coding_available=False,
+        )
+    }
+
+    assert "spawn_open_code" not in names
+    assert "repo_test" not in names
+    assert "pr_metadata" not in names
+    assert forge_tools.initialize_github_forge_identity() is False
+    assert forge_tools.github_identity_is_degraded() is True
+
+
 def test_enabled_coding_without_opencode_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

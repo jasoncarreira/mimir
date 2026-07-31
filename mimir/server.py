@@ -30,7 +30,7 @@ from .chat_skills import ChatSkillRegistry, strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
-from .event_logger import init_logger, log_event
+from .event_logger import init_logger, log_event, log_event_sync
 from .history import MessageBuffer
 from .http_ingress import strip_bridge_authority_extra
 from .identities import IdentityResolver
@@ -760,13 +760,22 @@ def reattach_inflight_worklink_runs(
 
 
 def build_app(config: Config) -> web.Application:
-    # Assemble the actual model-bound surface eagerly so an operator who opted
-    # into coding gets an immediate startup failure when OpenCode is missing,
-    # rather than a broken tool appearing on the first turn.
+    # Preserve the early dependency preflight: explicit coding opt-in still
+    # fails loudly before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
-    all_mimir_tools(coding_enabled=getattr(config, "coding_enabled", False))
+    requested_coding = getattr(config, "coding_enabled", False)
+    all_mimir_tools(coding_enabled=requested_coding)
 
     process_session_id = make_process_session_id()
+
+    config.logs_dir.mkdir(parents=True, exist_ok=True)
+    init_logger(
+        config.events_log,
+        process_session_id,
+        max_events=config.max_events_kept,
+        agent_id=config.agent_id,
+    )
+
     worklink_agent_id = f"mimir-worklink:{process_session_id}"
     # Detached controllers inherit this process generation. The Chainlink
     # tracker identity stays static; structured claim ownership does not.
@@ -848,12 +857,6 @@ def build_app(config: Config) -> web.Application:
     # Best-effort and gated on the binary, so plain pip installs are unaffected.
     ensure_chainlink_initialized(config.home)
 
-    init_logger(
-        config.events_log,
-        process_session_id,
-        max_events=config.max_events_kept,
-        agent_id=config.agent_id,
-    )
     turn_logger = TurnLogger(config.turns_log, max_turns=config.max_turns_kept)
 
     # Identity reconciliation (FUTURE_WORK §6.1). Loads
@@ -911,6 +914,78 @@ def build_app(config: Config) -> web.Application:
     channels = ChannelRegistry()
     channels.register(BenchBridge(home=config.home))
     pairing_notifier = _PairingNotifier(config, channels)
+
+    from .tools.forge import set_github_identity_degraded_callback
+
+    degradation_recorded = False
+    degradation_alert_scheduled = False
+
+    def _github_identity_degraded(exc: Exception) -> None:
+        nonlocal degradation_recorded, degradation_alert_scheduled
+        declared_login = getattr(exc, "declared_login", "")
+        authenticated_login = getattr(exc, "authenticated_login", "")
+        if not degradation_recorded:
+            degradation_recorded = True
+            log.warning(
+                "github_identity_degraded: authenticated=%r declared=%r — coding disabled until restart",
+                authenticated_login or "unknown",
+                declared_login or "unknown",
+            )
+            log_event_sync(
+                "github_identity_degraded",
+                declared_login=declared_login or None,
+                authenticated_login=authenticated_login or None,
+                reason=str(exc),
+            )
+        alert_channel = (config.operator_alert_channel or "").strip()
+        if not alert_channel or degradation_alert_scheduled:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # build_app can run before the event loop; _on_startup retries.
+            return
+        degradation_alert_scheduled = True
+        text = (
+            "GitHub identity verification failed; coding capability is disabled until "
+            "the process is restarted with corrected credentials. "
+            f"Authenticated login: {authenticated_login or 'unknown'}; "
+            f"declared login: {declared_login or 'unknown'}."
+        )
+
+        async def _alert() -> None:
+            try:
+                await channels.send(alert_channel, text, final=True)
+                await log_event(
+                    "github_identity_degraded_operator_alert_sent",
+                    channel_id=alert_channel,
+                )
+            except Exception as alert_exc:  # noqa: BLE001 — degradation remains latched
+                log.warning("github identity degraded alert failed: %s", alert_exc)
+                await log_event(
+                    "github_identity_degraded_operator_alert_failed",
+                    channel_id=alert_channel,
+                    error=str(alert_exc)[:500],
+                )
+
+        spawn_background(
+            _STARTUP_BACKGROUND_TASKS,
+            _alert(),
+            name="github-identity-degraded-alert",
+        )
+
+    set_github_identity_degraded_callback(_github_identity_degraded)
+
+    # Assemble the actual model-bound surface eagerly so missing coding runtime
+    # dependencies still fail at startup. Identity mismatch instead latches the
+    # process into the already-supported coding-disabled mode.
+    from .tools import all_mimir_tools
+    coding_enabled = getattr(config, "coding_enabled", False)
+    if coding_enabled:
+        from .tools.forge import initialize_github_forge_identity
+
+        coding_enabled = initialize_github_forge_identity()
+    all_mimir_tools(coding_enabled=coding_enabled)
 
     # Wiring order to break the (dispatcher → agent → scheduler → dispatcher)
     # cycle: dispatcher first with no runner, then scheduler bound to its
@@ -1307,6 +1382,16 @@ def build_app(config: Config) -> web.Application:
     web_chat.register_routes(app)
 
     async def _on_startup(app: web.Application) -> None:
+        # Install the identity-degradation callback BEFORE emitting any other
+        # startup diagnostics: notify_current=True replays a degradation that
+        # already latched during earlier startup, so a mismatch cannot go
+        # unreported just because it fired before the callback existed.
+        from .tools.forge import set_github_identity_degraded_callback
+
+        set_github_identity_degraded_callback(
+            _github_identity_degraded,
+            notify_current=True,
+        )
         for alert in await asyncio.to_thread(repo_binding_startup_alerts):
             await log_event("github_repo_binding_attention_required", **alert)
         if activity_panel is not None:

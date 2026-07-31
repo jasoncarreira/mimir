@@ -544,6 +544,16 @@ class RepoGitTools:
                     "push_auth_unavailable",
                     f"push credential is unavailable; {self._stranded_work_message()}",
                 )
+            from .forge.github import confirm_github_identity
+            from .forge import ForgeError
+
+            try:
+                confirm_github_identity(self._scope.principal, token)
+            except ForgeError as exc:
+                raise GitRefusal(
+                    "push_identity_unverified",
+                    f"push identity could not be verified: {exc}; {self._stranded_work_message()}",
+                ) from exc
             encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             authorization = f"Authorization: Basic {encoded}"
             return origin, {
