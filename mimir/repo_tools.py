@@ -779,7 +779,8 @@ class RepoGitTools:
                 "merge-base", "--is-ancestor", self._scope.observed_head_sha,
                 self._expected_head,
             ))
-            if ancestry.returncode != 0:
+            rewritten_rebase = self._scope.event_type == "pr_mergeability_rebase"
+            if ancestry.returncode != 0 and not rewritten_rebase:
                 raise GitRefusal("force_push_refused", "push would not be a fast-forward")
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
@@ -798,10 +799,15 @@ class RepoGitTools:
                     return GitOperationResult(
                         False, "stale_scope", stderr=self._stranded_work_message(),
                     )
-                result = self._command((
-                    "push", "--porcelain", push_remote,
-                    f"HEAD:{self._scope.destination_ref}",
-                ), network=True, network_remote=push_remote, overrides=overrides,
+                push_args = ["push", "--porcelain"]
+                if rewritten_rebase:
+                    push_args.append(
+                        f"--force-with-lease={self._scope.destination_ref}:"
+                        f"{self._scope.observed_head_sha}"
+                    )
+                push_args.extend((push_remote, f"HEAD:{self._scope.destination_ref}"))
+                result = self._command(tuple(push_args), network=True,
+                    network_remote=push_remote, overrides=overrides,
                     env=auth_env, sensitive_values=sensitive_values)
                 self._command((
                     "fetch", "--no-tags", "--no-recurse-submodules", push_remote,

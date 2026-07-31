@@ -428,6 +428,71 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     )
 
 
+def _clean_rebase_tools(tmp_path: Path) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    original_author = _git(source, "show", "-s", "--format=%an <%ae>", scope.observed_head_sha)
+    _git(source, "checkout", "-q", "main")
+    (source / "base-only.txt").write_text("advanced base\n", encoding="utf-8")
+    _git(source, "add", "base-only.txt")
+    _git(source, "commit", "-q", "-m", "advance base")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    rebase_scope = replace(
+        scope,
+        event_type="pr_mergeability_rebase",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(rebase_scope)
+    create_pr_checkout_lease(
+        rebase_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    assert RepoGitTools(state).execute(GitRebase()).ok
+    assert _git(state.checkout_lease.path, "show", "-s", "--format=%an <%ae>") == original_author
+    return origin, source, rebase_scope, state
+
+
+def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
+    tmp_path: Path,
+) -> None:
+    origin, _source, scope, state = _clean_rebase_tools(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    push = next(argv for argv in calls if "push" in argv)
+    assert (
+        f"--force-with-lease={scope.destination_ref}:{scope.observed_head_sha}"
+        in push
+    )
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
+
+
+def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path) -> None:
+    origin, source, scope, state = _clean_rebase_tools(tmp_path)
+    _git(source, "checkout", "-q", "worklink/7")
+    (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+    _git(source, "add", "concurrent.txt")
+    _git(source, "commit", "-q", "-m", "concurrent push")
+    concurrent_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+
+    result = RepoGitTools(state).execute(GitPush())
+
+    assert result.ok is False
+    assert result.code == "stale_scope"
+    assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
+
+
 def test_push_refuses_when_successful_command_leaves_remote_unchanged(repo_tools) -> None:
     origin, _source, scope, state, tools = repo_tools
     lease = state.checkout_lease
