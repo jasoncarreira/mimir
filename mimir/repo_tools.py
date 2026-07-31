@@ -793,6 +793,34 @@ class RepoGitTools:
                     f"HEAD:{self._scope.destination_ref}",
                 ), network=True, network_remote=push_remote, overrides=overrides,
                     env=auth_env, sensitive_values=sensitive_values)
+                self._command((
+                    "fetch", "--no-tags", "--no-recurse-submodules", push_remote,
+                    self._scope.destination_ref,
+                ), network=True, network_remote=push_remote, overrides=overrides,
+                    env=auth_env, sensitive_values=sensitive_values)
+                observed = self._command((
+                    "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+                ), overrides=overrides).stdout.strip().lower()
+                reachability = self._raw((
+                    *overrides, "merge-base", "--is-ancestor",
+                    self._expected_head, observed,
+                ))
+                if reachability.timed_out:
+                    raise GitRefusal("timeout", "push verification exceeded its time limit")
+                if reachability.output_limited:
+                    raise GitRefusal("output_limit", "push verification exceeded its output limit")
+                if reachability.returncode == 1:
+                    raise GitRefusal(
+                        "push_not_applied",
+                        f"push did not update {self._scope.destination_ref} to contain expected "
+                        f"commit {self._expected_head}; observed remote commit {observed}; "
+                        f"{self._stranded_work_message()}",
+                    )
+                if reachability.returncode != 0:
+                    raise GitRefusal(
+                        "git_failed",
+                        reachability.stderr.strip() or "push reachability verification failed",
+                    )
             except GitRefusal as exc:
                 if exc.code == "git_failed":
                     raise GitRefusal(

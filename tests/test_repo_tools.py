@@ -417,9 +417,68 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     ls_remote_index = next(index for index, argv in enumerate(calls) if "ls-remote" in argv)
     push_index = calls.index(push)
     assert push_index == ls_remote_index + 1
+    verification_fetches = [
+        argv for argv in calls
+        if "fetch" in argv and scope.destination_ref in argv
+    ]
+    assert len(verification_fetches) == 1
+    assert calls.index(verification_fetches[0]) == push_index + 1
     assert _git(Path(scope.canonical_origin), "rev-parse", scope.destination_ref) == _git(
         state.checkout_lease.path, "rev-parse", "HEAD",
     )
+
+
+def test_push_refuses_when_successful_command_leaves_remote_unchanged(repo_tools) -> None:
+    origin, _source, scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "stranded mutation"))
+    expected = _git(lease.path, "rev-parse", "HEAD")
+    observed = _git(origin, "rev-parse", scope.destination_ref)
+
+    def no_op_push(argv, *, env, timeout, output_limit):
+        if "push" in argv:
+            return GitProcessResult(0, stdout="To origin\n\tup to date\n")
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, runner=no_op_push).execute(GitPush())
+
+    assert refusal.value.code == "push_not_applied"
+    assert expected in str(refusal.value)
+    assert observed in str(refusal.value)
+    assert f"local commit {expected} remains unpushed" in str(refusal.value)
+    assert _git(origin, "rev-parse", scope.destination_ref) == observed
+
+
+def test_push_succeeds_if_remote_advances_on_top_before_verification(repo_tools) -> None:
+    origin, source, scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
+    tools.execute(GitCommit(("push.txt",), "push mutation"))
+    expected = _git(lease.path, "rev-parse", "HEAD")
+
+    def concurrent_push(argv, *, env, timeout, output_limit):
+        result = _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+        if "push" in argv and result.returncode == 0:
+            _git(source, "fetch", "-q", "origin", scope.destination_ref)
+            _git(source, "checkout", "-q", "-B", "concurrent", "FETCH_HEAD")
+            (source / "concurrent.txt").write_text("later work\n", encoding="utf-8")
+            _git(source, "add", "concurrent.txt")
+            _git(source, "commit", "-q", "-m", "concurrent advance")
+            _git(source, "push", "-q", "origin", f"HEAD:{scope.destination_ref}")
+        return result
+
+    result = RepoGitTools(state, runner=concurrent_push).execute(GitPush())
+    remote_head = _git(origin, "rev-parse", scope.destination_ref)
+
+    assert result.ok
+    assert remote_head != expected
+    assert _git(origin, "merge-base", "--is-ancestor", expected, remote_head) == ""
 
 
 @pytest.mark.parametrize("push_fails", [False, True])
@@ -474,8 +533,14 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
         assert exc.code == "git_failed"
         assert "upstream rejected [REDACTED]" in error
 
-    network_calls = [(argv, env) for argv, env in calls if "ls-remote" in argv or "push" in argv]
-    assert ["ls-remote" in argv for argv, _env in network_calls] == [True, False]
+    network_calls = [
+        (argv, env) for argv, env in calls
+        if "ls-remote" in argv or "push" in argv or "fetch" in argv
+    ]
+    assert [
+        next(command for command in ("ls-remote", "push", "fetch") if command in argv)
+        for argv, _env in network_calls
+    ] == (["ls-remote", "push"] if push_fails else ["ls-remote", "push", "fetch"])
     authorization = "Authorization: Basic " + base64.b64encode(
         f"x-access-token:{token}".encode(),
     ).decode()
@@ -493,7 +558,7 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     assert all(
         "GIT_CONFIG_COUNT" not in env
         for argv, env in calls
-        if "ls-remote" not in argv and "push" not in argv
+        if "ls-remote" not in argv and "push" not in argv and "fetch" not in argv
     )
     assert token not in error
     assert all(token not in event for event in events)
