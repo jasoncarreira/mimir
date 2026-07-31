@@ -10,6 +10,7 @@ import selectors as io_selectors
 import shlex
 import shutil
 import signal
+import secrets
 import subprocess
 import time
 from typing import Protocol
@@ -151,7 +152,16 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
 
     env = {
         "PATH": _PATH,
-        "HOME": "/nonexistent",
+        # HOME is deliberately absent here. A writable HOME is required -- every
+        # mainstream runner initialises a cache under it, and "/nonexistent" made
+        # uv fail before reaching pytest ("Permission denied" creating
+        # /nonexistent/.cache/uv) -- but it must be created FRESH PER EXECUTION and
+        # removed afterwards, so ``execute`` owns it rather than this function.
+        #
+        # A shared HOME would be a channel between executions: the tests running in
+        # it are PR-controlled, so one PR could plant ambient config (a .npmrc, a
+        # pip.conf -- only Git configuration is neutralised below) for a later PR to
+        # pick up. Caching is not worth a cross-PR write channel.
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "CI": "1",
@@ -189,6 +199,91 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable")
     return (str(resolved), *words[1:]), env
+
+
+#: Components walked from MIMIR_HOME to the per-execution home parent. Each is
+#: opened no-follow relative to the previous descriptor, never as one pathname.
+_PROJECT_TEST_HOME_COMPONENTS: tuple[str, ...] = ("scratch", "project-test-homes")
+
+
+def _open_project_test_home_parent() -> tuple[int, Path]:
+    """Walk from MIMIR_HOME to the home parent, refusing a symlink at any depth.
+
+    Opening the parent by pathname with ``O_NOFOLLOW`` is not enough: the flag
+    applies only to the FINAL component. PR-controlled code can replace an
+    intermediate component -- ``<MIMIR_HOME>/scratch`` -- with a symlink whose
+    target contains a real ``project-test-homes`` directory, and then both
+    ``mkdir(parents=True)`` and ``os.open(parent, O_NOFOLLOW)`` succeed while
+    resolving outside the home. The descriptor and every HOME derived from it
+    would sit in attacker-chosen storage, restoring the cross-run ambient-state
+    channel this function exists to prevent.
+
+    So MIMIR_HOME is the trust anchor -- it is operator-configured and a mount
+    root, not something the tests can replace -- and every component below it is
+    opened relative to the previous descriptor with ``O_NOFOLLOW``. A symlink at
+    any depth fails with ELOOP rather than being followed.
+    """
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
+    root = Path(home).resolve()
+    parent = root
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise ProjectTestRefusal(
+            "test_cache_home_unavailable",
+            f"project test home root is not usable: {root}",
+        ) from exc
+    try:
+        for component in _PROJECT_TEST_HOME_COMPONENTS:
+            try:
+                os.mkdir(component, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ProjectTestRefusal(
+                    "test_cache_home_unavailable",
+                    f"project test home component is not creatable: {parent / component}",
+                ) from exc
+            try:
+                nested = os.open(
+                    component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd,
+                )
+            except OSError as exc:
+                # ELOOP here means the component is a symlink: refuse rather than
+                # follow it out of the home tree.
+                raise ProjectTestRefusal(
+                    "test_cache_home_unavailable",
+                    f"project test home component is not a real directory: {parent / component}",
+                ) from exc
+            os.close(fd)
+            fd = nested
+            parent = parent / component
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parent
+
+
+def _make_project_test_home(parent_fd: int, parent: Path) -> tuple[str, Path]:
+    """Create a fresh 0o700 home relative to *parent_fd*; never reuse a path."""
+    for _ in range(8):
+        name = f"run-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise ProjectTestRefusal(
+                "test_cache_home_unavailable",
+                f"project test home could not be created under {parent}",
+            ) from exc
+        return name, parent / name
+    raise ProjectTestRefusal(
+        "test_cache_home_unavailable",
+        f"project test home could not be created under {parent}",
+    )
 
 
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
@@ -266,6 +361,16 @@ class RepoProjectTests:
             raise ProjectTestRefusal(exc.code, str(exc)) from exc
         command, env = _configured_command()
         selected = _validated_selectors(root, selectors)
+        # Fresh HOME per execution, removed afterwards. mkdtemp creates a new
+        # 0o700 directory and fails rather than reusing an existing path, so a
+        # planted symlink cannot capture it.
+        parent_fd, parent = _open_project_test_home_parent()
+        try:
+            run_name, run_home = _make_project_test_home(parent_fd, parent)
+        except ProjectTestRefusal:
+            os.close(parent_fd)
+            raise
+        env["HOME"] = str(run_home)
         try:
             result = self._runner(
                 (*command, *selected), cwd=root, env=env.copy(),
@@ -273,6 +378,15 @@ class RepoProjectTests:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProjectTestRefusal("test_execution_failed", "configured test runner could not start") from exc
+        finally:
+            # Delete relative to the descriptor, never by pathname: rmtree(dir_fd=)
+            # resolves run_name inside the directory we created it in, so replacing
+            # the parent mid-run cannot redirect the deletion. A leaked directory
+            # costs disk, not isolation -- the next execution mints a new name.
+            try:
+                shutil.rmtree(run_name, dir_fd=parent_fd, ignore_errors=True)
+            finally:
+                os.close(parent_fd)
         if result.timed_out:
             return ProjectTestResult(False, "test_timeout", None)
         if result.output_limited:
