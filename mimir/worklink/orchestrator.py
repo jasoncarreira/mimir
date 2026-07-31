@@ -44,6 +44,8 @@ from .run_state import (
     WorklinkRunState,
     clear_run_state,
     load_run_state,
+    process_is_alive,
+    process_start_ticks,
     save_run_state,
 )
 from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
@@ -399,16 +401,56 @@ class WorklinkRunner:
         # Re-read immediately before claiming so retries in a long-lived caller do
         # not use stale comments and collide with prior attempt-scoped branches.
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
-        claim = claims.claim_issue(
-            issue.issue_id,
-            issue.comments,
-            labels=issue.labels,
-            max_active_locks=config.defaults.max_concurrent if autonomous else None,
-        )
+        predicted_attempt = claims.next_attempt(issue.comments)
+        claiming_state_written = False
+
+        def record_claiming() -> None:
+            nonlocal claiming_state_written
+            existing = load_run_state(self.home, issue.issue_id)
+            if existing is not None and process_is_alive(existing):
+                raise WorklinkError(f"live run state already exists for issue {issue.issue_id}")
+            save_run_state(
+                self.home,
+                WorklinkRunState(
+                    issue_id=issue.issue_id,
+                    attempt=predicted_attempt,
+                    backend=selected_name,
+                    compute_name=compute.name,
+                    handle_substrate="controller",
+                    handle_identifier=str(os.getpid()),
+                    branch="",
+                    base_ref=base,
+                    local_base=base,
+                    repo=str(self.repo),
+                    repo_url=repo_url,
+                    test_command=test_cmd,
+                    started_at=datetime.now(UTC).isoformat(),
+                    process_start_ticks=process_start_ticks(os.getpid()),
+                    phase="claiming",
+                ),
+            )
+            claiming_state_written = True
+
+        try:
+            claim = claims.claim_issue(
+                issue.issue_id,
+                issue.comments,
+                labels=issue.labels,
+                max_active_locks=config.defaults.max_concurrent if autonomous else None,
+                before_claim=record_claiming,
+            )
+        except Exception:
+            if claiming_state_written:
+                clear_run_state(self.home, issue.issue_id)
+            raise
         if claim.attempts_exhausted:
+            if claiming_state_written:
+                clear_run_state(self.home, issue.issue_id)
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
+            if claiming_state_written:
+                clear_run_state(self.home, issue.issue_id)
             _log_event(
                 "worklink_claim_failed",
                 issue_id=issue.issue_id,
@@ -501,12 +543,9 @@ class WorklinkRunner:
                 handle = None
                 try:
                     handle = await compute.launch(spec)
-                    # #561: persist the worker handle so a fresh controller can
-                    # reattach after a container restart. local_subprocess work dies
-                    # with the controller, so nothing is persisted today; the
-                    # reaper remains the recovery net. After #832 no live compute
-                    # substrate is persistent, so this branch is dormant.
-                    if compute.capabilities().persistent_after_disconnect:
+                    # Atomically replace the provisional controller record with
+                    # the real cancellable worker handle immediately after spawn.
+                    try:
                         _persist_run_state(
                             self.home,
                             issue=issue,
@@ -520,6 +559,14 @@ class WorklinkRunner:
                             test_command=test_cmd,
                             started_at=started,
                         )
+                    except OSError as exc:
+                        _log_event(
+                            "worklink_run_state_persist_failed",
+                            issue_id=issue.issue_id,
+                            error=str(exc),
+                        )
+                        await compute.cancel(handle)
+                        raise
                     return await _heartbeat_while(
                         compute.wait(handle, spec.timeout_s),
                         claims=claims,
@@ -1938,29 +1985,29 @@ def _persist_run_state(
 ) -> None:
     """Record the worker handle so a fresh controller can reattach (#561).
 
-    Best-effort: a persist failure must not abort an otherwise-healthy run — the
-    only cost is falling back to the TTL reaper if this run is later interrupted."""
-    try:
-        save_run_state(
-            home,
-            WorklinkRunState(
-                issue_id=issue.issue_id,
-                attempt=attempt,
-                backend=backend_name,
-                compute_name=compute.name,
-                handle_substrate=handle.substrate,
-                handle_identifier=handle.identifier,
-                branch=lease.branch,
-                base_ref=lease.base_ref,
-                local_base=lease.local_base or lease.base_ref,
-                repo=str(repo),
-                repo_url=repo_url or "",
-                test_command=test_command,
-                started_at=started_at.astimezone(UTC).isoformat(),
-            ),
-        )
-    except OSError as exc:
-        _log_event("worklink_run_state_persist_failed", issue_id=issue.issue_id, error=str(exc))
+    A failed write is fatal to this launch: the caller cancels the worker rather
+    than allowing a claimed run with no operator-visible liveness record."""
+    save_run_state(
+        home,
+        WorklinkRunState(
+            issue_id=issue.issue_id,
+            attempt=attempt,
+            backend=backend_name,
+            compute_name=compute.name,
+            handle_substrate=handle.substrate,
+            handle_identifier=handle.identifier,
+            branch=lease.branch,
+            base_ref=lease.base_ref,
+            local_base=lease.local_base or lease.base_ref,
+            repo=str(repo),
+            repo_url=repo_url or "",
+            test_command=test_command,
+            started_at=started_at.astimezone(UTC).isoformat(),
+            checkout=str(lease.path),
+            process_start_ticks=handle.process_start_ticks,
+            phase="spawned",
+        ),
+    )
 
 
 def _create_observation_worktree(

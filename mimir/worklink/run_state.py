@@ -1,31 +1,27 @@
-"""Durable Worklink run state for controller resume-after-restart (#561).
+"""Durable Worklink leaf-run state and process liveness helpers.
 
 The Worklink controller (``mimir worklink run``) is a *detached* subprocess the
 ready-queue poller spawns. It survives the poller's own exit, but a container
-restart (``docker restart`` / SIGTERM) kills it mid-run. Originally this module
-persisted the minimal handle a fresh controller needed to reattach to a
-surviving remote worker (docker_sibling / ecs-runtask); after the #832
-substrate cleanup local_subprocess is the only Worklink compute substrate, its
-runs die with the controller, and nothing is ever persisted.
-
-State files at ``<home>/state/worklink/runs/<issue_id>.json`` from older
-deployments are still readable so ``mimir worklink run --reattach`` and the
-startup reconcile keep working unchanged against them; the write path is
-inert.
+restart (``docker restart`` / SIGTERM) kills it mid-run. State now covers both
+the claim controller and the local worker so operators can distinguish a live
+run from stale Chainlink labels and safely cancel a verified process.
 
 State lives at ``<home>/state/worklink/runs/<issue_id>.json`` and is deleted on
-terminal completion, so a file present at startup means "a worker we may still
-be able to reattach to".
+terminal completion. Older version-1 files remain readable for the persistent
+worker reattach path.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+import errno
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-RUN_STATE_VERSION = 1
+RUN_STATE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -45,6 +41,9 @@ class WorklinkRunState:
     repo_url: str
     test_command: str | None
     started_at: str
+    checkout: str = ""
+    process_start_ticks: int | None = None
+    phase: str = "spawned"
     version: int = RUN_STATE_VERSION
 
     def to_json(self) -> dict[str, Any]:
@@ -68,6 +67,13 @@ class WorklinkRunState:
             repo_url=str(data.get("repo_url") or ""),
             test_command=(str(data["test_command"]) if data.get("test_command") else None),
             started_at=str(data["started_at"]),
+            checkout=str(data.get("checkout") or ""),
+            process_start_ticks=(
+                int(data["process_start_ticks"])
+                if data.get("process_start_ticks") is not None
+                else None
+            ),
+            phase=str(data.get("phase") or "spawned"),
             version=int(data.get("version") or RUN_STATE_VERSION),
         )
 
@@ -132,6 +138,76 @@ def list_run_states(home: Path) -> list[WorklinkRunState]:
         except (KeyError, TypeError, ValueError):
             continue
     return states
+
+
+def _process_stat(pid: int) -> tuple[str, int] | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # The comm field is parenthesized and may contain spaces or parentheses.
+        fields = stat[stat.rfind(")") + 2 :].split()
+        return fields[0], int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_start_ticks(pid: int) -> int | None:
+    """Read Linux's stable process birth marker (field 22 of ``/proc/PID/stat``)."""
+    observed = _process_stat(pid)
+    return observed[1] if observed is not None else None
+
+
+def process_is_zombie(pid: int) -> bool:
+    observed = _process_stat(pid)
+    return observed is not None and observed[0] == "Z"
+
+
+def process_is_alive(state: WorklinkRunState) -> bool:
+    """Probe a recorded local process without shelling out to ``ps``.
+
+    Permission errors mean the process exists. A start-tick mismatch is dead for
+    this run even though the reused PID itself is alive.
+    """
+    try:
+        pid = int(state.handle_identifier)
+    except ValueError:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.EPERM:
+            return True
+        return False
+    if process_is_zombie(pid):
+        return False
+    if state.process_start_ticks is None:
+        return True
+    observed = process_start_ticks(pid)
+    return observed is not None and observed == state.process_start_ticks
+
+
+def process_identity_verified(state: WorklinkRunState) -> bool:
+    """Whether it is safe to signal the PID recorded by ``state``."""
+    if state.compute_name != "local_subprocess" or state.process_start_ticks is None:
+        return False
+    try:
+        pid = int(state.handle_identifier)
+    except ValueError:
+        return False
+    return process_start_ticks(pid) == state.process_start_ticks and process_is_alive(state)
+
+
+def elapsed_seconds(state: WorklinkRunState, *, now: datetime | None = None) -> float:
+    try:
+        started = datetime.fromisoformat(state.started_at)
+    except ValueError:
+        return 0.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return max(0.0, ((now or datetime.now(UTC)) - started.astimezone(UTC)).total_seconds())
 
 
 def reattach_dispatch_argv(run_bin: list[str], home: Path, repo: str, issue_id: int) -> list[str]:

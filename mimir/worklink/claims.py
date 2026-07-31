@@ -330,6 +330,7 @@ class ChainlinkClaims:
         labels: Iterable[str] | None = None,
         home_path: str | Path | None = None,
         max_active_locks: int | None = None,
+        before_claim: Callable[[], None] | None = None,
     ) -> ClaimResult:
         """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
 
@@ -365,7 +366,9 @@ class ChainlinkClaims:
             return ClaimResult(False, reason="review_ready_evidence_exists")
 
         claim_home = Path(home_path) if home_path is not None else self.home_path
-        lock = self._claim_lock_with_retry(issue_id, home_path=claim_home)
+        lock = self._claim_lock_with_retry(
+            issue_id, home_path=claim_home, before_claim=before_claim
+        )
         if lock.returncode != 0:
             if _is_git_contention(lock):
                 return ClaimResult(False, reason="claim_contention_exhausted")
@@ -444,7 +447,11 @@ class ChainlinkClaims:
         return ClaimResult(True, record=record)
 
     def _claim_lock_with_retry(
-        self, issue_id: int, *, home_path: Path | None
+        self,
+        issue_id: int,
+        *,
+        home_path: Path | None,
+        before_claim: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run only the Chainlink claim under the shared-worktree mutex."""
         lock_path: Path | None = None
@@ -468,11 +475,15 @@ class ChainlinkClaims:
         result: subprocess.CompletedProcess[str] | None = None
         for attempt in range(1, self.contention_max_attempts + 1):
             if lock_path is None:
+                if attempt == 1 and before_claim is not None:
+                    before_claim()
                 result = self._run("locks", "claim", str(issue_id), check=False)
             else:
                 with lock_path.open("a", encoding="utf-8") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                     try:
+                        if attempt == 1 and before_claim is not None:
+                            before_claim()
                         result = self._run("locks", "claim", str(issue_id), check=False)
                     finally:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

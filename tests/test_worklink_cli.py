@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime, timedelta
+import json
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 
 import pytest
 
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
+from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink.run_state import WorklinkRunState, load_run_state, process_start_ticks, save_run_state
 
 
 def test_worklink_run_cli_dispatches_operator_vertical(
@@ -182,3 +190,154 @@ def test_worklink_run_failed_without_attempt_prints_reason(
 
     assert exc.value.code == 1
     assert "worklink #529 attempt None: failed — claim_failed: lock held" in capsys.readouterr().out
+
+
+def _state(
+    home: Path,
+    issue_id: int,
+    pid: int,
+    *,
+    ticks: int | None,
+    started_at: datetime,
+) -> WorklinkRunState:
+    state = WorklinkRunState(
+        issue_id=issue_id,
+        attempt=2,
+        backend="opencode",
+        compute_name="local_subprocess",
+        handle_substrate="local_subprocess",
+        handle_identifier=str(pid),
+        branch=f"issue/{issue_id}-a2",
+        base_ref="main",
+        local_base="main",
+        repo="/repo",
+        repo_url="",
+        test_command="pytest",
+        started_at=started_at.isoformat(),
+        checkout=f"/repo/.worklink/{issue_id}-2",
+        process_start_ticks=ticks,
+    )
+    save_run_state(home, state)
+    return state
+
+
+def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    _state(
+        tmp_path,
+        1,
+        os.getpid(),
+        ticks=process_start_ticks(os.getpid()),
+        started_at=now - timedelta(minutes=2),
+    )
+    _state(tmp_path, 2, 999_999_999, ticks=1, started_at=now - timedelta(minutes=3))
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        payload = [
+            {"id": 1, "labels": ["worklink:in-progress"]},
+            {"id": 2, "labels": ["worklink:ready"]},
+            {"id": 3, "labels": ["worklink:in-progress"]},
+            {"id": 4, "labels": ["worklink:ready"]},
+        ]
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+
+    rows = worklink_status(tmp_path, runner=runner, now=now)
+    assert {row.issue_id: row.classification for row in rows} == {
+        1: "running",
+        2: "orphaned",
+        3: "unrecorded",
+        4: "clean",
+    }
+    assert rows[0].elapsed_s == 120
+    assert rows[1].disagreement == "run state present but worklink:in-progress label absent"
+    assert rows[2].disagreement == "worklink:in-progress label present but run state absent"
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_stop_clears_state_claim_and_label_and_missing_is_noop(tmp_path: Path) -> None:
+    # A verified stop requires Linux's stable process birth marker from /proc.
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    try:
+        ticks = process_start_ticks(proc.pid)
+        assert ticks is not None
+        _state(tmp_path, 7, proc.pid, ticks=ticks, started_at=datetime.now(UTC))
+        result = stop_worklink(tmp_path, 7, runner=runner)
+        assert result.stopped
+        assert result.state_cleared and result.claim_released and result.label_cleared
+        assert load_run_state(tmp_path, 7) is None
+        assert ["chainlink", "locks", "release", "7"] in calls
+        assert ["chainlink", "issue", "unlabel", "7", "worklink:in-progress"] in calls
+
+        calls.clear()
+        missing = stop_worklink(tmp_path, 8, runner=runner)
+        assert not missing.stopped and missing.reason == "no live run"
+        assert calls == []
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_stop_refuses_reused_pid_without_mutation(tmp_path: Path) -> None:
+    # PID-reuse refusal depends on comparing Linux /proc process birth markers.
+    calls: list[list[str]] = []
+    _state(
+        tmp_path,
+        9,
+        os.getpid(),
+        ticks=(process_start_ticks(os.getpid()) or 0) + 1,
+        started_at=datetime.now(UTC),
+    )
+
+    result = stop_worklink(
+        tmp_path,
+        9,
+        runner=lambda args: (
+            calls.append(list(args))
+            or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        ),
+    )
+
+    assert not result.stopped
+    assert result.reason == "no live run"
+    assert calls == []
+    assert load_run_state(tmp_path, 9) is not None
+
+
+def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    _state(
+        tmp_path,
+        10,
+        os.getpid(),
+        ticks=process_start_ticks(os.getpid()),
+        started_at=now,
+    )
+    _state(tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90))
+    events: list[tuple[str, dict[str, object]]] = []
+
+    alive = reconcile_run_states(
+        tmp_path,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    assert [state.issue_id for state in alive] == [10]
+    assert load_run_state(tmp_path, 10) is not None
+    assert load_run_state(tmp_path, 11) is None
+    assert events == [
+        (
+            "worklink_run_orphaned",
+            {"issue_id": 11, "attempt": 2, "elapsed_s": 90.0, "reaped": True},
+        )
+    ]

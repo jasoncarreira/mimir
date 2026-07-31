@@ -595,7 +595,7 @@ def test_run_persists_state_for_persistent_compute_then_clears(tmp_path: Path) -
     assert load_run_state(tmp_path, issue_id) is None
 
 
-def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
+def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 442
@@ -661,8 +661,10 @@ def test_run_does_not_persist_state_for_local_compute(tmp_path: Path) -> None:
     )
 
     assert result.status == "completed", (result.reason, calls)
-    # Local work dies with the controller -> nothing is ever persisted.
-    assert seen["during"] is None
+    during = seen["during"]
+    assert isinstance(during, WorklinkRunState)
+    assert during.compute_name == "fake_local"
+    assert during.checkout == str(worktree)
     assert load_run_state(tmp_path, issue_id) is None
 
 
