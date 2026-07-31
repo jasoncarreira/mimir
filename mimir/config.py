@@ -1027,6 +1027,13 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
+        if "MIMIR_FILE_OP_ROOTS" in os.environ:
+            log.warning(
+                "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "
+                "roots to MIMIR_FILE_TOOL_ROOTS as /absolute/path:ro or "
+                "/absolute/path:rw entries, then remove MIMIR_FILE_OP_ROOTS from "
+                "the deployment"
+            )
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
