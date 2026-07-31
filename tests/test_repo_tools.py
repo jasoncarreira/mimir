@@ -985,19 +985,35 @@ def test_project_test_parent_swap_during_run_cannot_delete_outside_tree(
     assert treasure.read_text(encoding="utf-8") == "must survive\n"
 
 
-def test_project_test_refuses_symlinked_home_parent(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("depth", ["scratch", "project-test-homes"])
+def test_project_test_refuses_symlinked_ancestor_at_any_depth(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: str,
 ) -> None:
-    """A symlinked parent could redirect every HOME outside the home tree."""
+    """A symlink at ANY component below MIMIR_HOME must refuse, not be followed.
+
+    O_NOFOLLOW guards only the final component, so a symlink planted at the
+    intermediate ``scratch`` level -- with a real ``project-test-homes`` inside the
+    target -- would otherwise be followed by both mkdir(parents=True) and
+    os.open(parent, O_NOFOLLOW), placing HOME outside the home tree and restoring
+    the cross-run ambient-state channel.
+    """
     _origin, _source, _scope, state, _tools = repo_tools
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    scratch = home / "scratch"
-    scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / "project-test-homes").symlink_to(elsewhere, target_is_directory=True)
+
+    outside = tmp_path / "outside"
+    if depth == "scratch":
+        # The target contains a REAL final component, so a final-component-only
+        # check would succeed here.
+        (outside / "project-test-homes").mkdir(parents=True)
+        (home / "scratch").symlink_to(outside, target_is_directory=True)
+    else:
+        outside.mkdir()
+        (home / "scratch").mkdir(parents=True, exist_ok=True)
+        (home / "scratch" / "project-test-homes").symlink_to(
+            outside, target_is_directory=True,
+        )
 
     def runner(argv, *, cwd, env, timeout, output_limit):  # pragma: no cover
         raise AssertionError("runner must not be reached")
@@ -1005,6 +1021,8 @@ def test_project_test_refuses_symlinked_home_parent(
     with pytest.raises(ProjectTestRefusal) as refusal:
         RepoProjectTests(state, runner=runner).execute(())
     assert refusal.value.code == "test_cache_home_unavailable"
+    # Nothing may have been created through the symlink.
+    assert not any(outside.rglob("run-*")), "an execution home was created outside the home tree"
 
 
 def test_project_test_failure_is_actionable_and_output_is_scrubbed(

@@ -201,32 +201,69 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
     return (str(resolved), *words[1:]), env
 
 
-def _open_project_test_home_parent() -> tuple[int, Path]:
-    """Open the per-execution home parent, returning a descriptor and its path.
+#: Components walked from MIMIR_HOME to the per-execution home parent. Each is
+#: opened no-follow relative to the previous descriptor, never as one pathname.
+_PROJECT_TEST_HOME_COMPONENTS: tuple[str, ...] = ("scratch", "project-test-homes")
 
-    The descriptor is the point. Validating the parent by pathname and then
-    cleaning up by pathname is a time-of-check/time-of-use gap: the tests running
-    inside the home are PR-controlled, so between creation and cleanup they can
-    replace the parent directory with a symlink, and a later pathname-based
-    ``rmtree`` would resolve through the swap and delete a matching tree outside
-    the home. Holding a descriptor means every subsequent operation is relative to
-    the directory we actually created in, so a swapped pathname is irrelevant.
+
+def _open_project_test_home_parent() -> tuple[int, Path]:
+    """Walk from MIMIR_HOME to the home parent, refusing a symlink at any depth.
+
+    Opening the parent by pathname with ``O_NOFOLLOW`` is not enough: the flag
+    applies only to the FINAL component. PR-controlled code can replace an
+    intermediate component -- ``<MIMIR_HOME>/scratch`` -- with a symlink whose
+    target contains a real ``project-test-homes`` directory, and then both
+    ``mkdir(parents=True)`` and ``os.open(parent, O_NOFOLLOW)`` succeed while
+    resolving outside the home. The descriptor and every HOME derived from it
+    would sit in attacker-chosen storage, restoring the cross-run ambient-state
+    channel this function exists to prevent.
+
+    So MIMIR_HOME is the trust anchor -- it is operator-configured and a mount
+    root, not something the tests can replace -- and every component below it is
+    opened relative to the previous descriptor with ``O_NOFOLLOW``. A symlink at
+    any depth fails with ELOOP rather than being followed.
     """
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
-    parent = Path(home).resolve() / "scratch" / "project-test-homes"
+    root = Path(home).resolve()
+    parent = root
     try:
-        parent.mkdir(parents=True, exist_ok=True)
-        # O_NOFOLLOW refuses to open the parent at all if it is a symlink, so a
-        # parent planted before this call cannot redirect the home either.
-        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
         raise ProjectTestRefusal(
             "test_cache_home_unavailable",
-            f"project test home parent is not usable: {parent}",
+            f"project test home root is not usable: {root}",
         ) from exc
-    return parent_fd, parent
+    try:
+        for component in _PROJECT_TEST_HOME_COMPONENTS:
+            try:
+                os.mkdir(component, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ProjectTestRefusal(
+                    "test_cache_home_unavailable",
+                    f"project test home component is not creatable: {parent / component}",
+                ) from exc
+            try:
+                nested = os.open(
+                    component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd,
+                )
+            except OSError as exc:
+                # ELOOP here means the component is a symlink: refuse rather than
+                # follow it out of the home tree.
+                raise ProjectTestRefusal(
+                    "test_cache_home_unavailable",
+                    f"project test home component is not a real directory: {parent / component}",
+                ) from exc
+            os.close(fd)
+            fd = nested
+            parent = parent / component
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parent
 
 
 def _make_project_test_home(parent_fd: int, parent: Path) -> tuple[str, Path]:
