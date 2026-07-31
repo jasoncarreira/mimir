@@ -3638,7 +3638,8 @@ class SinkGate:
             return False, None
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return (
-                tool_name == "worklink_run" and not has_untrusted_active_ingest,
+                tool_name in {"worklink_run", "repo_test"}
+                and not has_untrusted_active_ingest,
                 None,
             )
         if capability_tier is CapabilityTier.UNBOUNDED:

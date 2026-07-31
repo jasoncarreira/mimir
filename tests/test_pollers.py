@@ -36,6 +36,7 @@ from mimir.pollers import (
     _circuit_breakers,
     _github_author_is_trusted,
     _github_content_author,
+    _github_framework_trigger_is_trusted,
     _parse_poller_authority,
     discover_pollers,
     run_poller,
@@ -1445,6 +1446,118 @@ def test_github_content_author_uses_api_and_ignores_payload_claim(
 
     assert author == "api-attested-author"
     assert calls == ["repos/acme/widget/issues/comments/123"]
+
+
+def test_github_framework_trigger_trust_requires_matching_live_self_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = {
+        "event_type": "pr_changes_requested_stale",
+        "repo": "acme/widget",
+        "number": 11,
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "mimir-bot",
+        "head_repo": "acme/widget",
+        "head_remote": "origin",
+        "head_ref": "worklink/11",
+        "head_sha": "a" * 40,
+        "base_ref": "main",
+        "base_sha": "b" * 40,
+    }
+    live = {
+        "state": "open",
+        "number": 11,
+        "html_url": item["url"],
+        "user": {"login": "mimir-bot"},
+        "head": {
+            "ref": "worklink/11", "sha": "a" * 40,
+            "repo": {"full_name": "acme/widget"},
+        },
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+    monkeypatch.setattr(
+        "mimir.pollers._github_api_attestation",
+        lambda endpoint, token: (
+            (200, live)
+            if endpoint == "repos/acme/widget/pulls/11" and token == "server-token"
+            else None
+        ),
+    )
+
+    assert _github_framework_trigger_is_trusted(
+        "acme/widget", item, "server-token", "mimir-bot",
+    ) is True
+    assert _github_framework_trigger_is_trusted(
+        "acme/widget", {**item, "head_sha": "c" * 40},
+        "server-token", "mimir-bot",
+    ) is False
+    assert _github_framework_trigger_is_trusted(
+        "acme/widget", {**item, "event_type": "pr_opened"},
+        "server-token", "mimir-bot",
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_live_self_remediation_trigger_is_labeled_trusted(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    item = {
+        "poller": "x",
+        "prompt": "Framework remediation trigger",
+        "event_type": "pr_changes_requested_stale",
+        "repo": "acme/widget",
+        "number": 11,
+        "url": "https://github.com/acme/widget/pull/11",
+        "author": "mimir-bot",
+        "head_repo": "acme/widget",
+        "head_remote": "origin",
+        "head_ref": "worklink/11",
+        "head_sha": "a" * 40,
+        "base_ref": "main",
+        "base_sha": "b" * 40,
+    }
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({item!r}))
+""")
+    live = {
+        "state": "open", "number": 11, "html_url": item["url"],
+        "user": {"login": "mimir-bot"},
+        "head": {
+            "ref": "worklink/11", "sha": "a" * 40,
+            "repo": {"full_name": "acme/widget"},
+        },
+        "base": {"ref": "main", "sha": "b" * 40},
+    }
+    monkeypatch.setattr(
+        "mimir.pollers._github_api_attestation",
+        lambda _endpoint, _token: (200, live),
+    )
+    monkeypatch.setattr(
+        "mimir.pollers._github_content_author",
+        lambda *_args: pytest.fail("framework trigger fell through to content trust"),
+    )
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={
+            "GITHUB_TOKEN": "server-token",
+            "MIMIR_GITHUB_SELF_LOGIN": "mimir-bot",
+        },
+        skill_dir=skill_dir, trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+
+    await run_poller(cfg, enqueue=enq)
+
+    labels = enq.events[0].ifc_labels
+    assert labels is not None
+    assert labels.has_untrusted_active_ingest is False
+    assert {(source.integrity, source.integrity_effect) for source in labels.sources} == {
+        ("trusted", "active_ingest"),
+    }
 
 
 @pytest.mark.asyncio
