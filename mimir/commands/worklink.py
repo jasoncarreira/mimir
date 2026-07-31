@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 
+from ..worklink.control import stop_worklink, worklink_status
 from ..worklink.orchestrator import (
     LeafValidationError,
     WorklinkError,
@@ -28,6 +29,14 @@ def add_argparse(
     run_p.add_argument(
         "--backend", default=None, help="Backend name (default: route from worklink.yaml)."
     )
+
+    status_p = worklink_sub.add_parser("status", help="List and classify leaf Worklink runs.")
+    status_p.add_argument("issue_ids", type=int, nargs="*", help="Optional issue ids to inspect.")
+    status_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+
+    stop_p = worklink_sub.add_parser("stop", help="Safely stop one live leaf Worklink run.")
+    stop_p.add_argument("issue_id", type=int, help="Chainlink issue id to stop.")
+    stop_p.add_argument("--home", type=Path, default=None, help="Agent home.")
     run_p.add_argument(
         "--dry-run",
         action="store_true",
@@ -107,6 +116,12 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.worklink_action == "run-epic":
         return _run_epic(args, parser)
 
+    if args.worklink_action == "status":
+        return _status(args)
+
+    if args.worklink_action == "stop":
+        return _stop(args)
+
     if args.worklink_action != "run":
         parser.print_help()
         return 1
@@ -168,6 +183,54 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if result.evidence_path:
         print(f"evidence: {result.evidence_path}")
     return 0 if result.status in {"completed", "blocked"} else 1
+
+
+def _status(args: argparse.Namespace) -> int:
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    try:
+        rows = worklink_status(home, issue_ids=args.issue_ids)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("No Worklink leaf runs or labeled issues.")
+        return 0
+    print("ISSUE  STATE       ATTEMPT  BACKEND           BRANCH                    CHECKOUT  ELAPSED")
+    for row in rows:
+        state = row.state
+        elapsed = _format_elapsed(row.elapsed_s) if row.elapsed_s is not None else "-"
+        print(
+            f"{row.issue_id:<6} {row.classification:<11} "
+            f"{str(state.attempt if state else '-'):<8} "
+            f"{(state.backend if state else '-'):<17} "
+            f"{(state.branch if state else '-'):<25} "
+            f"{(state.checkout if state and state.checkout else '-'):<9} {elapsed}"
+        )
+        if row.disagreement:
+            print(f"  disagreement: {row.disagreement}")
+    return 0
+
+
+def _stop(args: argparse.Namespace) -> int:
+    home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    result = stop_worklink(home, args.issue_id)
+    if not result.stopped:
+        print(f"worklink #{args.issue_id}: nothing stopped ({result.reason})")
+        return 1
+    print(
+        f"worklink #{args.issue_id}: stopped; "
+        f"state={'cleared' if result.state_cleared else 'unchanged'}, "
+        f"claim={'released' if result.claim_released else 'unchanged'}, "
+        f"in-progress label={'cleared' if result.label_cleared else 'unchanged'}"
+    )
+    return 0
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"
 
 
 def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

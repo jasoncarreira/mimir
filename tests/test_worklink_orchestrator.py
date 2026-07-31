@@ -22,7 +22,7 @@ from mimir.worklink.backends import (
 from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
-from mimir.worklink.compute import WorkSpec
+from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.orchestrator import (
     IssueContext,
@@ -41,30 +41,30 @@ class FakeCompute:
     def __init__(self, *, shared_filesystem: bool = False) -> None:
         self.shared_filesystem = shared_filesystem
         self.specs: list[WorkSpec] = []
-        self.cleaned: list[WorkSpec] = []
+        self.cleaned: list[LaunchHandle] = []
 
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(self.shared_filesystem, False, True, False)
 
-    async def launch(self, spec: WorkSpec) -> WorkSpec:
+    async def launch(self, spec: WorkSpec) -> LaunchHandle:
         self.specs.append(spec)
-        return spec
+        return LaunchHandle(self.name, f"job-{len(self.specs)}")
 
-    async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         return ComputeResult(exit_code=0, stdout="ok", stderr="")
 
-    async def logs(self, handle: WorkSpec) -> str:
+    async def logs(self, handle: LaunchHandle) -> str:
         return ""
 
-    async def cancel(self, handle: WorkSpec) -> None:
+    async def cancel(self, handle: LaunchHandle) -> None:
         return None
 
-    async def cleanup(self, handle: WorkSpec) -> None:
+    async def cleanup(self, handle: LaunchHandle) -> None:
         self.cleaned.append(handle)
 
 
 class SlowTestCompute(FakeCompute):
-    async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         await asyncio.sleep(0)
         return ComputeResult(exit_code=0, stdout="tests ok", stderr="")
 
@@ -216,7 +216,7 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.specs[0].test_command == "echo ok"
     assert compute.specs[0].local_checkout == worktree
     assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
-    assert compute.cleaned == [compute.specs[0]]
+    assert compute.cleaned == [LaunchHandle("fake_compute", "job-1")]
 
 
 def cp(
@@ -1508,12 +1508,13 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
             super().__init__(**kwargs)
             self.waited: tuple[object, int] | None = None
 
-        async def wait(self, handle: WorkSpec, timeout_s: int) -> ComputeResult:
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
             self.waited = (handle, timeout_s)
+            spec = self.specs[-1]
             # The factory namespaces run.json under .opencode/factory/<run-id>/
             # (run-id = chainlink-<issue_id>) inside its ``--repo`` worktree.
             factory_run = (
-                handle.local_checkout / ".opencode" / "factory" / "chainlink-700" / "run.json"
+                spec.local_checkout / ".opencode" / "factory" / "chainlink-700" / "run.json"
             )
             factory_run.parent.mkdir(parents=True, exist_ok=True)
             factory_run.write_text(
@@ -1584,7 +1585,7 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     assert compute.specs, "compute.launch was never called"
     assert compute.waited is not None, "compute.wait was never reached"
     handle, waited_timeout = compute.waited
-    assert handle is compute.specs[0], "wait() did not receive the launch handle"
+    assert handle == LaunchHandle("fake_compute", "job-1")
     assert waited_timeout == compute.specs[0].timeout_s
 
 

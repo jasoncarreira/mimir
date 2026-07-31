@@ -703,14 +703,9 @@ def reattach_inflight_worklink_runs(
 ) -> list[int]:
     """Startup reconcile (#561): resume Worklink runs orphaned by a restart.
 
-    After the #832 substrate cleanup local_subprocess is the only Worklink
-    compute substrate and its runs die with the controller, so no run state is
-    ever persisted. This function therefore no-ops in production today; it
-    remains so a stale run-state file from a pre-#832 deployment (docker-sibling
-    / ecs-runtask) still triggers the same detached ``mimir worklink run <id>
-    --reattach`` resume — which ``WorklinkRunner.reattach`` then declines with
-    ``reattach: no run state`` (the state file was cleared once the resumed
-    run reached a terminal state on the prior container).
+    Dead local workers are reaped and reported. Persistent worker records from
+    older deployments retain the detached ``mimir worklink run <id> --reattach``
+    recovery path.
 
     Gated on ``WORKLINK_REPO`` (the same env the ready-queue poller needs); no-op
     on non-Worklink homes. Best-effort and non-blocking: each resume runs
@@ -719,19 +714,28 @@ def reattach_inflight_worklink_runs(
     import shlex
     import subprocess
 
-    from .worklink.run_state import list_run_states, reattach_dispatch_argv
+    from .event_logger import log_event_sync
+    from .worklink.control import reconcile_run_states
+    from .worklink.run_state import reattach_dispatch_argv
 
     spawn = popen or subprocess.Popen
+    # Local workers cannot survive a restart. Reap their records first, even on
+    # homes without a configured reattach repository; malformed records emit an
+    # event and never abort startup.
+    states = reconcile_run_states(home, event_logger=log_event_sync)
     repo = os.environ.get("WORKLINK_REPO")
     if not repo:
         return []
-    states = list_run_states(home)
     if not states:
         return []
     run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
     state_dir = home / "state" / "worklink" / "runs"
     dispatched: list[int] = []
     for state in states:
+        if state.compute_name == "local_subprocess":
+            # A live local worker already has its original controller; unlike a
+            # persistent remote substrate it cannot be reattached by a new one.
+            continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:

@@ -62,6 +62,7 @@ class LaunchHandle:
 
     substrate: str
     identifier: str
+    process_start_ticks: int | None = None
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,13 @@ class LocalSubprocessComputeBackend:
             )
         except OSError as exc:
             raise ComputeLaunchError(str(exc)) from exc
-        handle = LaunchHandle(self.name, str(getattr(proc, "pid", "unknown")))
+        pid = getattr(proc, "pid", None)
+        start_ticks = None
+        if isinstance(pid, int):
+            from .run_state import process_start_ticks
+
+            start_ticks = process_start_ticks(pid)
+        handle = LaunchHandle(self.name, str(pid if pid is not None else "unknown"), start_ticks)
         self._jobs[handle.identifier] = (proc, spec, command)
         return handle
 
@@ -289,7 +296,10 @@ class LocalSubprocessComputeBackend:
         return getattr(proc, "returncode", 0) is None
 
     async def cancel(self, handle: LaunchHandle) -> None:
-        proc, _spec, _command = self._job(handle)
+        try:
+            proc, _spec, _command = self._job(handle)
+        except KeyError:
+            proc = _verified_external_process(handle, self.name)
         await _kill_process_group(proc)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
@@ -299,6 +309,38 @@ class LocalSubprocessComputeBackend:
         if handle.substrate != self.name or handle.identifier not in self._jobs:
             raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
         return self._jobs[handle.identifier]
+
+
+class _ExternalProcess:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    async def wait(self) -> None:
+        while True:
+            from .run_state import process_is_zombie
+
+            if process_is_zombie(self.pid):
+                return
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                return
+            await asyncio.sleep(0.05)
+
+
+def _verified_external_process(handle: LaunchHandle, substrate: str) -> _ExternalProcess:
+    """Reconstruct a local handle only when its PID birth marker still matches."""
+    if handle.substrate != substrate or handle.process_start_ticks is None:
+        raise KeyError(f"unknown {substrate} handle: {handle.identifier}")
+    try:
+        pid = int(handle.identifier)
+    except ValueError as exc:
+        raise KeyError(f"invalid {substrate} pid: {handle.identifier}") from exc
+    from .run_state import process_start_ticks
+
+    if process_start_ticks(pid) != handle.process_start_ticks:
+        raise RuntimeError("refusing to cancel: recorded process identity no longer matches")
+    return _ExternalProcess(pid)
 
 
 async def _kill_process_group(proc: object) -> None:
