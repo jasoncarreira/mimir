@@ -2063,6 +2063,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
         str(maintenance_pinned_executables["git"]), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks",
         "log", "--oneline", "--no-ext-diff", "--no-textconv",
     ]
@@ -3981,6 +3982,123 @@ def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
     assert decision.allowed is True, decision.reason
 
 
+@pytest.mark.parametrize(
+    ("command", "subcommand", "safety_options"),
+    [
+        ("git grep -n pattern -- tests/x.py", "grep", ["--no-textconv"]),
+        ("git blame mimir/agent.py", "blame", ["--no-textconv"]),
+        ("git merge-base main HEAD", "merge-base", []),
+        ("git rev-list --count HEAD", "rev-list", []),
+    ],
+)
+def test_repo_review_git_admits_named_inspection_shapes_with_hardened_argv(
+    command: str,
+    subcommand: str,
+    safety_options: list[str],
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    argv = parse_service_shell_argv(command, "repo_review")
+
+    assert argv is not None
+    assert argv[:3] == [
+        str(maintenance_pinned_executables["git"]), "-C", str(Path.cwd().resolve()),
+    ]
+    assert ["-c", "core.hooksPath=/dev/null"] == argv[5:7]
+    assert "credential.helper=" in argv
+    assert "protocol.allow=never" in argv
+    assert "--no-pager" in argv
+    assert "--no-optional-locks" in argv
+    subcommand_index = argv.index(subcommand)
+    assert argv[subcommand_index + 1:subcommand_index + 1 + len(safety_options)] == safety_options
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git grep --textconv pattern -- tests/x.py",
+        "git grep --open-files-in-pager pattern",
+        "git blame --contents /tmp/attacker mimir/agent.py",
+        "git blame --incremental mimir/agent.py",
+        "git merge-base --octopus main HEAD topic",
+        "git rev-list --count --all",
+        "git rev-list --count HEAD --output=/tmp/count",
+    ],
+)
+def test_repo_review_git_retains_execution_and_write_capable_refusals(
+    command: str,
+) -> None:
+    argv, reason = parse_service_shell_argv_with_reason(command, "repo_review")
+
+    assert argv is None
+    assert "Admitted inspection alternatives include" in reason
+    assert "Git forms that can execute, write output, contact a remote" in reason
+    assert "git grep" in reason
+    assert "git blame" in reason
+    assert "git merge-base" in reason
+    assert "git rev-list --count" in reason
+
+
+def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    repo = tmp_path / "repo"
+    home = tmp_path / "home"
+    repo.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    sample = repo / "sample.txt"
+    sample.write_text("pattern\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "sample.txt diff=hostile filter=hostile\n", encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=test",
+            "-c", "user.email=test@example.com", "commit", "-qm", "initial",
+        ],
+        check=True,
+    )
+
+    marker = tmp_path / "helper-fired"
+    helper = tmp_path / "helper.sh"
+    helper.write_text(
+        f"#!/bin/sh\nprintf fired >> {marker}\nexit 0\n", encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    for key in (
+        "core.fsmonitor", "core.pager", "diff.external", "diff.hostile.textconv",
+        "filter.hostile.clean", "filter.hostile.smudge", "filter.hostile.process",
+    ):
+        subprocess.run(
+            ["git", "-C", str(repo), "config", key, str(helper)], check=True,
+        )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    state = _review_state("o/r", 1071, "worklink/1071", str(repo.resolve()))
+
+    for command in (
+        "git grep -n pattern -- sample.txt",
+        "git blame sample.txt",
+        "git merge-base HEAD HEAD",
+        "git rev-list --count HEAD",
+    ):
+        argv = parse_service_shell_argv(command, "repo_review", review_state=state)
+        assert argv is not None, command
+        subprocess.run(
+            argv,
+            cwd=tmp_path,
+            env={**os.environ, "GIT_PAGER": str(helper)},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert marker.exists() is False
+
+
 def test_repo_review_shell_profile_admits_pr_view_repo_alias(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
@@ -4811,6 +4929,7 @@ def test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized(
         "-C", str(worktree.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", "diff", "--cached",
         "--no-ext-diff", "--no-textconv",
     ]
@@ -5970,6 +6089,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
         str(pinned_git), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", subcommand, *arguments,
         *(
             ["--no-ext-diff", "--no-textconv"]
@@ -6000,6 +6120,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
         str(maintenance_pinned_executables["git"]), "-C", str(nested.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks",
         "log", "--oneline", "-5", "--no-ext-diff", "--no-textconv",
     ]
@@ -6011,6 +6132,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
         str(maintenance_pinned_executables["git"]), "-C", str(state.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", "status", "--short",
     ]
 

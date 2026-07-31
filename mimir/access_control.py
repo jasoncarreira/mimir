@@ -1647,11 +1647,11 @@ def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
 
 
 def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
-    """Return hardened argv for the branch-scoped Git mutation allow-list."""
+    """Return hardened argv for repo inspection or branch-scoped mutation."""
     if not argv or argv[0] != "git":
         return None
     if argv[1:2] == ["-C"]:
-        if len(argv) < 4:
+        if state is None or len(argv) < 4:
             return None
         try:
             if Path(argv[2]).resolve() != Path(state.root).resolve():
@@ -1665,7 +1665,7 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         arguments = argv[2:]
     else:
         return None
-    branch = state.head_ref
+    arguments = list(arguments)
     required_action = {
         "checkout": RepoPRAction.CHECKOUT,
         "add": RepoPRAction.WRITE,
@@ -1674,8 +1674,11 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
         "pull": RepoPRAction.CHECKOUT,
         "push": RepoPRAction.PUSH,
     }.get(subcommand, RepoPRAction.INSPECT)
-    if not _repo_review_action_allowed(state, required_action):
+    if state is not None and not _repo_review_action_allowed(state, required_action):
         return None
+    if state is None and required_action is not RepoPRAction.INSPECT:
+        return None
+    branch = getattr(state, "head_ref", "")
     if subcommand == "status":
         allowed = (
             all(argument.startswith("-") and argument != "--" for argument in arguments)
@@ -1742,12 +1745,18 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     git = _maintenance_resolved_pin("git")
     if git is None:
         return None
-    filter_overrides = _maintenance_git_filter_overrides(Path(state.root), str(git))
+    root = Path(state.root).resolve() if state is not None else Path.cwd().resolve()
+    filter_overrides = _maintenance_git_filter_overrides(root, str(git))
     if filter_overrides is None:
         return None
     transport_overrides = (
         ["-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]
         if subcommand == "push"
+        else []
+    )
+    credential_overrides = (
+        ["-c", "credential.helper="]
+        if required_action is RepoPRAction.INSPECT
         else []
     )
     identity_overrides: list[str] = []
@@ -1758,16 +1767,20 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
             "-c", f"user.name={DEFAULT_USER_NAME}",
             "-c", f"user.email={DEFAULT_USER_EMAIL}",
         ]
+    safety_options: list[str] = []
+    if subcommand in {"diff", "log", "show"}:
+        safety_options = ["--no-ext-diff", "--no-textconv"]
+    elif subcommand in {"blame", "grep"}:
+        safety_options = ["--no-textconv"]
     execution_argv = [
-        str(git), "-C", state.root,
+        str(git), "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        *credential_overrides,
         *transport_overrides,
         *identity_overrides,
         *filter_overrides,
-        "--no-pager", subcommand, *arguments,
+        "--no-pager", "--no-optional-locks", subcommand, *safety_options, *arguments,
     ]
-    if subcommand == "log":
-        execution_argv.extend(("--no-ext-diff", "--no-textconv"))
     return execution_argv
 
 
@@ -1899,6 +1912,62 @@ def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bo
                 }),
                 option_prefixes=("--max-count=", "--since=", "--until="),
             )
+        )
+    if subcommand in {"diff", "show"}:
+        return _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--name-only", "--name-status",
+                "--no-color", "--no-merges", "--no-patch", "--oneline",
+                "--quiet", "--raw", "--stat", "--staged",
+            }),
+            option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
+        )
+    if subcommand == "grep":
+        operands = [value for value in arguments if value != "--" and not value.startswith("-")]
+        return bool(operands) and _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset({
+                "-E", "-F", "-I", "-i", "-l", "-n", "-q", "-v", "-w",
+                "--cached", "--extended-regexp", "--files-with-matches",
+                "--fixed-strings", "--ignore-case", "--line-number", "--quiet",
+                "--untracked", "--invert-match", "--word-regexp",
+            }),
+            option_prefixes=("--max-count=",),
+        )
+    if subcommand == "blame":
+        before_separator = arguments
+        pathspecs: list[str] = []
+        if "--" in arguments:
+            position = arguments.index("--")
+            before_separator = arguments[:position]
+            pathspecs = arguments[position + 1:]
+            if len(pathspecs) != 1:
+                return False
+        if any(value == "-L" for value in before_separator):
+            return False
+        operands = [value for value in before_separator if not value.startswith("-")]
+        return (
+            (len(operands) in ({0, 1} if pathspecs else {1, 2}))
+            and _arguments_match_allowlist(
+                before_separator,
+                exact_options=frozenset({
+                    "-b", "-l", "-p", "-s", "-w", "--first-parent",
+                    "--line-porcelain", "--porcelain", "--root", "--show-stats",
+                }),
+                option_prefixes=("-L",),
+            )
+        )
+    if subcommand == "merge-base":
+        if arguments[:1] == ["--is-ancestor"]:
+            arguments = arguments[1:]
+        return len(arguments) == 2 and all(not value.startswith("-") for value in arguments)
+    if subcommand == "rev-list":
+        return (
+            len(arguments) == 2
+            and arguments[0] == "--count"
+            and not arguments[1].startswith("-")
         )
     if subcommand == "rev-parse":
         return bool(arguments) and _arguments_match_allowlist(
@@ -2072,18 +2141,6 @@ def _target_matches_repo_review_shell_command(
             return _repo_review_git_execution_argv(argv, review_state) is not None
         if _repo_review_git_read_arguments(subcommand, arguments):
             return True
-        if subcommand in {"diff", "log", "show"}:
-            return _arguments_match_allowlist(
-                arguments,
-                exact_options=frozenset({
-                    "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
-                    "--exit-code", "--full-index", "--name-only", "--name-status",
-                    "--no-color", "--no-ext-diff", "--no-merges", "--no-patch",
-                    "--no-textconv", "--oneline", "--quiet", "--raw", "--stat",
-                    "--staged",
-                }),
-                option_prefixes=("-U", "--max-count=", "--since=", "--until=", "--unified="),
-            )
         if subcommand == "fetch":
             if not _arguments_match_allowlist(
                 arguments,
@@ -2309,6 +2366,7 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     execution_argv = [
         pinned_git[0], "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", "credential.helper=",
         *filter_overrides, "--no-pager", "--no-optional-locks",
         subcommand, *subcommand_arguments,
     ]
@@ -2605,7 +2663,7 @@ _SERVICE_SHELL_DISPLAY_SUBCOMMANDS = frozenset({
     "block", "blocked", "close-all", "create", "delete", "describe", "diff",
     "fetch", "init", "issue", "label", "list", "lock", "locks", "log",
     "ls-files", "merge-base", "pr", "pull", "push", "quick", "ready", "relate",
-    "remote", "reopen", "rev-parse", "review", "run", "search", "session", "show",
+    "remote", "reopen", "rev-list", "rev-parse", "review", "run", "search", "session", "show",
     "status", "subissue", "sync", "test", "unblock", "unlabel", "unrelate",
     "update", "view",
 })
@@ -2674,6 +2732,19 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
             "admitted mutations are issue create/update/comment/label/unlabel/block/unblock/"
             "relate/unrelate/close/reopen/subissue/quick, using only each command's "
             "documented bounded options (-q/--quiet and --json included)."
+        )
+    elif argv[:1] == ["git"] and destination == "repo_review":
+        boundary = (
+            " Git forms that can execute, write output, contact a remote, or enable "
+            "textconv/external helpers are deliberately denied."
+        )
+        admitted = (
+            " Admitted inspection alternatives include git status --porcelain; "
+            "git log [options] [-- paths]; git diff [revisions] [-- paths]; "
+            "git show [revision]; git grep [-n] pattern [-- paths]; git blame "
+            "[-L<range>] [revision] [--] path; git merge-base [--is-ancestor] "
+            "<revision> <revision>; git rev-list --count <revision>; git rev-parse, "
+            "git remote -v, git branch --list, and git worktree list --porcelain."
         )
     else:
         boundary = admitted = ""
@@ -2747,12 +2818,11 @@ def parse_service_shell_argv_with_reason(
     elif destination == "repo_review":
         if not _target_matches_repo_review_shell_command(argv, review_state):
             return None, _service_shell_not_admitted_reason(argv, destination)
-        if argv[0] == "git" and review_state is not None:
+        if argv[0] == "git" and argv[1:2] != ["fetch"]:
             git_argv = _repo_review_git_execution_argv(argv, review_state)
             if git_argv is not None:
                 return git_argv, ""
-            if argv[:2] == ["git", "-C"]:
-                return None, _service_shell_not_admitted_reason(argv, destination)
+            return None, _service_shell_not_admitted_reason(argv, destination)
         pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
         if pinned is None:
             return None, reason
