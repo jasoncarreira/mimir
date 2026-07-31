@@ -201,11 +201,19 @@ def create_pr_checkout_lease(
                 "PR base already contains the authorized head: fetched base "
                 f"{actual_base}; authorized head {actual_head} is stale as an open PR"
             )
-        if actual_base != scoped_base and merge_base != scoped_base:
+        base_ancestry = runner([
+            "git", "-C", str(staging), "merge-base", "--is-ancestor",
+            scoped_base, actual_base,
+        ])
+        if base_ancestry.returncode == 1:
             raise RuntimeError(
                 "PR base history rewritten: scoped base "
-                f"{scoped_base} is stale; fetched base {actual_base} has merge-base "
-                f"{merge_base} with the authorized PR head"
+                f"{scoped_base} is unreachable from fetched base {actual_base}"
+            )
+        if base_ancestry.returncode != 0:
+            raise RuntimeError(
+                (base_ancestry.stderr or base_ancestry.stdout).strip()
+                or "PR base ancestry check failed"
             )
         lease = PRCheckoutLease(
             canonical_repo=scope.canonical_repo,

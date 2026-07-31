@@ -270,6 +270,12 @@ def test_pr_checkout_lease_accepts_base_advanced_by_unrelated_merge(tmp_path: Pa
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
     _git(repo, "checkout", "-q", "main")
+    (repo / "before-scope.txt").write_text("earlier merged work\n", encoding="utf-8")
+    _git(repo, "add", "before-scope.txt")
+    _git(repo, "commit", "-q", "-m", "advance before scope is minted")
+    scoped_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    scope = replace(scope, observed_base_sha=scoped_base)
     (repo / "unrelated.txt").write_text("merged work\n", encoding="utf-8")
     _git(repo, "add", "unrelated.txt")
     _git(repo, "commit", "-q", "-m", "unrelated merge")
@@ -280,7 +286,8 @@ def test_pr_checkout_lease_accepts_base_advanced_by_unrelated_merge(tmp_path: Pa
 
     assert lease.scope_base_sha == scope.observed_base_sha
     assert lease.base_sha == advanced_base
-    assert _git(lease.path, "merge-base", lease.head_sha, lease.base_sha) == scope.observed_base_sha
+    assert _git(lease.path, "merge-base", lease.head_sha, lease.base_sha) != scope.observed_base_sha
+    assert _git(lease.path, "merge-base", "--is-ancestor", lease.scope_base_sha, lease.base_sha) == ""
 
 
 def test_pr_checkout_lease_refuses_rewritten_base_with_both_identities(tmp_path: Path) -> None:
@@ -300,9 +307,30 @@ def test_pr_checkout_lease_refuses_rewritten_base_with_both_identities(tmp_path:
 
     message = str(refusal.value)
     assert "PR base history rewritten" in message
-    assert f"scoped base {scope.observed_base_sha} is stale" in message
-    assert f"fetched base {rewritten_base}" in message
-    assert "merge-base none" in message
+    assert (
+        f"scoped base {scope.observed_base_sha} is unreachable from fetched base {rewritten_base}"
+        in message
+    )
+    assert list(lease_root.iterdir()) == []
+
+
+def test_pr_checkout_lease_does_not_report_git_failure_as_base_rewrite(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+
+    def runner(args):
+        if list(args[-4:-2]) == ["merge-base", "--is-ancestor"]:
+            return subprocess.CompletedProcess(args, 128, "", "ancestry inspection failed\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_pr_checkout_lease(
+            scope, owner="mimir-bot", lease_root=lease_root, runner=runner,
+        )
+
+    assert str(refusal.value) == "ancestry inspection failed"
+    assert "history rewritten" not in str(refusal.value)
     assert list(lease_root.iterdir()) == []
 
 
