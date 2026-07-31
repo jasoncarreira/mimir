@@ -416,7 +416,8 @@ async def reconcile_failed_turns(
 
     For each turn-outcome event (since the last reconcile) whose
     ``source_id`` is still in-flight:
-      * ``turn_completed`` → drop it (the item was processed OK).
+      * ``turn_completed`` → drop it for generic recovery; retain and charge it
+        for live-state pollers, which verify the external transition themselves.
       * ``turn_failed`` with ``result_subtype=tool_budget_exhausted`` →
         drop it without retry. The failure is deterministic under an
         unchanged budget, so replay would repeat partial work and spend
@@ -477,9 +478,35 @@ async def reconcile_failed_turns(
             if isinstance(ts, str):
                 entry["last_outcome_at"] = ts
             if otype == "turn_completed":
-                del inflight[source_id]
                 summary["completed"] += 1
+                if not recover_failed_turns and poller_name == "github-activity":
+                    # Live-state pollers decide success from the next external
+                    # snapshot. If the requested state transition did not occur,
+                    # a normal model completion is still a spent wedge attempt.
+                    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+                    entry["outcome_disposition"] = "charge"
+                    entry["attempt_reasons"] = [
+                        str(rec.get("attempt_reason") or "turn_completed_without_state_change")[:240]
+                    ]
+                else:
+                    del inflight[source_id]
             elif otype == "turn_failed":
+                disposition = rec.get("attempt_disposition")
+                reason = rec.get("attempt_reason")
+                if disposition == "exempt_hard_refusal":
+                    # The framework, not the retried turn, owns this marker.
+                    # Keep it for live-state pollers so they can report the
+                    # refusal without charging their content-failure budget.
+                    entry["outcome_disposition"] = disposition
+                    entry["outcome_reason"] = (
+                        reason if isinstance(reason, str) else "hard_boundary_refusal"
+                    )
+                    entry["hard_refusals"] = rec.get("hard_refusals", [])
+                    if recover_failed_turns:
+                        del inflight[source_id]
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
                 # A tool-budget denial is not transient: the same event under
                 # the same configured budget will deterministically exhaust
                 # again, re-run partial side effects, and consume another full
@@ -498,6 +525,14 @@ async def reconcile_failed_turns(
                     # The turn did start and fail even though generic recovery
                     # will not re-enqueue it.
                     entry["attempts"] = int(entry.get("attempts", 0)) + 1
+                    entry["outcome_disposition"] = "charge"
+                    charged_reason = (
+                        reason if isinstance(reason, str) and reason
+                        else rec.get("result_subtype") or rec.get("error") or "turn_failed"
+                    )
+                    reasons = entry.setdefault("attempt_reasons", [])
+                    if isinstance(reasons, list):
+                        reasons.append(str(charged_reason)[:240])
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue

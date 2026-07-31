@@ -9,6 +9,7 @@ relies on the rebuild-on-every-poll cleanup contract.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -106,6 +107,35 @@ def _patch_api(
         return prs
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+
+def _recovery_entry(
+    *, attempts: int = 0, outcome_at: str | None = None,
+    disposition: str | None = None, reasons: list[str] | None = None,
+) -> dict:
+    entry = {
+        "attempts": attempts,
+        "enqueued_at": "2026-07-19T12:00:00+00:00",
+        "event": {"extra": {"items": [{
+            "event_type": "pr_changes_requested_stale",
+            "repo": "o/r",
+            "number": 638,
+            "head_sha": "aaa111",
+        }]}},
+    }
+    if outcome_at:
+        entry["last_outcome_at"] = outcome_at
+    if disposition:
+        entry["outcome_disposition"] = disposition
+    if reasons is not None:
+        entry["attempt_reasons"] = reasons
+    return entry
+
+
+def _write_recovery(tmp_path, entries: dict) -> None:
+    (tmp_path / ".recovery.json").write_text(json.dumps({
+        "last_reconciled": "", "inflight": entries,
+    }), encoding="utf-8")
 
 
 def test_stale_changes_requested_reemits_on_elapsed_boundary(
@@ -507,6 +537,163 @@ def test_attempt_cap_gives_up_once_then_rearms_after_backstop(
     assert len(captured_emits) == 2
     assert captured_emits[-1]["event_type"] == "pr_changes_requested_stale"
     assert captured_emits[-1]["attempt"] == 1
+
+
+def test_emitted_but_undelivered_reminder_does_not_charge_or_duplicate(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    _write_recovery(tmp_path, {})
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {}, now=NOW,
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+
+    _write_recovery(tmp_path, {"queued": _recovery_entry()})
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(hours=2),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+    assert len(captured_emits) == 1
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(days=1),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    assert len(captured_emits) == 2
+
+
+def test_hard_refusal_is_uncharged_and_retries_only_at_daily_backstop(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    refused = _recovery_entry(
+        outcome_at="2026-07-19T12:00:00+00:00",
+        disposition="exempt_hard_refusal",
+    )
+    refused["outcome_reason"] = "service_scope_denied"
+    _write_recovery(tmp_path, {"refused": refused})
+    prior = {"638": _entry("aaa111", attempts=0)}
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW + timedelta(hours=2),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(days=1),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    assert captured_emits[0]["attempt"] == 1
+    assert captured_emits[0]["prior_refusal_reasons"] == ["service_scope_denied"]
+
+
+def test_model_failure_charges_attempt_and_advances_retry(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    _write_recovery(tmp_path, {"failed": _recovery_entry(
+        attempts=1,
+        outcome_at="2026-07-19T12:01:00+00:00",
+        disposition="charge",
+        reasons=["model_context_window_exceeded"],
+    )})
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {"638": _entry("aaa111", attempts=0)},
+        now=NOW + timedelta(hours=2),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 1
+    assert captured_emits[0]["attempt"] == 2
+
+
+def test_completed_turn_with_unchanged_pr_charges_attempt(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    _write_recovery(tmp_path, {"completed": _recovery_entry(
+        attempts=1,
+        outcome_at="2026-07-19T12:01:00+00:00",
+        disposition="charge",
+        reasons=["turn_completed_without_state_change"],
+    )})
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {"638": _entry("aaa111", attempts=0)},
+        now=NOW + timedelta(hours=2),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 1
+    assert captured_emits[0]["attempt"] == 2
+
+
+def test_exhaustion_reports_each_charged_outcome_reason(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    reasons = ["bad_patch", "tests_failed", "review_unaddressed"]
+    _write_recovery(tmp_path, {"failed": _recovery_entry(
+        attempts=3,
+        outcome_at="2026-07-19T12:01:00+00:00",
+        disposition="charge",
+        reasons=reasons,
+    )})
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", {"638": _entry("aaa111", attempts=0)},
+        now=NOW + timedelta(hours=2),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1
+    assert captured_emits[0]["signal"] == "pr_changes_requested_gave_up"
+    assert captured_emits[0]["attempt_reasons"] == reasons
 
 
 def test_seconds_after_boundary_reemits_on_intended_cycle(

@@ -941,6 +941,10 @@ class TurnContext:
     tool_call_budget_denied_count: int = 0
     tool_call_budget_denied_tools: list[str] = field(default_factory=list)
     tool_call_budget_first_denied_at_count: int | None = None
+    # Framework-owned record of actions refused by an always-on authorization
+    # or tool boundary. The model only receives rendered ToolMessages and cannot
+    # populate this classification itself.
+    hard_boundary_denials: list[dict[str, str]] = field(default_factory=list)
     # CR2 (agent runtime) fix: soft-warning idempotency. Without this
     # flag, the previous ``count == soft_threshold`` trigger could miss
     # a warning if any code path skipped an increment, AND could fire
