@@ -28,12 +28,14 @@ from .run_state import (
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
+_CHAINLINK_COMMAND_TIMEOUT_SECONDS = 10
+
 
 @dataclass(frozen=True)
 class WorklinkStatus:
     issue_id: int
     classification: str
-    label_in_progress: bool
+    label_in_progress: bool | None
     state: WorklinkRunState | None
     elapsed_s: float | None
     disagreement: str | None = None
@@ -51,37 +53,106 @@ class WorklinkStopResult:
 
 def _runner(home: Path, chainlink_bin: str = "chainlink") -> Runner:
     def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(list(args), cwd=home, capture_output=True, text=True, check=False)
+        try:
+            return subprocess.run(
+                list(args),
+                cwd=home,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_CHAINLINK_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            stderr = (
+                exc.stderr.decode("utf-8", "replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            timeout_message = (
+                f"chainlink timed out after {_CHAINLINK_COMMAND_TIMEOUT_SECONDS}s"
+            )
+            stderr = f"{stderr.rstrip()}\n{timeout_message}" if stderr else timeout_message
+            return subprocess.CompletedProcess(args, 124, stdout=stdout, stderr=stderr)
 
     return run
 
 
-def _open_worklink_issues(run: Runner, chainlink_bin: str) -> dict[int, set[str]]:
+def _open_issue_ids(run: Runner, chainlink_bin: str) -> tuple[set[int], str | None]:
     result = run([chainlink_bin, "issue", "list", "--status", "open", "--json"])
     if result.returncode != 0:
-        raise RuntimeError(
+        return set(), (
             (result.stderr or result.stdout).strip() or "chainlink issue list failed"
         )
     try:
         payload = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("chainlink issue list returned invalid JSON") from exc
-    items = payload if isinstance(payload, list) else payload.get("issues", [])
-    issues: dict[int, set[str]] = {}
+    except json.JSONDecodeError:
+        return set(), "chainlink issue list returned invalid JSON"
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("issues", [])
+    else:
+        return set(), "chainlink issue list returned invalid JSON payload"
+    if not isinstance(items, list):
+        return set(), "chainlink issue list returned invalid issues"
+    issue_ids: set[int] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
         try:
-            issue_id = int(item.get("id", item.get("number")))
+            issue_ids.add(int(item.get("id", item.get("number"))))
         except (TypeError, ValueError):
             continue
-        labels = {
-            str(label.get("name") if isinstance(label, dict) else label)
-            for label in (item.get("labels") or ())
-        }
-        if any(label.startswith("worklink:") for label in labels):
-            issues[issue_id] = labels
-    return issues
+    return issue_ids, None
+
+
+def _worklink_issue_labels(
+    run: Runner, chainlink_bin: str, issue_ids: set[int]
+) -> tuple[dict[int, set[str]], dict[int, str]]:
+    labels_by_issue: dict[int, set[str]] = {}
+    errors: dict[int, str] = {}
+    # `issue list --json` omits labels and blocked_by. Only `issue show` is a
+    # valid source for reconciliation data.
+    for issue_id in sorted(issue_ids):
+        result = run([chainlink_bin, "issue", "show", str(issue_id), "--json"])
+        if result.returncode != 0:
+            errors[issue_id] = (
+                (result.stderr or result.stdout).strip()
+                or f"chainlink issue show {issue_id} failed"
+            )
+            continue
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            errors[issue_id] = f"chainlink issue show {issue_id} returned invalid JSON"
+            continue
+        if not isinstance(payload, dict) or "labels" not in payload:
+            errors[issue_id] = f"chainlink issue show {issue_id} omitted labels"
+            continue
+        raw_labels = payload["labels"]
+        if not isinstance(raw_labels, (list, dict)):
+            errors[issue_id] = f"chainlink issue show {issue_id} returned invalid labels"
+            continue
+        labels: set[str] = set()
+        malformed = False
+        for label in raw_labels:
+            if isinstance(label, str):
+                labels.add(label)
+            elif isinstance(label, dict) and label.get("name") is not None:
+                labels.add(str(label["name"]))
+            else:
+                malformed = True
+                break
+        if malformed:
+            errors[issue_id] = f"chainlink issue show {issue_id} returned invalid labels"
+            continue
+        labels_by_issue[issue_id] = labels
+    return labels_by_issue, errors
 
 
 def worklink_status(
@@ -94,21 +165,51 @@ def worklink_status(
 ) -> list[WorklinkStatus]:
     """Classify Worklink leaves from run state and current Chainlink labels."""
     states = {state.issue_id: state for state in list_run_states(home)}
-    issues = _open_worklink_issues(runner or _runner(home, chainlink_bin), chainlink_bin)
-    selected = set(issue_ids) if issue_ids else set(states) | set(issues)
+    run = runner or _runner(home, chainlink_bin)
+    explicit = set(issue_ids)
+    if explicit:
+        candidates = explicit
+    else:
+        open_issue_ids, discovery_error = _open_issue_ids(run, chainlink_bin)
+        if discovery_error is not None:
+            raise RuntimeError(discovery_error)
+        candidates = set(states) | open_issue_ids
+    labels_by_issue, label_errors = _worklink_issue_labels(
+        run, chainlink_bin, candidates
+    )
+    selected = (
+        explicit
+        if explicit
+        else (
+            set(states)
+            | set(label_errors)
+            | {
+                issue_id
+                for issue_id, labels in labels_by_issue.items()
+                if any(label.startswith("worklink:") for label in labels)
+            }
+        )
+    )
     rows: list[WorklinkStatus] = []
     for issue_id in sorted(selected):
         state = states.get(issue_id)
-        in_progress = "worklink:in-progress" in issues.get(issue_id, set())
+        labels = labels_by_issue.get(issue_id)
+        in_progress = None if labels is None else "worklink:in-progress" in labels
         disagreement = None
         if state is not None:
             classification = "running" if process_is_alive(state) else "orphaned"
-            if not in_progress:
+            if in_progress is None:
+                disagreement = f"labels unavailable: {label_errors[issue_id]}"
+            elif not in_progress:
                 disagreement = "run state present but worklink:in-progress label absent"
             elapsed = elapsed_seconds(state, now=now)
         elif in_progress:
             classification = "unrecorded"
             disagreement = "worklink:in-progress label present but run state absent"
+            elapsed = None
+        elif in_progress is None:
+            classification = "unknown"
+            disagreement = f"labels unavailable: {label_errors[issue_id]}"
             elapsed = None
         else:
             classification = "clean"
