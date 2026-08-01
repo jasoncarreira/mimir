@@ -114,6 +114,23 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
     assert session.calls[0][1].endswith("/repos/owner/repo/pulls/17")
 
 
+def test_live_snapshot_uses_origin_for_same_repository_head() -> None:
+    session = Session([Response({
+        "number": 17, "state": "open", "user": {"login": "author"},
+        "base": {"ref": "main", "sha": "b" * 40},
+        "head": {
+            "ref": "feature", "sha": "a" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
+    })])
+
+    snapshot = GitHubForgeClient(session=session).get_pull_request_snapshot(
+        "owner/repo", 17,
+    )
+
+    assert snapshot.head_remote == "origin"
+
+
 def test_submit_review_uses_json_transport_and_scope_head() -> None:
     session = Session([Response({"login": "reviewer"}), Response({
         "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",

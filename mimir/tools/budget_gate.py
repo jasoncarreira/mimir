@@ -378,19 +378,19 @@ def _extract_sink_target(
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
         "repo_revert_abort", "repo_push",
     }:
-        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
         state = (
-            registry.resolve(args.get("repository"), args.get("pull_request"))
-            if registry is not None and hasattr(registry, "resolve")
+            discovered.resolve(args.get("repository"), args.get("pull_request"))
+            if discovered is not None
+            and isinstance(args.get("repository"), str)
+            and isinstance(args.get("pull_request"), int)
             else None
         )
         if state is None:
-            discovered = getattr(auth_context, "server_discovered_pr_states", None)
+            registry = getattr(auth_context, "repo_pr_scope_registry", None)
             state = (
-                discovered.resolve(args.get("repository"), args.get("pull_request"))
-                if discovered is not None
-                and isinstance(args.get("repository"), str)
-                and isinstance(args.get("pull_request"), int)
+                registry.resolve(args.get("repository"), args.get("pull_request"))
+                if registry is not None and hasattr(registry, "resolve")
                 else None
             )
         if state is None:

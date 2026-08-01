@@ -20,6 +20,7 @@ from ..forge import ForgeClient, ForgeError, ReviewVerdict
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+    ServerDiscoveredPRStates,
 )
 from .refusals import ToolPolicyRefusal
 
@@ -146,10 +147,17 @@ def resolve_review_state_for_context(
     pull_request: int,
 ) -> RepoReviewState:
     """Context-level variant used by authorization before tool invocation."""
-    registry = getattr(context, "repo_pr_scope_registry", None)
-    state = registry.resolve(repository, pull_request) if isinstance(
-        registry, RepoPRScopeRegistry,
+    cache = getattr(context, "server_discovered_pr_states", None)
+    state = cache.resolve(repository, pull_request) if (
+        isinstance(cache, ServerDiscoveredPRStates)
+        and isinstance(repository, str)
+        and isinstance(pull_request, int)
     ) else None
+    registry = getattr(context, "repo_pr_scope_registry", None)
+    if state is None:
+        state = registry.resolve(repository, pull_request) if isinstance(
+            registry, RepoPRScopeRegistry,
+        ) else None
     if state is not None:
         return state
     if (
@@ -171,7 +179,6 @@ def resolve_review_state_for_context(
         raise ToolPolicyRefusal(
             "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
         )
-    cache = getattr(context, "server_discovered_pr_states", None)
     cached = cache.resolve(repository, pull_request) if cache is not None else None
     if cached is not None:
         return cached
@@ -188,6 +195,69 @@ def resolve_review_state_for_context(
         ))
     state = RepoReviewState(scope)
     return cache.remember(state) if cache is not None else state
+
+
+def remediation_checkout_preflight(
+    context: AuthContext | None,
+    repository: str,
+    pull_request: int,
+) -> tuple[RepoReviewState | None, str | None]:
+    """Refresh one stale own-remediation scope from a live provider snapshot."""
+    registry = getattr(context, "repo_pr_scope_registry", None)
+    original = registry.resolve(repository, pull_request) if isinstance(
+        registry, RepoPRScopeRegistry,
+    ) else None
+    if original is None:
+        return resolve_review_state_for_context(context, repository, pull_request), None
+    scope = original.action_scope
+    if scope.event_type != "pr_changes_requested_stale" or scope.provenance.value != "poller_payload":
+        return resolve_review_state_for_context(context, repository, pull_request), None
+
+    client = _client_for_repository(repository)
+    try:
+        snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
+    except ForgeError as exc:
+        raise ToolException(f"repository checkout rejected: {exc}") from exc
+    if snapshot.state != "open":
+        return None, "pull request is closed or merged"
+    if snapshot.head_sha.lower() == scope.observed_head_sha.lower():
+        return original, None
+
+    cache = getattr(context, "server_discovered_pr_states", None)
+    if not isinstance(cache, ServerDiscoveredPRStates) or not cache.begin_remint(
+        repository, pull_request,
+    ):
+        return resolve_review_state_for_context(context, repository, pull_request), None
+
+    from ..access_control import create_server_discovered_heartbeat_scope
+
+    fresh_scope = create_server_discovered_heartbeat_scope(
+        repository, snapshot, event_type=scope.event_type,
+    )
+    if fresh_scope is None:
+        # Failed re-authorization must retain today's exact stale-scope refusal.
+        return original, None
+    fresh = RepoReviewState(fresh_scope)
+
+    from ..repo_tools import was_agent_push
+
+    if not was_agent_push(
+        repository, pull_request, scope.observed_head_sha, snapshot.head_sha,
+    ):
+        try:
+            reviews = client.list_reviews(fresh_scope)
+        except ForgeError as exc:
+            raise ToolException(f"repository checkout rejected: {exc}") from exc
+        latest: dict[str, str] = {}
+        self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+        for review in reviews:
+            state = review.state.upper()
+            if review.author == self_login or state not in {"APPROVED", "CHANGES_REQUESTED"}:
+                continue
+            latest[review.author] = state
+        if "CHANGES_REQUESTED" not in latest.values():
+            return None, "pull request no longer has a blocking changes-requested review"
+    return cache.remember_remint(original, fresh), None
 
 
 def _client(scope: RepoPRActionScope) -> ForgeClient:

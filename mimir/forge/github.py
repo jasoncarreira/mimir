@@ -287,12 +287,15 @@ class GitHubForgeClient:
         base = data.get("base") if isinstance(data.get("base"), Mapping) else {}
         head = data.get("head") if isinstance(data.get("head"), Mapping) else {}
         head_repo = head.get("repo") if isinstance(head.get("repo"), Mapping) else {}
+        normalized_head_repo = str(head_repo.get("full_name", ""))
         return NormalizedPullRequestSnapshot(
             state=str(data.get("state", "")),
             number=observed_number,
             author=self._user(data),
-            head_repo=str(head_repo.get("full_name", "")),
-            head_remote="source",
+            head_repo=normalized_head_repo,
+            head_remote=(
+                "origin" if normalized_head_repo.lower() == repository.lower() else "source"
+            ),
             head_ref=str(head.get("ref", "")),
             head_sha=str(head.get("sha", "")),
             base_ref=str(base.get("ref", "")),

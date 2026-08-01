@@ -5747,28 +5747,28 @@ class ToolRegistry:
         repo_review_state_refusal = None
         if auth_context is not None:
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
-                registry = getattr(auth_context, "repo_pr_scope_registry", None)
                 tool_arguments = arguments or {}
+                discovered = getattr(
+                    auth_context, "server_discovered_pr_states", None,
+                )
                 state = (
-                    registry.resolve(
+                    discovered.resolve(
                         tool_arguments.get("repository"),
                         tool_arguments.get("pull_request"),
                     )
-                    if registry is not None and hasattr(registry, "resolve")
+                    if discovered is not None
+                    and isinstance(tool_arguments.get("repository"), str)
+                    and isinstance(tool_arguments.get("pull_request"), int)
                     else None
                 )
                 if state is None:
-                    discovered = getattr(
-                        auth_context, "server_discovered_pr_states", None,
-                    )
+                    registry = getattr(auth_context, "repo_pr_scope_registry", None)
                     state = (
-                        discovered.resolve(
+                        registry.resolve(
                             tool_arguments.get("repository"),
                             tool_arguments.get("pull_request"),
                         )
-                        if discovered is not None
-                        and isinstance(tool_arguments.get("repository"), str)
-                        and isinstance(tool_arguments.get("pull_request"), int)
+                        if registry is not None and hasattr(registry, "resolve")
                         else None
                     )
                 repo_pr_action_scope = (

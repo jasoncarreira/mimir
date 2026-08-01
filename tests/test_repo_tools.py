@@ -32,6 +32,7 @@ from mimir.repo_tools import (
     GitUnmerged,
     RepoGitTools,
     _bounded_subprocess_runner,
+    was_agent_push,
 )
 
 
@@ -411,6 +412,10 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
         )
 
     assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    pushed_head = _git(state.checkout_lease.path, "rev-parse", "HEAD")
+    assert was_agent_push(
+        scope.canonical_repo, scope.pr_number, scope.observed_head_sha, pushed_head,
+    )
     push = next(argv for argv in calls if "push" in argv)
     assert push[-4:] == ("push", "--porcelain", scope.canonical_origin, f"HEAD:{scope.destination_ref}")
     assert not any(arg in push for arg in ("--force", "--force-with-lease", "--delete", "--tags", "--mirror", "--all"))
