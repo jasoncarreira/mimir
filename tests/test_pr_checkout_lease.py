@@ -286,7 +286,9 @@ def test_acquire_refuses_and_reports_foreign_scope_candidate(
     ]
 
 
-def test_pr_checkout_lease_cleanup_accepts_commit_on_lease_branch(tmp_path: Path) -> None:
+def test_pr_checkout_lease_cleanup_refuses_unpublished_commit_on_lease_branch(
+    tmp_path: Path,
+) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
@@ -296,7 +298,26 @@ def test_pr_checkout_lease_cleanup_accepts_commit_on_lease_branch(tmp_path: Path
     _git(lease.path, "commit", "-q", "-m", "fix")
 
     assert _git(lease.path, "rev-parse", "HEAD") != lease.head_sha
-    assert cleanup_pr_checkout_lease(lease) is True
+    with pytest.raises(RuntimeError, match="cleanup publication mismatch"):
+        cleanup_pr_checkout_lease(lease)
+
+    assert lease.path.is_dir()
+
+
+def test_pr_checkout_lease_cleanup_refuses_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=lease_root)
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    _git(lease.path, "reset", "--hard", lease.base_sha)
+    _git(lease.path, "push", "--force", "origin", f"HEAD:{scope.destination_ref}")
+    _git(lease.path, "fetch", "origin", scope.destination_ref)
+
+    with pytest.raises(RuntimeError, match="found no publication proof"):
+        cleanup_pr_checkout_lease(lease)
+
+    assert lease.path.is_dir()
 
 
 def test_pr_checkout_lease_cleanup_refuses_mismatched_origin(tmp_path: Path) -> None:
@@ -389,8 +410,8 @@ def test_pr_checkout_lease_cleanup_refuses_unrelated_head_on_expected_branch(
         cleanup_pr_checkout_lease(lease)
 
     assert str(refusal.value) == (
-        "PR checkout lease cleanup ancestry mismatch: "
-        f"expected HEAD descendant of {lease.head_sha!r}; actual {unrelated_head!r}"
+        "PR checkout lease cleanup publication mismatch: "
+        f"HEAD {unrelated_head!r} is not contained in published commit {lease.head_sha!r}"
     )
     assert lease.path.is_dir()
 

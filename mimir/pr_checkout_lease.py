@@ -19,6 +19,7 @@ from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_c
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 _METADATA = ".git/mimir-pr-checkout-lease.json"
+PUBLISHED_HEAD_REF = "refs/mimir/pr-checkout-lease/published"
 _LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 _CLEANUP_IDENTITY_FIELDS = (
     "canonical_repo",
@@ -268,6 +269,11 @@ def create_pr_checkout_lease(
         ).lower()
         if checked_out != scope.observed_head_sha.lower():
             raise RuntimeError("checked-out HEAD does not match immutable scope")
+        _run(
+            runner,
+            ["git", "-C", str(staging), "update-ref", PUBLISHED_HEAD_REF, actual_head],
+            "could not record the published PR head",
+        )
         _assert_self_contained_checkout(staging, runner=runner)
         (staging / _METADATA).write_text(
             json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
@@ -630,14 +636,21 @@ def cleanup_pr_checkout_lease(
             "PR checkout lease cleanup branch mismatch: "
             f"expected {expected_branch!r}; actual {branch!r}"
         )
+    published = runner([
+        "git", "-C", str(lease.path), "rev-parse", "--verify",
+        f"{PUBLISHED_HEAD_REF}^{{commit}}",
+    ])
+    if published.returncode != 0:
+        raise RuntimeError("PR checkout lease cleanup found no publication proof")
+    published_head = published.stdout.strip().lower()
     ancestor = runner([
-        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
-        lease.head_sha.lower(), head,
+        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", head,
+        published_head,
     ])
     if ancestor.returncode != 0:
         raise RuntimeError(
-            "PR checkout lease cleanup ancestry mismatch: "
-            f"expected HEAD descendant of {lease.head_sha.lower()!r}; actual {head!r}"
+            "PR checkout lease cleanup publication mismatch: "
+            f"HEAD {head!r} is not contained in published commit {published_head!r}"
         )
     shutil.rmtree(lease.path)
     return True

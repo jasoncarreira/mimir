@@ -8,7 +8,11 @@ import subprocess
 import pytest
 
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
-from mimir.pr_checkout_lease import PRCheckoutLease, create_pr_checkout_lease
+from mimir.pr_checkout_lease import (
+    PRCheckoutLease,
+    cleanup_pr_checkout_lease,
+    create_pr_checkout_lease,
+)
 from mimir.project_tests import (
     ProjectTestProcessResult,
     ProjectTestRefusal,
@@ -480,6 +484,36 @@ def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
     assert _git(origin, "rev-parse", scope.destination_ref) == _git(
         state.checkout_lease.path, "rev-parse", "HEAD",
     )
+    assert cleanup_pr_checkout_lease(state.checkout_lease, review_state=state) is True
+
+
+def test_head_accepted_by_rewritten_push_is_accepted_by_cleanup_when_commit_skipped(
+    tmp_path: Path,
+) -> None:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("pull request\n", encoding="utf-8")
+    _git(source, "commit", "-qam", "apply PR content upstream")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    rebase_scope = replace(
+        scope,
+        event_type="pr_mergeability_rebase",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(rebase_scope)
+    lease = create_pr_checkout_lease(
+        rebase_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+
+    assert RepoGitTools(state).execute(GitRebase()).ok
+    assert _git(lease.path, "rev-parse", "HEAD") == advanced_base
+    assert RepoGitTools(state).execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == advanced_base
+    assert cleanup_pr_checkout_lease(lease, review_state=state) is True
 
 
 def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path) -> None:

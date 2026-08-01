@@ -17,6 +17,9 @@ def _pr(*, mergeable: bool | None, number: int = 42) -> dict:
         "number": number,
         "title": "Ready after rebase",
         "html_url": f"https://github.com/o/r/pull/{number}",
+        "state": "open",
+        "merged": False,
+        "merged_at": None,
         "user": {"login": "mimir-bot"},
         "head": {
             "sha": HEAD,
@@ -110,6 +113,29 @@ def test_current_pr_is_noop_and_consumes_no_cycle_budget(monkeypatch, events):
     assert count == 0
     assert cursor == {}
     assert budget == [1]
+    assert events == []
+
+
+def test_pr_merged_between_listing_and_detail_is_not_actioned(monkeypatch, events):
+    listed = _pr(mergeable=None)
+    detail = {**_pr(mergeable=True), "state": "closed", "merged": True,
+              "merged_at": "2026-07-31T11:59:00Z"}
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.endswith("/pulls/42"):
+            return detail
+        if "pulls?state=open" in endpoint:
+            return [listed]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+    count, cursor = poller._check_own_mergeability(
+        "o/r", "tok", "mimir-bot", {}, now=NOW,
+    )
+
+    assert count == 0
+    assert cursor == {}
     assert events == []
 
 
