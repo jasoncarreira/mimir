@@ -821,6 +821,7 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
         ToolRegistry,
         build_trigger_service_principal,
     )
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
     from mimir.tools._shell_env import direct_exec_env_overlay
     from mimir.tools.budget_gate import BudgetGateMiddleware
@@ -889,6 +890,7 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
         }]),
         AIMessage(content="done"),
     ]))
+    install_deepagents_grep_context_tool()
     agent = create_deep_agent(
         model=model,
         tools=[shell_async.bash_async],

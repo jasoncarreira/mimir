@@ -184,7 +184,9 @@ def build_system_prompt(
             f"root. Use relative paths or absolute paths prefixed with "
             f"`{home_dir}/`. This value is the source of truth — do "
             "not infer from `$HOME`, claude-code's default workspace, "
-            "or any prose in subsequent blocks."
+            "or any prose in subsequent blocks.\n\n"
+            "`write_file` creates a new file only. It never overwrites an "
+            "existing path; when the target exists, use `edit_file` instead."
         )
         # Writable-dir guidance (chainlink #299): the filesystem tools
         # refuse writes outside ``Config.writable_dirs`` — without this the

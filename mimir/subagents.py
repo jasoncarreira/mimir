@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mimir.structured_output_retry import StructuredOutputRetryMiddleware
@@ -168,6 +169,14 @@ Anchor each finding in specific evidence and make every recommendation actionabl
 """
 
 
+class _NoTodoListMiddleware(AgentMiddleware):
+    tools = ()
+
+    @property
+    def name(self) -> str:
+        return TodoListMiddleware.__name__
+
+
 def readonly_filesystem_permissions() -> list[FilesystemPermission]:
     """Return filesystem rules that permit reads but deny writes everywhere.
 
@@ -193,7 +202,11 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
     return [
         {
             **GENERAL_PURPOSE_SUBAGENT,
-            "middleware": [BudgetGateMiddleware(), *ingestion_middleware],
+            "middleware": [
+                TodoListMiddleware(),
+                BudgetGateMiddleware(),
+                *ingestion_middleware,
+            ],
         },
         {
             "name": "critic-structured",
@@ -210,6 +223,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             "tools": [],
             "permissions": readonly_filesystem_permissions(),
             "middleware": [
+                _NoTodoListMiddleware(),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
                 StructuredOutputRetryMiddleware(),

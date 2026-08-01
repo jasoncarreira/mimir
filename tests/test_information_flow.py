@@ -3346,6 +3346,7 @@ async def test_agent_graph_tool_call_survives_populated_auth_context():
 
     from deepagents import create_deep_agent
 
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.tools.store import memory_store
 
     class _ToolCallingFakeModel(GenericFakeChatModel):
@@ -3360,6 +3361,7 @@ async def test_agent_graph_tool_call_survives_populated_auth_context():
         }]),
         AIMessage(content="done"),
     ]))
+    install_deepagents_grep_context_tool()
     agent = create_deep_agent(
         model=model, tools=[memory_store], system_prompt="test",
         context_schema=AuthContext,

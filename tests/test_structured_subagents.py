@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from typing import Annotated, NotRequired
 
 from deepagents.backends import StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.subagents import _build_task_tool
+from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware.types import AgentState, PrivateStateAttr
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain.tools import ToolRuntime
@@ -25,6 +28,17 @@ from mimir.subagents import (
     readonly_filesystem_permissions,
 )
 from mimir.tools.budget_gate import _authorize_tool_call
+
+
+class _PrivateProbeState(AgentState):
+    private_probe: Annotated[NotRequired[str], PrivateStateAttr]
+
+
+class _PrivateProbeMiddleware(AgentMiddleware):
+    state_schema = _PrivateProbeState
+
+    def before_agent(self, state, runtime):  # noqa: ARG002
+        return {"private_probe": "parent-only"}
 
 
 class _AuthorizingSubagent(Runnable):
@@ -114,12 +128,19 @@ def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp(
         "critic-structured",
     ]
     critic = specs[1]
+    general = specs[0]
+    assert [middleware.name for middleware in general["middleware"]] == [
+        "TodoListMiddleware",
+        "BudgetGateMiddleware",
+    ]
     assert critic["response_format"] is CriticFindings
     assert critic["tools"] == []
-    assert [middleware.__class__.__name__ for middleware in critic["middleware"]] == [
+    assert [middleware.name for middleware in critic["middleware"]] == [
+        "TodoListMiddleware",
         "BudgetGateMiddleware",
         "StructuredOutputRetryMiddleware",
     ]
+    assert critic["middleware"][0].tools == ()
     assert "Read-only" in critic["description"]
 
 
@@ -517,6 +538,7 @@ async def test_real_task_subagent_gate_uses_propagated_parent_carrier(
     from langchain_core.tools import tool
 
     from mimir.tools import budget_gate
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     class _ToolCallingFakeModel(GenericFakeChatModel):
@@ -575,6 +597,7 @@ async def test_real_task_subagent_gate_uses_propagated_parent_carrier(
     ]))
 
     install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
     agent = create_deep_agent(
         model=model,
         tools=[],
@@ -604,3 +627,177 @@ async def test_real_task_subagent_gate_uses_propagated_parent_carrier(
         isinstance(message, ToolMessage) and message.tool_call_id == "tc-task"
         for message in result["messages"]
     )
+
+
+@pytest.mark.asyncio
+async def test_subagent_todo_policy_and_general_filesystem_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepagents import HarnessProfile, create_deep_agent
+    from deepagents.backends import StateBackend
+    import deepagents.graph as deepagents_graph
+    from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+
+    observed_todos: list[list[dict]] = []
+    critic_todo_presence: list[bool] = []
+    bound_tools: list[list[str]] = []
+
+    class _TodoStateCaptureMiddleware(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            if state.get("todos"):
+                observed_todos.append(state["todos"])
+
+    class _CriticStateCaptureMiddleware(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            critic_todo_presence.append("todos" in state)
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            bound_tools.append([tool.name for tool in tools])
+            return self
+
+    monkeypatch.setattr(
+        deepagents_graph,
+        "_harness_profile_for_model",
+        lambda *_args: HarnessProfile(extra_middleware=(TodoListMiddleware(),)),
+    )
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "track and finish the inventory check",
+                "subagent_type": "general-purpose",
+            },
+            "id": "tc-general-task",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "write_todos",
+            "args": {"todos": [{"content": "Check tools", "status": "in_progress"}]},
+            "id": "tc-general-todo",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="general done"),
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "review the inventory check",
+                "subagent_type": "critic-structured",
+            },
+            "id": "tc-critic-task",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "CriticFindings",
+            "args": {
+                "verdict": "no_concerns",
+                "summary": "The inventory is consistent.",
+                "findings": [],
+                "open_questions": [],
+            },
+            "id": "tc-critic-response",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="parent done"),
+    ]))
+    subagents = build_mimir_subagents()
+    subagents[0]["middleware"].append(_TodoStateCaptureMiddleware())
+    subagents[1]["middleware"].append(_CriticStateCaptureMiddleware())
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt="parent test",
+        backend=StateBackend(),
+        middleware=[TodoListMiddleware()],
+        subagents=subagents,
+        context_schema=AuthContext,
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="delegate the inventory check")]},
+        context=_auth_context(roles=("user",), enforce=False),
+    )
+
+    general_requests = [
+        names for names in bound_tools
+        if "task" not in names and "CriticFindings" not in names
+    ]
+    assert general_requests
+    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "glob", "grep"}
+    for names in general_requests:
+        assert set(names) & filesystem_names == filesystem_names
+        assert names.count("write_todos") == 1
+        assert "delete" not in names
+        assert "execute" not in names
+    assert observed_todos == [[{"content": "Check tools", "status": "in_progress"}]]
+    critic_requests = [names for names in bound_tools if "CriticFindings" in names]
+    assert critic_requests
+    assert all("write_todos" not in names for names in critic_requests)
+    assert critic_todo_presence == [False]
+
+
+@pytest.mark.asyncio
+async def test_critic_preserves_auth_context_while_private_state_is_stripped() -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+
+    child_inputs: list[dict] = []
+    child_contexts: list[AuthContext | None] = []
+
+    class _CapturingCritic(Runnable):
+        def invoke(self, input, config=None, *, context=None, **kwargs):  # noqa: ARG002
+            child_inputs.append(input)
+            child_contexts.append(context)
+            return {"messages": [AIMessage(content="critic done")]}
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):  # noqa: ARG002
+            return self.invoke(input, config, context=context, **kwargs)
+
+    class _ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    model = _ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "task",
+            "args": {
+                "description": "review the private-state boundary",
+                "subagent_type": "critic-structured",
+            },
+            "id": "tc-private-state",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="parent done"),
+    ]))
+    parent_auth = _auth_context(roles=("admin",), enforce=True)
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt="parent test",
+        middleware=[_PrivateProbeMiddleware()],
+        subagents=[{
+            "name": "critic-structured",
+            "description": "private-state boundary test",
+            "runnable": _AuthContextRunnable(_CapturingCritic()),
+        }],
+        context_schema=AuthContext,
+    )
+
+    await agent.ainvoke(
+        {"messages": [HumanMessage(content="review the boundary")]},
+        context=parent_auth,
+    )
+
+    assert len(child_inputs) == 1
+    assert "private_probe" not in child_inputs[0]
+    assert child_contexts == [parent_auth]
+    assert child_contexts[0] is parent_auth

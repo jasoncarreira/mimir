@@ -102,13 +102,6 @@ from .subagent_inbox import SubagentInbox, render_subagent_updates
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
-# Empty out deepagents' BASE_AGENT_PROMPT so it isn't appended to
-# mimir's system prompt. Mimir's prompt is the complete contract
-# (persona + memory layers + conventions + skills); the deepagents
-# generic framing competes with it. Match the SDK-era invariant of
-# "mimir's system_prompt is the only one." No-op when deepagents
-# isn't installed.
-_deepagents_patches.strip_deepagents_base_prompt()
 # Cache BaseTool->OpenAI schema conversion in DeepAgents token counting;
 # otherwise summarization middleware can rebuild Pydantic tool schemas on
 # the asyncio loop at every model boundary (chainlink #600).
@@ -1139,6 +1132,9 @@ chat history with dates — prefer for specifics), and triples \
 When the memory tool's result is truncated or incomplete, call \
 ``memory_query`` again with a more specific query.
 
+`write_file` creates a new file only. It never overwrites an existing path; \
+when the target exists, use `edit_file` instead.
+
 Think step by step:
 1. Which atoms / triples answer the question?
 2. If multiple conflict, which is most recent?
@@ -1680,6 +1676,7 @@ class Agent:
                 # built-ins — production heartbeats hit 142 tool_calls
                 # vs a budget of 120 with zero denials firing.
                 from .tools.budget_gate import BudgetGateMiddleware
+                from langchain.agents.middleware import TodoListMiddleware
                 # chainlink #266 (slice 3): on non-poller turns the model
                 # loads a skill by read_file-ing its SKILL.md; this middleware
                 # appends that skill's recorded learnings to the result. Ordered
@@ -1704,6 +1701,7 @@ class Agent:
                 # one-shot wrap-up land before the other before_model hooks.
                 from .tools.iteration_gate import IterationGateMiddleware
                 self._agent_middleware = (
+                    TodoListMiddleware(),
                     IterationGateMiddleware(),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),

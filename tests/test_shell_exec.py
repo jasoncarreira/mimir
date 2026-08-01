@@ -295,6 +295,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage, HumanMessage
 
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.access_control import ToolRegistry, create_auth_context
     from mimir.models import AgentEvent, InformationFlowLabels
     from mimir.tools._shell_env import direct_exec_env
@@ -345,6 +346,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
         }]),
         AIMessage(content="done"),
     ]))
+    install_deepagents_grep_context_tool()
     agent = create_deep_agent(
         model=model,
         tools=[shell_exec],

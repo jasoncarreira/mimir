@@ -792,6 +792,20 @@ def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
         access_control.assert_model_tool_inventory_cataloged(model_spec="openai:test")
 
 
+def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
+    assert access_control._deepagents_builtin_tool_names() == (
+        "write_todos",
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "execute",
+        "task",
+    )
+
+
 def test_inventory_assertion_rejects_uncataloged_registered_mcp_tool() -> None:
     from mimir.access_control import (
         CapabilityMatrixError,
