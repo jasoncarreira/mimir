@@ -3092,6 +3092,9 @@ def test_fetch_url_non_github_host_still_requires_exact_approval(
     "target",
     [
         "https://api.github.com@evil.host/repos/acme/widget/issues/123",
+        "https://evil.api.github.com/repos/acme/widget/issues/123",
+        "https://evil.github.com/acme/widget/pull/123",
+        "https://api.github.com./repos/acme/widget/issues/123",
         "https://github.com.evil.host/acme/widget/pull/123",
         "https://evilgithub.com/acme/widget/pull/123",
         "https://api.github.com:443/repos/acme/widget/issues/123",
