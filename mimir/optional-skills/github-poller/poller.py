@@ -1795,6 +1795,10 @@ def _check_own_mergeability(
             if key in prior:
                 new[key] = prior[key]
             continue
+        # Listing and detail retrieval are not atomic. Only the live detail
+        # response may authorize work if the PR merges between those requests.
+        if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
+            continue
         head = pr.get("head") or {}
         base = pr.get("base") or {}
         head_sha = head.get("sha") or ""

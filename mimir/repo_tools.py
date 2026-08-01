@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
+from .pr_checkout_lease import PUBLISHED_HEAD_REF
 
 
 _DEFAULT_GIT = Path("/usr/bin/git")
@@ -865,6 +866,7 @@ class RepoGitTools:
                         "git_failed",
                         reachability.stderr.strip() or "push reachability verification failed",
                     )
+                self._command(("update-ref", PUBLISHED_HEAD_REF, observed))
                 _record_agent_push(self._scope, observed)
             except GitRefusal as exc:
                 if exc.code == "git_failed":
