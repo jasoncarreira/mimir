@@ -766,18 +766,18 @@ def _reconcile_factory_runs(
             prior_obs_data = prior.fingerprint
             if prior_obs_data:
                 prior_status = "unknown"
+        status = obs.status.strip().lower()
+        is_completed_terminal = obs.is_terminal and status == "completed"
         cleanup_eligible = (
-            obs.is_terminal
-            and obs.status.strip().lower() == "completed"
+            is_completed_terminal
             and obs.validity_class == "valid"
-            and obs.liveness_class != "stale"
             and obs.pr_url
             and _is_pr_merged(obs.pr_url, repo)
         )
         is_actionable = (
-            obs.status.strip().lower() in ACTIONABLE_STATUSES
+            status in ACTIONABLE_STATUSES
             or obs.validity_class == "invalid"
-            or obs.liveness_class == "stale"
+            or (obs.liveness_class == "stale" and not is_completed_terminal)
         )
         should_alert = False
         if not prior:
@@ -794,7 +794,6 @@ def _reconcile_factory_runs(
             should_alert = True
         alert: LifecycleAlert | None = None
         if should_alert or cleanup_eligible:
-            status = obs.status.strip().lower()
             routing = "Inspect and perform only safe/reversible remediation."
             if cleanup_eligible:
                 routing += " This run is eligible for cleanup."
