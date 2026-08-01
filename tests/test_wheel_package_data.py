@@ -19,8 +19,12 @@ no ``uv`` / ``hatchling`` / ``pathspec`` dependency.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -58,6 +62,7 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/optional-skills/dependency-advisory-watch/pollers.json",  # poller manifest
     "mimir/optional-skills/dependency-advisory-watch/scanner.py",  # OSV scanning logic
     "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",  # pinned osv-scanner installer
+    "mimir/web_auth.js",  # web_ui serves this at /app/auth.js (_load_web_auth_js)
 )
 
 
@@ -165,6 +170,35 @@ def test_docs_force_included_into_wheel() -> None:
         assert (REPO_ROOT / rel).is_file(), f"seed source missing: {rel}"
 
 
+def _sdist_force_include() -> dict:
+    cfg = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    return cfg["tool"]["hatch"]["build"]["targets"]["sdist"].get("force-include", {})
+
+
+def test_sdist_carries_every_wheel_force_include_source() -> None:
+    """Every source the wheel force-includes must also ship in the sdist.
+
+    ``uv build`` (and PyPA build front-ends generally) builds the wheel FROM the
+    freshly built sdist, so a root path that only exists in the checkout is not
+    there when the wheel is assembled -- hatchling then aborts with "Forced
+    include not found". hatchling's default sdist selection ships only the
+    inferred package directory, so each source needs an explicit sdist entry at
+    the SAME relative path the wheel's force-include reads it from.
+    """
+    sdist = _sdist_force_include()
+    missing = {
+        source: sdist.get(source)
+        for source in _force_include()
+        if sdist.get(source) != source
+    }
+    assert not missing, (
+        "these wheel force-include sources are not carried by the sdist at the "
+        f"same path, so `uv build` cannot assemble the wheel: {missing}. Add "
+        "them to [tool.hatch.build.targets.sdist.force-include] mapped to "
+        "themselves."
+    )
+
+
 def test_doc_seed_enumerates_operator_docs_excluding_internal() -> None:
     from mimir import doc_seed
 
@@ -176,3 +210,44 @@ def test_doc_seed_enumerates_operator_docs_excluding_internal() -> None:
     assert "docs/.env.example" in rels
     # docs/internal/ is never seeded into the home
     assert not any(r.startswith("docs/internal") or "internal" in r for r in rels)
+
+
+def test_include_covers_every_tracked_package_file() -> None:
+    """The sdist ships only what ``include`` matches -- so it must match everything.
+
+    The wheel target sets ``packages = ["mimir"]``, which bypasses the global
+    ``include`` allowlist and ships the whole tracked package tree. The sdist has
+    no such override, so ``include`` alone decides its contents -- and ``uv
+    build`` assembles the published wheel FROM the sdist. Any tracked file under
+    ``mimir/`` that no pattern matches is therefore present in a direct wheel and
+    absent from a released one, which is exactly how ``mimir/web_auth.js``
+    (served at ``/app/auth.js``) came to be missing from the published 0.6.9
+    wheel. Assert parity for the whole tree rather than one file at a time.
+    """
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git unavailable; cannot enumerate tracked files")
+    proc = subprocess.run(
+        [git, "-C", str(REPO_ROOT), "ls-files", "-z", "mimir/"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"not a git checkout; cannot enumerate tracked files: {proc.stderr.strip()}")
+    tracked = [f for f in proc.stdout.split("\0") if f]
+    assert tracked, "git ls-files returned no files under mimir/"
+
+    include, exclude = _build_include_exclude()
+    inc = [_gitwildmatch_to_regex(p) for p in include]
+    exc = [_gitwildmatch_to_regex(p) for p in exclude]
+    uncovered = [
+        rel
+        for rel in tracked
+        if not any(r.match(rel) for r in inc) and not any(r.match(rel) for r in exc)
+    ]
+    assert not uncovered, (
+        "these tracked package files match no [tool.hatch.build].include pattern, "
+        "so they ship in a direct wheel but NOT in the sdist -- and the published "
+        f"wheel is built from the sdist: {uncovered}. Add a covering include glob "
+        "(or an explicit exclude if the file genuinely must not ship)."
+    )
