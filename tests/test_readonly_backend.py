@@ -9,6 +9,8 @@ working against the full home tree.
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,18 +18,18 @@ import pytest
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain_core.messages import ToolMessage
 
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.models import AuthContext
+from mimir.read_policy import framework_large_tool_results_root
 from mimir.readonly_backend import (
-    FileToolRouter,
     MAX_GREP_CONTEXT_LINES,
+    FileToolRouter,
     MimirFilesystemMiddleware,
     ReadOnlyFilesystemBackend,
     WriteGuardBackend,
     _RootAwareFilesystemBackend,
     build_file_tool_routes,
 )
-from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import AuthContext
-from mimir.read_policy import framework_large_tool_results_root
 
 
 @pytest.fixture
@@ -278,15 +280,16 @@ class TestWriteGuardBackend:
         r = b.write(file_path="/state/escape/evil.txt", content="no")
         assert "Write blocked" in (getattr(r, "error", "") or "")
 
-    def test_allows_internal_symlink(self, home: Path) -> None:
-        # A symlink that points back into the same writable root is
-        # fine — the resolved target is still under ``state``.
+    def test_blocks_internal_symlink(self, home: Path) -> None:
         (home / "state" / "sub").mkdir()
         link = home / "state" / "alias"
         link.symlink_to(home / "state" / "sub", target_is_directory=True)
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
         r = b.write(file_path="/state/alias/note.txt", content="ok")
-        assert getattr(r, "error", None) is None
+        assert r.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
+        assert not (home / "state" / "sub" / "note.txt").exists()
 
     def test_prefix_collision_does_not_grant_access(self, home: Path) -> None:
         # writable_dirs=["state"] must NOT match ``state-backup/`` — the
@@ -380,36 +383,392 @@ class TestWriteGuardBackend:
             b.some_future_mutator  # noqa: B018
         # Known read methods still forward.
         assert callable(b.read)
-        assert callable(b.ls_info)
+        assert callable(b.ls)
 
-    def test_deepagents_06_async_fs_methods_forward(self, home: Path) -> None:
-        """deepagents 0.6+ exposes high-level ``als`` / ``agrep`` /
-        ``aglob`` wrappers (return tool-friendly result types) on top
-        of the pre-0.6 low-level ``*_info`` / ``*_raw`` variants. The
-        agent's filesystem tools call the high-level names. Pre-fix,
-        ``WriteGuardBackend`` allowlisted only the low-level variants,
-        so an agent on deepagents 0.6+ hit ``AttributeError:
-        WriteGuardBackend does not forward 'agrep'`` on any grep call.
-
-        Caught during muninn-mimir cutover 2026-05-20 (the heartbeat
-        skill called ``agrep`` and crashed).
-
-        All six methods are read-only (audited against
-        ``deepagents/backends/composite.py``); allowlisting them is
-        safe."""
+    def test_current_async_fs_methods_forward(self, home: Path) -> None:
         b = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
-        # Sync read wrappers
         assert callable(b.ls)
         assert callable(b.grep)
         assert callable(b.glob)
-        # Async read wrappers (the ones the agent typically uses)
         assert callable(b.als)
         assert callable(b.agrep)
         assert callable(b.aglob)
-        # Existing low-level variants still forward (back-compat).
-        assert callable(b.ls_info)
-        assert callable(b.grep_raw)
-        assert callable(b.aglob_info)
+        for obsolete in (
+            "ls_info", "als_info", "glob_info", "aglob_info", "grep_raw", "agrep_raw",
+        ):
+            with pytest.raises(AttributeError):
+                getattr(b, obsolete)
+
+
+class TestCreateOnlyWrites:
+    def test_middleware_dispatches_only_approved_filesystem_tools(
+        self, home: Path,
+    ) -> None:
+        middleware = MimirFilesystemMiddleware(
+            backend=WriteGuardBackend(home, ["state"]),
+            tools=["read_file", "delete"],
+            custom_tool_descriptions={"write_file": "overwrite anything"},
+        )
+
+        assert [tool.name for tool in middleware.tools] == [
+            "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute",
+        ]
+        write_tool = next(tool for tool in middleware.tools if tool.name == "write_file")
+        assert write_tool.description == (
+            "Creates a new file and writes the supplied content. It never overwrites an "
+            "existing path; when the target exists, use `edit_file` instead. Parent "
+            "directories are created as needed."
+        )
+
+    def test_home_collision_uses_canonical_virtual_path_without_audit(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.models import TurnContext
+
+        target = home / "state" / "existing.txt"
+        target.write_text("original", encoding="utf-8")
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = WriteGuardBackend(home, ["state"])
+
+        token = set_current_turn(TurnContext(
+            turn_id="collision-turn",
+            session_id="session",
+            trigger="user_message",
+            channel_id="discord-channel",
+            started_at=0.0,
+        ))
+        try:
+            result = backend.write(str(target), "replacement")
+        finally:
+            reset_current_turn(token)
+
+        assert result.error == (
+            "File '/state/existing.txt' already exists. Use edit_file to modify existing files."
+        )
+        assert target.read_text(encoding="utf-8") == "original"
+        assert backend.drain_denials() == []
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_home_async_collision_uses_canonical_virtual_path(self, home: Path) -> None:
+        target = home / "state" / "existing-async.txt"
+        target.write_text("original", encoding="utf-8")
+        backend = WriteGuardBackend(home, ["state"])
+
+        result = await backend.awrite(str(target), "replacement")
+
+        assert result.error == (
+            "File '/state/existing-async.txt' already exists. Use edit_file to modify "
+            "existing files."
+        )
+        assert target.read_text(encoding="utf-8") == "original"
+        assert backend.drain_denials() == []
+
+    @pytest.mark.asyncio
+    async def test_routed_sync_and_async_collisions_name_original_requests(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        route = tmp_path / "route"
+        route.mkdir()
+        (route / "sync.txt").write_text("sync", encoding="utf-8")
+        (route / "async.txt").write_text("async", encoding="utf-8")
+        router = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"]),
+            routes=build_file_tool_routes([(str(route), "rw")]),
+        )
+        sync_path = str(route / "sync.txt")
+        async_path = str(route / "async.txt")
+
+        sync_result = router.write(sync_path, "changed")
+        async_result = await router.awrite(async_path, "changed")
+
+        assert sync_result.error == (
+            f"File '{sync_path}' already exists. Use edit_file to modify existing files."
+        )
+        assert async_result.error == (
+            f"File '{async_path}' already exists. Use edit_file to modify existing files."
+        )
+        assert sync_result.error != (
+            "File '/sync.txt' already exists. Use edit_file to modify existing files."
+        )
+        assert async_result.error != (
+            "File '/async.txt' already exists. Use edit_file to modify existing files."
+        )
+        assert (route / "sync.txt").read_text(encoding="utf-8") == "sync"
+        assert (route / "async.txt").read_text(encoding="utf-8") == "async"
+
+    @pytest.mark.parametrize("depth", [0, 1, 2])
+    def test_intermediate_symlink_at_every_depth_is_refused(
+        self, tmp_path: Path, depth: int,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        components = ["one", "two", "three"]
+        parent = root
+        for component in components[:depth]:
+            parent = parent / component
+            parent.mkdir()
+        decoy = outside / f"decoy-{depth}"
+        decoy.mkdir()
+        remaining = decoy
+        for component in components[depth + 1:]:
+            remaining = remaining / component
+            remaining.mkdir()
+        (parent / components[depth]).symlink_to(decoy, target_is_directory=True)
+        backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+
+        result = backend.write("/one/two/three/result.txt", "blocked")
+
+        assert result.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
+        assert not (remaining / "result.txt").exists()
+
+    @pytest.mark.parametrize("kind", ["file", "directory", "dangling"])
+    def test_final_symlink_is_refused_without_changing_target(
+        self, tmp_path: Path, kind: str,
+    ) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "target"
+        if kind == "file":
+            target.write_text("original", encoding="utf-8")
+        elif kind == "directory":
+            target.mkdir()
+        link = root / "link"
+        link.symlink_to(target, target_is_directory=kind == "directory")
+        backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+
+        result = backend.write("/link", "blocked")
+
+        assert result.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
+        if kind == "file":
+            assert target.read_text(encoding="utf-8") == "original"
+        elif kind == "directory":
+            assert list(target.iterdir()) == []
+        else:
+            assert not target.exists()
+
+    def test_non_directory_intermediate_component_is_refused(self, tmp_path: Path) -> None:
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "component").write_text("original", encoding="utf-8")
+        backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+
+        result = backend.write("/component/result.txt", "blocked")
+
+        assert result.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
+        assert (root / "component").read_text(encoding="utf-8") == "original"
+
+    def test_swap_before_component_open_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        (root / "one").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        (outside / "two").mkdir(parents=True)
+        backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+        real_open = os.open
+        swapped = False
+
+        def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if path == "one" and dir_fd is not None and not swapped:
+                swapped = True
+                (root / "one").rename(root / "original-one")
+                (root / "one").symlink_to(outside, target_is_directory=True)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr("mimir.readonly_backend.os.open", swapping_open)
+
+        result = backend.write("/one/two/result.txt", "blocked")
+
+        assert result.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
+        assert not (outside / "two" / "result.txt").exists()
+
+    def test_swap_after_component_open_cannot_redirect_later_operations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        (root / "one").mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+        real_open = os.open
+        swapped = False
+
+        def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path == "one" and dir_fd is not None and not swapped:
+                swapped = True
+                (root / "one").rename(root / "opened-one")
+                (root / "one").symlink_to(outside, target_is_directory=True)
+            return descriptor
+
+        monkeypatch.setattr("mimir.readonly_backend.os.open", swapping_open)
+
+        result = backend.write("/one/two/result.txt", "created")
+
+        assert result.error is None
+        assert (root / "opened-one" / "two" / "result.txt").read_text() == "created"
+        assert not (outside / "two").exists()
+
+    def test_descriptor_walk_uses_required_flags_and_modes(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        backend = WriteGuardBackend(home, ["state"])
+        real_open = os.open
+        real_mkdir = os.mkdir
+        open_calls = []
+        mkdir_calls = []
+
+        def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+            open_calls.append((path, flags, mode, dir_fd))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        def recording_mkdir(path, mode=0o777, *, dir_fd=None):
+            mkdir_calls.append((path, mode, dir_fd))
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr("mimir.readonly_backend.os.open", recording_open)
+        monkeypatch.setattr("mimir.readonly_backend.os.mkdir", recording_mkdir)
+
+        result = backend.write("/state/alpha/beta/result.txt", "line\n")
+
+        assert result.error is None
+        assert open_calls[0][1] == os.O_RDONLY | os.O_DIRECTORY
+        intermediate = open_calls[1:-1]
+        assert [call[0] for call in intermediate] == ["state", "alpha", "beta"]
+        assert all(
+            call[1] == os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            for call in intermediate
+        )
+        final = open_calls[-1]
+        assert final[0] == "result.txt"
+        assert final[1] == os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        assert final[1] & os.O_TRUNC == 0
+        assert final[2] == 0o644
+        assert [call[1] for call in mkdir_calls] == [0o777, 0o777, 0o777]
+
+    def test_missing_descriptor_primitives_fail_closed(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd - {os.open})
+        backend = WriteGuardBackend(home, ["state"])
+
+        result = backend.write("/state/result.txt", "blocked")
+
+        assert result.error == (
+            "Write failed: descriptor-relative file creation is unsupported on this platform."
+        )
+        assert not (home / "state" / "result.txt").exists()
+        assert backend.drain_denials() == []
+
+    def test_concurrent_creators_have_one_success_and_exact_collisions(
+        self, home: Path,
+    ) -> None:
+        backend = WriteGuardBackend(home, ["state"])
+        expected = (
+            "File '/state/race.txt' already exists. Use edit_file to modify existing files."
+        )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda value: backend.write("/state/race.txt", value),
+                [f"creator-{index}" for index in range(8)],
+            ))
+
+        assert sum(result.error is None for result in results) == 1
+        assert [result.error for result in results].count(expected) == 7
+        assert (home / "state" / "race.txt").read_text().startswith("creator-")
+        assert backend.drain_denials() == []
+
+    @pytest.mark.parametrize(
+        ("file_path", "writable_dirs", "expected_op", "expected_reason"),
+        [
+            ("/logs/blocked.txt", ["state"], "write", "filesystem_target_not_writable"),
+            ("/prompts/blocked.txt", ["state"], "write_prompts_readonly", "prompts_readonly"),
+            ("/memory/core/blocked.txt", ["memory"], "write_core_memory_readonly", "core_memory_readonly"),
+            ("/state/identities.yaml", ["state"], "write_identities_protected", "identities_protected"),
+            ("/state/../logs/blocked.txt", ["state"], "write", "filesystem_target_not_writable"),
+        ],
+    )
+    def test_authorization_denial_audit_and_turn_precede_creation(
+        self,
+        home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        file_path: str,
+        writable_dirs: list[str],
+        expected_op: str,
+        expected_reason: str,
+    ) -> None:
+        from mimir.models import TurnContext
+
+        (home / "memory" / "core").mkdir()
+        events = []
+        monkeypatch.setattr(
+            "mimir.tools.budget_gate._emit_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = WriteGuardBackend(home, writable_dirs)
+        token = set_current_turn(TurnContext(
+            turn_id="authorization-turn",
+            session_id="session",
+            trigger="user_message",
+            channel_id="discord-channel",
+            started_at=0.0,
+        ))
+        try:
+            result = backend.write(file_path, "blocked")
+        finally:
+            reset_current_turn(token)
+
+        assert result.error
+        denial = backend.drain_denials()
+        assert [(entry["op"], entry["turn_id"]) for entry in denial] == [
+            (expected_op, "authorization-turn"),
+        ]
+        hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
+        assert hard["reason"] == expected_reason
+
+    def test_empty_rendering_and_read_pagination_contract(self, home: Path) -> None:
+        (home / "page.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        middleware = MimirFilesystemMiddleware(backend=WriteGuardBackend(home, ["state"]))
+        tools = {tool.name: tool for tool in middleware.tools}
+        runtime = SimpleNamespace(tool_call_id="filesystem-rendering")
+
+        ls_result = tools["ls"].func(path="/state", runtime=runtime)
+        glob_result = tools["glob"].func(pattern="*.missing", path="/", runtime=runtime)
+        read_result = tools["read_file"].func(
+            file_path="/page.txt", offset=1, limit=2, runtime=runtime,
+        )
+        zero_result = tools["read_file"].func(
+            file_path="/page.txt", offset=0, limit=0, runtime=runtime,
+        )
+
+        assert ls_result.content == "No files found"
+        assert glob_result.content == "No files found"
+        assert read_result.content == (
+            "2  two\n3  three\n\n[Read 2 lines (lines 2-3 of 4 total). "
+            "1 line remaining from offset 3.]"
+        )
+        assert "no lines were read because `limit` was 0" in zero_result.content
 
 
 class TestCoreMemoryReflectionGate:
@@ -808,6 +1167,8 @@ class TestBuildFileToolRoutes:
         assert set(routes) == {str(rw) + "/", str(ro) + "/"}
         assert isinstance(routes[str(rw) + "/"], _RootAwareFilesystemBackend)
         assert isinstance(routes[str(ro) + "/"], ReadOnlyFilesystemBackend)
+        assert routes[str(rw) + "/"].virtual_mode is True
+        assert routes[str(ro) + "/"]._fs.virtual_mode is True
 
     def test_grep_skips_vendor_and_vcs_subtrees(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
@@ -1150,7 +1511,9 @@ class TestFileToolRouter:
         assert secret.read_text() == "SECRET\n"
 
         w = router.write(f"{repo}/escape/new.txt", "LEAK\n")
-        assert "outside the file-tool root" in (w.error or "")
+        assert w.error == (
+            "Write blocked: path contains a symbolic-link or non-directory component."
+        )
         assert not (outside / "new.txt").exists()
 
     def test_ro_route_blocks_writes_allows_reads(self, tmp_path: Path) -> None:
@@ -1176,6 +1539,12 @@ class TestFileToolRouter:
         # /logs is not a writable dir under the home → write denied + recorded
         router.write("/logs/x.txt", "no")
         assert any(d["op"] == "write" for d in router.drain_denials())
+
+    def test_programmatic_delete_methods_remain_inherited(self) -> None:
+        from deepagents.backends.composite import CompositeBackend
+
+        assert FileToolRouter.delete is CompositeBackend.delete
+        assert FileToolRouter.adelete is CompositeBackend.adelete
 
     @pytest.mark.asyncio
     async def test_broad_grep_keeps_default_and_route_matches_when_later_route_caps(

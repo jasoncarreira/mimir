@@ -79,6 +79,7 @@ Every SKILL.md begins with YAML frontmatter delimited by `---` lines. The parser
 | `name` | yes | string | The skill's short identifier (matches the directory name). |
 | `description` | yes | string | Trigger description — what the skill does + exact "when to use" cues + what it should NOT be used for. Single line is safest; if you need length, use plain quoted strings (NOT YAML folded `>` blocks — those have a known parser pitfall, see "Gotchas" below). |
 | `success_criteria` | optional | dict | Operator-declared "did the skill's procedure actually run?" test for outcome telemetry. See `mimir/skill_outcomes.py:SkillSuccessCriteria` for the shape (`any_of` list of `tool_call` patterns, with `name` + optional `args` / `args_glob`). Skills with a clear declarative completion signal benefit from declaring this; meta-cognitive skills can omit it. |
+| `allowed-tools` | optional | string or list | Descriptive tool names rendered with the skill. This metadata does not authorize or restrict request tools. |
 
 ## The `<!-- desc: -->` first-body-line convention
 
@@ -99,14 +100,11 @@ Conventions:
 
 The conformance test (`test_skill_md_body_starts_with_desc_comment` in `tests/test_skill_conformance.py`) enforces this — a missing `<!-- desc: -->` is a CI failure (chainlink #102). The line is required; the indexer's `[auto]` fallback path is a lint-only safety net, not a production path.
 
-## Why no `allowed-tools` field
+## `allowed-tools` metadata
 
-Earlier versions of mimir tracked an `allowed-tools` frontmatter field listing the tools each skill's body documented using. It got removed 2026-05-23 because:
+`allowed-tools` is optional descriptive metadata. It accepts either a scalar with space- or comma-separated tool names or a YAML list of tool-name strings. DeepAgents normalizes both forms and renders the names in the skill listing.
 
-1. **deepagents' SkillsMiddleware silently rejected it.** The parser only accepts the space-separated string form (per the Anthropic Agent Skills spec); mimir used the YAML-list form. Every parse logged "Ignoring non-string 'allowed-tools'" at DEBUG level (invisible at INFO) and treated the field as empty.
-2. **No runtime enforcement existed.** The original PR #264 spike compiled `allowed-tools`-declaring skills into restricted-tool SubAgents — but the LLMs routed around delegation in production (PR #271), so the SubAgent path was ripped out.
-
-The skill body still describes which tools the procedure uses in prose; that documentation is the supported pattern today. Use `success_criteria` to *measure* whether the canonical tool actually fired.
+This field is not an authorization boundary. It does not add, remove, restrict, or grant request tools. Runtime tool availability and authorization come from the agent graph, middleware, and access-control policy. Use the field to help readers understand the expected procedure, describe tool use in the body, and use `success_criteria` to measure whether the canonical tool actually fired.
 
 ## Skills that send a message to a specific channel
 

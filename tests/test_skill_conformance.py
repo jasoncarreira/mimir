@@ -14,13 +14,10 @@ Schema today (minimum spine):
   description: <non-empty, prose preferred>
   ---
 
-The ``allowed-tools:`` field used to live here (chainlink #79 / G3)
-but was removed 2026-05-23 — deepagents' SkillsMiddleware silently
-rejected mimir's YAML-list form (string-only per Anthropic Agent
-Skills spec), so the field never rendered in the catalog and had no
-runtime enforcement. After the SubAgent delegation rip-out (PR #271)
-there was no remaining consumer for the field; it got dropped along
-with its conformance audit.
+The optional ``allowed-tools:`` field accepts scalar and YAML-list
+forms. DeepAgents normalizes and renders it as descriptive metadata;
+it does not remove, restrict, grant, or otherwise authorize request
+tools.
 """
 
 from __future__ import annotations
@@ -28,6 +25,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from deepagents.backends import FilesystemBackend
+from deepagents.middleware.skills import SkillsMiddleware
+from deepagents.middleware.skills import (
+    _parse_skill_metadata as _da_parse_skill_metadata,
+)
+from langchain.agents.middleware.types import ModelRequest
 
 from mimir.skill_md import (
     parse_frontmatter as _parse_frontmatter,
@@ -177,26 +180,6 @@ def test_parse_frontmatter_folded_block_rejects_unindented_continuation() -> Non
     )
     with pytest.raises(ValueError, match="folded-scalar continuation"):
         _parse_frontmatter(text)
-
-
-
-
-# ─── runtime-loader conformance (#502) ────────────────────────────────
-#
-# Parse each SKILL.md with the SAME function the runtime uses — deepagents'
-# ``_parse_skill_metadata`` — so green CI GUARANTEES the skill is actually
-# loadable, not just well-formed by mimir's lenient tooling. The prior gate
-# used ``text.split('---', 2)``, which diverges from deepagents' frontmatter
-# regex (``^---\s*\n(.*?)\n---\s*\n``): a SKILL.md ending exactly at the closing
-# ``---`` with no trailing newline PASSED the old check but is dropped at
-# runtime (the invisible-skill failure this test exists to prevent), and a
-# ``---`` inside a frontmatter value made split() truncate and wrongly FAIL a
-# valid skill. Calling the runtime parser removes the drift entirely; if
-# deepagents moves the loader, the import breaks loudly so the gate is updated.
-from deepagents.middleware.skills import (  # noqa: E402
-    _parse_skill_metadata as _da_parse_skill_metadata,
-)
-
 _OPTIONAL_SKILLS_ROOT = Path(__file__).parent.parent / "mimir" / "optional-skills"
 
 
@@ -233,3 +216,73 @@ def test_skill_md_is_runtime_loadable(skill_md: Path) -> None:
         f"{skill_md}: frontmatter name '{meta_name}' must match folder '{folder}'. "
         f"The folder name is the canonical identifier — rename one to match."
     )
+
+
+@pytest.mark.parametrize(
+    ("allowed_tools", "expected"),
+    [
+        ("allowed-tools: read_file, grep write_file", ["read_file", "grep", "write_file"]),
+        (
+            "allowed-tools:\n  - read_file\n  - grep\n  - write_file",
+            ["read_file", "grep", "write_file"],
+        ),
+    ],
+    ids=["scalar", "list"],
+)
+def test_allowed_tools_scalar_and_list_are_normalized_and_rendered(
+    tmp_path: Path, allowed_tools: str, expected: list[str],
+) -> None:
+    content = (
+        "---\n"
+        "name: example\n"
+        "description: Example skill.\n"
+        f"{allowed_tools}\n"
+        "---\n"
+        "Body\n"
+    )
+    metadata = _da_parse_skill_metadata(content, "/skills/example/SKILL.md", "example")
+
+    assert metadata is not None
+    assert metadata["allowed_tools"] == expected
+    middleware = SkillsMiddleware(
+        backend=FilesystemBackend(root_dir=tmp_path, virtual_mode=True),
+        sources=["/skills"],
+    )
+    rendered = middleware._format_skills_list([metadata])
+    assert f"Allowed tools: {', '.join(expected)}" in rendered
+
+
+def test_allowed_tools_metadata_does_not_authorize_or_remove_request_tools(
+    tmp_path: Path,
+) -> None:
+    content = (
+        "---\n"
+        "name: example\n"
+        "description: Example skill.\n"
+        "allowed-tools: read_file\n"
+        "---\n"
+        "Body\n"
+    )
+    metadata = _da_parse_skill_metadata(content, "/skills/example/SKILL.md", "example")
+    assert metadata is not None
+    request_tools = [
+        {"type": "function", "function": {"name": "read_file"}},
+        {"type": "function", "function": {"name": "admin_only"}},
+    ]
+    request = ModelRequest(
+        model=object(),
+        messages=[],
+        system_prompt="base",
+        tools=request_tools,
+        state={"skills_metadata": [metadata]},
+    )
+    middleware = SkillsMiddleware(
+        backend=FilesystemBackend(root_dir=tmp_path, virtual_mode=True),
+        sources=["/skills"],
+    )
+
+    modified = middleware.modify_request(request)
+
+    assert modified.tools == request_tools
+    assert "Allowed tools: read_file" in modified.system_prompt
+    assert "admin_only" not in modified.system_prompt
