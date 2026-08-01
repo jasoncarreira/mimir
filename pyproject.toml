@@ -153,6 +153,18 @@ packages = ["mimir"]
 "README.md" = "mimir/bundled_docs/README.md"
 ".env.example" = "mimir/bundled_docs/.env.example"
 
+# ...and the sdist must CARRY those root paths, because `uv build` builds the
+# wheel FROM the freshly built sdist. With no sdist config, hatchling's default
+# file selection ships only the inferred `mimir/` package, so all three sources
+# were absent and the wheel-from-sdist step died with "Forced include not found"
+# (`.env.example` merely being the first one alphabetically). Mapping each path
+# to itself only ADDS to the default selection -- an `include` allowlist here
+# would instead narrow it and risk silently dropping package data.
+[tool.hatch.build.targets.sdist.force-include]
+"docs" = "docs"
+"README.md" = "README.md"
+".env.example" = ".env.example"
+
 [tool.hatch.build]
 # The built React app (mimir/react_app/dist/) is a VCS-IGNORED build artifact:
 # frontend bundles are gitignored, only mimir/react_app/.gitkeep is tracked.
@@ -209,6 +221,16 @@ include = [
     "mimir/ops_dashboard.html",
     "mimir/saga_dashboard.html",
     "mimir/file_memory_dashboard.html",
+    # web_ui serves this verbatim at /app/auth.js (`_load_web_auth_js` reads it
+    # from the installed package). It matched no glob above, so it shipped in a
+    # DIRECT wheel -- where the wheel target's `packages = ["mimir"]` bypasses
+    # this allowlist -- but not in the sdist, and therefore not in the wheel
+    # `uv build` assembles FROM the sdist. The published 0.6.9 wheel has no
+    # mimir/web_auth.js at all, so /app/auth.js is broken on a fresh install.
+    "mimir/web_auth.js",
+    # Inert VCS placeholder, listed only so the sdist carries every tracked file
+    # the wheel does and the parity guard needs no exemption list.
+    "mimir/react_app/.gitkeep",
 ]
 # Belt-and-suspenders: nothing under ``deepagent_poc/`` (deleted in
 # the cutover, but the exclude prevents accidental re-add from sneaking
