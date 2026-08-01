@@ -858,7 +858,10 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         prompt="-starts with dash",
         rules=None,
         timeout_s=30,
-        env={"PATH": "/bin"},
+        env={
+            "PATH": "/bin",
+            "MIMIR_MODEL_SPEC": "codex-plus:gpt-5.6-luna",
+        },
         transcript_root=transcript_root,
     )
 
@@ -868,7 +871,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         repo_url="git@github.com:jasoncarreira/mimir.git",
         base_ref="main",
         branch="issue/782-a1",
-        test_command="echo ok",
+        test_command="uv run pytest -q",
     )
     compute = LocalSubprocessComputeBackend()
     handle = await compute.launch(spec)
@@ -884,6 +887,8 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert calls[0]["args"].count("-m") == 1
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
     assert spec.backend_config["model_diverged"] is False
+    assert spec.test_command == "uv run pytest -q"
+    assert "MIMIR_MODEL_SPEC" not in calls[0]["kwargs"]["env"]
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
     assert permission == {
         "external_directory": {"/**": "deny"},
@@ -1093,7 +1098,11 @@ def test_registry_keeps_and_logs_python_default_bash_allowlist(
 
 @pytest.mark.parametrize(
     ("test_command", "runner_pattern"),
-    [("npm test", "npm *"), ("./gradlew test", "./gradlew *")],
+    [
+        ("npm test", "npm *"),
+        ("go test ./...", "go *"),
+        ("./gradlew test", "./gradlew *"),
+    ],
 )
 def test_registry_derives_only_configured_non_python_runner(
     monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str
@@ -1139,7 +1148,16 @@ def test_operator_bash_allowlist_beats_derivation() -> None:
     assert backend.bash_allowlist == ("npm test",)
 
 
-@pytest.mark.parametrize("test_command", ["bash -c 'npm test'", "make test"])
+@pytest.mark.parametrize(
+    "test_command",
+    [
+        "env -u MIMIR_MODEL_SPEC uv run pytest -q",
+        "make test",
+        "sh -c 'npm test'",
+        "bash -c 'npm test'",
+        "python -m pytest",
+    ],
+)
 def test_registry_refuses_nonderivable_test_runner(test_command: str) -> None:
     config = WorklinkConfig(defaults=WorklinkDefaults(test_command=test_command))
 

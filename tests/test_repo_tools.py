@@ -997,7 +997,7 @@ def test_constructor_refuses_unbounded_execution_and_untrusted_git_pins(tmp_path
         RepoGitTools(state, git_executable=not_executable)
 
 
-def _configure_worklink_test(home: Path, command: str = "env -u MIMIR_MODEL_SPEC /usr/bin/true -q") -> None:
+def _configure_worklink_test(home: Path, command: str = "/usr/bin/true -q") -> None:
     home.mkdir(exist_ok=True)
     (home / "worklink.yaml").write_text(
         f"defaults:\n  test_command: {command}\n",
@@ -1038,9 +1038,8 @@ def test_project_test_home_is_writable_and_fresh_per_execution(
 ) -> None:
     """HOME must be writable, and a different directory each execution.
 
-    Observed live on 2026-07-31: the configured runner
-    ``env -u MIMIR_MODEL_SPEC uv run pytest -q`` failed before reaching pytest
-    because uv could not create ``$HOME/.cache/uv`` under ``/nonexistent``.
+    Observed live on 2026-07-31: uv failed before reaching pytest because it
+    could not create ``$HOME/.cache/uv`` under ``/nonexistent``.
     """
     _origin, _source, _scope, state, _tools = repo_tools
     home = tmp_path / "home"
