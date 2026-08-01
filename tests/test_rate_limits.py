@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -431,6 +432,35 @@ def test_current_keeps_entries_without_resets_at(tmp_path: Path):
     }))
     current = RateLimitStore(path=path).current()
     assert "overage" in current
+
+
+def test_current_uses_reset_after_when_reset_at_missing(tmp_path: Path):
+    observed = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+    store = RateLimitStore(tmp_path / "rate_limits.json")
+    store.record_sync("openai_five_hour", RateLimitSnapshot(
+        status="allowed_warning", utilization=1.0,
+        reset_after_seconds=60,
+        observed_at=observed.isoformat(),
+    ))
+    assert "openai_five_hour" not in store.current()
+
+
+def test_current_bounds_implausible_reset_and_malformed_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    path = tmp_path / "rate_limits.json"
+    path.write_text(json.dumps({
+        "openai_five_hour": {
+            "status": "rejected", "utilization": 1.0,
+            "resets_at": int(time.time()) + 365 * 86400,
+            "observed_at": "not-a-time",
+        },
+    }))
+    old = time.time() - 6 * 3600
+    path.touch()
+    import os
+    os.utime(path, (old, old))
+    assert RateLimitStore(path).current() == {}
 
 
 def test_current_returns_empty_when_file_missing(tmp_path: Path):

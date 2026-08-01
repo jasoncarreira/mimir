@@ -985,6 +985,17 @@ def test_register_callable_installs_at_default_cron(tmp_path: Path):
     assert "demo" in sched.registered_callables()
 
 
+def test_codex_usage_poll_is_named_single_instance_callable(tmp_path: Path):
+    async def noop(_e):
+        return True
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    assert sched.add_codex_usage_poll_job(object(), "*/3 * * * *")
+    assert "codex-usage-poll" in sched.registered_callables()
+    cdef = sched._callables["codex-usage-poll"]
+    assert cdef.max_instances == 1
+    assert cdef.coalesce is True
+
+
 def test_register_callable_skips_install_when_cron_empty(tmp_path: Path):
     """Empty default cron + no yaml override → no APScheduler job
     installed; registration still recorded (so a yaml entry can later

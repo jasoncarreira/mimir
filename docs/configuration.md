@@ -186,6 +186,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_INTROSPECTION_HEALTH_THRESHOLD` | float | `0.80` | Health-score threshold in the report. |
 | `MIMIR_INTROSPECTION_EMIT_ALGEDONIC` | bool | `true` | Whether the report emits algedonic events. |
 | `MIMIR_OAUTH_USAGE_POLL_CRON` | cron | `*/3 * * * *` | Anthropic OAuth usage poller. Empty disables. |
+| `MIMIR_CODEX_USAGE_POLL_CRON` | cron | `*/3 * * * *` | Non-generative Codex account quota refresh. Empty disables. |
 | `MIMIR_OAUTH_REFRESH_WARN_DAYS` | int | `25` | Credential age (days) at which `oauth_refresh_token_age_warn` fires. |
 | `MIMIR_MINIMAX_USAGE_POLL_CRON` | cron | `""` (off) | Minimax usage poller. Opt in with a cron + `MINIMAX_API_KEY`. |
 | `MIMIR_MINIMAX_USAGE_MODEL` | str | `general` | Minimax `coding_plan/remains` bucket (`general` chat, `video`). |

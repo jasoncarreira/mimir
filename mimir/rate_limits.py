@@ -59,6 +59,17 @@ from .quota_windows import (
 log = logging.getLogger(__name__)
 
 
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[Path, threading.RLock] = {}
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    """Return the process-wide writer lock for one store path."""
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(resolved, threading.RLock())
+
+
 def running_on_claude_max() -> bool:
     """True iff the agent appears to be configured for Claude Max
     OAuth — the only config where ``ClaudeSDKClient.get_context_usage()``
@@ -102,6 +113,7 @@ class RateLimitSnapshot:
     status: str  # "allowed" | "allowed_warning" | "rejected"
     utilization: float | None = None
     resets_at: int | None = None
+    reset_after_seconds: int | None = None
     observed_at: str = ""
     overage_status: str | None = None
     overage_resets_at: int | None = None
@@ -119,7 +131,13 @@ class RateLimitStore:
 
     path: Path
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    _thread_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _thread_lock: threading.RLock = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Agent callbacks and scheduler pollers may construct separate store
+        # objects for the same file. Atomic rename prevents corruption, but a
+        # shared lock also prevents stale read-modify-write lost updates.
+        self._thread_lock = _path_lock(self.path)
 
     async def record(
         self,
@@ -135,12 +153,13 @@ class RateLimitStore:
         Writes are atomic (temp + rename) so a crash mid-write cannot
         corrupt the file."""
         async with self._lock:
-            data = self._load()
-            data[rate_limit_type] = asdict(snapshot)
-            try:
-                atomic_write_json(self.path, data)
-            except OSError as exc:
-                log.warning("rate_limits.json write failed: %s", exc)
+            with self._thread_lock:
+                data = self._load()
+                data[rate_limit_type] = asdict(snapshot)
+                try:
+                    atomic_write_json(self.path, data)
+                except OSError as exc:
+                    log.warning("rate_limits.json write failed: %s", exc)
 
     def record_sync(
         self,
@@ -206,17 +225,48 @@ class RateLimitStore:
         (the SDK doesn't always populate it; surface what we have)."""
         data = self._load()
         now = int(time.time())
+        try:
+            file_mtime = self.path.stat().st_mtime
+        except OSError:
+            file_mtime = float(now)
+        window_hours = store_window_hours()
         out: dict[str, RateLimitSnapshot] = {}
         for key, raw in data.items():
             if not isinstance(raw, dict):
                 continue
-            resets_at = raw.get("resets_at")
-            if isinstance(resets_at, (int, float)) and resets_at < now:
+            resets_at = _as_timestamp(raw.get("resets_at"))
+            reset_after = _as_positive_int(raw.get("reset_after_seconds"))
+            observed_epoch = _observed_epoch(raw.get("observed_at"))
+            anchor = observed_epoch if observed_epoch is not None else file_mtime
+            nominal_seconds = window_hours.get(key)
+            nominal_seconds = nominal_seconds * 3600 if nominal_seconds is not None else None
+            is_codex = key.startswith("openai_")
+
+            # A reset supplied by the provider is trusted only when it is
+            # plausible for this declared window. Otherwise use the relative
+            # reset, then the nominal window. The file timestamp is a bounded
+            # migration anchor for legacy records with malformed observations.
+            expiry: float | None = None
+            if resets_at is not None:
+                max_reset = (
+                    max(anchor, float(now)) + nominal_seconds + 300
+                    if nominal_seconds is not None
+                    else None
+                )
+                if not is_codex or max_reset is None or resets_at <= max_reset:
+                    expiry = float(resets_at)
+            if expiry is None and reset_after is not None:
+                if nominal_seconds is None or reset_after <= nominal_seconds + 300:
+                    expiry = anchor + reset_after
+            if expiry is None and is_codex and nominal_seconds is not None:
+                expiry = anchor + nominal_seconds
+            if expiry is not None and expiry < now:
                 continue
             out[key] = RateLimitSnapshot(
                 status=str(raw.get("status") or "allowed"),
                 utilization=_as_float(raw.get("utilization")),
-                resets_at=int(resets_at) if isinstance(resets_at, (int, float)) else None,
+                resets_at=resets_at,
+                reset_after_seconds=reset_after,
                 observed_at=str(raw.get("observed_at") or ""),
                 overage_status=raw.get("overage_status"),
                 overage_resets_at=raw.get("overage_resets_at"),
@@ -242,6 +292,30 @@ def _as_float(v: Any) -> float | None:
     if isinstance(v, (int, float)):
         return float(v)
     return None
+
+
+def _as_timestamp(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value > 0 else None
+
+
+def _as_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if value >= 0 else None
+
+
+def _observed_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed.timestamp()
 
 
 def filter_to_active_provider(

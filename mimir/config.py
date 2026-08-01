@@ -860,6 +860,10 @@ class Config:
     oauth_usage_poll_cron: str
     oauth_refresh_warn_days: int
 
+    # Codex account usage refresh. This is a scheduler named callable, not an
+    # LLM/skill poller, so quota suppression cannot prevent telemetry recovery.
+    codex_usage_poll_cron: str
+
     # Minimax usage poller (mimir/minimax_usage_poller.py): hits
     # ``www.minimax.io/v1/api/openplatform/coding_plan/remains`` and
     # writes ``minimax_five_hour`` / ``minimax_seven_day`` snapshots
@@ -1225,6 +1229,10 @@ class Config:
             ),
             oauth_refresh_warn_days=_env_int(
                 "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
+            ),
+
+            codex_usage_poll_cron=_env(
+                "MIMIR_CODEX_USAGE_POLL_CRON", "*/3 * * * *",
             ),
 
             # Default to empty (disabled). Minimax deployments opt in

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from mimir.billing import (
     Severity,
     detect_billing_mode,
     evaluate_quota_severity,
+    parse_codex_usage_payload,
+    poll_codex_usage_once,
+    OpenAIQuotaProvider,
 )
 from mimir.budget import HomeostaticArbiter
 from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
@@ -1256,3 +1260,167 @@ def test_get_windows_unparseable_observed_at_not_treated_stale(tmp_path):
     )))
     provider = AnthropicQuotaProvider(store)
     assert len(provider.get_windows()) == 1
+
+
+# ─── Codex out-of-band usage refresh (chainlink #1103) ────────────────
+
+
+def _codex_usage_payload(*, pro: bool = False, used: float = 12.0) -> dict:
+    now = int(time.time())
+    primary_seconds = 7 * 86400 if pro else 5 * 3600
+    rate_limit = {
+        "primary_window": {
+            "used_percent": used,
+            "limit_window_seconds": primary_seconds,
+            "reset_after_seconds": primary_seconds - 60,
+            "reset_at": now + primary_seconds - 60,
+        },
+    }
+    if not pro:
+        rate_limit["secondary_window"] = {
+            "used_percent": 8,
+            "limit_window_seconds": 7 * 86400,
+            "reset_after_seconds": 6 * 86400,
+            "reset_at": now + 6 * 86400,
+        }
+    return {"plan_type": "pro" if pro else "plus", "rate_limit": rate_limit}
+
+
+def test_parse_codex_usage_maps_plus_and_pro_by_declared_duration():
+    plus = parse_codex_usage_payload(_codex_usage_payload())
+    assert plus.primary.window_minutes == 300
+    assert plus.secondary.window_minutes == 10080
+    pro = parse_codex_usage_payload({"rate_limits": _codex_usage_payload(pro=True)})
+    assert pro.primary.window_minutes == 10080
+    assert pro.secondary is None
+
+
+class _UsageResponse:
+    def __init__(self, status: int, body: object):
+        self.status = status
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def text(self):
+        return self._body if isinstance(self._body, str) else json.dumps(self._body)
+
+
+class _UsageSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.headers = []
+
+    def get(self, _endpoint, *, headers, timeout):
+        self.headers.append(headers)
+        return self.responses.pop(0)
+
+
+def _write_codex_auth(path: Path, token: str) -> None:
+    path.write_text(json.dumps({
+        "auth_mode": "chatgpt",
+        "tokens": {"access_token": token, "account_id": "acct-secret"},
+    }))
+
+
+@pytest.mark.asyncio
+async def test_codex_refresh_replaces_hot_snapshot_and_recovers_arbiter(tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "token-one")
+    store = RateLimitStore(tmp_path / "rl.json")
+    store.record_sync("openai_five_hour", RateLimitSnapshot(
+        status="allowed_warning", utilization=1.0,
+        resets_at=int(time.time()) + 3600,
+        observed_at=datetime.now(tz=timezone.utc).isoformat(),
+    ))
+    provider = OpenAIQuotaProvider(store)
+    assert evaluate_quota_severity([provider]).severity is Severity.TIGHT
+
+    session = _UsageSession([_UsageResponse(200, _codex_usage_payload(used=2))])
+    assert await poll_codex_usage_once(
+        store, auth_path=auth_path, session=session,
+    )
+    assert evaluate_quota_severity([provider]).severity is Severity.CLEAR
+    assert store.current()["openai_five_hour"].utilization == pytest.approx(0.02)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [
+    (401, {"access_token": "must-not-log"}),
+    (429, {}),
+    (503, {}),
+    (200, {"plan_type": "plus", "rate_limit": {"new_shape": True}}),
+    (200, "not-json"),
+])
+async def test_codex_refresh_failures_preserve_trusted_snapshot(
+    tmp_path, status, body,
+):
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "token-secret")
+    store = RateLimitStore(tmp_path / "rl.json")
+    store.record_sync("openai_five_hour", RateLimitSnapshot(
+        status="allowed_warning", utilization=0.99,
+        resets_at=int(time.time()) + 3600,
+    ))
+    assert not await poll_codex_usage_once(
+        store,
+        auth_path=auth_path,
+        session=_UsageSession([_UsageResponse(status, body)]),
+    )
+    assert store.current()["openai_five_hour"].utilization == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
+async def test_codex_refresh_no_usable_windows_preserves_trusted_snapshot(
+    tmp_path, monkeypatch,
+):
+    """A parsed response that records no windows is a failed refresh."""
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "token-secret")
+    store = RateLimitStore(tmp_path / "rl.json")
+    store.record_sync("openai_five_hour", RateLimitSnapshot(
+        status="allowed_warning", utilization=0.99,
+        resets_at=int(time.time()) + 3600,
+    ))
+    before = (tmp_path / "rl.json").read_bytes()
+
+    monkeypatch.setattr(
+        "mimir.billing.record_codex_plus_rate_limits",
+        lambda *_args, **_kwargs: False,
+    )
+    assert not await poll_codex_usage_once(
+        store,
+        auth_path=auth_path,
+        session=_UsageSession([_UsageResponse(200, _codex_usage_payload())]),
+    )
+    assert (tmp_path / "rl.json").read_bytes() == before
+    assert store.current()["openai_five_hour"].utilization == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
+async def test_codex_refresh_rereads_auth_after_concurrent_cli_refresh(tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "expired-token")
+    store = RateLimitStore(tmp_path / "rl.json")
+    session = _UsageSession([
+        _UsageResponse(401, {}),
+        _UsageResponse(200, _codex_usage_payload(used=3)),
+    ])
+    assert not await poll_codex_usage_once(store, auth_path=auth_path, session=session)
+    _write_codex_auth(auth_path, "refreshed-token")
+    assert await poll_codex_usage_once(store, auth_path=auth_path, session=session)
+    assert session.headers[0]["Authorization"] == "Bearer expired-token"
+    assert session.headers[1]["Authorization"] == "Bearer refreshed-token"
+
+
+def test_codex_genuine_exhaustion_still_blocks(tmp_path):
+    payload = _codex_usage_payload(used=100)
+    parsed = parse_codex_usage_payload(payload)
+    from mimir.billing import record_codex_plus_rate_limits
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rate_limits(store, parsed)
+    assert evaluate_quota_severity([OpenAIQuotaProvider(store)]).severity is Severity.TIGHT
