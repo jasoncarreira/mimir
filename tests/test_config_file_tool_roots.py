@@ -15,6 +15,7 @@ import pytest
 from mimir.config import (
     _ALWAYS_RW_FILE_TOOL_ROOTS,
     _FILE_TOOL_FORBIDDEN_ROOTS,
+    _forbidden_root_forms,
     _parse_file_tool_roots,
 )
 
@@ -243,3 +244,20 @@ def test_effective_root_log_names_configured_and_derived_origins(
     assert f"path='{home.resolve()}' mode=rw origin=derived-home" in caplog.text
     assert f"path='{repo.resolve()}' mode=ro origin=configured" in caplog.text
     assert f"path='{scratch.resolve()}' mode=rw origin=derived" in caplog.text
+
+
+def test_forbidden_root_forms_covers_literal_and_resolved_spellings() -> None:
+    """Every forbidden root is rejected under both spellings on every platform.
+
+    The rejection is compared against a resolved candidate path, and resolution
+    rewrites platform aliases (macOS: ``/etc`` -> ``/private/etc``). On Linux the
+    two spellings coincide, so a Linux-only run cannot observe a regression here
+    -- assert the mapping directly so CI pins it regardless of platform.
+    """
+    forms = _forbidden_root_forms()
+    for raw in _FILE_TOOL_FORBIDDEN_ROOTS:
+        assert raw in forms
+        resolved = str(Path(raw).resolve())
+        assert resolved in forms, (
+            f"{raw!r} resolves to {resolved!r}, which is not in the rejected set"
+        )

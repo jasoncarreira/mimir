@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat as stat_module
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -362,6 +364,32 @@ _FILE_TOOL_FORBIDDEN_ROOTS: frozenset[str] = frozenset(
         "/var",
     }
 )
+
+
+@lru_cache(maxsize=1)
+def _forbidden_root_forms() -> frozenset[str]:
+    """Return each forbidden root in both its literal and resolved form.
+
+    ``Path.resolve()`` rewrites platform aliases: on macOS ``/etc`` becomes
+    ``/private/etc`` and ``/var`` becomes ``/private/var``. Comparing a resolved
+    candidate against the literal set therefore admitted a symlink to ``/etc``
+    on Darwin -- the guardrail applied on Linux and silently did not apply on a
+    developer machine. Both sides are now compared in the same space.
+
+    Resolution is per-platform and cached for the process. A root that cannot be
+    resolved contributes only its literal form, so an unresolvable entry never
+    removes an existing rejection.
+    """
+    forms: set[str] = set()
+    for raw in _FILE_TOOL_FORBIDDEN_ROOTS:
+        forms.add(raw)
+        try:
+            forms.add(str(Path(raw).resolve()))
+        except (OSError, RuntimeError):
+            continue
+    return frozenset(forms)
+
+
 _ALWAYS_RW_FILE_TOOL_ROOTS: tuple[str, ...] = ("/tmp",)
 
 
@@ -415,19 +443,31 @@ def _parse_file_tool_roots(
         if not p.is_absolute():
             _reject(entry, "path is not absolute")
             return
-        if rawpath.rstrip("/") in _FILE_TOOL_FORBIDDEN_ROOTS:
+        if rawpath.rstrip("/") in _forbidden_root_forms():
             _reject(entry, "path is a forbidden system root")
             return
         try:
             resolved = p.resolve()
-            is_dir = resolved.is_dir()
+        except (OSError, RuntimeError) as exc:
+            _reject(entry, f"path cannot be resolved: {exc}")
+            return
+        # ``Path.resolve()`` does not fail uniformly on a symlink loop: Linux
+        # raises ELOOP, macOS returns the path unchanged. ``is_dir()`` then
+        # swallows the stat error on both, so a loop was reported as "not an
+        # existing directory" on Darwin -- true of a missing path, misleading
+        # about a path that exists and cannot be followed. stat explicitly and
+        # keep the two reasons distinct: absent is not the same as unresolvable.
+        try:
+            is_dir = stat_module.S_ISDIR(os.stat(resolved).st_mode)
+        except FileNotFoundError:
+            is_dir = False
         except (OSError, RuntimeError) as exc:
             _reject(entry, f"path cannot be resolved: {exc}")
             return
         if not is_dir:
             _reject(entry, "path is not an existing directory")
             return
-        if str(resolved) in _FILE_TOOL_FORBIDDEN_ROOTS:
+        if str(resolved) in _forbidden_root_forms():
             _reject(entry, "path resolves to a forbidden system root")
             return
         if (
