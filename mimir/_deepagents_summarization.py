@@ -2,83 +2,143 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from functools import wraps
 from typing import Any
-
-from langchain_core.messages import get_buffer_string
 
 
 _OFFLOAD_LOGGING_PATCH_MARKER = "_mimir_offload_traceback_logging"
 
 
+class _LoggingBackendProxy:
+    __slots__ = ("_backend", "_logger")
+
+    def __init__(self, backend: Any, logger: Any) -> None:
+        self._backend = backend
+        self._logger = logger
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._backend, name)
+
+    def _log_exception(self, operation: str, path: str) -> None:
+        self._logger.exception(
+            "Exception during DeepAgents backend %s for %s", operation, path
+        )
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> Any:
+        path = files[0][0] if files else "<empty upload>"
+        try:
+            return self._backend.upload_files(files)
+        except Exception:
+            self._log_exception("upload_files", path)
+            raise
+
+    def download_files(self, paths: list[str]) -> Any:
+        path = paths[0] if paths else "<empty download>"
+        try:
+            return self._backend.download_files(paths)
+        except Exception:
+            self._log_exception("download_files", path)
+            raise
+
+    def write(self, file_path: str, content: str) -> Any:
+        try:
+            return self._backend.write(file_path, content)
+        except Exception:
+            self._log_exception("write", file_path)
+            raise
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> Any:
+        try:
+            return self._backend.edit(
+                file_path, old_string, new_string, replace_all=replace_all
+            )
+        except Exception:
+            self._log_exception("edit", file_path)
+            raise
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> Any:
+        path = files[0][0] if files else "<empty upload>"
+        try:
+            return await self._backend.aupload_files(files)
+        except Exception:
+            self._log_exception("aupload_files", path)
+            raise
+
+    async def adownload_files(self, paths: list[str]) -> Any:
+        path = paths[0] if paths else "<empty download>"
+        try:
+            return await self._backend.adownload_files(paths)
+        except Exception:
+            self._log_exception("adownload_files", path)
+            raise
+
+    async def awrite(self, file_path: str, content: str) -> Any:
+        try:
+            return await self._backend.awrite(file_path, content)
+        except Exception:
+            self._log_exception("awrite", file_path)
+            raise
+
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> Any:
+        try:
+            return await self._backend.aedit(
+                file_path, old_string, new_string, replace_all=replace_all
+            )
+        except Exception:
+            self._log_exception("aedit", file_path)
+            raise
+
+
+def _wrap_sync_offload(original: Any, logger: Any) -> Any:
+    @wraps(original)
+    def wrapped(self: Any, backend: Any, messages: list[Any]) -> Any:
+        return original(self, _LoggingBackendProxy(backend, logger), messages)
+
+    setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
+    return wrapped
+
+
+def _wrap_async_offload(original: Any, logger: Any) -> Any:
+    @wraps(original)
+    async def wrapped(self: Any, backend: Any, messages: list[Any]) -> Any:
+        return await original(self, _LoggingBackendProxy(backend, logger), messages)
+
+    setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
+    return wrapped
+
+
 def install_offload_traceback_logging_patch() -> None:
-    """Log DeepAgents history-offload exceptions without making them fatal."""
+    """Log DeepAgents offload exceptions while preserving upstream handling."""
     try:
         import deepagents.middleware.summarization as summarization
     except ImportError:
         return
 
     middleware = summarization.SummarizationMiddleware
-    current = middleware._offload_to_backend
-    if getattr(current, _OFFLOAD_LOGGING_PATCH_MARKER, False):
-        return
-
-    def _offload_to_backend(self: Any, backend: Any, messages: list[Any]) -> str | None:
-        path = self._get_history_path()
-        filtered_messages = self._filter_summary_messages(messages)
-        timestamp = datetime.now(UTC).isoformat()
-        new_section = (
-            f"## Summarized at {timestamp}\n\n"
-            f"{get_buffer_string(filtered_messages)}\n\n"
+    wrappers = {
+        "_offload_inline_media": _wrap_sync_offload,
+        "_aoffload_inline_media": _wrap_async_offload,
+        "_offload_to_backend": _wrap_sync_offload,
+        "_aoffload_to_backend": _wrap_async_offload,
+    }
+    for method_name, wrapper_factory in wrappers.items():
+        current = getattr(middleware, method_name)
+        if getattr(current, _OFFLOAD_LOGGING_PATCH_MARKER, False):
+            continue
+        setattr(
+            middleware,
+            method_name,
+            wrapper_factory(current, summarization.logger),
         )
-
-        existing_content = ""
-        try:
-            responses = backend.download_files([path])
-            if (
-                responses
-                and responses[0].content is not None
-                and responses[0].error is None
-            ):
-                existing_content = responses[0].content.decode("utf-8")
-        except Exception as exc:  # noqa: BLE001
-            summarization.logger.debug(
-                "Exception reading existing history from %s "
-                "(treating as new file): %s: %s",
-                path,
-                type(exc).__name__,
-                exc,
-            )
-
-        combined_content = existing_content + new_section
-        try:
-            result = (
-                backend.edit(path, existing_content, combined_content)
-                if existing_content
-                else backend.write(path, combined_content)
-            )
-            if result is None or result.error:
-                error_msg = result.error if result else "backend returned None"
-                summarization.logger.warning(
-                    "Failed to offload conversation history to %s (%d messages): %s",
-                    path,
-                    len(filtered_messages),
-                    error_msg,
-                )
-                return None
-        except Exception:  # noqa: BLE001
-            summarization.logger.exception(
-                "Exception offloading conversation history to %s (%d messages)",
-                path,
-                len(filtered_messages),
-            )
-            return None
-
-        summarization.logger.debug(
-            "Offloaded %d messages to %s", len(filtered_messages), path
-        )
-        return path
-
-    setattr(_offload_to_backend, _OFFLOAD_LOGGING_PATCH_MARKER, True)
-    _offload_to_backend.__wrapped__ = current  # type: ignore[attr-defined]
-    middleware._offload_to_backend = _offload_to_backend
