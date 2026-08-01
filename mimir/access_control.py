@@ -3073,10 +3073,12 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
 def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> bool:
     """Admit one file target only beneath this turn's exact active lease."""
     lease = getattr(review_state, "checkout_lease", None)
+    scope = getattr(review_state, "action_scope", None)
     if lease is None or not getattr(lease, "is_active", False):
         return False
-    if getattr(lease, "scope_id", None) != getattr(
-        getattr(review_state, "action_scope", None), "scope_id", None
+    if (
+        getattr(lease, "scope_id", None) != getattr(scope, "scope_id", None)
+        or getattr(lease, "owner", None) != getattr(scope, "principal", None)
     ):
         return False
     candidate = Path(target)
@@ -3085,7 +3087,10 @@ def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> b
     root = Path(lease.path)
     try:
         lexical = candidate.relative_to(root)
+        lease_root = Path(lease.lease_root).resolve(strict=True)
         resolved_root = root.resolve(strict=True)
+        if resolved_root.parent != lease_root or resolved_root == lease_root:
+            return False
         resolved = candidate.resolve(strict=False)
         relative = resolved.relative_to(resolved_root)
     except (OSError, RuntimeError, ValueError):
@@ -3981,43 +3986,62 @@ class SinkGate:
                     target, getattr(auth_context, "channel_id", None),
                 )
             )
-            github_repo_scope_denied = False
+            github_repo_scope_refusal = None
             scope = None
             if (
-                service_target_allowed
-                and service.authority_profile == "github"
+                service.authority_profile == "github"
                 and sink_category is SinkCategory.FILE
-                and _target_within_configured_repo_write_roots(target, "")
             ):
-                review_state = getattr(auth_context, "repo_review_state", None)
-                scope = getattr(review_state, "action_scope", None)
-                try:
-                    target_in_scope = (
-                        scope is not None
-                        and Path(target).resolve().is_relative_to(
-                            Path(scope.canonical_root).resolve()
-                        )
-                    )
-                except (OSError, RuntimeError):
-                    target_in_scope = False
-                github_repo_scope_denied = (
-                    not target_in_scope
-                    or not _repo_review_action_allowed(
-                        review_state, RepoPRAction.WRITE,
-                    )
+                review_state = (
+                    repo_review_state
+                    if repo_review_state is not None
+                    else getattr(auth_context, "repo_review_state", None)
                 )
+                scope = getattr(review_state, "action_scope", None)
+                target_in_lease = _target_within_active_pr_checkout_lease(
+                    target, review_state,
+                )
+                if target_in_lease:
+                    service_target_allowed = True
+                    if not _repo_review_action_allowed(
+                        review_state, RepoPRAction.WRITE,
+                    ):
+                        github_repo_scope_refusal = "repo_pr_write_not_granted"
+                elif scope is not None:
+                    lease = getattr(review_state, "checkout_lease", None)
+                    roots = (
+                        Path(scope.canonical_root),
+                        *(
+                            (Path(lease.lease_root),)
+                            if lease is not None else ()
+                        ),
+                    )
+                    try:
+                        resolved_target_path = Path(target).resolve(strict=False)
+                        targets_pr_checkout_area = any(
+                            resolved_target_path.is_relative_to(root.resolve(strict=True))
+                            for root in roots
+                        )
+                    except (OSError, RuntimeError):
+                        targets_pr_checkout_area = True
+                    if targets_pr_checkout_area:
+                        service_target_allowed = False
+                        github_repo_scope_refusal = (
+                            "repo_pr_target_outside_active_lease"
+                        )
             if (
                 adapter is None
                 or synthesis_scope_denied
                 or not service_target_allowed
-                or github_repo_scope_denied
+                or github_repo_scope_refusal is not None
             ):
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
                     allowed=not enforce,
                     reason=(
-                        "repo_pr_scope_denied" if github_repo_scope_denied
+                        github_repo_scope_refusal
+                        if github_repo_scope_refusal is not None
                         else "service_sink_destination_denied"
                     ),
                     service_principal=service,
