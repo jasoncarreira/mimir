@@ -184,8 +184,8 @@ class TestIsRetryableError:
 
     def test_empty_structured_output_validation_error_is_retryable(self) -> None:
         exc = StructuredOutputValidationError(
-            "CriticFindings",
-            ValueError("Native structured output expected valid JSON for CriticFindings"),
+            "RetryFixture",
+            ValueError("Native structured output expected valid JSON for RetryFixture"),
             AIMessage(content=""),
         )
 
@@ -196,7 +196,7 @@ class TestIsRetryableError:
 
     def test_non_empty_structured_output_validation_error_is_not_retryable(self) -> None:
         exc = StructuredOutputValidationError(
-            "CriticFindings",
+            "RetryFixture",
             ValueError("missing verdict"),
             AIMessage(content='{"summary":"missing verdict"}'),
         )

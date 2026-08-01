@@ -1,13 +1,7 @@
 # Structured subagents
 
-Mimir registers one explicit typed subagent role in addition to DeepAgents' default `general-purpose` role:
+Mimir does not currently register a typed DeepAgents subagent. It explicitly registers the standard `general-purpose` role so delegated calls retain Mimir's authorization, budget, and fetched-content middleware instead of receiving DeepAgents' ungated default.
 
-- `critic-structured` — skeptical review role with a `CriticFindings` Pydantic schema.
+`StructuredOutputRetryMiddleware` remains generic runtime machinery for compiled child runnables that use structured output. It retries an empty native structured-output parse failure but does not retry a non-empty schema mismatch. There is no model-visible role using it today.
 
-DeepAgents validates the child agent's structured response inside the subagent graph. At the normal `task` tool boundary, the validated object is serialized back to the parent as JSON `ToolMessage` text. That means the parent LLM gets schema-shaped JSON instead of untrusted prose, but regular chat turns do not receive a parsed Python object.
-
-If a non-LLM controller needs parsed objects, it should invoke a compiled child runnable directly and read `structured_response`; it should not scrape the parent-visible transcript.
-
-## Permissions boundary
-
-`critic-structured` uses a read-only DeepAgents filesystem permission profile: built-in filesystem write operations are denied. This is accidental-overreach protection, not a security sandbox. It does not secure arbitrary shell/process execution, so the role does not receive shell/process tools by default. Strong isolation requires an isolated container/task or compute substrate; a Worklink checkout is an audit and Git-state boundary, not a security sandbox.
+Worklink's pre-PR `work-reviewer` is separate from the interactive DeepAgents `task` menu. OpenCode loads that read-only agent from the pinned `opencode-feature-factory` plugin; Worklink invokes it directly and persists its advisory result with orchestrator-observed evidence.

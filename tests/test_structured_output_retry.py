@@ -10,8 +10,8 @@ from mimir.structured_output_retry import StructuredOutputRetryMiddleware
 
 def _empty_structured_error() -> StructuredOutputValidationError:
     return StructuredOutputValidationError(
-        "CriticFindings",
-        ValueError("Native structured output expected valid JSON for CriticFindings"),
+        "RetryFixture",
+        ValueError("Native structured output expected valid JSON for RetryFixture"),
         AIMessage(content=""),
     )
 
@@ -47,7 +47,7 @@ def test_structured_output_retry_does_not_retry_schema_mismatch(
     request = ModelRequest(model=object(), messages=[])
     calls = 0
     exc = StructuredOutputValidationError(
-        "CriticFindings",
+        "RetryFixture",
         ValueError("missing verdict"),
         AIMessage(content='{"summary":"missing verdict"}'),
     )

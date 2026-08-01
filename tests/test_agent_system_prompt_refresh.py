@@ -106,7 +106,7 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
 
 
 @pytest.mark.asyncio
-async def test_build_agent_registers_structured_subagents(
+async def test_build_agent_registers_explicit_general_purpose_subagent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = _make_agent(tmp_path, monkeypatch)
@@ -117,10 +117,7 @@ async def test_build_agent_registers_structured_subagents(
     subagents = capture.kwargs[0]["subagents"]
     # Worklink epic roles are per-run tool-armed agents (the retired epic roles (removed #830)),
     # not agent-wide registrations.
-    assert [spec["name"] for spec in subagents] == [
-        "general-purpose",
-        "critic-structured",
-    ]
+    assert [spec["name"] for spec in subagents] == ["general-purpose"]
 
 
 @pytest.mark.asyncio
