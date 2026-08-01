@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import inspect
+import warnings
 import weakref
 from functools import partial
 from typing import Any
@@ -21,6 +23,7 @@ from langchain_core.tools import BaseTool
 
 from mimir import _deepagents_patches as patches
 from mimir.readonly_backend import MimirFilesystemMiddleware
+from mimir.subagents import build_mimir_subagents
 
 
 class FakeAnthropicChatModel(BaseChatModel):
@@ -109,9 +112,20 @@ def test_install_deepagents_grep_context_tool_patches_all_real_aliases(monkeypat
     assert filesystem_middleware.FilesystemMiddleware is MimirFilesystemMiddleware
 
 
-def test_obsolete_base_prompt_patch_is_removed():
+def test_base_prompt_compatibility_shim_does_not_mutate_deepagents(
+    token_counter_state,
+):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        base_prompt = deepagents_graph.BASE_AGENT_PROMPT
+
+    patches.strip_deepagents_base_prompt()
+    importlib.import_module("mimir.agent")
+
     assert not hasattr(patches, "_DEEPAGENTS_BASE_PROMPT_MARKER")
-    assert not hasattr(patches, "strip_deepagents_base_prompt")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        assert deepagents_graph.BASE_AGENT_PROMPT == base_prompt
 
 
 def test_patch_deepagents_token_counter_passes_through_arguments(token_counter_state):
@@ -276,3 +290,57 @@ def test_patch_deepagents_token_counter_factory_uses_shared_model_tuned_wrapper(
     middleware.token_counter([], tools=[tool])
     assert reads_after_first_count > 0
     assert tool.schema_reads == reads_after_first_count
+
+
+def test_real_main_general_and_critic_graphs_share_schema_cache(
+    monkeypatch,
+    token_counter_state,
+):
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    patched = _patch_with_counter(count_tokens_approximately)
+    created_middleware = []
+    original_factory = deepagents_graph.create_summarization_middleware
+
+    def capture_factory(*args, **kwargs):
+        middleware = original_factory(*args, **kwargs)
+        created_middleware.append(middleware)
+        return middleware
+
+    monkeypatch.setattr(
+        deepagents_graph,
+        "create_summarization_middleware",
+        capture_factory,
+    )
+    subagents = build_mimir_subagents()
+
+    create_deep_agent(
+        model=GenericFakeChatModel(messages=iter([AIMessage(content="done")])),
+        backend=StateBackend(),
+        tools=[],
+        system_prompt="token counter construction test",
+        subagents=subagents,
+    )
+
+    assert [subagent["name"] for subagent in subagents] == [
+        "general-purpose",
+        "critic-structured",
+    ]
+    assert len(created_middleware) == 3
+    assert summarization.count_tokens_approximately is patched
+    assert lc_summarization.count_tokens_approximately is patched
+    assert all(
+        defaults["token_counter"] is patched
+        for defaults in _token_counter_kwdefaults()
+    )
+
+    for middleware in created_middleware:
+        assert isinstance(middleware.token_counter, partial)
+        assert middleware.token_counter.func is patched
+        tool = CountingTool()
+        middleware.token_counter([], tools=[tool])
+        reads_after_first_count = tool.schema_reads
+        middleware.token_counter([], tools=[tool])
+        assert reads_after_first_count > 0
+        assert tool.schema_reads == reads_after_first_count
