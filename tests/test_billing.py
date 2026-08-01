@@ -1375,6 +1375,33 @@ async def test_codex_refresh_failures_preserve_trusted_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_codex_refresh_no_usable_windows_preserves_trusted_snapshot(
+    tmp_path, monkeypatch,
+):
+    """A parsed response that records no windows is a failed refresh."""
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "token-secret")
+    store = RateLimitStore(tmp_path / "rl.json")
+    store.record_sync("openai_five_hour", RateLimitSnapshot(
+        status="allowed_warning", utilization=0.99,
+        resets_at=int(time.time()) + 3600,
+    ))
+    before = (tmp_path / "rl.json").read_bytes()
+
+    monkeypatch.setattr(
+        "mimir.billing.record_codex_plus_rate_limits",
+        lambda *_args, **_kwargs: False,
+    )
+    assert not await poll_codex_usage_once(
+        store,
+        auth_path=auth_path,
+        session=_UsageSession([_UsageResponse(200, _codex_usage_payload())]),
+    )
+    assert (tmp_path / "rl.json").read_bytes() == before
+    assert store.current()["openai_five_hour"].utilization == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
 async def test_codex_refresh_rereads_auth_after_concurrent_cli_refresh(tmp_path):
     auth_path = tmp_path / "auth.json"
     _write_codex_auth(auth_path, "expired-token")
