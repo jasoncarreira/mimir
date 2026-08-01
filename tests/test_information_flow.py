@@ -26,6 +26,7 @@ from mimir.access_control import (
     approve_live_declassification,
     audit_declassification,
     create_auth_context,
+    fetch_url_is_approved,
     get_service_principal,
     get_sink_category,
     get_tool_flow_direction,
@@ -1755,7 +1756,12 @@ def test_github_poller_fetch_rejects_widening_shapes(
     )
 
     assert decision.allowed is False
-    assert decision.reason == "egress_destination_not_approved"
+    expected_reason = (
+        "service_sink_destination_denied"
+        if fetch_url_is_approved(target, auth)
+        else "egress_destination_not_approved"
+    )
+    assert decision.reason == expected_reason
 
 
 def test_github_repo_template_does_not_change_exact_url_approval_semantics(

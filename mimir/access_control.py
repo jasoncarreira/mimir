@@ -3366,12 +3366,45 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
     return frozenset(approved)
 
 
+def _target_matches_configured_github_repo_fetch(target: str) -> bool:
+    """Match HTTPS API or web reads scoped to a configured GitHub repository."""
+    try:
+        parsed = urlsplit(target.strip())
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return False
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.hostname is None
+        or "%" in parsed.path
+        or "\\" in parsed.path
+    ):
+        return False
+
+    segments = parsed.path.split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        return False
+    host = parsed.hostname.lower()
+    if host == "api.github.com" and len(segments) >= 4 and segments[1] == "repos":
+        owner, repo = segments[2:4]
+    elif host == "github.com" and len(segments) >= 3:
+        owner, repo = segments[1:3]
+    else:
+        return False
+    return is_configured_github_repo(f"{owner}/{repo}")
+
+
 def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
-    """Authorize an exact URL, or a service's explicitly bounded URL adapter."""
+    """Authorize an exact URL, configured GitHub repo read, or service adapter."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
     if normalized in approved_fetch_urls(auth_context):
+        return True
+    if _target_matches_configured_github_repo_fetch(target):
         return True
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for("fetch_url") if service is not None else None
@@ -3862,7 +3895,7 @@ class SinkGate:
                 )
         if tool_name == "fetch_url" and (
             normalized_target is None
-            or not fetch_url_is_approved(normalized_target, auth_context)
+            or not fetch_url_is_approved(target, auth_context)
         ):
             return ToolAuthorization(
                 tool_name=tool_name,

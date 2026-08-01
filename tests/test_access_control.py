@@ -3034,6 +3034,101 @@ async def test_shadow_sink_event_records_redacted_resolved_destination() -> None
     assert fields["trigger"] == "user_message"
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://api.github.com/repos/acme/widget/issues/123",
+        "https://api.github.com/repos/Acme/Widget/pulls/123/files?per_page=100",
+        "https://github.com/acme/widget",
+        "https://github.com/Acme/Widget/pull/123/files",
+    ],
+)
+def test_fetch_url_approves_configured_github_repo_urls_at_check_time(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "other/repo, acme/widget")
+
+    assert access_control.fetch_url_is_approved(target, _write_auth())
+
+    monkeypatch.setenv("GITHUB_REPOS", "other/repo")
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://github.com/other/widget/pull/123",
+        "https://github.com/acme/widget-extra/pull/123",
+        "https://github.com/acme/pre-widget/pull/123",
+        "https://api.github.com/repos/other/widget/issues/123",
+    ],
+)
+def test_fetch_url_refuses_github_repo_near_misses(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+
+def test_fetch_url_non_github_host_still_requires_exact_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://downloads.example/acme/widget/release.tar.gz"
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", target)
+
+    assert access_control.fetch_url_is_approved(target, _write_auth())
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://api.github.com@evil.host/repos/acme/widget/issues/123",
+        "https://evil.api.github.com/repos/acme/widget/issues/123",
+        "https://evil.github.com/acme/widget/pull/123",
+        "https://api.github.com./repos/acme/widget/issues/123",
+        "https://github.com.evil.host/acme/widget/pull/123",
+        "https://evilgithub.com/acme/widget/pull/123",
+        "https://api.github.com:443/repos/acme/widget/issues/123",
+        "https://github.com:444/acme/widget/pull/123",
+        "https://api.github.com/repos/acme/../widget/issues/123",
+        "https://api.github.com/repos/acme/%2e%2e/issues/123",
+        "https://github.com/acme/../widget/pull/123",
+        "http://api.github.com/repos/acme/widget/issues/123",
+        "git://github.com/acme/widget",
+    ],
+)
+def test_fetch_url_refuses_malformed_configured_github_repo_urls(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+
+def test_fetch_url_sink_gate_allows_configured_github_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://github.com/acme/widget/pull/123"
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+
+    decision = ToolRegistry().authorize_tool(
+        "fetch_url", _write_auth(), enforce=True, target_channel=target,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason != "egress_destination_not_approved"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "requested_target", "reason"),
