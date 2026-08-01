@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.access_control import create_auth_context
+from mimir.agent import Agent
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
     ChatSkillDescriptor,
@@ -19,6 +21,8 @@ from mimir.chat_skills import (
     ChatSkillInvocation,
 )
 from mimir.bridges.web_chat import DEFAULT_CHANNEL, WebChatBridge, _Subscriber
+from mimir.history import MessageBuffer, render_recent_activity
+from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, SessionACL
 from mimir.saga.ownership import is_user_accessible
 from mimir.web_contracts import validate_api_envelope, validate_live_event
@@ -141,9 +145,199 @@ async def test_post_chat_enqueues_authenticated_user_message(tmp_path):
     e = enqueued[0]
     assert e.channel_id == "web-alice"
     assert e.content == "hello"
-    assert e.author == "Alice"
+    assert e.author == "alice"
+    assert e.author_display == "Alice"
     assert e.author_id == "alice"
     assert e.source == "web"
+
+
+def _cross_platform_resolver(tmp_path: Path) -> IdentityResolver:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(
+        dedent(
+            """\
+            people:
+              - canonical: jason
+                display_name: Jason Renamed
+                aliases: [discord-238367217903730690]
+              - canonical: riley
+                display_name: Jason Carreira
+                aliases: [discord-999]
+            """
+        ),
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    return resolver
+
+
+@pytest.mark.asyncio
+async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path):
+    resolver = _cross_platform_resolver(tmp_path)
+    _, app, enqueued = _authed_bridge_app(
+        tmp_path,
+        canonical="jason",
+        display_name="Jason Carreira",
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/api/v1/chat", json={"content": "web question"})
+    assert response.status == 200
+
+    web_event = enqueued[0]
+    history_path = tmp_path / "chat_history.jsonl"
+    buf = MessageBuffer(history_path=history_path, resolver=resolver)
+    agent = SimpleNamespace(
+        _buffer=buf,
+        _INBOUND_SKIP_TRIGGERS=frozenset(),
+        _kind_for_trigger=Agent._kind_for_trigger,
+    )
+    await Agent._append_inbound_to_buffer(agent, web_event)
+    await buf.append(
+        buf.make_message(
+            channel_id="web-jason",
+            kind="assistant_message",
+            content="web answer",
+            source="web",
+        )
+    )
+
+    discord_activity = buf.assemble_recent_activity(
+        channel_id="discord-general",
+        author="discord-238367217903730690",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in discord_activity] == [
+        "web question",
+        "web answer",
+    ]
+    assert web_event.author == "jason"
+    assert web_event.author_display == "Jason Carreira"
+    assert "Jason Renamed: web question" in render_recent_activity(
+        discord_activity,
+        resolver=resolver,
+    )
+
+    replayed = MessageBuffer(history_path=history_path, resolver=resolver)
+    assert replayed.replay() == 2
+    replayed_activity = replayed.assemble_recent_activity(
+        channel_id="discord-general",
+        author="discord-238367217903730690",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in replayed_activity] == [
+        "web question",
+        "web answer",
+    ]
+
+    reverse = MessageBuffer(
+        history_path=tmp_path / "reverse_history.jsonl",
+        resolver=resolver,
+    )
+    await reverse.append(
+        reverse.make_message(
+            channel_id="discord-general",
+            kind="user_message",
+            content="discord question",
+            author="discord-238367217903730690",
+            author_display="jason_discord",
+            source="discord",
+        )
+    )
+    await reverse.append(
+        reverse.make_message(
+            channel_id="discord-general",
+            kind="assistant_message",
+            content="discord answer",
+            source="discord",
+        )
+    )
+    web_activity = reverse.assemble_recent_activity(
+        channel_id=web_event.channel_id,
+        author=web_event.author,
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert [message.content for message in web_activity] == [
+        "discord question",
+        "discord answer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cross_platform_pull_never_matches_shared_display_name_or_public_dm(tmp_path):
+    resolver = _cross_platform_resolver(tmp_path)
+    buf = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    for channel_id, content, author in (
+        ("web-riley", "other user's public message", "riley"),
+        ("dm-discord-jason", "same user's private message", "jason"),
+    ):
+        await buf.append(
+            buf.make_message(
+                channel_id=channel_id,
+                kind="user_message",
+                content=content,
+                author=author,
+                author_display="Jason Carreira",
+                source="web" if channel_id.startswith("web-") else "discord",
+            )
+        )
+
+    activity = buf.assemble_recent_activity(
+        channel_id="discord-general",
+        author="discord-238367217903730690",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    )
+    assert activity == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_display_name_record_is_not_reassigned_on_replay(tmp_path):
+    resolver = _cross_platform_resolver(tmp_path)
+    history_path = tmp_path / "chat_history.jsonl"
+    buf = MessageBuffer(history_path=history_path, resolver=resolver)
+    await buf.append(
+        buf.make_message(
+            channel_id="web-jason",
+            kind="user_message",
+            content="legacy display-keyed message",
+            author="Jason Carreira",
+            author_display="Jason Carreira",
+            source="web",
+        )
+    )
+
+    replayed = MessageBuffer(history_path=history_path, resolver=resolver)
+    assert replayed.replay() == 1
+    assert replayed.cross_author_messages(
+        author="discord-238367217903730690",
+        exclude_channel="discord-general",
+        limit=10,
+        within_hours=24,
+        source_allowlist=frozenset({"web", "discord"}),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_web_bridge_fetch_history_explicitly_requires_authenticated_route(tmp_path):
+    bridge, _, _ = _authed_bridge_app(tmp_path)
+    with pytest.raises(NotImplementedError, match="authenticated HTTP route"):
+        await bridge.fetch_history("web-alice")
 
 
 @pytest.mark.asyncio
@@ -791,7 +985,7 @@ async def test_authenticated_default_channel_routes_per_user(tmp_path):
         b2 = await r2.json()
 
     assert b1["data"]["channel_id"] == "web-alice"
-    assert enqueued[0].channel_id == "web-alice" and enqueued[0].author == "Alice"
+    assert enqueued[0].channel_id == "web-alice" and enqueued[0].author == "alice"
     assert b2["data"]["channel_id"] == "web-alice"
     assert enqueued[1].channel_id == "web-alice"
 

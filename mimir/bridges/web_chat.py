@@ -340,7 +340,11 @@ class WebChatBridge(Bridge):
         # AUTHENTICATED per-user key, not the client body (which is spoofable).
         # The admin master key is not a chat identity, and dev/open anonymous
         # chat is rejected above, so no shared web-default channel is reachable.
-        author = identity.display_name or identity.canonical
+        # Web authentication has already resolved the durable key. Persist it
+        # as the matching key just like platform aliases on Discord/Slack;
+        # display text is mutable and non-unique, so it is rendering-only.
+        author = identity.canonical
+        author_display = identity.display_name or identity.canonical
         author_id = identity.canonical
 
         event = AgentEvent(
@@ -348,12 +352,26 @@ class WebChatBridge(Bridge):
             channel_id=channel_id,
             content=content,
             author=author,
+            author_display=author_display,
             author_id=author_id,
             source_id=body.get("msg_id") or uuid.uuid4().hex[:12],
             source="web",
             extra=sanitized_extra,
         )
         return event, channel_id, None
+
+    async def fetch_history(
+        self,
+        channel_id: str,
+        *,
+        limit: int = 20,
+        before: str | None = None,
+    ) -> list:
+        """Reject unscoped history reads; the authenticated HTTP route owns them."""
+        del channel_id, limit, before
+        raise NotImplementedError(
+            "web bridge history is only available through the authenticated HTTP route"
+        )
 
     def _log_chat_skill_accepted(self, event: AgentEvent) -> None:
         invocation = event.extra.get(CHAT_SKILL_EXTRA_KEY)
