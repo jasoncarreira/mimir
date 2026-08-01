@@ -640,16 +640,9 @@ def cleanup_pr_checkout_lease(
         "git", "-C", str(lease.path), "rev-parse", "--verify",
         f"{PUBLISHED_HEAD_REF}^{{commit}}",
     ])
-    if published.returncode == 0:
-        published_head = published.stdout.strip().lower()
-    else:
-        # Successful push verification leaves this proof in older leases that
-        # predate the private publication ref.
-        published_head = _run(
-            runner,
-            ["git", "-C", str(lease.path), "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-            "PR checkout lease cleanup found no publication proof",
-        ).lower()
+    if published.returncode != 0:
+        raise RuntimeError("PR checkout lease cleanup found no publication proof")
+    published_head = published.stdout.strip().lower()
     ancestor = runner([
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor", head,
         published_head,

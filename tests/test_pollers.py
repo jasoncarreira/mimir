@@ -12,6 +12,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import stat
@@ -50,7 +51,14 @@ from mimir.access_control import (
     create_auth_context,
 )
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
-from mimir.models import InformationFlowLabels, SourceLabel
+from mimir.models import (
+    InformationFlowLabels,
+    RepoPRAction,
+    RepoPRActionScope,
+    RepoPRScopeRegistry,
+    RepoReviewState,
+    SourceLabel,
+)
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────
@@ -499,6 +507,71 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         )
         assert decision.allowed is False, target
         assert decision.reason == "read_scope"
+
+
+def test_github_activity_active_checkout_write_refuses_git_metadata(
+    tmp_path: Path,
+) -> None:
+    lease_root = tmp_path / "leases"
+    checkout = lease_root / "scope-lease"
+    checkout.mkdir(parents=True)
+    scope = RepoPRActionScope(
+        provenance="poller_payload",
+        canonical_repo="owner/repo",
+        canonical_root=str(tmp_path / "repo"),
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pr_changes_requested_stale",
+        allowed_operations=frozenset({RepoPRAction.WRITE.value}),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(SimpleNamespace(
+        path=checkout,
+        lease_root=lease_root,
+        scope_id=scope.scope_id,
+        owner=scope.principal,
+        is_active=True,
+    ))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("write_file",),
+        roots=(tmp_path / "state" / "pollers" / "github-activity",),
+        creation_path="test",
+    )
+    context = replace(
+        create_auth_context(AgentEvent(
+            trigger="poller", channel_id=service.canonical,
+            service_principal=service.canonical, service_authority=service,
+        ), enforce=True, ifc_labels=InformationFlowLabels()),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state,
+        repo_pr_action_scope=scope,
+    )
+    registry = ToolRegistry()
+
+    source = registry.authorize_tool(
+        "write_file", context, enforce=True,
+        target_channel=str(checkout / "fixed.py"),
+    )
+    assert source.allowed is True
+
+    for target in (
+        checkout / ".git" / "refs" / "mimir" / "pr-checkout-lease" / "published",
+        checkout / ".git" / "mimir-pr-checkout-lease.json",
+        checkout / ".git" / "FETCH_HEAD",
+    ):
+        decision = registry.authorize_tool(
+            "write_file", context, enforce=True, target_channel=str(target),
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "repo_pr_target_outside_active_lease"
 
 
 def test_github_activity_scratch_write_denies_lexical_and_resolved_protected_names(

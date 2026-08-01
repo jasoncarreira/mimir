@@ -4683,7 +4683,7 @@ class WriteResourceAdapter:
     _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
     _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run"}
     _PROTECTED_NAMES: frozenset[str] = frozenset({
-        ".env", "compose.env", "rate_limits.json",
+        ".env", ".git", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
         "core-memory", "core_memory", "corememory", "prompts",
     })

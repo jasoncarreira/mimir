@@ -304,7 +304,7 @@ def test_pr_checkout_lease_cleanup_refuses_unpublished_commit_on_lease_branch(
     assert lease.path.is_dir()
 
 
-def test_pr_checkout_lease_cleanup_recovers_pre_fix_skipped_rebase(tmp_path: Path) -> None:
+def test_pr_checkout_lease_cleanup_refuses_without_publication_proof(tmp_path: Path) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
@@ -314,7 +314,10 @@ def test_pr_checkout_lease_cleanup_recovers_pre_fix_skipped_rebase(tmp_path: Pat
     _git(lease.path, "push", "--force", "origin", f"HEAD:{scope.destination_ref}")
     _git(lease.path, "fetch", "origin", scope.destination_ref)
 
-    assert cleanup_pr_checkout_lease(lease) is True
+    with pytest.raises(RuntimeError, match="found no publication proof"):
+        cleanup_pr_checkout_lease(lease)
+
+    assert lease.path.is_dir()
 
 
 def test_pr_checkout_lease_cleanup_refuses_mismatched_origin(tmp_path: Path) -> None:
