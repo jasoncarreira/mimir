@@ -2030,7 +2030,7 @@ def test_attempt_cleanup_requires_execute_to_report_run_deleted(
     assert not entry.cleaned and not entry.tombstone
 
 
-def test_reconcile_cleanup_eligible_only_for_completed_merged_run(
+def test_reconcile_cleanup_and_staleness_predicates(
     tmp_path: Path, monkeypatch
 ) -> None:
     import poller
@@ -2038,26 +2038,29 @@ def test_reconcile_cleanup_eligible_only_for_completed_merged_run(
     run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
     run_dir.mkdir(parents=True)
 
-    def observation(status: str) -> poller.FactoryRunObservation:
+    def observation(
+        status: str, *, stale: bool = False, pr_url: str | None = PR_URL
+    ) -> poller.FactoryRunObservation:
         return poller.FactoryRunObservation(
             run_id="chainlink-100",
             issue_id=100,
             attempt=None,
             physical_path=run_dir,
             status=status,
-            pr_url=PR_URL,
+            pr_url=pr_url,
             reason=None,
             summary=None,
             pending_gate=None,
             is_terminal=status in {"completed", "blocked", "partial", "needs-human"},
-            is_stale=False,
+            is_stale=stale,
             validator_verdict="GO",
             security_verdict="PASS",
             terminal_result=None,
+            liveness_class="stale" if stale else "healthy",
             validity_class="valid",
         )
 
-    current = observation("completed")
+    current = observation("completed", stale=True)
     merged = True
     monkeypatch.setattr(
         poller,
@@ -2083,12 +2086,111 @@ def test_reconcile_cleanup_eligible_only_for_completed_merged_run(
         )
         assert cleanup == [], status
 
-    current = observation("completed")
+    current = observation("completed", stale=True)
     object.__setattr__(current, "validity_class", "invalid")
     _, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "invalid")
     assert cleanup == []
 
-    current = observation("completed")
-    object.__setattr__(current, "liveness_class", "stale")
-    _, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "stale")
+    current = observation("running", stale=True)
+    alerts, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "stale-running")
     assert cleanup == []
+    assert [alert.run_id for alert in alerts] == ["chainlink-100"]
+
+    current = observation("completed", stale=True, pr_url=None)
+    alerts, cleanup = poller._reconcile_factory_runs(tmp_path, tmp_path / "no-pr")
+    assert alerts == []
+    assert cleanup == []
+
+
+def test_stale_completed_merged_run_is_cleaned_once_and_tombstoned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    state_dir = tmp_path / "state"
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    observation = poller.FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=run_dir,
+        status="completed",
+        pr_url=PR_URL,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=True,
+        is_stale=True,
+        validator_verdict="GO",
+        security_verdict="PASS",
+        terminal_result=None,
+        liveness_class="stale",
+        validity_class="valid",
+    )
+    cleanup_calls: list[tuple[bool, str | None]] = []
+
+    monkeypatch.setattr(
+        poller,
+        "_discover_factory_runs",
+        lambda repo: [(tmp_path, run_dir, "chainlink-100")],
+    )
+    monkeypatch.setattr(poller, "_observe_factory_run", lambda root, run_id: observation)
+    monkeypatch.setattr(poller, "_is_pr_merged", lambda pr_url, repo: True)
+
+    def fake_cleanup(worktree, dry_run=True, *, digest=None):
+        cleanup_calls.append((dry_run, digest))
+        if dry_run:
+            return True, "previewed", _cleanup_report("chainlink-100")
+        return True, "executed", _cleanup_report("chainlink-100", mode="execute")
+
+    monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
+
+    assert poller._run_lifecycle_reconciliation(tmp_path, state_dir) == []
+    entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
+    assert entry.cleaned and entry.tombstone
+    assert cleanup_calls == [(True, None), (False, CLEANUP_DIGEST)]
+
+    assert poller._run_lifecycle_reconciliation(tmp_path, state_dir) == []
+    assert cleanup_calls == [(True, None), (False, CLEANUP_DIGEST)]
+
+
+def test_unchanged_stale_completed_run_does_not_realert(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    observation = poller.FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=run_dir,
+        status="completed",
+        pr_url=PR_URL,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=True,
+        is_stale=True,
+        validator_verdict="GO",
+        security_verdict="PASS",
+        terminal_result=None,
+        liveness_class="stale",
+        validity_class="valid",
+    )
+    monkeypatch.setattr(
+        poller,
+        "_discover_factory_runs",
+        lambda repo: [(tmp_path, run_dir, "chainlink-100")],
+    )
+    monkeypatch.setattr(poller, "_observe_factory_run", lambda root, run_id: observation)
+    monkeypatch.setattr(poller, "_is_pr_merged", lambda pr_url, repo: False)
+
+    state_dir = tmp_path / "state"
+    first_alerts, first_cleanup = poller._reconcile_factory_runs(tmp_path, state_dir)
+    second_alerts, second_cleanup = poller._reconcile_factory_runs(tmp_path, state_dir)
+
+    assert len(first_alerts) + len(second_alerts) <= 1
+    assert first_cleanup == second_cleanup == []
