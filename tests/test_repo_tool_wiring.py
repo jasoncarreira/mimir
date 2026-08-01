@@ -337,16 +337,31 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
     second_head = "c" * 40
     third_head = "d" * 40
     client = _RemediationForge(_snapshot(second_head), _snapshot(third_head))
-    _old_scope, context, runtime = _remediation_runtime(monkeypatch, client)
+    old_scope, context, runtime = _remediation_runtime(monkeypatch, client)
     monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: True)
-    calls = 0
+    reminted_heads: list[str] = []
+
+    def mint(repository, snapshot, *, event_type):  # type: ignore[no-untyped-def]
+        reminted_heads.append(snapshot.head_sha)
+        return replace(
+            old_scope,
+            provenance="server_discovered",
+            observed_head_sha=snapshot.head_sha,
+        )
+
+    monkeypatch.setattr(
+        "mimir.access_control.create_server_discovered_heartbeat_scope", mint,
+    )
+    live_heads = iter((second_head, third_head))
+    checked_out_heads: list[str] = []
 
     def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+        live_head = next(live_heads)
+        checked_out_heads.append(scope.observed_head_sha)
+        if scope.observed_head_sha != live_head:
             raise RuntimeError(
-                f"PR head advanced: scoped head {second_head} is stale; fetched head is {third_head}"
+                f"PR head advanced: scoped head {scope.observed_head_sha} is stale; "
+                f"fetched head is {live_head}"
             )
         lease = SimpleNamespace(
             path=tmp_path / "fresh", scope_id=scope.scope_id,
@@ -365,6 +380,9 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
         f"repository checkout rejected: PR head advanced: scoped head {second_head} "
         f"is stale; fetched head is {third_head}"
     )
+    assert client.snapshot_calls == 2
+    assert reminted_heads == [second_head]
+    assert checked_out_heads == [second_head, second_head]
     assert context.server_discovered_pr_states.resolve(
         "owner/repo", 7,
     ).action_scope.observed_head_sha == second_head
