@@ -358,12 +358,19 @@ Per-issue flow (one `run`):
    `origin/<attempt-branch>`, checks out the fetched attempt ref, then
    re-derives diff/test evidence locally. Worker-reported evidence is a
    hint/transcript, not the transition gate.
-7. **Validate + transition.** Evidence gates the label move (§4).
+7. **Advisory review.** After a passing gate is committed and re-observed, invoke
+   the read-only `work-reviewer` once with the leaf acceptance criteria, committed
+   diff, and orchestrator-observed evidence. Persist its verdict/findings before
+   opening the PR. A rejection, timeout, unavailable agent, or malformed response
+   is reported but never changes readiness or consumes the changes-requested
+   attempt budget. The reviewer reads; it does not execute tests or prove that a
+   test fails under guard deletion.
+8. **Validate + transition.** Evidence gates the label move (§4).
    Local shared-filesystem runs push the committed branch before PR creation;
    remote runs expect the worker to have pushed the branch and the executor
    opens the PR only after fetched-ref evidence passes. Native PR creation can
    become another backend cap later, but it must not bypass executor evidence.
-8. **Cleanup.** Remove the attempt's checkout on success; keep on
+9. **Cleanup.** Remove the attempt's checkout on success; keep on
    `failed`/`blocked` for autopsy (the reaper prunes attempt checkouts
    and their `issue/<issue>-a<n>` branches after N days, and on issue
    close). Release the lock.
@@ -390,7 +397,9 @@ summary):
   "pr_url": "https://github.com/...",
   "status": "completed | blocked | failed",
   "blocked_reason": null,
-  "transcript": "state/worklink/transcripts/412-1.jsonl"
+  "transcript": "state/worklink/transcripts/412-1.jsonl",
+  "review": {"status": "completed", "verdict": "APPROVE",
+             "findings": [], "required_fixes": [], "reason": null}
 }
 ```
 
@@ -408,6 +417,33 @@ self-reported):
   ("readiness ≠ agent replied").
 - `blocked` requires a non-empty `blocked_reason`; it is a first-class
   outcome, not a failure.
+
+### Pre-PR reviewer
+
+Worklink deliberately uses the `work-reviewer` definition from the pinned
+`opencode-feature-factory` package. Generated runtime images install that package
+and register it in the global OpenCode plugin configuration, which also applies
+inside isolated Worklink checkouts. Mimir does not vendor the agent definition,
+so the package pin remains the single source of truth and normal tool-pin updates
+control drift.
+
+The submitted review is bounded to 100 changed files and 100,000 UTF-8 diff bytes,
+with a 300-second timeout. Exceeding either cap records `review.status=skipped` and
+the reason. Invocation, timeout, and output-validation failures record
+`review.status=failed`. These states and a `REJECT` verdict are commentary beside
+the observed evidence, never a second source of truth for test results and never a
+PR gate.
+
+Other possible invocation points were surveyed but are not wired by this leaf:
+
+- **Leaf authoring:** review proposed leaf text before applying `worklink:ready`.
+  Repository history provides concrete support: #1097 required deleting a file
+  outside the repository, an acceptance criterion no PR could satisfy. Recommend
+  adding advisory review at the planner's create-leaves/ready-label boundary.
+- **Remediation:** review requested changes plus the resulting diff before push
+  and re-request. #1098's first remediation removed the discovery case its own
+  criterion depended on. Recommend adding advisory review in the GitHub poller's
+  remediation flow after editing and before its test/push/re-request sequence.
 
 ## 5. Pluggable backends
 

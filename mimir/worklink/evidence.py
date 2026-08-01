@@ -32,6 +32,15 @@ class TestResult:
 
 
 @dataclass(frozen=True)
+class WorkReview:
+    status: str
+    verdict: str | None = None
+    findings: list[str] | None = None
+    required_fixes: list[str] | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class WorklinkEvidence:
     issue: int
     attempt: int
@@ -57,6 +66,9 @@ class WorklinkEvidence:
     # Commit pushed for this completed attempt. Recovery uses it to detect PR
     # branch updates made after Worklink finished.
     head_sha: str | None = None
+    # Advisory, read-only review commentary. Observed diff/tests above remain
+    # authoritative and this field never participates in evidence validation.
+    review: WorkReview | None = None
 
 
 @dataclass(frozen=True)

@@ -418,6 +418,8 @@ def _orchestrator_runner(
     files_stdout: str = "changed.txt\n",
     dirty_after_commit: bool = False,
     cleanup_returncode: int = 0,
+    review_stdout: str = '{"verdict":"APPROVE","findings":[],"required_fixes":[]}',
+    review_returncode: int = 0,
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
@@ -460,6 +462,13 @@ def _orchestrator_runner(
             if commit_seen:
                 return cp(args, stdout="?? generated.log\n" if dirty_after_commit else "")
             return cp(args, stdout="?? changed.txt\n" if files_stdout else "")
+        if isinstance(args, list) and args[:2] == ["opencode", "run"]:
+            return cp(
+                args,
+                returncode=review_returncode,
+                stdout=review_stdout,
+                stderr="reviewer failed" if review_returncode else "",
+            )
         if args == "echo ok":
             return cp(args, stdout="ok\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "add"]:
@@ -588,11 +597,100 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert ["git", "-C", str(worktree), "checkout", "-B", "issue/441-a1", "abc123"] in calls
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
+    reviewer_calls = [
+        c for c in calls
+        if isinstance(c, list) and "--agent" in c and c[c.index("--agent") + 1] == "work-reviewer"
+    ]
+    assert len(reviewer_calls) == 1
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text()
+    )
+    assert evidence["review"] == {
+        "status": "completed",
+        "verdict": "APPROVE",
+        "findings": [],
+        "required_fixes": [],
+        "reason": None,
+    }
+    pr_body = pr_calls[0][pr_calls[0].index("--body") + 1]
+    assert "Verdict: **APPROVE**" in pr_body
+    assert "did not execute tests" in pr_body
     body = events.read_text(encoding="utf-8")
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
     _reset_logger_for_tests()
+
+
+def test_work_reviewer_reject_is_reported_and_pr_still_opens(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(
+        repo,
+        worktree,
+        review_stdout=json.dumps({
+            "verdict": "REJECT",
+            "findings": ["The assertion does not reference the changed guard."],
+            "required_fixes": ["Add a negative control."],
+        }),
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.review_ready is True
+    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["review"]["verdict"] == "REJECT"
+    assert any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+
+
+def test_work_reviewer_failure_is_recorded_and_nonfatal(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree, review_returncode=1)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.review_ready is True
+    assert result.pr_url is not None
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["review"]["status"] == "failed"
+    assert "reviewer unavailable" in evidence["review"]["reason"]
+    assert len([call for call in calls if isinstance(call, list) and call[:2] == ["opencode", "run"]]) == 1
+
+
+def test_work_reviewer_over_file_cap_records_skip(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    files = "".join(f"file-{index}.txt\n" for index in range(101))
+    calls, runner = _orchestrator_runner(repo, worktree, files_stdout=files)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.review_ready is True
+    evidence = json.loads(result.evidence_path.read_text())
+    assert evidence["review"]["status"] == "skipped"
+    assert evidence["review"]["reason"] == "file count 101 exceeds cap 100"
+    assert not any(isinstance(call, list) and call[:2] == ["opencode", "run"] for call in calls)
 
 
 def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:

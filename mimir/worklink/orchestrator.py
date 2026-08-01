@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
+import inspect
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,7 @@ from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
     EvidenceValidation,
+    WorkReview,
     WorklinkEvidence,
     observe_evidence,
 )
@@ -53,6 +55,9 @@ from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
+_WORK_REVIEWER_MAX_FILES = 100
+_WORK_REVIEWER_MAX_DIFF_BYTES = 100_000
+_WORK_REVIEWER_TIMEOUT_S = 300
 
 # --- feature-factory autonomous adapter (chainlink #833) --------------------
 # The factory self-drives every gate and writes run.json.terminal_result at a
@@ -750,6 +755,18 @@ class WorklinkRunner:
                 validation = _with_head_sha(validation, lease.path, runner=runner)
             evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
+            review = _invoke_work_reviewer(
+                issue,
+                validation.evidence,
+                checkout=lease.path,
+                base_ref=lease.local_base or lease.base_ref,
+                runner=runner,
+            )
+            validation = replace(
+                validation,
+                evidence=replace(validation.evidence, review=review),
+            )
+            evidence_path = _write_evidence(self.home, validation.evidence)
             # chainlink #518: push from the checkout that OWNS the attempt
             # branch, not the parent repo. With the isolated-checkout shape
             # (#517) the branch + its commit live only inside ``lease.path``
@@ -2396,6 +2413,22 @@ def _open_pr(
     base: str,
     runner: Runner,
 ) -> str:
+    review = evidence.review
+    review_lines = ["\nWork reviewer (advisory, read-only; it did not execute tests):"]
+    if review is None:
+        review_lines.append("- Status: not run")
+    else:
+        review_lines.append(f"- Status: {review.status}")
+        if review.verdict:
+            review_lines.append(f"- Verdict: **{review.verdict}**")
+        if review.reason:
+            review_lines.append(f"- Reason: {review.reason}")
+        if review.findings:
+            review_lines.append("- Prioritized findings:")
+            review_lines.extend(f"  {index}. {finding}" for index, finding in enumerate(review.findings, 1))
+        if review.required_fixes:
+            review_lines.append("- Required fixes:")
+            review_lines.extend(f"  {index}. {fix}" for index, fix in enumerate(review.required_fixes, 1))
     body = (
         f"Closes chainlink #{issue.issue_id}.\n\n"
         f"Worklink evidence:\n"
@@ -2406,6 +2439,8 @@ def _open_pr(
         f"`{evidence.tests.cmd if evidence.tests else '(none)'}` → "
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
         f"- Transcript: `{evidence.transcript or '(none)'}`\n"
+        + "\n".join(review_lines)
+        + "\n"
     )
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     repo_slug = _repo_slug(repo, runner=runner)
@@ -2446,6 +2481,117 @@ def _repo_slug_from_url(url: str | None) -> str | None:
 def _with_pr_url(validation: EvidenceValidation, pr_url: str) -> EvidenceValidation:
     evidence = replace(validation.evidence, pr_url=pr_url)
     return replace(validation, evidence=evidence)
+
+
+def _invoke_work_reviewer(
+    issue: IssueContext,
+    evidence: WorklinkEvidence,
+    *,
+    checkout: Path,
+    base_ref: str,
+    runner: Runner,
+) -> WorkReview:
+    """Run the factory-owned read-only reviewer once and return advisory output."""
+    if len(evidence.files_changed) > _WORK_REVIEWER_MAX_FILES:
+        return WorkReview(
+            status="skipped",
+            reason=(
+                f"file count {len(evidence.files_changed)} exceeds cap "
+                f"{_WORK_REVIEWER_MAX_FILES}"
+            ),
+        )
+
+    diff_result = runner(["git", "-C", str(checkout), "diff", f"{base_ref}...HEAD", "--"])
+    if diff_result.returncode != 0:
+        return WorkReview(status="failed", reason="could not read committed diff for review")
+    diff = diff_result.stdout
+    diff_bytes = len(diff.encode("utf-8"))
+    if diff_bytes > _WORK_REVIEWER_MAX_DIFF_BYTES:
+        return WorkReview(
+            status="skipped",
+            reason=f"diff size {diff_bytes} bytes exceeds cap {_WORK_REVIEWER_MAX_DIFF_BYTES}",
+        )
+
+    observed = _evidence_json(evidence)
+    observed.pop("review", None)
+    prompt = (
+        "Review this Worklink attempt against the leaf acceptance criteria and repository "
+        "conventions. Treat ORCHESTRATOR-OBSERVED EVIDENCE as ground truth; never rely on "
+        "the producer's prose for test or diff claims. This is a read-only review: do not "
+        "edit files and do not claim to execute tests or mutation checks. Return only JSON "
+        'with shape {"verdict":"APPROVE|REJECT","findings":["highest priority first"],'
+        '"required_fixes":["fix"]}.\n\n'
+        f"LEAF ACCEPTANCE CRITERIA:\n{_acceptance_criteria(issue.description)}\n\n"
+        f"ORCHESTRATOR-OBSERVED EVIDENCE:\n{json.dumps(observed, sort_keys=True)}\n\n"
+        f"COMMITTED DIFF:\n{diff}"
+    )
+    command = [
+        "opencode", "run", "--dir", str(checkout), "--agent", "work-reviewer", "--", prompt
+    ]
+    try:
+        parameters = inspect.signature(runner).parameters.values()
+        supports_timeout = any(
+            parameter.name == "timeout" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if supports_timeout:
+            result = runner(command, cwd=checkout, timeout=_WORK_REVIEWER_TIMEOUT_S)
+        else:
+            result = runner(command, cwd=checkout)
+    except subprocess.TimeoutExpired:
+        return WorkReview(
+            status="failed", reason=f"reviewer timed out after {_WORK_REVIEWER_TIMEOUT_S}s"
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory review cannot fail a build.
+        return WorkReview(status="failed", reason=f"reviewer unavailable: {str(exc)[:300]}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "reviewer exited nonzero").strip()
+        return WorkReview(status="failed", reason=f"reviewer unavailable: {detail[:300]}")
+    try:
+        payload = _review_json(result.stdout)
+        verdict = str(payload["verdict"]).upper()
+        findings = payload["findings"]
+        required_fixes = payload["required_fixes"]
+        if verdict not in {"APPROVE", "REJECT"}:
+            raise ValueError("verdict must be APPROVE or REJECT")
+        if not isinstance(findings, list) or not all(isinstance(item, str) for item in findings):
+            raise ValueError("findings must be a string list")
+        if not isinstance(required_fixes, list) or not all(
+            isinstance(item, str) for item in required_fixes
+        ):
+            raise ValueError("required_fixes must be a string list")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return WorkReview(status="failed", reason=f"malformed reviewer output: {exc}")
+    return WorkReview(
+        status="completed",
+        verdict=verdict,
+        findings=findings,
+        required_fixes=required_fixes,
+    )
+
+
+def _review_json(output: str) -> dict[str, Any]:
+    text = output.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("review must be a JSON object")
+    return payload
+
+
+def _acceptance_criteria(description: str) -> str:
+    marker = "Acceptance criteria:"
+    start = description.lower().find(marker.lower())
+    if start < 0:
+        return description.strip()
+    section = description[start + len(marker):]
+    for heading in ("Review criteria:", "Worklink notes:"):
+        end = section.lower().find(heading.lower())
+        if end >= 0:
+            section = section[:end]
+    return section.strip()
 
 
 def _with_head_sha(
@@ -2524,21 +2670,38 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
-    def run(args: Sequence[str] | str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        args: Sequence[str] | str,
+        cwd: Path | None = None,
+        timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         if isinstance(args, str):
-            return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
+            return subprocess.run(
+                args, shell=True, cwd=cwd, timeout=timeout, capture_output=True, text=True, check=False
+            )
         # Chainlink discovers its repository from cwd. Its configured home is
         # authoritative even when a caller also supplies a backend checkout.
         command_cwd = home if args and args[0] == chainlink_bin else cwd
-        return subprocess.run(list(args), cwd=command_cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            list(args), cwd=command_cwd, timeout=timeout, capture_output=True, text=True, check=False
+        )
 
     return run
 
 
-def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: Sequence[str] | str,
+    *,
+    cwd: Path | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     if isinstance(args, str):
-        return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
-    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            args, shell=True, cwd=cwd, timeout=timeout, capture_output=True, text=True, check=False
+        )
+    return subprocess.run(
+        list(args), cwd=cwd, timeout=timeout, capture_output=True, text=True, check=False
+    )
 
 
 def _log_event(event_type: str, **payload: Any) -> None:
