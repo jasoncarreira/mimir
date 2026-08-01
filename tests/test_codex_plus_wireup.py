@@ -109,11 +109,12 @@ class _FakeQuotaWindow:
         used_percent: float,
         window_minutes: int | None = None,
         reset_at: int | None = None,
+        reset_after_seconds: int | None = None,
     ) -> None:
         self.used_percent = used_percent
         self.window_minutes = window_minutes
         self.reset_at = reset_at
-        self.reset_after_seconds = None
+        self.reset_after_seconds = reset_after_seconds
 
 
 class _FakeRateLimits:
@@ -273,6 +274,21 @@ def test_callback_observed_at_is_iso_utc(tmp_path: Path):
         store.current()["openai_five_hour"].observed_at
     )
     assert before <= obs <= after
+
+
+def test_callback_preserves_relative_reset_and_uses_it_as_fallback(tmp_path: Path):
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    callback = make_codex_plus_rate_limit_callback(store)
+    before = int(time.time())
+    callback(_FakeRateLimits(primary=_FakeQuotaWindow(
+        used_percent=95.0,
+        window_minutes=300,
+        reset_at=None,
+        reset_after_seconds=120,
+    )))
+    snap = store.current()["openai_five_hour"]
+    assert snap.reset_after_seconds == 120
+    assert before + 119 <= snap.resets_at <= int(time.time()) + 121
 
 
 def test_callback_tolerates_none_input(tmp_path: Path):

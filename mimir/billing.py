@@ -36,12 +36,17 @@ keys).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from .rate_limits import (
@@ -352,9 +357,9 @@ class OpenAIQuotaProvider(_StorageBackedQuotaProvider):
     """Reads OpenAI Codex Plus / Pro subscription quota windows from
     :class:`RateLimitStore`.
 
-    **Codex doesn't have a polling endpoint** — quota state is piggy-
-    backed on every Codex API response via headers, the same way
-    Anthropic does it. From ``openai/codex`` source
+    Quota is refreshed out-of-band from Codex's authenticated account-usage
+    endpoint and is also piggy-backed on Codex API responses via headers.
+    From ``openai/codex`` source
     (``codex-rs/codex-api/src/rate_limits.rs``):
 
     * ``x-codex-primary-used-percent`` / ``-window-minutes`` /
@@ -362,9 +367,8 @@ class OpenAIQuotaProvider(_StorageBackedQuotaProvider):
     * ``x-codex-secondary-*`` — long window (typically weekly)
     * ``x-codex-credits-*`` — credits balance
 
-    The writer that populates ``openai_five_hour`` /
-    ``openai_seven_day`` in the store is :func:`make_codex_plus_rate_limit_callback`
-    — a response-header interceptor on the LangChain Codex client.
+    Both writers use :func:`record_codex_plus_rate_limits`, which atomically
+    replaces the complete set of Codex-owned keys.
 
     Registered when ``MIMIR_MODEL_SPEC`` starts with ``openai:`` AND
     the billing mode is QUOTA (operator declared subscription tier
@@ -384,6 +388,104 @@ class OpenAIQuotaProvider(_StorageBackedQuotaProvider):
 
 
 # ─── Writer side: ChatCodexPlus → RateLimitStore ──────────────────────
+
+
+def record_codex_plus_rate_limits(
+    store: RateLimitStore,
+    rl: Any,
+    *,
+    observed_at: str | None = None,
+) -> bool:
+    """Validate, classify, and atomically persist one Codex quota reading."""
+    import datetime as _dt
+
+    from .event_logger import log_event_sync
+
+    if rl is None:
+        return False
+    observed = observed_at or _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+    try:
+        observed_epoch = _dt.datetime.fromisoformat(
+            observed.replace("Z", "+00:00")
+        ).timestamp()
+    except (AttributeError, ValueError):
+        observed_epoch = time.time()
+
+    recorded: dict[str, dict[str, Any]] = {}
+    updates: dict[str, RateLimitSnapshot] = {}
+    for window, positional_key, positional_short in (
+        (getattr(rl, "primary", None), "openai_five_hour", "five_hour"),
+        (getattr(rl, "secondary", None), "openai_seven_day", "seven_day"),
+    ):
+        if window is None or getattr(window, "used_percent", None) is None:
+            continue
+        minutes = getattr(window, "window_minutes", None)
+        if minutes == 0:
+            continue
+        if minutes is None:
+            store_key, short = positional_key, positional_short
+        elif minutes >= 1440:
+            store_key, short = "openai_seven_day", "seven_day"
+        else:
+            store_key, short = "openai_five_hour", "five_hour"
+        try:
+            used_percent = float(window.used_percent)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(used_percent) or not 0 <= used_percent <= 100:
+            continue
+        util = used_percent / 100.0
+
+        reset_at = getattr(window, "reset_at", None)
+        reset_after = getattr(window, "reset_after_seconds", None)
+        reset_after = (
+            int(reset_after)
+            if isinstance(reset_after, (int, float))
+            and not isinstance(reset_after, bool)
+            and math.isfinite(float(reset_after))
+            and reset_after >= 0
+            else None
+        )
+        nominal_seconds = (minutes * 60) if isinstance(minutes, (int, float)) else None
+        plausible_reset = (
+            isinstance(reset_at, (int, float))
+            and not isinstance(reset_at, bool)
+            and reset_at > 0
+            and (nominal_seconds is None or reset_at <= observed_epoch + nominal_seconds + 300)
+        )
+        if plausible_reset:
+            effective_reset = int(reset_at)
+        elif reset_after is not None and (
+            nominal_seconds is None or reset_after <= nominal_seconds + 300
+        ):
+            effective_reset = int(observed_epoch + reset_after)
+        elif nominal_seconds is not None:
+            effective_reset = int(observed_epoch + nominal_seconds)
+        else:
+            effective_reset = None
+
+        updates[store_key] = RateLimitSnapshot(
+            status="allowed",
+            utilization=util,
+            resets_at=effective_reset,
+            reset_after_seconds=reset_after,
+            observed_at=observed,
+        )
+        recorded[short] = {
+            "utilization": util,
+            "resets_at": effective_reset,
+            "status": "allowed",
+        }
+    if not updates:
+        return False
+    store.reconcile_sync(
+        updates, owned_keys=provider_store_keys(CODEX_PLUS.provider)
+    )
+    try:
+        log_event_sync("codex_plus_usage_ok", recorded=recorded)
+    except (RuntimeError, OSError):
+        pass
+    return True
 
 
 def make_codex_plus_rate_limit_callback(
@@ -408,80 +510,8 @@ def make_codex_plus_rate_limit_callback(
     ``primary`` / ``secondary`` :class:`CodexQuotaWindow` fields.
     Conversion: ``used_percent`` (0-100) → ``utilization`` (0-1).
     """
-    import datetime as _dt
-
-    from .event_logger import log_event_sync
-
     def _sync_callback(rl: Any) -> None:
-        observed_at = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
-        if rl is None:
-            return
-        # Collect snapshots first so we can emit a single combined
-        # ``codex_plus_usage_ok`` event at the end — same shape as
-        # ``minimax_usage_ok`` / ``oauth_usage_ok`` so ``usage_history``
-        # treats all three providers uniformly.
-        # Route each window to its store key by WINDOW LENGTH, not by
-        # primary/secondary position. The Codex backend does not fix the
-        # position: on a Plus plan primary=5h + secondary=7d, but on a Pro plan
-        # the single window is the 7d one reported as PRIMARY (window_minutes
-        # 10080) with an empty secondary. Position-based mapping put the real
-        # 7d usage under the 5h key and left the 7d panel reading the empty
-        # secondary → a false 0%. Classify by window_minutes instead: >= 1 day
-        # is the long (7d) window, shorter is the 5h window. An empty window
-        # (window_minutes == 0) is skipped; unknown length (None) falls back to
-        # positional so Plus behavior is unchanged.
-        recorded: dict[str, dict[str, Any]] = {}
-        updates: dict[str, RateLimitSnapshot] = {}
-        for window, positional_key, positional_short in (
-            (getattr(rl, "primary", None), "openai_five_hour", "five_hour"),
-            (getattr(rl, "secondary", None), "openai_seven_day", "seven_day"),
-        ):
-            if window is None or window.used_percent is None:
-                continue
-            minutes = getattr(window, "window_minutes", None)
-            if minutes == 0:
-                continue  # empty/absent window (e.g. Pro plan's unused secondary)
-            if minutes is None:
-                store_key, short = positional_key, positional_short
-            elif minutes >= 1440:  # >= 1 day → the long (weekly/7d) window
-                store_key, short = "openai_seven_day", "seven_day"
-            else:
-                store_key, short = "openai_five_hour", "five_hour"
-            util = float(window.used_percent) / 100.0
-            updates[store_key] = RateLimitSnapshot(
-                status="allowed",
-                utilization=util,
-                resets_at=window.reset_at,
-                observed_at=observed_at,
-            )
-            recorded[short] = {
-                "utilization": util,
-                "resets_at": window.reset_at,
-                "status": "allowed",
-            }
-        # Write the reported windows AND drop any Codex-owned key the snapshot
-        # did NOT report this round, in one atomic write (#1058). On a
-        # Pro plan the callback reports only the 7d window; an older
-        # position-based mapper had already stored that 7d usage under
-        # ``openai_five_hour`` with the 7-day reset, so ``current()`` (which
-        # drops only by reset time) would keep that phantom 5h bucket live for
-        # up to a week. Reconciling removes the absent key in the same write.
-        # Guard on ``updates`` so a response carrying no usable window never
-        # blanks the panel.
-        if updates:
-            store.reconcile_sync(
-                updates, owned_keys=provider_store_keys(CODEX_PLUS.provider)
-            )
-        # Emit one event per response so the ops dashboard can build
-        # a time series. Best-effort — log_event_sync's OSError path
-        # already swallows file IO errors at WARN; we belt-and-suspender
-        # against logger-not-initialized too (some tests construct the
-        # callback before event_logger.init_logger has run).
-        if recorded:
-            try:
-                log_event_sync("codex_plus_usage_ok", recorded=recorded)
-            except (RuntimeError, OSError):
-                pass
+        record_codex_plus_rate_limits(store, rl)
 
     background_lock = asyncio.Lock()
     background_tasks: set[asyncio.Task[None]] = set()
@@ -508,6 +538,155 @@ def make_codex_plus_rate_limit_callback(
         task.add_done_callback(_background_done)
 
     return _callback
+
+
+# ``/wham/usage`` is undocumented but is the endpoint used by the upstream
+# Codex client. The timeout bounds a wedged request. Scheduler retries start at
+# one cadence and cap at 30 minutes: enough to avoid an auth/outage retry storm,
+# while remaining far shorter than either tracked quota window.
+CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_USAGE_TIMEOUT_SECONDS = 15.0
+CODEX_USAGE_BACKOFF_INITIAL_SECONDS = 180.0
+CODEX_USAGE_BACKOFF_MAX_SECONDS = 30.0 * 60.0
+_CODEX_WINDOW_SECONDS = {5 * 3600, 7 * 24 * 3600}
+
+
+class CodexUsageSchemaError(ValueError):
+    """The undocumented usage response did not match the trusted schema."""
+
+
+def parse_codex_usage_payload(data: Any) -> Any:
+    """Parse known Plus/Pro usage JSON into the callback's window shape."""
+    if not isinstance(data, dict):
+        raise CodexUsageSchemaError("top_level_not_object")
+    payload = data.get("rate_limits", data)
+    if not isinstance(payload, dict):
+        raise CodexUsageSchemaError("rate_limits_not_object")
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        raise CodexUsageSchemaError("rate_limit_not_object")
+
+    def _window(name: str) -> Any | None:
+        raw = rate_limit.get(name)
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise CodexUsageSchemaError(f"{name}_not_object")
+        used = raw.get("used_percent")
+        duration = raw.get("limit_window_seconds")
+        if (
+            isinstance(used, bool)
+            or not isinstance(used, (int, float))
+            or not math.isfinite(float(used))
+            or not 0 <= float(used) <= 100
+        ):
+            raise CodexUsageSchemaError(f"{name}_invalid_used_percent")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or int(duration) not in _CODEX_WINDOW_SECONDS
+        ):
+            raise CodexUsageSchemaError(f"{name}_unknown_duration")
+        for field_name in ("reset_at", "reset_after_seconds"):
+            value = raw.get(field_name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise CodexUsageSchemaError(f"{name}_invalid_{field_name}")
+        return SimpleNamespace(
+            used_percent=float(used),
+            window_minutes=int(duration) // 60,
+            reset_at=raw.get("reset_at"),
+            reset_after_seconds=raw.get("reset_after_seconds"),
+        )
+
+    primary = _window("primary_window")
+    secondary = _window("secondary_window")
+    if primary is None and secondary is None:
+        raise CodexUsageSchemaError("no_quota_windows")
+    return SimpleNamespace(primary=primary, secondary=secondary)
+
+
+async def poll_codex_usage_once(
+    store: RateLimitStore,
+    *,
+    auth_path: Path | None = None,
+    endpoint: str = CODEX_USAGE_ENDPOINT,
+    timeout_seconds: float = CODEX_USAGE_TIMEOUT_SECONDS,
+    session: Any = None,
+) -> bool:
+    """Refresh Codex quota without generation; preserve state on all failures."""
+    import aiohttp
+
+    from .codex_auth import load_codex_auth
+    from .event_logger import log_event
+    from .redaction import redact_text
+
+    async def _failed(stage: str, *, status: int | None = None, error: str = "") -> bool:
+        fields: dict[str, Any] = {"stage": stage}
+        if status is not None:
+            fields["status"] = status
+        if error:
+            fields["error"] = redact_text(error)
+        try:
+            await log_event("codex_plus_usage_failed", **fields)
+        except (RuntimeError, OSError):
+            pass
+        return False
+
+    try:
+        auth = load_codex_auth(auth_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return await _failed("auth", error=type(exc).__name__)
+    if auth is None:
+        return await _failed("auth_missing")
+
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        headers = {
+            "Authorization": f"Bearer {auth.access_token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli (mimir quota refresh)",
+        }
+        if auth.account_id:
+            headers["ChatGPT-Account-Id"] = auth.account_id
+        try:
+            async with session.get(
+                endpoint,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ) as response:
+                if response.status != 200:
+                    return await _failed("http", status=response.status)
+                try:
+                    data = json.loads(await response.text())
+                except (json.JSONDecodeError, UnicodeError):
+                    return await _failed("json")
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            return await _failed("network", error=type(exc).__name__)
+    finally:
+        if owns_session:
+            await session.close()
+
+    try:
+        rate_limits = parse_codex_usage_payload(data)
+    except CodexUsageSchemaError as exc:
+        return await _failed("schema", error=str(exc))
+    observed_at = datetime.now(tz=timezone.utc).isoformat()
+    recorded = await asyncio.to_thread(
+        record_codex_plus_rate_limits,
+        store,
+        rate_limits,
+        observed_at=observed_at,
+    )
+    if not recorded:
+        return await _failed("schema", error="no_usable_windows")
+    return True
 
 
 # ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
@@ -842,5 +1021,3 @@ def evaluate_quota_severity(
         provider=pname, window_key=key,
         burst_multiple=m, gamma=gamma,
     )
-
-

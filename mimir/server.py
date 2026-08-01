@@ -1743,7 +1743,7 @@ def build_app(config: Config) -> web.Application:
         # OAuth path's gating. Single writer per poller instance, the
         # store's own asyncio.Lock serializes concurrent writes — fine
         # for two pollers on different cron cadences.
-        rate_limit_store = RateLimitStore(
+        rate_limit_store = getattr(agent, "_rate_limits", None) or RateLimitStore(
             path=config.home / ".mimir" / "rate_limits.json",
         )
         # Only run the Anthropic OAuth usage poller when Anthropic is the
@@ -1788,6 +1788,23 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc),
                 )
 
+        # Codex account usage is a named callable and bypasses the LLM
+        # arbiter, allowing a reset reading to recover TIGHT/BLOCKED work.
+        # Gate on the actual subscription route: public ``openai:`` API-key
+        # traffic shares the quota-provider key but not this account endpoint.
+        codex_poll_registered = False
+        if config.model_spec.strip().lower().startswith("codex-plus:"):
+            try:
+                codex_poll_registered = scheduler.add_codex_usage_poll_job(
+                    rate_limit_store,
+                    config.codex_usage_poll_cron,
+                )
+            except ValueError as exc:
+                await log_event(
+                    "scheduler_invalid_cron",
+                    job="codex-usage-poll",
+                    error=str(exc),
+                )
         # Minimax usage poller. Opt-in: requires both
         # MIMIR_MINIMAX_USAGE_POLL_CRON (non-empty) AND
         # MINIMAX_API_KEY in env. We don't gate on billing_mode here
@@ -1942,6 +1959,7 @@ def build_app(config: Config) -> web.Application:
             consolidate_registered
             or introspection_registered
             or oauth_poll_registered
+            or codex_poll_registered
             or health_probe_registered
             or scheduler_health_registered
             or identities_populate_registered

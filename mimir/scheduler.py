@@ -2757,6 +2757,66 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Codex account usage poll cron -------------------------------
+
+    def add_codex_usage_poll_job(
+        self,
+        rate_limit_store: Any,
+        cron_expr: str,
+        *,
+        auth_path: Path | None = None,
+        job_id: str = "codex-usage-poll",
+    ) -> bool:
+        """Register the non-generative Codex quota refresh callable."""
+        import time
+
+        from .billing import (
+            CODEX_USAGE_BACKOFF_INITIAL_SECONDS,
+            CODEX_USAGE_BACKOFF_MAX_SECONDS,
+            poll_codex_usage_once,
+        )
+
+        failures = 0
+        next_attempt = 0.0
+
+        async def _run() -> None:
+            nonlocal failures, next_attempt
+            now = time.monotonic()
+            if now < next_attempt:
+                return
+            try:
+                success = await poll_codex_usage_once(
+                    rate_limit_store,
+                    auth_path=auth_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                await log_event(
+                    "codex_plus_usage_failed",
+                    stage="job_wrapper",
+                    error=type(exc).__name__,
+                )
+                success = False
+            if success:
+                failures = 0
+                next_attempt = 0.0
+                return
+            failures += 1
+            delay = min(
+                CODEX_USAGE_BACKOFF_MAX_SECONDS,
+                CODEX_USAGE_BACKOFF_INITIAL_SECONDS * (2 ** (failures - 1)),
+            )
+            next_attempt = time.monotonic() + delay
+
+        return self.register_callable(
+            name=job_id,
+            fn=_run,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=60,
+            max_instances=1,
+            coalesce=True,
+        )
+
     # ---- bind-mount health probe cron --------------------------------
 
     # VSM: S3 — non-LLM safety probe for the VirtioFS bind-mount stale-

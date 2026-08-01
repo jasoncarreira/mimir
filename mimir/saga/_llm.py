@@ -345,10 +345,12 @@ async def _call_codex_plus_async(
     persisting atomically). Returns "" on any failure — every saga call
     site already handles empty.
 
-    NOTE: saga's codex_plus usage consumes the same subscription quota
-    as the main agent server-side, but isn't yet wired into mimir's
-    local ``rate_limits`` surface (no ``rate_limit_callback`` here) —
-    tracked as a follow-up."""
+    The scheduled Codex account-usage refresh accounts for these calls
+    server-side when the active model route is also ``codex-plus:``. The
+    remaining blind spot is a deployment using Codex only for saga while its
+    active agent provider is different: active-provider gating intentionally
+    prevents the Codex refresh there, and saga still has no response callback.
+    """
     try:
         from langchain_codex_plus import ChatCodexPlus
         from langchain_core.messages import HumanMessage, SystemMessage
