@@ -2855,9 +2855,7 @@ class Agent:
         # them before finalization and reuse the exact classification.
         result_fields = derive_result_fields(messages, context=ctx)
         hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
-        outcome_is_error = bool(
-            error or result_fields["result_is_error"] or hard_refusals
-        )
+        outcome_is_error = bool(error or result_fields["result_is_error"])
         outcome_fields = {
             "result_subtype": result_fields["result_subtype"],
             "result_is_error": result_fields["result_is_error"],
