@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.agent import Agent
+from mimir.agent import Agent, _DEFAULT_SYSTEM_PROMPT
 from mimir.config import Config
 from mimir.event_logger import init_logger
 from mimir.history import MessageBuffer
@@ -121,6 +121,10 @@ async def test_build_agent_registers_structured_subagents(
         "general-purpose",
         "critic-structured",
     ]
+    middleware = capture.kwargs[0]["middleware"]
+    todo_middleware = [item for item in middleware if item.name == "TodoListMiddleware"]
+    assert len(todo_middleware) == 1
+    assert [tool.name for tool in todo_middleware[0].tools] == ["write_todos"]
 
 
 @pytest.mark.asyncio
@@ -203,3 +207,41 @@ async def test_core_prompt_degraded_event_emits_only_on_rebuild(
     assert len(capture.prompts) == 2
     events = agent._config.events_log.read_text(encoding="utf-8")
     assert events.count('"type": "core_prompt_degraded"') == 2
+
+
+def test_normal_system_prompt_includes_create_only_write_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+
+    prompt = agent._current_system_prompt()
+
+    assert (
+        "`write_file` creates a new file only. It never overwrites an existing path; "
+        "when the target exists, use `edit_file` instead."
+    ) in prompt
+
+
+def test_fallback_system_prompt_includes_create_only_write_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr("mimir.core_blocks.load_core", lambda _home: 1 / 0)
+
+    prompt = agent._build_system_prompt()
+
+    assert prompt == _DEFAULT_SYSTEM_PROMPT
+    assert (
+        "`write_file` creates a new file only. It never overwrites an existing path; "
+        "when the target exists, use `edit_file` instead."
+    ) in prompt
+
+
+def test_system_prompt_override_is_preserved_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    override = "Operator-owned prompt without appended defaults."
+    monkeypatch.setenv("MIMIR_SYSTEM_PROMPT_OVERRIDE", override)
+
+    assert agent._current_system_prompt() == override

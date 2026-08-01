@@ -552,27 +552,71 @@ async def test_budget_middleware_publishes_inventory_on_async_model_path() -> No
 
 
 @pytest.mark.asyncio
-async def test_final_model_bound_tool_surface_is_fully_cataloged() -> None:
-    from deepagents import create_deep_agent
+async def test_final_model_bound_tool_surface_is_fully_cataloged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepagents import HarnessProfile, create_deep_agent
+    from deepagents.backends import StateBackend
+    import deepagents.graph as deepagents_graph
+    from langchain.agents.middleware import TodoListMiddleware
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage, HumanMessage
 
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.subagents import build_mimir_subagents
     from mimir.tools.registry import all_mimir_tools
+
+    bound_tools: list[list[object]] = []
 
     class _InventoryModel(GenericFakeChatModel):
         def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            bound_tools.append(list(tools))
             return self
 
-    model = _InventoryModel(messages=iter([AIMessage(content="done")]))
+    monkeypatch.setattr(
+        deepagents_graph,
+        "_harness_profile_for_model",
+        lambda *_args: HarnessProfile(extra_middleware=(TodoListMiddleware(),)),
+    )
+    install_deepagents_grep_context_tool()
+    model = _InventoryModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "write_todos",
+            "args": {"todos": [{"content": "Verify inventory", "status": "in_progress"}]},
+            "id": "tc-main-todo",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
     agent = create_deep_agent(
         model=model,
         tools=all_mimir_tools(model_spec="openai:test"),
         system_prompt="inventory test",
-        middleware=[budget_gate.BudgetGateMiddleware()],
+        backend=StateBackend(),
+        middleware=[TodoListMiddleware(), budget_gate.BudgetGateMiddleware()],
+        subagents=build_mimir_subagents(),
     )
 
-    await agent.ainvoke({"messages": [HumanMessage(content="finish")]})
+    result = await agent.ainvoke({"messages": [HumanMessage(content="finish")]})
 
+    main_tools = next(
+        tools for tools in bound_tools
+        if sum(tool.name == "task" for tool in tools) == 1
+    )
+    main_names = [tool.name for tool in main_tools]
+    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "glob", "grep"}
+    assert set(main_names) & filesystem_names == filesystem_names
+    assert main_names.count("task") == 1
+    assert main_names.count("write_todos") == 1
+    assert "delete" not in main_names
+    assert "execute" not in main_names
+    write_file = next(tool for tool in main_tools if tool.name == "write_file")
+    assert write_file.description == (
+        "Creates a new file and writes the supplied content. It never overwrites an "
+        "existing path; when the target exists, use `edit_file` instead. Parent "
+        "directories are created as needed."
+    )
+    assert result["todos"] == [{"content": "Verify inventory", "status": "in_progress"}]
     runtime_tools = budget_gate.get_tool_registry().list_tools()
     assert runtime_tools
     unknown = sorted(
