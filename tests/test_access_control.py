@@ -4548,6 +4548,62 @@ def test_repo_review_push_is_still_gated_by_untrusted_active_ingest(
     assert blocked.reason == "ifc_label_blocked:shell_process"
 
 
+def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
+    tmp_path: Path,
+) -> None:
+    state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
+        creation_path="test",
+    )
+    self_trigger = SourceLabel(
+        principal="service:poller:github-activity", domain="channel",
+        resource_id="poller:github-activity", bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="service", integrity="trusted", integrity_effect="active_ingest",
+    )
+    untrusted_page = SourceLabel(
+        principal="https://attacker.invalid", domain="web",
+        resource_id="https://attacker.invalid/instructions", bridge_instance="fetch_url",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    clean = InformationFlowLabels().with_channel(
+        "poller:github-activity",
+    ).with_source(self_trigger)
+    untrusted_only = InformationFlowLabels().with_channel(
+        "poller:github-activity",
+    ).with_source(untrusted_page)
+    mixed = clean.with_source(untrusted_page)
+    target = (
+        f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
+        f"@{state.action_scope.observed_head_sha}:{state.action_scope.scope_id}"
+    )
+
+    def decision(labels: InformationFlowLabels):
+        auth = replace(
+            _service_auth(service, labels),
+            channel_id="poller:github-activity", repo_review_state=state,
+            ifc_state=InformationFlowState(labels=labels),
+        )
+        return SinkGate.check_sink_flow(
+            "repo_test", target, labels, auth, enforce=True,
+            repo_review_state=state,
+            repo_pr_action_scope=state.action_scope,
+        )
+
+    clean_decision = decision(clean)
+    assert clean_decision.allowed is True, clean_decision.reason
+    for labels in (untrusted_only, mixed):
+        blocked = decision(labels)
+        assert blocked.allowed is False
+        assert blocked.reason == "ifc_label_blocked:forge"
+
+
 @pytest.mark.asyncio
 async def test_repo_review_successful_checkout_unlocks_same_branch_push(
     tmp_path: Path,

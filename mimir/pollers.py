@@ -139,6 +139,11 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
 _POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
+_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = frozenset({
+    "pr_changes_requested_stale",
+    "pr_mergeability_rebase",
+    "pr_mergeability_conflicting",
+})
 # Circuit-breaker: after this many consecutive failures the poller is
 # suspended for ``POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS``. "Failure"
 # means a non-zero exit, timeout, or subprocess launch error — clean
@@ -332,7 +337,9 @@ def _github_author_is_trusted(repo: Any, author: Any, token: str) -> bool:
     parts = repo.split("/")
     if len(parts) != 2 or not all(parts):
         return False
-    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    allowed = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.",
+    )
     if any(set(value) - allowed for value in (*parts, author)):
         return False
     escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
@@ -400,11 +407,75 @@ def _github_content_author(repo: Any, extras: Any, token: str) -> str | None:
     if endpoint is None:
         return None
     attestation = _github_api_attestation(endpoint, token)
-    if attestation is None or attestation[0] != 200 or not isinstance(attestation[1], dict):
+    if (
+        attestation is None
+        or attestation[0] != 200
+        or not isinstance(attestation[1], dict)
+    ):
         return None
     user = attestation[1].get("user")
     author = user.get("login") if isinstance(user, dict) else None
     return author if isinstance(author, str) and author else None
+
+
+def _github_framework_trigger_is_trusted(
+    repo: Any,
+    extras: Any,
+    token: str,
+    self_login: str,
+) -> bool:
+    """Attest one framework-authored remediation trigger against live PR state."""
+    if (
+        not isinstance(repo, str)
+        or not isinstance(extras, dict)
+        or extras.get("event_type") not in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES
+        or not isinstance(self_login, str)
+        or not self_login
+    ):
+        return False
+    parts = repo.split("/")
+    number = extras.get("number")
+    if (
+        len(parts) != 2
+        or not all(parts)
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+    ):
+        return False
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+    if any(set(value) - allowed for value in (*parts, self_login)):
+        return False
+    escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
+    attestation = _github_api_attestation(
+        f"repos/{escaped_repo}/pulls/{number}", token,
+    )
+    if attestation is None or attestation[0] != 200 or not isinstance(attestation[1], dict):
+        return False
+    pull_request = attestation[1]
+    user = pull_request.get("user")
+    head = pull_request.get("head")
+    base = pull_request.get("base")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    return bool(
+        pull_request.get("state") == "open"
+        and pull_request.get("number") == number
+        and isinstance(user, dict)
+        and user.get("login") == self_login
+        and extras.get("author") == self_login
+        and isinstance(head, dict)
+        and isinstance(head_repo, dict)
+        and head_repo.get("full_name") == repo
+        and extras.get("head_repo") == repo
+        and extras.get("head_remote") == "origin"
+        and extras.get("head_ref") == head.get("ref")
+        and extras.get("head_sha") == head.get("sha")
+        and isinstance(base, dict)
+        and extras.get("base_ref") == base.get("ref")
+        and extras.get("base_sha") == base.get("sha")
+        and extras.get("url") == pull_request.get("html_url")
+    )
+
 
 # Pollers manifest schema version history:
 #
@@ -2055,24 +2126,32 @@ async def run_poller(
             trusted = poller.trust_source == "trusted_system"
             if poller.trust_source == "github":
                 repo = item_extras.get("repo")
-                author = await asyncio.to_thread(
-                    _github_content_author,
+                trusted = await asyncio.to_thread(
+                    _github_framework_trigger_is_trusted,
                     repo,
                     item_extras,
                     env.get("GITHUB_TOKEN", ""),
+                    env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
                 )
-                cache_key = (
-                    repo if isinstance(repo, str) else "",
-                    author if isinstance(author, str) else "",
-                )
-                if cache_key not in github_trust_cache:
-                    github_trust_cache[cache_key] = await asyncio.to_thread(
-                        _github_author_is_trusted,
+                if not trusted:
+                    author = await asyncio.to_thread(
+                        _github_content_author,
                         repo,
-                        author,
+                        item_extras,
                         env.get("GITHUB_TOKEN", ""),
                     )
-                trusted = github_trust_cache[cache_key]
+                    cache_key = (
+                        repo if isinstance(repo, str) else "",
+                        author if isinstance(author, str) else "",
+                    )
+                    if cache_key not in github_trust_cache:
+                        github_trust_cache[cache_key] = await asyncio.to_thread(
+                            _github_author_is_trusted,
+                            repo,
+                            author,
+                            env.get("GITHUB_TOKEN", ""),
+                        )
+                    trusted = github_trust_cache[cache_key]
             item_labels = item_labels.with_source(SourceLabel(
                 principal=service_principal,
                 domain="channel",

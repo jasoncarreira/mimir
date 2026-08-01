@@ -196,6 +196,12 @@ Two **independent** inputs decide what a turn may do:
      `untrusted` retains untrusted active ingest. Server locality, transport,
      display name, operation labels such as “read-only,” model arguments, and MCP
      response fields are not trust signals.
+   - **A GitHub poller's framework-authored remediation trigger** → trusted only
+     for the closed remediation event set and only after the server re-fetches the
+     open PR and matches its number, URL, configured self author, repository,
+     head/base refs, and head/base SHAs. The event name or metadata emitted by the
+     poller subprocess is never sufficient by itself. PR bodies and comments,
+     fetched pages, and attachments retain their independently derived trust.
    - Everything else ingested from outside → **untrusted**.
 
 The gate is the **2×2 of content-trust × sink blast-radius** (§3): *trusted →
@@ -231,6 +237,14 @@ what separates them. The **integrity gate fires iff an accumulated source is
 user turn." Wherever this doc says "untrusted taint" / "the turn-taint gate," that
 is the exact test — *any untrusted **active-ingest** source this turn* — never
 confidentiality emptiness and never an informational recall.
+
+The remediation trigger itself is trusted active ingest, not external content.
+This is the “trigger payload is not untrusted ingest” fix; `repo_test` remains a
+FORGE sink with the repository family. Successful `repo_checkout` and `repo_test`
+results still add `protected_tool` repository provenance as untrusted
+*informational* sources. Such labels can appear on later `repo_test` or
+`pr_submit_review` audits, but do not taint the turn; cross-PR/head repository
+provenance and execution-fault active ingest remain blocked.
 
 #### 2026-07-29 interactive shadow re-baseline (#1054)
 
