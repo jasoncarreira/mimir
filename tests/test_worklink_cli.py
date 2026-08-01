@@ -232,16 +232,22 @@ def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
     )
     _state(tmp_path, 2, 999_999_999, ticks=1, started_at=now - timedelta(minutes=3))
 
-    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
-        payload = [
-            {"id": 1, "labels": ["worklink:in-progress"]},
-            {"id": 2, "labels": ["worklink:ready"]},
-            {"id": 3, "labels": ["worklink:in-progress"]},
-            {"id": 4, "labels": ["worklink:ready"]},
-        ]
-        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+    calls: list[list[str]] = []
+    issue_details = {
+        1: {"id": 1, "labels": ["worklink:in-progress"]},
+        2: {"id": 2, "labels": ["worklink:ready"]},
+        3: {"id": 3, "labels": ["worklink:in-progress"]},
+        4: {"id": 4, "labels": ["worklink:ready"]},
+    }
 
-    rows = worklink_status(tmp_path, runner=runner, now=now)
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        issue_id = int(args[3])
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(issue_details[issue_id]), stderr=""
+        )
+
+    rows = worklink_status(tmp_path, issue_ids=[3, 4], runner=runner, now=now)
     assert {row.issue_id: row.classification for row in rows} == {
         1: "running",
         2: "orphaned",
@@ -249,8 +255,50 @@ def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
         4: "clean",
     }
     assert rows[0].elapsed_s == 120
+    assert rows[0].disagreement is None
     assert rows[1].disagreement == "run state present but worklink:in-progress label absent"
     assert rows[2].disagreement == "worklink:in-progress label present but run state absent"
+    assert any(row.label_in_progress for row in rows)
+    assert calls == [
+        ["chainlink", "issue", "show", str(issue_id), "--json"]
+        for issue_id in range(1, 5)
+    ]
+
+
+def test_status_reports_labels_unavailable_instead_of_absent(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    _state(
+        tmp_path,
+        5,
+        os.getpid(),
+        ticks=process_start_ticks(os.getpid()),
+        started_at=now,
+    )
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        # This is the real `issue list --json` item shape: it has neither labels
+        # nor blocked_by, and is invalid as an `issue show` label response.
+        payload = {
+            "closed_at": None,
+            "created_at": "2026-07-31T00:00:00Z",
+            "description": "",
+            "id": int(args[3]),
+            "parent_id": None,
+            "priority": 0,
+            "status": "open",
+            "title": "Issue",
+            "updated_at": "2026-07-31T00:00:00Z",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+
+    rows = worklink_status(tmp_path, issue_ids=[6], runner=runner, now=now)
+
+    assert [row.classification for row in rows] == ["running", "clean"]
+    assert all(row.label_in_progress is None for row in rows)
+    assert [row.disagreement for row in rows] == [
+        "labels unavailable: chainlink issue show 5 omitted labels",
+        "labels unavailable: chainlink issue show 6 omitted labels",
+    ]
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
