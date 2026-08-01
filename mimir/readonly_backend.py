@@ -23,10 +23,12 @@ mutator methods added by deepagents (``delete_file``, ``rename``,
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
@@ -75,6 +77,130 @@ MAX_GREP_CONTEXT_LINES = 200
 _grep_context: ContextVar[tuple[int, int]] = ContextVar(
     "mimir_grep_context", default=(0, 0),
 )
+_FILESYSTEM_TOOLS = [
+    "ls",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "execute",
+]
+_WRITE_FILE_DESCRIPTION = (
+    "Creates a new file and writes the supplied content. It never overwrites an "
+    "existing path; when the target exists, use `edit_file` instead. Parent "
+    "directories are created as needed."
+)
+_UNSUPPORTED_CREATE_ERROR = (
+    "Write failed: descriptor-relative file creation is unsupported on this platform."
+)
+_UNSAFE_COMPONENT_ERROR = (
+    "Write blocked: path contains a symbolic-link or non-directory component."
+)
+_OS_OPEN = os.open
+_OS_MKDIR = os.mkdir
+_OS_STAT = os.stat
+
+
+class _WriteCollision(str):
+    pass
+
+
+_WRITE_COLLISION = _WriteCollision("mimir-private-write-collision")
+
+
+def _exclusive_write(root: Path, file_path: str, content: str) -> WriteResult | _WriteCollision:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or _OS_OPEN not in supports_dir_fd
+        or _OS_MKDIR not in supports_dir_fd
+        or _OS_STAT not in supports_dir_fd
+        or _OS_STAT not in supports_follow_symlinks
+    ):
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+
+    root_text = str(root).rstrip("/")
+    key = file_path
+    if key == root_text:
+        key = "/"
+    elif root_text and key.startswith(root_text + "/"):
+        key = "/" + key[len(root_text) + 1:]
+    if key.startswith("~"):
+        return WriteResult(error="Path traversal not allowed")
+    relative = PurePosixPath(key.lstrip("/"))
+    parts = relative.parts
+    if not parts:
+        return WriteResult(error="File path must name a file")
+    if any(part in {"..", "~"} for part in parts):
+        return WriteResult(error="Path traversal not allowed")
+
+    opened: list[int] = []
+    final_fd: int | None = None
+    try:
+        opened.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY))
+        for component in parts[:-1]:
+            try:
+                os.mkdir(component, 0o777, dir_fd=opened[-1])
+            except FileExistsError:
+                pass
+            try:
+                nested = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=opened[-1],
+                )
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+                raise
+            opened.append(nested)
+
+        try:
+            final_fd = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=opened[-1],
+            )
+        except FileExistsError:
+            try:
+                existing = os.stat(parts[-1], dir_fd=opened[-1], follow_symlinks=False)
+            except OSError:
+                return _WRITE_COLLISION
+            if stat.S_ISLNK(existing.st_mode):
+                return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+            return _WRITE_COLLISION
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+            raise
+
+        with os.fdopen(final_fd, "w", encoding="utf-8", newline="") as handle:
+            final_fd = None
+            handle.write(content)
+        return WriteResult(path=file_path)
+    except NotImplementedError:
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+    except (OSError, UnicodeEncodeError) as exc:
+        return WriteResult(error=f"Error writing file '{file_path}': {exc}")
+    finally:
+        if final_fd is not None:
+            try:
+                os.close(final_fd)
+            except OSError:
+                pass
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _collision_error(file_path: str) -> str:
+    return f"File '{file_path}' already exists. Use edit_file to modify existing files."
 
 
 class GrepWithContextSchema(BaseModel):
@@ -112,6 +238,13 @@ class GrepWithContextSchema(BaseModel):
 
 class MimirFilesystemMiddleware(FilesystemMiddleware):
     """Filesystem middleware whose grep tool exposes backend context support."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        descriptions = dict(kwargs.pop("custom_tool_descriptions", None) or {})
+        descriptions["write_file"] = _WRITE_FILE_DESCRIPTION
+        kwargs["custom_tool_descriptions"] = descriptions
+        kwargs["tools"] = list(_FILESYSTEM_TOOLS)
+        super().__init__(**kwargs)
 
     def _create_grep_tool(self) -> BaseTool:
         stock_tool = super()._create_grep_tool()
@@ -907,13 +1040,13 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         )
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        try:
-            return super().write(file_path, content)
-        except ValueError as e:
-            return WriteResult(error=self._path_value_error_msg(file_path, e))
+        result = _exclusive_write(self.cwd, file_path, content)
+        if result is _WRITE_COLLISION:
+            return WriteResult(error=_WRITE_COLLISION)
+        return result
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
-        return await super().awrite(file_path, content)
+        return await asyncio.to_thread(self.write, file_path, content)
 
     def edit(
         self,
@@ -978,22 +1111,11 @@ class WriteGuardBackend:
     # a future deepagents release adding ``delete_file`` / ``rename`` /
     # ``mkdir`` can't bypass the guard until we audit + wrap it.
     #
-    # The ``*_info`` / ``*_raw`` variants are pre-deepagents-0.6 low-
-    # level shapes (return raw structs). The bare names (``ls``,
-    # ``als``, ``grep``, ``agrep``, ``glob``, ``aglob``) are the
-    # deepagents-0.6+ high-level wrappers — they're what the agent
-    # actually calls as filesystem tools. Both kinds are read-only
-    # (audited against ``deepagents/backends/composite.py``); allow-
-    # listing both keeps back-compat with older deepagents versions
-    # while making the 0.6+ tool surface work. Pre-fix, an agent on
-    # deepagents 0.6+ hit ``AttributeError: WriteGuardBackend does
-    # not forward 'agrep'`` every turn it tried to grep — surfaced
-    # during muninn-mimir cutover 2026-05-20.
     _ALLOWED_READS = frozenset({
         "read", "aread",
-        "ls", "als", "ls_info", "als_info",
-        "grep", "agrep", "grep_raw", "agrep_raw",
-        "glob", "aglob", "glob_info", "aglob_info",
+        "ls", "als",
+        "grep", "agrep",
+        "glob", "aglob",
         "execute", "aexecute",  # bash via backend — read-shaped from FS perspective
         "download_files", "adownload_files",
     })
@@ -1290,13 +1412,19 @@ class WriteGuardBackend:
         # ``_resolve_target`` during the writable-root check — the
         # explicit call here keeps the forward to ``self._fs`` self-
         # contained against future refactors of ``_resolve_target``.
-        return self._fs.write(
-            file_path=self._canonicalize_path(file_path),
+        canonical_path = self._canonicalize_path(file_path)
+        if not canonical_path.startswith("/"):
+            canonical_path = "/" + canonical_path
+        result = self._fs.write(
+            file_path=canonical_path,
             content=content,
         )
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(canonical_path))
+        return result
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
-        return self.write(file_path=file_path, content=content)
+        return await asyncio.to_thread(self.write, file_path, content)
 
     def edit(
         self,
@@ -1489,6 +1617,18 @@ class FileToolRouter(CompositeBackend):
         if callable(drain):
             return drain(turn_id=turn_id)
         return []
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        result = super().write(file_path, content)
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(file_path))
+        return result
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        result = await super().awrite(file_path, content)
+        if result.error is _WRITE_COLLISION:
+            return WriteResult(error=_collision_error(file_path))
+        return result
 
     def grep(
         self,
