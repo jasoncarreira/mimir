@@ -90,14 +90,21 @@ def test_direct_exec_env_uv_run_uses_project_virtualenv(
         encoding="utf-8",
     )
     pyvenv = project / ".venv" / "pyvenv.cfg"
+    # A venv's `home` must name the BASE interpreter's directory. `sys.executable`
+    # is only that when pytest itself runs on a base interpreter; under `uv run
+    # pytest` it is this project's own `.venv/bin/python`, and a venv derived from
+    # it has no stdlib -- uv's Python query then dies with "No module named
+    # 'encodings'" and the probe fails for a reason unrelated to what it asserts.
+    # `sys._base_executable` is what the stdlib `venv` module writes here.
+    base_executable = Path(getattr(sys, "_base_executable", None) or sys.executable)
     pyvenv.write_text(
-        f"home = {Path(sys.executable).parent}\n"
-        f"executable = {sys.executable}\n"
+        f"home = {base_executable.parent}\n"
+        f"executable = {base_executable}\n"
         f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
         encoding="utf-8",
     )
     venv_python = venv_bin / "python"
-    venv_python.symlink_to(sys.executable)
+    venv_python.symlink_to(base_executable)
     monkeypatch.setattr(_shell_env, "_TRUSTED_PATH", str(Path(uv).parent))
 
     completed = subprocess.run(
