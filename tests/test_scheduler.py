@@ -3296,6 +3296,39 @@ def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    async def noop(_e):
+        return True
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    active = {lease_root / "live"}
+    calls: list[tuple[Path, set[Path]]] = []
+
+    def fake_reclaim(root: Path, *, active_paths):
+        calls.append((root, active_paths()))
+        return []
+
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease.reclaim_expired_pr_checkout_leases", fake_reclaim,
+    )
+    monkeypatch.setattr(
+        "mimir.scheduler.active_pr_checkout_lease_paths", lambda: active,
+    )
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+
+    assert sched.add_pr_checkout_lease_reaper_job(lease_root) is True
+    job = sched._scheduler.get_job("pr-checkout-lease-reaper")
+    assert job is not None
+
+    await job.func()
+
+    assert calls == [(lease_root, active)]
+
+
+@pytest.mark.asyncio
 async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

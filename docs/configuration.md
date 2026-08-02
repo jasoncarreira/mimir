@@ -220,6 +220,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_FILE_OP_ROOTS` | retired tripwire | unset | Retired and ignored. If still present, startup warns to migrate every required root to `MIMIR_FILE_TOOL_ROOTS` and remove the old deployment setting; it grants no access. |
 | `MIMIR_FILE_TOOL_ROOTS` | csv `/absolute/path[:ro\|:rw]` | `""` | Legacy projection of `repositories.yaml` repository and allowed roots. When the YAML inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without that inventory, it retains the legacy behavior. `/tmp` is always derived as `rw`. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
 | `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Root for atomic, scope-bound PR checkout leases. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
+| `MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON` | cron | `*/15 * * * *` | Expired PR checkout lease reclamation cadence. Each lease's recorded `expires_at` determines eligibility; an empty value disables the scheduled sweep. |
 | `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
 | `MIMIR_MCP_SERVERS_JSON` | json | `""` | Inline MCP server config list (wins over `_PATH`). MCP is opt-in. |
 | `MIMIR_MCP_SERVERS_PATH` | path | `""` | Path to a JSON MCP server config file. |
