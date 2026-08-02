@@ -7,15 +7,19 @@ unit tests."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+from mimir._context import reset_current_turn, set_current_turn
+from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
 from mimir.cli import (
     DEFAULT_HEARTBEAT_BACKLOG,
     DEFAULT_HEARTBEAT_PATTERNS,
     setup_home,
 )
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, AuthContext, InformationFlowLabels, TurnContext
 from mimir.prompts import HEARTBEAT_DEFAULT_PROMPT, build_turn_prompt
+from mimir.readonly_backend import WriteGuardBackend
 # ---- Heartbeat prompt template (no longer a bundled skill) ---------------
 
 
@@ -52,6 +56,111 @@ def test_heartbeat_prompt_template_has_required_sections():
         )
     assert "jq pipelines over events.jsonl" not in body
     assert "git-commit any uncommitted memory work" not in body
+
+
+def test_heartbeat_required_filesystem_operations_are_permitted(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Execute the prompt's declared housekeeping operations through both gates."""
+    template = (
+        Path(__file__).parent.parent
+        / "mimir"
+        / "prompt_templates"
+        / "heartbeat.md"
+    ).read_text()
+    operations = re.findall(
+        r"^- `([a-z_]+) ([^`]+)`$", template, flags=re.MULTILINE,
+    )
+    assert operations, "heartbeat prompt must declare its required file operations"
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    (home / "memory" / "core").mkdir(parents=True)
+    (home / "memory" / "channels" / "scheduler:heartbeat").mkdir(parents=True)
+    (home / "state" / "heartbeat-backlog.md").write_text("# Backlog\n")
+    (home / "memory" / "core" / "50-heartbeat-patterns.md").write_text("# Core\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    authority = builtin_trigger_service_principal("heartbeat", home)
+    labels = InformationFlowLabels()
+    auth = AuthContext(
+        principal="service:heartbeat",
+        canonical_principal="heartbeat",
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+    )
+    turn = TurnContext(
+        turn_id="heartbeat-policy-test",
+        session_id="scheduler:heartbeat",
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        started_at=0.0,
+        auth_context=auth,
+        ifc_labels=labels,
+    )
+    backend = WriteGuardBackend(
+        root_dir=home, writable_dirs=["state", "memory"],
+    )
+    registry = ToolRegistry()
+    token = set_current_turn(turn)
+    try:
+        for operation, declared_path in operations:
+            relative_path = declared_path.replace(
+                "<timestamp>", "2026-08-02-120000",
+            )
+            absolute_path = str(home / relative_path)
+            if operation == "read_file":
+                decision = registry.authorize_tool(
+                    operation,
+                    auth,
+                    enforce=True,
+                    arguments={"file_path": absolute_path},
+                )
+                result = backend.read(relative_path)
+            elif operation == "write_file":
+                decision = registry.authorize_tool(
+                    operation,
+                    auth,
+                    enforce=True,
+                    target_channel=absolute_path,
+                )
+                result = backend.write(relative_path, "observation\n")
+            else:
+                raise AssertionError(
+                    f"test does not drive declared heartbeat operation {operation!r}"
+                )
+            assert decision.allowed is True, (operation, relative_path, decision.reason)
+            assert not getattr(result, "error", None), (operation, relative_path, result)
+
+        assert backend.drain_denials() == []
+        assert not any(
+            denial.get("reason") == "protected_read_target"
+            for denial in turn.hard_boundary_denials
+        )
+    finally:
+        reset_current_turn(token)
+
+    # The observation sink does not weaken the independent core write gate.
+    core_turn = TurnContext(
+        turn_id="heartbeat-core-write-test",
+        session_id="scheduler:heartbeat",
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        started_at=0.0,
+    )
+    token = set_current_turn(core_turn)
+    try:
+        blocked = backend.write("memory/core/50-heartbeat-patterns.md", "bad\n")
+        assert "read-only" in (getattr(blocked, "error", "") or "")
+    finally:
+        reset_current_turn(token)
 
 
 # ---- setup_home additions -----------------------------------------------

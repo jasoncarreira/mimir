@@ -35,22 +35,34 @@ compositions. Use direct `git`/`gh`/`chainlink` commands only for repository or
 tracker queries the structured tools cannot express, and use the file tools for
 `cat`/`head`/`tail`/`sed`-shaped reads.
 
+The fixed housekeeping filesystem operations in this workflow are:
+
+- `read_file state/heartbeat-backlog.md`
+- `write_file memory/channels/scheduler:heartbeat/heartbeat-patterns-<timestamp>.md`
+
+Other file operations come only from the selected backlog task. Core memory is
+already rendered into the system prompt and must not be read again with a file
+tool. Any change to `memory/core/` must use `open_proposal`; never write or edit
+the live core files during a turn.
+
 ## Step 1 — Librarian Protocol
 
-Run this first, every heartbeat. Five quick checks (~2 min total).
+Run this first, every heartbeat. Six quick checks (~2 min total).
 Catches drift before it compounds — the failure mode is silent
 "lobotomy" of working state without you noticing.
 
 **1. State coherence (30 sec)**
-Read your `memory/core/*.md` blocks. Are they intact, readable,
-non-empty in the spots they should have content (persona, procedures,
-style)? No surprise edits since you last looked?
+Inspect the core-memory blocks already rendered in the system prompt. Are they
+intact and non-empty in the spots that should have content (persona,
+procedures, style)? No surprise changes since the prior turn? Do not issue a
+filesystem read for `memory/core/`; the rendered blocks are the authoritative
+input for this check.
 
 **2. Drift check (30 sec)**
 Are you still speaking and acting as the identity/persona in `00-identity.md`?
 Have recent turns matched your stated values, or have you been generic
 and assistant-shaped? If you've drifted, name it and correct via a
-core-memory edit before doing anything else.
+core-memory proposal before doing anything else.
 
 **3. Re-anchor to current date (15 sec)**
 What's today's date according to the system reminder? What time of day
@@ -121,7 +133,7 @@ work:
   above.)
 
 **Decision after librarian:**
-- Drift detected → fix via memory edit, then proceed
+- Drift detected → open a core-memory proposal, then proceed
 - Dropped thread should be resumed → make that the heartbeat work
 - Cost rate or budget elevated → pick a small / no-spend item, or
   end silently
@@ -152,8 +164,8 @@ If the resource check above flagged a cost-rate alert or you're near
 budget thresholds, prefer:
 
 - **Memory cleanup** that doesn't fan out — compact a single core
-  block, prune stale entries from one extended file, run wiki orphan
-  tagging. These edit files; tokens are bounded.
+  block through `open_proposal`, prune stale entries from one extended
+  file, run wiki orphan tagging. These are bounded tasks.
 - **Backlog pruning** — read `state/heartbeat-backlog.md`, mark
   obsolete items as done. Useful and cheap.
 - **Structured local investigations** — use `read_file`/`grep`/`file_search`
@@ -176,8 +188,8 @@ nothing.
 Ranges from light to heavy:
 
 - **Memory maintenance** (10-15 min) — review a core block, compact
-  bloat, append a learned-behavior, consolidate a redundant non-core
-  file
+  bloat or append a learned behavior through `open_proposal`, or
+  consolidate a redundant non-core file
 - **Research** (20-30 min) — pick one backlog research item, follow
   the trail, write findings to `state/wiki/` or a new `memory/topics/`
   entry
@@ -223,16 +235,20 @@ to close out the heartbeat.
 
 ## Step 5 — Patterns
 
-Append observations to `memory/core/50-heartbeat-patterns.md` (it's
-a small core block — keep it tight). Things worth recording:
+When there is a useful observation, write it to a new timestamped file at
+`memory/channels/scheduler:heartbeat/heartbeat-patterns-<timestamp>.md`. Use a
+UTC `YYYY-MM-DD-HHMMSS` timestamp so the write never needs to read or overwrite
+an earlier observation. Keep each note tight. Things worth recording:
 
 - Tasks that consistently work well in a heartbeat
 - Tasks that tried to span multiple turns and failed
 - Time-of-day patterns (some work fits mornings, some weekends)
 - Mistakes you don't want to repeat
 
-The block is in core memory because it's load-bearing for next time;
-treat it like a personal playbook, not a journal.
+This channel memory is an observation log, not a way around core-memory review.
+If a pattern becomes stable and load-bearing, use `open_proposal` to curate it
+into `memory/core/50-heartbeat-patterns.md`; never copy raw recurring notes into
+core during the tick.
 
 ## Step 6 — End silently
 
@@ -244,8 +260,8 @@ genuinely needs operator attention. The bar is high:
 - "I did a thing today" → no message (the work is in the logs)
 
 If you find yourself wanting to send a routine update, that's a sign
-to update a memory block instead. The operator reads files, not chat
-for status updates.
+to write a channel-memory observation instead. The operator reads files,
+not chat for status updates.
 
 ## Self-reminders
 
