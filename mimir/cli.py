@@ -339,6 +339,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Include tombstoned atoms (default: live atoms only).",
     )
 
+    enforcement_replay_p = sub.add_parser(
+        "saga-enforcement-replay",
+        help="Measure strict-scope recall losses from a privileged replay trace.",
+    )
+    enforcement_replay_p.add_argument("--db", type=Path, required=True)
+    enforcement_replay_p.add_argument("--trace", type=Path, required=True)
+    enforcement_replay_p.add_argument(
+        "--cutover", required=True, help="Provenance-fix ISO-8601 timestamp.",
+    )
+
+    legacy_migration_p = sub.add_parser(
+        "saga-migrate-legacy-acl",
+        help="Migrate attributable historical rows on a new database copy.",
+    )
+    legacy_migration_p.add_argument("--source", type=Path, required=True)
+    legacy_migration_p.add_argument(
+        "--output", type=Path, help="New copy to modify; omit for dry-run.",
+    )
+    legacy_migration_p.add_argument("--cutover", required=True)
+    legacy_migration_p.add_argument(
+        "--channel-owner", action="append", default=[], metavar="CHANNEL=PRINCIPAL",
+    )
+
     # chainlink #507: out-of-process dead-man's-switch. Run as a compose
     # sidecar or cron — it alerts (ntfy / webhook) when the agent's liveness
     # beat goes stale, which the agent itself can't do once it's dead/wedged.
@@ -631,6 +654,40 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.db, include_tombstoned=args.include_tombstoned,
             )
         except (FileNotFoundError, OSError, sqlite3.Error) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    if args.command == "saga-enforcement-replay":
+        from .saga.enforcement_replay import analyze_paths
+        import json
+        import sqlite3
+
+        try:
+            report = analyze_paths(db=args.db, trace=args.trace, cutover=args.cutover)
+        except (FileNotFoundError, OSError, sqlite3.Error, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    if args.command == "saga-migrate-legacy-acl":
+        from .saga.legacy_acl_migration import migrate_copy
+        import json
+        import sqlite3
+
+        try:
+            mappings = dict(item.split("=", 1) for item in args.channel_owner)
+            report = migrate_copy(
+                source=args.source,
+                output=args.output,
+                cutover=args.cutover,
+                channel_owners=mappings,
+            )
+        except (
+            FileExistsError, FileNotFoundError, OSError, sqlite3.Error, ValueError,
+        ) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
         print(json.dumps(report, indent=2, sort_keys=True))
