@@ -378,6 +378,7 @@ class ServicePrincipal:
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     filesystem_read_roots: tuple[str, ...] = ()
+    channel_memory_directory: str | None = None
     saga_full_corpus_read: bool = False
     creation_path: str | None = None
     authority_profile: str | None = None
@@ -556,6 +557,7 @@ def build_trigger_service_principal(
     capabilities: tuple[str, ...],
     roots: tuple[Path, ...] = (),
     saga_full_corpus_read: bool = False,
+    channel_memory_directory: str | None = None,
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -644,6 +646,7 @@ def build_trigger_service_principal(
                 *((artifact_root,) if artifact_root is not None else ()),
             ))
         ),
+        channel_memory_directory=channel_memory_directory,
         saga_full_corpus_read=saga_full_corpus_read,
         creation_path=creation_path,
         authority_profile=profile,
@@ -662,6 +665,7 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
             tier=CapabilityTier.UNBOUNDED,
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
             roots=(root,),
+            channel_memory_directory="scheduler:heartbeat",
             creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
         )
     if profile == "session-boundary":

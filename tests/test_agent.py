@@ -838,6 +838,7 @@ async def test_poller_turn_reads_owned_channel_memory_without_boundary_denial(
         tier=CapabilityTier.CODE_EXECUTION,
         capabilities=("write_file",),
         roots=(state,),
+        channel_memory_directory="poller:memory-probe",
         creation_path="test",
     )
     denials: list[dict[str, Any]] = []
@@ -866,6 +867,79 @@ async def test_poller_turn_reads_owned_channel_memory_without_boundary_denial(
     assert fake_agent.result.content == "owned note\n"
     assert not any(
         denial.get("reason") == "service_scoped_read_boundary" for denial in denials
+    )
+
+
+async def test_heartbeat_turn_reads_explicitly_mapped_channel_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.access_control import builtin_trigger_service_principal
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    memory = home / "memory" / "channels" / "scheduler:heartbeat"
+    memory.mkdir(parents=True)
+    note = memory / "notes.md"
+    note.write_text("heartbeat note\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = builtin_trigger_service_principal("heartbeat", home)
+    fake_agent = _ServiceMemoryReadProbeAgent(
+        WriteGuardBackend(home, ["state", "memory"]),
+        "/memory/channels/scheduler:heartbeat/notes.md",
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="read your notes",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    ))
+
+    assert record.error is None
+    assert fake_agent.result is not None
+    assert fake_agent.result.status != "error"
+    assert fake_agent.result.content == "heartbeat note\n"
+
+
+async def test_missing_declared_service_channel_memory_root_is_observable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.access_control import builtin_trigger_service_principal
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = builtin_trigger_service_principal("heartbeat", home)
+    denials: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: denials.append(fields) if kind == "hard_boundary_denied" else None,
+    )
+    fake_agent = _ServiceMemoryReadProbeAgent(
+        WriteGuardBackend(home, ["state", "memory"]),
+        "/memory/channels/scheduler:heartbeat/notes.md",
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        content="read your notes",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    ))
+
+    assert any(
+        denial.get("reason") == "service_owned_channel_memory_root_missing"
+        and denial.get("target", "").endswith("memory/channels/scheduler:heartbeat")
+        for denial in denials
     )
 
 

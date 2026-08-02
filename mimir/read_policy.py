@@ -306,18 +306,21 @@ def service_owned_channel_memory_root(auth_context: Any) -> Path | None:
         return None
     authority = getattr(auth_context, "service_authority", None)
     canonical = getattr(auth_context, "canonical_principal", None)
+    directory = getattr(authority, "channel_memory_directory", None)
     if (
         not isinstance(canonical, str)
         or not canonical
         or getattr(authority, "canonical", None) != canonical
-        or Path(canonical).name != canonical
-        or canonical in {".", ".."}
+        or not isinstance(directory, str)
+        or not directory
+        or Path(directory).name != directory
+        or directory in {".", ".."}
     ):
         return None
     home = _resolved_mimir_home()
     if home is None:
         return None
-    root = home / "memory" / "channels" / canonical
+    root = home / "memory" / "channels" / directory
     try:
         if root.is_symlink():
             return None
@@ -335,6 +338,16 @@ def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
         resolved_root = root.resolve(strict=True)
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
+        try:
+            targets_owned_root = path == root or path.is_relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            targets_owned_root = False
+        if targets_owned_root:
+            emit_hard_read_denial(
+                "read_file",
+                str(root),
+                "service_owned_channel_memory_root_missing",
+            )
         return False
     return resolved == resolved_root or resolved.is_relative_to(resolved_root)
 

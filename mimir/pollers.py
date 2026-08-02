@@ -705,13 +705,15 @@ class PollerConfig:
     def resolved_authority(self) -> ServicePrincipal:
         if self.authority is not None:
             return self.authority
+        canonical = f"poller:{self.name}"
         return build_trigger_service_principal(
-            canonical=f"poller:{self.name}",
+            canonical=canonical,
             trigger="poller",
             profile="custom",
             tier=CapabilityTier.SCOPE_CONTAINED,
             capabilities=(),
             roots=(self.resolved_persist_dir().resolve(),),
+            channel_memory_directory=canonical,
             creation_path="mimir.pollers.run_poller",
         )
 
@@ -833,13 +835,15 @@ def _parse_poller_authority(
     if {"write_file", "edit_file"} & set(capabilities) and not roots:
         raise ValueError("file capabilities require at least one scoped root")
 
+    canonical = f"poller:{name}"
     return build_trigger_service_principal(
-        canonical=f"poller:{name}",
+        canonical=canonical,
         trigger="poller",
         profile=profile,
         tier=tier,
         capabilities=capabilities,
         roots=tuple(roots),
+        channel_memory_directory=canonical,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )
 
