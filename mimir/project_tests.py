@@ -56,6 +56,8 @@ class ProjectTestResult:
     returncode: int | None
     stdout: str = ""
     stderr: str = ""
+    command: tuple[str, ...] = ()
+    command_source: str = ""
 
 
 class ProjectTestRunner(Protocol):
@@ -137,18 +139,28 @@ def _bounded_project_test_runner(
     )
 
 
-def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
+def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str], str]:
     """Resolve Worklink's deployment command into one shell-free fixed argv."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
     try:
-        command = WorklinkConfig.load(Path(home) / "worklink.yaml").defaults.test_command
+        config = WorklinkConfig.load(Path(home) / "worklink.yaml")
+        record = config.repository(repo_slug) if config.repository_config_declared else None
+        if record is not None and record.test_command is not None:
+            command = record.test_command
+            source = "repository"
+        else:
+            command = config.defaults.test_command
+            source = "deployment"
         words = shlex.split(command, posix=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectTestRefusal("test_config_invalid", "project test command is invalid") from exc
     if not words:
-        raise ProjectTestRefusal("test_not_configured", "project test command is empty")
+        raise ProjectTestRefusal(
+            "test_command_unresolvable",
+            f"project test command from {source} configuration is empty",
+        )
 
     env = {
         "PATH": _PATH,
@@ -188,17 +200,17 @@ def _configured_command() -> tuple[tuple[str, ...], dict[str, str]]:
             else shutil.which(words[0], path=_PATH)
         )
     except OSError as exc:
-        raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
     if not resolved_text:
-        raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable")
+        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
     resolved = Path(resolved_text)
     try:
         resolved = resolved.resolve(strict=True)
     except OSError as exc:
-        raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable") from exc
+        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable") from exc
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
-        raise ProjectTestRefusal("test_runner_unavailable", "configured test runner is unavailable")
-    return (str(resolved), *words[1:]), env
+        raise ProjectTestRefusal("test_command_unresolvable", "configured test runner is unavailable")
+    return (str(resolved), *words[1:]), env, source
 
 
 #: Components walked from MIMIR_HOME to the per-execution home parent. Each is
@@ -359,7 +371,7 @@ class RepoProjectTests:
             root = RepoGitTools(self._state).validated_checkout_root()
         except GitRefusal as exc:
             raise ProjectTestRefusal(exc.code, str(exc)) from exc
-        command, env = _configured_command()
+        command, env, command_source = _configured_command(scope.canonical_repo)
         selected = _validated_selectors(root, selectors)
         # Fresh HOME per execution, removed afterwards. mkdtemp creates a new
         # 0o700 directory and fails rather than reusing an existing path, so a
@@ -388,12 +400,23 @@ class RepoProjectTests:
             finally:
                 os.close(parent_fd)
         if result.timed_out:
-            return ProjectTestResult(False, "test_timeout", None)
+            return ProjectTestResult(
+                False, "test_timeout", None,
+                command=command, command_source=command_source,
+            )
         if result.output_limited:
             # A token cut at the capture boundary cannot be safely redacted.
-            return ProjectTestResult(False, "test_output_limit", result.returncode)
+            return ProjectTestResult(
+                False, "test_output_limit", result.returncode,
+                command=command, command_source=command_source,
+            )
         stdout = _safe_output(result.stdout, root, _RETURN_STDOUT_CHARS)
         stderr = _safe_output(result.stderr, root, _RETURN_STDERR_CHARS)
         if result.returncode != 0:
-            return ProjectTestResult(False, "tests_failed", result.returncode, stdout, stderr)
-        return ProjectTestResult(True, "tests_passed", 0, stdout, stderr)
+            return ProjectTestResult(
+                False, "tests_failed", result.returncode, stdout, stderr,
+                command, command_source,
+            )
+        return ProjectTestResult(
+            True, "tests_passed", 0, stdout, stderr, command, command_source,
+        )

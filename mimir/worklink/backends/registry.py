@@ -118,6 +118,23 @@ class WorklinkDefaults:
 
 
 @dataclass(frozen=True)
+class RepositoryConfig:
+    slug: str
+    root: Path
+    mode: str
+    origin: str
+    base_branch: str
+    test_command: str | None = None
+    worklink: bool = False
+
+
+@dataclass(frozen=True)
+class AllowedRootConfig:
+    root: Path
+    mode: str
+
+
+@dataclass(frozen=True)
 class ToolPin:
     name: str
     category: str
@@ -151,6 +168,9 @@ class WorklinkRoute:
 @dataclass(frozen=True)
 class WorklinkConfig:
     defaults: WorklinkDefaults = field(default_factory=WorklinkDefaults)
+    repositories: tuple[RepositoryConfig, ...] = ()
+    allowed_roots: tuple[AllowedRootConfig, ...] = ()
+    repository_config_declared: bool = False
     routes: tuple[WorklinkRoute, ...] = ()
     backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     compute_backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -218,6 +238,14 @@ class WorklinkConfig:
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
+        repositories = _parse_repositories(data.get("repositories") or ())
+        allowed_roots = _parse_allowed_roots(data.get("allowed_roots") or ())
+        overlap = {repo.root for repo in repositories}.intersection(
+            root.root for root in allowed_roots
+        )
+        if overlap:
+            paths = ", ".join(str(path) for path in sorted(overlap))
+            raise ValueError(f"repository roots cannot also be allowed_roots: {paths}")
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
         raw_backends = data.get("backends") or {}
@@ -270,6 +298,11 @@ class WorklinkConfig:
         )
         return cls(
             defaults=defaults,
+            repositories=repositories,
+            allowed_roots=allowed_roots,
+            repository_config_declared=(
+                "repositories" in data or "allowed_roots" in data
+            ),
             routes=routes,
             backend_settings={
                 name: _expect_mapping(settings, f"worklink backends.{name}")
@@ -281,6 +314,18 @@ class WorklinkConfig:
             },
             tool_pins=tool_pins,
         )
+
+    def repository(self, slug: str) -> RepositoryConfig | None:
+        normalized = slug.strip().lower()
+        return next((repo for repo in self.repositories if repo.slug == normalized), None)
+
+    def repository_for_root(self, root: Path) -> RepositoryConfig | None:
+        resolved = root.resolve()
+        return next((repo for repo in self.repositories if repo.root == resolved), None)
+
+    @property
+    def worklink_repository(self) -> RepositoryConfig | None:
+        return next((repo for repo in self.repositories if repo.worklink), None)
 
     def select_compute_backend_name(
         self,
@@ -458,6 +503,105 @@ def _coerce_safety_bool(value: Any, *, default: bool = False) -> bool:
         if token in _FALSE_TOKENS:
             return False
     return default
+
+
+_REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_GITHUB_ORIGIN = re.compile(
+    r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?"
+)
+
+
+def _parse_mode(value: Any, label: str) -> str:
+    if value not in {"ro", "rw"}:
+        raise ValueError(f"{label}.mode must be 'ro' or 'rw'")
+    return str(value)
+
+
+def _parse_absolute_root(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value or "~" in value:
+        raise ValueError(f"{label}.root must be an absolute path")
+    root = Path(value)
+    if not root.is_absolute() or ".." in root.parts:
+        raise ValueError(f"{label}.root must be an absolute path without ~ or ..")
+    return root.resolve()
+
+
+def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError("worklink repositories must be a list")
+    repositories: list[RepositoryConfig] = []
+    slugs: set[str] = set()
+    roots: set[Path] = set()
+    worklink_count = 0
+    for index, item in enumerate(value):
+        label = f"worklink repositories[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be a mapping")
+        missing = [key for key in ("slug", "root", "mode", "origin", "base_branch") if key not in item]
+        if missing:
+            raise ValueError(f"{label} missing required field(s): {', '.join(missing)}")
+        slug = item["slug"]
+        if not isinstance(slug, str) or _REPOSITORY_SLUG.fullmatch(slug) is None:
+            raise ValueError(f"{label}.slug must be owner/repository")
+        slug = slug.lower()
+        root = _parse_absolute_root(item["root"], label)
+        origin = item["origin"]
+        origin_match = _GITHUB_ORIGIN.fullmatch(origin) if isinstance(origin, str) else None
+        if origin_match is None:
+            raise ValueError(f"{label}.origin must be a GitHub repository URL")
+        origin_slug = f"{origin_match.group('owner')}/{origin_match.group('repo')}".lower()
+        if origin_slug != slug:
+            raise ValueError(
+                f"{label}.origin names {origin_slug}, which disagrees with slug {slug}"
+            )
+        base_branch = item["base_branch"]
+        if not isinstance(base_branch, str) or not base_branch.strip():
+            raise ValueError(f"{label}.base_branch must be a non-empty string")
+        test_command = item.get("test_command")
+        if test_command is not None and not isinstance(test_command, str):
+            raise ValueError(f"{label}.test_command must be a string or null")
+        worklink = item.get("worklink", False)
+        if not isinstance(worklink, bool):
+            raise ValueError(f"{label}.worklink must be a boolean")
+        if slug in slugs:
+            raise ValueError(f"duplicate repository slug: {slug}")
+        if root in roots:
+            raise ValueError(f"duplicate repository root: {root}")
+        slugs.add(slug)
+        roots.add(root)
+        worklink_count += int(worklink)
+        repositories.append(RepositoryConfig(
+            slug=slug,
+            root=root,
+            mode=_parse_mode(item["mode"], label),
+            origin=origin.strip(),
+            base_branch=base_branch.strip(),
+            test_command=test_command,
+            worklink=worklink,
+        ))
+    if worklink_count > 1:
+        raise ValueError("only one repository may be the Worklink build target")
+    return tuple(repositories)
+
+
+def _parse_allowed_roots(value: Any) -> tuple[AllowedRootConfig, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError("worklink allowed_roots must be a list")
+    roots: set[Path] = set()
+    parsed: list[AllowedRootConfig] = []
+    for index, item in enumerate(value):
+        label = f"worklink allowed_roots[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be a mapping")
+        if set(item) != {"root", "mode"}:
+            raise ValueError(f"{label} must contain exactly root and mode")
+        root = _parse_absolute_root(item["root"], label)
+        if root in roots:
+            raise ValueError(f"duplicate allowed root: {root}")
+        roots.add(root)
+        parsed.append(AllowedRootConfig(root, _parse_mode(item["mode"], label)))
+    return tuple(parsed)
 
 
 def _parse_tool_pins(value: Any) -> tuple[ToolPin, ...]:

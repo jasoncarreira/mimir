@@ -729,6 +729,12 @@ def _configured_repo_write_roots() -> list[Path]:
     if not home:
         return []
 
+    from .worklink.backends.registry import WorklinkConfig
+
+    declared = WorklinkConfig.load(Path(home) / "worklink.yaml")
+    if declared.repository_config_declared:
+        return [repo.root for repo in declared.repositories if repo.mode == "rw"]
+
     from .config import _parse_file_tool_roots
 
     extra_roots = _parse_file_tool_roots(
@@ -742,6 +748,12 @@ def _configured_repo_roots() -> list[Path]:
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return []
+
+    from .worklink.backends.registry import WorklinkConfig
+
+    declared = WorklinkConfig.load(Path(home) / "worklink.yaml")
+    if declared.repository_config_declared:
+        return [repo.root for repo in declared.repositories]
 
     from .config import _parse_file_tool_roots
 
@@ -847,6 +859,13 @@ class RepoPRScopeResolution:
 
 
 def _configured_scope_github_repos() -> frozenset[str]:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        from .worklink.backends.registry import WorklinkConfig
+
+        config = WorklinkConfig.load(Path(home) / "worklink.yaml")
+        if config.repository_config_declared:
+            return frozenset(repo.slug for repo in config.repositories)
     return frozenset(
         f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
     )
@@ -862,8 +881,21 @@ def is_configured_github_repo(repo: object) -> bool:
 
 
 def _canonical_repo_binding_resolution(repo: str) -> RepoBindingResolution:
-    """Probe configured writable roots without exposing unconfigured paths."""
+    """Resolve a declared binding, with the legacy probe as migration fallback."""
     repo = repo.lower()
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        from .worklink.backends.registry import WorklinkConfig
+
+        config = WorklinkConfig.load(Path(home) / "worklink.yaml")
+        if config.repository_config_declared:
+            configured_roots = tuple(str(item.root) for item in config.repositories)
+            record = config.repository(repo)
+            if record is None:
+                return RepoBindingResolution(None, configured_roots, 0)
+            return RepoBindingResolution(
+                (str(record.root), record.origin), configured_roots, 1,
+            )
     configured_roots = tuple(str(root) for root in _configured_repo_write_roots())
     if repo not in _configured_scope_github_repos():
         return RepoBindingResolution(None, configured_roots, 0)

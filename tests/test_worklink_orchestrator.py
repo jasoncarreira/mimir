@@ -770,6 +770,42 @@ def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Pat
     assert pr_calls[0][pr_calls[0].index("--base") + 1] == "integration/worklink"
 
 
+def test_worklink_runner_uses_repository_base_over_deployment_default(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        f"""
+defaults:
+  base_branch: deployment-default
+repositories:
+  - slug: jasoncarreira/mimir
+    root: {repo}
+    mode: rw
+    origin: https://github.com/jasoncarreira/mimir.git
+    base_branch: repository-base
+    test_command: echo repository-tests
+    worklink: true
+""".strip(),
+        encoding="utf-8",
+    )
+    calls, runner = _orchestrator_runner(repo, worktree)
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake"
+        )
+    )
+
+    assert result.status == "completed"
+    assert ["git", "-C", str(repo), "fetch", "origin", "repository-base"] in calls
+    pr_calls = [call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"]]
+    assert pr_calls[0][pr_calls[0].index("--base") + 1] == "repository-base"
+    assert "echo repository-tests" in backend.orders[0].prompt
+
+
 def test_worklink_run_base_override_beats_config(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
