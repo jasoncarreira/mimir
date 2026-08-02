@@ -48,6 +48,12 @@ from mimir.tools.repo import repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operator_repository_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy GITHUB_REPOS cases must not inherit the operator's inventory."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+
 def _scope(
     *actions: RepoPRAction,
     number: int = 17,

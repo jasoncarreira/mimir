@@ -329,6 +329,7 @@ def test_claim_issue_blocks_when_attempts_exhausted() -> None:
 
 def test_reaper_enforces_own_ttl_before_steal() -> None:
     calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
@@ -342,9 +343,21 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
         return completed(args)
 
     now = datetime(2026, 6, 11, 5, tzinfo=UTC)
-    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, clock=lambda: now)
+    claims = ChainlinkClaims(
+        agent_id="mimir-a",
+        runner=runner,
+        clock=lambda: now,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+    )
     fresh = ClaimRecord(1, 1, "live", now - timedelta(minutes=5))
-    stale = ClaimRecord(2, 1, "stale", now - timedelta(hours=3))
+    heartbeat = now - timedelta(hours=2)
+    stale = ClaimRecord(
+        2,
+        1,
+        "stale",
+        now - timedelta(hours=3),
+        heartbeat_at=heartbeat,
+    )
 
     reaped = claims.reap_stale_claims([fresh, stale], ttl=timedelta(hours=1))
 
@@ -354,7 +367,21 @@ def test_reaper_enforces_own_ttl_before_steal() -> None:
     assert ["chainlink", "locks", "release", "2"] in calls
     assert ["chainlink", "issue", "label", "2", "worklink:ready"] in calls
     comments = [call[-1] for call in calls if call[:3] == ["chainlink", "issue", "comment"]]
-    assert any("stale_agent_id" in comment and "stale" in comment for comment in comments)
+    payload = json.loads(comments[-1].removeprefix("WORKLINK_REAPER "))
+    assert payload["stale_agent_id"] == "stale"
+    assert payload["last_heartbeat"] == heartbeat.isoformat()
+    assert payload["resulting_label"] == "worklink:ready"
+    assert events == [
+        (
+            "worklink_claim_reaped",
+            {
+                "issue_id": 2,
+                "agent_id": "stale",
+                "last_heartbeat": heartbeat.isoformat(),
+                "resulting_label": "worklink:ready",
+            },
+        )
+    ]
 
 
 def test_reaper_blocks_after_max_attempts() -> None:

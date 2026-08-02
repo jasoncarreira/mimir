@@ -33,6 +33,7 @@ import subprocess
 import time
 from typing import Callable, Sequence
 
+from ..event_logger import log_event_sync
 from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
@@ -95,6 +96,7 @@ def make_claims(home: Path, *, agent_id: str | None = None) -> ChainlinkClaims:
         agent_id=agent_id or current_agent_id(),
         runner=_home_runner(home),
         home_path=home,
+        event_logger=log_event_sync,
     )
 
 

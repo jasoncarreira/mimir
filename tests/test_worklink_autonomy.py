@@ -292,16 +292,35 @@ def test_reap_home_skips_when_issue_already_transitioned() -> None:
     assert not any(c[1:] == ["issue", "label", "56", "worklink:ready"] for c in fake.calls)
 
 
-def test_reap_home_skips_when_lock_owner_changed() -> None:
+def test_reap_home_reclaims_lock_with_distinct_chainlink_tracker_owner() -> None:
+    """Lock and claim agent ids belong to different identity namespaces.
+
+    Production Chainlink locks name the configured tracker agent, not the
+    Worklink process id written to claim comments. That normal shape must not
+    suppress stale-claim recovery.
+    """
     fake = FakeChainlink(
         in_progress=[55],
         active_locks=[55],
-        lock_agents={55: "other-agent"},
-        comments={55: [_claim_comment(55, attempt=1, age=timedelta(hours=3), agent="old-agent")]},
+        lock_agents={55: "mimir-carreira"},
+        comments={
+            55: [
+                _claim_comment(
+                    55,
+                    attempt=1,
+                    age=timedelta(hours=3),
+                    heartbeat_age=timedelta(hours=2, minutes=1),
+                    agent="mimir-worklink:process-a",
+                )
+            ]
+        },
     )
     claims = ChainlinkClaims(agent_id="t", runner=fake)
-    assert claims.reap_home(ttl=timedelta(hours=2)) == []
-    assert "locks steal 55" not in fake.names()
+    reaped = claims.reap_home(ttl=timedelta(hours=2))
+
+    assert [record.issue_id for record in reaped] == [55]
+    assert "locks steal 55" in fake.names()
+    assert "locks release 55" in fake.names()
 
 
 def test_reap_home_leaves_fresh_claim_untouched() -> None:
@@ -335,6 +354,26 @@ def test_reap_home_leaves_finalizing_claim_with_fresh_heartbeat_untouched() -> N
 
     assert claims.reap_home(ttl=timedelta(seconds=1860)) == []
     assert "locks steal 57" not in fake.names()
+
+
+def test_reap_home_leaves_old_claim_with_current_heartbeat_untouched() -> None:
+    fake = FakeChainlink(
+        in_progress=[58],
+        comments={
+            58: [
+                _claim_comment(
+                    58,
+                    attempt=1,
+                    age=timedelta(days=3),
+                    heartbeat_age=timedelta(minutes=1),
+                )
+            ]
+        },
+    )
+    claims = ChainlinkClaims(agent_id="t", runner=fake)
+
+    assert claims.reap_home(ttl=timedelta(hours=2)) == []
+    assert "locks steal 58" not in fake.names()
 
 
 def test_reap_home_uses_latest_record_per_issue() -> None:

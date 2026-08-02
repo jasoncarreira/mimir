@@ -3377,7 +3377,7 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
 
 
 @pytest.mark.asyncio
-async def test_worklink_reaper_job_silent_when_nothing_reaped(
+async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     async def noop(_e):
@@ -3394,7 +3394,9 @@ async def test_worklink_reaper_job_silent_when_nothing_reaped(
     await job.func()
 
     events = _read_event_types(tmp_path / "logs" / "events.jsonl")
-    assert not [e for e in events if e["type"] == "worklink_claims_reaped"]
+    [event] = [e for e in events if e["type"] == "worklink_claims_reaped"]
+    assert event["count"] == 0
+    assert event["issue_ids"] == []
 
 
 def test_poller_reload_prunes_circuit_breakers_for_removed_pollers(tmp_path: Path):
