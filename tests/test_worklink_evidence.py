@@ -39,6 +39,45 @@ def test_completed_empty_diff_demotes_to_failed() -> None:
     assert "completed_empty_diff" in result.reasons
 
 
+def test_backend_failure_without_text_still_records_a_reason() -> None:
+    """A failed run must never be reasonless — chainlink #1108.
+
+    Reproduces the shape of evidence files 1108-1/2/3: the backend reported
+    ``failed`` with no ``failure_reason``, while the work was committed and the
+    gate passed. Every other failure transition in ``validate_evidence`` names
+    itself; this one only did when the backend supplied text, so the record was
+    written with ``failure_reason: null`` and ``reasons: []`` and nobody could
+    say why three complete builds were discarded.
+    """
+    result = validate_evidence(
+        base_evidence(
+            status="failed",
+            failure_reason=None,
+            files_changed=["mimir/worklink/orchestrator.py"],
+            tests=TestResult("uv run pytest -q", 0, "ok", observed=True),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert result.reasons, "a failed run must state at least one reason"
+    assert "failed_missing_reason" in result.reasons
+    # the persisted record must carry it too, not just the validation object
+    assert result.evidence.failure_reason
+    assert "without a reason" in result.evidence.failure_reason
+
+
+def test_backend_supplied_failure_reason_is_preserved() -> None:
+    """The synthesized reason must not displace a real one."""
+    result = validate_evidence(
+        base_evidence(status="failed", failure_reason="executor exited 7")
+    )
+
+    assert "executor exited 7" in result.reasons
+    assert "failed_missing_reason" not in result.reasons
+    assert result.evidence.failure_reason == "executor exited 7"
+
+
 def test_review_rejects_unobserved_fabricated_tests() -> None:
     result = validate_evidence(base_evidence(tests=TestResult("pytest", 0, "backend says passed", observed=False)))
 

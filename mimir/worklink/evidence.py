@@ -97,8 +97,25 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     if status == "blocked":
         return EvidenceValidation(status="blocked", review_ready=False, reasons=tuple(reasons), evidence=evidence)
 
-    if status == "failed" and evidence.failure_reason:
-        reasons.append(evidence.failure_reason)
+    if status == "failed":
+        if evidence.failure_reason:
+            reasons.append(evidence.failure_reason)
+        else:
+            # A backend that reports "failed" without supplying text used to
+            # produce a record with status=failed, failure_reason=null and an
+            # EMPTY reasons list: every other transition below names itself,
+            # but this one only did so when the backend happened to provide a
+            # message. Chainlink #1108 was diagnosed from three such records —
+            # each had committed work and a passing gate, and nothing said why
+            # the run failed. `blocked` already has `blocked_missing_reason`
+            # for exactly this; `failed` now has its counterpart.
+            reasons.append("failed_missing_reason")
+            evidence = replace(
+                evidence,
+                failure_reason=(
+                    f"{evidence.backend} reported failure without a reason"
+                ),
+            )
 
     if status == "completed" and not evidence.files_changed:
         reasons.append("completed_empty_diff")
