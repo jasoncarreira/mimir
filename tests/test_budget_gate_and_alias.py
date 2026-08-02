@@ -2615,7 +2615,7 @@ async def test_real_repo_execution_fault_taints_turn(
 
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
-    assert "repository operation rejected (git_failed)" in str(result.content)
+    assert "repository operation rejected (repository_git_failed)" in str(result.content)
     assert ctx.ifc_labels.has_untrusted_active_ingest is True
 
 

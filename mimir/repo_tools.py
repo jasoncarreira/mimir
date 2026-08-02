@@ -25,6 +25,7 @@ from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from .pr_checkout_lease import PUBLISHED_HEAD_REF
+from .redaction import redact_text
 
 
 _DEFAULT_GIT = Path("/usr/bin/git")
@@ -37,6 +38,7 @@ _REF_RE = re.compile(r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _FILTER_KEY_RE = re.compile(r"filter\.([^.\x00]+)\.(clean|smudge|process)")
 _MERGE_KEY_RE = re.compile(r"merge\.([^.\x00]+)\.driver")
 _RECENT_AGENT_PUSH_LIMIT = 1024
+_URL_USERINFO_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,31}://)[^/@\s]+@")
 _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
 _recent_agent_pushes_lock = threading.Lock()
 
@@ -86,6 +88,11 @@ class GitRefusal(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _redact_git_output(text: str) -> str:
+    """Redact token-shaped secrets and URL userinfo from Git diagnostics."""
+    return _URL_USERINFO_RE.sub(r"\1[REDACTED]@", redact_text(text))
 
 
 @dataclass(frozen=True)
@@ -428,7 +435,11 @@ class RepoGitTools:
                     stdout=result.stdout.replace(value, "[REDACTED]"),
                     stderr=result.stderr.replace(value, "[REDACTED]"),
                 )
-            return result
+            return replace(
+                result,
+                stdout=_redact_git_output(result.stdout),
+                stderr=_redact_git_output(result.stderr),
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             raise GitRefusal("git_failed", "pinned Git execution failed") from exc
 
@@ -516,12 +527,21 @@ class RepoGitTools:
             report_stdout_on_failure=report_stdout_on_failure,
         )
 
+    def _has_in_progress_merge_or_rebase(self) -> bool:
+        git_dir = Path(
+            self._command(("rev-parse", "--absolute-git-dir")).stdout.strip()
+        )
+        return any(
+            (git_dir / marker).exists()
+            for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD")
+        )
+
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
         top = self._command(("rev-parse", "--show-toplevel")).stdout.strip()
         origin = self._command(("remote", "get-url", "origin")).stdout.strip()
         if Path(top).resolve(strict=False) != self._root or origin != self._scope.canonical_origin:
             raise GitRefusal("cross_pr_checkout", "checkout identity no longer matches the PR scope")
-        if allow_in_progress:
+        if allow_in_progress and self._has_in_progress_merge_or_rebase():
             return
         branch = self._command(("symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
         head = self._command(("rev-parse", "--verify", "HEAD")).stdout.strip().lower()
@@ -662,7 +682,11 @@ class RepoGitTools:
         """Authorize one typed operation and execute only server-built argv."""
         self._root = self._validate_lease()
         self._assert_checkout_identity(allow_in_progress=isinstance(
-            operation, (GitMergeAbort, GitRebaseAbort, GitRevertAbort),
+            operation,
+            (
+                GitStatus, GitDiff, GitUnmerged,
+                GitMergeAbort, GitRebaseAbort, GitRevertAbort,
+            ),
         ))
 
         if isinstance(operation, GitFetch):

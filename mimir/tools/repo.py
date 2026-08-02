@@ -29,6 +29,7 @@ from ..repo_tools import (
     GitStatus,
     GitUnmerged,
     RepoGitTools,
+    _redact_git_output,
 )
 from .refusals import ToolPolicyRefusal
 
@@ -43,6 +44,15 @@ _GIT_EXECUTION_REFUSAL_CODES = frozenset({
     "push_not_applied",
     "timeout",
 })
+_GIT_BINDING_REFUSAL_CODES = frozenset({
+    "cross_pr_checkout",
+    "inactive_checkout",
+    "invalid_checkout",
+    "invalid_scope",
+})
+_REPOSITORY_AUTHORIZATION_REFUSED = "repository_authorization_refused"
+_REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
+_REPOSITORY_GIT_FAILED = "repository_git_failed"
 _PROJECT_TEST_EXECUTION_REFUSAL_CODES = frozenset({
     "test_execution_failed",
     "test_output_limit",
@@ -131,12 +141,28 @@ def _execute(
                 ),
             ).execute(operation)
         )
-    except (GitRefusal, RuntimeError, ValueError) as exc:
-        code = getattr(exc, "code", "repository_operation_failed")
-        message = f"repository operation rejected ({code}): {exc}"
+    except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
+        cause_code = getattr(exc, "code", None)
+        if isinstance(exc, ToolPolicyRefusal) or (
+            isinstance(exc, GitRefusal)
+            and cause_code not in _GIT_EXECUTION_REFUSAL_CODES | _GIT_BINDING_REFUSAL_CODES
+        ):
+            code = _REPOSITORY_AUTHORIZATION_REFUSED
+        elif isinstance(exc, ValueError) or cause_code in _GIT_BINDING_REFUSAL_CODES or (
+            isinstance(exc, ToolException) and not isinstance(exc, GitRefusal)
+        ):
+            code = _REPOSITORY_BINDING_INVALID
+        else:
+            code = _REPOSITORY_GIT_FAILED
+        cause = f" [{cause_code}]" if cause_code else ""
+        detail = _redact_git_output(str(exc))
+        message = f"repository operation rejected ({code}){cause}: {detail}"
         raise _tool_refusal(
-            message, exc, code=code, execution_codes=_GIT_EXECUTION_REFUSAL_CODES,
-        ) from exc
+            message,
+            exc,
+            code=code,
+            execution_codes=frozenset({_REPOSITORY_GIT_FAILED}),
+        ) from None
 
 
 @tool
