@@ -672,20 +672,25 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     assert any(match["path"].endswith("tests/test_access_control.py") for match in grep_result.matches)
     assert any(match["path"].endswith("tests/test_access_control.py") for match in glob_result.matches)
     assert untracked_grep.matches == []
-    refusal = (
-        "Read denied: protected_read_target. For published PR content, "
+    result_refusal = (
+        "Read denied: protected_read_result. For published PR content, "
         "use pr_files or pr_diff."
     )
-    assert untracked_result.error == refusal
-    assert tracked_protected_result.error == refusal
-    assert env_result.error == refusal
+    name_refusal = (
+        "Read denied: protected_name_match. "
+        "Use a non-secret source or an authorized secret interface."
+    )
+    assert untracked_result.error == result_refusal
+    assert tracked_protected_result.error == name_refusal
+    assert env_result.error == name_refusal
     assert escape_result.error is not None
-    assert other_result.error == refusal
-    assert live_result.error == refusal
+    assert other_result.error == result_refusal
+    assert live_result.error == result_refusal
     denied_targets = {
         fields["target"]
         for kind, fields in events
-        if kind == "hard_boundary_denied" and fields["reason"] == "protected_read_target"
+        if kind == "hard_boundary_denied"
+        and fields["reason"] in {"protected_name_match", "protected_read_result"}
     }
     assert str(untracked) in denied_targets
     assert str(tracked_protected) in denied_targets
@@ -703,7 +708,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
             denied = WriteGuardBackend(lease.path, []).read(str(tracked))
         finally:
             reset_current_turn(token)
-        assert denied.error == refusal
+        assert denied.error == result_refusal
 
     lease.revoke()
     token = set_current_turn(SimpleNamespace(turn_id="revoked-pr-read", auth_context=auth))
@@ -711,7 +716,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
         revoked = WriteGuardBackend(lease.path, []).read(str(tracked))
     finally:
         reset_current_turn(token)
-    assert revoked.error == refusal
+    assert revoked.error == result_refusal
 
 
 def _service_auth(service) -> AuthContext:

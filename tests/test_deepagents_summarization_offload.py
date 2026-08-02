@@ -66,12 +66,11 @@ def test_production_backend_offloads_and_appends_on_fresh_home(
     assert "Human: first" in history.read_text()
     assert "Human: second" in history.read_text()
     assert direct_read.error == (
-        "Read denied: protected_read_target. For published PR content, "
-        "use pr_files or pr_diff."
+        "Read denied: mimir_home_read_boundary. Use an allowed state path instead."
     )
     hard = next(fields for kind, fields in events if kind == "hard_boundary_denied")
     assert hard["boundary"] == "protected_read_policy"
-    assert hard["reason"] == "protected_read_target"
+    assert hard["reason"] == "mimir_home_read_boundary"
     assert hard["target"] == str(history)
     assert hard["trigger"] == "user_message"
 

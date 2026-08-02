@@ -316,29 +316,21 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         if any(part in self._traversal_excludes for part in rel_parts):
             return True
         from .read_policy import (
-            is_current_service_scoped_read_path,
-            is_current_service_protected_read_path,
             is_mimir_home_root,
-            is_protected_read_path,
             non_admin_read_filter_enabled,
+            protected_read_denial_reason,
         )
 
-        protected = (
-            non_admin_read_filter_enabled()
-            and not is_mimir_home_root(path)
-            and (
-                (
-                    not is_current_service_scoped_read_path(path)
-                    and is_protected_read_path(path)
-                )
-                or is_current_service_protected_read_path(path)
-            )
+        reason = (
+            protected_read_denial_reason(path)
+            if non_admin_read_filter_enabled() and not is_mimir_home_root(path)
+            else None
         )
-        if protected:
+        if reason is not None:
             from .read_policy import emit_hard_read_denial
 
-            emit_hard_read_denial(tool, str(path), "protected_read_target")
-        return protected
+            emit_hard_read_denial(tool, str(path), reason)
+        return reason is not None
 
     def _walk_files(self, root: Path, *, tool: str) -> Iterator[Path]:
         for dirpath, dirnames, filenames in os.walk(root):
@@ -456,12 +448,17 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 content = fp.read_text()
             except (UnicodeDecodeError, PermissionError, OSError, RuntimeError):
                 continue
-            from .read_policy import non_admin_read_filter_enabled, result_is_protected
+            from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
-            if non_admin_read_filter_enabled() and result_is_protected(fp, text=content):
+            reason = (
+                protected_read_result_reason(fp, text=content)
+                if non_admin_read_filter_enabled()
+                else None
+            )
+            if reason is not None:
                 from .read_policy import emit_hard_read_denial
 
-                emit_hard_read_denial("grep", str(fp), "protected_read_result")
+                emit_hard_read_denial("grep", str(fp), reason)
                 continue
             for line_num, line in enumerate(content.splitlines(), 1):
                 if regex.search(line):
@@ -591,14 +588,17 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 if not candidate.match(pattern):
                     continue
                 matched_path = candidate
-                from .read_policy import non_admin_read_filter_enabled, result_is_protected
+                from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
-                if non_admin_read_filter_enabled() and result_is_protected(matched_path):
+                reason = (
+                    protected_read_result_reason(matched_path)
+                    if non_admin_read_filter_enabled()
+                    else None
+                )
+                if reason is not None:
                     from .read_policy import emit_hard_read_denial
 
-                    emit_hard_read_denial(
-                        "glob", str(matched_path), "protected_read_result",
-                    )
+                    emit_hard_read_denial("glob", str(matched_path), reason)
                     continue
                 try:
                     is_file = matched_path.is_file()
@@ -653,7 +653,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             entry for entry in entries
             if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
         ]
-        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
             safe = []
@@ -667,12 +667,13 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                         "ls", str(entry.get("path", "")), "unresolved_read_target",
                     )
                     continue
-                if not result_is_protected(resolved):
+                reason = protected_read_result_reason(resolved)
+                if reason is None:
                     safe.append(entry)
                 else:
                     from .read_policy import emit_hard_read_denial
 
-                    emit_hard_read_denial("ls", str(resolved), "protected_read_result")
+                    emit_hard_read_denial("ls", str(resolved), reason)
             filtered = safe
         return LsResult(error=result.error, entries=filtered)
 
@@ -739,24 +740,31 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def _is_outside_root(self, key: str) -> bool:
         return self._guard_outside_root and _real_path_outside_root(key, self.cwd) is not None
 
+    @staticmethod
+    def _read_denied_message(reason: str) -> str:
+        guidance = {
+            "core_memory_block": "Use an allowed memory or state path instead.",
+            "protected_name_match": "Use a non-secret source or an authorized secret interface.",
+            "service_scoped_read_boundary": "Use a path inside this service's configured read roots.",
+            "mimir_home_read_boundary": "Use an allowed state path instead.",
+            "protected_read_result": "For published PR content, use pr_files or pr_diff.",
+        }.get(reason, "Choose an allowed read target.")
+        return f"Read denied: {reason}. {guidance}"
+
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
-        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
             try:
                 resolved = self._resolve_path(file_path)
-                if result_is_protected(resolved):
+                reason = protected_read_result_reason(resolved)
+                if reason is not None:
                     from .read_policy import emit_hard_read_denial
 
-                    emit_hard_read_denial(
-                        "read_file", str(resolved), "protected_read_target",
-                    )
-                    return ReadResult(error=(
-                        "Read denied: protected_read_target. For published PR content, "
-                        "use pr_files or pr_diff."
-                    ))
+                    emit_hard_read_denial("read_file", str(resolved), reason)
+                    return ReadResult(error=self._read_denied_message(reason))
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial
 
@@ -773,21 +781,17 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path))
-        from .read_policy import non_admin_read_filter_enabled, result_is_protected
+        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
             try:
                 resolved = self._resolve_path(file_path)
-                if result_is_protected(resolved):
+                reason = protected_read_result_reason(resolved)
+                if reason is not None:
                     from .read_policy import emit_hard_read_denial
 
-                    emit_hard_read_denial(
-                        "read_file", str(resolved), "protected_read_target",
-                    )
-                    return ReadResult(error=(
-                        "Read denied: protected_read_target. For published PR content, "
-                        "use pr_files or pr_diff."
-                    ))
+                    emit_hard_read_denial("read_file", str(resolved), reason)
+                    return ReadResult(error=self._read_denied_message(reason))
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial
 
