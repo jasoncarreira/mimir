@@ -12,14 +12,6 @@ _DEEPAGENTS_TOKEN_COUNTER_PATCH_MARKER = "_mimir_token_counter_tool_schema_cache
 _DEEPAGENTS_GREP_CONTEXT_PATCH_MARKER = "_mimir_grep_context_tool"
 
 
-def strip_deepagents_base_prompt() -> None:
-    """Keep the legacy caller import-safe without mutating DeepAgents.
-
-    The graph-composition slice removes both the caller and this temporary
-    compatibility shim. DeepAgents 0.7 prompt composition remains unchanged.
-    """
-
-
 def install_deepagents_grep_context_tool() -> None:
     """Use Mimir's bounded-context grep schema in every DeepAgents stack."""
     try:
