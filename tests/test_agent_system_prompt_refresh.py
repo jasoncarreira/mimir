@@ -245,3 +245,47 @@ def test_system_prompt_override_is_preserved_verbatim(
     monkeypatch.setenv("MIMIR_SYSTEM_PROMPT_OVERRIDE", override)
 
     assert agent._current_system_prompt() == override
+
+
+def test_real_graph_binds_only_the_mimir_system_prompt(tmp_path: Path) -> None:
+    """The caller-owned prompt reaches the model without framework prose."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    from mimir.readonly_backend import MimirFilesystemMiddleware, WriteGuardBackend
+
+    sentinel = "MIMIR-ONLY-PROMPT-SENTINEL"
+    model_requests: list[list[object]] = []
+
+    class _PromptCapturingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            model_requests.append(list(messages))
+            return super()._generate(
+                messages, stop=stop, run_manager=run_manager, **kwargs,
+            )
+
+    model = _PromptCapturingModel(messages=iter([AIMessage(content="done")]))
+    backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+    graph = create_deep_agent(
+        model=model,
+        tools=[],
+        system_prompt=sentinel,
+        backend=backend,
+        middleware=[MimirFilesystemMiddleware(backend=backend)],
+    )
+    graph.invoke({"messages": [HumanMessage(content="finish")]})
+
+    system_prompts = [
+        "".join(
+            part["text"] if isinstance(part, dict) else part.text
+            for part in message.content
+        ) if isinstance(message.content, list) else message.content
+        for request in model_requests
+        for message in request
+        if isinstance(message, SystemMessage)
+    ]
+    assert system_prompts == [sentinel]
