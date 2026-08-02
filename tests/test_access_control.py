@@ -2153,6 +2153,57 @@ def test_service_shell_denial_argv_redaction_and_truncation() -> None:
     assert truncated is True
 
 
+def test_service_shell_metacharacter_refusal_records_attempted_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger="scheduled_tick",
+            channel_id="scheduler:test",
+            service_principal="scheduler",
+        ),
+        enforce=False,
+    )
+    command = (
+        "gh api --token opaque-value | "
+        + " ".join(f"argument-{index}" for index in range(40))
+    )
+    captured: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(
+            auth_context,
+            tool_name="shell_exec",
+            args={"command": command},
+        ),
+        "shell_exec",
+        auth_context,
+    )
+
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["binding_rule"] == "shell_control_characters"
+    assert hard["shell_profile"] == "maintenance"
+    assert hard["argv"][:6] == [
+        "gh", "api", "--token", "[REDACTED]", "|", "argument-0",
+    ]
+    assert "opaque-value" not in repr(hard)
+    assert hard["argv"][-1] == "[TRUNCATED]"
+    assert hard["argv_truncated"] is True
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert "shell syntax is never admitted and no quoting will change that" in refusal
+    assert "Issue one command per call" in refusal
+    assert "git -C <dir>" in refusal
+    assert "--body-file <path beneath the agent scratch root>" in refusal
+
+
 @pytest.mark.asyncio
 async def test_service_shell_executes_pinned_non_git_argv(
     tmp_path: Path,
