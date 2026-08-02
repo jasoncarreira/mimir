@@ -854,6 +854,124 @@ for trusted sources (§4); the provenance schema + informational recall are set
 (§5.3); JIRA trust is by instance (§4). The §7 blockers are closed; current
 operator readiness and flip-time checks live in the enablement runbook.
 
+### 6.1 SAGA historical ACL disposition and cutover measurement
+
+`legacy_admin` remains the fail-closed owner and visibility sentinel. Its rank,
+meaning, and read grants are unchanged. In particular, it is not redefined to
+mean "the operator": doing that would make every future provenance ambiguity
+fail open.
+
+**Disposition: mixed migration by persisted evidence.** A historical raw atom
+may move from `legacy_admin/legacy_admin` to `<mapped-principal>/private` only
+when all of these mechanical conditions hold:
+
+- `created_at` is before the recorded provenance-stamping cutover timestamp;
+- `memory_type = raw` and `source_type` is `conversation` or `agent_authored`;
+- `origin_channel` exactly matches an operator-reviewed channel-to-principal
+  mapping supplied for this migration; and
+- the current owner and visibility are both `legacy_admin`.
+
+The rule intentionally leaves service-derived rows, observations and their
+evidence intersections, service-owned rows, rows without a mapped channel, and
+post-cutover unclassified rows admin/platform-service-only. A channel mapping is
+an assertion that the named channel was exclusively the mapped operator's own
+channel during the historical period; shared or uncertain channels must not be
+listed. Derived rows are not folded into operator-authored rows: their safe ACL
+continues to be computed from evidence, and historical derived rows without a
+provable common owner stay narrow. This rule is deterministic for a new row and
+does not infer an owner from content, source labels, or the current operator.
+
+The migration implementation is `mimir/saga/legacy_acl_migration.py`. It is
+dry-run by default and can only apply to a newly created database copy. It
+refuses an output equal to the source, refuses an existing output, reports
+eligible and changed counts by channel, and is idempotent because changed rows
+no longer match the `legacy_admin/legacy_admin` predicate. It must not be run on
+the live store as part of enablement measurement:
+
+```bash
+# Count only; source is opened read-only.
+uv run mimir saga-migrate-legacy-acl \
+  --source /snapshot/saga.db \
+  --cutover 2026-07-01T00:00:00Z \
+  --channel-owner 'discord:operator=user:operator'
+
+# Apply only to a new disposable/reviewable copy.
+uv run mimir saga-migrate-legacy-acl \
+  --source /snapshot/saga.db \
+  --output /snapshot/saga.migrated.db \
+  --cutover 2026-07-01T00:00:00Z \
+  --channel-owner 'discord:operator=user:operator'
+```
+
+**Measurement protocol.** After provenance stamping is fixed, replay a
+representative period of normal recall against a live-store snapshot using the
+privileged/admin view. Write one JSON object per recall to a JSONL trace. The
+required fields are:
+
+```json
+{
+  "ts": "2026-07-10T10:00:00Z",
+  "surface": "automatic_recall",
+  "caller_kind": "interactive_user",
+  "trigger": "user_message",
+  "scope": {"principal": "user:operator"},
+  "pathways": {
+    "semantic": ["atom-before-rrf", "..."],
+    "keyword": ["atom-before-rrf", "..."],
+    "triple": []
+  },
+  "results": ["final-permissive-result-after-production-ranking"]
+}
+```
+
+`pathways` must contain the privileged candidate lists before ACL filtering and
+RRF. `results` must contain the permissive final observation/raw IDs after the
+normal activation, confidence, fusion, scoring, and top-k stages. `surface` must
+distinguish at least automatic pre-message recall and model-invoked
+`memory_query`; `caller_kind` must distinguish interactive users, admins,
+ordinary services, and platform services when present. `scope` uses the same
+fields as SAGA's `AuthorizationScope`: `principal`, `is_admin`, `is_service`,
+`is_platform_service`, `service_canonical`, and `readable_domains`. These labels
+are measurement inputs only and never grant runtime authority.
+
+Run the read-only analyzer against the same snapshot:
+
+```bash
+uv run mimir saga-enforcement-replay \
+  --db /snapshot/saga.db \
+  --trace /snapshot/representative-recall.jsonl \
+  --cutover 2026-07-01T00:00:00Z \
+  > /snapshot/saga-enforcement-report.json
+```
+
+The report breaks losses down by surface, caller kind, and trigger. Its
+`pre_fusion_*` fields count candidates strict scope removes before RRF (both
+pathway occurrences and per-event unique atoms); these losses cannot be inferred
+from returned top-k IDs. Its `post_fusion_*` fields count permissive final
+results hidden by strict scope. `legacy_admin_corpus` and
+`legacy_admin_exclusions` independently split genuinely historical rows from
+rows created at or after the stamping cutover.
+
+The sandbox validation uses a synthetic mix of historical legacy, continuing
+legacy, private operator, public, and service rows; it is not represented as a
+live result. The operator must paste the generated report below before making a
+flip decision:
+
+```text
+Live representative period: PENDING OPERATOR REPLAY
+Cutover timestamp: PENDING
+Trace/store snapshot identity: PENDING
+Report: PENDING
+```
+
+The report is invalid if `legacy_admin_corpus.post_cutover` is non-zero (after
+allowing for explicitly imported historical data), because that means the
+stamping defect is still producing unclassified rows and the target is moving.
+The operator must also inspect `missing_trace_atom_ids`; a non-empty value means
+the trace and snapshot do not correspond. Neither the analyzer nor migration
+changes `MIMIR_ACCESS_CONTROL_ENFORCED`; enforcement remains a separate operator
+decision made only after the live report and migration-copy review.
+
 ---
 
 ## 7. Other enablement blockers (closed)
