@@ -2905,6 +2905,65 @@ def _service_shell_command_shape(argv: list[str]) -> str:
     return " ".join(shape)
 
 
+def _service_shell_coding_enabled() -> bool:
+    """Whether this deployment exposes coding tools, using config's bool syntax."""
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    # Keep this truthy set aligned with config._env_bool without importing config
+    # here: access_control is imported by config, so that would create a cycle.
+    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
+
+
+def _service_shell_typed_tool_guidance(
+    argv: list[str], destination: str,
+) -> str:
+    """Name bounded tools for observed commands that must stay outside the shell."""
+    # Provenance: poller:github-activity refusals recorded in events.jsonl after
+    # argv logging landed were `npm run` (repository script), `python -c ...`
+    # (arbitrary Python), and `python - <<PY ...` (attachment/HTML parsing).
+    # All remain correctly refused: the first must use repo_test when available;
+    # the latter two have no general bounded typed equivalent. `npm ci` and
+    # `npm install` are inferred dependency-install shapes and remain refused
+    # because this profile exposes no typed dependency-install capability.
+    if destination != "repo_review" or not argv:
+        return ""
+    executable = Path(argv[0]).name
+    operation = argv[1:2]
+    if executable == "npm" and operation in (["run"], ["test"]):
+        if _service_shell_coding_enabled():
+            return (
+                " Repository scripts must run through the typed repo_test tool, "
+                "which uses the deployment-configured test command in the bound PR "
+                "checkout; shell_exec does not admit npm run or npm test."
+            )
+        return (
+            " Repository scripts remain denied, and this deployment does not expose "
+            "repo_test. Use whatever bounded verification capability the deployment "
+            "provides, and state plainly when the tests could not be run."
+        )
+    if executable == "npm" and operation in (["ci"], ["install"]):
+        return (
+            " npm dependency installation remains denied and has no typed equivalent "
+            "in this profile; do not retry it through shell_exec."
+        )
+    if (
+        len(argv) >= 2
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+        and argv[1] in {"-c", "-"}
+    ):
+        mode = "python -c" if argv[1] == "-c" else "Python stdin/heredoc"
+        guidance = (
+            f" Inline {mode} is arbitrary code execution and remains denied. There "
+            "is no general typed equivalent for arbitrary Python or attachment/HTML "
+            "parsing in this profile. Use read_file or grep only when bounded text "
+            "inspection suffices; otherwise report that the workload cannot be "
+            "performed rather than retrying it through shell_exec."
+        )
+        if _service_shell_coding_enabled():
+            guidance += " For repository tests only, use the typed repo_test tool."
+        return guidance
+    return ""
+
+
 def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
     """Explain that a well-formed command is outside the profile's allowlist."""
     supplied = [token for token in argv[1:] if token.startswith("-")]
@@ -2953,12 +3012,13 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
         )
     else:
         boundary = admitted = ""
+    guidance = _service_shell_typed_tool_guidance(argv, destination)
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
         "admits a fixed set of commands, subcommands and options; anything "
         "outside it is refused for this principal regardless of how it is "
-        f"written.{boundary}{admitted}"
+        f"written.{boundary}{admitted}{guidance}"
     )
 
 
@@ -2985,10 +3045,16 @@ def parse_service_shell_argv_with_diagnostics(
     found = sorted(set(target) & _SHELL_CONTROL_CHARACTERS)
     if found:
         rendered = ", ".join(repr(character) for character in found)
+        try:
+            refused_argv = shlex.split(target)
+        except ValueError:
+            refused_argv = []
+        guidance = _service_shell_typed_tool_guidance(refused_argv, destination)
         return None, (
             f"the command contains shell metacharacters ({rendered}), which the "
             f"{destination!r} trusted-service shell profile never admits. "
             + _SHELL_PROFILE_SINGLE_ARGV_HINT
+            + guidance
         ), ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
     try:
         argv = shlex.split(target)
