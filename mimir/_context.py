@@ -113,6 +113,15 @@ def set_current_turn(ctx: "TurnContext") -> Token:
 def reset_current_turn(token: Token) -> None:
     ctx = _current_turn.get()
     if ctx is not None:
+        # Turn-level SAGA shadow telemetry must flush while the turn carrier is
+        # still available so every read surface contributes to one event.
+        try:
+            from mimir.saga.ownership import finalize_shadow_read_turn
+
+            finalize_shadow_read_turn(ctx)
+        except Exception:
+            # Teardown and successful read results must not depend on telemetry.
+            pass
         _active_turns.pop(ctx.turn_id, None)
     _current_turn.reset(token)
 

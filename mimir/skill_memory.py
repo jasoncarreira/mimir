@@ -37,10 +37,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from mimir.saga.ownership import AuthorizationScope
+from typing import Any
 
 # Atom source_type tag for skill-learning atoms. Recall (mimir/saga/recall.py)
 # excludes this source_type from general candidate hydration.
@@ -141,9 +138,9 @@ def recall_skill_learnings(
     *kinds* optionally restricts to a valence subset (e.g.
     ``NEGATIVE_KINDS`` for the #267 surfacing path). ``None`` = all kinds.
     *now* is injectable for deterministic tests.
-    *auth_context* filters results by authorization scope (visibility/owner).
-    When omitted, recall fails closed to public atoms only; an unavailable
-    request context must never widen a skill load to private or service memory.
+    *auth_context* enables filtering only when its immutable enforcement flag is
+    true. Otherwise the legacy unrestricted ordering is preserved and a strict
+    counterfactual decision is logged when applicable.
 
     Each result: ``{"id", "content", "kind", "created_at"}``. Tombstoned
     atoms are excluded.
@@ -160,21 +157,12 @@ def recall_skill_learnings(
         )
         params.extend(kind_list)
 
-    if auth_context is None:
-        # Context resolution is best-effort at skill-load time.  Missing context
-        # must narrow recall, not silently restore the pre-auth unfiltered path.
-        auth_clause = " AND atoms.visibility = ?"
-        params.append("public")
-    else:
-        from mimir.saga.ownership import (
-            authorization_predicate,
-            get_authorization_scope,
-        )
+    from mimir.saga.ownership import SagaReadAuthorization
 
-        auth_scope = get_authorization_scope(auth_context)
-        auth_predicate, auth_params = authorization_predicate(auth_scope)
-        auth_clause = f" AND {auth_predicate}"
-        params.extend(auth_params)
+    read_authorization = SagaReadAuthorization(auth_context, "skill_memory_recall")
+    auth_predicate, auth_params = read_authorization.selection_predicate("atoms")
+    auth_clause = f" AND {auth_predicate}"
+    params.extend(auth_params)
 
     # No SQL LIMIT: skill atoms are sparse, and we rank by activation in
     # Python before taking the top-*limit*. A SQL ``LIMIT`` on created_at
@@ -215,10 +203,15 @@ def recall_skill_learnings(
         key=lambda r: (activations.get(r[0], neg_inf), r[3]),
         reverse=True,
     )
-    return [
+    result = [
         {"id": r[0], "content": r[1], "kind": r[2], "created_at": r[3]}
         for r in ranked[: int(limit)]
     ]
+    read_authorization.observe_selected(
+        conn, "atom", "atoms", [item["id"] for item in result]
+    )
+    read_authorization.finalize()
+    return result
 
 
 def render_skill_learnings(learnings: list[dict]) -> str:

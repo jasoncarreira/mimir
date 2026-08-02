@@ -517,14 +517,13 @@ def get_current_value(
     subject (proper noun) and case-folded on predicate (snake_case
     normalized at write time). Authorization is enforced against the
     world-state row's inherited, intersected source ACL."""
-    from .ownership import authorization_predicate, get_authorization_scope
+    from .ownership import SagaReadAuthorization
 
-    auth_where, auth_params = authorization_predicate(
-        get_authorization_scope(auth_context), table="ws"
-    )
+    read_authorization = SagaReadAuthorization(auth_context, "get_current_value")
+    auth_where, auth_params = read_authorization.selection_predicate("ws")
     pred = _PREDICATE_NORM.sub("_", predicate.lower()).strip("_")
     row = conn.execute(
-        "SELECT subject, predicate, value, valid_from, valid_until, "
+        "SELECT ws.rowid, subject, predicate, value, valid_from, valid_until, "
         "is_current, source_triple_id "
         "FROM world_state ws WHERE subject = ? AND predicate = ? "
         "AND is_current = 1 "
@@ -534,15 +533,20 @@ def get_current_value(
     ).fetchone()
     if row is None:
         return None
-    return WorldFact(
-        subject=row[0],
-        predicate=row[1],
-        value=row[2],
-        valid_from=row[3],
-        valid_until=row[4],
-        is_current=bool(row[5]),
-        source_triple_id=row[6],
+    result = WorldFact(
+        subject=row[1],
+        predicate=row[2],
+        value=row[3],
+        valid_from=row[4],
+        valid_until=row[5],
+        is_current=bool(row[6]),
+        source_triple_id=row[7],
     )
+    read_authorization.observe_selected(
+        conn, "world_state", "world_state", [row[0]], id_column="rowid"
+    )
+    read_authorization.finalize()
+    return result
 
 
 def get_history(
@@ -553,39 +557,43 @@ def get_history(
     auth_context: Any = None,
 ) -> list[WorldFact]:
     """Authorized historical values for (subject, predicate), oldest first."""
-    from .ownership import authorization_predicate, get_authorization_scope
+    from .ownership import SagaReadAuthorization
 
-    auth_where, auth_params = authorization_predicate(
-        get_authorization_scope(auth_context), table="ws"
-    )
+    read_authorization = SagaReadAuthorization(auth_context, "get_history")
+    auth_where, auth_params = read_authorization.selection_predicate("ws")
     pred = _PREDICATE_NORM.sub("_", predicate.lower()).strip("_")
     rows = conn.execute(
-        "SELECT subject, predicate, value, valid_from, valid_until, "
+        "SELECT ws.rowid, subject, predicate, value, valid_from, valid_until, "
         "is_current, source_triple_id "
         "FROM world_state ws WHERE subject = ? AND predicate = ? "
         f"AND {auth_where} "
         "ORDER BY valid_from ASC",
         (subject, pred, *auth_params),
     ).fetchall()
-    return [
+    result = [
         WorldFact(
-            subject=r[0],
-            predicate=r[1],
-            value=r[2],
-            valid_from=r[3],
-            valid_until=r[4],
-            is_current=bool(r[5]),
-            source_triple_id=r[6],
+            subject=r[1],
+            predicate=r[2],
+            value=r[3],
+            valid_from=r[4],
+            valid_until=r[5],
+            is_current=bool(r[6]),
+            source_triple_id=r[7],
         )
         for r in rows
     ]
+    read_authorization.observe_selected(
+        conn, "world_state", "world_state", [row[0] for row in rows], id_column="rowid"
+    )
+    read_authorization.finalize()
+    return result
 
 
 # ─── Retrieval: triple_augment_v2 pathway ────────────────────────────
 
 
 def _triple_read_authorization_predicate(
-    auth_context: Any,
+    read_authorization: Any,
 ) -> tuple[str, list]:
     """Authorize a triple against both its source atom and stored ACL.
 
@@ -593,12 +601,20 @@ def _triple_read_authorization_predicate(
     may narrow it below the original source atom's ACL. Requiring both SQL
     predicates keeps reads no wider than either resource and handles the
     fail-closed ``legacy_admin`` sentinel without a source-only fallback.
-    """
-    from .ownership import authorization_predicate, get_authorization_scope
 
-    auth_scope = get_authorization_scope(auth_context)
-    source_where, source_params = authorization_predicate(auth_scope, table="a")
-    triple_where, triple_params = authorization_predicate(auth_scope, table="t")
+    The two sides are gated differently, deliberately. The SOURCE-atom side uses
+    the mode-aware selection predicate, so compatibility shadow restores the
+    pre-regression read scope (chainlink #1112). The TRIPLE side is always
+    strict, because a triple ACL narrower than its source is not policy scope —
+    it is attenuation the writer chose via ``_update_triple_acl_on_dedup``,
+    which exists so a triple never becomes "more readable than its least
+    permissive source" (chainlink #1117). Routing that through the mode gate
+    would let shadow mode re-open the disclosure path #1117 closed, since
+    ``1=1 AND 1=1`` filters nothing. Shadow mode restores results that were
+    legitimately visible before; it must not restore ones a writer attenuated.
+    """
+    source_where, source_params = read_authorization.selection_predicate("a")
+    triple_where, triple_params = read_authorization.strict_predicate("t")
     return (
         f"({source_where}) AND ({triple_where})",
         [*source_params, *triple_params],
@@ -674,6 +690,7 @@ def triple_augment_search(
     dim: int | None = None,
     reference_date=None,
     auth_context: Any = None,
+    read_authorization=None,
 ) -> list[tuple[str, float]]:
     """P41-style triple-augmented retrieval.
 
@@ -697,7 +714,13 @@ def triple_augment_search(
 
     chainlinks #883/#1117: authorization filters on both ownership boundaries.
     """
-    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
+    from .ownership import SagaReadAuthorization
+
+    owns_read_authorization = read_authorization is None
+    read_authorization = read_authorization or SagaReadAuthorization(
+        auth_context, "triple_augment_search"
+    )
+    auth_where, auth_params = _triple_read_authorization_predicate(read_authorization)
 
     ref_iso = (
         reference_date.isoformat()
@@ -729,7 +752,13 @@ def triple_augment_search(
         if sim > best.get(source_atom_id, -1.0):
             best[source_atom_id] = sim
     ordered = sorted(best.items(), key=lambda x: -x[1])
-    return ordered[:top_k]
+    result = ordered[:top_k]
+    read_authorization.observe_selected(
+        conn, "atom", "atoms", [atom_id for atom_id, _ in result]
+    )
+    if owns_read_authorization:
+        read_authorization.finalize()
+    return result
 
 
 def top_triples_with_payload(
@@ -740,6 +769,7 @@ def top_triples_with_payload(
     dim: int | None = None,
     reference_date=None,
     auth_context: Any = None,
+    read_authorization=None,
 ) -> list[dict]:
     """Same cosine match as ``triple_augment_search`` but returns the
     FULL triple data — subject/predicate/object/source_atom_id/valid
@@ -766,7 +796,13 @@ def top_triples_with_payload(
 
     chainlinks #883/#1117: authorization filters on both ownership boundaries.
     """
-    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
+    from .ownership import SagaReadAuthorization
+
+    owns_read_authorization = read_authorization is None
+    read_authorization = read_authorization or SagaReadAuthorization(
+        auth_context, "top_triples_with_payload"
+    )
+    auth_where, auth_params = _triple_read_authorization_predicate(read_authorization)
 
     ref_iso = (
         reference_date.isoformat()
@@ -824,7 +860,16 @@ def top_triples_with_payload(
             )
         )
     scored.sort(key=lambda x: -x[0])
-    return [t for _, t in scored[:top_n]]
+    result = [t for _, t in scored[:top_n]]
+    read_authorization.observe_selected(
+        conn,
+        "triple",
+        "atoms",
+        [item["source_atom_id"] for item in result],
+    )
+    if owns_read_authorization:
+        read_authorization.finalize()
+    return result
 
 
 # ─── Entity-side retrieval (no embedding needed) ─────────────────────
@@ -846,7 +891,10 @@ def retrieve_by_entity(
     Authorization: See ``triple_augment_search``; both the source atom ACL and
     the triple's stored ACL must authorize the caller.
     """
-    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
+    from .ownership import SagaReadAuthorization
+
+    read_authorization = SagaReadAuthorization(auth_context, "retrieve_by_entity")
+    auth_where, auth_params = _triple_read_authorization_predicate(read_authorization)
 
     pat = f"%{escape_like_pattern(entity)}%"
     rows = conn.execute(
@@ -860,7 +908,7 @@ def retrieve_by_entity(
             LIMIT ?""",
         (pat, pat, *auth_params, top_k),
     ).fetchall()
-    return [
+    result = [
         {
             "id": r[0],
             "subject": r[1],
@@ -872,6 +920,11 @@ def retrieve_by_entity(
         }
         for r in rows
     ]
+    read_authorization.observe_selected(
+        conn, "triple", "atoms", [row[4] for row in rows]
+    )
+    read_authorization.finalize()
+    return result
 
 
 # ─── Contradiction detection ─────────────────────────────────────────
@@ -902,18 +955,56 @@ def detect_contradictions(
     ``resolve_contradictions_to_supersedes``. Callers that want the
     full picture should walk both this and that table.
     """
-    from .ownership import authorization_predicate, get_authorization_scope
+    from .ownership import SagaReadAuthorization
 
-    auth_where, auth_params = authorization_predicate(
-        get_authorization_scope(auth_context), table="ws"
-    )
-    return _detect_contradictions_unscoped(
+    read_authorization = SagaReadAuthorization(auth_context, "detect_contradictions")
+    auth_where, auth_params = read_authorization.selection_predicate("ws")
+    result = _detect_contradictions_unscoped(
         conn,
         subject=subject,
         predicate=predicate,
         extra_where=auth_where,
         extra_params=auth_params,
     )
+    if not read_authorization.enforcement_enabled and result:
+        try:
+            strict_where, strict_params = read_authorization.strict_predicate("ws")
+            strict_result = _detect_contradictions_unscoped(
+                conn,
+                subject=subject,
+                predicate=predicate,
+                extra_where=strict_where,
+                extra_params=strict_params,
+            )
+            strict_rows = {
+                (item["subject"], item["predicate"]): item for item in strict_result
+            }
+            read_authorization.observe_would_deny(
+                "world_state",
+                {
+                    (
+                        item["subject"],
+                        item["predicate"],
+                        tuple(item["values"]),
+                        item["count"],
+                    )
+                    for item in result
+                    if (
+                        (
+                            strict := strict_rows.get(
+                                (item["subject"], item["predicate"])
+                            )
+                        )
+                        is None
+                        or strict["count"] != item["count"]
+                        or strict["values"] != item["values"]
+                    )
+                },
+            )
+        except Exception:  # noqa: BLE001 - shadow evaluation is telemetry
+            read_authorization.observe_probe_failure()
+    read_authorization.finalize()
+    return result
 
 
 def _detect_contradictions_unscoped(

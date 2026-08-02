@@ -32,8 +32,7 @@ from .dedup import BASELINE_ENCODING_CONFIDENCE
 from .mark_access import AccessEvent, mark_access
 from .ownership import (
     AuthorizationScope,
-    authorization_predicate,
-    get_authorization_scope,
+    SagaReadAuthorization,
 )
 from .retrieval_fusion import DEFAULT_K as RRF_DEFAULT_K, reciprocal_rank_fusion
 
@@ -223,6 +222,7 @@ def recall(
     min_confidence_tier: str | None = None,
     auth_context: Any = None,
     auth_scope: AuthorizationScope | None = None,
+    read_authorization: SagaReadAuthorization | None = None,
 ) -> RecallResult:
     """Two-pass recall. See SCORING.md for the contract.
 
@@ -243,7 +243,10 @@ def recall(
     # adapters are responsible for applying this scope before returning IDs;
     # the hydration predicate below is a defense-in-depth recheck, not the
     # ranking boundary.
-    auth_scope = auth_scope or get_authorization_scope(auth_context)
+    owns_read_authorization = read_authorization is None
+    read_authorization = read_authorization or SagaReadAuthorization(
+        auth_context, "recall"
+    )
 
     # ── Pass 1: candidate generation ────────────────────────────────
     query_emb = query_embed_fn(query)
@@ -276,10 +279,10 @@ def recall(
         aid for aid, _ in (faiss_candidates + fts_candidates + triple_candidates)
         if isinstance(aid, str) and aid
     }
-    authorized_ids: set[str] = set()
-    if raw_candidate_ids:
+    authorized_ids = set(raw_candidate_ids)
+    if raw_candidate_ids and read_authorization.enforcement_enabled:
         placeholders = ",".join(["?"] * len(raw_candidate_ids))
-        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        auth_where, auth_params = read_authorization.selection_predicate("a")
         authorized_ids = {
             row[0]
             for row in conn.execute(
@@ -309,10 +312,10 @@ def recall(
         for aid in atom_ids
         if isinstance(aid, str) and aid
     }
-    authorized_extra_ids: set[str] = set()
-    if raw_extra_ids:
+    authorized_extra_ids = set(raw_extra_ids)
+    if raw_extra_ids and read_authorization.enforcement_enabled:
         placeholders = ",".join(["?"] * len(raw_extra_ids))
-        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        auth_where, auth_params = read_authorization.selection_predicate("a")
         authorized_extra_ids = {
             row[0]
             for row in conn.execute(
@@ -347,7 +350,25 @@ def recall(
         | set(triple_sim_map)
         | {aid for ids in extra_ranked_lists.values() for aid in ids}
     )
+    if candidate_ids and not read_authorization.enforcement_enabled:
+        try:
+            placeholders = ",".join("?" for _ in candidate_ids)
+            live_candidate_ids = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT id FROM atoms WHERE id IN ({placeholders}) "
+                    "AND tombstoned = 0",
+                    list(candidate_ids),
+                ).fetchall()
+            }
+            read_authorization.observe_selected(
+                conn, "atom", "atoms", live_candidate_ids
+            )
+        except Exception:  # noqa: BLE001 - shadow evaluation is telemetry
+            read_authorization.observe_probe_failure()
     if not candidate_ids:
+        if owns_read_authorization:
+            read_authorization.finalize()
         return RecallResult()
 
     # ── RRF fusion ──────────────────────────────────────────────────
@@ -381,7 +402,7 @@ def recall(
     # chainlink #883: apply authorization predicate - this is the security
     # boundary that ensures unauthorized rows are filtered at SQL level
     # before content/existence is exposed
-    auth_where, auth_params = authorization_predicate(auth_scope)
+    auth_where, auth_params = read_authorization.selection_predicate("atoms")
     base_sql = (
         f"SELECT id, content, stream, profile, memory_type, source_type, "
         f"topics, metadata, agent_id, is_pinned, created_at, session_id, "
@@ -417,6 +438,8 @@ def recall(
         filtered[atom_id] = atom
 
     if not filtered:
+        if owns_read_authorization:
+            read_authorization.finalize()
         return RecallResult()
 
     # Fetch summaries for activation computation.
@@ -488,6 +511,8 @@ def recall(
         ))
 
     if not candidates:
+        if owns_read_authorization:
+            read_authorization.finalize()
         return RecallResult()
 
     # ── Pass 3: combined-score ranking ─────────────────────────────
@@ -532,10 +557,19 @@ def recall(
                 conn.rollback()
                 raise
 
-    return RecallResult(
+    surfaced = RecallResult(
         observations=surfaced_obs,
         raws=surfaced_raws,
     )
+    read_authorization.observe_selected(
+        conn,
+        "atom",
+        "atoms",
+        [candidate.atom["id"] for candidate in surfaced_obs + surfaced_raws],
+    )
+    if owns_read_authorization:
+        read_authorization.finalize()
+    return surfaced
 
 
 def _obs_top_k(k: int) -> int:

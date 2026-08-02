@@ -878,6 +878,7 @@ async def test_session_summary_assembly_is_authorization_scoped(
         trigger="user_message",
         channel_id="ch-auth",
         interactivity=None,
+        enforcement_enabled=True,
     )
     alice_auth = AuthContext(
         principal="user:alice",
@@ -887,6 +888,7 @@ async def test_session_summary_assembly_is_authorization_scoped(
         trigger="user_message",
         channel_id="ch-auth",
         interactivity=None,
+        enforcement_enabled=True,
     )
 
     try:

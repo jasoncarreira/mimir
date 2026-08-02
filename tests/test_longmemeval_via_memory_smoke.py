@@ -148,8 +148,15 @@ async def test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms(
             )
             self.calls = []
 
-        async def search_sessions(self, question, *, alpha, limit):
-            self.calls.append({"question": question, "alpha": alpha, "limit": limit})
+        async def search_sessions(
+            self, question, *, alpha, limit, auth_context=None,
+        ):
+            self.calls.append({
+                "question": question,
+                "alpha": alpha,
+                "limit": limit,
+                "auth_context": auth_context,
+            })
             return [
                 {"session_id": "s_a", "blended_score": 0.9},
                 {"session_id": "s_b", "blended_score": 0.8},
@@ -169,7 +176,12 @@ async def test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms(
     )
 
     assert client.calls == [
-        {"question": "What does Alice prefer?", "alpha": 0.6, "limit": 2}
+        {
+            "question": "What does Alice prefer?",
+            "alpha": 0.6,
+            "limit": 2,
+            "auth_context": None,
+        }
     ]
     assert atom_ids == ["a_early", "b_early"]
     assert debug["session_boundary_atoms_by_session"] == {
@@ -181,7 +193,13 @@ async def test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms(
 
 
 @pytest.mark.asyncio
-async def test_runner_completes_one_question(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
+async def test_runner_completes_one_question(tmp_path, monkeypatch, enforced):
+    if enforced:
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    else:
+        monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+
     # Stub embedding provider so we don't touch voyage / openai.
     import mimir.saga.embeddings as _mm_embeddings
     monkeypatch.setattr(_mm_embeddings, "get_provider", _stub_provider)
@@ -234,11 +252,22 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
 
     from benchmarks.longmemeval_via_memory import runner as r
 
-    # Override the default embedding_dim to match the stub (4d).
+    # Override the default embedding_dim to match the stub (4d), and capture
+    # the query carrier so enforced-mode coverage cannot pass by silently
+    # falling back to compatibility behavior.
     orig_make_client = r._make_client
+    query_auth_contexts = []
 
     def _make_4d_client(db_path, *, embedding_dim=4):
-        return orig_make_client(db_path, embedding_dim=4)
+        client = orig_make_client(db_path, embedding_dim=4)
+        orig_query = client.query
+
+        async def _capturing_query(*args, **kwargs):
+            query_auth_contexts.append(kwargs.get("auth_context"))
+            return await orig_query(*args, **kwargs)
+
+        client.query = _capturing_query
+        return client
 
     monkeypatch.setattr(r, "_make_client", _make_4d_client)
 
@@ -256,8 +285,15 @@ async def test_runner_completes_one_question(tmp_path, monkeypatch):
     assert metrics["n_atoms_ingested"] > 0
     # 6 turns in the synthetic question.
     assert metrics["n_atoms_ingested"] == 6
-    # At least the raws path returns something.
-    assert metrics["n_atoms_retrieved"] >= 0
+    # Both compatibility and strict enforcement must retrieve the benchmark
+    # corpus; an empty result silently corrupts the quality measurement.
+    assert metrics["n_atoms_retrieved"] > 0
+    assert "(no atoms retrieved)" not in record["hypothesis"]
+    assert len(query_auth_contexts) == 1
+    query_auth = query_auth_contexts[0]
+    assert query_auth.principal == "benchmark-operator"
+    assert query_auth.roles == ("admin",)
+    assert query_auth.enforcement_enabled is enforced
 
 
 @pytest.mark.asyncio

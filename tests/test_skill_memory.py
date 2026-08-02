@@ -194,6 +194,7 @@ class TestRecallSkillLearnings:
             trigger="user_message",
             channel_id="test-channel",
             interactivity=None,
+            enforcement_enabled=True,
         )
         user_b_auth = AuthContext(
             principal="user-b",
@@ -203,6 +204,7 @@ class TestRecallSkillLearnings:
             trigger="user_message",
             channel_id="test-channel",
             interactivity=None,
+            enforcement_enabled=True,
         )
 
         user_a_results = recall_skill_learnings(
@@ -223,8 +225,8 @@ class TestRecallSkillLearnings:
         assert "private user-b tip" not in user_a_contents
 
     @pytest.mark.asyncio
-    async def test_recall_without_auth_context_returns_public_only(self, store):
-        """Missing request context narrows recall instead of exposing all atoms."""
+    async def test_recall_without_auth_context_preserves_legacy_results(self, store):
+        """Missing request context keeps the pre-enforcement recall behavior."""
         await store.store(
             "public tip",
             source_type=SKILL_LEARNING_SOURCE_TYPE,
@@ -250,7 +252,11 @@ class TestRecallSkillLearnings:
 
         results = recall_skill_learnings(conn, "test-skill", auth_context=None)
 
-        assert [item["content"] for item in results] == ["public tip"]
+        assert {item["content"] for item in results} == {
+            "public tip",
+            "private user tip",
+            "service tip",
+        }
 
     @pytest.mark.asyncio
     async def test_recall_admin_sees_all(self, store):
