@@ -119,6 +119,7 @@ async def test_synthesized_private_boundary_is_readable_only_by_source_owner(
             trigger="user_message",
             channel_id="discord-dm",
             interactivity=None,
+            enforcement_enabled=True,
         )
 
     own = await store.recent_session_boundaries(

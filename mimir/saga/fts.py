@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 from ._like import escape_like_pattern
 
 if TYPE_CHECKING:
-    from .ownership import AuthorizationScope
+    from .ownership import AuthorizationScope, SagaReadAuthorization
 
 
 # Same stopword list saga uses — empirically tuned for English
@@ -157,6 +157,7 @@ def fts_search(
     agent_id: str = "default",
     synonyms: dict[str, list[str]] | None = None,
     auth_scope: "AuthorizationScope | None" = None,
+    read_authorization: "SagaReadAuthorization | None" = None,
 ) -> list[tuple[str, float]]:
     """Run an FTS5-backed keyword search. Returns
     ``[(atom_id, keyword_score)]`` sorted by score (highest first).
@@ -186,7 +187,11 @@ def fts_search(
     # shared atom silently miss. The agent_id value stays parameterized.
     where = ["a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]
     params: list = [fts_q, agent_id]
-    if auth_scope is not None:
+    if read_authorization is not None:
+        auth_where, auth_params = read_authorization.selection_predicate("a")
+        where.append(auth_where)
+        params.extend(auth_params)
+    elif auth_scope is not None:
         from .ownership import authorization_predicate
 
         auth_where, auth_params = authorization_predicate(auth_scope, table="a")
@@ -216,6 +221,7 @@ def fts_search(
             memory_type=memory_type,
             agent_id=agent_id,
             auth_scope=auth_scope,
+            read_authorization=read_authorization,
         )
 
     return [(r[0], -float(r[1]) * 100.0) for r in rows]
@@ -229,6 +235,7 @@ def _fts_fallback(
     memory_type: str | None,
     agent_id: str,
     auth_scope: "AuthorizationScope | None" = None,
+    read_authorization: "SagaReadAuthorization | None" = None,
 ) -> list[tuple[str, float]]:
     """Plain LIKE search, term-count score. Used when FTS5 is missing
     (pre-trigger schema migration) or when fts5_query produced syntax
@@ -245,7 +252,10 @@ def _fts_fallback(
     )
     where = [like_clauses, "a.tombstoned = 0", "a.agent_id IN (?, 'shared')"]  # #491
     auth_params: list = []
-    if auth_scope is not None:
+    if read_authorization is not None:
+        auth_where, auth_params = read_authorization.selection_predicate("a")
+        where.append(auth_where)
+    elif auth_scope is not None:
         from .ownership import authorization_predicate
 
         auth_where, auth_params = authorization_predicate(auth_scope, table="a")

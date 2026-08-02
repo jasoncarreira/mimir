@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
     CapabilityTier,
     build_trigger_service_principal,
@@ -17,6 +19,7 @@ from mimir.models import AgentEvent, AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
     AuthorizationScope,
+    SagaReadAuthorization,
     Visibility,
     authorization_predicate,
     get_authorization_scope,
@@ -79,6 +82,26 @@ def test_public_authorization_scope_cannot_assert_read_authority() -> None:
     assert scope == AuthorizationScope()
 
 
+def test_auth_context_subclass_cannot_carry_read_authority() -> None:
+    @dataclass(frozen=True)
+    class ForgedAuthContext(AuthContext):
+        pass
+
+    forged = ForgedAuthContext(
+        principal="attacker",
+        canonical_principal="user:attacker",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    assert get_authorization_scope(forged) == AuthorizationScope()
+    assert SagaReadAuthorization(forged, "test").enforcement_enabled is False
+
+
 def test_world_state_readers_filter_cross_owner_rows(
     conn: sqlite3.Connection,
 ) -> None:
@@ -100,6 +123,7 @@ def test_world_state_readers_filter_cross_owner_rows(
         trigger="user_message",
         channel_id="channel",
         interactivity=None,
+        enforcement_enabled=True,
     )
 
     current = get_current_value(
@@ -201,7 +225,16 @@ def test_service_owner_grant_uses_prefixed_canonical_identity(
 def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3.Connection) -> None:
     hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
     visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
-    scope = AuthorizationScope(principal="user:alice")
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+        enforcement_enabled=True,
+    )
 
     result = recall(
         conn,
@@ -210,7 +243,7 @@ def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3
         faiss_search_fn=lambda _emb, _k: [(hidden, 0.99), (visible, 0.8)],
         fts_search_fn=lambda _q, _k: [(hidden, 10.0), (visible, 9.0)],
         triple_search_fn=lambda _emb, _k: [(hidden, 0.95), (visible, 0.7)],
-        auth_scope=scope,
+        auth_context=auth_context,
         fire_access_events=True,
     )
 
@@ -225,6 +258,132 @@ def test_unauthorized_candidates_are_removed_before_rrf_and_access(conn: sqlite3
         (hidden,),
     ).fetchone()[0]
     assert hidden_retrievals == 0
+
+
+def test_shadow_recall_preserves_unrestricted_pathway_ranks(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
+    visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *_args, **_kwargs: None)
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+    )
+
+    result = recall(
+        conn,
+        "query term",
+        query_embed_fn=lambda _q: [1.0, 0.0, 0.0, 0.0],
+        faiss_search_fn=lambda _emb, _k: [(hidden, 0.99), (visible, 0.8)],
+        fts_search_fn=lambda _q, _k: [(hidden, 10.0), (visible, 9.0)],
+        triple_search_fn=lambda _emb, _k: [(hidden, 0.95), (visible, 0.7)],
+        auth_context=auth_context,
+        fire_access_events=False,
+    )
+
+    candidates = result.observations + result.raws
+    assert [candidate.atom["id"] for candidate in candidates] == [hidden, visible]
+    assert [candidate.semantic_rank for candidate in candidates] == [1, 2]
+    assert [candidate.keyword_rank for candidate in candidates] == [1, 2]
+    assert [candidate.triple_rank for candidate in candidates] == [1, 2]
+
+
+def test_shadow_recall_reports_pre_rrf_candidate_exclusions(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(conn, "hidden query term", owner="user:bob", visibility="private")
+    visible = _store(conn, "visible query term", owner="user:alice", visibility="private")
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress="discord",
+        trigger="user_message",
+        channel_id="discord-C1",
+        interactivity=None,
+        enforcement_enabled=False,
+        policy_version="test-policy",
+    )
+
+    result = recall(
+        conn,
+        "query term",
+        query_embed_fn=lambda _q: [1.0, 0.0, 0.0, 0.0],
+        faiss_search_fn=lambda _emb, _k: [(hidden, 0.99), (visible, 0.8)],
+        fts_search_fn=lambda _q, _k: [(hidden, 10.0), (visible, 9.0)],
+        auth_context=auth_context,
+        fire_access_events=False,
+    )
+
+    assert [
+        candidate.atom["id"] for candidate in result.observations + result.raws
+    ] == [hidden, visible]
+    assert len(events) == 1
+    event_type, payload = events[0]
+    assert event_type == "saga_read_would_block"
+    assert payload["reason"] == "saga_read_policy_would_exclude_candidates"
+    assert payload["observation_stage"] == "pre_rrf_candidates"
+    assert payload["risk_direction"] == "over_serving"
+    assert payload["resource_counts"] == {"atom": 1}
+    assert payload["principal"] == "user:alice"
+    assert payload["trigger"] == "user_message"
+    assert payload["event_ingress"] == "discord"
+    assert payload["aggregation"] == "one_event_per_read_operation"
+    assert payload["sampling"] == "none"
+    serialized = repr(payload)
+    assert hidden not in serialized
+    assert visible not in serialized
+
+
+def test_shadow_read_events_are_bounded_to_one_per_turn(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress="discord",
+        trigger="user_message",
+        channel_id="discord-C1",
+        interactivity=None,
+        enforcement_enabled=False,
+    )
+    token = set_current_turn(SimpleNamespace(turn_id="turn-shadow-bounded"))
+    try:
+        for surface in ("query", "get_atoms"):
+            authorization = SagaReadAuthorization(auth_context, surface)
+            authorization.observe_selected(conn, "atom", "atoms", [hidden])
+            authorization.finalize()
+    finally:
+        reset_current_turn(token)
+
+    assert len(events) == 1
+    _, payload = events[0]
+    assert payload["turn_id"] == "turn-shadow-bounded"
+    assert payload["aggregation"] == "max_one_event_per_turn"
+    assert payload["sampling"] == "first_shadow_read_with_exclusions"
 
 
 def test_session_boundary_expansion_binds_authorization_before_limit(
@@ -261,6 +420,7 @@ def test_session_boundary_expansion_binds_authorization_before_limit(
         trigger="user_message",
         channel_id="channel",
         interactivity=None,
+        enforcement_enabled=True,
     )
     atom_ids = client._session_boundary_atom_pathway_with_conn(
         conn,
@@ -275,7 +435,7 @@ def test_session_boundary_expansion_binds_authorization_before_limit(
 
 
 @pytest.mark.asyncio
-async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
+async def test_get_atoms_missing_context_preserves_legacy_unrestricted_read(
     conn: sqlite3.Connection,
 ) -> None:
     public = _store(conn, "public", owner="other", visibility="public")
@@ -285,8 +445,38 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
 
     payload = await client.get_atoms([public, private, legacy])
 
-    assert [atom["id"] for atom in payload["atoms"]] == [public]
-    assert payload["missing"] == [private, legacy]
+    assert [atom["id"] for atom in payload["atoms"]] == [public, private, legacy]
+    assert payload["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_default_and_false_context_preserve_exact_order(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _store(conn, "first", owner="user:bob", visibility="private")
+    second = _store(conn, "second", owner="legacy_admin", visibility="legacy_admin")
+    default_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+    )
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync", lambda *_args, **_kwargs: None
+    )
+    client = SagaStore(conn=conn, embedding_dim=4)
+
+    for auth_context in (
+        default_context,
+        replace(default_context, enforcement_enabled=False),
+    ):
+        payload = await client.get_atoms([second, first], auth_context=auth_context)
+        assert [atom["id"] for atom in payload["atoms"]] == [second, first]
+        assert payload["missing"] == []
 
 
 @pytest.mark.parametrize(
@@ -678,6 +868,7 @@ async def test_most_retrieved_atoms_admin_sees_all(conn: sqlite3.Connection) -> 
         trigger="test",
         channel_id=None,
         interactivity=None,
+        enforcement_enabled=True,
     )
     client = SagaStore(conn=conn, embedding_dim=4)
     result = await client.most_retrieved_atoms(
@@ -711,6 +902,7 @@ async def test_most_retrieved_atoms_scoped_principal_sees_only_authorized(
         trigger="test",
         channel_id=None,
         interactivity=None,
+        enforcement_enabled=True,
     )
     client = SagaStore(conn=conn, embedding_dim=4)
     result = await client.most_retrieved_atoms(
@@ -725,7 +917,9 @@ async def test_most_retrieved_atoms_scoped_principal_sees_only_authorized(
 
 
 @pytest.mark.asyncio
-async def test_most_retrieved_atoms_no_auth_sees_only_public(conn: sqlite3.Connection) -> None:
+async def test_most_retrieved_atoms_no_auth_preserves_unrestricted_results(
+    conn: sqlite3.Connection,
+) -> None:
     public = _store_with_access_event(
         conn, "public atom", owner="user:other", visibility="public", agent_id="test-agent",
     )
@@ -739,4 +933,151 @@ async def test_most_retrieved_atoms_no_auth_sees_only_public(conn: sqlite3.Conne
     )
     result_ids = {r["id"] for r in result}
     assert public in result_ids
-    assert private not in result_ids
+    assert private in result_ids
+
+
+@pytest.mark.asyncio
+async def test_get_atoms_true_enforcement_filters_private_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    public = _store(conn, "public", owner="other", visibility="public")
+    private = _store(conn, "private", owner="user:bob", visibility="private")
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    payload = await SagaStore(conn=conn, embedding_dim=4).get_atoms(
+        [public, private], auth_context=auth_context
+    )
+
+    assert [atom["id"] for atom in payload["atoms"]] == [public]
+    assert payload["missing"] == [private]
+
+
+@pytest.mark.asyncio
+async def test_query_shadow_read_emits_one_bounded_non_sensitive_event(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(
+        conn, "shadow-only-memory", owner="user:bob", visibility="private"
+    )
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    monkeypatch.setattr(
+        "mimir.saga.client._query_embed_sync",
+        lambda _query: [1.0, 0.0, 0.0, 0.0],
+    )
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress="test",
+        trigger="user_message",
+        channel_id="sensitive-channel",
+        interactivity=None,
+        enforcement_enabled=False,
+    )
+    client = SagaStore(
+        conn=conn, embedding_dim=4, include_triples_in_response=False
+    )
+
+    result = await client.query(
+        "shadow-only-memory",
+        top_k=5,
+        enable_contextual_rewrite=False,
+        enable_session_boundary_rrf=False,
+        extra_atom_ranked_pathways={"repeat": [hidden, hidden]},
+        auth_context=auth_context,
+    )
+
+    returned = result["observations"] + result["raws"]
+    assert [item["id"] for item in returned] == [hidden]
+    assert len(events) == 1
+    event_type, payload = events[0]
+    assert event_type == "saga_read_would_block"
+    assert payload["surface"] == "query"
+    assert payload["allowed"] is True
+    assert payload["status"] == "would_block"
+    assert payload["enforcement_enabled"] is False
+    assert payload["is_shadow_decision"] is True
+    assert payload["would_block"] is True
+    assert payload["resource_counts"] == {"atom": 1}
+    serialized = repr(payload).lower()
+    for sensitive in (hidden.lower(), "shadow-only-memory", "sensitive-channel"):
+        assert sensitive not in serialized
+    for forbidden_key in ("query", "session_id", "channel_id", "domain"):
+        assert forbidden_key not in payload
+
+
+@pytest.mark.asyncio
+async def test_matching_owner_shadow_read_emits_no_event(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = _store(conn, "owned", owner="user:alice", visibility="private")
+    events: list[dict] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda _event_type, **payload: events.append(payload),
+    )
+    auth_context = AuthContext(
+        principal="alice",
+        canonical_principal="user:alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=None,
+        interactivity=None,
+    )
+
+    payload = await SagaStore(conn=conn, embedding_dim=4).get_atoms(
+        [owned], auth_context=auth_context
+    )
+
+    assert [atom["id"] for atom in payload["atoms"]] == [owned]
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_event_logger_failure_does_not_change_read(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+
+    def fail_logger(_event_type: str, **_payload) -> None:
+        raise OSError("logger unavailable")
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", fail_logger)
+
+    payload = await SagaStore(conn=conn, embedding_dim=4).get_atoms([hidden])
+
+    assert [atom["id"] for atom in payload["atoms"]] == [hidden]
+
+
+@pytest.mark.asyncio
+async def test_shadow_policy_probe_failure_does_not_change_read(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+
+    def fail_probe(_self, _table: str):
+        raise sqlite3.OperationalError("strict probe unavailable")
+
+    monkeypatch.setattr(SagaReadAuthorization, "strict_predicate", fail_probe)
+
+    payload = await SagaStore(conn=conn, embedding_dim=4).get_atoms([hidden])
+
+    assert [atom["id"] for atom in payload["atoms"]] == [hidden]

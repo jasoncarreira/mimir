@@ -40,6 +40,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,36 @@ RETRIEVAL_TOP_K = 20
 # amortizes the embedding-provider network cost (voyage / openai batch
 # both prefer >32 inputs per request).
 INGEST_BATCH_SIZE = 256
+
+
+def _access_control_enforced() -> bool:
+    """Mirror the harness's explicit opt-in access-control switch."""
+    raw = os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED")
+    return bool(
+        raw is not None
+        and raw != ""
+        and raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+    )
+
+
+def _benchmark_auth_context() -> AuthContext:
+    """Return the benchmark's shared write/read authority carrier.
+
+    The per-question DB is an isolated evaluator artifact whose atoms retain the
+    legacy ownership shape.  The benchmark operator therefore reads it as admin,
+    in both compatibility and enforced modes.  Constructing this once per
+    question prevents generated-boundary writes and retrieval from drifting.
+    """
+    return AuthContext(
+        principal="benchmark-operator",
+        canonical_principal="benchmark-operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="longmemeval",
+        channel_id="longmemeval",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=_access_control_enforced(),
+    )
 
 
 # ─── Per-question DB ─────────────────────────────────────────────────
@@ -262,7 +293,12 @@ async def _ingest_question(client, q: dict) -> dict:
 # ─── Generated session boundaries ───────────────────────────────────
 
 
-async def _write_generated_session_boundaries(client, q: dict) -> dict:
+async def _write_generated_session_boundaries(
+    client,
+    q: dict,
+    *,
+    auth_context: AuthContext,
+) -> dict:
     """Bench-only LongMemEval session reflection path.
 
     Synthesizes structured boundary fields with Saga's boundary prompt and
@@ -307,16 +343,7 @@ async def _write_generated_session_boundaries(client, q: dict) -> dict:
             unfinished=fields.get("unfinished") or [],
             emotional_state=fields.get("emotional_state"),
             channel_id="longmemeval",
-            auth_context=AuthContext(
-                principal="benchmark-operator",
-                canonical_principal="benchmark-operator",
-                roles=("admin",),
-                event_ingress=None,
-                trigger="longmemeval",
-                channel_id="longmemeval",
-                interactivity=TurnInteractivity.NON_INTERACTIVE,
-                saga_session_id=sid,
-            ),
+            auth_context=replace(auth_context, saga_session_id=sid),
         )
         if result.get("session_summary_written"):
             written += 1
@@ -351,6 +378,7 @@ async def _session_boundary_rrf_pathway(
     alpha: float = 0.7,
     atoms_per_session: int = 30,
     weight: float = 0.5,
+    auth_context: AuthContext | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Resolve session-boundary matches into atom ids for an RRF lane.
 
@@ -362,6 +390,7 @@ async def _session_boundary_rrf_pathway(
         question,
         alpha=alpha,
         limit=limit,
+        auth_context=auth_context,
     )
     cap = max(0, int(atoms_per_session))
 
@@ -521,6 +550,7 @@ async def _run_one(
     err: str | None = None
 
     client = _make_client(db_path)
+    auth_context = _benchmark_auth_context()
 
     metrics: dict[str, Any] = {
         "question_id": qid,
@@ -541,7 +571,9 @@ async def _run_one(
         # not rendered to the reader in this leaf.
         t0 = time.time()
         if session_boundary_treatment == "generated" or session_boundary_rrf_lane:
-            boundary_stats = await _write_generated_session_boundaries(client, q)
+            boundary_stats = await _write_generated_session_boundaries(
+                client, q, auth_context=auth_context
+            )
         else:
             boundary_stats = {
                 "session_boundaries_total": 0,
@@ -638,6 +670,7 @@ async def _run_one(
                 alpha=session_boundary_alpha,
                 atoms_per_session=session_boundary_atoms_per_session,
                 weight=session_boundary_weight,
+                auth_context=auth_context,
             )
             extra_atom_ranked_pathways = {"session_boundary": boundary_atom_ids}
             rrf_pathway_weights = {"session_boundary": session_boundary_weight}
@@ -663,6 +696,7 @@ async def _run_one(
             # no-boundary ablations stay clean even though production query()
             # defaults the lane on.
             enable_session_boundary_rrf=False,
+            auth_context=auth_context,
         )
         metrics["retrieve_s"] = round(time.time() - t0, 2)
         metrics["n_observations"] = len(retrieved.get("observations", []))

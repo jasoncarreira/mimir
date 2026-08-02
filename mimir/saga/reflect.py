@@ -222,6 +222,7 @@ def recent_session_boundaries(
     count: int = 3,
     agent_id: str = "default",  # noqa: ARG001 — see note below
     auth_context: Any = None,
+    read_authorization=None,
 ) -> list[dict]:
     """Return the most recent session summaries (by ``reflected_at``),
     optionally scoped to a channel. Used by the prompt-build path to
@@ -262,13 +263,13 @@ def recent_session_boundaries(
     agents' sessions here. Non-issue under the single-agent-per-DB
     posture; revisit if a multi-agent DB shape lands.
     """
-    from .ownership import (
-        authorization_predicate_for_sessions,
-        get_authorization_scope,
-    )
+    from .ownership import SagaReadAuthorization
 
-    auth_scope = get_authorization_scope(auth_context)
-    auth_where, auth_params = authorization_predicate_for_sessions(auth_scope)
+    owns_read_authorization = read_authorization is None
+    read_authorization = read_authorization or SagaReadAuthorization(
+        auth_context, "recent_session_boundaries"
+    )
+    auth_where, auth_params = read_authorization.selection_predicate("sessions")
 
     if channel_id is not None:
         rows = conn.execute(f"""
@@ -358,4 +359,9 @@ def recent_session_boundaries(
                 "closed_since": closed_since,
             },
         })
+    read_authorization.observe_selected(
+        conn, "session", "sessions", [item["session_id"] for item in out]
+    )
+    if owns_read_authorization:
+        read_authorization.finalize()
     return out

@@ -13,9 +13,15 @@ which is service/admin-only and not readable by regular users.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
+import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+
+
+log = logging.getLogger(__name__)
 
 
 class Visibility(StrEnum):
@@ -242,7 +248,7 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     # is publicly constructible, so accepting one here would let a caller assert
     # is_admin/is_platform_service. Arbitrary duck-typed carriers fail closed for
     # the same reason; read authority must come from the frozen server carrier.
-    if not isinstance(auth_context, AuthContext):
+    if type(auth_context) is not AuthContext:
         return AuthorizationScope()
 
     from mimir.access_control import (
@@ -273,6 +279,182 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
         service_canonical=None,
     )
 
+
+_SHADOW_COUNT_LIMIT = 1000
+_SHADOW_TYPE_LIMIT = 8
+_SHADOW_EVENT_LIMIT_PER_TURN = 1
+_SHADOW_EVENT_COUNTS: dict[str, int] = {}
+_SHADOW_EVENT_COUNTS_LOCK = threading.Lock()
+
+
+@dataclass
+class SagaReadAuthorization:
+    """Strict SAGA read policy plus the operation's effective selection mode.
+
+    The strict scope is always derived from the immutable server carrier and is
+    never widened. Compatibility mode changes only the SQL predicate used to
+    select rows; the strict predicate remains available for the counterfactual
+    shadow decision.
+    """
+
+    auth_context: Any
+    surface: str
+    strict_scope: AuthorizationScope = field(init=False)
+    enforcement_enabled: bool = field(init=False)
+    _would_deny: dict[str, set[Any]] = field(default_factory=dict, init=False)
+    _counts_truncated: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from mimir.models import AuthContext
+
+        self.strict_scope = get_authorization_scope(self.auth_context)
+        self.enforcement_enabled = bool(
+            type(self.auth_context) is AuthContext
+            and AuthContext.__dataclass_params__.frozen
+            and self.auth_context.enforcement_enabled is True
+        )
+
+    def strict_predicate(self, table: str) -> tuple[str, list]:
+        return authorization_predicate(self.strict_scope, table=table)
+
+    def selection_predicate(self, table: str) -> tuple[str, list]:
+        if not self.enforcement_enabled:
+            return "1=1", []
+        return self.strict_predicate(table)
+
+    def observe_selected(
+        self,
+        conn: sqlite3.Connection,
+        resource_type: str,
+        table: str,
+        resource_ids: list[Any] | tuple[Any, ...] | set[Any],
+        *,
+        id_column: str = "id",
+    ) -> None:
+        """Record selected rows that strict enforcement would have removed."""
+        if self.enforcement_enabled:
+            return
+        try:
+            strict_where, strict_params = self.strict_predicate(table)
+            denied = self._would_deny.setdefault(resource_type, set())
+            chunk: list[Any] = []
+
+            def inspect_chunk() -> None:
+                if not chunk:
+                    return
+                unique = list(dict.fromkeys(chunk))
+                placeholders = ",".join("?" for _ in unique)
+                rows = conn.execute(
+                    f"SELECT {table}.{id_column} FROM {table} "
+                    f"WHERE {table}.{id_column} IN ({placeholders}) AND {strict_where}",
+                    [*unique, *strict_params],
+                ).fetchall()
+                allowed = {row[0] for row in rows}
+                for resource_id in unique:
+                    if resource_id in allowed or resource_id in denied:
+                        continue
+                    if len(denied) < _SHADOW_COUNT_LIMIT:
+                        denied.add(resource_id)
+                    else:
+                        self._counts_truncated = True
+
+            for resource_id in resource_ids:
+                chunk.append(resource_id)
+                if len(chunk) == 400:
+                    inspect_chunk()
+                    chunk.clear()
+            inspect_chunk()
+            if not denied:
+                self._would_deny.pop(resource_type, None)
+        except Exception as exc:  # noqa: BLE001 - shadow evaluation is telemetry
+            if not self._would_deny.get(resource_type):
+                self._would_deny.pop(resource_type, None)
+            log.debug("saga shadow read evaluation failed: %s", exc)
+
+    def observe_would_deny(self, resource_type: str, resource_ids: set[Any]) -> None:
+        """Record counterfactual denials already computed by a read adapter."""
+        if not self.enforcement_enabled and resource_ids:
+            denied = self._would_deny.setdefault(resource_type, set())
+            for resource_id in resource_ids:
+                if len(denied) < _SHADOW_COUNT_LIMIT:
+                    denied.add(resource_id)
+                elif resource_id not in denied:
+                    self._counts_truncated = True
+
+    def finalize(self) -> None:
+        """Emit one bounded best-effort shadow event after a successful read."""
+        if self.enforcement_enabled or not self._would_deny:
+            return
+        from mimir.models import AuthContext
+
+        context = self.auth_context if type(self.auth_context) is AuthContext else None
+        counts = {
+            resource_type: min(len(ids), _SHADOW_COUNT_LIMIT)
+            for resource_type, ids in sorted(self._would_deny.items())[:_SHADOW_TYPE_LIMIT]
+        }
+        total = sum(len(ids) for ids in self._would_deny.values())
+        principal = None
+        if context is not None:
+            principal = context.canonical_principal or context.principal
+        payload = {
+            "surface": self.surface,
+            "allowed": True,
+            "status": "would_block",
+            "reason": "saga_read_policy_would_exclude_candidates",
+            "enforcement_enabled": False,
+            "is_shadow_decision": True,
+            "would_block": True,
+            "risk_direction": "over_serving",
+            "observation_stage": "pre_rrf_candidates",
+            "resource_count": min(total, _SHADOW_COUNT_LIMIT),
+            "resource_counts": counts,
+            "resource_types": list(counts),
+            "counts_truncated": (
+                self._counts_truncated
+                or total > _SHADOW_COUNT_LIMIT
+                or len(self._would_deny) > _SHADOW_TYPE_LIMIT
+            ),
+            "principal": principal,
+            "principal_kind": (
+                "service" if self.strict_scope.is_service
+                else "admin" if self.strict_scope.is_admin
+                else "user" if principal
+                else "unknown"
+            ),
+            "roles": list(context.roles[:16]) if context is not None else [],
+            "service_principal": self.strict_scope.service_canonical,
+            "trigger": context.trigger if context is not None else None,
+            "event_ingress": context.event_ingress if context is not None else None,
+            "policy_version": context.policy_version if context is not None else None,
+        }
+        try:
+            from mimir._context import get_current_turn
+            from mimir.event_logger import log_event_sync
+
+            turn = get_current_turn()
+            turn_id = getattr(turn, "turn_id", None)
+            if turn_id:
+                with _SHADOW_EVENT_COUNTS_LOCK:
+                    emitted = _SHADOW_EVENT_COUNTS.get(turn_id, 0)
+                    if emitted >= _SHADOW_EVENT_LIMIT_PER_TURN:
+                        return
+                    _SHADOW_EVENT_COUNTS[turn_id] = emitted + 1
+                    if len(_SHADOW_EVENT_COUNTS) > 4096:
+                        # Keep the limiter bounded without coupling SAGA reads to
+                        # the turn registry lifecycle. Insertion order retains
+                        # the newest half.
+                        for stale in list(_SHADOW_EVENT_COUNTS)[:2048]:
+                            _SHADOW_EVENT_COUNTS.pop(stale, None)
+                payload["turn_id"] = turn_id
+                payload["aggregation"] = "max_one_event_per_turn"
+                payload["sampling"] = "first_shadow_read_with_exclusions"
+            else:
+                payload["aggregation"] = "one_event_per_read_operation"
+                payload["sampling"] = "none"
+
+            log_event_sync("saga_read_would_block", **payload)
+        except Exception as exc:  # noqa: BLE001 - telemetry cannot affect reads
+            log.debug("saga shadow read event failed: %s", exc)
 
 
 def intersect_acl(acls: list[Ownership]) -> Ownership:
@@ -429,6 +611,7 @@ __all__ = [
     "authorization_predicate_for_triples",
     "authorization_predicate_for_sessions",
     "get_authorization_scope",
+    "SagaReadAuthorization",
     "intersect_acl",
     "intersect_acl_from_rows",
 ]

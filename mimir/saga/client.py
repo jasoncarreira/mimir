@@ -182,6 +182,7 @@ def _make_faiss_search_fn(
     conn: sqlite3.Connection | None = None,
     *,
     auth_scope=None,
+    read_authorization=None,
     agent_id: str = "default",
 ):
     """Return an authorization-scoped VectorIndex search adapter.
@@ -196,12 +197,17 @@ def _make_faiss_search_fn(
     def _fn(query_emb: list[float], top_k: int) -> list[tuple[str, float]]:
         if index is None:
             return []
-        if conn is None or auth_scope is None:
+        if read_authorization is not None and not read_authorization.enforcement_enabled:
+            return index.search(query_emb, top_k=top_k)
+        if conn is None or (auth_scope is None and read_authorization is None):
             return index.search(query_emb, top_k=top_k)
 
         from .ownership import authorization_predicate
 
-        auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+        if read_authorization is not None:
+            auth_where, auth_params = read_authorization.selection_predicate("a")
+        else:
+            auth_where, auth_params = authorization_predicate(auth_scope, table="a")
         allowed = {
             row[0]
             for row in conn.execute(
@@ -228,6 +234,7 @@ def _make_fts_search_fn(
     agent_id: str = "default",
     synonyms: dict[str, list[str]] | None = None,
     auth_scope=None,
+    read_authorization=None,
 ):
     """Closure over the connection matching recall.FtsSearchFn shape.
     ``synonyms`` is the P12 query-expansion dict (FTS-only pathway)."""
@@ -240,6 +247,7 @@ def _make_fts_search_fn(
             agent_id=agent_id,
             synonyms=synonyms,
             auth_scope=auth_scope,
+            read_authorization=read_authorization,
         )
 
     return _fn
@@ -251,6 +259,7 @@ def _make_triple_search_fn(
     dim: int | None,
     reference_date=None,
     auth_context: Any = None,
+    read_authorization=None,
 ):
     """Closure over the connection matching recall.TripleSearchFn shape.
     Returns None when triples are disabled (the dim arg is None, meaning
@@ -271,6 +280,7 @@ def _make_triple_search_fn(
             dim=dim,
             reference_date=reference_date,
             auth_context=auth_context,
+            read_authorization=read_authorization,
         )
 
     return _fn
@@ -844,6 +854,10 @@ class SagaStore:
                 rewritten_query = None
         effective_query = rewritten_query or query
 
+        from .ownership import SagaReadAuthorization
+
+        read_authorization = SagaReadAuthorization(auth_context, "query")
+
         cfg = None
         if enable_session_boundary_rrf is None:
             from ._config_io import get_config
@@ -916,6 +930,7 @@ class SagaStore:
                     atoms_per_session=boundary_atoms_per_session or 0,
                     query_emb=query_emb,
                     auth_context=auth_context,
+                    read_authorization=read_authorization,
                 )
                 if boundary_atom_ids:
                     extra_pathways = extra_pathways or {}
@@ -925,9 +940,6 @@ class SagaStore:
 
             with self._index_lock:
                 index = self._ensure_index(conn)
-            from .ownership import get_authorization_scope
-
-            auth_scope = get_authorization_scope(auth_context)
             # Triple-augment pathway uses the SAME embedding dim as the
             # atom-level FAISS index (triples are embedded under the
             # same provider). Pass dim through so triples with a stale
@@ -940,20 +952,21 @@ class SagaStore:
                 faiss_search_fn=_make_faiss_search_fn(
                     index,
                     conn,
-                    auth_scope=auth_scope,
+                    read_authorization=read_authorization,
                     agent_id=self._agent_id,
                 ),
                 fts_search_fn=_make_fts_search_fn(
                     conn,
                     agent_id=self._agent_id,
                     synonyms=self._synonyms,
-                    auth_scope=auth_scope,
+                    read_authorization=read_authorization,
                 ),
                 triple_search_fn=_make_triple_search_fn(
                     conn,
                     dim=triple_dim,
                     reference_date=reference_date,
                     auth_context=auth_context,
+                    read_authorization=read_authorization,
                 ),
                 extra_atom_ranked_pathways=extra_pathways,
                 rrf_pathway_weights=pathway_weights,
@@ -964,7 +977,7 @@ class SagaStore:
                 min_confidence_tier=min_confidence_tier,
                 fire_access_events=False,
                 auth_context=auth_context,
-                auth_scope=auth_scope,
+                read_authorization=read_authorization,
             )
             returned_atom_ids = [
                 c.atom["id"] for c in (result.observations + result.raws)
@@ -993,6 +1006,7 @@ class SagaStore:
                     dim=triple_dim,
                     reference_date=reference_date,
                     auth_context=auth_context,
+                    read_authorization=read_authorization,
                 )
                 # Strip the internal _cosine field from the wire shape;
                 # keep it out of the agent-facing dict.
@@ -1068,8 +1082,11 @@ class SagaStore:
                     conn.close()
 
         if self._db_path is None:
-            return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+            payload = await self._db_locked(_do)
+        else:
+            payload = await asyncio.to_thread(_do)
+        read_authorization.finalize()
+        return payload
 
     def _session_boundary_atom_pathway_with_conn(
         self,
@@ -1081,6 +1098,7 @@ class SagaStore:
         atoms_per_session: int = 30,
         query_emb: list[float] | None = None,
         auth_context: Any = None,
+        read_authorization=None,
     ) -> list[str]:
         """Search session boundaries and expand matched sessions to atom ids.
 
@@ -1090,12 +1108,11 @@ class SagaStore:
         connection so default-on boundary recall does not double per-query
         sqlite connection churn.
         """
-        from .ownership import (
-            authorization_predicate,
-            get_authorization_scope,
-        )
+        from .ownership import SagaReadAuthorization
 
-        auth_scope = get_authorization_scope(auth_context)
+        read_authorization = read_authorization or SagaReadAuthorization(
+            auth_context, "session_boundary"
+        )
 
         limit = max(0, int(limit))
         cap = max(0, int(atoms_per_session))
@@ -1112,6 +1129,7 @@ class SagaStore:
                 limit=limit,
                 query_emb=query_emb,
                 auth_context=auth_context,
+                read_authorization=read_authorization,
             )
         except Exception:  # noqa: BLE001 — boundary recall is auxiliary
             log.warning("session-boundary RRF search failed", exc_info=True)
@@ -1119,7 +1137,7 @@ class SagaStore:
         if not matched_sessions:
             return []
 
-        auth_where, auth_params = authorization_predicate(auth_scope, table="atoms")
+        auth_where, auth_params = read_authorization.selection_predicate("atoms")
 
         atom_ids: list[str] = []
         seen: set[str] = set()
@@ -1200,12 +1218,9 @@ class SagaStore:
         if not clean:
             return {"atoms": [], "missing": []}
 
-        from .ownership import (
-            authorization_predicate,
-            get_authorization_scope,
-        )
+        from .ownership import SagaReadAuthorization
 
-        auth_scope = get_authorization_scope(auth_context)
+        read_authorization = SagaReadAuthorization(auth_context, "get_atoms")
 
         def _do_with_conn(conn: sqlite3.Connection):
             cols = (
@@ -1233,7 +1248,7 @@ class SagaStore:
             unique = list(dict.fromkeys(clean))
             placeholders = ",".join(["?"] * len(unique))
 
-            auth_where, auth_params = authorization_predicate(auth_scope)
+            auth_where, auth_params = read_authorization.selection_predicate("atoms")
             sql = (
                 f"SELECT {', '.join(cols)} FROM atoms "
                 f"WHERE id IN ({placeholders}) AND tombstoned = 0 "
@@ -1268,7 +1283,7 @@ class SagaStore:
                 )
             returned = {a["id"] for a in atoms}
             missing = [i for i in unique if i not in returned]
-            return {
+            payload = {
                 "atoms": atoms,
                 "missing": missing,
                 "_ifc_sources": [
@@ -1286,6 +1301,10 @@ class SagaStore:
                     for a in atoms
                 ],
             }
+            read_authorization.observe_selected(
+                conn, "atom", "atoms", [atom["id"] for atom in atoms]
+            )
+            return payload
 
         def _do():
             conn, should_close = self._operation_conn()
@@ -1296,8 +1315,11 @@ class SagaStore:
                     conn.close()
 
         if self._db_path is None:
-            return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+            payload = await self._db_locked(_do)
+        else:
+            payload = await asyncio.to_thread(_do)
+        read_authorization.finalize()
+        return payload
 
     async def contextual_rewrite(
         self,
@@ -2549,6 +2571,12 @@ class SagaStore:
         count: int = 3,
         auth_context: Any = None,
     ) -> list[dict[str, Any]]:
+        from .ownership import SagaReadAuthorization
+
+        read_authorization = SagaReadAuthorization(
+            auth_context, "recent_session_boundaries"
+        )
+
         def _do():
             conn, should_close = self._operation_conn()
             try:
@@ -2557,14 +2585,18 @@ class SagaStore:
                     channel_id=channel_id,
                     count=count,
                     auth_context=auth_context,
+                    read_authorization=read_authorization,
                 )
             finally:
                 if should_close:
                     conn.close()
 
         if self._db_path is None:
-            return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+            result = await self._db_locked(_do)
+        else:
+            result = await asyncio.to_thread(_do)
+        read_authorization.finalize()
+        return result
 
     def _search_sessions_with_conn(
         self,
@@ -2576,6 +2608,7 @@ class SagaStore:
         limit: int = 10,
         query_emb: list[float] | None = None,
         auth_context: Any = None,
+        read_authorization=None,
     ) -> list[dict]:
         """Connection-scoped implementation for :meth:`search_sessions`.
 
@@ -2585,12 +2618,12 @@ class SagaStore:
         """
         import math
 
-        from .ownership import (
-            authorization_predicate_for_sessions,
-            get_authorization_scope,
-        )
+        from .ownership import SagaReadAuthorization
 
-        auth_scope = get_authorization_scope(auth_context)
+        owns_read_authorization = read_authorization is None
+        read_authorization = read_authorization or SagaReadAuthorization(
+            auth_context, "search_sessions"
+        )
 
         if query_emb is None:
             query_emb = _query_embed_sync(query) if alpha > 0.0 else []
@@ -2636,7 +2669,7 @@ class SagaStore:
                         continue
 
         # ── Step 2: fetch sessions rows ──
-        auth_where, auth_params = authorization_predicate_for_sessions(auth_scope)
+        auth_where, auth_params = read_authorization.selection_predicate("sessions")
         channel_clause = "AND channel_id = ?" if channel_id else ""
         params: list = list(auth_params)
         if channel_id:
@@ -2699,7 +2732,13 @@ class SagaStore:
             )
 
         results.sort(key=lambda r: r["blended_score"], reverse=True)
-        return results[:limit]
+        selected = results[:limit]
+        read_authorization.observe_selected(
+            conn, "session", "sessions", [item["session_id"] for item in selected]
+        )
+        if owns_read_authorization:
+            read_authorization.finalize()
+        return selected
 
     async def search_sessions(
         self,
@@ -2738,6 +2777,10 @@ class SagaStore:
                 similarity_score, recency_score, blended_score
             Sorted descending by blended_score.
         """
+        from .ownership import SagaReadAuthorization
+
+        read_authorization = SagaReadAuthorization(auth_context, "search_sessions")
+
         # Skip the embed round-trip when alpha=0 (pure recency — cosine score
         # is never consulted).  The downstream helper handles query_emb==[] via
         # the existing ``if query_emb:`` guard, so the recency path still works.
@@ -2757,14 +2800,18 @@ class SagaStore:
                     limit=limit,
                     query_emb=query_emb,
                     auth_context=auth_context,
+                    read_authorization=read_authorization,
                 )
             finally:
                 if should_close:
                     conn.close()
 
         if self._db_path is None:
-            return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+            result = await self._db_locked(_do)
+        else:
+            result = await asyncio.to_thread(_do)
+        read_authorization.finalize()
+        return result
 
     async def most_retrieved_atoms(
         self,
@@ -2794,13 +2841,12 @@ class SagaStore:
         """
         from datetime import datetime, timedelta, timezone
 
-        from .ownership import (
-            authorization_predicate,
-            get_authorization_scope,
-        )
+        from .ownership import SagaReadAuthorization
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        auth_scope = get_authorization_scope(auth_context)
+        read_authorization = SagaReadAuthorization(
+            auth_context, "most_retrieved_atoms"
+        )
 
         def _do():
             conn, should_close = self._operation_conn()
@@ -2836,7 +2882,7 @@ class SagaStore:
                 where.append("om.trend = ?")
                 params.append(trend)
 
-            auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+            auth_where, auth_params = read_authorization.selection_predicate("a")
             where.append(auth_where)
             params.extend(auth_params)
 
@@ -2853,13 +2899,20 @@ class SagaStore:
                 f"GROUP BY a.id ORDER BY n DESC LIMIT ?"
             )
             rows = conn.execute(sql, params).fetchall()
-            return [
+            result = [
                 {"id": r[0], "content": r[1], "retrieval_count": r[2]} for r in rows
             ]
+            read_authorization.observe_selected(
+                conn, "atom", "atoms", [item["id"] for item in result]
+            )
+            return result
 
         if self._db_path is None:
-            return await self._db_locked(_do)
-        return await asyncio.to_thread(_do)
+            result = await self._db_locked(_do)
+        else:
+            result = await asyncio.to_thread(_do)
+        read_authorization.finalize()
+        return result
 
     async def mark_contributions(
         self,
