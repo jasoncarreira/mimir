@@ -109,7 +109,13 @@ class _WriteCollision(str):
 _WRITE_COLLISION = _WriteCollision("mimir-private-write-collision")
 
 
-def _exclusive_write(root: Path, file_path: str, content: str) -> WriteResult | _WriteCollision:
+class _WriteFailure(str):
+    pass
+
+
+def _exclusive_write(
+    root: Path, file_path: str, content: str,
+) -> WriteResult | _WriteCollision | _WriteFailure:
     supports_dir_fd = getattr(os, "supports_dir_fd", ())
     supports_follow_symlinks = getattr(os, "supports_follow_symlinks", ())
     if (
@@ -185,7 +191,7 @@ def _exclusive_write(root: Path, file_path: str, content: str) -> WriteResult | 
     except NotImplementedError:
         return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
     except (OSError, UnicodeEncodeError) as exc:
-        return WriteResult(error=f"Error writing file '{file_path}': {exc}")
+        return _WriteFailure(str(exc))
     finally:
         if final_fd is not None:
             try:
@@ -201,6 +207,10 @@ def _exclusive_write(root: Path, file_path: str, content: str) -> WriteResult | 
 
 def _collision_error(file_path: str) -> str:
     return f"File '{file_path}' already exists. Use edit_file to modify existing files."
+
+
+def _write_failure_error(file_path: str, detail: str) -> str:
+    return f"Error writing file '{file_path}': {detail}"
 
 
 class GrepWithContextSchema(BaseModel):
@@ -1043,6 +1053,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         result = _exclusive_write(self.cwd, file_path, content)
         if result is _WRITE_COLLISION:
             return WriteResult(error=_WRITE_COLLISION)
+        if isinstance(result, _WriteFailure):
+            return WriteResult(error=result)
         return result
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
@@ -1421,6 +1433,8 @@ class WriteGuardBackend:
         )
         if result.error is _WRITE_COLLISION:
             return WriteResult(error=_collision_error(canonical_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(canonical_path, result.error))
         return result
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
@@ -1622,12 +1636,16 @@ class FileToolRouter(CompositeBackend):
         result = super().write(file_path, content)
         if result.error is _WRITE_COLLISION:
             return WriteResult(error=_collision_error(file_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(file_path, result.error))
         return result
 
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         result = await super().awrite(file_path, content)
         if result.error is _WRITE_COLLISION:
             return WriteResult(error=_collision_error(file_path))
+        if isinstance(result.error, _WriteFailure):
+            return WriteResult(error=_write_failure_error(file_path, result.error))
         return result
 
     def grep(
