@@ -2905,28 +2905,53 @@ def _service_shell_command_shape(argv: list[str]) -> str:
     return " ".join(shape)
 
 
+def _service_shell_coding_enabled() -> bool:
+    """Whether this deployment exposes coding tools, using config's bool syntax."""
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
+
+
 def _service_shell_typed_tool_guidance(
     argv: list[str], destination: str,
 ) -> str:
     """Name bounded tools for observed commands that must stay outside the shell."""
-    if destination != "repo_review":
+    if destination != "repo_review" or not argv:
         return ""
-    if argv[:2] in (["npm", "run"], ["npm", "test"]):
+    executable = Path(argv[0]).name
+    operation = argv[1:2]
+    if executable == "npm" and operation in (["run"], ["test"]):
+        if _service_shell_coding_enabled():
+            return (
+                " Repository scripts must run through the typed repo_test tool, "
+                "which uses the deployment-configured test command in the bound PR "
+                "checkout; shell_exec does not admit npm run or npm test."
+            )
         return (
-            " Repository scripts must run through the typed repo_test tool, "
-            "which uses the deployment-configured test command in the bound PR "
-            "checkout; shell_exec does not admit npm run or npm test."
+            " Repository scripts remain denied, and this deployment does not expose "
+            "repo_test. Use whatever bounded verification capability the deployment "
+            "provides, and state plainly when the tests could not be run."
+        )
+    if executable == "npm" and operation in (["ci"], ["install"]):
+        return (
+            " npm dependency installation remains denied and has no typed equivalent "
+            "in this profile; do not retry it through shell_exec."
         )
     if (
         len(argv) >= 2
-        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(argv[0]).name)
-        and argv[1] == "-c"
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+        and argv[1] in {"-c", "-"}
     ):
-        return (
-            " Inline python -c is arbitrary code execution and remains denied. "
-            "Use the typed read_file or grep tool for repository inspection, or "
-            "repo_test for the deployment-configured test command."
+        mode = "python -c" if argv[1] == "-c" else "Python stdin/heredoc"
+        guidance = (
+            f" Inline {mode} is arbitrary code execution and remains denied. There "
+            "is no general typed equivalent for arbitrary Python or attachment/HTML "
+            "parsing in this profile. Use read_file or grep only when bounded text "
+            "inspection suffices; otherwise report that the workload cannot be "
+            "performed rather than retrying it through shell_exec."
         )
+        if _service_shell_coding_enabled():
+            guidance += " For repository tests only, use the typed repo_test tool."
+        return guidance
     return ""
 
 

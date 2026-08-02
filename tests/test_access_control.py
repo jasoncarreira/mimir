@@ -2393,20 +2393,30 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
             "typed repo_test tool",
         ),
         (
+            "/usr/bin/npm test",
+            access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "typed repo_test tool",
+        ),
+        (
             "python -c 'import json; print(json.dumps({}))'",
             access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
-            "typed read_file or grep tool",
+            "no general typed equivalent",
+        ),
+        (
+            "python - <<PY\nprint('attachment parser')\nPY",
+            access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            "attachment/HTML parsing",
         ),
     ],
 )
-def test_repo_review_observed_code_execution_refusals_name_typed_tools(
+def test_repo_review_observed_code_execution_refusals_name_usable_guidance(
     command: str,
     binding_rule: access_control.ServiceShellBindingRule,
     expected_guidance: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Observed review-turn npm and inline Python attempts stay refused usefully."""
-    monkeypatch.delenv("MIMIR_PROJECT_TEST_COMMAND", raising=False)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         command, "repo_review",
@@ -2416,6 +2426,44 @@ def test_repo_review_observed_code_execution_refusals_name_typed_tools(
     assert rule is binding_rule
     assert expected_guidance in reason
     assert "repo_test" in reason
+
+
+@pytest.mark.parametrize(
+    "coding_env",
+    [None, "", "false", "0", "invalid"],
+)
+def test_repo_review_guidance_does_not_name_unavailable_repo_test(
+    coding_env: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default coding-disabled deployment is not sent to a missing tool."""
+    if coding_env is None:
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", coding_env)
+
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "npm run", "repo_review",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "does not expose repo_test" in reason
+    assert "typed repo_test tool" not in reason
+
+
+@pytest.mark.parametrize("command", ["npm ci", "/usr/bin/npm install"])
+def test_repo_review_npm_install_refusal_names_missing_typed_equivalent(
+    command: str,
+) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command, "repo_review",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "dependency installation remains denied" in reason
+    assert "no typed equivalent" in reason
 
 
 @pytest.mark.asyncio
