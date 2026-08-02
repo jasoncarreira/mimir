@@ -102,10 +102,13 @@ slack = [
 gepa = [
     "gepa>=0.1.1,<0.2",
 ]
-# ``pip install -e ".[dev]"`` — minimal dev toolchain. Claude Code
+# ``pip install -e ".[dev]"`` — full test toolchain. Claude Code
 # adapter import coverage lives in the dedicated CI smoke job that installs
-# ``--extra claude-code``; dev alone keeps the default contributor graph lean.
+# ``--extra claude-code``. The LongMemEval collection guard requires the local
+# workspace bench harness, so dev includes ``saga`` as well as the explicit
+# ``bench`` extra above.
 dev = [
+    "saga",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-aiohttp>=1.0",
@@ -264,6 +267,7 @@ saga = { workspace = true }
 # Claude Code remains opt-in via ``--extra claude-code``; CI has a
 # dedicated smoke job for that adapter path.
 dev = [
+    "saga",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-aiohttp>=1.0",
