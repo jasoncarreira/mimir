@@ -48,7 +48,7 @@ from .billing import normalize_priority
 from .access_control import builtin_trigger_service_principal
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event
-from ._context import active_turn_snapshots
+from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
     stack_is_apscheduler_logging_flush,
@@ -2381,6 +2381,35 @@ class Scheduler:
             default_cron=cron_expr,
             job_id=job_id,
             misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # ---- PR checkout lease reaper cron -------------------------------
+
+    def add_pr_checkout_lease_reaper_job(
+        self,
+        lease_root: Path,
+        cron_expr: str = "*/15 * * * *",
+        *,
+        job_id: str = "pr-checkout-lease-reaper",
+    ) -> bool:
+        """Register expiry enforcement for isolated PR checkout leases."""
+        from .pr_checkout_lease import reclaim_expired_pr_checkout_leases
+
+        async def _fire() -> None:
+            await asyncio.to_thread(
+                reclaim_expired_pr_checkout_leases,
+                lease_root,
+                active_paths=active_pr_checkout_lease_paths,
+            )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
+            misfire_grace_time=900,
             max_instances=1,
             coalesce=True,
         )

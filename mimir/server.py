@@ -1592,6 +1592,26 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
 
+        # Enforce each PR checkout lease's recorded expiry. The root itself is
+        # opt-in, but configured deployments get a default-on periodic sweep.
+        lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+        if lease_root_value:
+            try:
+                from .pr_checkout_lease import configured_pr_checkout_lease_root
+
+                scheduler.add_pr_checkout_lease_reaper_job(
+                    lease_root=configured_pr_checkout_lease_root(),
+                    cron_expr=os.environ.get(
+                        "MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON", "*/15 * * * *",
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                await log_event(
+                    "scheduler_invalid_pr_checkout_lease_reaper",
+                    error=str(exc),
+                    job="pr-checkout-lease-reaper",
+                )
+
         # Scratch retention janitor: scratch/ is ephemeral by contract
         # (config.py writable-dirs table) but nothing deleted it — poller-
         # driven per-task clones left a live home with 140 GB in six weeks.

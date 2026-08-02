@@ -27,6 +27,7 @@ from mimir.pr_checkout_lease import (
     acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
+    reclaim_expired_pr_checkout_leases,
     recover_pr_checkout_lease,
 )
 from mimir._context import reset_current_turn, set_current_turn
@@ -158,6 +159,93 @@ def test_expired_lease_with_unpushed_work_is_named_and_renewed(tmp_path: Path) -
     assert candidates == (fix_head,)
     renewed = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert datetime.fromisoformat(renewed["expires_at"]) > datetime.now(UTC)
+
+
+def _expire_lease(lease: PRCheckoutLease) -> datetime:
+    expired_at = datetime.now(UTC) - timedelta(minutes=5)
+    metadata_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = expired_at.isoformat()
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+    return expired_at
+
+
+def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is True
+    assert not lease.path.exists()
+    reclaimed = next(fields for kind, fields in events if kind == "pr_checkout_lease_reclaimed")
+    assert reclaimed["lease"] == lease.path.name
+    assert reclaimed["expired_by_s"] == 300.0
+    assert reclaimed["size_bytes"] > 0
+    assert reclaimed["publication_proof_present"] is True
+    assert events[-1] == (
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 1, "reclaimed_count": 1, "retained_count": 0},
+    )
+
+
+def test_reaper_retains_and_reports_expired_unpublished_work(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("unpublished fix\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "unpublished fix")
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is False
+    assert "publication mismatch" in (results[0].error or "")
+    assert lease.path.is_dir()
+    retained = next(fields for kind, fields in events if kind == "pr_checkout_lease_retained")
+    assert retained["lease"] == lease.path.name
+    assert retained["publication_proof_present"] is True
+    assert "publication mismatch" in str(retained["error"])
+
+
+def test_reaper_never_reclaims_expired_lease_attached_to_live_turn(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        active_paths={lease.path},
+        now=expired_at + timedelta(hours=3),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert results == []
+    assert lease.path.is_dir()
+    assert events == [(
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 0, "reclaimed_count": 0, "retained_count": 0},
+    )]
 
 
 def test_expired_lease_refuses_resume_after_pr_head_moves(tmp_path: Path) -> None:

@@ -92,6 +92,17 @@ class PRCheckoutLease:
         object.__setattr__(self, "revoked", True)
 
 
+@dataclass(frozen=True)
+class PRCheckoutLeaseReclamation:
+    lease: str
+    path: Path
+    expired_by_s: float
+    size_bytes: int
+    publication_proof_present: bool
+    reclaimed: bool
+    error: str | None = None
+
+
 def configured_pr_checkout_lease_root() -> Path:
     raw = os.environ.get(_LEASE_ROOT_ENV, "").strip()
     if not raw:
@@ -408,6 +419,131 @@ def replace_lease_expiry(lease: PRCheckoutLease, expires_at: datetime) -> PRChec
     values = {field: getattr(lease, field) for field in lease.__dataclass_fields__}
     values["expires_at"] = expires_at
     return PRCheckoutLease(**values)
+
+
+def _lease_from_recorded_metadata(path: Path, root: Path) -> PRCheckoutLease:
+    try:
+        raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError("PR checkout lease reclamation metadata is invalid")
+    try:
+        created_at = datetime.fromisoformat(str(raw["created_at"]))
+        expires_at = datetime.fromisoformat(str(raw["expires_at"]))
+        lease = PRCheckoutLease(
+            canonical_repo=str(raw["canonical_repo"]),
+            canonical_origin=str(raw["canonical_origin"]),
+            source_root=Path(str(raw["source_root"])),
+            scope_base_sha=str(raw.get("scope_base_sha", raw["base_sha"])),
+            base_sha=str(raw["base_sha"]),
+            head_sha=str(raw["head_sha"]),
+            destination_ref=str(raw["destination_ref"]),
+            owner=str(raw["owner"]),
+            scope_id=str(raw["scope_id"]),
+            path=path,
+            lease_root=root,
+            created_at=created_at,
+            expires_at=expires_at,
+            recovery_id=str(raw["recovery_id"]),
+            pr_number=int(raw.get("pr_number", 0)),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
+    if created_at.tzinfo is None or expires_at.tzinfo is None:
+        raise RuntimeError("PR checkout lease reclamation metadata is invalid")
+    return lease
+
+
+def _checkout_size_bytes(path: Path) -> int:
+    total = 0
+    for current_root, directories, files in os.walk(path, followlinks=False):
+        entries = [*(Path(current_root) / name for name in directories),
+                   *(Path(current_root) / name for name in files)]
+        for entry in entries:
+            try:
+                total += entry.lstat().st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def reclaim_expired_pr_checkout_leases(
+    lease_root: Path,
+    *,
+    active_paths: set[Path] | Callable[[], set[Path]] | None = None,
+    now: datetime | None = None,
+    runner: Runner = _default_runner,
+    event_logger: Callable[..., None] | None = None,
+) -> list[PRCheckoutLeaseReclamation]:
+    """Safely reclaim expired leases not attached to a live turn."""
+    if lease_root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = lease_root.resolve(strict=True)
+    observed_at = now or datetime.now(UTC)
+    if observed_at.tzinfo is None:
+        raise ValueError("PR checkout lease reclamation time must be timezone-aware")
+    if event_logger is None:
+        from .event_logger import log_event_sync
+
+        event_logger = log_event_sync
+    results: list[PRCheckoutLeaseReclamation] = []
+    directory_fd = os.open(root, os.O_RDONLY)
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        current_active_paths = active_paths() if callable(active_paths) else active_paths
+        active = {
+            path.resolve(strict=False) for path in (current_active_paths or set())
+        }
+        for path in sorted(root.iterdir()):
+            if path.name.startswith(".") or not path.is_dir() or path.is_symlink():
+                continue
+            try:
+                lease = _lease_from_recorded_metadata(path, root)
+            except RuntimeError:
+                continue
+            if observed_at < lease.expires_at or path.resolve(strict=False) in active:
+                continue
+            size_bytes = _checkout_size_bytes(path)
+            proof = runner([
+                "git", "-C", str(path), "rev-parse", "--verify",
+                f"{PUBLISHED_HEAD_REF}^{{commit}}",
+            ]).returncode == 0
+            error: str | None = None
+            reclaimed = False
+            try:
+                reclaimed = cleanup_pr_checkout_lease(lease, runner=runner)
+            except RuntimeError as exc:
+                error = str(exc)
+            result = PRCheckoutLeaseReclamation(
+                lease=path.name,
+                path=path,
+                expired_by_s=max(0.0, (observed_at - lease.expires_at).total_seconds()),
+                size_bytes=size_bytes,
+                publication_proof_present=proof,
+                reclaimed=reclaimed,
+                error=error,
+            )
+            results.append(result)
+            event_logger(
+                "pr_checkout_lease_reclaimed" if reclaimed else "pr_checkout_lease_retained",
+                lease=result.lease,
+                path=str(result.path),
+                expired_by_s=round(result.expired_by_s, 3),
+                size_bytes=result.size_bytes,
+                publication_proof_present=result.publication_proof_present,
+                error=result.error,
+            )
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+    event_logger(
+        "pr_checkout_lease_reaper_sweep",
+        expired_count=len(results),
+        reclaimed_count=sum(result.reclaimed for result in results),
+        retained_count=sum(not result.reclaimed for result in results),
+    )
+    return results
 
 
 def _retained_candidate_head(

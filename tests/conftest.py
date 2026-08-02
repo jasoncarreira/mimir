@@ -88,8 +88,8 @@ def maintenance_git_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _clear_mimir_api_key():
-    """Pop ``MIMIR_API_KEY`` from os.environ for the whole test session.
+def _clear_host_mimir_environment():
+    """Pop host-only Mimir settings from os.environ for the test session.
 
     ``mimir.server._make_auth_middleware`` reads this env var at
     ``build_app`` time. When non-empty it gates every non-exempt route
@@ -98,14 +98,21 @@ def _clear_mimir_api_key():
     Tests that want to exercise the auth-on path should monkeypatch
     the env var explicitly inside the test body.
 
+    ``MIMIR_HOME`` is also host-specific. Leaving it set makes the live
+    ``repositories.yaml`` override temporary ``GITHUB_REPOS`` and writable-root
+    settings in authorization tests.
+
     Same shape as the SAGA_CONFIG cleanup proposed in chainlink #129's
     PR #75 precedent. Session-scoped so we don't churn os.environ on
     every test; autouse so individual test files don't have to opt in.
     """
-    saved = os.environ.pop("MIMIR_API_KEY", None)
+    saved = {
+        name: os.environ.pop(name)
+        for name in ("MIMIR_API_KEY", "MIMIR_HOME")
+        if name in os.environ
+    }
     yield
-    if saved is not None:
-        os.environ["MIMIR_API_KEY"] = saved
+    os.environ.update(saved)
 
 
 @pytest.fixture(autouse=True)
