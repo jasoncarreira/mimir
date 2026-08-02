@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ...repository_config import valid_repository_slug
 from ..compute import (
     ComputeBackend,
     ComputeCaps,
@@ -151,6 +152,7 @@ class WorklinkRoute:
 @dataclass(frozen=True)
 class WorklinkConfig:
     defaults: WorklinkDefaults = field(default_factory=WorklinkDefaults)
+    repository: str | None = None
     routes: tuple[WorklinkRoute, ...] = ()
     backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     compute_backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -218,6 +220,11 @@ class WorklinkConfig:
             reviewer_backend=str(defaults_data.get("reviewer_backend", backend_name)),
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
+        repository = data.get("repository")
+        if repository is not None and not valid_repository_slug(repository):
+            raise ValueError("worklink repository must be owner/repository")
+        if repository is not None:
+            repository = repository.lower()
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
         raw_backends = data.get("backends") or {}
@@ -270,6 +277,7 @@ class WorklinkConfig:
         )
         return cls(
             defaults=defaults,
+            repository=repository,
             routes=routes,
             backend_settings={
                 name: _expect_mapping(settings, f"worklink backends.{name}")

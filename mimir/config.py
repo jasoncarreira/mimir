@@ -11,7 +11,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import stat as stat_module
+import subprocess
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -518,6 +520,107 @@ def _parse_file_tool_roots(
             )
 
     return tuple(out.items())
+
+
+def _configure_declared_repositories(home: Path) -> None:
+    """Validate the repository inventory and reconcile its legacy projections."""
+    from .repository_config import RepositoryInventory
+    from .worklink.backends.registry import WorklinkConfig
+
+    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    if not inventory.declared:
+        return
+    worklink = WorklinkConfig.load(home / "worklink.yaml")
+
+    declared_roots = tuple(
+        (str(item.root), item.mode)
+        for item in (*inventory.repositories, *inventory.allowed_roots)
+    )
+    rendered_roots = ",".join(f"{path}:{mode}" for path, mode in declared_roots)
+    effective_declared = _parse_file_tool_roots(rendered_roots, home, always_rw=())
+    if effective_declared != declared_roots:
+        raise RuntimeError(
+            "declared repositories/allowed_roots contain a root that is not a valid "
+            f"file-tool root: declared={declared_roots!r}, effective={effective_declared!r}"
+        )
+
+    legacy_roots = os.environ.get("MIMIR_FILE_TOOL_ROOTS")
+    if legacy_roots is not None:
+        effective_legacy = _parse_file_tool_roots(legacy_roots, home, always_rw=())
+        if dict(effective_legacy) != dict(declared_roots):
+            raise RuntimeError(
+                "MIMIR_FILE_TOOL_ROOTS disagrees with repositories.yaml: "
+                f"legacy={effective_legacy!r}, declared={declared_roots!r}"
+            )
+    else:
+        os.environ["MIMIR_FILE_TOOL_ROOTS"] = rendered_roots
+
+    declared_slugs = tuple(repo.slug for repo in inventory.repositories)
+    legacy_slugs = os.environ.get("GITHUB_REPOS")
+    if legacy_slugs is not None:
+        effective_slugs = tuple(
+            part.strip().lower() for part in legacy_slugs.split(",") if part.strip()
+        )
+        if set(effective_slugs) != set(declared_slugs):
+            raise RuntimeError(
+                "GITHUB_REPOS disagrees with repositories.yaml: "
+                f"legacy={effective_slugs!r}, declared={declared_slugs!r}"
+            )
+    else:
+        os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
+
+    target = inventory.repository(worklink.repository) if worklink.repository else None
+    if worklink.repository is not None and target is None:
+        raise RuntimeError(
+            "worklink.yaml repository does not name a declared repository: "
+            f"{worklink.repository}"
+        )
+    declared_target = str(target.root) if target is not None else None
+    for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
+        legacy_target = os.environ.get(name)
+        if legacy_target is not None and (
+            declared_target is None
+            or Path(legacy_target).resolve() != Path(declared_target)
+        ):
+            raise RuntimeError(
+                f"{name} disagrees with worklink.yaml: "
+                f"legacy={legacy_target!r}, declared={declared_target!r}"
+            )
+    if declared_target is not None and "WORKLINK_REPO" not in os.environ:
+        os.environ["WORKLINK_REPO"] = declared_target
+
+    git = shutil.which("git")
+    if git is None and inventory.repositories:
+        raise RuntimeError("declared repositories cannot be validated: git is unavailable")
+    for repo in inventory.repositories:
+        found = "not a git checkout"
+        try:
+            top = subprocess.run(
+                [str(git), "-C", str(repo.root), "rev-parse", "--show-toplevel"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            origin = subprocess.run(
+                [str(git), "-C", str(repo.root), "config", "--local", "--get", "remote.origin.url"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            observed_top = Path(top.stdout.strip()).resolve() if top.returncode == 0 else None
+            if observed_top == repo.root and origin.returncode == 0:
+                found = origin.stdout.strip() or "origin is empty"
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+        if found != repo.origin:
+            raise RuntimeError(
+                f"repository {repo.slug} did not bind: expected origin "
+                f"{repo.origin!r}, found {found!r} at {repo.root}"
+            )
 
 
 def _parse_sources(raw: str) -> frozenset[str] | None:
@@ -1071,6 +1174,7 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
+        _configure_declared_repositories(home)
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
                 "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "

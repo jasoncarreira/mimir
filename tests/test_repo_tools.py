@@ -1083,6 +1083,8 @@ def test_project_tests_use_fixed_command_checkout_and_environment(
 
     assert result.ok is True
     assert result.code == "tests_passed"
+    assert result.command == ("/usr/bin/true", "-q")
+    assert result.command_source == "deployment"
     assert result.stdout == "ok <checkout>"
     argv, cwd, env, timeout, output_limit = calls[0]
     assert argv == ("/usr/bin/true", "-q", "tracked.txt::case")
@@ -1091,6 +1093,68 @@ def test_project_tests_use_fixed_command_checkout_and_environment(
     assert "MIMIR_MODEL_SPEC" not in env
     assert timeout == 300.0
     assert output_limit == 64 * 1024
+
+
+def test_project_tests_prefer_repository_command_and_report_source(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text(
+        "defaults:\n  test_command: /usr/bin/false\n",
+        encoding="utf-8",
+    )
+    (home / "repositories.yaml").write_text(
+        f"""
+repositories:
+  - slug: owner/repo
+    root: {scope.canonical_root}
+    mode: rw
+    origin: https://github.com/owner/repo.git
+    base_branch: main
+    test_command: /usr/bin/true --repository
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    calls = []
+
+    def runner(argv, *, cwd, env, timeout, output_limit):
+        calls.append(argv)
+        return ProjectTestProcessResult(0)
+
+    result = RepoProjectTests(state, runner=runner).execute(())
+
+    assert calls == [("/usr/bin/true", "--repository")]
+    assert result.command == ("/usr/bin/true", "--repository")
+    assert result.command_source == "repository"
+
+
+def test_project_tests_refuse_unresolvable_repository_command(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _origin, _source, scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "repositories.yaml").write_text(
+        f"""
+repositories:
+  - slug: owner/repo
+    root: {scope.canonical_root}
+    mode: rw
+    origin: https://github.com/owner/repo.git
+    base_branch: main
+    test_command: runner-that-does-not-exist --quiet
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    with pytest.raises(ProjectTestRefusal) as exc_info:
+        RepoProjectTests(state).execute(())
+
+    assert exc_info.value.code == "test_command_unresolvable"
 
 
 def test_project_test_home_is_writable_and_fresh_per_execution(

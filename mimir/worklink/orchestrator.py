@@ -49,6 +49,7 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
+from ..repository_config import RepositoryInventory
 from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -340,9 +341,11 @@ class WorklinkRunner:
                 )
             raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
+        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         registry = self.registry or BackendRegistry(config)
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
+        repository_config = inventory.repository(repo_slug) if inventory.declared else None
         backend = (
             registry.get(backend_name)
             if backend_name
@@ -350,10 +353,20 @@ class WorklinkRunner:
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
-        test_cmd = test_command if test_command is not None else config.defaults.test_command
+        test_cmd = (
+            test_command
+            if test_command is not None
+            else repository_config.test_command
+            if repository_config is not None and repository_config.test_command is not None
+            else config.defaults.test_command
+        )
         template_path = _template_path(self.home)
         # Per-run override beats worklink.yaml, which beats the built-in "main".
-        base = base_branch or config.defaults.base_branch
+        base = (
+            base_branch
+            or (repository_config.base_branch if repository_config is not None else None)
+            or config.defaults.base_branch
+        )
 
         # Dry-run validates the issue and renders the exact prompt without claiming
         # or mutating Chainlink/git state.
@@ -1091,6 +1104,8 @@ class WorklinkRunner:
 
         backend = registry.get("feature_factory")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        repository_config = inventory.repository(repo_slug) if inventory.declared else None
 
         if autonomous:
             allowed, reason = config.autonomous_compute_allowed(compute.name, compute.capabilities())
@@ -1144,7 +1159,11 @@ class WorklinkRunner:
         )
 
         try:
-            base = config.defaults.base_branch
+            base = (
+                repository_config.base_branch
+                if repository_config is not None
+                else config.defaults.base_branch
+            )
             lease = _create_backend_checkout(
                 self.repo,
                 issue_id=issue.issue_id,
