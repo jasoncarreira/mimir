@@ -327,6 +327,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Overwrite --dest if it exists",
     )
 
+    acl_inventory_p = sub.add_parser(
+        "saga-acl-inventory",
+        help="Classify atom ACLs by persisted writer-path evidence (read-only).",
+    )
+    acl_inventory_p.add_argument(
+        "--db", type=Path, required=True, help="Path to the SAGA SQLite database",
+    )
+    acl_inventory_p.add_argument(
+        "--include-tombstoned", action="store_true",
+        help="Include tombstoned atoms (default: live atoms only).",
+    )
+
     # chainlink #507: out-of-process dead-man's-switch. Run as a compose
     # sidecar or cron — it alerts (ntfy / webhook) when the agent's liveness
     # beat goes stale, which the agent itself can't do once it's dead/wedged.
@@ -608,6 +620,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
         sys.exit(0)
+
+    if args.command == "saga-acl-inventory":
+        from .saga.acl_inventory import inventory_path
+        import json
+        import sqlite3
+
+        try:
+            report = inventory_path(
+                args.db, include_tombstoned=args.include_tombstoned,
+            )
+        except (FileNotFoundError, OSError, sqlite3.Error) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
 
     if args.command == "reflection":
         sys.exit(_reflection_cmd.dispatch(args, refl_p))
