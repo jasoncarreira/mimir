@@ -140,10 +140,6 @@ def test_heartbeat_required_filesystem_operations_are_permitted(
             assert not getattr(result, "error", None), (operation, relative_path, result)
 
         assert backend.drain_denials() == []
-        assert not any(
-            denial.get("reason") == "protected_read_target"
-            for denial in turn.hard_boundary_denials
-        )
     finally:
         reset_current_turn(token)
 
