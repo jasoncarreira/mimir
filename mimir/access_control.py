@@ -2787,6 +2787,69 @@ _SERVICE_SHELL_DISPLAY_OPTIONS = frozenset({
     "--search", "--short", "--state", "--status", "--template",
 })
 
+_SERVICE_SHELL_LOG_MAX_ARGUMENTS = 32
+_SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH = 256
+_SERVICE_SHELL_SECRET_OPTIONS = frozenset({
+    "--api-key", "--apikey", "--auth", "--authorization", "--client-secret",
+    "--credential", "--header", "--password", "--secret", "--token", "-c",
+    "-H", "-t",
+})
+
+
+class ServiceShellBindingRule(StrEnum):
+    """Stable aggregation keys for trusted-service shell binding refusals."""
+
+    SHELL_CONTROL_CHARACTERS = "shell_control_characters"
+    ARGV_UNBALANCED_QUOTING = "argv_unbalanced_quoting"
+    ARGV_EMPTY = "argv_empty"
+    SHELL_HOME_EXPANSION = "shell_home_expansion"
+    PROJECT_TEST_POLICY = "project_test_policy"
+    PROFILE_ALLOWLIST = "profile_allowlist"
+    EXECUTABLE_PIN = "executable_pin"
+    REPOSITORY_REVIEW_STATE = "repository_review_state"
+    REVIEW_BODY_CAPTURE = "review_body_capture"
+    UNKNOWN_PROFILE = "unknown_profile"
+
+
+def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
+    """Return a bounded argv with credential-bearing argument values redacted.
+
+    Redaction covers shared token shapes plus values supplied to credential/header
+    options. Truncation is represented both in the argv and by the returned flag.
+    """
+    from .redaction import redact_text
+
+    try:
+        raw_argv = shlex.split(target)
+    except ValueError:
+        raw_argv = ["<unparseable argv>"]
+
+    redacted: list[str] = []
+    redact_next = False
+    truncated = len(raw_argv) > _SERVICE_SHELL_LOG_MAX_ARGUMENTS
+    for argument in raw_argv[:_SERVICE_SHELL_LOG_MAX_ARGUMENTS]:
+        if redact_next:
+            rendered = "[REDACTED]"
+            redact_next = False
+        else:
+            option, separator, _value = argument.partition("=")
+            if separator and option in _SERVICE_SHELL_SECRET_OPTIONS:
+                rendered = f"{option}=[REDACTED]"
+            elif argument.startswith("-H") and argument != "-H":
+                rendered = "-H[REDACTED]"
+            elif argument.startswith("-t") and argument != "-t":
+                rendered = "-t[REDACTED]"
+            else:
+                rendered = redact_text(argument)
+            redact_next = argument in _SERVICE_SHELL_SECRET_OPTIONS
+        if len(rendered) > _SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH:
+            rendered = rendered[:_SERVICE_SHELL_LOG_MAX_ARGUMENT_LENGTH] + "[TRUNCATED]"
+            truncated = True
+        redacted.append(rendered)
+    if len(raw_argv) > _SERVICE_SHELL_LOG_MAX_ARGUMENTS:
+        redacted.append("[TRUNCATED]")
+    return redacted, truncated
+
 
 def _service_shell_command_shape(argv: list[str]) -> str:
     """Name the refused command surface without echoing any argument value.
@@ -2867,10 +2930,10 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
     )
 
 
-def parse_service_shell_argv_with_reason(
+def parse_service_shell_argv_with_diagnostics(
     target: str, destination: str, *, review_state: Any = None,
-) -> tuple[list[str] | None, str]:
-    """Return the argv a service shell profile admits, or why it refused.
+) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
+    """Return the admitted argv, refusal reason, and stable rejecting rule.
 
     The returned argv is both the authorization artifact and the execution
     artifact. Callers must exec it directly with ``shell=False``; handing the
@@ -2879,7 +2942,7 @@ def parse_service_shell_argv_with_reason(
 
     On refusal the second element says why. It is produced at the same branch
     that refuses, so an explanation can never disagree with the decision it
-    describes — which is why this is one function with two outputs rather than a
+    describes — which is why this is one function with three outputs rather than a
     separate explainer that could drift out of step with the rule.
 
     Reasons are deliberately *structural*: metacharacters, the executable, the
@@ -2894,7 +2957,7 @@ def parse_service_shell_argv_with_reason(
             f"the command contains shell metacharacters ({rendered}), which the "
             f"{destination!r} trusted-service shell profile never admits. "
             + _SHELL_PROFILE_SINGLE_ARGV_HINT
-        )
+        ), ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
     try:
         argv = shlex.split(target)
     except ValueError:
@@ -2902,16 +2965,16 @@ def parse_service_shell_argv_with_reason(
             "the command could not be split into an argv because its quoting is "
             "unbalanced. Close every quote, or pass the value through a file "
             "option instead of inline."
-        )
+        ), ServiceShellBindingRule.ARGV_UNBALANCED_QUOTING
     if not argv:
-        return None, "the command is empty."
+        return None, "the command is empty.", ServiceShellBindingRule.ARGV_EMPTY
     # A leading tilde is shell home expansion; an embedded tilde such as
     # ``HEAD~1`` is a normal Git revision expression and is passed literally.
     if any(argument.startswith("~") for argument in argv):
         return None, (
             "an argument begins with '~', which requires the shell home "
             "expansion this profile does not perform. Use an absolute path."
-        )
+        ), ServiceShellBindingRule.SHELL_HOME_EXPANSION
 
     if argv[0] == "/usr/local/bin/chainlink":
         argv[0] = "chainlink"
@@ -2919,23 +2982,35 @@ def parse_service_shell_argv_with_reason(
     test_argv, test_reason, test_matched = _project_test_execution_argv(argv)
     if test_matched:
         if test_argv is None:
-            return None, f"configured project test refused: {test_reason}"
-        return test_argv, ""
+            return (
+                None,
+                f"configured project test refused: {test_reason}",
+                ServiceShellBindingRule.PROJECT_TEST_POLICY,
+            )
+        return test_argv, "", None
 
     allowed = False
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
         if not _target_matches_repo_review_shell_command(argv, review_state):
-            return None, _service_shell_not_admitted_reason(argv, destination)
+            return (
+                None,
+                _service_shell_not_admitted_reason(argv, destination),
+                ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            )
         if argv[0] == "git" and argv[1:2] != ["fetch"]:
             git_argv = _repo_review_git_execution_argv(argv, review_state)
             if git_argv is not None:
-                return git_argv, ""
-            return None, _service_shell_not_admitted_reason(argv, destination)
+                return git_argv, "", None
+            return (
+                None,
+                _service_shell_not_admitted_reason(argv, destination),
+                ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            )
         pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
         if pinned is None:
-            return None, reason
+            return None, reason, ServiceShellBindingRule.EXECUTABLE_PIN
         # Capture any review body HERE, so the returned artifact carries no
         # pathname for ``gh`` to look up again. See
         # ``_capture_review_body_beneath_scratch``: validating a path and
@@ -2948,21 +3023,29 @@ def parse_service_shell_argv_with_reason(
                 "without traversing a symlink, and be at most "
                 f"{_REVIEW_BODY_MAX_BYTES} bytes. The body is read once during "
                 "authorization so the path is never re-opened at execution."
-            )
-        return captured, ""
+            ), ServiceShellBindingRule.REVIEW_BODY_CAPTURE
+        return captured, "", None
     elif destination == "maintenance":
         if argv[0] == "git":
             git_argv = _maintenance_git_execution_argv(argv)
             if git_argv is None:
-                return None, _service_shell_not_admitted_reason(argv, destination)
-            return git_argv, ""
+                return (
+                    None,
+                    _service_shell_not_admitted_reason(argv, destination),
+                    ServiceShellBindingRule.PROFILE_ALLOWLIST,
+                )
+            return git_argv, "", None
         allowed = _target_matches_maintenance_shell_command(argv)
     elif destination == "upgrade_workspace":
         if argv[0] == "git":
             git_argv = _maintenance_git_execution_argv(argv)
             if git_argv is None:
-                return None, _service_shell_not_admitted_reason(argv, destination)
-            return git_argv, ""
+                return (
+                    None,
+                    _service_shell_not_admitted_reason(argv, destination),
+                    ServiceShellBindingRule.PROFILE_ALLOWLIST,
+                )
+            return git_argv, "", None
         allowed = _target_matches_read_only_shell_command(argv) or (
             argv[0] == "uv"
             and argv[1:] in (["lock"], ["sync"])
@@ -2971,10 +3054,29 @@ def parse_service_shell_argv_with_reason(
         return None, (
             f"there is no trusted-service shell profile named {destination!r}, "
             "so no command can be admitted for this principal."
-        )
+        ), ServiceShellBindingRule.UNKNOWN_PROFILE
     if not allowed:
-        return None, _service_shell_not_admitted_reason(argv, destination)
-    return _maintenance_pinned_execution_argv_with_reason(argv)
+        return (
+            None,
+            _service_shell_not_admitted_reason(argv, destination),
+            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        )
+    pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
+    return (
+        (pinned, "", None)
+        if pinned is not None
+        else (None, reason, ServiceShellBindingRule.EXECUTABLE_PIN)
+    )
+
+
+def parse_service_shell_argv_with_reason(
+    target: str, destination: str, *, review_state: Any = None,
+) -> tuple[list[str] | None, str]:
+    """Compatibility view returning only the admitted argv and refusal prose."""
+    argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
+        target, destination, review_state=review_state,
+    )
+    return argv, reason
 
 
 def parse_service_shell_argv(
