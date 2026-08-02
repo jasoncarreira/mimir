@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 
 import pytest
+from langchain_core.tools import ToolException
 
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
@@ -38,6 +39,7 @@ from mimir.repo_tools import (
     _bounded_subprocess_runner,
     was_agent_push,
 )
+from mimir.tools.refusals import ToolPolicyRefusal
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -357,6 +359,25 @@ def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) ->
         tools.execute(GitRebase())
     assert conflict.value.code == "git_failed"
     assert (state.checkout_lease.path / ".git" / "rebase-merge").is_dir()
+
+    unmerged = tools.execute(GitUnmerged())
+    records = [record for record in unmerged.stdout.split("\x00") if record]
+    assert {record.partition("\t")[2] for record in records} == {"tracked.txt"}
+    assert {
+        record.partition("\t")[0].rsplit(" ", 1)[1]
+        for record in records
+    } == {"1", "2", "3"}
+    status = tools.execute(GitStatus())
+    assert "tracked.txt" in status.stdout
+    assert tools.execute(GitDiff()).ok
+
+    for operation in (
+        GitCommit(("tracked.txt",), "must not commit a conflicted rebase"),
+        GitPush(),
+    ):
+        with pytest.raises(GitRefusal) as mutation:
+            tools.execute(operation)
+        assert mutation.value.code == "git_failed"
 
     assert tools.execute(GitRebaseAbort()).ok
     assert _git(state.checkout_lease.path, "symbolic-ref", "--short", "HEAD") == scope.head_ref
@@ -1437,6 +1458,72 @@ def test_git_execution_os_failure_is_a_named_refusal(repo_tools) -> None:
     with pytest.raises(GitRefusal) as refusal:
         RepoGitTools(state, runner=failed_runner).execute(GitStatus())
     assert refusal.value.code == "git_failed"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "exception_type"),
+    [
+        (ToolPolicyRefusal("scope action denied"), "repository_authorization_refused", ToolPolicyRefusal),
+        (GitRefusal("inactive_checkout", "lease binding missing"), "repository_binding_invalid", ToolPolicyRefusal),
+        (RuntimeError("plain Git invocation failed"), "repository_git_failed", ToolException),
+    ],
+)
+def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
+    repo_tools,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_code: str,
+    exception_type: type[Exception],
+) -> None:
+    from mimir.tools import repo as repo_module
+
+    state = repo_tools[-2]
+    if isinstance(failure, ToolPolicyRefusal):
+        monkeypatch.setattr(repo_module, "_state", lambda *_args: (_ for _ in ()).throw(failure))
+    else:
+        monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+
+        class FailingRepoGitTools:
+            def __init__(self, review_state, *, enforce=True):
+                self.review_state = review_state
+
+            def execute(self, operation):
+                raise failure
+
+        monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)
+
+    with pytest.raises(exception_type) as refusal:
+        repo_module._execute(None, "owner/repo", 7, GitStatus())
+
+    assert f"repository operation rejected ({expected_code})" in str(refusal.value)
+    assert "repository_operation_failed" not in str(refusal.value)
+
+
+def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import repo as repo_module
+
+    secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
+
+    class FailingRepoGitTools:
+        def __init__(self, review_state, *, enforce=True):
+            self.review_state = review_state
+
+        def execute(self, operation):
+            raise GitRefusal("git_failed", f"fatal: unable to access {secret_url}")
+
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: repo_tools[-2])
+    monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)
+
+    with pytest.raises(ToolException) as refusal:
+        repo_module._execute(None, "owner/repo", 7, GitStatus())
+
+    # The wrapper is a second redaction boundary for injected/future runners.
+    rendered = str(refusal.value)
+    assert "repository operation rejected (repository_git_failed)" in rendered
+    assert "super-secret-password" not in rendered
+    assert "https://[REDACTED]@example.invalid/owner/repo.git" in rendered
 
 
 def test_inspection_operation_types_cannot_express_fetch_or_mutation() -> None:
