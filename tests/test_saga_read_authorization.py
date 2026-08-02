@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from mimir.access_control import create_auth_context
+from mimir.access_control import (
+    CapabilityTier,
+    build_trigger_service_principal,
+    builtin_trigger_service_principal,
+    create_auth_context,
+)
 from mimir.models import AgentEvent, AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
@@ -289,7 +294,6 @@ async def test_get_atoms_missing_context_does_not_reveal_legacy_or_private(
     [
         ("scheduled_tick", "scheduler"),
         ("saga_session_end", "synthesis"),
-        ("upgrade", "system"),
     ],
 )
 def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
@@ -330,6 +334,119 @@ def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
     assert legacy in readable_ids
     assert service in readable_ids
     assert private in readable_ids
+
+
+@pytest.mark.parametrize(
+    ("event", "expected_canonical"),
+    [
+        (
+            AgentEvent(
+                trigger="poller",
+                channel_id="poller:new-feed",
+                service_principal="poller:new-feed",
+                service_authority=build_trigger_service_principal(
+                    canonical="poller:new-feed",
+                    trigger="poller",
+                    profile="custom",
+                    tier=CapabilityTier.SCOPE_CONTAINED,
+                    capabilities=(),
+                    creation_path="test",
+                ),
+            ),
+            "poller:new-feed",
+        ),
+        (
+            AgentEvent(
+                trigger="scheduled_tick",
+                channel_id="scheduler:heartbeat",
+                service_principal="heartbeat",
+                service_authority=builtin_trigger_service_principal(
+                    "heartbeat", Path("."),
+                ),
+            ),
+            "heartbeat",
+        ),
+        (
+            AgentEvent(
+                trigger="upgrade",
+                channel_id="upgrade:test",
+                service_principal="system",
+            ),
+            "system",
+        ),
+    ],
+)
+def test_trusted_service_without_corpus_declaration_is_narrow(
+    conn: sqlite3.Connection,
+    event: AgentEvent,
+    expected_canonical: str,
+) -> None:
+    public = _store(conn, "public", owner="other", visibility="public")
+    owned = _store(
+        conn,
+        "owned",
+        owner=f"service:{expected_canonical}",
+        visibility="service",
+    )
+    domain = _store(
+        conn,
+        "domain",
+        owner="service:writer",
+        visibility="service",
+        domain="poller_payload",
+    )
+    foreign = _store(
+        conn,
+        "foreign",
+        owner="user:alice",
+        visibility="private",
+        domain="private",
+    )
+    scope = get_authorization_scope(create_auth_context(event, enforce=True))
+
+    assert scope.is_service is True
+    assert scope.is_platform_service is False
+    assert scope.service_canonical == expected_canonical
+    where, params = authorization_predicate(scope, table="a")
+    readable_ids = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT a.id FROM atoms a WHERE {where}", params,
+        ).fetchall()
+    }
+    assert public in readable_ids
+    assert owned in readable_ids
+    if "poller_payload" in scope.readable_domains:
+        assert domain in readable_ids
+    else:
+        assert domain not in readable_ids
+    assert foreign not in readable_ids
+
+
+def test_full_corpus_scope_follows_declared_principal_not_poller_trigger() -> None:
+    authority = build_trigger_service_principal(
+        canonical="poller:corpus-maintenance",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=(),
+        saga_full_corpus_read=True,
+        creation_path="test",
+    )
+    auth_context = create_auth_context(
+        AgentEvent(
+            trigger="poller",
+            channel_id="poller:corpus-maintenance",
+            service_principal=authority.canonical,
+            service_authority=authority,
+        ),
+        enforce=True,
+    )
+
+    scope = get_authorization_scope(auth_context)
+
+    assert scope.is_service is True
+    assert scope.is_platform_service is True
 
 
 def test_forged_platform_trigger_does_not_widen_read_scope(
