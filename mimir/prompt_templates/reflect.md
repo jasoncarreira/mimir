@@ -42,6 +42,14 @@ profile does not admit the `mimir` CLI; use the report artifacts produced by its
 dedicated in-process scheduled jobs instead. Do not recreate
 `cat`/`head`/`tail`/`sed` reads through `shell_exec`.
 
+The fixed filesystem operation required by this workflow is:
+
+- `read_file memory/core/30-reflection-policy.md`
+
+Core blocks are already rendered into the system prompt, but this explicit read
+is permitted so the workflow can re-anchor to the policy file. Core memory
+remains read-only: every change must use the proposal flow.
+
 Before either track, gather inputs:
 
 - **Introspection report** — read the newest
@@ -76,7 +84,7 @@ Before either track, gather inputs:
   profile deliberately does not admit that general Python entry point. Treat a
   missing exact top-N ranking as an evidence limitation rather than routing
   around the profile.
-- All `memory/core/*.md` files
+- All core-memory blocks already rendered in the system prompt
 - `memory/learnings-pending.md` — candidate behaviors captured by
   `saga_session_end` synthesis turns since last reflection. Promote /
   drop / keep per §B.4.
@@ -132,7 +140,7 @@ architecture stays tight.
 
 ### B.1 — Core memory cleanup
 
-Walk `memory/core/*.md` block by block. For each:
+Walk the core-memory blocks rendered in the system prompt block by block. For each:
 
 - Is this still accurate?
 - Is it still load-bearing — would something break in a turn if it

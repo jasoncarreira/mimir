@@ -3307,7 +3307,11 @@ def _trigger_service_read_target_is_allowed(
     arguments: dict[str, Any] | None,
 ) -> bool:
     """Authorize a service read against its frozen roots, lexically and resolved."""
-    from .read_policy import file_contains_secret, is_operator_secret_read_path
+    from .read_policy import (
+        file_contains_secret,
+        is_core_memory_read_path,
+        is_operator_secret_read_path,
+    )
 
     args = arguments if isinstance(arguments, dict) else {}
     raw = (
@@ -3320,6 +3324,32 @@ def _trigger_service_read_target_is_allowed(
     candidate = Path(raw)
     roots = tuple(Path(root) for root in service.filesystem_read_roots)
     home = os.environ.get("MIMIR_HOME", "").strip()
+    if home:
+        home_root = Path(home).resolve()
+        core_candidate = candidate
+        if not candidate.is_absolute() or not (
+            candidate == home_root or candidate.is_relative_to(home_root)
+        ):
+            core_candidate = home_root / raw.lstrip("/")
+        try:
+            resolved_core_candidate = core_candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            resolved_core_candidate = None
+        if (
+            resolved_core_candidate is not None
+            and is_core_memory_read_path(resolved_core_candidate)
+        ):
+            if _is_trigger_service_protected_read_path(
+                resolved_core_candidate.relative_to(home_root / "memory" / "core")
+            ) or is_operator_secret_read_path(resolved_core_candidate):
+                return False
+            return not (
+                tool_name in {"read_file", "aread"}
+                and (
+                    not resolved_core_candidate.is_file()
+                    or file_contains_secret(resolved_core_candidate)
+                )
+            )
     if home:
         home_candidate = Path(home) / raw.lstrip("/")
         if any(

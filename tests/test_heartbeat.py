@@ -11,7 +11,11 @@ import re
 from pathlib import Path
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
+from mimir.access_control import (
+    ToolRegistry,
+    builtin_trigger_service_principal,
+    get_service_principal,
+)
 from mimir.cli import (
     DEFAULT_HEARTBEAT_BACKLOG,
     DEFAULT_HEARTBEAT_PATTERNS,
@@ -58,90 +62,125 @@ def test_heartbeat_prompt_template_has_required_sections():
     assert "git-commit any uncommitted memory work" not in body
 
 
-def test_heartbeat_required_filesystem_operations_are_permitted(
+def test_prompt_template_required_filesystem_operations_are_permitted(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """Execute the prompt's declared housekeeping operations through both gates."""
-    template = (
-        Path(__file__).parent.parent
-        / "mimir"
-        / "prompt_templates"
-        / "heartbeat.md"
-    ).read_text()
-    operations = re.findall(
-        r"^- `([a-z_]+) ([^`]+)`$", template, flags=re.MULTILINE,
+    """Execute every prompt's declared filesystem operations through real gates."""
+    template_dir = Path(__file__).parent.parent / "mimir" / "prompt_templates"
+    operation_pattern = re.compile(
+        r"^- `([a-z_]+) ([^`]+)`$", flags=re.MULTILINE,
     )
-    assert operations, "heartbeat prompt must declare its required file operations"
+    filesystem_tool_pattern = re.compile(
+        r"`(?:read_file|write_file|edit_file|ls|glob|grep|file_search)`"
+    )
+    templates = {
+        path.name: path.read_text()
+        for path in template_dir.glob("*.md")
+        if filesystem_tool_pattern.search(path.read_text())
+    }
+    declared_operations = {
+        name: operation_pattern.findall(template)
+        for name, template in templates.items()
+    }
+    assert all(declared_operations.values()), (
+        "every prompt template that names a filesystem tool must declare its "
+        f"required operations: {declared_operations}"
+    )
 
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)
+    (home / "state" / "audit").mkdir()
     (home / "memory" / "core").mkdir(parents=True)
     (home / "memory" / "channels" / "scheduler:heartbeat").mkdir(parents=True)
     (home / "state" / "heartbeat-backlog.md").write_text("# Backlog\n")
     (home / "memory" / "core" / "50-heartbeat-patterns.md").write_text("# Core\n")
+    (home / "memory" / "core" / "30-reflection-policy.md").write_text("# Policy\n")
+    (home / "memory" / "core" / "60-filing-rules.md").write_text("# Filing\n")
+    (home / "state" / "audit" / "issues-audit-cursor.md").write_text("start\n")
+    upgrade_worktree = home / "scratch" / "proposals" / "upgrade-test"
+    (upgrade_worktree / "memory" / "core").mkdir(parents=True)
+    (upgrade_worktree / "memory" / "core" / "30-reflection-policy.md").write_text(
+        "# Proposed policy\n"
+    )
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    authority = builtin_trigger_service_principal("heartbeat", home)
     labels = InformationFlowLabels()
-    auth = AuthContext(
-        principal="service:heartbeat",
-        canonical_principal="heartbeat",
-        roles=("service",),
-        event_ingress=None,
-        trigger="scheduled_tick",
-        channel_id="scheduler:heartbeat",
-        interactivity=None,
-        is_service=True,
-        service_authority=authority,
-        enforcement_enabled=True,
-        ifc_labels=labels,
-    )
-    turn = TurnContext(
-        turn_id="heartbeat-policy-test",
-        session_id="scheduler:heartbeat",
-        trigger="scheduled_tick",
-        channel_id="scheduler:heartbeat",
-        started_at=0.0,
-        auth_context=auth,
-        ifc_labels=labels,
-    )
     backend = WriteGuardBackend(
-        root_dir=home, writable_dirs=["state", "memory"],
+        root_dir=home, writable_dirs=["state", "memory", "scratch"],
     )
     registry = ToolRegistry()
-    token = set_current_turn(turn)
-    try:
-        for operation, declared_path in operations:
-            relative_path = declared_path.replace(
-                "<timestamp>", "2026-08-02-120000",
-            )
-            absolute_path = str(home / relative_path)
-            if operation == "read_file":
-                decision = registry.authorize_tool(
-                    operation,
-                    auth,
-                    enforce=True,
-                    arguments={"file_path": absolute_path},
+    for template_name, operations in declared_operations.items():
+        if template_name == "upgrade.md":
+            authority = get_service_principal("upgrade")
+            trigger = "upgrade"
+            channel = "system:upgrade"
+        else:
+            authority = builtin_trigger_service_principal("heartbeat", home)
+            trigger = "scheduled_tick"
+            channel = f"scheduler:{Path(template_name).stem}"
+        assert authority is not None
+        auth = AuthContext(
+            principal=f"service:{authority.canonical}",
+            canonical_principal=authority.canonical,
+            roles=("service",),
+            event_ingress=None,
+            trigger=trigger,
+            channel_id=channel,
+            interactivity=None,
+            is_service=True,
+            service_authority=authority,
+            enforcement_enabled=True,
+            ifc_labels=labels,
+        )
+        turn = TurnContext(
+            turn_id=f"{Path(template_name).stem}-policy-test",
+            session_id=channel,
+            trigger=trigger,
+            channel_id=channel,
+            started_at=0.0,
+            auth_context=auth,
+            ifc_labels=labels,
+        )
+        token = set_current_turn(turn)
+        try:
+            for operation, declared_path in operations:
+                relative_path = declared_path.replace(
+                    "<timestamp>", "2026-08-02-120000",
+                ).replace(
+                    "{worktree}", "scratch/proposals/upgrade-test",
                 )
-                result = backend.read(relative_path)
-            elif operation == "write_file":
-                decision = registry.authorize_tool(
-                    operation,
-                    auth,
-                    enforce=True,
-                    target_channel=absolute_path,
+                absolute_path = str(home / relative_path)
+                if operation == "read_file":
+                    decision = registry.authorize_tool(
+                        operation,
+                        auth,
+                        enforce=True,
+                        arguments={"file_path": absolute_path},
+                    )
+                    result = backend.read(relative_path)
+                elif operation == "write_file":
+                    decision = registry.authorize_tool(
+                        operation,
+                        auth,
+                        enforce=True,
+                        target_channel=absolute_path,
+                    )
+                    result = backend.write(relative_path, "observation\n")
+                else:
+                    raise AssertionError(
+                        f"test does not drive declared operation {operation!r} "
+                        f"from {template_name}"
+                    )
+                assert decision.allowed is True, (
+                    template_name, operation, relative_path, decision.reason,
                 )
-                result = backend.write(relative_path, "observation\n")
-            else:
-                raise AssertionError(
-                    f"test does not drive declared heartbeat operation {operation!r}"
+                assert not getattr(result, "error", None), (
+                    template_name, operation, relative_path, result,
                 )
-            assert decision.allowed is True, (operation, relative_path, decision.reason)
-            assert not getattr(result, "error", None), (operation, relative_path, result)
+        finally:
+            reset_current_turn(token)
 
-        assert backend.drain_denials() == []
-    finally:
-        reset_current_turn(token)
+    assert backend.drain_denials() == []
 
     # The observation sink does not weaken the independent core write gate.
     core_turn = TurnContext(

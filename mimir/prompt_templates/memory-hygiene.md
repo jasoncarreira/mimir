@@ -21,6 +21,13 @@ The scheduled-maintenance shell profile does not admit arbitrary interpreters,
 pipelines, redirects, `&&`, or globs. Use `ls`, `glob`, `grep`, `read_file`, and
 `file_search` for this scan rather than translating it to `shell_exec`.
 
+The fixed filesystem operation required by this workflow is:
+
+- `read_file memory/core/60-filing-rules.md`
+
+Use that read only to apply the filing rules. Core memory remains read-only;
+route any proposed correction through the protected-surface proposal flow.
+
 Run cheap scans first; avoid reading the whole tree unless a candidate
 actually needs inspection.
 
