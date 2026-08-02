@@ -2905,6 +2905,31 @@ def _service_shell_command_shape(argv: list[str]) -> str:
     return " ".join(shape)
 
 
+def _service_shell_typed_tool_guidance(
+    argv: list[str], destination: str,
+) -> str:
+    """Name bounded tools for observed commands that must stay outside the shell."""
+    if destination != "repo_review":
+        return ""
+    if argv[:2] in (["npm", "run"], ["npm", "test"]):
+        return (
+            " Repository scripts must run through the typed repo_test tool, "
+            "which uses the deployment-configured test command in the bound PR "
+            "checkout; shell_exec does not admit npm run or npm test."
+        )
+    if (
+        len(argv) >= 2
+        and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(argv[0]).name)
+        and argv[1] == "-c"
+    ):
+        return (
+            " Inline python -c is arbitrary code execution and remains denied. "
+            "Use the typed read_file or grep tool for repository inspection, or "
+            "repo_test for the deployment-configured test command."
+        )
+    return ""
+
+
 def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str:
     """Explain that a well-formed command is outside the profile's allowlist."""
     supplied = [token for token in argv[1:] if token.startswith("-")]
@@ -2953,12 +2978,13 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
         )
     else:
         boundary = admitted = ""
+    guidance = _service_shell_typed_tool_guidance(argv, destination)
     return (
         f"the {destination!r} trusted-service shell profile does not admit "
         f"{_service_shell_command_shape(argv)!r}.{option_text} This profile "
         "admits a fixed set of commands, subcommands and options; anything "
         "outside it is refused for this principal regardless of how it is "
-        f"written.{boundary}{admitted}"
+        f"written.{boundary}{admitted}{guidance}"
     )
 
 
@@ -2985,10 +3011,16 @@ def parse_service_shell_argv_with_diagnostics(
     found = sorted(set(target) & _SHELL_CONTROL_CHARACTERS)
     if found:
         rendered = ", ".join(repr(character) for character in found)
+        try:
+            refused_argv = shlex.split(target)
+        except ValueError:
+            refused_argv = []
+        guidance = _service_shell_typed_tool_guidance(refused_argv, destination)
         return None, (
             f"the command contains shell metacharacters ({rendered}), which the "
             f"{destination!r} trusted-service shell profile never admits. "
             + _SHELL_PROFILE_SINGLE_ARGV_HINT
+            + guidance
         ), ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
     try:
         argv = shlex.split(target)

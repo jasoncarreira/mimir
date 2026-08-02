@@ -2384,6 +2384,40 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
     assert "shell=False" in reason              # why no rewrite can work
 
 
+@pytest.mark.parametrize(
+    ("command", "binding_rule", "expected_guidance"),
+    [
+        (
+            "npm run",
+            access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            "typed repo_test tool",
+        ),
+        (
+            "python -c 'import json; print(json.dumps({}))'",
+            access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            "typed read_file or grep tool",
+        ),
+    ],
+)
+def test_repo_review_observed_code_execution_refusals_name_typed_tools(
+    command: str,
+    binding_rule: access_control.ServiceShellBindingRule,
+    expected_guidance: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Observed review-turn npm and inline Python attempts stay refused usefully."""
+    monkeypatch.delenv("MIMIR_PROJECT_TEST_COMMAND", raising=False)
+
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command, "repo_review",
+    )
+
+    assert argv is None
+    assert rule is binding_rule
+    assert expected_guidance in reason
+    assert "repo_test" in reason
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enforce", [False, True])
 async def test_refused_service_shell_returns_the_reason_and_executes_nothing(
