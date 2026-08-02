@@ -19,6 +19,7 @@ from mimir.saga.triples import (
     resolve_contradictions_to_supersedes,
     retrieve_by_entity,
     store_triples,
+    top_triples_with_payload,
     triple_augment_search,
 )
 
@@ -256,6 +257,78 @@ def test_store_triples_dedup_reassertion_only_narrows_acl(conn):
 
     store_triples(conn, [triple], source_atom_id="public", evidence_ids=["public"])
     assert conn.execute("SELECT visibility FROM triples").fetchone()[0] == "private"
+
+
+def test_dedup_narrowed_triple_is_hidden_from_wider_source_reader(conn):
+    _seed_atom(
+        conn, "alice-source", "Alice source", owner="alice",
+        domain="tenant:one", visibility="private", provenance={"alice": True},
+    )
+    _seed_atom(
+        conn, "bob-source", "Bob source", owner="bob",
+        domain="tenant:two", visibility="private", provenance={"bob": True},
+    )
+    triple = {"subject": "Project", "predicate": "status", "object": "secret"}
+    embed_fn = _stub_embed([1.0, 0.0, 0.0, 0.0])
+
+    store_triples(
+        conn, [triple], source_atom_id="alice-source",
+        evidence_ids=["alice-source"], embed_fn=embed_fn,
+    )
+    store_triples(
+        conn, [triple], source_atom_id="bob-source", evidence_ids=["bob-source"],
+    )
+
+    assert conn.execute(
+        "SELECT source_atom_id, owner_principal, visibility FROM triples"
+    ).fetchone() == ("alice-source", "legacy_admin", "legacy_admin")
+    alice = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=(),
+        event_ingress=None,
+        trigger="test",
+        channel_id=None,
+        interactivity=None,
+    )
+    assert triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], auth_context=alice,
+    ) == []
+    assert top_triples_with_payload(
+        conn, [1.0, 0.0, 0.0, 0.0], auth_context=alice,
+    ) == []
+    assert retrieve_by_entity(conn, "Project", auth_context=alice) == []
+
+
+def test_triple_reads_preserve_matching_source_acl_behavior(conn):
+    _seed_atom(
+        conn, "alice-source", "Alice source", owner="alice",
+        domain="tenant:one", visibility="private", provenance={"alice": True},
+    )
+    store_triples(
+        conn,
+        [{"subject": "Project", "predicate": "status", "object": "active"}],
+        source_atom_id="alice-source",
+        evidence_ids=["alice-source"],
+        embed_fn=_stub_embed([1.0, 0.0, 0.0, 0.0]),
+    )
+    alice = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=(),
+        event_ingress=None,
+        trigger="test",
+        channel_id=None,
+        interactivity=None,
+    )
+
+    assert triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], auth_context=alice,
+    )
+    assert top_triples_with_payload(
+        conn, [1.0, 0.0, 0.0, 0.0], auth_context=alice,
+    )
+    assert retrieve_by_entity(conn, "Project", auth_context=alice)
 
 
 # ─── World state ─────────────────────────────────────────────────────

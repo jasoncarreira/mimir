@@ -584,6 +584,27 @@ def get_history(
 # ─── Retrieval: triple_augment_v2 pathway ────────────────────────────
 
 
+def _triple_read_authorization_predicate(
+    auth_context: Any,
+) -> tuple[str, list]:
+    """Authorize a triple against both its source atom and stored ACL.
+
+    The stored triple ACL is an enforced attenuation boundary: deduplication
+    may narrow it below the original source atom's ACL. Requiring both SQL
+    predicates keeps reads no wider than either resource and handles the
+    fail-closed ``legacy_admin`` sentinel without a source-only fallback.
+    """
+    from .ownership import authorization_predicate, get_authorization_scope
+
+    auth_scope = get_authorization_scope(auth_context)
+    source_where, source_params = authorization_predicate(auth_scope, table="a")
+    triple_where, triple_params = authorization_predicate(auth_scope, table="t")
+    return (
+        f"({source_where}) AND ({triple_where})",
+        [*source_params, *triple_params],
+    )
+
+
 def _cosine_scores(
     query_emb: list[float],
     blobs_dims: list[tuple[bytes | None, int | None]],
@@ -670,23 +691,13 @@ def triple_augment_search(
     expiry filter. Expired triples (valid_until ≤ reference_date) are
     excluded from the candidate set — they represent superseded facts
 
-    Authorization: This function authorizes on the source atom's ACL (joined
-    via t.source_atom_id = a.id), not the triple's own ACL columns. The
-    triple table maintains ACL columns for potential future narrow-granularity
-    access control, but currently the read path derives authorization from
-    the source atom's ownership. This means a triple is accessible if the
-    user can read its source atom, regardless of the triple's own owner_principal.
-    and should not surface in retrieval. Defaults to utcnow when None.
+    Authorization is the intersection of the joined source atom's ACL and the
+    triple's stored ACL. The latter is enforced because deduplication can narrow
+    a triple below its original source.
 
-    chainlink #883: authorization filters triples based on source atom ownership.
+    chainlinks #883/#1117: authorization filters on both ownership boundaries.
     """
-    from .ownership import (
-        authorization_predicate,
-        get_authorization_scope,
-    )
-
-    auth_scope = get_authorization_scope(auth_context)
-    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
 
     ref_iso = (
         reference_date.isoformat()
@@ -750,18 +761,12 @@ def top_triples_with_payload(
     key ``include_triples_in_response`` claims: "Filters out triples
     whose valid_until has expired."
 
-    Authorization: See ``triple_augment_search`` — authorizes on the source
-    atom's ACL, not the triple's own ACL columns.
+    Authorization: See ``triple_augment_search``; both the source atom ACL and
+    the triple's stored ACL must authorize the caller.
 
-    chainlink #883: authorization filters triples based on source atom ownership.
+    chainlinks #883/#1117: authorization filters on both ownership boundaries.
     """
-    from .ownership import (
-        authorization_predicate,
-        get_authorization_scope,
-    )
-
-    auth_scope = get_authorization_scope(auth_context)
-    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
 
     ref_iso = (
         reference_date.isoformat()
@@ -836,18 +841,12 @@ def retrieve_by_entity(
     probes ("what did the user say about Alice?") where the query
     *names* the entity and we can skip the embedding path.
 
-    chainlink #883: authorization filters triples based on source atom ownership.
+    chainlinks #883/#1117: authorization filters on both ownership boundaries.
 
-    Authorization: See ``triple_augment_search`` — authorizes on the source
-    atom's ACL, not the triple's own ACL columns.
+    Authorization: See ``triple_augment_search``; both the source atom ACL and
+    the triple's stored ACL must authorize the caller.
     """
-    from .ownership import (
-        authorization_predicate,
-        get_authorization_scope,
-    )
-
-    auth_scope = get_authorization_scope(auth_context)
-    auth_where, auth_params = authorization_predicate(auth_scope, table="a")
+    auth_where, auth_params = _triple_read_authorization_predicate(auth_context)
 
     pat = f"%{escape_like_pattern(entity)}%"
     rows = conn.execute(
