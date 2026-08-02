@@ -2005,7 +2005,13 @@ def test_attempt_cleanup_alerts_on_empty_preview_without_executing(
 
     monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
     alert = _lifecycle_alert(run_dir)
-    assert poller._attempt_cleanup(tmp_path, state_dir, [alert]) == [alert]
+    failures = poller._attempt_cleanup(tmp_path, state_dir, [alert])
+    assert len(failures) == 1
+    assert failures[0].signal == "worklink_factory_cleanup_failed"
+    assert failures[0].status == "failed"
+    assert failures[0].reason == (
+        "Factory cleanup preview did not mark run chainlink-100 eligible"
+    )
     assert calls == [(tmp_path, True, None)]
     entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
     assert not entry.cleaned and not entry.tombstone
@@ -2030,9 +2036,70 @@ def test_attempt_cleanup_requires_execute_to_report_run_deleted(
 
     monkeypatch.setattr(poller, "_run_factory_cleanup", fake_cleanup)
     alert = _lifecycle_alert(run_dir)
-    assert poller._attempt_cleanup(tmp_path, state_dir, [alert]) == [alert]
+    failures = poller._attempt_cleanup(tmp_path, state_dir, [alert])
+    assert len(failures) == 1
+    assert failures[0].reason == (
+        "Factory cleanup execution did not report run chainlink-100 deleted"
+    )
     entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
     assert not entry.cleaned and not entry.tombstone
+
+
+def test_cleanup_failure_has_reason_and_repeated_failure_escalates_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import poller
+
+    state_dir = tmp_path / "state"
+    run_dir = tmp_path / ".opencode" / "factory" / "chainlink-100"
+    run_dir.mkdir(parents=True)
+    observation = poller.FactoryRunObservation(
+        run_id="chainlink-100",
+        issue_id=100,
+        attempt=None,
+        physical_path=run_dir,
+        status="completed",
+        pr_url=PR_URL,
+        reason=None,
+        summary=None,
+        pending_gate=None,
+        is_terminal=True,
+        is_stale=True,
+        validator_verdict="GO",
+        security_verdict="PASS",
+        terminal_result=None,
+        liveness_class="stale",
+        validity_class="valid",
+    )
+    monkeypatch.setattr(
+        poller,
+        "_discover_factory_runs",
+        lambda repo: [(tmp_path, run_dir, "chainlink-100")],
+    )
+    monkeypatch.setattr(poller, "_observe_factory_run", lambda root, run_id: observation)
+    monkeypatch.setattr(poller, "_is_pr_merged", lambda pr_url, repo: True)
+    monkeypatch.setattr(
+        poller,
+        "_run_factory_cleanup",
+        lambda worktree, dry_run=True, *, digest=None: (False, "", None),
+    )
+
+    first = poller._run_lifecycle_reconciliation(tmp_path, state_dir)
+    assert len(first) == 1
+    assert first[0].signal == "worklink_factory_cleanup_failed"
+    assert first[0].status == "failed"
+    assert first[0].reason == "Factory cleanup preview failed without a reason"
+    assert "None" not in first[0].reason
+
+    second = poller._run_lifecycle_reconciliation(tmp_path, state_dir)
+    assert len(second) == 1
+    assert second[0].signal == "worklink_factory_cleanup_failure_escalated"
+    assert second[0].reason == first[0].reason
+
+    assert poller._run_lifecycle_reconciliation(tmp_path, state_dir) == []
+    entry = poller._load_cursor(state_dir).entries[f"chainlink-100:{run_dir}"]
+    assert entry.cleanup_failure_count == 3
+    assert entry.cleanup_failure_escalated
 
 
 def test_reconcile_cleanup_and_staleness_predicates(
