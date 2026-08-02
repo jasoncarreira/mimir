@@ -230,7 +230,11 @@ def test_fallback_system_prompt_includes_create_only_write_guidance(
 
     prompt = agent._build_system_prompt()
 
-    assert prompt == _DEFAULT_SYSTEM_PROMPT
+    # Containment, not equality: under MIMIR_ACCESS_CONTROL_ENFORCED the agent
+    # appends the declassification guidance block (mimir/prompts.py), so the
+    # fallback prompt is the default PLUS that block. This test is about the
+    # create-only guidance being present, which holds in both modes.
+    assert _DEFAULT_SYSTEM_PROMPT in prompt
     assert (
         "`write_file` creates a new file only. It never overwrites an existing path; "
         "when the target exists, use `edit_file` instead."

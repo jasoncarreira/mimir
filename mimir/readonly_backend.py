@@ -184,9 +184,24 @@ def _exclusive_write(
                 return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
             raise
 
-        with os.fdopen(final_fd, "w", encoding="utf-8", newline="") as handle:
-            final_fd = None
-            handle.write(content)
+        try:
+            with os.fdopen(final_fd, "w", encoding="utf-8", newline="") as handle:
+                final_fd = None
+                handle.write(content)
+        except BaseException:
+            # ``O_CREAT | O_EXCL`` already created the destination, so a failure
+            # during the write leaves an empty or partial file behind. Because
+            # ``write_file`` is create-only, that turns a transient encoding or
+            # I/O error into a PERMANENT collision: the corrected retry gets
+            # FileExistsError and is told to use ``edit_file`` instead, against
+            # content the model never successfully wrote. Unlink through the
+            # same ``dir_fd`` used to create it, so cleanup cannot be redirected
+            # by a symlink swapped in after the open.
+            try:
+                os.unlink(parts[-1], dir_fd=opened[-1])
+            except OSError:
+                pass
+            raise
         return WriteResult(path=file_path)
     except NotImplementedError:
         return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)

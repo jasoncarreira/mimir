@@ -513,7 +513,30 @@ class TestCreateOnlyWrites:
         assert "surrogates not allowed" in result.error
         assert f"'{target}'" not in result.error
         assert type(result.error) is str
-        assert target.exists()
+        assert not target.exists()  # a failed create must not consume the path
+
+    def test_failed_create_leaves_path_free_for_a_corrected_retry(
+        self, home: Path,
+    ) -> None:
+        """A failed create-only write must not turn into a permanent collision.
+
+        ``_exclusive_write`` opens with ``O_CREAT | O_EXCL``, so the destination
+        exists before the content is written. If the write then fails and the
+        file is left behind, the corrected retry hits FileExistsError and is
+        told to use ``edit_file`` on content that was never written -- a
+        transient encoding error becoming permanent.
+        """
+        target = home / "state" / "retry-after-failure.txt"
+        backend = WriteGuardBackend(home, ["state"])
+
+        failed = backend.write(str(target), "\ud800")
+        assert failed.error is not None
+        assert not target.exists()
+
+        retried = backend.write(str(target), "corrected content")
+
+        assert not getattr(retried, "error", None), retried
+        assert target.read_text(encoding="utf-8") == "corrected content"
 
     @pytest.mark.asyncio
     async def test_routed_sync_and_async_write_failures_name_original_requests(
@@ -541,8 +564,8 @@ class TestCreateOnlyWrites:
             assert "surrogates not allowed" in result.error
             assert f"'{stripped}'" not in result.error
             assert type(result.error) is str
-        assert Path(sync_path).exists()
-        assert Path(async_path).exists()
+        assert not Path(sync_path).exists()  # failed creates leave no destination
+        assert not Path(async_path).exists()
 
     @pytest.mark.parametrize("depth", [0, 1, 2])
     def test_intermediate_symlink_at_every_depth_is_refused(
