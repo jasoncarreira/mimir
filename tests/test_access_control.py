@@ -2097,8 +2097,12 @@ def test_service_shell_final_binding_refusal_emits_hard_denial(
     # the reason it was refused. Forcing a binding failure means returning both.
     monkeypatch.setattr(
         budget_gate,
-        "parse_service_shell_argv_with_reason",
-        lambda *_args: (None, "forced binding failure"),
+        "parse_service_shell_argv_with_diagnostics",
+        lambda *_args, **_kwargs: (
+            None,
+            "forced binding failure",
+            budget_gate.ServiceShellBindingRule.PROFILE_ALLOWLIST,
+        ),
     )
     monkeypatch.setattr(
         budget_gate,
@@ -2119,10 +2123,34 @@ def test_service_shell_final_binding_refusal_emits_hard_denial(
         "tool": "shell_exec",
         "boundary": "service_shell_argv_binding",
         "reason": "service_shell_argv_binding_failed",
-        "target": "gh pr view 7 --repo o/r --json token=[REDACTED]",
+        "target": None,
         "trigger": "scheduled_tick",
         "service_principal": "scheduler",
+        "argv": [
+            "gh", "pr", "view", "7", "--repo", "o/r", "--json",
+            "token=[REDACTED]",
+        ],
+        "argv_truncated": False,
+        "shell_profile": "maintenance",
+        "binding_rule": "profile_allowlist",
     }
+
+
+def test_service_shell_denial_argv_redaction_and_truncation() -> None:
+    from mimir.access_control import service_shell_argv_for_log
+
+    argv, truncated = service_shell_argv_for_log(
+        "gh api --token opaque-value -HAuthorization:opaque "
+        + " ".join(f"argument-{index}" for index in range(40))
+    )
+
+    assert argv[:5] == [
+        "gh", "api", "--token", "[REDACTED]", "-H[REDACTED]",
+    ]
+    assert "opaque-value" not in repr(argv)
+    assert "Authorization:opaque" not in repr(argv)
+    assert argv[-1] == "[TRUNCATED]"
+    assert truncated is True
 
 
 @pytest.mark.asyncio

@@ -62,8 +62,10 @@ from ..access_control import (
     get_tool_registry,
     get_trusted_service_from_auth_context,
     normalize_sink_destination,
-    parse_service_shell_argv_with_reason,
+    parse_service_shell_argv_with_diagnostics,
     resolve_repository_review_state,
+    ServiceShellBindingRule,
+    service_shell_argv_for_log,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 from .web_search_destination import web_search_url
@@ -225,6 +227,7 @@ def _emit_hard_boundary_denied(
     target: Any = None,
     auth_context: AuthContext | None = None,
     turn_context: Any | None = None,
+    event_fields: dict[str, Any] | None = None,
 ) -> None:
     """Record an action that an always-on boundary actually refused."""
     active_turn = turn_context or _get_current_turn_context()
@@ -245,19 +248,24 @@ def _emit_hard_boundary_denied(
     from ..redaction import redact_payload
 
     service = get_trusted_service_from_auth_context(auth_context)
-    _emit_event_sync(
-        "hard_boundary_denied",
-        tool=tool,
-        boundary=boundary,
-        reason=reason,
+    payload = {
+        "tool": tool,
+        "boundary": boundary,
+        "reason": reason,
         # Pre-scrub for replaced emitters and other pre-persistence consumers.
-        target=redact_payload(target),
-        trigger=(
+        "target": redact_payload(target),
+        "trigger": (
             getattr(auth_context, "origin_trigger", None)
             or getattr(auth_context, "trigger", None)
             or getattr(turn_context, "trigger", None)
         ),
-        service_principal=service.canonical if service is not None else None,
+        "service_principal": service.canonical if service is not None else None,
+    }
+    if event_fields:
+        payload.update(redact_payload(event_fields))
+    _emit_event_sync(
+        "hard_boundary_denied",
+        **payload,
     )
 
 
@@ -650,7 +658,7 @@ def _request_for_authorized_execution(
         review_state, state_refusal = resolve_repository_review_state(
             auth_context, command=target, cwd=args.get("cwd"),
         )
-        argv, refusal = parse_service_shell_argv_with_reason(
+        argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
             target,
             policy.destination,
             review_state=review_state,
@@ -658,21 +666,24 @@ def _request_for_authorized_execution(
         if state_refusal is not None:
             argv = None
             refusal = state_refusal
+            binding_rule = ServiceShellBindingRule.REPOSITORY_REVIEW_STATE
     else:
-        argv, refusal = parse_service_shell_argv_with_reason(
+        argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
             target, policy.destination,
         )
     if argv is None:
+        refused_argv, argv_truncated = service_shell_argv_for_log(target)
         # The authorization adapter already admitted this call. Failing to bind
         # a direct argv here must not fall back to the original ``bash -lc``
         # surface if a config probe races, times out, or otherwise changes.
         #
         # Log under a distinct fingerprint so the cause stays greppable for an
-        # operator, naming the profile and the rejected command.
+        # operator, naming the profile and stable rejecting rule. The command is
+        # represented only by the separately redacted argv used by the event.
         log.error(
-            "service_shell_argv_binding_failed profile=%s command=%r",
+            "service_shell_argv_binding_failed profile=%s binding_rule=%s",
             policy.destination,
-            target[:200],
+            binding_rule,
         )
         # Record it for the audit stream: this boundary fails closed whether or
         # not enforcement is on, so without an event the refusal is invisible to
@@ -681,8 +692,14 @@ def _request_for_authorized_execution(
             tool=tool_name,
             boundary="service_shell_argv_binding",
             reason="service_shell_argv_binding_failed",
-            target=target,
+            target=None,
             auth_context=auth_context,
+            event_fields={
+                "argv": refused_argv,
+                "argv_truncated": argv_truncated,
+                "shell_profile": policy.destination,
+                "binding_rule": binding_rule,
+            },
         )
         # ...and tell the CALLER why, in the tool result. Binding
         # ``/usr/bin/false`` alone made every refusal look identical — it ignores
