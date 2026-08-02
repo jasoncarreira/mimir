@@ -365,7 +365,7 @@ def recall(
                 conn, "atom", "atoms", live_candidate_ids
             )
         except Exception:  # noqa: BLE001 - shadow evaluation is telemetry
-            pass
+            read_authorization.observe_probe_failure()
     if not candidate_ids:
         if owns_read_authorization:
             read_authorization.finalize()

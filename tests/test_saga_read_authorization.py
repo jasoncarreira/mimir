@@ -337,7 +337,8 @@ def test_shadow_recall_reports_pre_rrf_candidate_exclusions(
     assert payload["reason"] == "saga_read_policy_would_exclude_candidates"
     assert payload["observation_stage"] == "pre_rrf_candidates"
     assert payload["risk_direction"] == "over_serving"
-    assert payload["resource_counts"] == {"atom": 1}
+    assert payload["resource_counts"] == {"recall": 1}
+    assert payload["resource_type_counts"] == {"recall": {"atom": 1}}
     assert payload["principal"] == "user:alice"
     assert payload["trigger"] == "user_message"
     assert payload["event_ingress"] == "discord"
@@ -348,13 +349,14 @@ def test_shadow_recall_reports_pre_rrf_candidate_exclusions(
     assert visible not in serialized
 
 
-def test_shadow_read_events_are_bounded_to_one_per_turn(
+def test_shadow_read_events_aggregate_all_surfaces_once_per_turn(
     conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from types import SimpleNamespace
 
     hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+    hidden_two = _store(conn, "hidden two", owner="user:bob", visibility="private")
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "mimir.event_logger.log_event_sync",
@@ -372,18 +374,30 @@ def test_shadow_read_events_are_bounded_to_one_per_turn(
     )
     token = set_current_turn(SimpleNamespace(turn_id="turn-shadow-bounded"))
     try:
-        for surface in ("query", "get_atoms"):
-            authorization = SagaReadAuthorization(auth_context, surface)
-            authorization.observe_selected(conn, "atom", "atoms", [hidden])
-            authorization.finalize()
+        query_authorization = SagaReadAuthorization(auth_context, "query")
+        query_authorization.observe_selected(conn, "atom", "atoms", [hidden])
+        query_authorization.finalize()
+        get_authorization = SagaReadAuthorization(auth_context, "get_atoms")
+        get_authorization.observe_selected(
+            conn, "atom", "atoms", [hidden, hidden_two]
+        )
+        get_authorization.finalize()
+        assert events == []
     finally:
         reset_current_turn(token)
 
     assert len(events) == 1
     _, payload = events[0]
     assert payload["turn_id"] == "turn-shadow-bounded"
-    assert payload["aggregation"] == "max_one_event_per_turn"
-    assert payload["sampling"] == "first_shadow_read_with_exclusions"
+    assert payload["surface"] == "multiple"
+    assert payload["surfaces"] == ["get_atoms", "query"]
+    assert payload["resource_counts"] == {"get_atoms": 2, "query": 1}
+    assert payload["resource_type_counts"] == {
+        "get_atoms": {"atom": 2},
+        "query": {"atom": 1},
+    }
+    assert payload["aggregation"] == "one_event_per_turn_by_surface"
+    assert payload["sampling"] == "none"
 
 
 def test_session_boundary_expansion_binds_authorization_before_limit(
@@ -1012,7 +1026,8 @@ async def test_query_shadow_read_emits_one_bounded_non_sensitive_event(
     assert payload["enforcement_enabled"] is False
     assert payload["is_shadow_decision"] is True
     assert payload["would_block"] is True
-    assert payload["resource_counts"] == {"atom": 1}
+    assert payload["resource_counts"] == {"query": 1}
+    assert payload["resource_type_counts"] == {"query": {"atom": 1}}
     serialized = repr(payload).lower()
     for sensitive in (hidden.lower(), "shadow-only-memory", "sensitive-channel"):
         assert sensitive not in serialized
@@ -1067,17 +1082,30 @@ async def test_shadow_event_logger_failure_does_not_change_read(
 
 
 @pytest.mark.asyncio
-async def test_shadow_policy_probe_failure_does_not_change_read(
+async def test_shadow_policy_probe_failure_is_reported_without_changing_read(
     conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     hidden = _store(conn, "hidden", owner="user:bob", visibility="private")
+    events: list[tuple[str, dict]] = []
 
     def fail_probe(_self, _table: str):
         raise sqlite3.OperationalError("strict probe unavailable")
 
     monkeypatch.setattr(SagaReadAuthorization, "strict_predicate", fail_probe)
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
 
     payload = await SagaStore(conn=conn, embedding_dim=4).get_atoms([hidden])
 
     assert [atom["id"] for atom in payload["atoms"]] == [hidden]
+    assert len(events) == 1
+    event_type, event = events[0]
+    assert event_type == "saga_read_would_block"
+    assert event["status"] == "probe_failed"
+    assert event["would_block"] is False
+    assert event["resource_count"] == 0
+    assert event["probe_failure_count"] == 1
+    assert event["probe_failure_counts"] == {"get_atoms": 1}

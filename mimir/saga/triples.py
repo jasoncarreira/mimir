@@ -998,7 +998,7 @@ def detect_contradictions(
                 },
             )
         except Exception:  # noqa: BLE001 - shadow evaluation is telemetry
-            pass
+            read_authorization.observe_probe_failure()
     read_authorization.finalize()
     return result
 
