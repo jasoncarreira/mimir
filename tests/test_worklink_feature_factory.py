@@ -966,6 +966,11 @@ def _drive(
             return _cp()
         if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
             return _cp(stdout="abc123\n")
+        if args in (
+            ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"],
+            ["git", "-C", str(worktree), "remote", "get-url", "--push", "origin"],
+        ):
+            return _cp(stdout="git@github.com:o/r.git\n")
         if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
             return _cp(stdout=f"{worktree}\n")
         if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:

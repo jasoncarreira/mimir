@@ -239,6 +239,11 @@ def _isolated_checkout_result(
         return cp(args)
     if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
         return cp(args, stdout="abc123\n")
+    if args in (
+        ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"],
+        ["git", "-C", str(checkout), "remote", "get-url", "--push", "origin"],
+    ):
+        return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
     if args == ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"]:
         return cp(args, stdout=f"{checkout}\n")
     if args == ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"]:
