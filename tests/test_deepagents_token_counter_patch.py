@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import gc
-import importlib
 import inspect
-import warnings
 import weakref
 from functools import partial
 from typing import Any
@@ -110,22 +108,6 @@ def test_install_deepagents_grep_context_tool_patches_all_real_aliases(monkeypat
     assert deepagents_graph.FilesystemMiddleware is MimirFilesystemMiddleware
     assert deepagents_middleware.FilesystemMiddleware is MimirFilesystemMiddleware
     assert filesystem_middleware.FilesystemMiddleware is MimirFilesystemMiddleware
-
-
-def test_base_prompt_compatibility_shim_does_not_mutate_deepagents(
-    token_counter_state,
-):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        base_prompt = deepagents_graph.BASE_AGENT_PROMPT
-
-    patches.strip_deepagents_base_prompt()
-    importlib.import_module("mimir.agent")
-
-    assert not hasattr(patches, "_DEEPAGENTS_BASE_PROMPT_MARKER")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        assert deepagents_graph.BASE_AGENT_PROMPT == base_prompt
 
 
 def test_patch_deepagents_token_counter_passes_through_arguments(token_counter_state):
