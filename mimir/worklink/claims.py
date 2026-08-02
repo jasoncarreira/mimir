@@ -282,14 +282,6 @@ def _lock_issue_id(lock: dict[str, Any]) -> int | None:
     return None
 
 
-def _lock_owner(lock: dict[str, Any]) -> str | None:
-    for key in ("agent_id", "owner", "holder", "holder_id", "claimant"):
-        raw = lock.get(key)
-        if raw not in (None, ""):
-            return str(raw)
-    return None
-
-
 class ChainlinkClaims:
     """Small wrapper around the Chainlink CLI claim/label/comment protocol."""
 
@@ -718,6 +710,10 @@ class ChainlinkClaims:
                 "stale_agent_id": record.agent_id,
                 "attempt": record.attempt,
                 "transition": transition,
+                "last_heartbeat": (
+                    record.heartbeat_at.isoformat() if record.heartbeat_at else None
+                ),
+                "resulting_label": f"worklink:{transition}",
                 "reaped_at": now.isoformat(),
             }
             self._run(
@@ -726,6 +722,14 @@ class ChainlinkClaims:
                 str(record.issue_id),
                 REAPER_PREFIX + json.dumps(payload, sort_keys=True),
             )
+            if self.event_logger is not None:
+                self.event_logger(
+                    "worklink_claim_reaped",
+                    issue_id=record.issue_id,
+                    agent_id=record.agent_id,
+                    last_heartbeat=payload["last_heartbeat"],
+                    resulting_label=payload["resulting_label"],
+                )
             reaped.append(record)
         return reaped
 
@@ -785,13 +789,15 @@ class ChainlinkClaims:
         return label in labels
 
     def _lock_still_held_by(self, record: ClaimRecord) -> bool:
-        """Best-effort race guard before TTL reaping.
+        """Return whether the issue still consumes a Chainlink lock.
 
         If the original worker already released the lock during its normal
-        transition, do not steal/relabel the issue back to ready. When the lock
-        table exposes an owner/agent field, require it to match the claim record;
-        when the shape is too old to identify owners, retain the prior behavior
-        rather than disabling reaping entirely.
+        transition, do not steal/relabel the issue back to ready. The lock's
+        ``agent_id`` is the Chainlink tracker identity, while ``record.agent_id``
+        is the Worklink process identity; comparing them made every normally
+        shaped live lock invisible to the reaper. Claim ownership and freshness
+        therefore come from the latest structured claim comment, while this
+        guard checks only that the concurrency-slot lock still exists.
         """
         result = self._run("locks", "list", "--json", check=False)
         if result.returncode != 0:
@@ -816,11 +822,7 @@ class ChainlinkClaims:
                     break
         if lock is None:
             return False
-        if not isinstance(lock, dict):
-            return True
-        owner = _lock_owner(lock)
-        process_tracker_id = record.agent_id.split(":", 1)[0]
-        return owner is None or owner in {record.agent_id, process_tracker_id}
+        return True
 
     # ---- Discovery / concurrency (slice-3 autonomy) ------------------
 

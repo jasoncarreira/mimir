@@ -55,6 +55,12 @@ from mimir.models import (
 from mimir.pr_checkout_lease import PRCheckoutLease
 
 
+@pytest.fixture(autouse=True)
+def _isolate_operator_repository_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests opt into repository inventories explicitly, never from the host."""
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+
 def test_every_denial_sets_would_block() -> None:
     """Every emitted denial must say enforcement would have blocked it.
 

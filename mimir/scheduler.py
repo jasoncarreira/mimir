@@ -2356,12 +2356,11 @@ class Scheduler:
                 )
 
             reaped, pruned_paths, closed_chainlinks = await asyncio.to_thread(_reap)
-            if reaped:
-                await log_event(
-                    "worklink_claims_reaped",
-                    count=len(reaped),
-                    issue_ids=[record.issue_id for record in reaped],
-                )
+            await log_event(
+                "worklink_claims_reaped",
+                count=len(reaped),
+                issue_ids=[record.issue_id for record in reaped],
+            )
             if pruned_paths:
                 await log_event(
                     "worklink_attempt_checkouts_pruned",
