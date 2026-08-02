@@ -89,12 +89,12 @@ jobs:
       - name: Set up Python 3.11
         run: uv python install 3.11
 
-      - name: Sync dependencies (with dev extras)
+      - name: Sync dependencies (with dev and bench extras)
         # ``--extra dev`` is required — plain ``uv sync`` skips
         # pytest-aiohttp (declared under [project.optional-dependencies].dev
         # in pyproject.toml) and other dev-only deps, which produces
         # cascading ``fixture 'aiohttp_server' not found`` errors.
-        run: uv sync --extra dev
+        run: uv sync --extra dev --extra bench
 
       - name: Skill conformance + catalog tests
         run: uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v
@@ -121,8 +121,8 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
-      - name: Sync dependencies (with dev extras)
-        run: uv sync --extra dev
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
 
       - name: Install pinned Chainlink CLI
         # Keep this pin in sync with mimir/skills/chainlink/dockerfile.fragment.
@@ -166,10 +166,10 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Sync dependencies (with dev extras)
+      - name: Sync dependencies (with dev and bench extras)
         # ``--extra dev`` is required — see skill-conformance job's
         # comment for the rationale.
-        run: uv sync --extra dev
+        run: uv sync --extra dev --extra bench
 
       - name: Run mimir test suite
         # ``testpaths`` is set in pyproject.toml so no explicit path
@@ -246,8 +246,8 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
-      - name: Sync dependencies (with dev extras)
-        run: uv sync --extra dev
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
 
       - name: Run mimir test suite (enforcement on)
         env:
