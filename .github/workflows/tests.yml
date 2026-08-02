@@ -20,6 +20,46 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  package:
+    # Exercise the same source-distribution-first build used for releases. A
+    # second, direct wheel catches file-selection differences between the two
+    # paths before a tag reaches publish.yml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build React app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Build sdist and wheel from sdist
+        run: uv build
+
+      - name: Build wheel directly from checkout
+        run: uv build --wheel --out-dir dist/direct
+
+      - name: Verify wheel contents and build-path parity
+        run: >-
+          python .github/assert_wheel_contents.py
+          --sdist-wheel dist/*.whl
+          --direct-wheel dist/direct/*.whl
+
   skill-conformance:
     # Fast gate (<1s of pytest work). Surfaces a single status check
     # SKILL-authors can grep for on a PR. Closes the body-vs-declared
