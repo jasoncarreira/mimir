@@ -24,6 +24,17 @@ ADMIN_SCOPE = AuthContext(
     interactivity=None,
 )
 
+ALICE_SCOPE = AuthContext(
+    principal="alice",
+    canonical_principal="user:alice",
+    roles=("user",),
+    event_ingress="test",
+    trigger="test",
+    channel_id=None,
+    interactivity=None,
+    enforcement_enabled=True,
+)
+
 
 def _end_auth(session_id: str) -> AuthContext:
     return replace(ADMIN_SCOPE, saga_session_id=session_id)
@@ -183,6 +194,64 @@ async def test_search_sessions_limit(store):
 
     results = await store.search_sessions("session summary", limit=3, auth_context=ADMIN_SCOPE)
     assert len(results) <= 3
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_foreign_neighbors_do_not_starve_semantic_scores(store):
+    """Foreign nearest neighbors must not consume the caller's FAISS slots."""
+    conn = store._ensure_conn()
+    recent = datetime.now(tz=timezone.utc)
+    old = recent - timedelta(days=365)
+    rows = []
+    ranked = []
+    for i in range(10):
+        session_id = f"foreign-{i}"
+        rows.append((
+            session_id, recent.isoformat(), recent.isoformat(),
+            "foreign nearest neighbor", b"foreign", "user:bob", "private",
+        ))
+        ranked.append((session_id, 1.0 - i / 100.0))
+    rows.extend([
+        (
+            "alice-relevant", old.isoformat(), old.isoformat(),
+            "authorized semantic match", b"relevant", "user:alice", "private",
+        ),
+        (
+            "alice-recent", recent.isoformat(), recent.isoformat(),
+            "authorized but irrelevant", b"irrelevant", "user:alice", "private",
+        ),
+    ])
+    ranked.extend([("alice-relevant", 0.9), ("alice-recent", 0.1)])
+    conn.executemany(
+        """
+        INSERT INTO sessions (
+            id, started_at, ended_at, summary, embedding, embedding_dim,
+            owner_principal, visibility
+        ) VALUES (?, ?, ?, ?, ?, 4, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+
+    class _RankedSessionIndex:
+        total_vectors = len(ranked)
+
+        def search(self, _query_emb, top_k):
+            return ranked[:top_k]
+
+    store._sessions_index = _RankedSessionIndex()
+    store._sessions_index_built = True
+
+    results = await store.search_sessions(
+        "semantic match", alpha=0.7, limit=2, auth_context=ALICE_SCOPE,
+    )
+
+    assert [result["session_id"] for result in results] == [
+        "alice-relevant", "alice-recent",
+    ]
+    assert results[0]["similarity_score"] == 0.9
+    assert results[1]["similarity_score"] == 0.1
+    assert all(not result["session_id"].startswith("foreign-") for result in results)
 
 
 @pytest.mark.asyncio

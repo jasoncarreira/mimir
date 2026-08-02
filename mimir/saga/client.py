@@ -2628,17 +2628,41 @@ class SagaStore:
         if query_emb is None:
             query_emb = _query_embed_sync(query) if alpha > 0.0 else []
 
-        # ── Step 1: build similarity map from sessions FAISS index ──
+        # ── Step 1: fetch the authorized session pool ──
+        auth_where, auth_params = read_authorization.selection_predicate("sessions")
+        channel_clause = "AND channel_id = ?" if channel_id else ""
+        params: list = list(auth_params)
+        if channel_id:
+            params.append(channel_id)
+
+        rows = conn.execute(
+            f"""
+            SELECT id, channel_id, started_at, ended_at, summary, reflected_at,
+                   embedding
+            FROM sessions
+            WHERE {auth_where} {channel_clause}
+            ORDER BY COALESCE(ended_at, reflected_at) DESC
+            LIMIT 500
+            """,
+            params,
+        ).fetchall()
+        eligible_ids = {row[0] for row in rows}
+
+        # ── Step 2: build similarity map for eligible sessions ──
         sim_map: dict[str, float] = {}  # session_id → cosine similarity
 
-        if query_emb:
+        if query_emb and eligible_ids:
             with self._sessions_index_lock:
                 index = self._ensure_sessions_index(conn)
             if index is not None:
+                # FAISS cannot apply the SQL authorization predicate. Search
+                # the complete sessions index, as the atom lane does, so
+                # hidden vectors cannot consume an eligible session's slot.
                 for sess_id, score in index.search(
-                    query_emb, top_k=min(limit * 4, 200)
+                    query_emb, top_k=index.total_vectors
                 ):
-                    sim_map[sess_id] = float(score)
+                    if sess_id in eligible_ids:
+                        sim_map[sess_id] = float(score)
 
             if not sim_map:
                 # Python cosine fallback (FAISS unavailable or empty).
@@ -2646,9 +2670,7 @@ class SagaStore:
 
                 q_norm = math.sqrt(sum(x * x for x in query_emb)) + 1e-9
                 dim = len(query_emb)
-                for sess_id, emb_blob in conn.execute(
-                    "SELECT id, embedding FROM sessions WHERE embedding IS NOT NULL"
-                ).fetchall():
+                for sess_id, *_, emb_blob in rows:
                     if not emb_blob:
                         continue
                     # #432: a stored embedding from a different-dim provider
@@ -2668,28 +2690,10 @@ class SagaStore:
                     except Exception:
                         continue
 
-        # ── Step 2: fetch sessions rows ──
-        auth_where, auth_params = read_authorization.selection_predicate("sessions")
-        channel_clause = "AND channel_id = ?" if channel_id else ""
-        params: list = list(auth_params)
-        if channel_id:
-            params.append(channel_id)
-
-        rows = conn.execute(
-            f"""
-            SELECT id, channel_id, started_at, ended_at, summary, reflected_at
-            FROM sessions
-            WHERE {auth_where} {channel_clause}
-            ORDER BY COALESCE(ended_at, reflected_at) DESC
-            LIMIT 500
-            """,
-            params,
-        ).fetchall()
-
         # ── Step 3: score each session ──
         now_ts = datetime.now(tz=timezone.utc).timestamp()
         results: list[dict] = []
-        for sess_id, ch_id, started_at, ended_at, summary, reflected_at in rows:
+        for sess_id, ch_id, started_at, ended_at, summary, reflected_at, _ in rows:
             sim = sim_map.get(sess_id, 0.0)
 
             # Recency reference: ended_at, falling back to reflected_at —
