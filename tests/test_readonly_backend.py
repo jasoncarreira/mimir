@@ -502,6 +502,48 @@ class TestCreateOnlyWrites:
         assert (route / "sync.txt").read_text(encoding="utf-8") == "sync"
         assert (route / "async.txt").read_text(encoding="utf-8") == "async"
 
+    def test_home_write_failure_uses_canonical_virtual_path(self, home: Path) -> None:
+        target = home / "state" / "invalid-utf8.txt"
+        backend = WriteGuardBackend(home, ["state"])
+
+        result = backend.write(str(target), "\ud800")
+
+        assert result.error is not None
+        assert result.error.startswith("Error writing file '/state/invalid-utf8.txt': ")
+        assert "surrogates not allowed" in result.error
+        assert f"'{target}'" not in result.error
+        assert type(result.error) is str
+        assert target.exists()
+
+    @pytest.mark.asyncio
+    async def test_routed_sync_and_async_write_failures_name_original_requests(
+        self, tmp_path: Path,
+    ) -> None:
+        home = _split_home(tmp_path)
+        route = tmp_path / "route"
+        route.mkdir()
+        router = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"]),
+            routes=build_file_tool_routes([(str(route), "rw")]),
+        )
+        sync_path = str(route / "sync-invalid-utf8.txt")
+        async_path = str(route / "async-invalid-utf8.txt")
+
+        sync_result = router.write(sync_path, "\ud800")
+        async_result = await router.awrite(async_path, "\ud800")
+
+        for result, request, stripped in (
+            (sync_result, sync_path, "/sync-invalid-utf8.txt"),
+            (async_result, async_path, "/async-invalid-utf8.txt"),
+        ):
+            assert result.error is not None
+            assert result.error.startswith(f"Error writing file '{request}': ")
+            assert "surrogates not allowed" in result.error
+            assert f"'{stripped}'" not in result.error
+            assert type(result.error) is str
+        assert Path(sync_path).exists()
+        assert Path(async_path).exists()
+
     @pytest.mark.parametrize("depth", [0, 1, 2])
     def test_intermediate_symlink_at_every_depth_is_refused(
         self, tmp_path: Path, depth: int,
