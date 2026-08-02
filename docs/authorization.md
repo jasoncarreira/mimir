@@ -507,9 +507,9 @@ remaining uncataloged silently.
    canonical value. Never infer service authority from a trigger or missing
    author alone.
 3. If the service is mandatory for an enforcement-enabled deployment, add its
-   trigger to `_REQUIRED_SERVICE_PRINCIPALS`. If it is a platform maintenance
-   service that requires broad SAGA recall, review and update
-   `PLATFORM_SERVICE_TRIGGERS` in `mimir/saga/ownership.py` explicitly.
+   trigger to `_REQUIRED_SERVICE_PRINCIPALS`. If its assigned work demonstrably
+   requires broad SAGA recall, declare `saga_full_corpus_read=True` on that
+   principal. A trigger name never supplies this authority.
 4. For each capability, add/read the domain and sink mappings that reflect its
    data flow, then grant those exact values in the service entry. Do not add a
    capability merely to exploit the service exception for `UNKNOWN`; catalog
@@ -519,6 +519,34 @@ remaining uncataloged silently.
 6. Test wrong canonical identity, wrong/unregistered trigger, `is_service=False`,
    any non-`None` ingress, missing domain/sink, forbidden capabilities, IFC, and
    concurrent turns. Assert `assert_capability_matrix_complete()` passes.
+
+### SAGA trusted-service read inventory
+
+This inventory records the services that received full-corpus reads before
+chainlink #1116 narrowed the grant. `access_events` records atom and source but
+not the reader principal, so there are no principal-attributed historical reads;
+the evidence below is the executable path and assigned workflow.
+
+| Principal | Trigger | Demonstrated SAGA/corpus work | Declared scope |
+| --- | --- | --- | --- |
+| `scheduler` | `scheduled_tick` | Runs the weekly `reflect` cross-session audit, whose prompt inspects SAGA retrieval evidence and atom hygiene. The same principal also runs ordinary configured ticks. | Full corpus, retained for reflection. |
+| `heartbeat` | `scheduled_tick` | Reads core memory, active-work files, and channel-scoped recent summaries. Its prompt explicitly assigns cross-session and SAGA hygiene to reflection. | Owned/public plus declared domains. |
+| `synthesis` | `saga_session_end` | The server-created session-boundary turn loads and synthesizes SAGA/session evidence and emits ACL-intersected outputs. | Full corpus, retained for session synthesis. |
+| `system` | `upgrade` | Reconciles defaults/proposal files and runs version prompts that inspect files or schedules; current prompts do not query SAGA. | Owned/public plus declared domains. |
+| `poller:worklink-ready-queue` | `poller` | Processes the Worklink ready queue using its GitHub/worklink and state capabilities. | Owned/public plus declared domains. |
+| `poller:github-activity` | `poller` | Processes configured GitHub activity using repository and PR capabilities. | Owned/public plus declared domains. |
+| `poller:github-ci-watch` | `poller` | Watches GitHub CI and repository state. | Owned/public plus declared domains. |
+| `poller:dependency-advisory-watch` | `poller` | Scans dependency lockfiles and OSV advisories. | Owned/public plus declared domains. |
+| `poller:gmail-inbox` | `poller` | Processes Gmail payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:social-cli-notifications` | `poller` | Processes social notification payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:social-cli-feed` | `poller` | Processes social feed payloads and its state directory. | Owned/public plus declared domains. |
+| `poller:worklink-tool-pins` | `poller` | Checks Worklink tool pins and its state directory. | Owned/public plus declared domains. |
+
+Installed custom pollers are an open-ended set of per-instance principals. Their
+manifest capabilities derive readable domains, but neither a `poller` trigger
+nor a capability implies full-corpus SAGA read. The nightly consolidation
+callable remains cross-corpus: it invokes `SagaStore.consolidate()` directly,
+partitions candidates by ACL scope, and does not use trigger-derived read scope.
 
 ### Add a resource adapter
 

@@ -105,26 +105,22 @@ class AuthorizationScope:
     Captures the caller's identity and permissions to determine what
     resources they can read from SAGA (atoms, sessions, triples).
 
-    Platform/maintenance services (scheduler, poller, synthesis, system) get
-    broad internal read access. Tenant isolation is enforced on their OUTPUTS
-    via derivation-ACL intersection (#884) and egress/IFC (#871), NOT by
-    restricting maintenance reads. This design decision is intentional:
+    Trusted services receive broad internal read access only when their frozen
+    ``ServicePrincipal`` explicitly declares it. Tenant isolation is enforced
+    on broad readers' OUTPUTS via derivation-ACL intersection (#884) and
+    egress/IFC (#871), NOT by restricting those declared reads:
     - Tenant isolation is enforced by user-facing read scope, derivation-ACL
       intersection on consolidated artifacts, and egress/IFC. A user never sees
       an autonomous turn's raw reads, only its ACL-carrying outputs.
-    - A static per-principal readable_domain does not represent WHICH tenant
-      a given autonomous op is acting for (dynamic: the session that ended,
-      the poll's account), so it aligns with no tenant boundary.
-    - readable_domains is reserved for narrow external integration services.
+    - Services without that declaration receive public and owned rows plus
+      their explicitly declared readable domains.
 
     Attributes:
         principal: The caller's principal identifier (e.g., "user:123")
         is_admin: Whether the caller has admin role
         is_service: Whether the caller is a trusted service
-        is_platform_service: Whether the caller is a platform/maintenance service
-            with full internal read (scheduler, poller, synthesis, upgrade).
-            These services can read the complete internal corpus without becoming
-            admins. Tenant isolation is enforced on their outputs.
+        is_platform_service: Whether the trusted principal explicitly declares
+            full internal SAGA read. This does not make it an admin.
         readable_domains: Tuple of domain names the service can read
         service_canonical: Canonical name of the service (if is_service)
     """
@@ -149,14 +145,12 @@ def _authorization_predicate(
     #884 + #871.
 
     Regular services with readable_domains get domain-restricted access plus
-    public and owned rows. readable_domains is reserved for narrow external
-    integration services.
+    public and owned rows.
     """
     if scope.is_admin:
         return ("1=1", [])
 
-    # Platform/maintenance services (scheduler, poller, synthesis, system) get
-    # the full internal read view. This does not widen role or mutation authority;
+    # Explicit full-corpus authority does not widen role or mutation authority;
     # tenant isolation remains enforced on derived outputs.
     if scope.is_platform_service:
         return ("1=1", [])
@@ -223,14 +217,6 @@ def authorization_predicate_for_sessions(
     return _authorization_predicate(scope, table=table)
 
 
-PLATFORM_SERVICE_TRIGGERS: frozenset[str] = frozenset({
-    "scheduled_tick",
-    "poller",
-    "saga_session_end",
-    "upgrade",
-})
-
-
 def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     """Build AuthorizationScope from an auth_context (chainlink #883, #897).
 
@@ -241,9 +227,8 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     system reads that need wider access must pass an explicit server-created
     admin or trusted-service context; omission is never ambient authority.
 
-    Platform/maintenance services (scheduled_tick, poller, saga_session_end, upgrade)
-    get full internal read access via is_platform_service=True without acquiring
-    admin role. Tenant isolation is enforced on their outputs via #884 + #871.
+    Full-corpus read is copied from the resolved trusted principal's declared
+    authority. Trigger strings do not grant read authority.
 
     Args:
         auth_context: Frozen, server-created ``mimir.models.AuthContext``
@@ -270,13 +255,11 @@ def get_authorization_scope(auth_context: Any) -> AuthorizationScope:
     service = get_trusted_service_from_auth_context(auth_context)
 
     if service:
-        trigger = getattr(auth_context, "trigger", None)
-        is_platform = trigger in PLATFORM_SERVICE_TRIGGERS
         return AuthorizationScope(
             principal=principal,
             is_admin=False,
             is_service=True,
-            is_platform_service=is_platform,
+            is_platform_service=service.saga_full_corpus_read,
             readable_domains=service.readable_domains,
             service_canonical=service.canonical,
         )

@@ -367,9 +367,9 @@ class ServiceSinkPolicy:
 class ServicePrincipal:
     """Trusted autonomous service principal (chainlink #865).
 
-    Defined by server-owned creation path, trigger, capabilities,
-    readable domains, and sink destinations. Unknown synthetic triggers
-    receive no privilege.
+    Defined by server-owned creation path, trigger, capabilities, readable
+    domains, SAGA read breadth, and sink destinations. Unknown synthetic
+    triggers receive no privilege.
     """
     canonical: str
     trigger: str
@@ -378,6 +378,7 @@ class ServicePrincipal:
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     filesystem_read_roots: tuple[str, ...] = ()
+    saga_full_corpus_read: bool = False
     creation_path: str | None = None
     authority_profile: str | None = None
     capability_tier: CapabilityTier | None = None
@@ -554,6 +555,7 @@ def build_trigger_service_principal(
     tier: CapabilityTier,
     capabilities: tuple[str, ...],
     roots: tuple[Path, ...] = (),
+    saga_full_corpus_read: bool = False,
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -645,6 +647,7 @@ def build_trigger_service_principal(
                 *((artifact_root,) if artifact_root is not None else ()),
             ))
         ),
+        saga_full_corpus_read=saga_full_corpus_read,
         creation_path=creation_path,
         authority_profile=profile,
         capability_tier=tier,
@@ -672,6 +675,7 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
             tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
             creation_path="mimir.server._on_session_idle",
+            saga_full_corpus_read=True,
         )
     raise ValueError(f"unknown built-in authority profile: {profile!r}")
 
@@ -6579,6 +6583,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
                 ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
             ),
+            saga_full_corpus_read=True,
             creation_path="mimir.scheduler.Scheduler._fire_job",
         ),
         ServicePrincipal(
@@ -6600,6 +6605,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
             ),
+            saga_full_corpus_read=True,
             creation_path="mimir.server._on_session_idle",
             authority_profile="session-boundary",
             capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -7077,6 +7083,7 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
                 for policy in principal.sink_policies
             ],
             "filesystem_read_roots": list(principal.filesystem_read_roots),
+            "saga_full_corpus_read": principal.saga_full_corpus_read,
             "creation_path": principal.creation_path,
         }
     return report
