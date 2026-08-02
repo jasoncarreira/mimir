@@ -458,29 +458,36 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
             assert read_result.file_data["content"] == expected
         assert hard_denials == []
 
-        home_protected_targets = (
-            other_memory_file,
-            core_file,
-            identities_file,
-            prompt_file,
-            operator_secret,
-        )
-        for target in home_protected_targets:
+        expected_denials = {
+            other_memory_file: "service_scoped_read_boundary",
+            core_file: "core_memory_block",
+            identities_file: "service_scoped_read_boundary",
+            prompt_file: "service_scoped_read_boundary",
+            operator_secret: "protected_name_match",
+        }
+        for target, reason in expected_denials.items():
             read_result = backend.read(str(target))
-            assert read_result.error == (
-                "Read denied: protected_read_target. For published PR content, "
-                "use pr_files or pr_diff."
-            ), target
+            assert read_result.error is not None, target
+            assert f"Read denied: {reason}." in read_result.error, target
     finally:
         reset_current_turn(token)
-    assert len(hard_denials) == len(home_protected_targets)
+    assert len(hard_denials) == len(expected_denials)
     assert all(
         kind == "hard_boundary_denied"
         and fields["boundary"] == "protected_read_policy"
+        and fields["target"] in {str(target) for target in expected_denials}
+        and fields["reason"] == expected_denials[Path(fields["target"])]
+        and fields["trigger"] == "poller"
+        and fields["service_principal"] == service.canonical
         for kind, fields in hard_denials
     )
+    assert {fields["reason"] for _, fields in hard_denials} == {
+        "protected_name_match",
+        "core_memory_block",
+        "service_scoped_read_boundary",
+    }
 
-    for target in home_protected_targets:
+    for target in expected_denials:
         decision = registry.authorize_tool(
             "read_file", context, enforce=True,
             arguments={"file_path": str(target)},

@@ -137,13 +137,17 @@ def resolved_read_target_from_arguments(
 
 def emit_hard_read_denial(tool: str, target: Any, reason: str) -> None:
     """Record a protected result that the backend actually withheld."""
+    from ._context import get_current_turn
     from .tools.budget_gate import _emit_hard_boundary_denied
 
+    turn_context = get_current_turn()
     _emit_hard_boundary_denied(
         tool=tool,
         boundary="protected_read_policy",
         reason=reason,
         target=target,
+        auth_context=getattr(turn_context, "auth_context", None),
+        turn_context=turn_context,
     )
 
 _PROTECTED_BASENAMES = frozenset({
@@ -259,6 +263,59 @@ def is_protected_read_path(path: Path) -> bool:
         ):
             return True
     return False
+
+
+def _has_protected_read_name(path: Path) -> bool:
+    """Return whether a path matches the protected-name portion of policy."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    name = resolved.name.lower()
+    return (
+        name in _PROTECTED_BASENAMES
+        or name.startswith(".env.")
+        or resolved.suffix.lower() in _PROTECTED_SUFFIXES
+        or any(part.lower() in _PROTECTED_DIR_NAMES for part in resolved.parts)
+        or is_operator_secret_read_path(resolved)
+    )
+
+
+def _is_core_memory_read_path(path: Path) -> bool:
+    """Return whether ``memory/core`` occurs as adjacent path components."""
+    try:
+        parts = tuple(part.lower() for part in path.resolve().parts)
+    except (OSError, RuntimeError):
+        parts = tuple(part.lower() for part in path.parts)
+    return any(
+        parts[index:index + 2] == ("memory", "core")
+        for index in range(len(parts) - 1)
+    )
+
+
+def protected_read_denial_reason(path: Path) -> str | None:
+    """Name the path-policy rule that withholds ``path``, if any."""
+    service_scoped = is_current_service_scoped_read_path(path)
+    general_protected = not service_scoped and is_protected_read_path(path)
+    service_name_protected = is_current_service_protected_read_path(path)
+    if not (general_protected or service_name_protected):
+        return None
+    if _is_core_memory_read_path(path):
+        return "core_memory_block"
+
+    from ._context import get_current_turn
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    authority = getattr(auth_context, "service_authority", None)
+    if (
+        getattr(auth_context, "is_service", False)
+        and getattr(authority, "filesystem_read_roots", ())
+        and not service_scoped
+    ):
+        return "service_scoped_read_boundary"
+    if service_name_protected or _has_protected_read_name(path):
+        return "protected_name_match"
+    return "mimir_home_read_boundary"
 
 
 def is_current_service_protected_read_path(path: Path) -> bool:
@@ -390,6 +447,23 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
         return False
 
 
+def protected_read_result_reason(path: Path, *, text: str | None = None) -> str | None:
+    """Name the path or content rule that withholds one resolved result."""
+    if is_large_tool_results_path(path):
+        return None
+    path_reason = protected_read_denial_reason(path)
+    if path_reason is not None:
+        return path_reason
+    contains_protected_content = (
+        text_contains_secret(text, path=path)
+        if text is not None
+        else path.is_file() and file_contains_secret(path)
+    )
+    if contains_protected_content and not is_tracked_file_in_current_pr_lease(path):
+        return "protected_read_result"
+    return None
+
+
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     """Check a result, exempting only published files in an authorized PR lease.
 
@@ -398,18 +472,7 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
     """
     if is_large_tool_results_path(path):
         return False
-    service_scoped = is_current_service_scoped_read_path(path)
-    if (
-        (not service_scoped and is_protected_read_path(path))
-        or is_current_service_protected_read_path(path)
-    ):
-        return True
-    contains_protected_content = (
-        text_contains_secret(text, path=path)
-        if text is not None
-        else path.is_file() and file_contains_secret(path)
-    )
-    return contains_protected_content and not is_tracked_file_in_current_pr_lease(path)
+    return protected_read_result_reason(path, text=text) is not None
 
 
 def configured_non_admin_read_roots() -> tuple[Path, ...]:
