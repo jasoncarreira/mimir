@@ -7128,14 +7128,16 @@ def assert_capability_matrix_complete() -> None:
 def _deepagents_builtin_tool_names() -> tuple[str, ...]:
     """Return the tools injected by the DeepAgents middleware stack."""
     from deepagents.backends import StateBackend
-    from deepagents.middleware import FilesystemMiddleware, SubAgentMiddleware
+    from deepagents.middleware import SubAgentMiddleware
     from langchain.agents.middleware import TodoListMiddleware
     from langchain_core.runnables import RunnableLambda
+
+    from .readonly_backend import MimirFilesystemMiddleware
 
     backend = StateBackend()
     middleware = (
         TodoListMiddleware(),
-        FilesystemMiddleware(backend=backend),
+        MimirFilesystemMiddleware(backend=backend),
         SubAgentMiddleware(
             backend=backend,
             subagents=[{
