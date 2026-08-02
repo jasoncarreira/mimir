@@ -2908,6 +2908,8 @@ def _service_shell_command_shape(argv: list[str]) -> str:
 def _service_shell_coding_enabled() -> bool:
     """Whether this deployment exposes coding tools, using config's bool syntax."""
     raw = os.environ.get("MIMIR_CODING_ENABLED")
+    # Keep this truthy set aligned with config._env_bool without importing config
+    # here: access_control is imported by config, so that would create a cycle.
     return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
 
 
@@ -2915,6 +2917,13 @@ def _service_shell_typed_tool_guidance(
     argv: list[str], destination: str,
 ) -> str:
     """Name bounded tools for observed commands that must stay outside the shell."""
+    # Provenance: poller:github-activity refusals recorded in events.jsonl after
+    # argv logging landed were `npm run` (repository script), `python -c ...`
+    # (arbitrary Python), and `python - <<PY ...` (attachment/HTML parsing).
+    # All remain correctly refused: the first must use repo_test when available;
+    # the latter two have no general bounded typed equivalent. `npm ci` and
+    # `npm install` are inferred dependency-install shapes and remain refused
+    # because this profile exposes no typed dependency-install capability.
     if destination != "repo_review" or not argv:
         return ""
     executable = Path(argv[0]).name
