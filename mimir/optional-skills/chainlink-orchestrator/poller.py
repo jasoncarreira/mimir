@@ -131,6 +131,7 @@ RUN_JSON = "run.json"
 
 CURSOR_FILE = "lifecycle_cursor.json"
 CURSOR_VERSION = 1
+CLEANUP_FAILURE_REALERT_INTERVAL = 144  # Once a day at the default 10-minute cadence.
 
 LIVENESS_CLASSES = frozenset({"healthy", "stale", "unknown"})
 VALIDITY_CLASSES = frozenset({"valid", "invalid", "unreadable"})
@@ -207,6 +208,7 @@ class CursorEntry:
     cleaned: bool = False
     cleaned_at: str | None = None
     tombstone: bool = False
+    cleanup_failure_kind: str | None = None
     cleanup_failure_reason: str | None = None
     cleanup_failure_count: int = 0
     cleanup_failure_escalated: bool = False
@@ -601,6 +603,7 @@ def _load_cursor(state_dir: Path) -> LifecycleCursor:
                     cleaned=entry_data.get("cleaned", False),
                     cleaned_at=entry_data.get("cleaned_at"),
                     tombstone=entry_data.get("tombstone", False),
+                    cleanup_failure_kind=entry_data.get("cleanup_failure_kind"),
                     cleanup_failure_reason=entry_data.get("cleanup_failure_reason"),
                     cleanup_failure_count=entry_data.get("cleanup_failure_count", 0),
                     cleanup_failure_escalated=entry_data.get(
@@ -634,6 +637,7 @@ def _save_cursor(state_dir: Path, cursor: LifecycleCursor) -> None:
                 "cleaned": entry.cleaned,
                 "cleaned_at": entry.cleaned_at,
                 "tombstone": entry.tombstone,
+                "cleanup_failure_kind": entry.cleanup_failure_kind,
                 "cleanup_failure_reason": entry.cleanup_failure_reason,
                 "cleanup_failure_count": entry.cleanup_failure_count,
                 "cleanup_failure_escalated": entry.cleanup_failure_escalated,
@@ -692,7 +696,8 @@ def _run_factory_cleanup(
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc), None
     if proc.returncode != 0:
-        return False, proc.stderr or proc.stdout, None
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or f"exit code {proc.returncode}", None
     try:
         report = json.loads(proc.stdout)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -851,6 +856,11 @@ def _reconcile_factory_runs(
             cleaned=False,
             cleaned_at=None,
             tombstone=False,
+            cleanup_failure_kind=(
+                prior.cleanup_failure_kind
+                if prior and prior.fingerprint == obs.fingerprint
+                else None
+            ),
             cleanup_failure_reason=(
                 prior.cleanup_failure_reason
                 if prior and prior.fingerprint == obs.fingerprint
@@ -886,15 +896,19 @@ def _attempt_cleanup(
     updated_entries = dict(cursor.entries)
 
     def record_failure(
-        alert: LifecycleAlert, entry: CursorEntry, reason: str
+        alert: LifecycleAlert, entry: CursorEntry, kind: str, reason: str
     ) -> LifecycleAlert | None:
-        repeated = entry.cleanup_failure_reason == reason
+        repeated = entry.cleanup_failure_kind == kind
         failure_count = entry.cleanup_failure_count + 1 if repeated else 1
         already_escalated = entry.cleanup_failure_escalated if repeated else False
-        escalate = failure_count > 1 and not already_escalated
+        escalate = failure_count > 1 and (
+            not already_escalated
+            or failure_count % CLEANUP_FAILURE_REALERT_INTERVAL == 0
+        )
         updated_entries[f"{alert.run_id}:{alert.physical_path}"] = replace(
             entry,
             last_observed=now,
+            cleanup_failure_kind=kind,
             cleanup_failure_reason=reason,
             cleanup_failure_count=failure_count,
             cleanup_failure_escalated=already_escalated or escalate,
@@ -905,11 +919,7 @@ def _attempt_cleanup(
             alert,
             source_id=alert.source_id
             + (":cleanup_failure_escalated" if escalate else ":cleanup_failed"),
-            signal=(
-                "worklink_factory_cleanup_failure_escalated"
-                if escalate
-                else "worklink_factory_cleanup_failed"
-            ),
+            signal="worklink_factory_cleanup_failed",
             status="failed",
             reason=reason,
             cleanup_eligible=False,
@@ -951,14 +961,19 @@ def _attempt_cleanup(
         worktree = _factory_worktree_for_run(run_dir)
         if worktree is None:
             failure = record_failure(
-                alert, entry, "Factory cleanup could not identify the run worktree"
+                alert,
+                entry,
+                "worktree-unidentified",
+                "Factory cleanup could not identify the run worktree",
             )
             if failure:
                 failed_alerts.append(failure)
             continue
         success, msg, preview = _run_factory_cleanup(worktree, dry_run=True)
         if not success:
-            failure = record_failure(alert, entry, command_failure("preview", msg))
+            failure = record_failure(
+                alert, entry, "preview", command_failure("preview", msg)
+            )
             if failure:
                 failed_alerts.append(failure)
             continue
@@ -967,6 +982,7 @@ def _attempt_cleanup(
             failure = record_failure(
                 alert,
                 entry,
+                "digest-not-eligible",
                 f"Factory cleanup preview did not mark run {alert.run_id} eligible",
             )
             if failure:
@@ -997,7 +1013,7 @@ def _attempt_cleanup(
                 if not success
                 else f"Factory cleanup execution did not report run {alert.run_id} deleted"
             )
-            failure = record_failure(alert, entry, reason)
+            failure = record_failure(alert, entry, "execution", reason)
             if failure:
                 failed_alerts.append(failure)
     new_cursor = LifecycleCursor(
