@@ -14,6 +14,12 @@ Conflict markers present: `{conflicts}`
 
 Your job:
 
+The fixed filesystem operation required by this workflow is:
+
+- `read_file {worktree}/memory/core/30-reflection-policy.md`
+
+Other reads are confined to changed files in the same proposal worktree.
+
 1. Read the changed files under `{worktree}/memory/core/` and `{worktree}/prompts/`.
 2. Review the staged diff with `git -C {worktree} diff --cached`. Service shell
    commands must be one admitted argv; do not express the working directory as

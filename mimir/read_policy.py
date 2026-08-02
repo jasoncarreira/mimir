@@ -254,10 +254,13 @@ def is_protected_read_path(path: Path) -> bool:
     home = _resolved_mimir_home()
     if home is not None and (resolved == home or resolved.is_relative_to(home)):
         state = home / "state"
+        core = home / "memory" / "core"
         artifact_root = framework_large_tool_results_root(home)
         if not (
             resolved == state
             or resolved.is_relative_to(state)
+            or resolved == core
+            or resolved.is_relative_to(core)
             or artifact_root is not None
             and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
         ):
@@ -281,16 +284,17 @@ def _has_protected_read_name(path: Path) -> bool:
     )
 
 
-def _is_core_memory_read_path(path: Path) -> bool:
-    """Return whether ``memory/core`` occurs as adjacent path components."""
+def is_core_memory_read_path(path: Path) -> bool:
+    """Return whether ``path`` is in this home's already-rendered core memory."""
+    home = _resolved_mimir_home()
+    if home is None:
+        return False
     try:
-        parts = tuple(part.lower() for part in path.resolve().parts)
+        resolved = path.resolve()
     except (OSError, RuntimeError):
-        parts = tuple(part.lower() for part in path.parts)
-    return any(
-        parts[index:index + 2] == ("memory", "core")
-        for index in range(len(parts) - 1)
-    )
+        return False
+    core = home / "memory" / "core"
+    return resolved == core or resolved.is_relative_to(core)
 
 
 def protected_read_denial_reason(path: Path) -> str | None:
@@ -300,9 +304,6 @@ def protected_read_denial_reason(path: Path) -> str | None:
     service_name_protected = is_current_service_protected_read_path(path)
     if not (general_protected or service_name_protected):
         return None
-    if _is_core_memory_read_path(path):
-        return "core_memory_block"
-
     from ._context import get_current_turn
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
@@ -492,7 +493,12 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     configured_paths = [Path(path) for path, _mode in configured]
     configured_path_set = set(configured_paths)
     artifact_root = framework_large_tool_results_root(home)
-    roots = [home / "state", *((artifact_root,) if artifact_root is not None else ()), *configured_paths]
+    roots = [
+        home / "state",
+        home / "memory" / "core",
+        *((artifact_root,) if artifact_root is not None else ()),
+        *configured_paths,
+    ]
 
     # The shared parser intentionally returns canonical paths. Retain any
     # validated spelling supplied by the operator for lexical root selection.
@@ -544,6 +550,7 @@ def resolve_non_admin_read_target(
     try:
         home = Path(home_raw).resolve(strict=True)
         state = (home / "state").resolve(strict=True)
+        core = (home / "memory" / "core").resolve(strict=False)
         artifact_root = framework_large_tool_results_root(home)
     except (OSError, RuntimeError):
         return None
@@ -582,6 +589,8 @@ def resolve_non_admin_read_target(
     elif resolved.is_relative_to(home) and not (
         resolved == state
         or resolved.is_relative_to(state)
+        or resolved == core
+        or resolved.is_relative_to(core)
         or artifact_root is not None
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
     ):

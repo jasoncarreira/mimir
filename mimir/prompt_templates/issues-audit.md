@@ -23,6 +23,12 @@ selected entries. Do not send a glob, pipeline, redirect, or `&&` to
 `shell_exec`; the scheduled-maintenance profile rejects shell composition.
 Order the returned entries oldest-first when metadata is available.
 
+The fixed filesystem operation required by this workflow is:
+
+- `read_file state/audit/issues-audit-cursor.md`
+
+Other reads and cursor updates are bounded by the selected batch.
+
 There are usually dozens of files; one turn can't read + verify all of
 them inside the tool-call budget. Work a **batch of ~25–30 files per
 run**, oldest-by-mtime first (recently-edited gotchas are usually still

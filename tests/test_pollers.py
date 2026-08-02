@@ -448,6 +448,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         for file_path, expected in (
             ("/attachments/fetch-cache/body.txt", "fetched\n"),
             ("/scratch/pr-150-review.md", "review verdict\n"),
+            (str(core_file), "core memory\n"),
             (
                 "/memory/channels/poller:github-activity/pr-reviews.md",
                 "own channel notes\n",
@@ -460,7 +461,6 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
 
         expected_denials = {
             other_memory_file: "service_scoped_read_boundary",
-            core_file: "core_memory_block",
             identities_file: "service_scoped_read_boundary",
             prompt_file: "service_scoped_read_boundary",
             operator_secret: "protected_name_match",
@@ -483,7 +483,6 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     )
     assert {fields["reason"] for _, fields in hard_denials} == {
         "protected_name_match",
-        "core_memory_block",
         "service_scoped_read_boundary",
     }
 
@@ -494,6 +493,12 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         )
         assert decision.allowed is False, target
         assert decision.reason == "read_scope"
+
+    core_decision = registry.authorize_tool(
+        "read_file", context, enforce=True,
+        arguments={"file_path": str(core_file)},
+    )
+    assert core_decision.allowed is True
 
     for target in (persist_dir / "cursor.json", scratch / "pr-1221-review.md"):
         decision = registry.authorize_tool(
