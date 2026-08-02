@@ -602,15 +602,19 @@ def _triple_read_authorization_predicate(
     predicates keeps reads no wider than either resource and handles the
     fail-closed ``legacy_admin`` sentinel without a source-only fallback.
 
-    Both sides come from the same ``SagaReadAuthorization`` so the intersection
-    obeys the enforcement-mode contract: compatibility shadow selects ``1=1`` on
-    both, true enforcement applies the strict scope to both. Deriving only the
-    source side from the mode-aware predicate would leave triples strictly
-    filtered while atoms fell back to ``1=1`` — the same split-behavior defect
-    chainlink #1112 exists to remove, relocated into the triple path.
+    The two sides are gated differently, deliberately. The SOURCE-atom side uses
+    the mode-aware selection predicate, so compatibility shadow restores the
+    pre-regression read scope (chainlink #1112). The TRIPLE side is always
+    strict, because a triple ACL narrower than its source is not policy scope —
+    it is attenuation the writer chose via ``_update_triple_acl_on_dedup``,
+    which exists so a triple never becomes "more readable than its least
+    permissive source" (chainlink #1117). Routing that through the mode gate
+    would let shadow mode re-open the disclosure path #1117 closed, since
+    ``1=1 AND 1=1`` filters nothing. Shadow mode restores results that were
+    legitimately visible before; it must not restore ones a writer attenuated.
     """
     source_where, source_params = read_authorization.selection_predicate("a")
-    triple_where, triple_params = read_authorization.selection_predicate("t")
+    triple_where, triple_params = read_authorization.strict_predicate("t")
     return (
         f"({source_where}) AND ({triple_where})",
         [*source_params, *triple_params],
