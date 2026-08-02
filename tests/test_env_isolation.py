@@ -14,6 +14,8 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -21,6 +23,18 @@ from mimir.config import _load_home_dotenv
 
 _CANARY = "MIMIR_TEST_DOTENV_LEAK_CANARY"
 _ENFORCEMENT_FLAG = "MIMIR_ACCESS_CONTROL_ENFORCED"
+_LONGMEMEVAL_SMOKE = "tests/test_longmemeval_via_memory_smoke.py"
+_LONGMEMEVAL_NODE_IDS = {
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_parser_defaults_to_boundary_rrf_adoption_settings",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_parser_preserves_boundary_ablation_flags",
+    f"{_LONGMEMEVAL_SMOKE}::test_session_boundary_rrf_pathway_searches_sessions_and_expands_atoms",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_completes_one_question[shadow]",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_completes_one_question[enforced]",
+    f"{_LONGMEMEVAL_SMOKE}::test_session_boundary_rrf_lane_keeps_summaries_out_of_reader",
+    f"{_LONGMEMEVAL_SMOKE}::test_runner_no_consolidate_path",
+    f"{_LONGMEMEVAL_SMOKE}::test_generated_session_boundaries_persist_real_sessions",
+    f"{_LONGMEMEVAL_SMOKE}::test_capture_reader_prompt_writes_debug_without_bloating_metrics",
+}
 
 
 # ── 1. dotenv leakage ────────────────────────────────────────────────
@@ -132,4 +146,37 @@ def test_no_test_is_skipped_because_enforcement_is_on():
 
     assert not offenders, (
         "tests skipped on the enforcement flag: " + ", ".join(offenders)
+    )
+
+
+def test_longmemeval_memory_smoke_cases_are_collected():
+    """Fail if the optional bench dependency silently skips pipeline coverage."""
+    root = Path(__file__).parent.parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:randomly",
+            _LONGMEMEVAL_SMOKE,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    collected = {
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.startswith(f"{_LONGMEMEVAL_SMOKE}::")
+    }
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert collected == _LONGMEMEVAL_NODE_IDS, (
+        "LongMemEval via_memory collection changed:\n"
+        f"missing: {sorted(_LONGMEMEVAL_NODE_IDS - collected)}\n"
+        f"unexpected: {sorted(collected - _LONGMEMEVAL_NODE_IDS)}"
     )
