@@ -196,15 +196,40 @@ def create_isolated_checkout(
         raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
     local_base = start_sha.stdout.strip()
 
+    parent_push = runner(["git", "-C", str(repo), "remote", "get-url", "--push", "origin"])
+    if parent_push.returncode != 0 or not parent_push.stdout.strip():
+        raise RuntimeError(
+            (parent_push.stderr or parent_push.stdout).strip()
+            or "git remote get-url --push origin failed"
+        )
+    wanted_push_target = parent_push.stdout.strip()
+
     _clone_attempt_checkout(repo, path, runner=runner, event_logger=event_logger)
 
-    remote = runner(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
-    if remote.returncode == 0 and remote.stdout.strip():
+    try:
         set_remote = runner(
-            ["git", "-C", str(path), "remote", "set-url", "origin", remote.stdout.strip()]
+            ["git", "-C", str(path), "remote", "set-url", "origin", wanted_push_target]
         )
         if set_remote.returncode != 0:
             raise RuntimeError((set_remote.stderr or set_remote.stdout).strip() or "git remote set-url failed")
+
+        checkout_push = runner(
+            ["git", "-C", str(path), "remote", "get-url", "--push", "origin"]
+        )
+        if checkout_push.returncode != 0:
+            raise RuntimeError(
+                (checkout_push.stderr or checkout_push.stdout).strip()
+                or "isolated checkout push-target verification failed"
+            )
+        observed_push_target = checkout_push.stdout.strip()
+        if observed_push_target != wanted_push_target:
+            raise RuntimeError(
+                "isolated checkout push-target mismatch: "
+                f"wanted {wanted_push_target!r}, observed {observed_push_target!r}"
+            )
+    except RuntimeError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
 
     checkout = runner(["git", "-C", str(path), "checkout", "-B", branch, local_base])
     if checkout.returncode != 0:

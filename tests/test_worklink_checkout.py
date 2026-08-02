@@ -7,6 +7,7 @@ from typing import Sequence
 
 import pytest
 
+import mimir.worklink.checkout as checkout_module
 from mimir.worklink.checkout import (
     CheckoutLease,
     _assert_self_contained_checkout,
@@ -563,6 +564,100 @@ def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path
     assert _git(lease.path, "branch", "--show-current") == "issue/517-a1"
     assert _git(lease.path, "remote", "get-url", "origin") == str(origin)
     assert _git(lease.path, "rev-parse", "HEAD") == lease.local_base
+
+
+def test_isolated_checkout_uses_explicit_effective_pushurl(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    push_target = tmp_path / "push-target.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(push_target)], check=True)
+    _git(repo, "config", "remote.origin.pushurl", str(push_target))
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    lease = create_isolated_checkout(repo, issue_id=1125, attempt=1, runner=runner)
+
+    assert _git(repo, "remote", "get-url", "--push", "origin") == str(push_target)
+    assert _git(lease.path, "remote", "get-url", "--push", "origin") == str(push_target)
+    parent_resolve = ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"]
+    checkout_resolve = [
+        "git", "-C", str(lease.path), "remote", "get-url", "--push", "origin",
+    ]
+    branch_checkout = [
+        "git", "-C", str(lease.path), "checkout", "-B", lease.branch, lease.local_base,
+    ]
+    assert calls.index(parent_resolve) < calls.index(checkout_resolve) < calls.index(branch_checkout)
+
+
+def test_isolated_checkout_uses_push_instead_of_effective_target(tmp_path: Path) -> None:
+    repo = _repo_with_main(tmp_path)
+    fetch_target = _git(repo, "remote", "get-url", "origin")
+    push_target = tmp_path / "rewritten-push.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(push_target)], check=True)
+    _git(repo, "config", f"url.{push_target}.pushInsteadOf", fetch_target)
+
+    effective_target = _git(repo, "remote", "get-url", "--push", "origin")
+    assert effective_target == str(push_target)
+
+    lease = create_isolated_checkout(repo, issue_id=1125, attempt=2)
+
+    assert _git(lease.path, "remote", "get-url", "--push", "origin") == effective_target
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("set", "remote set denied"),
+        ("verify", "push target lookup exploded"),
+        ("mismatch", "wanted 'wanted-target', observed 'wrong-target'"),
+    ],
+)
+def test_isolated_checkout_push_target_failures_clean_up_before_branch_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    message: str,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    path = tmp_path / ".worklink" / repo.name / "1125-3"
+    calls: list[list[str]] = []
+
+    def fake_clone(
+        _repo: Path,
+        clone_path: Path,
+        **_kwargs: object,
+    ) -> None:
+        clone_path.mkdir(parents=True)
+
+    monkeypatch.setattr(checkout_module, "_clone_attempt_checkout", fake_clone)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[-2:] == ["--verify", "origin/main"]:
+            return subprocess.CompletedProcess(call, 0, stdout="base-sha\n", stderr="")
+        if call == ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"]:
+            return subprocess.CompletedProcess(call, 0, stdout="wanted-target\n", stderr="")
+        if call[2] == str(path) and call[3:5] == ["remote", "set-url"] and failure == "set":
+            return subprocess.CompletedProcess(call, 1, stdout="", stderr="remote set denied\n")
+        if call[2] == str(path) and call[3:] == ["remote", "get-url", "--push", "origin"]:
+            if failure == "verify":
+                return subprocess.CompletedProcess(
+                    call, 2, stdout="push target lookup exploded\n", stderr="",
+                )
+            return subprocess.CompletedProcess(
+                call, 0, stdout=("wrong-target\n" if failure == "mismatch" else "wanted-target\n"), stderr="",
+            )
+        return completed(call)
+
+    with pytest.raises(RuntimeError, match=message):
+        create_isolated_checkout(repo, issue_id=1125, attempt=3, runner=runner)
+
+    assert not path.exists()
+    assert not any(call[3:5] == ["checkout", "-B"] for call in calls)
 
 
 def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:

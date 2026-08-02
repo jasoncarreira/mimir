@@ -172,6 +172,11 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
             return cp(args)
         if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
             return cp(args, stdout="abc123\n")
+        if args in (
+            ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"],
+            ["git", "-C", str(checkout), "remote", "get-url", "--push", "origin"],
+        ):
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         if args == ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"]:
             return cp(args, stdout=f"{checkout}\n")
         if args == ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"]:
@@ -625,6 +630,11 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
             return cp(args)
         if args[:5] == ["git", "-C", str(repo), "rev-parse", "--verify"]:
             return cp(args, stdout="abc123\n")
+        if args in (
+            ["git", "-C", str(repo), "remote", "get-url", "--push", "origin"],
+            ["git", "-C", str(worktree), "remote", "get-url", "--push", "origin"],
+        ):
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         if args == ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]:
             return cp(args, stdout=f"{worktree}\n")
         if args == ["git", "-C", str(worktree), "rev-parse", "--absolute-git-dir"]:
