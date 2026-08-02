@@ -218,7 +218,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_SYSTEM_PROMPT_OVERRIDE` | str | unset | Full system-prompt override (replaces the rendered prompt entirely). |
 | `MIMIR_FOLDERS` | csv `name:mode` | built-in | Per-subdir write permissions under home (`state:rw,logs:ro,...`). Unknown modes → `ro`; unsafe names rejected. |
 | `MIMIR_FILE_OP_ROOTS` | retired tripwire | unset | Retired and ignored. If still present, startup warns to migrate every required root to `MIMIR_FILE_TOOL_ROOTS` and remove the old deployment setting; it grants no access. |
-| `MIMIR_FILE_TOOL_ROOTS` | csv `/absolute/path[:ro\|:rw]` | `""` | Legacy projection of `worklink.yaml` repository and allowed roots. When the YAML inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without that inventory, it retains the legacy behavior. `/tmp` is always derived as `rw`. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
+| `MIMIR_FILE_TOOL_ROOTS` | csv `/absolute/path[:ro\|:rw]` | `""` | Legacy projection of `repositories.yaml` repository and allowed roots. When the YAML inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without that inventory, it retains the legacy behavior. `/tmp` is always derived as `rw`. See [file-tool access](../README.md#file-tool-access-outside-the-home). |
 | `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Root for atomic, scope-bound PR checkout leases. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
 | `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
 | `MIMIR_MCP_SERVERS_JSON` | json | `""` | Inline MCP server config list (wins over `_PATH`). MCP is opt-in. |
@@ -304,7 +304,7 @@ repository files and model-generated values never add permission entries.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `worklink.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
+| `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
 | `MIMIR_WORKLINK_REPO` | str | unset | Repo autonomous Worklink dispatch works in (back-compat alias of `WORKLINK_REPO`, which wins). |
 | `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
@@ -330,14 +330,16 @@ above configures the Mimir process. Omitted keys use the defaults below.
 | Top-level key | Type | Default | Effect | Example |
 |---|---|---|---|---|
 | `defaults` | mapping | `{}` | Holds routing, execution, autonomy, and compatibility defaults described below. | `defaults: {backend: opencode}` |
-| `repositories` | list[mapping] | undeclared | Declares each repository as one record containing `slug`, absolute checkout `root`, `mode` (`ro` or `rw`), exact GitHub `origin`, `base_branch`, optional `test_command`, and optional `worklink: true`. | See below. |
-| `allowed_roots` | list[mapping] | undeclared | Declares non-repository file-tool roots as `{root, mode}` records. These roots never participate in repository binding. | `allowed_roots: [{root: /benchmark, mode: rw}]` |
+| `repository` | `owner/repository` | unset | Names Worklink's target from the neutral `repositories.yaml` inventory. | `repository: owner/service` |
 | `routes` | list[mapping] | `[]` | Selects tool/compute backends using first-match-wins rules. | `routes: [{label: worklink:epic, backend: feature_factory}]` |
 | `backends` | mapping | `{}` | Configures the shipping tool-backend adapters. | `backends: {opencode: {bin: opencode}}` |
 | `compute_backends` | mapping | `{}` | Configures compute substrates; the sole shipping substrate accepts an empty block only. | `compute_backends: {local_subprocess: {}}` |
 | `tool_pins` | list[mapping] | `[]` | Records operator-owned external-tool pins for drift and bump issue generation. | `tool_pins: [{name: opencode, category: coding-cli, pin: "1.18.9", smoke: "opencode --version"}]` |
 
 ### Repository Inventory
+
+The neutral repository and file-root inventory lives in
+`<MIMIR_HOME>/repositories.yaml`, separate from Worklink's execution settings:
 
 ```yaml
 repositories:
@@ -347,7 +349,6 @@ repositories:
     origin: https://github.com/owner/service.git
     base_branch: trunk
     test_command: npm test
-    worklink: true
 allowed_roots:
   - root: /benchmark
     mode: rw
@@ -355,18 +356,26 @@ allowed_roots:
     mode: ro
 ```
 
+Worklink names its target in its own file:
+
+```yaml
+# worklink.yaml
+repository: owner/service
+```
+
 Declaring either inventory key enables the new source. Startup derives omitted
-`GITHUB_REPOS`, `MIMIR_FILE_TOOL_ROOTS`, and `WORKLINK_REPO` values; if a legacy
-value is still present, its effective value must agree exactly or startup fails
-with both values. This permits one-variable-at-a-time migration without widening
-file scope.
+`GITHUB_REPOS`, `MIMIR_FILE_TOOL_ROOTS`, and, when Worklink names a target,
+`WORKLINK_REPO` values; if a legacy value is still present, its effective value
+must agree exactly or startup fails with both values. This permits
+one-variable-at-a-time migration without widening file scope.
 
 Every repository root must exist, be the checkout top level, and have a local
-`remote.origin.url` exactly equal to `origin`. Duplicate slugs or roots, overlap
-between repository and allowed roots, and multiple `worklink: true` records are
-fatal. Run `MIMIR_HOME=/path/to/home mimir run` after editing the inventory; the
-preflight runs before application construction or socket binding and names the
-repository, expected origin, and observed origin on failure.
+`remote.origin.url` exactly equal to `origin`. Duplicate slugs or roots and
+an overlap between repository and allowed roots are fatal. A Worklink target
+that is absent from the neutral inventory is also fatal. Run
+`MIMIR_HOME=/path/to/home mimir run` after editing either file; the preflight
+runs before application construction or socket binding and names the repository,
+expected origin, and observed origin on failure.
 
 `repo_test` uses a repository `test_command` when present and otherwise falls
 back to `defaults.test_command`. It POSIX-splits the selected value into fixed

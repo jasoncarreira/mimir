@@ -8,6 +8,7 @@ import pytest
 
 from mimir import access_control
 from mimir.config import Config
+from mimir.repository_config import RepositoryInventory
 from mimir.worklink.backends.registry import WorklinkConfig
 
 
@@ -28,7 +29,7 @@ def _write_inventory(
     origin: str = "https://github.com/owner/repo.git",
 ) -> None:
     home.mkdir()
-    (home / "worklink.yaml").write_text(
+    (home / "repositories.yaml").write_text(
         f"""
 repositories:
   - slug: owner/repo
@@ -37,11 +38,14 @@ repositories:
     origin: {origin}
     base_branch: trunk
     test_command: /usr/bin/true --repository
-    worklink: true
 allowed_roots:
   - root: {allowed}
     mode: ro
 """.strip(),
+        encoding="utf-8",
+    )
+    (home / "worklink.yaml").write_text(
+        "repository: owner/repo\n",
         encoding="utf-8",
     )
 
@@ -69,7 +73,7 @@ def test_repository_record_drives_binding_roots_and_legacy_projections(
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
     config = Config.from_env()
-    record = WorklinkConfig.load(home / "worklink.yaml").repository("OWNER/REPO")
+    record = RepositoryInventory.load(home / "repositories.yaml").repository("OWNER/REPO")
 
     assert record is not None
     assert record.base_branch == "trunk"
@@ -84,6 +88,29 @@ def test_repository_record_drives_binding_roots_and_legacy_projections(
     assert allowed.resolve() not in access_control._configured_repo_roots()
     assert os.environ["GITHUB_REPOS"] == "owner/repo"
     assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
+
+
+def test_worklink_target_must_name_declared_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    (home / "worklink.yaml").write_text(
+        "repository: owner/missing\n",
+        encoding="utf-8",
+    )
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    with pytest.raises(
+        RuntimeError,
+        match="worklink.yaml repository does not name a declared repository: owner/missing",
+    ):
+        Config.from_env()
 
 
 def test_repository_origin_mismatch_is_fatal_and_names_both_origins(
@@ -149,8 +176,34 @@ def test_legacy_root_disagreement_fails_closed_with_both_values(
     assert str(allowed) in message
 
 
-def test_duplicate_repository_root_is_rejected(tmp_path: Path) -> None:
+def test_worklink_config_names_one_neutral_repository(tmp_path: Path) -> None:
     config = tmp_path / "worklink.yaml"
+    config.write_text("repository: OWNER/Service\n", encoding="utf-8")
+
+    assert WorklinkConfig.load(config).repository == "owner/service"
+
+
+def test_repository_inventory_rejects_worklink_back_reference(tmp_path: Path) -> None:
+    config = tmp_path / "repositories.yaml"
+    config.write_text(
+        f"""
+repositories:
+  - slug: owner/repo
+    root: {tmp_path / 'repo'}
+    mode: rw
+    origin: https://github.com/owner/repo.git
+    base_branch: main
+    worklink: true
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="contains unknown fields"):
+        RepositoryInventory.load(config)
+
+
+def test_duplicate_repository_root_is_rejected(tmp_path: Path) -> None:
+    config = tmp_path / "repositories.yaml"
     config.write_text(
         f"""
 repositories:
@@ -169,4 +222,4 @@ repositories:
     )
 
     with pytest.raises(ValueError, match="duplicate repository root"):
-        WorklinkConfig.load(config)
+        RepositoryInventory.load(config)

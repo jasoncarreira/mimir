@@ -1102,9 +1102,11 @@ def test_project_tests_prefer_repository_command_and_report_source(
     home = tmp_path / "home"
     home.mkdir()
     (home / "worklink.yaml").write_text(
+        "defaults:\n  test_command: /usr/bin/false\n",
+        encoding="utf-8",
+    )
+    (home / "repositories.yaml").write_text(
         f"""
-defaults:
-  test_command: /usr/bin/false
 repositories:
   - slug: owner/repo
     root: {scope.canonical_root}
@@ -1135,7 +1137,7 @@ def test_project_tests_refuse_unresolvable_repository_command(
     _origin, _source, scope, state, _tools = repo_tools
     home = tmp_path / "home"
     home.mkdir()
-    (home / "worklink.yaml").write_text(
+    (home / "repositories.yaml").write_text(
         f"""
 repositories:
   - slug: owner/repo

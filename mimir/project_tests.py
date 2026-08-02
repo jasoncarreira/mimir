@@ -18,6 +18,7 @@ from typing import Protocol
 from .models import RepoPRAction, RepoReviewState
 from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
+from .repository_config import RepositoryInventory
 from .worklink.backends.registry import WorklinkConfig
 
 
@@ -146,7 +147,8 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
         raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
     try:
         config = WorklinkConfig.load(Path(home) / "worklink.yaml")
-        record = config.repository(repo_slug) if config.repository_config_declared else None
+        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
+        record = inventory.repository(repo_slug) if inventory.declared else None
         if record is not None and record.test_command is not None:
             command = record.test_command
             source = "repository"

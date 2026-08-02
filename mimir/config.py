@@ -524,15 +524,17 @@ def _parse_file_tool_roots(
 
 def _configure_declared_repositories(home: Path) -> None:
     """Validate the repository inventory and reconcile its legacy projections."""
+    from .repository_config import RepositoryInventory
     from .worklink.backends.registry import WorklinkConfig
 
-    config = WorklinkConfig.load(home / "worklink.yaml")
-    if not config.repository_config_declared:
+    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    if not inventory.declared:
         return
+    worklink = WorklinkConfig.load(home / "worklink.yaml")
 
     declared_roots = tuple(
         (str(item.root), item.mode)
-        for item in (*config.repositories, *config.allowed_roots)
+        for item in (*inventory.repositories, *inventory.allowed_roots)
     )
     rendered_roots = ",".join(f"{path}:{mode}" for path, mode in declared_roots)
     effective_declared = _parse_file_tool_roots(rendered_roots, home, always_rw=())
@@ -547,13 +549,13 @@ def _configure_declared_repositories(home: Path) -> None:
         effective_legacy = _parse_file_tool_roots(legacy_roots, home, always_rw=())
         if dict(effective_legacy) != dict(declared_roots):
             raise RuntimeError(
-                "MIMIR_FILE_TOOL_ROOTS disagrees with worklink.yaml: "
+                "MIMIR_FILE_TOOL_ROOTS disagrees with repositories.yaml: "
                 f"legacy={effective_legacy!r}, declared={declared_roots!r}"
             )
     else:
         os.environ["MIMIR_FILE_TOOL_ROOTS"] = rendered_roots
 
-    declared_slugs = tuple(repo.slug for repo in config.repositories)
+    declared_slugs = tuple(repo.slug for repo in inventory.repositories)
     legacy_slugs = os.environ.get("GITHUB_REPOS")
     if legacy_slugs is not None:
         effective_slugs = tuple(
@@ -561,13 +563,18 @@ def _configure_declared_repositories(home: Path) -> None:
         )
         if set(effective_slugs) != set(declared_slugs):
             raise RuntimeError(
-                "GITHUB_REPOS disagrees with worklink.yaml: "
+                "GITHUB_REPOS disagrees with repositories.yaml: "
                 f"legacy={effective_slugs!r}, declared={declared_slugs!r}"
             )
     else:
         os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
 
-    target = config.worklink_repository
+    target = inventory.repository(worklink.repository) if worklink.repository else None
+    if worklink.repository is not None and target is None:
+        raise RuntimeError(
+            "worklink.yaml repository does not name a declared repository: "
+            f"{worklink.repository}"
+        )
     declared_target = str(target.root) if target is not None else None
     for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
         legacy_target = os.environ.get(name)
@@ -583,9 +590,9 @@ def _configure_declared_repositories(home: Path) -> None:
         os.environ["WORKLINK_REPO"] = declared_target
 
     git = shutil.which("git")
-    if git is None and config.repositories:
+    if git is None and inventory.repositories:
         raise RuntimeError("declared repositories cannot be validated: git is unavailable")
-    for repo in config.repositories:
+    for repo in inventory.repositories:
         found = "not a git checkout"
         try:
             top = subprocess.run(

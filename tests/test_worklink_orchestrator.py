@@ -774,9 +774,11 @@ def test_worklink_runner_uses_repository_base_over_deployment_default(tmp_path: 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  base_branch: deployment-default\nrepository: jasoncarreira/mimir\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "repositories.yaml").write_text(
         f"""
-defaults:
-  base_branch: deployment-default
 repositories:
   - slug: jasoncarreira/mimir
     root: {repo}
@@ -784,7 +786,6 @@ repositories:
     origin: https://github.com/jasoncarreira/mimir.git
     base_branch: repository-base
     test_command: echo repository-tests
-    worklink: true
 """.strip(),
         encoding="utf-8",
     )

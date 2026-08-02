@@ -49,6 +49,7 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
+from ..repository_config import RepositoryInventory
 from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -340,10 +341,11 @@ class WorklinkRunner:
                 )
             raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
+        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         registry = self.registry or BackendRegistry(config)
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
-        repository_config = config.repository(repo_slug)
+        repository_config = inventory.repository(repo_slug) if inventory.declared else None
         backend = (
             registry.get(backend_name)
             if backend_name
@@ -1102,7 +1104,8 @@ class WorklinkRunner:
 
         backend = registry.get("feature_factory")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
-        repository_config = config.repository(repo_slug)
+        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        repository_config = inventory.repository(repo_slug) if inventory.declared else None
 
         if autonomous:
             allowed, reason = config.autonomous_compute_allowed(compute.name, compute.capabilities())
