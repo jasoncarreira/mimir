@@ -198,6 +198,85 @@ def test_prompt_template_required_filesystem_operations_are_permitted(
         reset_current_turn(token)
 
 
+def test_heartbeat_can_read_safe_core_memory_but_not_write_or_read_secrets(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    core = home / "memory" / "core"
+    core.mkdir(parents=True)
+    identity = core / "00-identity.md"
+    patterns = core / "50-heartbeat-patterns.md"
+    protected_name = core / "config"
+    secret_content = core / "45-private-note.md"
+    identity.write_text("# Identity\n", encoding="utf-8")
+    patterns.write_text("# Heartbeat patterns\n", encoding="utf-8")
+    protected_name.write_text("operator settings\n", encoding="utf-8")
+    secret_content.write_text("ghp_" + "a" * 30 + "\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    authority = builtin_trigger_service_principal("heartbeat", home)
+    labels = InformationFlowLabels()
+    auth = AuthContext(
+        principal=f"service:{authority.canonical}",
+        canonical_principal=authority.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        interactivity=None,
+        is_service=True,
+        service_authority=authority,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+    )
+    turn = TurnContext(
+        turn_id="heartbeat-core-read-test",
+        session_id="scheduler:heartbeat",
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        started_at=0.0,
+        auth_context=auth,
+        ifc_labels=labels,
+    )
+    hard_denials = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: hard_denials.append((kind, fields)),
+    )
+    registry = ToolRegistry()
+    backend = WriteGuardBackend(
+        root_dir=home, writable_dirs=["state", "memory", "scratch"],
+    )
+
+    token = set_current_turn(turn)
+    try:
+        for path, expected in (
+            (identity, "# Identity\n"),
+            (patterns, "# Heartbeat patterns\n"),
+        ):
+            decision = registry.authorize_tool(
+                "read_file", auth, enforce=True,
+                arguments={"file_path": str(path)},
+            )
+            assert decision.allowed is True
+            result = backend.read(str(path))
+            assert result.error is None
+            assert result.file_data["content"] == expected
+        assert hard_denials == []
+
+        blocked_write = backend.write(str(patterns), "changed\n")
+        assert "read-only" in (blocked_write.error or "")
+
+        for path, reason in (
+            (protected_name, "protected_name_match"),
+            (secret_content, "protected_read_result"),
+        ):
+            result = backend.read(str(path))
+            assert f"Read denied: {reason}." in (result.error or "")
+    finally:
+        reset_current_turn(token)
+
+
 # ---- setup_home additions -----------------------------------------------
 
 

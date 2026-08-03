@@ -389,6 +389,10 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     auth_context = getattr(turn, "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
     roots = tuple(getattr(authority, "filesystem_read_roots", ()))
+    if getattr(auth_context, "is_service", False) and is_core_memory_read_path(path):
+        home = _resolved_mimir_home()
+        if home is not None:
+            roots += (str(home / "memory" / "core"),)
     owned_root = service_owned_channel_memory_root(auth_context)
     if owned_root is not None:
         roots += (str(owned_root),)
@@ -433,6 +437,8 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
+    if getattr(auth_context, "is_service", False) and is_core_memory_read_path(path):
+        return True
     if is_service_owned_channel_memory_path(path, auth_context):
         return True
     authority = getattr(auth_context, "service_authority", None)
