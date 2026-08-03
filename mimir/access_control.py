@@ -3452,35 +3452,6 @@ def _trigger_service_read_target_is_allowed(
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
-        home_candidate = candidate
-        if not candidate.is_absolute() or not (
-            candidate == home_root or candidate.is_relative_to(home_root)
-        ):
-            home_candidate = home_root / raw.lstrip("/")
-        if (
-            service.canonical == "synthesis"
-            and resolve_large_tool_results_target(raw) is None
-        ):
-            try:
-                resolved = home_candidate.resolve(strict=True)
-                relative = resolved.relative_to(home_root)
-            except (OSError, RuntimeError, ValueError):
-                return False
-            channel_matches = _synthesis_channel_target_matches_session(
-                str(resolved), getattr(auth_context, "channel_id", None),
-            )
-            shared_learnings = resolved == home_root / "memory" / "learnings-pending.md"
-            if not (channel_matches or shared_learnings):
-                return False
-            if (
-                _is_trigger_service_protected_read_path(relative)
-                or is_operator_secret_read_path(resolved)
-            ):
-                return False
-            return not (
-                tool_name in {"read_file", "aread"}
-                and (not resolved.is_file() or file_contains_secret(resolved))
-            )
         core_candidate = candidate
         if not candidate.is_absolute() or not (
             candidate == home_root or candidate.is_relative_to(home_root)
@@ -6222,18 +6193,6 @@ class ToolRegistry:
             if tool_name in READ_RESOURCE_OPERATIONS:
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                     allowed = True
-                elif (
-                    service_principal is not None
-                    and service_principal.canonical == "synthesis"
-                    and tool_name in {
-                        "read_file", "aread", "ls", "als", "glob", "aglob",
-                        "grep", "agrep",
-                    }
-                ):
-                    allowed = _trigger_service_read_target_is_allowed(
-                        service_principal, tool_name, arguments,
-                        auth_context=auth_context,
-                    )
                 elif service_allowed:
                     allowed = True
                 elif (

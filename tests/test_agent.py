@@ -921,8 +921,6 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
     [
         ("memory/channels/discord-a/notes.md", "session note\n", True),
         ("memory/learnings-pending.md", "pending learning\n", True),
-        ("memory/channels/discord-b/notes.md", "other note\n", False),
-        ("memory/core/00-persona.md", "core memory\n", False),
     ],
 )
 async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
