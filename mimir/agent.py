@@ -4000,7 +4000,15 @@ class Agent:
         ``turn_started`` event's ``recent_message_count``.
         """
         if event.trigger == "saga_session_end":
-            return await self._build_synthesis_prompt(ctx, event), []
+            synthesis_prompt = await self._build_synthesis_prompt(ctx, event)
+            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
+            return (
+                "## Current turn scratch\n\n"
+                f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
+                "is private to this turn; the shared `scratch/` root and other turns' "
+                f"workspaces are unreadable.\n\n{synthesis_prompt}",
+                [],
+            )
 
         auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         source_blocks: list[PromptBlock] = []
@@ -4313,6 +4321,9 @@ class Agent:
             ),
             trigger_capabilities=(
                 trigger_authority.capabilities if trigger_authority else None
+            ),
+            turn_scratch_path=str(
+                self._config.home / "scratch" / "turns" / ctx.turn_id
             ),
         )
         ctx.ifc_labels = _merge_ifc_labels(

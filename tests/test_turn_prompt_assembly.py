@@ -309,6 +309,7 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
     # The synthesis template carries the session id verbatim
     # (placeholder ``{saga_session_id}`` is filled by render).
     assert "sess-xyz" in turn_prompt
+    assert f"`{tmp_path}/scratch/turns/turn-test/`" in turn_prompt
     # The standard-turn ``## Today's date`` header should NOT be
     # present — synthesis uses its own scaffold.
     assert "## Today's date" not in turn_prompt
@@ -530,6 +531,19 @@ def test_build_turn_prompt_function_emits_all_blocks_when_supplied() -> None:
             f"mimir/prompts.py:build_turn_prompt for a missing "
             f"_add_labeled(\"{label}\", ...) call."
         )
+
+
+def test_build_turn_prompt_directs_scratch_to_server_supplied_turn_path() -> None:
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="user_message", channel_id="ch", content="work")
+    rendered = build_turn_prompt(
+        event, turn_scratch_path="/mimir-home/scratch/turns/server-turn-id",
+    )
+
+    assert "## Current turn scratch" in rendered
+    assert "`/mimir-home/scratch/turns/server-turn-id/`" in rendered
+    assert "shared `scratch/` root" in rendered
 
 
 @pytest.mark.asyncio

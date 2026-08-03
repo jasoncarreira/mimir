@@ -259,6 +259,9 @@ def is_protected_read_path(path: Path) -> bool:
         state = home / "state"
         memory = home / "memory"
         artifact_root = framework_large_tool_results_root(home)
+        from .access_control import current_turn_scratch_root
+
+        turn_scratch = current_turn_scratch_root()
         if not (
             resolved == state
             or resolved.is_relative_to(state)
@@ -266,6 +269,8 @@ def is_protected_read_path(path: Path) -> bool:
             or resolved.is_relative_to(memory)
             or artifact_root is not None
             and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
+            or turn_scratch is not None
+            and (resolved == turn_scratch or resolved.is_relative_to(turn_scratch))
         ):
             return True
     return False
@@ -343,7 +348,13 @@ def protected_read_denial_reason(path: Path) -> str | None:
     )
     general_protected = not service_scoped and is_protected_read_path(path)
     service_name_protected = is_current_service_protected_read_path(path)
-    if not (memory_scope_denied or general_protected or service_name_protected):
+    protected_name = _has_protected_read_name(path)
+    if not (
+        memory_scope_denied
+        or general_protected
+        or service_name_protected
+        or protected_name
+    ):
         return None
     if (
         getattr(auth_context, "is_service", False)
@@ -351,7 +362,7 @@ def protected_read_denial_reason(path: Path) -> str | None:
         and (memory_scope_denied or not service_scoped)
     ):
         return "service_scoped_read_boundary"
-    if service_name_protected or _has_protected_read_name(path):
+    if service_name_protected or protected_name:
         return "protected_name_match"
     return "mimir_home_read_boundary"
 
@@ -521,10 +532,14 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     configured_paths = [Path(path) for path, _mode in configured]
     configured_path_set = set(configured_paths)
     artifact_root = framework_large_tool_results_root(home)
+    from .access_control import current_turn_scratch_root
+
+    turn_scratch = current_turn_scratch_root()
     roots = [
         home / "state",
         home / "memory",
         *((artifact_root,) if artifact_root is not None else ()),
+        *((turn_scratch,) if turn_scratch is not None else ()),
         *configured_paths,
     ]
 
@@ -580,6 +595,9 @@ def resolve_non_admin_read_target(
         state = (home / "state").resolve(strict=True)
         memory = (home / "memory").resolve(strict=False)
         artifact_root = framework_large_tool_results_root(home)
+        from .access_control import current_turn_scratch_root
+
+        turn_scratch = current_turn_scratch_root()
     except (OSError, RuntimeError):
         return None
     if allow_home_root and all(
@@ -621,6 +639,8 @@ def resolve_non_admin_read_target(
         or resolved.is_relative_to(memory)
         or artifact_root is not None
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
+        or turn_scratch is not None
+        and (resolved == turn_scratch or resolved.is_relative_to(turn_scratch))
     ):
         return None
     # Bind the call to the most specific root named by the caller. A repo path

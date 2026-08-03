@@ -108,6 +108,8 @@ def test_system_prompt_renders_writable_dirs_and_scratch_guidance():
     assert "`state/`" in sp
     assert "ephemeral" in sp.lower()
     assert "throwaway clones" in sp
+    assert "current turn scratch path" in sp
+    assert "shared `scratch/` root" in sp
 
 
 def test_system_prompt_writable_dirs_absent_without_param():

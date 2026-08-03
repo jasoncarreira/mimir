@@ -350,7 +350,8 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     safe_file.write_text("safe\n", encoding="utf-8")
     fetched_file = fetch_cache / "body.txt"
     fetched_file.write_text("fetched\n", encoding="utf-8")
-    scratch_file = scratch / "pr-150-review.md"
+    scratch_file = scratch / "turns" / "fetch-cache-read" / "pr-150-review.md"
+    scratch_file.parent.mkdir(parents=True)
     scratch_file.write_text("review verdict\n", encoding="utf-8")
     own_memory_file = own_memory / "pr-reviews.md"
     own_memory_file.write_text("own channel notes\n", encoding="utf-8")
@@ -417,30 +418,36 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         str(framework_large_tool_results_root(home)),
     )
     assert service.owned_skill_directory == str(manifest_path.parent.resolve())
-    for tool_name, arguments in (
-        ("read_file", {"file_path": str(safe_file)}),
-        ("grep", {"path": str(repo), "pattern": "safe"}),
-    ):
-        decision = registry.authorize_tool(
-            tool_name, context, enforce=True, arguments=arguments,
-        )
-        assert decision.allowed is True, (tool_name, decision.reason)
-
-    for file_path in (
-        "attachments/fetch-cache/body.txt",
-        "/attachments/fetch-cache/body.txt",
-        "scratch/pr-150-review.md",
-        "/scratch/pr-150-review.md",
-        "memory/channels/poller:github-activity/pr-reviews.md",
-        "/memory/channels/poller:github-activity/pr-reviews.md",
-    ):
-        decision = registry.authorize_tool(
-            "read_file", context, enforce=True, arguments={"file_path": file_path},
-        )
-        assert decision.allowed is True, (file_path, decision.reason)
-
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.readonly_backend import WriteGuardBackend
+
+    auth_token = set_current_turn(SimpleNamespace(
+        turn_id="fetch-cache-read", auth_context=context,
+    ))
+    try:
+        for tool_name, arguments in (
+            ("read_file", {"file_path": str(safe_file)}),
+            ("grep", {"path": str(repo), "pattern": "safe"}),
+        ):
+            decision = registry.authorize_tool(
+                tool_name, context, enforce=True, arguments=arguments,
+            )
+            assert decision.allowed is True, (tool_name, decision.reason)
+
+        for file_path in (
+            "attachments/fetch-cache/body.txt",
+            "/attachments/fetch-cache/body.txt",
+            "scratch/turns/fetch-cache-read/pr-150-review.md",
+            "/scratch/turns/fetch-cache-read/pr-150-review.md",
+            "memory/channels/poller:github-activity/pr-reviews.md",
+            "/memory/channels/poller:github-activity/pr-reviews.md",
+        ):
+            decision = registry.authorize_tool(
+                "read_file", context, enforce=True, arguments={"file_path": file_path},
+            )
+            assert decision.allowed is True, (file_path, decision.reason)
+    finally:
+        reset_current_turn(auth_token)
 
     hard_denials = []
     monkeypatch.setattr(
@@ -452,7 +459,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         backend = WriteGuardBackend(home, ["state"])
         for file_path, expected in (
             ("/attachments/fetch-cache/body.txt", "fetched\n"),
-            ("/scratch/pr-150-review.md", "review verdict\n"),
+            ("/scratch/turns/fetch-cache-read/pr-150-review.md", "review verdict\n"),
             (str(core_file), "core memory\n"),
             (str(issue_note), "shared issue\n"),
             (str(shared_learnings), "shared queue\n"),
@@ -468,9 +475,9 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
 
         expected_denials = {
             other_memory_file: "service_scoped_read_boundary",
-            identities_file: "service_scoped_read_boundary",
+            identities_file: "protected_name_match",
             prompt_file: "service_scoped_read_boundary",
-            operator_secret: "protected_name_match",
+            operator_secret: "service_scoped_read_boundary",
         }
         for target, reason in expected_denials.items():
             read_result = backend.read(str(target))
@@ -507,11 +514,20 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     )
     assert core_decision.allowed is True
 
-    for target in (persist_dir / "cursor.json", scratch / "pr-1221-review.md"):
-        decision = registry.authorize_tool(
-            "write_file", context, enforce=True, target_channel=str(target),
-        )
-        assert decision.allowed is True, (target, decision.reason)
+    write_token = set_current_turn(SimpleNamespace(
+        turn_id="fetch-cache-read", auth_context=context,
+    ))
+    try:
+        for target in (
+            persist_dir / "cursor.json",
+            scratch / "turns" / "fetch-cache-read" / "pr-1221-review.md",
+        ):
+            decision = registry.authorize_tool(
+                "write_file", context, enforce=True, target_channel=str(target),
+            )
+            assert decision.allowed is True, (target, decision.reason)
+    finally:
+        reset_current_turn(write_token)
     for target in (repo / "changed.py", tmp_path / "outside-review.md"):
         decision = registry.authorize_tool(
             "write_file", context, enforce=True, target_channel=str(target),
