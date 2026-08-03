@@ -1821,23 +1821,33 @@ def _repo_review_argv_with_captured_body(argv: list[str]) -> list[str] | None:
     return out
 
 
+def _git_arguments_without_restrictive_global_options(
+    arguments: list[str],
+) -> list[str]:
+    """Strip global Git options that can only make inspection more restrictive."""
+    while arguments[:1] and arguments[0] in {"--no-pager", "--no-ext-diff"}:
+        arguments = arguments[1:]
+    return arguments
+
+
 def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | None:
     """Return hardened argv for repo inspection or branch-scoped mutation."""
     if not argv or argv[0] != "git":
         return None
-    if argv[1:2] == ["-C"]:
-        if state is None or len(argv) < 4:
+    git_arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    if git_arguments[:1] == ["-C"]:
+        if state is None or len(git_arguments) < 3:
             return None
         try:
-            if Path(argv[2]).resolve() != Path(state.root).resolve():
+            if Path(git_arguments[1]).resolve() != Path(state.root).resolve():
                 return None
         except (OSError, RuntimeError):
             return None
-        subcommand = argv[3]
-        arguments = argv[4:]
-    elif len(argv) >= 2:
-        subcommand = argv[1]
-        arguments = argv[2:]
+        subcommand = git_arguments[2]
+        arguments = git_arguments[3:]
+    elif git_arguments:
+        subcommand = git_arguments[0]
+        arguments = git_arguments[1:]
     else:
         return None
     arguments = list(arguments)
@@ -2312,12 +2322,14 @@ def _target_matches_repo_review_shell_command(
         # option is permitted.
         return True
 
-    if argv[0] == "git" and review_state is not None and argv[1:2] == ["-C"]:
-        return _repo_review_git_execution_argv(argv, review_state) is not None
-
-    if argv[0] == "git" and len(argv) >= 2:
-        subcommand = argv[1]
-        arguments = argv[2:]
+    if argv[0] == "git":
+        git_arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+        if review_state is not None and git_arguments[:1] == ["-C"]:
+            return _repo_review_git_execution_argv(argv, review_state) is not None
+        if not git_arguments:
+            return False
+        subcommand = git_arguments[0]
+        arguments = git_arguments[1:]
         if review_state is not None and subcommand in {
             "add", "checkout", "commit", "pull", "push", "worktree",
         }:
@@ -2563,9 +2575,7 @@ def _upgrade_workspace_git_execution_argv(argv: list[str]) -> list[str] | None:
     """Harden read-only Git after binding ``-C`` to ``scratch/proposals``."""
     if not argv or argv[0] != "git":
         return None
-    arguments = argv[1:]
-    while arguments[:1] and arguments[0] in {"--no-pager", "--no-ext-diff"}:
-        arguments = arguments[1:]
+    arguments = _git_arguments_without_restrictive_global_options(argv[1:])
     if arguments[:1] != ["-C"] or len(arguments) < 3:
         return None
     requested_root = arguments[1]
