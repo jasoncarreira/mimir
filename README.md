@@ -148,7 +148,10 @@ See **[docs/configuration.md](./docs/configuration.md)** for the complete
 reference of every environment variable mimir reads — types, defaults, and what
 each does, including the opt-in feature flags (auto-deliver, activity panel,
 mid-turn injection, …) that are easy to miss. `.env.example` is a copy-paste
-starter covering the common ones. See the
+starter covering the common ones. Operators enabling autonomous code builds
+should follow the **[end-to-end code-building pipeline](./docs/code-building-pipeline.md)**
+for repository inventory, strict Chainlink leaves, dispatch, claims, PR evidence,
+and GitHub review polling. See the
 **[authorization reference](./docs/authorization.md)** for identity roles,
 requester-resource decisions, trusted services, IFC, and the shadow-first
 enablement runbook. Authorization enforcement is default-off, and every model
