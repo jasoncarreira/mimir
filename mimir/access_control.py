@@ -3431,9 +3431,9 @@ def _trigger_service_read_target_is_allowed(
     """Authorize a service read against frozen roots and verified ownership."""
     from .read_policy import (
         file_contains_secret,
-        is_core_memory_read_path,
+        is_memory_read_path,
+        is_memory_read_path_allowed,
         is_operator_secret_read_path,
-        service_owned_channel_memory_root,
     )
 
     args = arguments if isinstance(arguments, dict) else {}
@@ -3446,34 +3446,35 @@ def _trigger_service_read_target_is_allowed(
         return False
     candidate = Path(raw)
     roots = tuple(Path(root) for root in service.filesystem_read_roots)
-    owned_root = service_owned_channel_memory_root(auth_context)
-    if owned_root is not None:
-        roots += (owned_root,)
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
-        core_candidate = candidate
+        memory_candidate = candidate
         if not candidate.is_absolute() or not (
             candidate == home_root or candidate.is_relative_to(home_root)
         ):
-            core_candidate = home_root / raw.lstrip("/")
+            memory_candidate = home_root / raw.lstrip("/")
         try:
-            resolved_core_candidate = core_candidate.resolve(strict=True)
+            resolved_memory_candidate = memory_candidate.resolve(strict=True)
         except (OSError, RuntimeError):
-            resolved_core_candidate = None
+            resolved_memory_candidate = None
         if (
-            resolved_core_candidate is not None
-            and is_core_memory_read_path(resolved_core_candidate)
+            resolved_memory_candidate is not None
+            and is_memory_read_path(resolved_memory_candidate)
         ):
+            if not is_memory_read_path_allowed(
+                memory_candidate, auth_context,
+            ):
+                return False
             if _is_trigger_service_protected_read_path(
-                resolved_core_candidate.relative_to(home_root / "memory" / "core")
-            ) or is_operator_secret_read_path(resolved_core_candidate):
+                resolved_memory_candidate.relative_to(home_root / "memory")
+            ) or is_operator_secret_read_path(resolved_memory_candidate):
                 return False
             return not (
                 tool_name in {"read_file", "aread"}
                 and (
-                    not resolved_core_candidate.is_file()
-                    or file_contains_secret(resolved_core_candidate)
+                    not resolved_memory_candidate.is_file()
+                    or file_contains_secret(resolved_memory_candidate)
                 )
             )
     if home:
@@ -6193,8 +6194,6 @@ class ToolRegistry:
             if tool_name in READ_RESOURCE_OPERATIONS:
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                     allowed = True
-                elif service_allowed:
-                    allowed = True
                 elif (
                     service_principal is not None
                     and tool_name in {
@@ -6202,10 +6201,24 @@ class ToolRegistry:
                         "grep", "agrep",
                     }
                 ):
-                    allowed = _trigger_service_read_target_is_allowed(
+                    scoped_read_allowed = _trigger_service_read_target_is_allowed(
                         service_principal, tool_name, arguments,
                         auth_context=auth_context,
                     )
+                    resolved_read_target = resolved_read_target_from_arguments(
+                        tool_name, arguments,
+                    )
+                    from .read_policy import is_memory_read_path
+
+                    targets_memory = (
+                        resolved_read_target is not None
+                        and is_memory_read_path(Path(resolved_read_target))
+                    )
+                    allowed = scoped_read_allowed or (
+                        service_allowed and not targets_memory
+                    )
+                elif service_allowed:
+                    allowed = True
                 else:
                     allowed = (
                         auth_context is not None
