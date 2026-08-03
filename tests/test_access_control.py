@@ -2145,6 +2145,7 @@ def test_service_shell_final_binding_refusal_emits_hard_denial(
         "reason": "service_shell_argv_binding_failed",
         "target": None,
         "trigger": "scheduled_tick",
+        "channel_id": "scheduler:test",
         "service_principal": "scheduler",
         "argv": [
             "gh", "pr", "view", "7", "--repo", "o/r", "--json",

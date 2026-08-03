@@ -89,6 +89,83 @@ def _make_request(
     )
 
 
+def _service_turn(tmp_path: Path, channel_id: str | None) -> TurnContext:
+    service = builtin_trigger_service_principal("session-boundary", tmp_path)
+    auth_context = AuthContext(
+        principal=f"service:{service.canonical}",
+        canonical_principal=service.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger="saga_session_end",
+        channel_id=channel_id,
+        interactivity=None,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=True,
+    )
+    return TurnContext(
+        turn_id="read-denial",
+        session_id=channel_id or "unbound",
+        trigger="saga_session_end",
+        channel_id=channel_id,
+        started_at=time.monotonic(),
+        auth_context=auth_context,
+    )
+
+
+def test_service_read_denial_emits_bound_session_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import emit_hard_read_denial
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    token = set_current_turn(_service_turn(tmp_path, "session-channel"))
+    try:
+        emit_hard_read_denial(
+            "read_file",
+            "/memory/channels/denied-target/secret.md",
+            "service_scoped_read_boundary",
+        )
+    finally:
+        reset_current_turn(token)
+
+    kind, fields = captured[0]
+    assert kind == "hard_boundary_denied"
+    assert fields["channel_id"] == "session-channel"
+
+
+def test_service_read_denial_emits_null_for_unbound_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import emit_hard_read_denial
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    token = set_current_turn(_service_turn(tmp_path, None))
+    try:
+        emit_hard_read_denial(
+            "read_file",
+            "/memory/channels/denied-target/secret.md",
+            "service_scoped_read_boundary",
+        )
+    finally:
+        reset_current_turn(token)
+
+    kind, fields = captured[0]
+    assert kind == "hard_boundary_denied"
+    assert "channel_id" in fields
+    assert fields["channel_id"] is None
+
+
 @pytest.mark.parametrize(
     ("tool_name", "args", "reason"),
     [

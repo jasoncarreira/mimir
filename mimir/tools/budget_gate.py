@@ -259,6 +259,7 @@ def _emit_hard_boundary_denied(
             or getattr(auth_context, "trigger", None)
             or getattr(turn_context, "trigger", None)
         ),
+        "channel_id": getattr(auth_context, "channel_id", None),
         "service_principal": service.canonical if service is not None else None,
     }
     if event_fields:
