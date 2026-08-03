@@ -12,6 +12,7 @@ lane proposal.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -742,6 +743,30 @@ async def enqueue_upgrade_reconciliation_turn(
     content = prompt
     for placeholder, value in replacements.items():
         content = content.replace(placeholder, value)
+    operator_channel = os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", "").strip()
+    channel_instruction = (
+        f"Send the notification to the configured operator alert channel "
+        f"`{operator_channel}`."
+        if operator_channel
+        else "No operator alert channel is configured; skip the notification."
+    )
+    # Muninn's observed `gh pr view`/`gh pr list`, shell `ls` with a pipe
+    # or glob, and `list_channels` refusals were all correct and shadow-only:
+    # they carried would_block=True/is_shadow_decision=True while enforcement
+    # was disabled. This guidance prevents those calls before enforcement is enabled.
+    content += (
+        "\n\n## Reconciliation access boundaries\n\n"
+        "If you need to inspect the proposal PR after `submit_proposal`, parse the "
+        "repository and pull-request number from the returned PR URL and use only "
+        "`pr_metadata`, `pr_checks`, `pr_reviews`, or `pr_comments`. Do not run "
+        "`gh pr view` or `gh pr list`; `gh` is intentionally outside this "
+        "principal's shell profile.\n\n"
+        "Use the typed file tools (`read_file`, `ls`, `glob`, and `grep`) as "
+        "separate calls for workspace inspection. Do not run shell `ls`, and do "
+        "not compose a pipe or shell glob.\n\n"
+        "Do not call `list_channels` to discover a notification target. "
+        f"{channel_instruction}"
+    )
     event = AgentEvent(
         trigger=UPGRADE_TRIGGER,
         channel_id=f"{UPGRADE_CHANNEL_PREFIX}{result.version}",
