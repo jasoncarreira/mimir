@@ -347,6 +347,7 @@ class TestMiddlewareBlocksProhibited:
             "reason": "prohibited_action",
             "target": "git push --force origin main # token=[REDACTED]",
             "trigger": "user_message",
+            "channel_id": "test-channel",
             "service_principal": None,
         }
 
