@@ -1394,22 +1394,49 @@ def test_project_test_scope_action_and_active_lease_guards_are_pinned(
     assert inactive.value.code == "inactive_checkout"
 
 
-def test_project_test_output_limit_returns_no_partial_unredactable_output(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("exit_code", "final_line", "expected_ok", "expected_code"),
+    [
+        (0, "FINAL PASS: 8000 passed", True, "tests_passed"),
+        (1, "FAILED tests/test_chatty.py::test_failure", False, "tests_failed"),
+    ],
+)
+def test_project_test_output_limit_preserves_real_status_and_final_lines(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    final_line: str,
+    expected_ok: bool,
+    expected_code: str,
 ) -> None:
     state = repo_tools[-2]
+    runner = tmp_path / f"chatty-{exit_code}"
+    runner.write_text(
+        "#!/bin/sh\n"
+        "i=0\n"
+        "while [ $i -lt 8000 ]; do\n"
+        "  printf 'progress-%05d\\n' \"$i\"\n"
+        "  i=$((i + 1))\n"
+        "done\n"
+        f"printf '%s\\n' '{final_line}'\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o755)
     home = tmp_path / "home"
-    _configure_worklink_test(home)
+    _configure_worklink_test(home, str(runner))
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        return ProjectTestProcessResult(
-            -9, stdout="possibly-partial-secret", output_limited=True,
-        )
+    result = RepoProjectTests(state).execute()
 
-    result = RepoProjectTests(state, runner=runner).execute()
-    assert result.code == "test_output_limit"
-    assert result.stdout == result.stderr == ""
+    assert result.ok is expected_ok
+    assert result.code == expected_code
+    assert result.returncode == exit_code
+    assert final_line in result.stdout
+    assert result.output_limited is True
+    assert result.stdout_dropped_bytes > 0
+    assert result.stderr_dropped_bytes == 0
 
 
 @pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])

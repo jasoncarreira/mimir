@@ -48,6 +48,8 @@ class ProjectTestProcessResult:
     stderr: str = ""
     timed_out: bool = False
     output_limited: bool = False
+    stdout_dropped_bytes: int = 0
+    stderr_dropped_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,9 @@ class ProjectTestResult:
     stderr: str = ""
     command: tuple[str, ...] = ()
     command_source: str = ""
+    output_limited: bool = False
+    stdout_dropped_bytes: int = 0
+    stderr_dropped_bytes: int = 0
 
 
 class ProjectTestRunner(Protocol):
@@ -100,7 +105,7 @@ def _bounded_project_test_runner(
         selector.register(stream, io_selectors.EVENT_READ)
     deadline = time.monotonic() + timeout
     timed_out = False
-    output_limited = False
+    dropped_bytes = {process.stdout: 0, process.stderr: 0}
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
@@ -114,14 +119,12 @@ def _bounded_project_test_runner(
                     selector.unregister(stream)
                     continue
                 target = streams[stream]
-                room = output_limit - len(target)
-                target.extend(chunk[:max(room, 0)])
-                if len(chunk) > room:
-                    output_limited = True
-                    break
-            if output_limited:
-                break
-        if timed_out or output_limited:
+                target.extend(chunk)
+                overflow = len(target) - output_limit
+                if overflow > 0:
+                    del target[:overflow]
+                    dropped_bytes[stream] += overflow
+        if timed_out:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -131,12 +134,22 @@ def _bounded_project_test_runner(
         selector.close()
         for stream in streams:
             stream.close()
+    for stream, target in streams.items():
+        if dropped_bytes[stream]:
+            # The ring boundary may bisect a token that prefix-based redaction
+            # would then miss. Retain only complete trailing lines.
+            newline = target.find(b"\n")
+            unsafe_prefix = len(target) if newline < 0 else newline + 1
+            del target[:unsafe_prefix]
+            dropped_bytes[stream] += unsafe_prefix
     return ProjectTestProcessResult(
         returncode,
         bytes(streams[process.stdout]).decode("utf-8", "replace"),
         bytes(streams[process.stderr]).decode("utf-8", "replace"),
         timed_out,
-        output_limited,
+        any(dropped_bytes.values()),
+        dropped_bytes[process.stdout],
+        dropped_bytes[process.stderr],
     )
 
 
@@ -342,9 +355,9 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
     return tuple(validated)
 
 
-def _safe_output(text: str, root: Path, limit: int) -> str:
+def _safe_output(text: str, root: Path, limit: int, *, keep_tail: bool = False) -> str:
     scrubbed = redact_text(text).replace(str(root), "<checkout>")
-    return scrubbed[:limit]
+    return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
 
 
 class RepoProjectTests:
@@ -406,19 +419,25 @@ class RepoProjectTests:
                 False, "test_timeout", None,
                 command=command, command_source=command_source,
             )
-        if result.output_limited:
-            # A token cut at the capture boundary cannot be safely redacted.
-            return ProjectTestResult(
-                False, "test_output_limit", result.returncode,
-                command=command, command_source=command_source,
-            )
-        stdout = _safe_output(result.stdout, root, _RETURN_STDOUT_CHARS)
-        stderr = _safe_output(result.stderr, root, _RETURN_STDERR_CHARS)
+        stdout = _safe_output(
+            result.stdout, root, _RETURN_STDOUT_CHARS,
+            keep_tail=result.stdout_dropped_bytes > 0,
+        )
+        stderr = _safe_output(
+            result.stderr, root, _RETURN_STDERR_CHARS,
+            keep_tail=result.stderr_dropped_bytes > 0,
+        )
+        truncation = {
+            "output_limited": result.output_limited,
+            "stdout_dropped_bytes": result.stdout_dropped_bytes,
+            "stderr_dropped_bytes": result.stderr_dropped_bytes,
+        }
         if result.returncode != 0:
             return ProjectTestResult(
                 False, "tests_failed", result.returncode, stdout, stderr,
-                command, command_source,
+                command, command_source, **truncation,
             )
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
+            **truncation,
         )
