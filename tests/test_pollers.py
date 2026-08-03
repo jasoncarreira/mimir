@@ -366,6 +366,9 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     prompt_file.write_text("operator prompt\n", encoding="utf-8")
     shared_learnings = home / "memory" / "learnings-pending.md"
     shared_learnings.write_text("shared queue\n", encoding="utf-8")
+    issue_note = home / "memory" / "issues" / "declarative-guard-test-vacuity.md"
+    issue_note.parent.mkdir()
+    issue_note.write_text("shared issue\n", encoding="utf-8")
     operator_secret = scratch / "operator-settings.json"
     operator_secret.write_text("{}\n", encoding="utf-8")
     protected_names = (
@@ -450,6 +453,8 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
             ("/attachments/fetch-cache/body.txt", "fetched\n"),
             ("/scratch/pr-150-review.md", "review verdict\n"),
             (str(core_file), "core memory\n"),
+            (str(issue_note), "shared issue\n"),
+            (str(shared_learnings), "shared queue\n"),
             (
                 "/memory/channels/poller:github-activity/pr-reviews.md",
                 "own channel notes\n",
@@ -462,7 +467,6 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
 
         expected_denials = {
             other_memory_file: "service_scoped_read_boundary",
-            shared_learnings: "service_scoped_read_boundary",
             identities_file: "service_scoped_read_boundary",
             prompt_file: "service_scoped_read_boundary",
             operator_secret: "protected_name_match",

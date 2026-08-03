@@ -790,19 +790,20 @@ def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
     own_note = home / "memory" / "channels" / "channel-a" / "summary.md"
     other_note = home / "memory" / "channels" / "channel-b" / "summary.md"
     core_note = home / "memory" / "core" / "00-persona.md"
-    protected_note = own_note.parent / "secrets" / "token.txt"
+    issue_note = home / "memory" / "issues" / "issue.md"
+    protected_note = issue_note.parent / "secrets" / "token.txt"
     shared_learnings = home / "memory" / "learnings-pending.md"
-    operator_secret = own_note.parent / "operator-settings.json"
+    content_secret = home / "memory" / "shared" / "notes.md"
     repository_note = tmp_path / "repo" / "README.md"
     for path in (
-        own_note, other_note, core_note, protected_note, shared_learnings,
-        operator_secret, repository_note,
+        own_note, other_note, core_note, issue_note, protected_note,
+        shared_learnings, content_secret, repository_note,
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("safe notes\n", encoding="utf-8")
+    content_secret.write_text("ghp_" + "a" * 30, encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repository_note.parent}:ro")
-    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(operator_secret))
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", home,
     )
@@ -813,9 +814,9 @@ def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
     registry = ToolRegistry()
 
     argument_name = "file_path" if tool_name == "read_file" else "path"
-    # The channel/shared-memory grant is additive: synthesis retains the
+    # The memory grant is additive: synthesis retains the
     # repository roots declared by its principal instead of narrowing to memory.
-    for target in (own_note, shared_learnings, repository_note):
+    for target in (own_note, core_note, issue_note, shared_learnings, repository_note):
         decision = registry.authorize_tool(
             tool_name,
             auth,
@@ -823,6 +824,43 @@ def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
             arguments={argument_name: str(target)},
         )
         assert decision.allowed is True, (target, decision.reason)
+
+    denied_targets = [other_note, protected_note]
+    if tool_name == "read_file":
+        denied_targets.append(content_secret)
+    for target in denied_targets:
+        decision = registry.authorize_tool(
+            tool_name,
+            auth,
+            enforce=True,
+            arguments={argument_name: str(target)},
+        )
+        assert decision.allowed is False, target
+
+
+def test_memory_read_rule_compares_session_channel_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import is_memory_read_path_allowed
+
+    home = tmp_path / "home"
+    own = home / "memory" / "channels" / "channel-a" / "summary.md"
+    other = home / "memory" / "channels" / "channel-b" / "summary.md"
+    for path in (own, other):
+        path.parent.mkdir(parents=True)
+        path.write_text("notes\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = replace(
+        _service_auth(
+            access_control.builtin_trigger_service_principal("session-boundary", home),
+            InformationFlowLabels(),
+        ),
+        channel_id="channel-a",
+    )
+
+    assert is_memory_read_path_allowed(own, auth) is True
+    assert is_memory_read_path_allowed(other, auth) is False
 
 
 

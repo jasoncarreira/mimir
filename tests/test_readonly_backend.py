@@ -1473,7 +1473,7 @@ class TestBuildFileToolRoutes:
         assert ls_names == {"safe.txt"}
 
     @pytest.mark.parametrize("home_location", ["route", "tmp"])
-    def test_non_admin_home_collections_only_surface_state(
+    def test_non_admin_home_collections_surface_state_and_memory(
         self,
         home_location: str,
         tmp_path: Path,
@@ -1528,9 +1528,13 @@ class TestBuildFileToolRoutes:
 
                 shutil.rmtree(home, ignore_errors=True)
 
-        assert grep_paths == {"/home/state/visible.txt"}
-        assert glob_paths == {"/home/state/visible.txt"}
-        assert ls_names == {"state"}
+        assert grep_paths == {
+            "/home/memory/hidden.txt", "/home/state/visible.txt",
+        }
+        assert glob_paths == {
+            "/home/memory/hidden.txt", "/home/state/visible.txt",
+        }
+        assert ls_names == {"memory", "state"}
 
 
 class TestFileToolRouter:

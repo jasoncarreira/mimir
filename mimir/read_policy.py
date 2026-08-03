@@ -186,8 +186,7 @@ def non_admin_read_filter_enabled() -> bool:
     authority = getattr(auth_context, "service_authority", None)
     service_has_read_scope = bool(
         getattr(authority, "filesystem_read_roots", ())
-        or service_owned_channel_memory_root(auth_context)
-        or synthesis_session_channel_memory_root(auth_context)
+        or getattr(auth_context, "is_service", False)
     )
     return "admin" not in roles and (
         not getattr(auth_context, "is_service", False) or service_has_read_scope
@@ -258,13 +257,13 @@ def is_protected_read_path(path: Path) -> bool:
     home = _resolved_mimir_home()
     if home is not None and (resolved == home or resolved.is_relative_to(home)):
         state = home / "state"
-        core = home / "memory" / "core"
+        memory = home / "memory"
         artifact_root = framework_large_tool_results_root(home)
         if not (
             resolved == state
             or resolved.is_relative_to(state)
-            or resolved == core
-            or resolved.is_relative_to(core)
+            or resolved == memory
+            or resolved.is_relative_to(memory)
             or artifact_root is not None
             and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
         ):
@@ -288,129 +287,47 @@ def _has_protected_read_name(path: Path) -> bool:
     )
 
 
-def is_core_memory_read_path(path: Path) -> bool:
-    """Return whether ``path`` is in this home's already-rendered core memory."""
+def is_memory_read_path(path: Path) -> bool:
+    """Return whether ``path`` lexically or physically targets this home's memory."""
     home = _resolved_mimir_home()
     if home is None:
         return False
+    memory = home / "memory"
+    if path.is_absolute() and (path == memory or path.is_relative_to(memory)):
+        return True
     try:
         resolved = path.resolve()
     except (OSError, RuntimeError):
         return False
-    core = home / "memory" / "core"
-    return resolved == core or resolved.is_relative_to(core)
+    return resolved == memory or resolved.is_relative_to(memory)
 
 
-def service_owned_channel_memory_root(auth_context: Any) -> Path | None:
-    """Return the channel-memory root owned by a server-authenticated service.
-
-    Shared memory such as ``memory/learnings-pending.md`` has no owning
-    principal and is intentionally outside this ownership grant.
-    """
-    if not getattr(auth_context, "is_service", False):
-        return None
-    authority = getattr(auth_context, "service_authority", None)
-    canonical = getattr(auth_context, "canonical_principal", None)
-    directory = getattr(authority, "channel_memory_directory", None)
-    if (
-        not isinstance(canonical, str)
-        or not canonical
-        or getattr(authority, "canonical", None) != canonical
-        or not isinstance(directory, str)
-        or not directory
-        or Path(directory).name != directory
-        or directory in {".", ".."}
-    ):
-        return None
+def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
+    """Allow memory reads except beneath a different session's channel directory."""
     home = _resolved_mimir_home()
-    if home is None:
-        return None
-    root = home / "memory" / "channels" / directory
-    try:
-        if root.is_symlink():
-            return None
-    except OSError:
-        return None
-    return root
-
-
-def synthesis_session_channel_memory_root(auth_context: Any) -> Path | None:
-    """Return the channel-memory root bound to a trusted synthesis turn."""
-    authority = getattr(auth_context, "service_authority", None)
     channel_id = getattr(auth_context, "channel_id", None)
-    if (
-        not getattr(auth_context, "is_service", False)
-        or getattr(auth_context, "canonical_principal", None) != "synthesis"
-        or getattr(authority, "canonical", None) != "synthesis"
-        or not isinstance(channel_id, str)
-        or not channel_id
-        or Path(channel_id).name != channel_id
-        or channel_id in {".", ".."}
-    ):
-        return None
-    home = _resolved_mimir_home()
     if home is None:
-        return None
-    return home / "memory" / "channels" / channel_id
-
-
-def _is_synthesis_session_channel_memory_path(path: Path, auth_context: Any) -> bool:
-    root = synthesis_session_channel_memory_root(auth_context)
-    if root is None:
         return False
+    memory = home / "memory"
     try:
         resolved = path.resolve(strict=True)
+        resolved_memory = memory.resolve(strict=True)
     except (OSError, RuntimeError):
         return False
-    # Keep write and read channel ownership on the same channel-only predicate.
-    from .access_control import _synthesis_channel_target_matches_session
-
-    return _synthesis_channel_target_matches_session(
-        str(resolved), getattr(auth_context, "channel_id", None),
-    )
-
-
-def _is_synthesis_shared_memory_path(path: Path, auth_context: Any) -> bool:
-    """Admit only the one shared memory file synthesis already writes."""
-    authority = getattr(auth_context, "service_authority", None)
-    home = _resolved_mimir_home()
-    if (
-        home is None
-        or not getattr(auth_context, "is_service", False)
-        or getattr(auth_context, "canonical_principal", None) != "synthesis"
-        or getattr(authority, "canonical", None) != "synthesis"
-    ):
+    if not (resolved == resolved_memory or resolved.is_relative_to(resolved_memory)):
         return False
+
+    relatives: list[Path] = [resolved.relative_to(resolved_memory)]
     try:
-        return path.resolve(strict=True) == home / "memory" / "learnings-pending.md"
-    except (OSError, RuntimeError):
+        if path.is_absolute() and (path == memory or path.is_relative_to(memory)):
+            relatives.append(path.relative_to(memory))
+    except ValueError:
         return False
-
-
-def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
-    """Return whether an existing path is in the authenticated service's memory."""
-    root = service_owned_channel_memory_root(auth_context)
-    if root is None:
-        return False
-    try:
-        resolved_root = root.resolve(strict=True)
-    except (OSError, RuntimeError):
-        try:
-            targets_owned_root = path == root or path.is_relative_to(root)
-        except (OSError, RuntimeError, ValueError):
-            targets_owned_root = False
-        if targets_owned_root:
-            emit_hard_read_denial(
-                "read_file",
-                str(root),
-                "service_owned_channel_memory_root_missing",
-            )
-        return False
-    try:
-        resolved = path.resolve(strict=True)
-    except (OSError, RuntimeError):
-        return False
-    return resolved == resolved_root or resolved.is_relative_to(resolved_root)
+    for relative in relatives:
+        if relative.parts[:1] == ("channels",) and len(relative.parts) > 1:
+            if relative.parts[1] != channel_id:
+                return False
+    return True
 
 
 def protected_read_denial_reason(path: Path) -> str | None:
@@ -420,14 +337,18 @@ def protected_read_denial_reason(path: Path) -> str | None:
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
+    memory_scope_denied = (
+        is_memory_read_path(path)
+        and not is_memory_read_path_allowed(path, auth_context)
+    )
     general_protected = not service_scoped and is_protected_read_path(path)
     service_name_protected = is_current_service_protected_read_path(path)
-    if not (general_protected or service_name_protected):
+    if not (memory_scope_denied or general_protected or service_name_protected):
         return None
     if (
         getattr(auth_context, "is_service", False)
         and getattr(authority, "filesystem_read_roots", ())
-        and not service_scoped
+        and (memory_scope_denied or not service_scoped)
     ):
         return "service_scoped_read_boundary"
     if service_name_protected or _has_protected_read_name(path):
@@ -443,12 +364,9 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     auth_context = getattr(turn, "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
     roots = tuple(getattr(authority, "filesystem_read_roots", ()))
-    owned_root = service_owned_channel_memory_root(auth_context)
-    if owned_root is not None:
-        roots += (str(owned_root),)
-    synthesis_root = synthesis_session_channel_memory_root(auth_context)
-    if synthesis_root is not None:
-        roots += (str(synthesis_root),)
+    home = _resolved_mimir_home()
+    if home is not None:
+        roots += (str(home / "memory"),)
     if not roots:
         return False
     if is_operator_secret_read_path(path):
@@ -490,12 +408,7 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
-    if is_service_owned_channel_memory_path(path, auth_context):
-        return True
-    if (
-        _is_synthesis_session_channel_memory_path(path, auth_context)
-        or _is_synthesis_shared_memory_path(path, auth_context)
-    ):
+    if is_memory_read_path_allowed(path, auth_context):
         return True
     authority = getattr(auth_context, "service_authority", None)
     for raw_root in getattr(authority, "filesystem_read_roots", ()):
@@ -625,7 +538,7 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     artifact_root = framework_large_tool_results_root(home)
     roots = [
         home / "state",
-        home / "memory" / "core",
+        home / "memory",
         *((artifact_root,) if artifact_root is not None else ()),
         *configured_paths,
     ]
@@ -680,7 +593,7 @@ def resolve_non_admin_read_target(
     try:
         home = Path(home_raw).resolve(strict=True)
         state = (home / "state").resolve(strict=True)
-        core = (home / "memory" / "core").resolve(strict=False)
+        memory = (home / "memory").resolve(strict=False)
         artifact_root = framework_large_tool_results_root(home)
     except (OSError, RuntimeError):
         return None
@@ -719,8 +632,8 @@ def resolve_non_admin_read_target(
     elif resolved.is_relative_to(home) and not (
         resolved == state
         or resolved.is_relative_to(state)
-        or resolved == core
-        or resolved.is_relative_to(core)
+        or resolved == memory
+        or resolved.is_relative_to(memory)
         or artifact_root is not None
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
     ):
@@ -736,6 +649,13 @@ def resolve_non_admin_read_target(
         is_protected_read_path(resolved)
         and not is_large_tool_results_path(resolved)
         and not (allow_home_root and resolved == home)
+    ):
+        return None
+    from ._context import get_current_turn
+
+    auth_context = getattr(get_current_turn(), "auth_context", None)
+    if is_memory_read_path(resolved) and not is_memory_read_path_allowed(
+        resolved, auth_context,
     ):
         return None
     if scan_file and (
