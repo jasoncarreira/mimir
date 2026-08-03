@@ -6,7 +6,47 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-## [0.7.0] — 2026-07-27
+### Changed
+- Version bumped to 0.7.1 for the next release.
+
+## [0.7.0] — 2026-08-03
+
+### Fixed (landed 2026-08-03, before the 0.7.0 tag)
+- **Stale Worklink claims were never reaped.** The concurrency lock records the
+  Chainlink tracker identity while a claim records the Worklink process identity;
+  comparing them made every normally shaped live lock look like another owner's,
+  so a claim whose heartbeat stopped kept `worklink:in-progress` indefinitely and
+  could not be re-dispatched. Ownership and freshness now come from the latest
+  structured claim comment.
+- **A failed run could be recorded with no reason.** Evidence validation named
+  every failure it caused but not one arriving already failed, and factory cleanup
+  emitted `Cleanup failed: None` by propagating the input alert's empty reason.
+  Both synthesize a concrete reason; repeated cleanup failures escalate on a
+  stable classifier rather than on raw command output, and re-alert daily instead
+  of going permanently silent.
+- **Exceeding the project-test output cap killed the test run.** A suite emitting
+  more than the capture limit was `SIGKILL`ed and reported as failed regardless of
+  its real exit status — so a chatty but passing suite failed a build for reasons
+  unrelated to the change. The cap is now a ring buffer retaining the tail, so the
+  pytest summary and `FAILED` lines survive; only a timeout kills the process group.
+- **Memory read policy was a growing list of exact paths.** It is now one rule: a
+  turn may read anything under `<home>/memory/` except a channel directory that is
+  not its own session channel. Core memory is readable by every turn and writable
+  by none outside the proposal path. Protected names and secret-bearing content
+  stay withheld inside readable directories.
+- **Shell refusals were opaque.** A command refused by a trusted-service shell
+  profile now names the typed tool to use instead where one exists, and says
+  plainly when none does, rather than only reporting the rejected shape.
+
+### Added (landed 2026-08-03, before the 0.7.0 tag)
+- **Read-denial telemetry records the session channel**, so a denial can be
+  attributed to the session that caused it from the event alone.
+- **Operator guide for the code-building pipeline**
+  ([`docs/code-building-pipeline.md`](./docs/code-building-pipeline.md)): declaring
+  repositories, Worklink configuration, the strict leaf format and the validator
+  contract that silently blocks a malformed leaf, dispatch and claim lifecycle,
+  and the GitHub review flow. The documented leaf markers are pinned to
+  `_REQUIRED_SECTIONS` by test.
 
 > **Authorization enforcement ships off by default. Leave it that way for now.**
 > The authorization / information-flow framework below is complete and validated
