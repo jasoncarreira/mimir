@@ -441,14 +441,22 @@ def file_contains_secret(path: Path) -> bool:
     return text_contains_secret(text, path=path)
 
 
-def is_path_in_current_pr_checkout_lease(path: Path) -> bool:
-    """Return whether a service read is inside its exact active PR lease."""
+def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
+    """Allow published content only in the service turn's exact active PR lease.
+
+    The shared lease resolver and containment check fix the reported refusal of a
+    tracked, secret-shaped test file when the turn carries repository-scoped PR
+    state. Git index membership remains the publication proof: untracked or
+    ignored files, protected path names, symlinks, and paths outside the exact
+    active lease remain subject to the content veto.
+    """
     from ._context import get_current_turn
     from .access_control import (
         _target_within_active_pr_checkout_lease,
         resolve_repository_review_state,
     )
     from .models import RepoPRScopeRegistry
+    from .repo_tools import GitRefusal, RepoGitTools
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     if not getattr(auth_context, "is_service", False):
@@ -464,7 +472,12 @@ def is_path_in_current_pr_checkout_lease(path: Path) -> bool:
         is not getattr(state, "action_scope", None)
     ):
         return False
-    return _target_within_active_pr_checkout_lease(str(path), state)
+    if not _target_within_active_pr_checkout_lease(str(path), state):
+        return False
+    try:
+        return RepoGitTools(state).is_tracked_file(path)
+    except (GitRefusal, OSError, RuntimeError, ValueError):
+        return False
 
 
 def protected_read_result_reason(path: Path, *, text: str | None = None) -> str | None:
@@ -479,13 +492,13 @@ def protected_read_result_reason(path: Path, *, text: str | None = None) -> str 
         if text is not None
         else path.is_file() and file_contains_secret(path)
     )
-    if contains_protected_content and not is_path_in_current_pr_checkout_lease(path):
+    if contains_protected_content and not is_tracked_file_in_current_pr_lease(path):
         return "protected_read_result"
     return None
 
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
-    """Check a result, exempting content only inside an authorized PR lease."""
+    """Check a result, exempting only published files in an authorized PR lease."""
     if is_large_tool_results_path(path):
         return False
     return protected_read_result_reason(path, text=text) is not None
