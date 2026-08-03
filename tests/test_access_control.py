@@ -4412,6 +4412,59 @@ def test_repo_review_git_admits_named_inspection_shapes_with_hardened_argv(
     assert argv[subcommand_index + 1:subcommand_index + 1 + len(safety_options)] == safety_options
 
 
+@pytest.mark.parametrize("global_option", ["--no-ext-diff", "--no-pager"])
+@pytest.mark.parametrize("subcommand", ["diff", "log", "show"])
+def test_repo_review_git_admits_restrictive_global_options_before_c(
+    global_option: str,
+    subcommand: str,
+    tmp_path: Path,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    state = _review_state("o/r", 1144, "worklink/1144", str(root.resolve()))
+
+    argv = parse_service_shell_argv(
+        f"git {global_option} -C {root} {subcommand} HEAD",
+        "repo_review",
+        review_state=state,
+    )
+
+    assert argv is not None
+    assert argv[:3] == [
+        str(maintenance_pinned_executables["git"]), "-C", str(root.resolve()),
+    ]
+    assert subcommand in argv
+    assert "--no-ext-diff" in argv
+    assert "--no-pager" in argv
+
+
+def test_read_only_git_profiles_refuse_global_config_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    review_root = tmp_path / "review"
+    proposal_root = home / "scratch" / "proposals" / "upgrade" / "worktree"
+    review_root.mkdir()
+    proposal_root.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    state = _review_state(
+        "o/r", 1144, "worklink/1144", str(review_root.resolve()),
+    )
+
+    assert parse_service_shell_argv(
+        f"git -c diff.external=attacker -C {review_root} diff HEAD",
+        "repo_review",
+        review_state=state,
+    ) is None
+    assert parse_service_shell_argv(
+        f"git -c diff.external=attacker -C {proposal_root} diff HEAD",
+        "upgrade_workspace",
+    ) is None
+
+
 @pytest.mark.parametrize(
     "command",
     [
