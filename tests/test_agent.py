@@ -921,6 +921,10 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
     [
         ("memory/channels/discord-a/notes.md", "session note\n", True),
         ("memory/learnings-pending.md", "pending learning\n", True),
+        ("memory/channels/discord-b/notes.md", "other session\n", False),
+        ("memory/core/00-identity.md", "core memory\n", False),
+        ("memory/channels/discord-a/.git/token", "protected name\n", False),
+        ("memory/channels/discord-a/operator-settings.json", "operator secret\n", False),
     ],
 )
 async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
@@ -938,6 +942,8 @@ async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(expected, encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    if target.name == "operator-settings.json":
+        monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(target))
     authority = builtin_trigger_service_principal("session-boundary", home)
     fake_agent = _ServiceMemoryReadProbeAgent(
         WriteGuardBackend(home, ["state", "memory"]),
@@ -961,7 +967,7 @@ async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
     if allowed:
         assert fake_agent.result.content == expected
     else:
-        assert "refused before execution" in str(fake_agent.result.content)
+        assert "Read denied:" in str(fake_agent.result.content)
 
 
 async def test_heartbeat_turn_reads_explicitly_mapped_channel_memory(
