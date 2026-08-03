@@ -16,7 +16,14 @@ from typing import Awaitable, Callable, Sequence
 from ...config import model_spec_at_call_time
 from ...opencode_config import opencode_model_from_agent_spec, resolve_opencode_invocation
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from_output
+from .base import (
+    Caps,
+    CheckoutShape,
+    RawResult,
+    WorkOrder,
+    blocked_reason_from_output,
+    last_nonempty_line,
+)
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
@@ -320,31 +327,38 @@ def _permission_override(bash_allowlist: Sequence[str]) -> str:
 def _permission_refusal_reason(
     stdout: str, stderr: str, bash_allowlist: Sequence[str], exit_code: int
 ) -> str | None:
-    """Report an executor permission refusal that actually stopped the run.
+    """Report an executor permission refusal, distinguished by position or exit.
 
-    The refusal text is free-form OpenCode output, so a substring scan alone
-    cannot distinguish "the executor was refused a command" from "the executor
-    wrote the words permission denied" — and a build editing authorization code
-    necessarily writes them into source, tests and docs. Chainlink #1152: three
-    leaves (#1123, #1149 and the fix for this defect itself) each completed
-    their work with a passing gate and were discarded because the phrase
-    appeared in a Python string literal they were editing.
+    The refusal text is free-form OpenCode output, so presence alone cannot
+    distinguish "the executor was refused a command" from "the executor wrote the
+    words permission denied" — a build editing authorization code necessarily
+    writes them into source, tests and docs. Chainlink #1152: nine of the ten
+    retained transcripts (#1123, #1149 and #1152's own attempts) matched this way
+    while exiting 0 with their work committed and their gate green, because the
+    phrase appeared in a Python literal they were editing.
 
-    The structural signal is the process outcome. A refusal the executor
-    recovered from — it exited 0, the work is present, the gate passed — did not
-    fail the run, whatever the transcript says. A refusal that genuinely stopped
-    the executor leaves a nonzero exit, and is still reported, with this text as
-    the failure reason. This mirrors ``blocked_reason_from_output``, which
-    honors its marker only when positioned as a real signal rather than merely
-    present in the output.
+    A refusal counts when it is *positioned as a signal* — the final non-empty
+    line of a stream — or when the executor also exited nonzero. This is the same
+    discipline ``blocked_reason_from_output`` already applies to its own marker,
+    and for the same stated reason: a backend that echoes the phrase mid-stream
+    and then completes normally must not be mislabeled.
+
+    Both fail-closed shapes are retained. A refusal that halted the executor
+    surfaces via the nonzero exit wherever it appears; a refusal the executor
+    reported last surfaces via position even at exit 0. Measured against the
+    discarded builds, the nearest false positive sat four non-empty lines from
+    the end of its stream, so neither rule admits them.
     """
-    if exit_code == 0:
-        return None
-    output = f"{stdout}\n{stderr}"
-    if not re.search(
+    pattern = re.compile(
         r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
-        output,
         re.IGNORECASE,
+    )
+    positioned = any(
+        (last := last_nonempty_line(stream)) is not None and pattern.search(last)
+        for stream in (stdout, stderr)
+    )
+    if not positioned and not (
+        exit_code != 0 and pattern.search(f"{stdout}\n{stderr}")
     ):
         return None
     return (

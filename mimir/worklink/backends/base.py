@@ -62,7 +62,7 @@ def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
     blocked: the real final line is its success output, not the echoed marker.
     """
     for stream in (stdout, stderr):
-        last = _last_nonempty_line(stream)
+        last = last_nonempty_line(stream)
         if last is None:
             continue
         stripped = last.strip()
@@ -73,7 +73,14 @@ def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
     return None
 
 
-def _last_nonempty_line(text: str) -> str | None:
+def last_nonempty_line(text: str) -> str | None:
+    """Return the last line with non-whitespace content, or None.
+
+    Shared by the backend signal readers so "the executor reported this" is
+    distinguished from "this text appeared somewhere in the output" the same way
+    for every marker — see ``blocked_reason_from_output`` and OpenCode's
+    permission-refusal reader.
+    """
     for line in reversed(text.splitlines()):
         if line.strip():
             return line
