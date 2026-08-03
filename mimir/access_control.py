@@ -2564,7 +2564,7 @@ def _upgrade_workspace_git_execution_argv(argv: list[str]) -> list[str] | None:
     if not argv or argv[0] != "git":
         return None
     arguments = argv[1:]
-    if arguments[:1] == ["--no-pager"]:
+    while arguments[:1] and arguments[0] in {"--no-pager", "--no-ext-diff"}:
         arguments = arguments[1:]
     if arguments[:1] != ["-C"] or len(arguments) < 3:
         return None

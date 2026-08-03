@@ -5876,16 +5876,15 @@ def test_upgrade_workspace_git_is_proposal_scoped_and_read_only(
     subprocess.run(["git", "init", "-q", str(outside)], check=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    for operation in (
-        "status --short",
-        "--no-pager show --no-ext-diff HEAD",
-        "diff --no-ext-diff --cached",
-        "--no-pager log --oneline -5",
+    for command in (
+        f"git -C {proposal} status --short",
+        f"git -C {proposal} --no-pager show --no-ext-diff HEAD",
+        f"git --no-ext-diff -C {proposal} diff --stat",
+        f"git -C {proposal} diff --no-ext-diff --cached",
+        f"git -C {proposal} --no-pager log --oneline -5",
     ):
-        argv = parse_service_shell_argv(
-            f"git -C {proposal} {operation}", "upgrade_workspace",
-        )
-        assert argv is not None, operation
+        argv = parse_service_shell_argv(command, "upgrade_workspace")
+        assert argv is not None, command
         assert argv[0] == str(maintenance_pinned_executables["git"])
         assert argv[1:3] == ["-C", str(proposal.resolve())]
 
