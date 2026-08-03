@@ -420,15 +420,7 @@ def protected_read_denial_reason(path: Path) -> str | None:
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
-    synthesis_scope_denied = (
-        getattr(auth_context, "is_service", False)
-        and getattr(auth_context, "canonical_principal", None) == "synthesis"
-        and getattr(authority, "canonical", None) == "synthesis"
-        and not service_scoped
-    )
-    general_protected = (
-        not service_scoped and is_protected_read_path(path)
-    ) or synthesis_scope_denied
+    general_protected = not service_scoped and is_protected_read_path(path)
     service_name_protected = is_current_service_protected_read_path(path)
     if not (general_protected or service_name_protected):
         return None
