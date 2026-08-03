@@ -378,6 +378,7 @@ class ServicePrincipal:
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     filesystem_read_roots: tuple[str, ...] = ()
+    owned_skill_directory: str | None = None
     channel_memory_directory: str | None = None
     saga_full_corpus_read: bool = False
     creation_path: str | None = None
@@ -556,6 +557,7 @@ def build_trigger_service_principal(
     tier: CapabilityTier,
     capabilities: tuple[str, ...],
     roots: tuple[Path, ...] = (),
+    owned_skill_directory: Path | None = None,
     saga_full_corpus_read: bool = False,
     channel_memory_directory: str | None = None,
     creation_path: str,
@@ -646,6 +648,11 @@ def build_trigger_service_principal(
                 *((artifact_root,) if artifact_root is not None else ()),
             ))
         ),
+        owned_skill_directory=(
+            str(owned_skill_directory.resolve())
+            if owned_skill_directory is not None
+            else None
+        ),
         channel_memory_directory=channel_memory_directory,
         saga_full_corpus_read=saga_full_corpus_read,
         creation_path=creation_path,
@@ -724,6 +731,12 @@ def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Pat
     if service is None:
         return ()
     roots = [Path(root) for root in service.filesystem_read_roots]
+    if (
+        getattr(service, "trigger", None) == "poller"
+        and str(getattr(service, "canonical", "")).startswith("poller:")
+        and getattr(service, "owned_skill_directory", None)
+    ):
+        roots.append(Path(service.owned_skill_directory))
     if (
         getattr(service, "canonical", None) == "system"
         and getattr(service, "trigger", None) == "upgrade"

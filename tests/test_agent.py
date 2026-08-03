@@ -870,6 +870,61 @@ async def test_poller_turn_reads_owned_channel_memory_without_boundary_denial(
     )
 
 
+async def test_poller_turn_reads_its_server_bound_skill_without_boundary_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    state = home / "state" / "pollers" / "social-cli-feed"
+    skill = home / "skills" / "social-cli"
+    state.mkdir(parents=True)
+    skill.mkdir(parents=True)
+    dispatch = skill / "dispatch-outbox.sh"
+    dispatch.write_text("#!/bin/sh\necho dispatched\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = build_trigger_service_principal(
+        canonical="poller:social-cli-feed",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("read_file",),
+        roots=(state,),
+        owned_skill_directory=skill,
+        channel_memory_directory="poller:social-cli-feed",
+        creation_path="test-server-binding",
+    )
+    denials: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: denials.append(fields) if kind == "hard_boundary_denied" else None,
+    )
+    fake_agent = _ServiceMemoryReadProbeAgent(
+        WriteGuardBackend(home, ["state", "skills"]),
+        "/skills/social-cli/dispatch-outbox.sh",
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="poller",
+        channel_id=authority.canonical,
+        content="dispatch the outbox",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    ))
+
+    assert record.error is None
+    assert fake_agent.result is not None
+    assert fake_agent.result.status != "error"
+    assert fake_agent.result.content == "#!/bin/sh\necho dispatched\n"
+    assert not any(
+        denial.get("reason") == "service_scoped_read_boundary" for denial in denials
+    )
+
+
 async def test_poller_turn_cannot_read_another_pollers_channel_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

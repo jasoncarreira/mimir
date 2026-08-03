@@ -416,6 +416,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
         str(repo.resolve()), str(fetch_cache.resolve()), str(scratch.resolve()),
         str(framework_large_tool_results_root(home)),
     )
+    assert service.owned_skill_directory == str(manifest_path.parent.resolve())
     for tool_name, arguments in (
         ("read_file", {"file_path": str(safe_file)}),
         ("grep", {"path": str(repo), "pattern": "safe"}),

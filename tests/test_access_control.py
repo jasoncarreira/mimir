@@ -275,6 +275,52 @@ def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
     assert result.service_principal is service
 
 
+def test_poller_read_scope_is_limited_to_its_server_bound_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own_skill = home / "skills" / "social-cli"
+    other_skill = home / "skills" / "other-skill"
+    own_skill.mkdir(parents=True)
+    other_skill.mkdir(parents=True)
+    skill_md = own_skill / "SKILL.md"
+    manifest = own_skill / "pollers.json"
+    script = own_skill / "dispatch-outbox.sh"
+    secret = own_skill / "runtime-notes.txt"
+    for path, content in (
+        (skill_md, "# Social CLI\n"),
+        (manifest, '{"pollers": [{"name": "social-cli-feed"}]}\n'),
+        (script, "#!/bin/sh\nexit 0\n"),
+        (secret, "github_token: ghp_" + "a" * 30 + "\n"),
+    ):
+        path.write_text(content, encoding="utf-8")
+    other_script = other_skill / "dispatch.sh"
+    other_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = build_trigger_service_principal(
+        canonical="poller:social-cli-feed",
+        trigger="poller",
+        profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("read_file",),
+        owned_skill_directory=own_skill,
+        creation_path="test-server-binding",
+    )
+
+    roots = access_control.service_filesystem_read_roots(service)
+    assert own_skill.resolve() in roots
+    for target in (skill_md, manifest, script):
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)},
+        ) is True
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, "read_file", {"file_path": str(other_script)},
+    ) is False
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, "read_file", {"file_path": str(secret)},
+    ) is False
+
+
 @pytest.mark.parametrize("enforce", [False, True])
 def test_large_tool_result_root_is_available_to_service_principals(
     enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
