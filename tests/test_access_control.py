@@ -2638,6 +2638,74 @@ def test_repo_review_npm_install_refusal_names_missing_typed_equivalent(
     assert "no typed equivalent" in reason
 
 
+@pytest.mark.parametrize(
+    ("command", "example"),
+    [
+        ("git status --short", "git -C <dir> status --short"),
+        ("git log --since=24.hours", "git -C <dir> log --oneline"),
+    ],
+)
+def test_maintenance_git_missing_only_c_stays_refused_with_required_form(
+    command: str,
+    example: str,
+) -> None:
+    """A valid maintenance Git shape still binds its repository in argv."""
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        command, "maintenance",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "repository must be named in argv with -C" in reason
+    assert example in reason
+
+
+def test_maintenance_git_guidance_does_not_misdiagnose_other_refusals() -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "git status --verbose", "maintenance",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "repository must be named in argv with -C" not in reason
+
+
+@pytest.mark.parametrize("profile", ["repo_review", "maintenance"])
+def test_inline_python_guidance_is_shared_with_maintenance(profile: str) -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "python3 -c 'print(1)'", profile,
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "arbitrary code execution and remains denied" in reason
+    assert "no general typed equivalent" in reason
+    assert "read_file or grep" in reason
+
+
+def test_maintenance_inline_python_with_shell_syntax_keeps_guidance() -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "python3 -c 'import os; print(os.getcwd())'", "maintenance",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
+    assert "arbitrary code execution and remains denied" in reason
+    assert "no general typed equivalent" in reason
+
+
+def test_maintenance_wiki_backlinks_refusal_names_bounded_replacement() -> None:
+    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
+        "mimir wiki backlinks", "maintenance",
+    )
+
+    assert argv is None
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
+    assert "mimir wiki backlinks` remains denied" in reason
+    assert "bounded post-turn hook" in reason
+    assert "read_file" in reason
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enforce", [False, True])
 async def test_refused_service_shell_returns_the_reason_and_executes_nothing(

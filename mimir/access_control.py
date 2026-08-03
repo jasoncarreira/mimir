@@ -2479,6 +2479,61 @@ def _maintenance_git_filter_overrides(
     return overrides
 
 
+def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
+    """Return whether arguments after ``git -C <root>`` are admitted."""
+    if not arguments:
+        return False
+    subcommand = arguments[0]
+    subcommand_arguments = arguments[1:]
+    if subcommand == "status":
+        # ``--verbose``/``-v`` renders a diff and can execute a configured
+        # textconv/filter helper. Keep maintenance status to metadata-only
+        # forms; the hardened argv still disables fsmonitor and optional locks.
+        return (
+            "--" not in subcommand_arguments
+            and not any(argument.startswith("-v") for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({
+                    "-b", "-s", "--ahead-behind", "--branch",
+                    "--ignore-submodules", "--long", "--no-ahead-behind",
+                    "--porcelain", "--short", "--show-stash",
+                    "--untracked-files",
+                }),
+                option_prefixes=(
+                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
+                ),
+            )
+        )
+    if subcommand == "branch":
+        return subcommand_arguments == ["--show-current"]
+    if subcommand not in {"diff", "log", "show"}:
+        return False
+    # ``-<digits>`` is Git's bounded max-count shorthand used by the
+    # maintenance prompts (for example ``git log --oneline -5``).
+    arguments_without_count_shorthand = [
+        argument
+        for argument in subcommand_arguments
+        if not (subcommand == "log" and argument.startswith("-") and argument[1:].isdigit())
+    ]
+    return (
+        "--" not in subcommand_arguments
+        and _arguments_match_allowlist(
+            arguments_without_count_shorthand,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--grep", "--name-only",
+                "--name-status", "--no-color", "--no-merges", "--no-patch",
+                "--no-ext-diff", "--no-textconv", "--oneline", "--quiet",
+                "--raw", "--stat", "--staged",
+            }),
+            option_prefixes=(
+                "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
+            ),
+        )
+    )
+
+
 def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     """Validate maintenance Git input and return its hardened execution argv.
 
@@ -2514,58 +2569,10 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     except (IndexError, OSError, PathOutsideHomeError, RuntimeError):
         return None
 
+    if not _maintenance_git_subcommand_allowed(arguments):
+        return None
     subcommand = arguments[0]
     subcommand_arguments = arguments[1:]
-    if subcommand == "status":
-        # ``--verbose``/``-v`` renders a diff and can execute a configured
-        # textconv/filter helper. Keep maintenance status to metadata-only
-        # forms; the hardened argv still disables fsmonitor and optional locks.
-        allowed = (
-            "--" not in subcommand_arguments
-            and not any(argument.startswith("-v") for argument in subcommand_arguments)
-            and _arguments_match_allowlist(
-                subcommand_arguments,
-                exact_options=frozenset({
-                    "-b", "-s", "--ahead-behind", "--branch",
-                    "--ignore-submodules", "--long", "--no-ahead-behind",
-                    "--porcelain", "--short", "--show-stash",
-                    "--untracked-files",
-                }),
-                option_prefixes=(
-                    "--ignore-submodules=", "--porcelain=", "--untracked-files=",
-                ),
-            )
-        )
-    elif subcommand == "branch":
-        allowed = subcommand_arguments == ["--show-current"]
-    elif subcommand in {"diff", "log", "show"}:
-        # ``-<digits>`` is Git's bounded max-count shorthand used by the
-        # maintenance prompts (for example ``git log --oneline -5``).
-        arguments_without_count_shorthand = [
-            argument
-            for argument in subcommand_arguments
-            if not (subcommand == "log" and argument.startswith("-") and argument[1:].isdigit())
-        ]
-        allowed = (
-            "--" not in subcommand_arguments
-            and _arguments_match_allowlist(
-                arguments_without_count_shorthand,
-                exact_options=frozenset({
-                    "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
-                    "--exit-code", "--full-index", "--grep", "--name-only",
-                    "--name-status", "--no-color", "--no-merges", "--no-patch",
-                    "--no-ext-diff", "--no-textconv", "--oneline", "--quiet",
-                    "--raw", "--stat", "--staged",
-                }),
-                option_prefixes=(
-                    "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
-                ),
-            )
-        )
-    else:
-        return None
-    if not allowed:
-        return None
 
     filter_overrides = _maintenance_git_filter_overrides(root, pinned_git[0])
     if filter_overrides is None:
@@ -3031,10 +3038,35 @@ def _service_shell_typed_tool_guidance(
                 " Use the typed read_file, grep, glob, or ls tool for bounded "
                 "inspection beneath the proposal workspace."
             )
+    if destination in {"maintenance", "upgrade_workspace"} and executable == "git":
+        arguments = argv[1:]
+        if destination == "upgrade_workspace":
+            arguments = _git_arguments_without_restrictive_global_options(arguments)
+        if arguments[:1] != ["-C"] and _maintenance_git_subcommand_allowed(arguments):
+            example = {
+                "branch": "git -C <dir> branch --show-current",
+                "diff": "git -C <dir> diff --stat",
+                "log": "git -C <dir> log --oneline",
+                "show": "git -C <dir> show --stat",
+                "status": "git -C <dir> status --short",
+            }[arguments[0]]
+            return (
+                " This Git command is otherwise an admitted inspection shape, but "
+                "the repository must be named in argv with -C; the process working "
+                f"directory is not an authorized target. Use `{example}`."
+            )
+    if destination == "maintenance" and executable == "mimir" and argv[1:3] == [
+        "wiki", "backlinks",
+    ]:
+        return (
+            " `mimir wiki backlinks` remains denied in this shell profile. Wiki "
+            "backlinks are regenerated by the bounded post-turn hook after wiki "
+            "content changes; inspect its generated files with read_file instead "
+            "of retrying this command through shell_exec."
+        )
+    if destination not in {"repo_review", "maintenance"}:
         return ""
-    if destination != "repo_review":
-        return ""
-    if executable == "npm" and operation in (["run"], ["test"]):
+    if destination == "repo_review" and executable == "npm" and operation in (["run"], ["test"]):
         if _service_shell_coding_enabled():
             return (
                 " Repository scripts must run through the typed repo_test tool, "
@@ -3046,7 +3078,7 @@ def _service_shell_typed_tool_guidance(
             "repo_test. Use whatever bounded verification capability the deployment "
             "provides, and state plainly when the tests could not be run."
         )
-    if executable == "npm" and operation in (["ci"], ["install"]):
+    if destination == "repo_review" and executable == "npm" and operation in (["ci"], ["install"]):
         return (
             " npm dependency installation remains denied and has no typed equivalent "
             "in this profile; do not retry it through shell_exec."
@@ -3064,7 +3096,7 @@ def _service_shell_typed_tool_guidance(
             "inspection suffices; otherwise report that the workload cannot be "
             "performed rather than retrying it through shell_exec."
         )
-        if _service_shell_coding_enabled():
+        if destination == "repo_review" and _service_shell_coding_enabled():
             guidance += " For repository tests only, use the typed repo_test tool."
         return guidance
     return ""
