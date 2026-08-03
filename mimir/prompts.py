@@ -203,8 +203,10 @@ def build_system_prompt(
             if "scratch" in writable_dirs:
                 home_section += (
                     " For ephemeral working files — review drafts, scratch "
-                    "notes, throwaway clones — use `scratch/` (gitignored, "
-                    "not tracked state); don't invent ad-hoc top-level dirs."
+                    "notes, throwaway clones — use the current turn scratch path "
+                    "provided in the turn prompt (gitignored, not tracked state); "
+                    "don't write at the shared `scratch/` root or invent ad-hoc "
+                    "top-level dirs."
                 )
         parts.append(home_section)
 
@@ -260,6 +262,7 @@ def build_turn_prompt(
     trigger_authority_profile: str | None = None,
     trigger_capability_tier: str | None = None,
     trigger_capabilities: Iterable[str] | None = None,
+    turn_scratch_path: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
     atom hits, subagent completion notifications (from prior turns), event
@@ -290,6 +293,14 @@ def build_turn_prompt(
         rendered = f"## {label}\n\n{body.rstrip()}"
         sections.append(rendered)
         section_sizes[label] = len(rendered)
+
+    if turn_scratch_path:
+        _add_labeled(
+            "Current turn scratch",
+            f"Use `{turn_scratch_path}/` for ordinary ephemeral files. This workspace "
+            "is private to this turn; the shared `scratch/` root and other turns' "
+            "workspaces are unreadable.",
+        )
 
     # Materialize once if we need to scan it twice (identity + render).
     recent_list: list[Message] | None = None

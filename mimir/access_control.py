@@ -726,11 +726,40 @@ def _upgrade_proposals_root() -> Path | None:
     return (Path(home).resolve() / "scratch" / "proposals").resolve()
 
 
+def current_turn_scratch_root() -> Path | None:
+    """Return the active turn's server-owned ordinary scratch workspace."""
+    from ._context import get_current_turn
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    turn_id = getattr(get_current_turn(), "turn_id", None)
+    if not home or not isinstance(turn_id, str) or not turn_id:
+        return None
+    component = Path(turn_id)
+    if component.name != turn_id or turn_id in {".", ".."}:
+        return None
+    return (Path(home).resolve() / "scratch" / "turns" / turn_id).resolve()
+
+
 def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Path, ...]:
     """Resolve static read roots plus built-in service-owned workspace roots."""
     if service is None:
         return ()
-    roots = [Path(root) for root in service.filesystem_read_roots]
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    home_scratch = (Path(home).resolve() / "scratch").resolve() if home else None
+    roots = [
+        Path(root) for root in service.filesystem_read_roots
+        if home_scratch is None or Path(root).resolve() != home_scratch
+    ]
+    if home:
+        home_root = Path(home).resolve()
+        roots.extend((
+            home_root / "state",
+            home_root / ".mimir",
+            home_root / "CHANGELOG.md",
+        ))
+    turn_scratch = current_turn_scratch_root()
+    if turn_scratch is not None:
+        roots.append(turn_scratch)
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -1299,7 +1328,9 @@ def _is_static_service_protected_write_path(
     return False
 
 
-def _target_within_static_service_write_roots(target: str, _destination: str) -> bool:
+def _target_within_static_service_write_roots(
+    target: str, _destination: str, *, allow_shared_scratch: bool = False,
+) -> bool:
     """Authorize static service writes to narrow roots and safe home data."""
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -1341,6 +1372,12 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
             and lexical_root not in home_write_roots
         ):
             return False
+        if lexical_root == scratch_root and not allow_shared_scratch:
+            turn_scratch = current_turn_scratch_root()
+            if turn_scratch is None or not (
+                candidate == turn_scratch or candidate.is_relative_to(turn_scratch)
+            ):
+                return False
         # ``allow_git_metadata`` permits exactly ``.git`` under scratch — not
         # its trailing-dot laundering variants, and NOT ``.git/config``: the
         # ``config`` name is independently protected, which preserves #984's
@@ -1371,6 +1408,12 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
             and root not in home_write_roots
         ):
             return False
+        if root == scratch_root and not allow_shared_scratch:
+            turn_scratch = current_turn_scratch_root()
+            if turn_scratch is None or not (
+                resolved == turn_scratch or resolved.is_relative_to(turn_scratch)
+            ):
+                return False
         # A lexical scratch/.git alias may not launder writes into another
         # writable root. Both spellings must remain inside scratch.
         if lexical_has_git_metadata and root != scratch_root:
@@ -1398,7 +1441,9 @@ def _target_within_upgrade_proposals(target: str, _destination: str) -> bool:
         resolve_within_roots([root], str(candidate))
     except (OSError, PathOutsideHomeError, RuntimeError):
         return False
-    return _target_within_static_service_write_roots(str(candidate), _destination)
+    return _target_within_static_service_write_roots(
+        str(candidate), _destination, allow_shared_scratch=True,
+    )
 
 
 def resolve_configured_write_target(target: str) -> Path:
@@ -3377,6 +3422,15 @@ def _target_within_trigger_service_write_roots(target: str, destination: str) ->
         if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
             return False
         roots = [Path(path).resolve() for path in raw]
+        turn_scratch = current_turn_scratch_root()
+        if turn_scratch is not None:
+            roots.append(turn_scratch)
+        scratch_root = (home_root / "scratch").resolve()
+        if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
+            turn_scratch is None
+            or not (candidate == turn_scratch or candidate.is_relative_to(turn_scratch))
+        ):
+            return False
         memory_root = (home_root / "memory").resolve()
         lexical_relatives = tuple(
             (root, candidate.relative_to(root))
@@ -3542,9 +3596,18 @@ def resolve_trigger_service_write_target(target: str, destination: str) -> Path:
     if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
         raise PathOutsideHomeError("trigger-service write roots are invalid")
     roots = [Path(path).resolve() for path in raw]
+    turn_scratch = current_turn_scratch_root()
+    if turn_scratch is not None:
+        roots.append(turn_scratch)
     candidate = Path(target)
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
+    scratch_root = (Path(home).resolve() / "scratch").resolve()
+    if (candidate == scratch_root or candidate.is_relative_to(scratch_root)) and (
+        turn_scratch is None
+        or not (candidate == turn_scratch or candidate.is_relative_to(turn_scratch))
+    ):
+        raise PathOutsideHomeError("scratch target is outside the current turn workspace")
     return resolve_within_roots(roots, str(candidate))
 
 
@@ -3584,6 +3647,7 @@ def _trigger_service_read_target_is_allowed(
 ) -> bool:
     """Authorize a service read against frozen roots and verified ownership."""
     from .read_policy import (
+        _has_protected_read_name,
         file_contains_secret,
         is_memory_read_path,
         is_memory_read_path_allowed,
@@ -3672,7 +3736,10 @@ def _trigger_service_read_target_is_allowed(
     resolved_is_artifact = artifact_root is not None and root == artifact_root
     if resolved_is_artifact:
         return True
-    if _is_service_protected_read_path(service, root, relative):
+    if (
+        _is_service_protected_read_path(service, root, relative)
+        or _has_protected_read_name(resolved)
+    ):
         return False
     if is_operator_secret_read_path(resolved):
         return False
@@ -5147,10 +5214,16 @@ class WriteResourceAdapter:
             home_root = Path(home).resolve()
             state_root = (Path(home) / "state").resolve()
             resolved = resolve_within_roots([home_root], target)
-            resolved.relative_to(state_root)
+            turn_scratch = current_turn_scratch_root()
+            root = next(
+                root for root in (state_root, turn_scratch) if root is not None
+                and (resolved == root or resolved.is_relative_to(root))
+            )
         except (OSError, PathOutsideHomeError, RuntimeError, ValueError):
             return False
-        return not cls._is_protected_path(resolved.relative_to(state_root))
+        except StopIteration:
+            return False
+        return not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
     def authorize_operation(
@@ -6369,9 +6442,27 @@ class ToolRegistry:
                         resolved_read_target is not None
                         and is_memory_read_path(Path(resolved_read_target))
                     )
+                    home = os.environ.get("MIMIR_HOME", "").strip()
+                    scratch_root = (
+                        (Path(home).resolve() / "scratch").resolve()
+                        if home else None
+                    )
+                    resolved_target_path = (
+                        Path(resolved_read_target).resolve(strict=False)
+                        if resolved_read_target is not None else None
+                    )
+                    targets_scratch = (
+                        scratch_root is not None
+                        and resolved_target_path is not None
+                        and (
+                            resolved_target_path == scratch_root
+                            or resolved_target_path.is_relative_to(scratch_root)
+                        )
+                    )
                     allowed = scoped_read_allowed or (
                         service_allowed
                         and not targets_memory
+                        and not targets_scratch
                         and not (
                             service_principal.canonical == "system"
                             and service_principal.trigger == "upgrade"

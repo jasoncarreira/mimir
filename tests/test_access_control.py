@@ -253,6 +253,171 @@ def test_non_admin_virtual_state_protected_and_symlink_targets_remain_denied(
         assert result.reason == "read_scope"
 
 
+def test_turn_can_write_and_read_its_own_scratch_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = access_control.builtin_trigger_service_principal("heartbeat", home)
+    auth = _service_auth(service, InformationFlowLabels())
+    target = home / "scratch" / "turns" / "heartbeat-turn" / "result.json"
+    token = set_current_turn(SimpleNamespace(
+        turn_id="heartbeat-turn", auth_context=auth,
+    ))
+    try:
+        registry = ToolRegistry()
+        write = registry.authorize_tool(
+            "write_file", auth, enforce=True, target_channel=str(target),
+        )
+        assert write.allowed is True, write.reason
+
+        backend = WriteGuardBackend(home, ["scratch"])
+        write_result = backend.write(str(target), '{"ok": true}\n')
+        assert write_result.error is None
+
+        read = registry.authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert read.allowed is True, read.reason
+        assert backend.read(str(target)).file_data["content"] == '{"ok": true}\n'
+    finally:
+        reset_current_turn(token)
+
+
+def test_interactive_turn_is_scoped_to_its_own_scratch_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own = home / "scratch" / "turns" / "interactive-turn" / "notes.md"
+    other = home / "scratch" / "turns" / "other-turn" / "notes.md"
+    for target in (own, other):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("notes\n", encoding="utf-8")
+    (home / "state").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _write_auth()
+    token = set_current_turn(SimpleNamespace(
+        turn_id="interactive-turn", auth_context=auth,
+    ))
+    try:
+        registry = ToolRegistry()
+        assert registry.authorize_tool(
+            "edit_file", auth, enforce=True, target_channel=str(own),
+        ).allowed is True
+        assert registry.authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(own)},
+        ).allowed is True
+        assert registry.authorize_tool(
+            "edit_file", auth, enforce=True, target_channel=str(other),
+        ).allowed is False
+        assert registry.authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(other)},
+        ).allowed is False
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("relative", ["turns/other-turn/result.json", "flat.json"])
+def test_turn_cannot_read_other_or_flat_scratch(
+    relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    target = home / "scratch" / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("withheld\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = access_control.builtin_trigger_service_principal("heartbeat", home)
+    auth = _service_auth(service, InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(turn_id="own-turn", auth_context=auth))
+    try:
+        decision = ToolRegistry().authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert decision.allowed is False
+    assert decision.reason == "read_scope"
+
+
+def test_secret_content_in_own_turn_scratch_remains_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    target = home / "scratch" / "turns" / "own-turn" / "notes.txt"
+    target.parent.mkdir(parents=True)
+    target.write_text("ghp_" + "a" * 30, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = access_control.builtin_trigger_service_principal("heartbeat", home)
+    auth = _service_auth(service, InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(turn_id="own-turn", auth_context=auth))
+    try:
+        decision = ToolRegistry().authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert decision.allowed is False
+    assert decision.reason == "read_scope"
+
+
+@pytest.mark.parametrize("principal_name", ["heartbeat", "upgrade"])
+@pytest.mark.parametrize(
+    ("relative", "content"),
+    [
+        ("state/deployment.json", "state-ok\n"),
+        (".mimir/last-booted-version", "0.7.0\n"),
+        ("CHANGELOG.md", "# Changes\n"),
+    ],
+)
+def test_service_turns_read_admitted_home_surfaces_under_enforcement(
+    principal_name: str,
+    relative: str,
+    content: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    target = home / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = (
+        access_control.builtin_trigger_service_principal("heartbeat", home)
+        if principal_name == "heartbeat"
+        else get_service_principal(principal_name)
+    )
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(
+        turn_id=f"{principal_name}-turn", auth_context=auth,
+    ))
+    try:
+        decision = ToolRegistry().authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(target)},
+        )
+        assert decision.allowed is True, decision.reason
+        assert WriteGuardBackend(home, ["state"]).read(str(target)).file_data[
+            "content"
+        ] == content
+    finally:
+        reset_current_turn(token)
+
+
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
     tmp_path: Path,
 ) -> None:
@@ -4045,33 +4210,39 @@ def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
-    for target in (
-        home / "state" / "reports" / "x.md",
-        home / "memory" / "issues" / "x.md",
-        home / "memory" / "channels" / "C1" / "notes.md",
-        home / "scratch" / "proposals" / "upgrade" / "result.md",
-        # ``.resolve()``: on macOS ``/tmp`` is a symlink to ``private/tmp``, and
-        # the write-root check compares the lexical spelling against resolved
-        # roots — an unresolved ``/tmp`` target matches nothing and is denied.
-        Path("/tmp").resolve() / f"mimir-service-write-{tmp_path.name}.txt",
-        repo / "src" / "x.py",
-        repo / ".gitignore",
-        repo / ".gitattributes",
-    ):
-        decision = registry.authorize_tool(
-            tool_name, auth, enforce=True, target_channel=str(target),
-        )
-        assert decision.allowed is True, target
+    token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
+    try:
+        for target in (
+            home / "state" / "reports" / "x.md",
+            home / "memory" / "issues" / "x.md",
+            home / "memory" / "channels" / "C1" / "notes.md",
+            home / "scratch" / "turns" / "scheduler-turn" / "result.md",
+            # ``.resolve()``: on macOS ``/tmp`` is a symlink to ``private/tmp``, and
+            # the write-root check compares the lexical spelling against resolved
+            # roots — an unresolved ``/tmp`` target matches nothing and is denied.
+            Path("/tmp").resolve() / f"mimir-service-write-{tmp_path.name}.txt",
+            repo / "src" / "x.py",
+            repo / ".gitignore",
+            repo / ".gitattributes",
+        ):
+            decision = registry.authorize_tool(
+                tool_name, auth, enforce=True, target_channel=str(target),
+            )
+            assert decision.allowed is True, target
 
-    for target in (
-        home / "root.txt",
-        outside / "data.txt",
-    ):
-        decision = registry.authorize_tool(
-            tool_name, auth, enforce=True, target_channel=str(target),
-        )
-        assert decision.allowed is False, target
-        assert decision.reason == "service_sink_destination_denied"
+        for target in (
+            home / "scratch" / "turns" / "another-turn" / "result.md",
+            home / "scratch" / "flat.md",
+            home / "root.txt",
+            outside / "data.txt",
+        ):
+            decision = registry.authorize_tool(
+                tool_name, auth, enforce=True, target_channel=str(target),
+            )
+            assert decision.allowed is False, target
+            assert decision.reason == "service_sink_destination_denied"
+    finally:
+        reset_current_turn(token)
 
 
 @pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
@@ -4208,24 +4379,30 @@ def test_static_service_write_git_metadata_exception_is_scratch_only(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
-    allowed = registry.authorize_tool(
-        tool_name,
-        auth,
-        enforce=True,
-        target_channel=str(scratch / "proposal" / ".git" / "index"),
-    )
-    assert allowed.allowed is True
-
-    for target in (
-        repo / ".git" / "index",
-        state / ".git" / "index",
-        Path("/tmp") / f"mimir-{tmp_path.name}" / ".git" / "index",
-    ):
-        denied = registry.authorize_tool(
-            tool_name, auth, enforce=True, target_channel=str(target),
+    token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
+    try:
+        allowed = registry.authorize_tool(
+            tool_name,
+            auth,
+            enforce=True,
+            target_channel=str(
+                scratch / "turns" / "scheduler-turn" / "proposal" / ".git" / "index"
+            ),
         )
-        assert denied.allowed is False, target
-        assert denied.reason == "service_sink_destination_denied"
+        assert allowed.allowed is True
+
+        for target in (
+            repo / ".git" / "index",
+            state / ".git" / "index",
+            Path("/tmp") / f"mimir-{tmp_path.name}" / ".git" / "index",
+        ):
+            denied = registry.authorize_tool(
+                tool_name, auth, enforce=True, target_channel=str(target),
+            )
+            assert denied.allowed is False, target
+            assert denied.reason == "service_sink_destination_denied"
+    finally:
+        reset_current_turn(token)
 
 
 @pytest.mark.parametrize(
@@ -6017,7 +6194,7 @@ def test_upgrade_service_reads_only_its_proposal_workspace(
     allowed = ToolRegistry().authorize_tool(
         tool_name, auth, enforce=True, arguments=arguments,
     )
-    denied = ToolRegistry().authorize_tool(
+    changelog_decision = ToolRegistry().authorize_tool(
         tool_name,
         auth,
         enforce=True,
@@ -6029,15 +6206,18 @@ def test_upgrade_service_reads_only_its_proposal_workspace(
     )
 
     assert allowed.allowed is True, allowed.reason
-    assert denied.allowed is False
-    assert denied.reason == "read_scope"
+    if tool_name == "read_file":
+        assert changelog_decision.allowed is True
+    else:
+        assert changelog_decision.allowed is False
+        assert changelog_decision.reason == "read_scope"
 
     from mimir.read_policy import protected_read_denial_reason
 
     token = set_current_turn(SimpleNamespace(turn_id=f"upgrade-{tool_name}", auth_context=auth))
     try:
         assert protected_read_denial_reason(target) is None
-        assert protected_read_denial_reason(changelog) == "mimir_home_read_boundary"
+        assert protected_read_denial_reason(changelog) is None
     finally:
         reset_current_turn(token)
 
