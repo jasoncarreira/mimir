@@ -378,6 +378,7 @@ class ServicePrincipal:
     sink_destinations: tuple[str, ...] = ()
     sink_policies: tuple[ServiceSinkPolicy, ...] = ()
     filesystem_read_roots: tuple[str, ...] = ()
+    channel_memory_directory: str | None = None
     saga_full_corpus_read: bool = False
     creation_path: str | None = None
     authority_profile: str | None = None
@@ -556,6 +557,7 @@ def build_trigger_service_principal(
     capabilities: tuple[str, ...],
     roots: tuple[Path, ...] = (),
     saga_full_corpus_read: bool = False,
+    channel_memory_directory: str | None = None,
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -579,10 +581,7 @@ def build_trigger_service_principal(
         else ()
     )
     service_work_roots = (
-        (
-            Path(home) / "scratch",
-            Path(home) / "memory" / "channels" / canonical,
-        )
+        (Path(home) / "scratch",)
         if is_github_activity and home
         else ()
     )
@@ -647,6 +646,7 @@ def build_trigger_service_principal(
                 *((artifact_root,) if artifact_root is not None else ()),
             ))
         ),
+        channel_memory_directory=channel_memory_directory,
         saga_full_corpus_read=saga_full_corpus_read,
         creation_path=creation_path,
         authority_profile=profile,
@@ -665,6 +665,7 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
             tier=CapabilityTier.UNBOUNDED,
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
             roots=(root,),
+            channel_memory_directory="scheduler:heartbeat",
             creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
         )
     if profile == "session-boundary":
@@ -3403,12 +3404,15 @@ def _trigger_service_read_target_is_allowed(
     service: ServicePrincipal,
     tool_name: str,
     arguments: dict[str, Any] | None,
+    *,
+    auth_context: "AuthContext | None" = None,
 ) -> bool:
-    """Authorize a service read against its frozen roots, lexically and resolved."""
+    """Authorize a service read against frozen roots and verified ownership."""
     from .read_policy import (
         file_contains_secret,
         is_core_memory_read_path,
         is_operator_secret_read_path,
+        service_owned_channel_memory_root,
     )
 
     args = arguments if isinstance(arguments, dict) else {}
@@ -3421,6 +3425,9 @@ def _trigger_service_read_target_is_allowed(
         return False
     candidate = Path(raw)
     roots = tuple(Path(root) for root in service.filesystem_read_roots)
+    owned_root = service_owned_channel_memory_root(auth_context)
+    if owned_root is not None:
+        roots += (owned_root,)
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
@@ -6169,7 +6176,6 @@ class ToolRegistry:
                     allowed = True
                 elif (
                     service_principal is not None
-                    and service_principal.filesystem_read_roots
                     and tool_name in {
                         "read_file", "aread", "ls", "als", "glob", "aglob",
                         "grep", "agrep",
@@ -6177,6 +6183,7 @@ class ToolRegistry:
                 ):
                     allowed = _trigger_service_read_target_is_allowed(
                         service_principal, tool_name, arguments,
+                        auth_context=auth_context,
                     )
                 else:
                     allowed = (

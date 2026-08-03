@@ -184,7 +184,10 @@ def non_admin_read_filter_enabled() -> bool:
         return False
     roles = getattr(auth_context, "roles", ()) or ()
     authority = getattr(auth_context, "service_authority", None)
-    service_has_read_scope = bool(getattr(authority, "filesystem_read_roots", ()))
+    service_has_read_scope = bool(
+        getattr(authority, "filesystem_read_roots", ())
+        or service_owned_channel_memory_root(auth_context)
+    )
     return "admin" not in roles and (
         not getattr(auth_context, "is_service", False) or service_has_read_scope
     )
@@ -297,6 +300,65 @@ def is_core_memory_read_path(path: Path) -> bool:
     return resolved == core or resolved.is_relative_to(core)
 
 
+def service_owned_channel_memory_root(auth_context: Any) -> Path | None:
+    """Return the channel-memory root owned by a server-authenticated service.
+
+    Shared memory such as ``memory/learnings-pending.md`` has no owning
+    principal and is intentionally outside this ownership grant.
+    """
+    if not getattr(auth_context, "is_service", False):
+        return None
+    authority = getattr(auth_context, "service_authority", None)
+    canonical = getattr(auth_context, "canonical_principal", None)
+    directory = getattr(authority, "channel_memory_directory", None)
+    if (
+        not isinstance(canonical, str)
+        or not canonical
+        or getattr(authority, "canonical", None) != canonical
+        or not isinstance(directory, str)
+        or not directory
+        or Path(directory).name != directory
+        or directory in {".", ".."}
+    ):
+        return None
+    home = _resolved_mimir_home()
+    if home is None:
+        return None
+    root = home / "memory" / "channels" / directory
+    try:
+        if root.is_symlink():
+            return None
+    except OSError:
+        return None
+    return root
+
+
+def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
+    """Return whether an existing path is in the authenticated service's memory."""
+    root = service_owned_channel_memory_root(auth_context)
+    if root is None:
+        return False
+    try:
+        resolved_root = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        try:
+            targets_owned_root = path == root or path.is_relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            targets_owned_root = False
+        if targets_owned_root:
+            emit_hard_read_denial(
+                "read_file",
+                str(root),
+                "service_owned_channel_memory_root_missing",
+            )
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return resolved == resolved_root or resolved.is_relative_to(resolved_root)
+
+
 def protected_read_denial_reason(path: Path) -> str | None:
     """Name the path-policy rule that withholds ``path``, if any."""
     service_scoped = is_current_service_scoped_read_path(path)
@@ -326,7 +388,11 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
-    if not getattr(authority, "filesystem_read_roots", ()):
+    roots = tuple(getattr(authority, "filesystem_read_roots", ()))
+    owned_root = service_owned_channel_memory_root(auth_context)
+    if owned_root is not None:
+        roots += (str(owned_root),)
+    if not roots:
         return False
     if is_operator_secret_read_path(path):
         return True
@@ -335,7 +401,7 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     # from the authorization path that scans individual file contents.
     from .access_control import _TRIGGER_SERVICE_PROTECTED_READ_NAMES
 
-    for raw_root in authority.filesystem_read_roots:
+    for raw_root in roots:
         root = Path(raw_root)
         try:
             if path == root or path.is_relative_to(root):
@@ -367,6 +433,8 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
+    if is_service_owned_channel_memory_path(path, auth_context):
+        return True
     authority = getattr(auth_context, "service_authority", None)
     for raw_root in getattr(authority, "filesystem_read_roots", ()):
         try:

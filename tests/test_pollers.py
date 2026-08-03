@@ -364,6 +364,8 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     prompt_file = home / "prompts" / "system.md"
     prompt_file.parent.mkdir()
     prompt_file.write_text("operator prompt\n", encoding="utf-8")
+    shared_learnings = home / "memory" / "learnings-pending.md"
+    shared_learnings.write_text("shared queue\n", encoding="utf-8")
     operator_secret = scratch / "operator-settings.json"
     operator_secret.write_text("{}\n", encoding="utf-8")
     protected_names = (
@@ -409,7 +411,6 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
 
     assert service.filesystem_read_roots == (
         str(repo.resolve()), str(fetch_cache.resolve()), str(scratch.resolve()),
-        str(own_memory.resolve()),
         str(framework_large_tool_results_root(home)),
     )
     for tool_name, arguments in (
@@ -461,6 +462,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
 
         expected_denials = {
             other_memory_file: "service_scoped_read_boundary",
+            shared_learnings: "service_scoped_read_boundary",
             identities_file: "service_scoped_read_boundary",
             prompt_file: "service_scoped_read_boundary",
             operator_secret: "protected_name_match",
