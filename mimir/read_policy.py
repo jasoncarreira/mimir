@@ -301,7 +301,11 @@ def is_core_memory_read_path(path: Path) -> bool:
 
 
 def service_owned_channel_memory_root(auth_context: Any) -> Path | None:
-    """Return the channel-memory root owned by a server-authenticated service."""
+    """Return the channel-memory root owned by a server-authenticated service.
+
+    Shared memory such as ``memory/learnings-pending.md`` has no owning
+    principal and is intentionally outside this ownership grant.
+    """
     if not getattr(auth_context, "is_service", False):
         return None
     authority = getattr(auth_context, "service_authority", None)
@@ -336,7 +340,6 @@ def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
         return False
     try:
         resolved_root = root.resolve(strict=True)
-        resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
         try:
             targets_owned_root = path == root or path.is_relative_to(root)
@@ -348,6 +351,10 @@ def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
                 str(root),
                 "service_owned_channel_memory_root_missing",
             )
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
         return False
     return resolved == resolved_root or resolved.is_relative_to(resolved_root)
 
