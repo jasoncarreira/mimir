@@ -964,15 +964,19 @@ class TestCoreMemoryReflectionGate:
         finally:
             self._clear_turn(tok)
 
+    @pytest.mark.parametrize(
+        ("trigger", "channel_id"),
+        [
+            ("scheduled_tick", "scheduler:reflect"),
+            ("saga_session_end", "discord-a"),
+        ],
+    )
     def test_blocks_core_memory_write_in_reflection_turn(
-        self, home_with_memory: Path
+        self, home_with_memory: Path, trigger: str, channel_id: str,
     ) -> None:
-        """chainlink #342: reflection no longer has a core-write exception —
-        even a reflection turn is blocked. Promotions go via the PR flow."""
+        """Reflection and session synthesis may read core, but never write it."""
         b = WriteGuardBackend(root_dir=home_with_memory, writable_dirs=["memory"])
-        ctx = self._make_turn_ctx(
-            trigger="scheduled_tick", channel_id="scheduler:reflect"
-        )
+        ctx = self._make_turn_ctx(trigger=trigger, channel_id=channel_id)
         tok = self._set_turn(ctx)
         try:
             r = b.write(file_path="/memory/core/40-learned-behaviors.md",

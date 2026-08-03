@@ -3351,8 +3351,10 @@ def resolve_repository_review_state(
     return None, "no matching checkout lease was found for the repository command"
 
 
-def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
-    """Prevent one session boundary from mutating another channel's memory."""
+def _synthesis_channel_target_matches_session(
+    target: str, channel_id: str | None,
+) -> bool:
+    """Bind a channel-memory target to the synthesis turn's session channel."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home or not channel_id:
         return False
@@ -3368,9 +3370,28 @@ def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bo
         # Resolution failure cannot prove channel ownership; fail closed.
         return False
     except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] == channel_id
+
+
+def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bool:
+    """Prevent one session boundary from mutating another channel's memory."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home or not channel_id:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(home).resolve() / candidate
+    try:
+        candidate.resolve().relative_to(
+            (Path(home).resolve() / "memory" / "channels").resolve()
+        )
+    except (OSError, RuntimeError):
+        return False
+    except ValueError:
         # The prompt also authorizes shared non-channel memory and state paths.
         return True
-    return bool(relative.parts) and relative.parts[0] == channel_id
+    return _synthesis_channel_target_matches_session(target, channel_id)
 
 
 def resolve_trigger_service_write_target(target: str, destination: str) -> Path:

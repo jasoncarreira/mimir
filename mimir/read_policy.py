@@ -187,6 +187,7 @@ def non_admin_read_filter_enabled() -> bool:
     service_has_read_scope = bool(
         getattr(authority, "filesystem_read_roots", ())
         or service_owned_channel_memory_root(auth_context)
+        or synthesis_session_channel_memory_root(auth_context)
     )
     return "admin" not in roles and (
         not getattr(auth_context, "is_service", False) or service_has_read_scope
@@ -333,6 +334,59 @@ def service_owned_channel_memory_root(auth_context: Any) -> Path | None:
     return root
 
 
+def synthesis_session_channel_memory_root(auth_context: Any) -> Path | None:
+    """Return the channel-memory root bound to a trusted synthesis turn."""
+    authority = getattr(auth_context, "service_authority", None)
+    channel_id = getattr(auth_context, "channel_id", None)
+    if (
+        not getattr(auth_context, "is_service", False)
+        or getattr(auth_context, "canonical_principal", None) != "synthesis"
+        or getattr(authority, "canonical", None) != "synthesis"
+        or not isinstance(channel_id, str)
+        or not channel_id
+        or Path(channel_id).name != channel_id
+        or channel_id in {".", ".."}
+    ):
+        return None
+    home = _resolved_mimir_home()
+    if home is None:
+        return None
+    return home / "memory" / "channels" / channel_id
+
+
+def _is_synthesis_session_channel_memory_path(path: Path, auth_context: Any) -> bool:
+    root = synthesis_session_channel_memory_root(auth_context)
+    if root is None:
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    # Keep write and read channel ownership on the same channel-only predicate.
+    from .access_control import _synthesis_channel_target_matches_session
+
+    return _synthesis_channel_target_matches_session(
+        str(resolved), getattr(auth_context, "channel_id", None),
+    )
+
+
+def _is_synthesis_shared_memory_path(path: Path, auth_context: Any) -> bool:
+    """Admit only the one shared memory file synthesis already writes."""
+    authority = getattr(auth_context, "service_authority", None)
+    home = _resolved_mimir_home()
+    if (
+        home is None
+        or not getattr(auth_context, "is_service", False)
+        or getattr(auth_context, "canonical_principal", None) != "synthesis"
+        or getattr(authority, "canonical", None) != "synthesis"
+    ):
+        return False
+    try:
+        return path.resolve(strict=True) == home / "memory" / "learnings-pending.md"
+    except (OSError, RuntimeError):
+        return False
+
+
 def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
     """Return whether an existing path is in the authenticated service's memory."""
     root = service_owned_channel_memory_root(auth_context)
@@ -362,14 +416,14 @@ def is_service_owned_channel_memory_path(path: Path, auth_context: Any) -> bool:
 def protected_read_denial_reason(path: Path) -> str | None:
     """Name the path-policy rule that withholds ``path``, if any."""
     service_scoped = is_current_service_scoped_read_path(path)
-    general_protected = not service_scoped and is_protected_read_path(path)
-    service_name_protected = is_current_service_protected_read_path(path)
-    if not (general_protected or service_name_protected):
-        return None
     from ._context import get_current_turn
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
+    general_protected = not service_scoped and is_protected_read_path(path)
+    service_name_protected = is_current_service_protected_read_path(path)
+    if not (general_protected or service_name_protected):
+        return None
     if (
         getattr(auth_context, "is_service", False)
         and getattr(authority, "filesystem_read_roots", ())
@@ -392,6 +446,9 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     owned_root = service_owned_channel_memory_root(auth_context)
     if owned_root is not None:
         roots += (str(owned_root),)
+    synthesis_root = synthesis_session_channel_memory_root(auth_context)
+    if synthesis_root is not None:
+        roots += (str(synthesis_root),)
     if not roots:
         return False
     if is_operator_secret_read_path(path):
@@ -434,6 +491,11 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
     if is_service_owned_channel_memory_path(path, auth_context):
+        return True
+    if (
+        _is_synthesis_session_channel_memory_path(path, auth_context)
+        or _is_synthesis_shared_memory_path(path, auth_context)
+    ):
         return True
     authority = getattr(auth_context, "service_authority", None)
     for raw_root in getattr(authority, "filesystem_read_roots", ()):
