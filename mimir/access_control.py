@@ -711,6 +711,29 @@ def _configured_maintenance_git_roots() -> list[Path]:
     return [Path(home), *(Path(path) for path, _mode in extra_roots)]
 
 
+def _upgrade_proposals_root() -> Path | None:
+    """Return the upgrade service's bounded proposal workspace root."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    return (Path(home).resolve() / "scratch" / "proposals").resolve()
+
+
+def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Path, ...]:
+    """Resolve static read roots plus built-in service-owned workspace roots."""
+    if service is None:
+        return ()
+    roots = [Path(root) for root in service.filesystem_read_roots]
+    if (
+        getattr(service, "canonical", None) == "system"
+        and getattr(service, "trigger", None) == "upgrade"
+    ):
+        proposal_root = _upgrade_proposals_root()
+        if proposal_root is not None:
+            roots.append(proposal_root)
+    return tuple(dict.fromkeys(roots))
+
+
 def _configured_file_write_roots() -> list[Path]:
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
@@ -1348,6 +1371,23 @@ def _target_within_static_service_write_roots(target: str, _destination: str) ->
         under_memory_root=root == memory_root,
         allow_git_metadata=root == scratch_root,
     )
+
+
+def _target_within_upgrade_proposals(target: str, _destination: str) -> bool:
+    """Restrict upgrade file mutations to the proposal workspace it owns."""
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    root = _upgrade_proposals_root()
+    if root is None:
+        return False
+    candidate = Path(target)
+    if not candidate.is_absolute():
+        candidate = Path(os.environ["MIMIR_HOME"]).resolve() / candidate
+    try:
+        resolve_within_roots([root], str(candidate))
+    except (OSError, PathOutsideHomeError, RuntimeError):
+        return False
+    return _target_within_static_service_write_roots(str(candidate), _destination)
 
 
 def resolve_configured_write_target(target: str) -> Path:
@@ -2491,7 +2531,8 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
                     "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
                     "--exit-code", "--full-index", "--grep", "--name-only",
                     "--name-status", "--no-color", "--no-merges", "--no-patch",
-                    "--oneline", "--quiet", "--raw", "--stat", "--staged",
+                    "--no-ext-diff", "--no-textconv", "--oneline", "--quiet",
+                    "--raw", "--stat", "--staged",
                 }),
                 option_prefixes=(
                     "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
@@ -2516,6 +2557,34 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     if subcommand in {"diff", "log", "show"}:
         execution_argv.extend(("--no-ext-diff", "--no-textconv"))
     return execution_argv
+
+
+def _upgrade_workspace_git_execution_argv(argv: list[str]) -> list[str] | None:
+    """Harden read-only Git after binding ``-C`` to ``scratch/proposals``."""
+    if not argv or argv[0] != "git":
+        return None
+    arguments = argv[1:]
+    if arguments[:1] == ["--no-pager"]:
+        arguments = arguments[1:]
+    if arguments[:1] != ["-C"] or len(arguments) < 3:
+        return None
+    requested_root = arguments[1]
+    remaining = arguments[2:]
+    if remaining[:1] == ["--no-pager"]:
+        remaining = remaining[1:]
+
+    from ._paths import PathOutsideHomeError, resolve_within_roots
+
+    proposal_root = _upgrade_proposals_root()
+    if proposal_root is None:
+        return None
+    try:
+        resolve_within_roots([proposal_root], requested_root)
+    except (OSError, PathOutsideHomeError, RuntimeError):
+        return None
+    return _maintenance_git_execution_argv(
+        ["git", "-C", requested_root, *remaining]
+    )
 
 
 def _maintenance_pin_is_service_writable(expected: Path) -> bool:
@@ -2925,10 +2994,25 @@ def _service_shell_typed_tool_guidance(
     # the latter two have no general bounded typed equivalent. `npm ci` and
     # `npm install` are inferred dependency-install shapes and remain refused
     # because this profile exposes no typed dependency-install capability.
-    if destination != "repo_review" or not argv:
+    if not argv:
         return ""
     executable = Path(argv[0]).name
     operation = argv[1:2]
+    if destination == "upgrade_workspace":
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable):
+            return (
+                " Python execution is arbitrary code execution and remains denied. "
+                "Use read_file, glob, or grep for bounded inspection beneath the "
+                "proposal workspace; do not retry with python -c or a script."
+            )
+        if executable in {"cat", "grep", "rg", "ls"}:
+            return (
+                " Use the typed read_file, grep, glob, or ls tool for bounded "
+                "inspection beneath the proposal workspace."
+            )
+        return ""
+    if destination != "repo_review":
+        return ""
     if executable == "npm" and operation in (["run"], ["test"]):
         if _service_shell_coding_enabled():
             return (
@@ -3137,7 +3221,7 @@ def parse_service_shell_argv_with_diagnostics(
         allowed = _target_matches_maintenance_shell_command(argv)
     elif destination == "upgrade_workspace":
         if argv[0] == "git":
-            git_argv = _maintenance_git_execution_argv(argv)
+            git_argv = _upgrade_workspace_git_execution_argv(argv)
             if git_argv is None:
                 return (
                     None,
@@ -3421,6 +3505,23 @@ def _is_trigger_service_protected_read_path(path: Path) -> bool:
     return any(part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES for part in path.parts)
 
 
+def _is_service_protected_read_path(
+    service: ServicePrincipal | None, root: Path, relative: Path,
+) -> bool:
+    """Apply protected names, except shipped prompt files in upgrade proposals."""
+    protected = {
+        part.lower() for part in relative.parts
+        if part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+    }
+    return bool(protected) and not (
+        service is not None
+        and getattr(service, "canonical", None) == "system"
+        and getattr(service, "trigger", None) == "upgrade"
+        and root == _upgrade_proposals_root()
+        and protected == {"prompts"}
+    )
+
+
 def _trigger_service_read_target_is_allowed(
     service: ServicePrincipal,
     tool_name: str,
@@ -3445,7 +3546,7 @@ def _trigger_service_read_target_is_allowed(
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         return False
     candidate = Path(raw)
-    roots = tuple(Path(root) for root in service.filesystem_read_roots)
+    roots = service_filesystem_read_roots(service)
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
@@ -3497,8 +3598,8 @@ def _trigger_service_read_target_is_allowed(
         )
         artifact_root = framework_large_tool_results_root()
         lexical_is_artifact = artifact_root is not None and lexical_root == artifact_root
-        if not lexical_is_artifact and _is_trigger_service_protected_read_path(
-            lexical_relative
+        if not lexical_is_artifact and _is_service_protected_read_path(
+            service, lexical_root, lexical_relative,
         ):
             return False
         resolved = candidate.resolve(strict=True)
@@ -3518,7 +3619,7 @@ def _trigger_service_read_target_is_allowed(
     resolved_is_artifact = artifact_root is not None and root == artifact_root
     if resolved_is_artifact:
         return True
-    if _is_trigger_service_protected_read_path(relative):
+    if _is_service_protected_read_path(service, root, relative):
         return False
     if is_operator_secret_read_path(resolved):
         return False
@@ -3681,6 +3782,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "configured_repo_write_roots": _target_within_configured_repo_write_roots,
     "static_service_write_roots": _target_within_static_service_write_roots,
+    "upgrade_proposals": _target_within_upgrade_proposals,
     "shell_profile": _target_matches_shell_profile,
     "spawn_workspace": _target_within_configured_write_roots,
     "worklink_repo": _target_matches_worklink_repo,
@@ -6215,7 +6317,12 @@ class ToolRegistry:
                         and is_memory_read_path(Path(resolved_read_target))
                     )
                     allowed = scoped_read_allowed or (
-                        service_allowed and not targets_memory
+                        service_allowed
+                        and not targets_memory
+                        and not (
+                            service_principal.canonical == "system"
+                            and service_principal.trigger == "upgrade"
+                        )
                     )
                 elif service_allowed:
                     allowed = True
@@ -6924,12 +7031,12 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             ),
             sink_policies=(
                 ServiceSinkPolicy(
-                    "write_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                    "write_file", "upgrade_proposals",
+                    "MIMIR_HOME/scratch/proposals",
                 ),
                 ServiceSinkPolicy(
-                    "edit_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                    "edit_file", "upgrade_proposals",
+                    "MIMIR_HOME/scratch/proposals",
                 ),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),

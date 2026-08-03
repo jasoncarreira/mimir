@@ -3872,7 +3872,7 @@ def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
 
 @pytest.mark.parametrize(
     ("trigger", "canonical"),
-    [("scheduled_tick", "scheduler"), ("upgrade", "system")],
+    [("scheduled_tick", "scheduler")],
 )
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
 def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
@@ -4037,7 +4037,7 @@ def test_static_service_write_denies_symlink_escapes_and_protected_aliases(
         assert decision.reason == "service_sink_destination_denied"
 
 
-@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("trigger", ["scheduled_tick"])
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
 def test_static_service_write_git_metadata_exception_is_scratch_only(
     trigger: str,
@@ -4112,7 +4112,7 @@ def test_new_static_service_roots_retain_protected_name_denials(
     assert decision.reason == "service_sink_destination_denied"
 
 
-@pytest.mark.parametrize("trigger", ["scheduled_tick", "upgrade"])
+@pytest.mark.parametrize("trigger", ["scheduled_tick"])
 def test_static_service_write_allows_home_when_file_tool_roots_unset(
     trigger: str,
     tmp_path: Path,
@@ -5690,6 +5690,11 @@ def test_heartbeat_scope_rejects_raw_provider_payload(
 def test_every_service_shell_profile_returns_absolute_executables(
     maintenance_git_home: Path,
 ) -> None:
+    upgrade_worktree = (
+        maintenance_git_home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    )
+    upgrade_worktree.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(upgrade_worktree)], check=True)
     samples = {
         "scheduler_read_only": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
@@ -5712,7 +5717,7 @@ def test_every_service_shell_profile_returns_absolute_executables(
         "upgrade_workspace": (
             "pwd -P", "ls -la", "wc -l sample.txt", "grep -n needle sample.txt",
             "jq -r .name sample.json", "rg --no-config -n needle .",
-            f"git -C {maintenance_git_home} status --short", "uv lock",
+            f"git -C {upgrade_worktree} status --short", "uv lock",
         ),
     }
 
@@ -5773,6 +5778,130 @@ def test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized(
         target_channel=f"ls -ld {worktree}",
     )
     assert inspection.allowed is True, inspection.reason
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "ls", "glob", "grep"])
+def test_upgrade_service_reads_only_its_proposal_workspace(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    proposal = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    target = proposal / ("prompts/heartbeat.md" if tool_name == "read_file" else "memory")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if tool_name == "read_file":
+        target.write_text("bounded prompt\n", encoding="utf-8")
+    else:
+        target.mkdir()
+        (target / "core.md").write_text("bounded memory\n", encoding="utf-8")
+    changelog = home / "CHANGELOG.md"
+    changelog.write_text("outside proposal\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("upgrade")
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    arguments = (
+        {"file_path": str(target)}
+        if tool_name == "read_file"
+        else {"path": str(target), "pattern": "bounded"}
+    )
+
+    allowed = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True, arguments=arguments,
+    )
+    denied = ToolRegistry().authorize_tool(
+        tool_name,
+        auth,
+        enforce=True,
+        arguments=(
+            {"file_path": str(changelog)}
+            if tool_name == "read_file"
+            else {"path": str(home), "pattern": "outside"}
+        ),
+    )
+
+    assert allowed.allowed is True, allowed.reason
+    assert denied.allowed is False
+    assert denied.reason == "read_scope"
+
+    from mimir.read_policy import protected_read_denial_reason
+
+    token = set_current_turn(SimpleNamespace(turn_id=f"upgrade-{tool_name}", auth_context=auth))
+    try:
+        assert protected_read_denial_reason(target) is None
+        assert protected_read_denial_reason(changelog) == "mimir_home_read_boundary"
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_upgrade_service_writes_are_limited_to_proposals(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    proposal = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    proposal.mkdir(parents=True)
+    (home / "state").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("upgrade")
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+
+    allowed = registry.authorize_tool(
+        tool_name, auth, enforce=True, target_channel=str(proposal / "result.md"),
+    )
+    denied = registry.authorize_tool(
+        tool_name, auth, enforce=True, target_channel=str(home / "state" / "result.md"),
+    )
+
+    assert allowed.allowed is True, allowed.reason
+    assert denied.allowed is False
+
+
+def test_upgrade_workspace_git_is_proposal_scoped_and_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home = tmp_path / "home"
+    proposal = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    outside = home / "outside"
+    proposal.mkdir(parents=True)
+    outside.mkdir()
+    subprocess.run(["git", "init", "-q", str(proposal)], check=True)
+    subprocess.run(["git", "init", "-q", str(outside)], check=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    for operation in (
+        "status --short",
+        "--no-pager show --no-ext-diff HEAD",
+        "diff --no-ext-diff --cached",
+        "--no-pager log --oneline -5",
+    ):
+        argv = parse_service_shell_argv(
+            f"git -C {proposal} {operation}", "upgrade_workspace",
+        )
+        assert argv is not None, operation
+        assert argv[0] == str(maintenance_pinned_executables["git"])
+        assert argv[1:3] == ["-C", str(proposal.resolve())]
+
+    for command in (
+        f"git -C {outside} status --short",
+        f"git -C {proposal} commit -m changed",
+        f"git -C {proposal} show HEAD > /tmp/x && head -2 /tmp/x",
+        f"python3 {proposal / 'inspect.py'}",
+        "python3 -c 'print(1)'",
+    ):
+        argv, reason = parse_service_shell_argv_with_reason(command, "upgrade_workspace")
+        assert argv is None, command
+        if command.startswith("python3"):
+            assert "read_file, glob, or grep" in reason
+        if ">" in command:
+            assert "one argv" in reason
 
 
 def test_repo_review_npm_uses_pinned_interpreter_and_script(
