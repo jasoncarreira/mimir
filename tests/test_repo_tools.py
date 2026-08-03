@@ -317,28 +317,77 @@ def test_merge_non_conflict_failure_preserves_git_stderr(repo_tools) -> None:
     assert "repo_merge_abort" not in str(refusal.value)
 
 
-def test_checked_failure_stdout_is_redacted_but_commands_must_opt_in(repo_tools) -> None:
+def test_checked_failure_reports_redacted_stdout_and_names_silent_exit(repo_tools) -> None:
     _origin, _source, _scope, state, _tools = repo_tools
     secret = "stdout-secret"
 
     def failed_runner(argv, *, env, timeout, output_limit):
         if "status" in argv:
             return GitProcessResult(1, stdout=f"diagnostic {secret}")
+        if "show" in argv:
+            return GitProcessResult(1)
         return _bounded_subprocess_runner(
             argv, env=env, timeout=timeout, output_limit=output_limit,
         )
 
     tools = RepoGitTools(state, runner=failed_runner)
-    with pytest.raises(GitRefusal, match="Git operation failed"):
-        tools._command(("status",), sensitive_values=(secret,))
     with pytest.raises(GitRefusal) as refusal:
-        tools._checked(
-            ("status",),
-            sensitive_values=(secret,),
-            report_stdout_on_failure=True,
-        )
+        tools._command(("status",), sensitive_values=(secret,))
 
     assert str(refusal.value) == "diagnostic [REDACTED]"
+
+    with pytest.raises(GitRefusal) as silent:
+        tools._checked(("show",))
+    assert str(silent.value) == "Git exited with status 1 without diagnostic output"
+
+
+@pytest.mark.parametrize(
+    ("failed_command", "operation", "stream", "condition"),
+    [
+        (
+            "add",
+            GitStage(("tracked.txt",)),
+            "stderr",
+            "index.lock: File exists",
+        ),
+        (
+            "commit",
+            GitCommit(("tracked.txt",), "remediate review"),
+            "stdout",
+            "nothing to commit, working tree clean",
+        ),
+    ],
+)
+def test_stage_and_commit_failures_report_named_redacted_git_condition(
+    repo_tools,
+    failed_command: str,
+    operation,
+    stream: str,
+    condition: str,
+) -> None:
+    _origin, _source, _scope, state, _tools = repo_tools
+    secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
+    (state.checkout_lease.path / "tracked.txt").write_text("remediated\n", encoding="utf-8")
+
+    def failed_runner(argv, *, env, timeout, output_limit):
+        if failed_command in argv:
+            return GitProcessResult(
+                1,
+                **{stream: f"{condition}; remote {secret_url}"},
+            )
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    with pytest.raises(GitRefusal) as failure:
+        RepoGitTools(state, runner=failed_runner).execute(operation)
+
+    detail = str(failure.value)
+    assert failure.value.code == "git_failed"
+    assert condition in detail
+    assert detail != "Git operation failed"
+    assert "super-secret-password" not in detail
+    assert "https://[REDACTED]@example.invalid/owner/repo.git" in detail
 
 
 def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) -> None:

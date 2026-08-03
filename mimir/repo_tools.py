@@ -123,6 +123,14 @@ class GitOperationResult:
     stderr: str = ""
 
 
+def _git_failure_detail(result: GitProcessResult) -> str:
+    """Return all scrubbed Git diagnostics, or an explicit silent-failure reason."""
+    detail = "\n".join(
+        output.strip() for output in (result.stderr, result.stdout) if output.strip()
+    )
+    return detail or f"Git exited with status {result.returncode} without diagnostic output"
+
+
 @dataclass(frozen=True)
 class GitFetch:
     """Fetch only the immutable head and base refs bound into the scope."""
@@ -456,7 +464,6 @@ class RepoGitTools:
         network_remote: str | None = None,
         env: dict[str, str] | None = None,
         sensitive_values: tuple[str, ...] = (),
-        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         result = self._raw(
             arguments,
@@ -470,10 +477,7 @@ class RepoGitTools:
         if result.output_limited:
             raise GitRefusal("output_limit", "Git operation exceeded its output limit")
         if result.returncode != 0:
-            detail = result.stderr.strip()
-            if not detail and report_stdout_on_failure:
-                detail = result.stdout.strip()
-            raise GitRefusal("git_failed", detail or "Git operation failed")
+            raise GitRefusal("git_failed", _git_failure_detail(result))
         return result
 
     def _config_overrides(self) -> tuple[str, ...]:
@@ -513,7 +517,6 @@ class RepoGitTools:
         overrides: tuple[str, ...] | None = None,
         env: dict[str, str] | None = None,
         sensitive_values: tuple[str, ...] = (),
-        report_stdout_on_failure: bool = False,
     ) -> GitProcessResult:
         local_overrides = self._config_overrides() if overrides is None else overrides
         prefix = local_overrides
@@ -529,7 +532,6 @@ class RepoGitTools:
             network_remote=network_remote,
             env=env,
             sensitive_values=sensitive_values,
-            report_stdout_on_failure=report_stdout_on_failure,
         )
 
     def _has_in_progress_merge_or_rebase(self) -> bool:
@@ -810,7 +812,6 @@ class RepoGitTools:
                 result = self._command(
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
                     identity=True,
-                    report_stdout_on_failure=True,
                 )
             except GitRefusal as exc:
                 if exc.code != "git_failed":
