@@ -780,6 +780,57 @@ def test_synthesis_unresolvable_other_channel_target_fails_closed(
     assert decision.reason == "service_sink_destination_denied"
 
 
+@pytest.mark.parametrize("tool_name", ["read_file", "grep"])
+def test_synthesis_reads_only_its_session_channel_and_explicit_shared_memory(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own_note = home / "memory" / "channels" / "channel-a" / "summary.md"
+    other_note = home / "memory" / "channels" / "channel-b" / "summary.md"
+    core_note = home / "memory" / "core" / "00-persona.md"
+    protected_note = own_note.parent / "secrets" / "token.txt"
+    shared_learnings = home / "memory" / "learnings-pending.md"
+    operator_secret = own_note.parent / "operator-settings.json"
+    for path in (
+        own_note, other_note, core_note, protected_note, shared_learnings,
+        operator_secret,
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("safe notes\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(operator_secret))
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", home,
+    )
+    auth = replace(
+        _service_auth(principal, InformationFlowLabels()),
+        channel_id="channel-a",
+    )
+    registry = ToolRegistry()
+
+    argument_name = "file_path" if tool_name == "read_file" else "path"
+    for target in (own_note, shared_learnings):
+        decision = registry.authorize_tool(
+            tool_name,
+            auth,
+            enforce=True,
+            arguments={argument_name: str(target)},
+        )
+        assert decision.allowed is True, (target, decision.reason)
+
+    for target in (other_note, core_note, protected_note, operator_secret):
+        decision = registry.authorize_tool(
+            tool_name,
+            auth,
+            enforce=True,
+            arguments={argument_name: str(target)},
+        )
+        assert decision.allowed is False, target
+        assert decision.reason == "read_scope"
+
+
 def test_inventory_assertion_rejects_uncataloged_deepagents_builtin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

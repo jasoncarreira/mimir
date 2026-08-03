@@ -916,6 +916,56 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
     assert "refused before execution" in str(fake_agent.result.content)
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "expected", "allowed"),
+    [
+        ("memory/channels/discord-a/notes.md", "session note\n", True),
+        ("memory/learnings-pending.md", "pending learning\n", True),
+        ("memory/channels/discord-b/notes.md", "other note\n", False),
+        ("memory/core/00-persona.md", "core memory\n", False),
+    ],
+)
+async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
+    relative_path: str,
+    expected: str,
+    allowed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.access_control import builtin_trigger_service_principal
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    target = home / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(expected, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = builtin_trigger_service_principal("session-boundary", home)
+    fake_agent = _ServiceMemoryReadProbeAgent(
+        WriteGuardBackend(home, ["state", "memory"]),
+        f"/{relative_path}",
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="saga_session_end",
+        channel_id="discord-a",
+        content="synthesize this session",
+        service_principal=authority.canonical,
+        service_authority=authority,
+        extra={"saga_session_id": "saga-session-a"},
+    ))
+
+    assert record.error is None
+    assert fake_agent.result is not None
+    assert (fake_agent.result.status != "error") is allowed
+    if allowed:
+        assert fake_agent.result.content == expected
+    else:
+        assert "refused before execution" in str(fake_agent.result.content)
+
+
 async def test_heartbeat_turn_reads_explicitly_mapped_channel_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -684,11 +684,21 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         source_channels=frozenset({event.channel_id}),
     )
     ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
+    read_arguments = None
+    if trigger == "saga_session_end" and allowed_operation == "read_file":
+        note = (
+            maintenance_git_home / "memory" / "channels"
+            / str(event.channel_id) / "notes.md"
+        )
+        note.parent.mkdir(parents=True)
+        note.write_text("session notes\n", encoding="utf-8")
+        read_arguments = {"file_path": str(note)}
 
     admitted = registry.authorize_tool(
         allowed_operation,
         ctx,
         enforce=True,
+        arguments=read_arguments,
         target_channel=(
             f"git -C {maintenance_git_home} status"
             if allowed_operation == "shell_exec"
