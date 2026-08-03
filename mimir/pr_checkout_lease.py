@@ -19,6 +19,8 @@ from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_c
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 _METADATA = ".git/mimir-pr-checkout-lease.json"
+_RECLAMATION_METADATA = ".git/mimir-pr-checkout-lease-reclamation.json"
+_RECOVERY_DIRECTORY = ".recovery"
 PUBLISHED_HEAD_REF = "refs/mimir/pr-checkout-lease/published"
 _LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 _CLEANUP_IDENTITY_FIELDS = (
@@ -101,6 +103,8 @@ class PRCheckoutLeaseReclamation:
     publication_proof_present: bool
     reclaimed: bool
     error: str | None = None
+    recovery_bundle: Path | None = None
+    canonical_origin_contains_head: bool | None = None
 
 
 def configured_pr_checkout_lease_root() -> Path:
@@ -405,6 +409,7 @@ def recover_pr_checkout_lease(
         )
     if expired:
         lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
+        (path / _RECLAMATION_METADATA).unlink(missing_ok=True)
         (path / _METADATA).write_text(
             json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
         )
@@ -468,6 +473,79 @@ def _checkout_size_bytes(path: Path) -> int:
     return total
 
 
+def _origin_contains_head(lease: PRCheckoutLease, head: str, runner: Runner) -> bool | None:
+    """Classify whether the current HEAD is reachable from a fetched origin ref."""
+    fetched = runner([
+        "git", "-C", str(lease.path), "fetch", "--no-tags", "origin",
+    ])
+    if fetched.returncode != 0:
+        return None
+    refs = runner([
+        "git", "-C", str(lease.path), "for-each-ref", f"--contains={head}",
+        "--format=%(refname)", "refs/remotes/origin",
+    ])
+    if refs.returncode != 0:
+        return None
+    return bool(refs.stdout.strip())
+
+
+def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -> Path:
+    """Atomically preserve the complete history reachable from a lease HEAD."""
+    recovery_root = lease.lease_root / _RECOVERY_DIRECTORY
+    if recovery_root.is_symlink():
+        raise RuntimeError("PR checkout lease recovery directory may not be a symlink")
+    recovery_root.mkdir(mode=0o700, exist_ok=True)
+    recovery_root = recovery_root.resolve(strict=True)
+    if recovery_root.parent != lease.lease_root.resolve(strict=True):
+        raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
+    bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
+    if bundle.exists():
+        verified = runner(["git", "bundle", "verify", str(bundle)])
+        if verified.returncode != 0:
+            raise RuntimeError("existing PR checkout lease recovery bundle is invalid")
+        return bundle
+    staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        _run(
+            runner,
+            ["git", "-C", str(lease.path), "bundle", "create", str(staging), "HEAD"],
+            "PR checkout lease recovery bundle creation failed",
+        )
+        _run(
+            runner,
+            ["git", "bundle", "verify", str(staging)],
+            "PR checkout lease recovery bundle verification failed",
+        )
+        os.replace(staging, bundle)
+    finally:
+        staging.unlink(missing_ok=True)
+    return bundle
+
+
+def _mark_lease_unreclaimable(
+    lease: PRCheckoutLease,
+    *,
+    observed_at: datetime,
+    error: str,
+) -> None:
+    marker = lease.path / _RECLAMATION_METADATA
+    staging = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+    record = {
+        "version": 1,
+        "classification": "unreclaimable",
+        "lease": lease.path.name,
+        "path": str(lease.path),
+        "recovery_id": lease.recovery_id,
+        "decided_at": observed_at.isoformat(),
+        "error": error,
+    }
+    try:
+        staging.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(staging, marker)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
 def reclaim_expired_pr_checkout_leases(
     lease_root: Path,
     *,
@@ -498,6 +576,8 @@ def reclaim_expired_pr_checkout_leases(
         for path in sorted(root.iterdir()):
             if path.name.startswith(".") or not path.is_dir() or path.is_symlink():
                 continue
+            if (path / _RECLAMATION_METADATA).is_file():
+                continue
             try:
                 lease = _lease_from_recorded_metadata(path, root)
             except RuntimeError:
@@ -511,10 +591,39 @@ def reclaim_expired_pr_checkout_leases(
             ]).returncode == 0
             error: str | None = None
             reclaimed = False
+            recovery_bundle: Path | None = None
+            canonical_origin_contains_head: bool | None = None
             try:
                 reclaimed = cleanup_pr_checkout_lease(lease, runner=runner)
             except RuntimeError as exc:
                 error = str(exc)
+                if error in {
+                    "PR checkout lease cleanup found no publication proof",
+                } or error.startswith("PR checkout lease cleanup publication mismatch:"):
+                    try:
+                        head = _run(
+                            runner,
+                            ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+                            "PR checkout lease reclamation found no HEAD",
+                        ).lower()
+                        canonical_origin_contains_head = _origin_contains_head(
+                            lease, head, runner,
+                        )
+                        recovery_bundle = _preserve_checkout_head(lease, head, runner)
+                        shutil.rmtree(path)
+                        reclaimed = True
+                        error = None
+                    except (OSError, RuntimeError) as preservation_exc:
+                        error = (
+                            f"{error}; preservation failed: {preservation_exc}"
+                        )
+                if not reclaimed:
+                    try:
+                        _mark_lease_unreclaimable(
+                            lease, observed_at=observed_at, error=error,
+                        )
+                    except OSError as marker_exc:
+                        error = f"{error}; terminal marker failed: {marker_exc}"
             result = PRCheckoutLeaseReclamation(
                 lease=path.name,
                 path=path,
@@ -523,16 +632,22 @@ def reclaim_expired_pr_checkout_leases(
                 publication_proof_present=proof,
                 reclaimed=reclaimed,
                 error=error,
+                recovery_bundle=recovery_bundle,
+                canonical_origin_contains_head=canonical_origin_contains_head,
             )
             results.append(result)
             event_logger(
-                "pr_checkout_lease_reclaimed" if reclaimed else "pr_checkout_lease_retained",
+                "pr_checkout_lease_reclaimed" if reclaimed else "pr_checkout_lease_unreclaimable",
                 lease=result.lease,
                 path=str(result.path),
                 expired_by_s=round(result.expired_by_s, 3),
                 size_bytes=result.size_bytes,
                 publication_proof_present=result.publication_proof_present,
                 error=result.error,
+                recovery_bundle=(
+                    str(result.recovery_bundle) if result.recovery_bundle else None
+                ),
+                canonical_origin_contains_head=result.canonical_origin_contains_head,
             )
     finally:
         fcntl.flock(directory_fd, fcntl.LOCK_UN)
