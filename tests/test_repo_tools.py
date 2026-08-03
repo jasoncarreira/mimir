@@ -385,6 +385,107 @@ def test_rebase_conflict_has_separately_modeled_working_abort(tmp_path: Path) ->
     assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
 
 
+def _two_sided_conflict_tools(
+    tmp_path: Path,
+) -> tuple[Path, RepoPRActionScope, RepoReviewState, RepoGitTools]:
+    origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("base property\n", encoding="utf-8")
+    (source / "base-test").write_text(
+        "#!/bin/sh\ngrep -q 'base property' tracked.txt\n", encoding="utf-8",
+    )
+    (source / "head-test").write_text(
+        "#!/bin/sh\ngrep -q 'head property' tracked.txt\n", encoding="utf-8",
+    )
+    (source / "suite").write_text(
+        "#!/bin/sh\n./base-test && ./head-test\n", encoding="utf-8",
+    )
+    for path in ("base-test", "head-test", "suite"):
+        (source / path).chmod(0o755)
+    _git(source, "add", "tracked.txt", "base-test", "head-test", "suite")
+    _git(source, "commit", "-q", "-m", "advance base with pinned property")
+    advanced_base = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    conflict_scope = replace(
+        scope,
+        event_type="pr_mergeability_conflicting",
+        observed_base_sha=advanced_base,
+    )
+    state = RepoReviewState(conflict_scope)
+    create_pr_checkout_lease(
+        conflict_scope,
+        owner="mimir-bot",
+        lease_root=old_state.checkout_lease.lease_root,
+        review_state=state,
+    )
+    return origin, conflict_scope, state, RepoGitTools(state)
+
+
+@pytest.mark.parametrize("dropped_side", ["base", "head"])
+def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dropped_side: str,
+) -> None:
+    origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
+    lease = state.checkout_lease
+    with pytest.raises(GitRefusal):
+        tools.execute(GitRebase())
+    chosen = "head property\n" if dropped_side == "base" else "base property\n"
+    (lease.path / "tracked.txt").write_text(chosen, encoding="utf-8")
+    tools.execute(GitStage(("tracked.txt",)))
+    assert tools.execute(GitRebase(
+        "base property", "base-test",
+        "head property", "head-test",
+    )).ok
+
+    home = tmp_path / "home"
+    _configure_worklink_test(home, str(lease.path / "suite"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    result = RepoProjectTests(state).execute()
+    assert result.ok is False
+
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "full_test_required"
+    assert _git(origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+
+
+def test_conflict_resolution_preserves_both_sides_records_evidence_and_pushes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    origin, scope, state, tools = _two_sided_conflict_tools(tmp_path)
+    lease = state.checkout_lease
+    with pytest.raises(GitRefusal):
+        tools.execute(GitRebase())
+    (lease.path / "tracked.txt").write_text(
+        "base property\nhead property\n", encoding="utf-8",
+    )
+    tools.execute(GitStage(("tracked.txt",)))
+    assert tools.execute(GitRebase(
+        "base property", "base-test checks the rebased file",
+        "head property", "head-test checks the rebased file",
+    )).ok
+    message = _git(lease.path, "log", "-1", "--format=%B")
+    assert "Base property: base property" in message
+    assert "Base verification: base-test checks the rebased file" in message
+    assert "Head property: head property" in message
+    assert "Head verification: head-test checks the rebased file" in message
+
+    with pytest.raises(GitRefusal) as untested:
+        tools.execute(GitPush())
+    assert untested.value.code == "full_test_required"
+    home = tmp_path / "home"
+    _configure_worklink_test(home, str(lease.path / "suite"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert RepoProjectTests(state).execute().ok
+    assert tools.execute(GitPush()).ok
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        lease.path, "rev-parse", "HEAD",
+    )
+
+
 def test_revert_conflict_has_separately_authorized_abort(repo_tools) -> None:
     _origin, _source, scope, state, tools = repo_tools
     lease = state.checkout_lease

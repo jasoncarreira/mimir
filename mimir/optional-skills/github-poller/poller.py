@@ -1826,7 +1826,8 @@ def _check_own_mergeability(
             if key in prior:
                 new[key] = prior[key]
             continue
-        if mergeable and _blocking_reviewers(reviews, me):
+        blocking = _blocking_reviewers(reviews, me)
+        if blocking:
             # Moving the head could make an unaddressed blocking review appear
             # stale. The changes-requested reconciler owns this PR until cleared.
             continue
@@ -1907,17 +1908,43 @@ def _check_own_mergeability(
             )
             event_type = "pr_mergeability_rebase"
         else:
+            reviewers = sorted({
+                (review.get("user") or {}).get("login")
+                for review in reviews
+                if isinstance(review, dict)
+                and (review.get("user") or {}).get("login")
+                and (review.get("user") or {}).get("login") != me
+            } | {
+                reviewer.get("login")
+                for reviewer in (pr.get("requested_reviewers") or [])
+                if isinstance(reviewer, dict)
+                and reviewer.get("login")
+                and reviewer.get("login") != me
+            })
+            reviewer_text = ", ".join(reviewers) if reviewers else "an available reviewer"
             prompt = (
                 f"Your PR #{number} on {repo} conflicts with its declared base "
                 f"{base.get('ref')} at {base_sha}: {title}\n"
-                "Use the scoped PR checkout and repo_rebase only to reproduce the "
-                "conflict, collect every path with repo_unmerged, then repo_rebase_abort. "
-                "Never resolve, complete, or push this automatic rebase. Escalate with "
-                f"the conflicting paths, base commit {base_sha}, and instructions to "
-                f"resolve and test a manual rebase before pushing. Do not merge.\n{url}"
+                "Use the scoped PR checkout and repo_rebase to reproduce the conflict, "
+                "then collect every path with repo_unmerged. Resolve only when you can "
+                "identify the intended property from both the base and head; prefer "
+                "repo_rebase_abort and escalation over guessing. Stage only the conflict "
+                "paths and call repo_rebase again with the base property, head property, "
+                "and how you verified each so that evidence is recorded in the rebased "
+                "commit. Run repo_test with no selectors for the repository's configured "
+                "full suite; never push if it fails. Then repo_push with the existing lease "
+                f"and re-request review from {reviewer_text}. This path only resolves and "
+                "re-requests review: do not merge the PR.\n"
+                f"There is no blocking CHANGES_REQUESTED review. Base: {base_sha}.\n{url}"
             )
             event_type = "pr_mergeability_conflicting"
-        _emit(prompt, event_type=event_type, behind_by=behind_by, **common)
+        _emit(
+            prompt,
+            event_type=event_type,
+            behind_by=behind_by,
+            **({"reviewers": reviewers} if not mergeable else {}),
+            **common,
+        )
         new[key] = {
             "head_sha": head_sha,
             "reason": reason,

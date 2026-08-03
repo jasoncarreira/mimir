@@ -5785,7 +5785,7 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     )
     assert conflict_scope is not None
     assert access_control.RepoPRAction.COMMIT.value in conflict_scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value not in conflict_scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value in conflict_scope.allowed_operations
     for change in (
         {"state": "closed"},
         {"author": "someone-else"},

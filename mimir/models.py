@@ -634,6 +634,8 @@ class RepoReviewState:
     checked_out: bool = field(default=False, init=False, compare=False)
     checkout_lease: Any = field(default=None, init=False, repr=False, compare=False)
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
+    full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
+    conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def repo(self) -> str:
@@ -683,6 +685,29 @@ class RepoReviewState:
         ):
             raise ValueError("Git HEAD update does not match active review scope")
         object.__setattr__(self, "git_expected_head", normalized)
+        object.__setattr__(self, "full_tested_head", None)
+        object.__setattr__(self, "conflict_evidence_head", None)
+
+    def record_full_test(self, scope_id: str, head: str) -> None:
+        """Record a successful unselected suite run against the exact checkout HEAD."""
+        self._record_checkout_proof(scope_id, head, "full_tested_head")
+
+    def record_conflict_evidence(self, scope_id: str, head: str) -> None:
+        """Record structured two-sided preservation evidence in the exact HEAD."""
+        self._record_checkout_proof(scope_id, head, "conflict_evidence_head")
+
+    def _record_checkout_proof(self, scope_id: str, head: str, field_name: str) -> None:
+        lease = self.checkout_lease
+        normalized = head.lower()
+        if (
+            lease is None
+            or scope_id != self.action_scope.scope_id
+            or getattr(lease, "scope_id", None) != scope_id
+            or not getattr(lease, "is_active", False)
+            or normalized != self.git_expected_head
+        ):
+            raise ValueError("checkout proof does not match the current scoped HEAD")
+        object.__setattr__(self, field_name, normalized)
 
     def revoke_checkout_lease(self, lease: Any) -> None:
         """Revoke the exact attached lease without affecting a replacement."""
@@ -690,6 +715,8 @@ class RepoReviewState:
             object.__setattr__(self, "checkout_lease", None)
             object.__setattr__(self, "checked_out", False)
             object.__setattr__(self, "git_expected_head", None)
+            object.__setattr__(self, "full_tested_head", None)
+            object.__setattr__(self, "conflict_evidence_head", None)
 
 
 @dataclass(frozen=True)

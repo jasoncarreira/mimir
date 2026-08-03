@@ -321,11 +321,18 @@ def repo_merge_abort(
 
 @tool
 def repo_rebase(
-    repository: str, pull_request: int,
+    repository: str,
+    pull_request: int,
+    base_property: str = "",
+    base_verification: str = "",
+    head_property: str = "",
+    head_verification: str = "",
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Rebase the bound head onto the immutable observed base commit."""
-    return _execute(runtime, repository, pull_request, GitRebase())
+    """Start a bound rebase, or continue it with two-sided preservation evidence."""
+    return _execute(runtime, repository, pull_request, GitRebase(
+        base_property, base_verification, head_property, head_verification,
+    ))
 
 
 @tool

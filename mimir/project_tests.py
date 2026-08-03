@@ -437,6 +437,11 @@ class RepoProjectTests:
                 False, "tests_failed", result.returncode, stdout, stderr,
                 command, command_source, **truncation,
             )
+        if not selectors:
+            head = self._state.git_expected_head
+            if head is None:
+                raise ProjectTestRefusal("inactive_checkout", "the checkout has no current HEAD")
+            self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
             **truncation,
