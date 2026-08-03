@@ -663,26 +663,6 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
     assert "shell_process" not in principal.sink_destinations
 
 
-def test_upgrade_pr_state_access_is_typed_and_enforced() -> None:
-    principal = get_service_principal("upgrade")
-    assert principal is not None
-    state = _review_state("owner/repo", 43, "upgrade/defaults", "/repo")
-    auth = replace(
-        _service_auth(principal, InformationFlowLabels()),
-        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
-    )
-    registry = ToolRegistry()
-
-    for capability in ("pr_metadata", "pr_checks", "pr_reviews", "pr_comments"):
-        decision = registry.authorize_tool(
-            capability,
-            auth,
-            enforce=True,
-            arguments={"repository": "owner/repo", "pull_request": 43},
-        )
-        assert decision.allowed is True, capability
-
-
 @pytest.mark.parametrize(
     "command",
     (

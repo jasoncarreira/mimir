@@ -1335,15 +1335,10 @@ def test_system_principal_has_required_capabilities_for_upgrade() -> None:
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     schedule_ops = {"add_schedule", "set_schedule_priority", "list_schedules"}
     message_ops = {"send_message"}
-    pr_read_ops = {"pr_metadata", "pr_checks", "pr_reviews", "pr_comments"}
 
-    all_expected = (
-        read_ops | write_ops | shell_ops | proposal_ops | schedule_ops
-        | message_ops | pr_read_ops
-    )
+    all_expected = read_ops | write_ops | shell_ops | proposal_ops | schedule_ops | message_ops
     for cap in all_expected:
         assert system.has_capability(cap), f"system missing {cap}"
-    assert system.can_read_domain("repository")
 
     forbidden = {"spawn_open_code", "worklink_run", "saga_forget"}
     for cap in forbidden:

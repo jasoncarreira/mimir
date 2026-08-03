@@ -750,6 +750,10 @@ async def enqueue_upgrade_reconciliation_turn(
         if operator_channel
         else "No operator alert channel is configured; skip the notification."
     )
+    # Muninn's observed `gh pr view`/`gh pr list`, shell `ls` with a pipe
+    # or glob, and `list_channels` refusals were all correct and shadow-only:
+    # they carried would_block=True/is_shadow_decision=True while enforcement
+    # was disabled. This guidance prevents those calls before enforcement is enabled.
     content += (
         "\n\n## Reconciliation access boundaries\n\n"
         "If you need to inspect the proposal PR after `submit_proposal`, parse the "
