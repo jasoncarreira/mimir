@@ -5575,7 +5575,10 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
             self.state = state
 
         def is_tracked_file(self, path: Path) -> bool:
-            return path.parent == Path(self.state.checkout_lease.path)
+            return (
+                not path.is_symlink()
+                and path.parent == Path(self.state.checkout_lease.path)
+            )
 
     monkeypatch.setattr("mimir.repo_tools.RepoGitTools", TrackedRepoGitTools)
     service = build_trigger_service_principal(
@@ -5597,6 +5600,8 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
         )
         symlink = checkouts[0] / "linked.txt"
         symlink.symlink_to(files[0])
+        # Even an in-lease target is refused through a symlink: the lease
+        # containment proof and Git publication proof both apply to the path read.
         assert result_is_protected(symlink)
     finally:
         reset_current_turn(token)

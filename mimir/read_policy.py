@@ -442,48 +442,39 @@ def file_contains_secret(path: Path) -> bool:
 
 
 def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
-    """Allow published content only in the service turn's exact active PR lease."""
+    """Allow published content only in the service turn's exact active PR lease.
+
+    The shared lease resolver and containment check fix the reported refusal of a
+    tracked, secret-shaped test file when the turn carries repository-scoped PR
+    state. Git index membership remains the publication proof: untracked or
+    ignored files, protected path names, symlinks, and paths outside the exact
+    active lease remain subject to the content veto.
+    """
     from ._context import get_current_turn
-    from .models import RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
-    from .pr_checkout_lease import PRCheckoutLease
+    from .access_control import (
+        _target_within_active_pr_checkout_lease,
+        resolve_repository_review_state,
+    )
+    from .models import RepoPRScopeRegistry
     from .repo_tools import GitRefusal, RepoGitTools
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
-    registry = getattr(auth_context, "repo_pr_scope_registry", None)
-    if isinstance(registry, RepoPRScopeRegistry):
-        state = registry.resolve_checkout_path(path)
-        scope = getattr(state, "action_scope", None)
-    else:
-        state = getattr(auth_context, "repo_review_state", None)
-        scope = getattr(auth_context, "repo_pr_action_scope", None)
+    if not getattr(auth_context, "is_service", False):
+        return False
+    state, refusal = resolve_repository_review_state(auth_context, path=str(path))
+    if refusal is not None or state is None:
+        return False
     if (
-        not getattr(auth_context, "is_service", False)
-        or not isinstance(state, RepoReviewState)
-        or not isinstance(scope, RepoPRActionScope)
-        or state.action_scope is not scope
-        or state.checkout_lease is None
-        or not isinstance(state.checkout_lease, PRCheckoutLease)
+        not isinstance(
+            getattr(auth_context, "repo_pr_scope_registry", None), RepoPRScopeRegistry,
+        )
+        and getattr(auth_context, "repo_pr_action_scope", None)
+        is not getattr(state, "action_scope", None)
     ):
         return False
-
-    lease = state.checkout_lease
-    if (
-        lease.scope_id != scope.scope_id
-        or lease.owner != scope.principal
-        or not lease.is_active
-    ):
+    if not _target_within_active_pr_checkout_lease(str(path), state):
         return False
     try:
-        lease_root = Path(lease.lease_root).resolve(strict=True)
-        checkout = Path(lease.path).resolve(strict=True)
-        if checkout.parent != lease_root or checkout == lease_root:
-            return False
-        if not path.is_absolute() or path.is_symlink():
-            return False
-        path.relative_to(checkout)
-        resolved = path.resolve(strict=True)
-        if not resolved.is_relative_to(checkout):
-            return False
         return RepoGitTools(state).is_tracked_file(path)
     except (GitRefusal, OSError, RuntimeError, ValueError):
         return False
@@ -507,11 +498,7 @@ def protected_read_result_reason(path: Path, *, text: str | None = None) -> str 
 
 
 def result_is_protected(path: Path, *, text: str | None = None) -> bool:
-    """Check a result, exempting only published files in an authorized PR lease.
-
-    Git index membership is the publication proof. Untracked and ignored files
-    remain protected, as do protected path names even when they are tracked.
-    """
+    """Check a result, exempting only published files in an authorized PR lease."""
     if is_large_tool_results_path(path):
         return False
     return protected_read_result_reason(path, text=text) is not None
