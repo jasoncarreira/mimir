@@ -713,6 +713,7 @@ class PollerConfig:
             tier=CapabilityTier.SCOPE_CONTAINED,
             capabilities=(),
             roots=(self.resolved_persist_dir().resolve(),),
+            owned_skill_directory=self.skill_dir,
             channel_memory_directory=canonical,
             creation_path="mimir.pollers.run_poller",
         )
@@ -843,6 +844,7 @@ def _parse_poller_authority(
         tier=tier,
         capabilities=capabilities,
         roots=tuple(roots),
+        owned_skill_directory=manifest_path.parent,
         channel_memory_directory=canonical,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )
