@@ -55,7 +55,6 @@ _REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
 _REPOSITORY_GIT_FAILED = "repository_git_failed"
 _PROJECT_TEST_EXECUTION_REFUSAL_CODES = frozenset({
     "test_execution_failed",
-    "test_output_limit",
     "test_timeout",
     "tests_failed",
 })
