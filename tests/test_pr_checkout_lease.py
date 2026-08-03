@@ -198,7 +198,7 @@ def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
     )
 
 
-def test_reaper_retains_and_reports_expired_unpublished_work(tmp_path: Path) -> None:
+def test_reaper_preserves_and_reclaims_expired_unpublished_work(tmp_path: Path) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
@@ -206,6 +206,7 @@ def test_reaper_retains_and_reports_expired_unpublished_work(tmp_path: Path) -> 
     (lease.path / "fix.txt").write_text("unpublished fix\n", encoding="utf-8")
     _git(lease.path, "add", "fix.txt")
     _git(lease.path, "commit", "-q", "-m", "unpublished fix")
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
     expired_at = _expire_lease(lease)
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -216,13 +217,107 @@ def test_reaper_retains_and_reports_expired_unpublished_work(tmp_path: Path) -> 
     )
 
     assert len(results) == 1
-    assert results[0].reclaimed is False
-    assert "publication mismatch" in (results[0].error or "")
+    assert results[0].reclaimed is True
+    assert results[0].error is None
+    assert results[0].canonical_origin_contains_head is False
+    assert not lease.path.exists()
+    bundle = results[0].recovery_bundle
+    assert bundle is not None and bundle.is_file()
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    reclaimed = next(fields for kind, fields in events if kind == "pr_checkout_lease_reclaimed")
+    assert reclaimed["lease"] == lease.path.name
+    assert reclaimed["publication_proof_present"] is True
+    assert reclaimed["recovery_bundle"] == str(bundle)
+
+
+def test_reaper_preserves_expired_lease_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("only local copy\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "only local copy")
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    expired_at = _expire_lease(lease)
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root, now=expired_at + timedelta(minutes=5), event_logger=lambda *_a, **_k: None,
+    )
+
+    assert len(results) == 1
+    assert results[0].reclaimed is True
+    assert results[0].publication_proof_present is False
+    assert results[0].canonical_origin_contains_head is False
+    assert not lease.path.exists()
+    bundle = results[0].recovery_bundle
+    assert bundle is not None
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+
+
+def test_reaper_skips_unexpired_lease_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=datetime.now(UTC),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert results == []
     assert lease.path.is_dir()
-    retained = next(fields for kind, fields in events if kind == "pr_checkout_lease_retained")
-    assert retained["lease"] == lease.path.name
-    assert retained["publication_proof_present"] is True
-    assert "publication mismatch" in str(retained["error"])
+    assert not (lease_root / ".recovery").exists()
+    assert not (
+        lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
+    ).exists()
+    assert events == [(
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 0, "reclaimed_count": 0, "retained_count": 0},
+    )]
+
+
+def test_reaper_marks_preservation_failure_once(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    (lease.path / "fix.txt").write_text("only local copy\n", encoding="utf-8")
+    _git(lease.path, "add", "fix.txt")
+    _git(lease.path, "commit", "-q", "-m", "only local copy")
+    expired_at = _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args):
+        if "bundle" in args and "create" in args:
+            return subprocess.CompletedProcess(args, 1, "", "disk full\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    first = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=5),
+        runner=runner,
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+    second = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=expired_at + timedelta(minutes=15),
+        runner=runner,
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert len(first) == 1 and first[0].reclaimed is False
+    assert "preservation failed: disk full" in (first[0].error or "")
+    assert second == []
+    assert lease.path.is_dir()
+    marker = lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["classification"] == "unreclaimable"
+    assert [kind for kind, _fields in events].count("pr_checkout_lease_unreclaimable") == 1
 
 
 def test_reaper_never_reclaims_expired_lease_attached_to_live_turn(tmp_path: Path) -> None:
