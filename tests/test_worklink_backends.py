@@ -1186,6 +1186,12 @@ def test_empty_operator_allowlist_fails_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: Path) -> None:
+    """The refusal message names the patterns that produced it.
+
+    Fixture unchanged across Chainlink #1152: the refusal is the executor's final
+    output line and the exit code is 0, so this also pins the fail-closed case
+    that a refusal reported last still fails the run without a nonzero exit.
+    """
     backend = OpenCodeBackend(bash_allowlist=("git *", "npm *"))
     order = WorkOrder(1, tmp_path, "p", None, 30, {}, transcript_root=tmp_path / "t")
 
@@ -1244,3 +1250,116 @@ async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
     assert env["MIMIR_HOME"] == "/mimir-home"  # spec.env still applied
     assert "DISCORD_BOT_TOKEN" not in env
     assert "MIMIR_API_KEY" not in env
+
+
+# The exact literal that discarded three completed builds (chainlink #1152):
+# a build editing authorization code writes these words into source and tests.
+_AUTHZ_SOURCE_LINE = (
+    '                    content=f"Error: permission denied for read on {permission_path}",'
+)
+
+
+@pytest.mark.asyncio
+async def test_permission_words_in_executor_source_do_not_fail_a_successful_run(
+    tmp_path: Path,
+) -> None:
+    """A completed run is not failed because its diff contains the words.
+
+    Chainlink #1152: `_permission_refusal_reason` substring-scanned free-form
+    output, so a build editing read-policy code incriminated itself. #1123,
+    #1149 and #1152's own first two attempts each finished with a passing gate
+    and were discarded.
+    """
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend()
+
+    raw = await backend.interpret(
+        order,
+        ComputeResult(0, f"edited a file\n{_AUTHZ_SOURCE_LINE}\nall todos complete", ""),
+    )
+
+    assert raw.backend_status == "success"
+    assert raw.error is None
+
+
+@pytest.mark.asyncio
+async def test_permission_refusal_that_stopped_the_executor_still_fails_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    """A refusal that actually stopped the run is reported, and names itself."""
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend(bash_allowlist=("git *",))
+
+    raw = await backend.interpret(
+        order, ComputeResult(1, "", "permission denied: bash command not allowed")
+    )
+
+    assert raw.backend_status == "failed"
+    assert "OpenCode refused an executor shell command" in (raw.error or "")
+    assert "git *" in (raw.error or "")
+
+
+@pytest.mark.asyncio
+async def test_midstream_refusal_that_crashed_the_executor_is_still_reported(
+    tmp_path: Path,
+) -> None:
+    """Position is not the only signal: a nonzero exit reports a refusal anywhere.
+
+    The refusal here sits mid-stream with unrelated output after it, which is
+    what a refusal followed by the executor's own teardown looks like. Position
+    alone would miss it, so the nonzero exit must independently fail the run —
+    otherwise Chainlink #1152's fix would trade one silent misclassification for
+    another.
+    """
+    order = WorkOrder(
+        issue_id=1152,
+        checkout=tmp_path,
+        prompt="p",
+        rules=None,
+        timeout_s=30,
+        env={},
+        transcript_root=tmp_path / "t",
+    )
+    backend = OpenCodeBackend(bash_allowlist=("git *",))
+
+    raw = await backend.interpret(
+        order,
+        ComputeResult(
+            2,
+            "",
+            "permission denied for bash command\naborting run\nsession closed",
+        ),
+    )
+
+    assert raw.backend_status == "failed"
+    assert "OpenCode refused an executor shell command" in (raw.error or "")
+
+
+def test_blocked_marker_in_echoed_output_does_not_block_a_completed_run() -> None:
+    """The sibling matcher is not exposed to the same defect, by position.
+
+    `blocked_reason_from_output` honors its marker only as the final non-empty
+    line, so a run that echoes the instruction and then completes normally is
+    not mislabeled. Pinned here because #1152 audited it as a candidate for the
+    same bug and it is the precedent the refusal fix follows.
+    """
+    echoed = "reminder: emit WORKLINK_BLOCKED: <reason> and stop\nwork finished cleanly"
+
+    assert blocked_reason_from_output(echoed, "") is None
+    assert blocked_reason_from_output("done\nWORKLINK_BLOCKED: real", "") == "real"

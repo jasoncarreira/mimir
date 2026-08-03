@@ -16,7 +16,14 @@ from typing import Awaitable, Callable, Sequence
 from ...config import model_spec_at_call_time
 from ...opencode_config import opencode_model_from_agent_spec, resolve_opencode_invocation
 from ..compute import ComputeResult, WorkSpec
-from .base import Caps, CheckoutShape, RawResult, WorkOrder, blocked_reason_from_output
+from .base import (
+    Caps,
+    CheckoutShape,
+    RawResult,
+    WorkOrder,
+    blocked_reason_from_output,
+    last_nonempty_line,
+)
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
@@ -221,7 +228,7 @@ class OpenCodeBackend:
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
         permission_refusal = _permission_refusal_reason(
-            result.stdout, result.stderr, self.bash_allowlist
+            result.stdout, result.stderr, self.bash_allowlist, result.exit_code
         )
         status = "output_overflow" if result.output_overflow else (
             "blocked" if blocked_reason else (
@@ -318,13 +325,40 @@ def _permission_override(bash_allowlist: Sequence[str]) -> str:
 
 
 def _permission_refusal_reason(
-    stdout: str, stderr: str, bash_allowlist: Sequence[str]
+    stdout: str, stderr: str, bash_allowlist: Sequence[str], exit_code: int
 ) -> str | None:
-    output = f"{stdout}\n{stderr}"
-    if not re.search(
+    """Report an executor permission refusal, distinguished by position or exit.
+
+    The refusal text is free-form OpenCode output, so presence alone cannot
+    distinguish "the executor was refused a command" from "the executor wrote the
+    words permission denied" — a build editing authorization code necessarily
+    writes them into source, tests and docs. Chainlink #1152: nine of the ten
+    retained transcripts (#1123, #1149 and #1152's own attempts) matched this way
+    while exiting 0 with their work committed and their gate green, because the
+    phrase appeared in a Python literal they were editing.
+
+    A refusal counts when it is *positioned as a signal* — the final non-empty
+    line of a stream — or when the executor also exited nonzero. This is the same
+    discipline ``blocked_reason_from_output`` already applies to its own marker,
+    and for the same stated reason: a backend that echoes the phrase mid-stream
+    and then completes normally must not be mislabeled.
+
+    Both fail-closed shapes are retained. A refusal that halted the executor
+    surfaces via the nonzero exit wherever it appears; a refusal the executor
+    reported last surfaces via position even at exit 0. Measured against the
+    discarded builds, the nearest false positive sat four non-empty lines from
+    the end of its stream, so neither rule admits them.
+    """
+    pattern = re.compile(
         r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
-        output,
         re.IGNORECASE,
+    )
+    positioned = any(
+        (last := last_nonempty_line(stream)) is not None and pattern.search(last)
+        for stream in (stdout, stderr)
+    )
+    if not positioned and not (
+        exit_code != 0 and pattern.search(f"{stdout}\n{stderr}")
     ):
         return None
     return (

@@ -600,6 +600,55 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_backend_failure_with_zero_exit_still_names_its_reason(tmp_path: Path) -> None:
+    """A backend-reported failure carries its reason even when the process exits 0.
+
+    Chainlink #1152: ``failure_reason`` keyed off ``raw.exit_code != 0`` alone, so
+    a backend that judged the run failed while the executor exited cleanly
+    produced status=failed with reason=null — and validate_evidence had to
+    synthesize "reported failure without a reason" (#1108/#1349). The status and
+    the reason were reading different inputs and disagreeing.
+    """
+    _reset_logger_for_tests()
+    events = tmp_path / "logs" / "events.jsonl"
+    init_logger(events, session_id="test-worklink-zero-exit-failure")
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _calls, runner = _orchestrator_runner(repo, worktree, files_stdout="")
+    backend_reason = "backend judged the run failed while the executor exited cleanly"
+
+    class QuietFailureBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            return RawResult(
+                0,
+                order.transcript_root / "opencode-quiet.json",
+                "failed",
+                backend_reason,
+            )
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(QuietFailureBackend(write_change=False))
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["failure_reason"] == backend_reason
+    assert "without a reason" not in (evidence["failure_reason"] or "")
+    # The exit code still decides the test-gate message; only the reason changed.
+    assert evidence["tests"]["skipped_reason"] != (
+        "executor exited nonzero before the test gate"
+    )
+
+
 def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"

@@ -685,6 +685,14 @@ class WorklinkRunner:
         raw = await backend.interpret(order, compute_result)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
+        # A backend may report failure without the executor process exiting
+        # nonzero (chainlink #1152). ``failure_reason`` previously keyed off the
+        # exit code alone, so such a run recorded status=failed with reason=null
+        # and validate_evidence had to synthesize "reported failure without a
+        # reason" (#1108/#1349). Whatever the backend judged, its own error text
+        # is the reason; the exit code still decides whether the TEST GATE was
+        # skipped, which is a separate question.
+        backend_reported_failure = raw.backend_status not in {"success", "blocked"}
         if raw.output_overflow:
             _log_event(
                 "worklink_output_overflow",
@@ -711,7 +719,7 @@ class WorklinkRunner:
             transcript=str(raw.transcript_path) if raw.transcript_path else None,
             blocked_reason=raw.blocked_reason,
             model=invocation_model,
-            failure_reason=raw.error if executor_failed else None,
+            failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
             skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
         )
@@ -745,7 +753,7 @@ class WorklinkRunner:
                     transcript=str(raw.transcript_path) if raw.transcript_path else None,
                     blocked_reason=raw.blocked_reason,
                     model=invocation_model,
-                    failure_reason=raw.error if executor_failed else None,
+                    failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
                     skip_test_reason=(
                         "executor exited nonzero before the test gate" if executor_failed else None
                     ),
