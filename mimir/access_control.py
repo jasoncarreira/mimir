@@ -6906,6 +6906,10 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "grep",
                 "agrep",
                 "send_message",
+                "pr_metadata",
+                "pr_checks",
+                "pr_reviews",
+                "pr_comments",
             ),
             readable_domains=(
                 "defaults",
@@ -6913,6 +6917,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "filesystem",
                 "schedule_metadata",
                 "shell_jobs",
+                "repository",
             ),
             sink_destinations=(
                 "operator_alert",

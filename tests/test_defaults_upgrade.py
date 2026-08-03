@@ -305,6 +305,35 @@ async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_pat
     assert f"wt={wt}" in event.content
     assert "conflicts=true" in event.content
     assert event.extra["proposal_worktree"] == str(wt)
+    assert "pr_metadata" in event.content
+    assert "Do not run `gh pr view` or `gh pr list`" in event.content
+    assert "Do not run shell `ls`" in event.content
+    assert "Do not call `list_channels`" in event.content
+
+
+@pytest.mark.asyncio
+async def test_upgrade_reconciliation_turn_uses_configured_operator_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "slack-C-operators")
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="proposal_opened",
+        version="1.1.0",
+        proposal=du.OpenResult(
+            ok=True, branch="upgrade/defaults", worktree=home / "proposal",
+        ),
+    )
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    assert await du.enqueue_upgrade_reconciliation_turn(home, result, fake_enqueue)
+    assert "configured operator alert channel `slack-C-operators`" in events[0].content
 
 
 @pytest.mark.asyncio
