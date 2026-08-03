@@ -221,7 +221,7 @@ class OpenCodeBackend:
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
         permission_refusal = _permission_refusal_reason(
-            result.stdout, result.stderr, self.bash_allowlist
+            result.stdout, result.stderr, self.bash_allowlist, result.exit_code
         )
         status = "output_overflow" if result.output_overflow else (
             "blocked" if blocked_reason else (
@@ -318,8 +318,28 @@ def _permission_override(bash_allowlist: Sequence[str]) -> str:
 
 
 def _permission_refusal_reason(
-    stdout: str, stderr: str, bash_allowlist: Sequence[str]
+    stdout: str, stderr: str, bash_allowlist: Sequence[str], exit_code: int
 ) -> str | None:
+    """Report an executor permission refusal that actually stopped the run.
+
+    The refusal text is free-form OpenCode output, so a substring scan alone
+    cannot distinguish "the executor was refused a command" from "the executor
+    wrote the words permission denied" — and a build editing authorization code
+    necessarily writes them into source, tests and docs. Chainlink #1152: three
+    leaves (#1123, #1149 and the fix for this defect itself) each completed
+    their work with a passing gate and were discarded because the phrase
+    appeared in a Python string literal they were editing.
+
+    The structural signal is the process outcome. A refusal the executor
+    recovered from — it exited 0, the work is present, the gate passed — did not
+    fail the run, whatever the transcript says. A refusal that genuinely stopped
+    the executor leaves a nonzero exit, and is still reported, with this text as
+    the failure reason. This mirrors ``blocked_reason_from_output``, which
+    honors its marker only when positioned as a real signal rather than merely
+    present in the output.
+    """
+    if exit_code == 0:
+        return None
     output = f"{stdout}\n{stderr}"
     if not re.search(
         r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
