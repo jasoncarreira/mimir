@@ -675,7 +675,7 @@ def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
 
 
 @pytest.mark.asyncio
-async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_lease(
+async def test_protected_reads_admit_content_only_in_exact_authorized_pr_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, initial_scope = _repo_and_scope(tmp_path)
@@ -759,7 +759,9 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     assert async_result.error is None
     assert any(match["path"].endswith("tests/test_access_control.py") for match in grep_result.matches)
     assert any(match["path"].endswith("tests/test_access_control.py") for match in glob_result.matches)
-    assert untracked_grep.matches == []
+    assert untracked_result.error is None
+    assert "not published" in untracked_result.file_data["content"]
+    assert any(match["path"].endswith("notes.txt") for match in untracked_grep.matches)
     result_refusal = (
         "Read denied: protected_read_result. For published PR content, "
         "use pr_files or pr_diff."
@@ -768,7 +770,6 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
         "Read denied: protected_name_match. "
         "Use a non-secret source or an authorized secret interface."
     )
-    assert untracked_result.error == result_refusal
     assert tracked_protected_result.error == name_refusal
     assert env_result.error == name_refusal
     assert escape_result.error is not None
@@ -780,7 +781,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
         if kind == "hard_boundary_denied"
         and fields["reason"] in {"protected_name_match", "protected_read_result"}
     }
-    assert str(untracked) in denied_targets
+    assert str(untracked) not in denied_targets
     assert str(tracked_protected) in denied_targets
     assert str(untracked_env) in denied_targets
     assert str(other_tracked) in denied_targets

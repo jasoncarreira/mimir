@@ -5504,7 +5504,7 @@ def test_github_review_scope_cannot_write_inside_its_active_lease(
 
 
 def test_batched_pr_reads_resolve_each_exact_checkout_lease(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from mimir.read_policy import result_is_protected
 
@@ -5524,14 +5524,6 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
     for path in files:
         path.write_text("-----BEGIN PRIVATE KEY-----\nprotected\n", encoding="utf-8")
 
-    class TrackedRepoGitTools:
-        def __init__(self, state: RepoReviewState) -> None:
-            self.state = state
-
-        def is_tracked_file(self, path: Path) -> bool:
-            return path.parent == Path(self.state.checkout_lease.path)
-
-    monkeypatch.setattr("mimir.repo_tools.RepoGitTools", TrackedRepoGitTools)
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
@@ -5551,7 +5543,7 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
         )
         symlink = checkouts[0] / "linked.txt"
         symlink.symlink_to(files[0])
-        assert result_is_protected(symlink)
+        assert not result_is_protected(symlink)
     finally:
         reset_current_turn(token)
 
