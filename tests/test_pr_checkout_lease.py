@@ -256,6 +256,32 @@ def test_reaper_preserves_expired_lease_without_publication_proof(tmp_path: Path
     assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
 
 
+def test_reaper_skips_unexpired_lease_without_publication_proof(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    _git(lease.path, "update-ref", "-d", "refs/mimir/pr-checkout-lease/published")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    results = reclaim_expired_pr_checkout_leases(
+        lease_root,
+        now=datetime.now(UTC),
+        event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    assert results == []
+    assert lease.path.is_dir()
+    assert not (lease_root / ".recovery").exists()
+    assert not (
+        lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
+    ).exists()
+    assert events == [(
+        "pr_checkout_lease_reaper_sweep",
+        {"expired_count": 0, "reclaimed_count": 0, "retained_count": 0},
+    )]
+
+
 def test_reaper_marks_preservation_failure_once(tmp_path: Path) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
