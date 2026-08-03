@@ -2516,7 +2516,6 @@ def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(
     ("trigger", "canonical", "tool_name"),
     [
         ("scheduled_tick", "scheduler", "write_file"),
-        ("upgrade", "system", "write_file"),
     ],
 )
 def test_service_file_policy_requires_configured_root_and_compatible_source(

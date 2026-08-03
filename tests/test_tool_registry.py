@@ -693,6 +693,14 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         note.parent.mkdir(parents=True)
         note.write_text("session notes\n", encoding="utf-8")
         read_arguments = {"file_path": str(note)}
+    elif trigger == "upgrade" and allowed_operation == "read_file":
+        note = (
+            maintenance_git_home / "scratch" / "proposals"
+            / "upgrade" / "upgrade_defaults" / "notes.md"
+        )
+        note.parent.mkdir(parents=True)
+        note.write_text("proposal notes\n", encoding="utf-8")
+        read_arguments = {"file_path": str(note)}
 
     admitted = registry.authorize_tool(
         allowed_operation,

@@ -363,7 +363,9 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
     authority = getattr(auth_context, "service_authority", None)
-    roots = tuple(getattr(authority, "filesystem_read_roots", ()))
+    from .access_control import service_filesystem_read_roots
+
+    roots = tuple(str(root) for root in service_filesystem_read_roots(authority))
     home = _resolved_mimir_home()
     if home is not None:
         roots += (str(home / "memory"),)
@@ -374,26 +376,20 @@ def is_current_service_protected_read_path(path: Path) -> bool:
     # Keep authorization and read-boundary enforcement on one security list.
     # Import lazily to avoid a module cycle: access_control imports this module
     # from the authorization path that scans individual file contents.
-    from .access_control import _TRIGGER_SERVICE_PROTECTED_READ_NAMES
+    from .access_control import _is_service_protected_read_path
 
     for raw_root in roots:
         root = Path(raw_root)
         try:
             if path == root or path.is_relative_to(root):
                 lexical = path.relative_to(root)
-                if any(
-                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
-                    for part in lexical.parts
-                ):
+                if _is_service_protected_read_path(authority, root, lexical):
                     return True
             resolved_root = root.resolve(strict=True)
             resolved = path.resolve(strict=True)
             if resolved == resolved_root or resolved.is_relative_to(resolved_root):
                 relative = resolved.relative_to(resolved_root)
-                if any(
-                    part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
-                    for part in relative.parts
-                ):
+                if _is_service_protected_read_path(authority, resolved_root, relative):
                     return True
         except (OSError, RuntimeError, ValueError):
             # Read roots, including the artifact root, may be created lazily.
@@ -411,7 +407,9 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
     if is_memory_read_path_allowed(path, auth_context):
         return True
     authority = getattr(auth_context, "service_authority", None)
-    for raw_root in getattr(authority, "filesystem_read_roots", ()):
+    from .access_control import service_filesystem_read_roots
+
+    for raw_root in service_filesystem_read_roots(authority):
         try:
             root = Path(raw_root).resolve(strict=True)
             resolved = path.resolve(strict=True)
