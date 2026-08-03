@@ -169,6 +169,11 @@ class GitMergeAbort:
 class GitRebase:
     """Rebase onto the server-bound observed base commit."""
 
+    base_property: str = ""
+    base_verification: str = ""
+    head_property: str = ""
+    head_verification: str = ""
+
 
 @dataclass(frozen=True)
 class GitRebaseAbort:
@@ -552,6 +557,28 @@ class RepoGitTools:
         self._expected_head = self._command(("rev-parse", "--verify", "HEAD")).stdout.strip().lower()
         self._state.record_git_head(self._scope.scope_id, self._expected_head)
 
+    @staticmethod
+    def _conflict_evidence(operation: GitRebase) -> tuple[str, str, str, str]:
+        values = (
+            operation.base_property,
+            operation.base_verification,
+            operation.head_property,
+            operation.head_verification,
+        )
+        if any(
+            not isinstance(value, str)
+            or not value.strip()
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 2_048
+            for value in values
+        ):
+            raise GitRefusal(
+                "conflict_evidence_required",
+                "continuing a conflicting rebase requires non-empty base/head properties "
+                "and a verification for each",
+            )
+        return tuple(value.strip() for value in values)  # type: ignore[return-value]
+
     def _stranded_work_message(self) -> str:
         if self._expected_head == self._scope.observed_head_sha.lower():
             return "the checkout lease was preserved for retry"
@@ -685,7 +712,7 @@ class RepoGitTools:
             operation,
             (
                 GitStatus, GitDiff, GitUnmerged,
-                GitMergeAbort, GitRebaseAbort, GitRevertAbort,
+                GitStage, GitMergeAbort, GitRebase, GitRebaseAbort, GitRevertAbort,
             ),
         ))
 
@@ -804,10 +831,35 @@ class RepoGitTools:
             result = self._command(("merge", "--abort"))
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
-            result = self._command(
-                ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
-            )
+            continuing = self._has_in_progress_merge_or_rebase()
+            if continuing:
+                if self._scope.event_type != "pr_mergeability_conflicting":
+                    raise GitRefusal("rebase_continue_refused", "this scope may not continue a rebase")
+                base_property, base_verification, head_property, head_verification = (
+                    self._conflict_evidence(operation)
+                )
+                result = self._command(
+                    ("rebase", "--continue"), identity=True,
+                    env={"GIT_EDITOR": "/usr/bin/true"},
+                )
+                message = self._command(("log", "-1", "--format=%B")).stdout.rstrip()
+                evidence = (
+                    f"{message}\n\nConflict resolution evidence:\n"
+                    f"Base property: {base_property}\n"
+                    f"Base verification: {base_verification}\n"
+                    f"Head property: {head_property}\n"
+                    f"Head verification: {head_verification}"
+                )
+                self._command(("commit", "--amend", "-m", evidence), identity=True)
+            else:
+                result = self._command(
+                    ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
+                )
             self._refresh_expected_head()
+            if continuing:
+                self._state.record_conflict_evidence(
+                    self._scope.scope_id, self._expected_head,
+                )
         elif isinstance(operation, GitRebaseAbort):
             self._require("repo_rebase_abort", RepoPRAction.WRITE)
             result = self._command(("rebase", "--abort"))
@@ -827,12 +879,26 @@ class RepoGitTools:
             result = self._command(("revert", "--abort"))
         elif isinstance(operation, GitPush):
             self._require("repo_push", RepoPRAction.PUSH)
+            if self._scope.event_type == "pr_mergeability_conflicting":
+                if self._state.conflict_evidence_head != self._expected_head:
+                    raise GitRefusal(
+                        "conflict_evidence_required",
+                        "conflict push refused until the resulting commit names the preserved "
+                        "base/head properties and verification for each",
+                    )
+                if self._state.full_tested_head != self._expected_head:
+                    raise GitRefusal(
+                        "full_test_required",
+                        "conflict push refused until the configured full suite passes against HEAD",
+                    )
             overrides = self._config_overrides()
             ancestry = self._raw((
                 "merge-base", "--is-ancestor", self._scope.observed_head_sha,
                 self._expected_head,
             ))
-            rewritten_rebase = self._scope.event_type == "pr_mergeability_rebase"
+            rewritten_rebase = self._scope.event_type in {
+                "pr_mergeability_rebase", "pr_mergeability_conflicting",
+            }
             if ancestry.returncode != 0 and not rewritten_rebase:
                 raise GitRefusal("force_push_refused", "push would not be a fast-forward")
             try:

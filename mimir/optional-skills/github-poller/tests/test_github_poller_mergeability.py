@@ -85,7 +85,7 @@ def test_behind_clean_emits_scoped_rebase_and_push_work(monkeypatch, events):
     assert "Do not merge" in event["prompt"]
 
 
-def test_conflict_escalates_paths_and_base_without_push(monkeypatch, events):
+def test_conflict_authorizes_resolution_suite_push_and_review_rerequest(monkeypatch, events):
     _patch_api(monkeypatch, mergeable=False, behind=3)
 
     count, cursor = poller._check_own_mergeability(
@@ -98,8 +98,11 @@ def test_conflict_escalates_paths_and_base_without_push(monkeypatch, events):
     assert event["event_type"] == "pr_mergeability_conflicting"
     assert BASE in event["prompt"]
     assert "collect every path with repo_unmerged" in event["prompt"]
-    assert "repo_rebase_abort" in event["prompt"]
-    assert "Never resolve, complete, or push" in event["prompt"]
+    assert "base property, head property" in event["prompt"]
+    assert "repo_test with no selectors" in event["prompt"]
+    assert "repo_push" in event["prompt"]
+    assert "re-request review" in event["prompt"]
+    assert "do not merge" in event["prompt"]
 
 
 def test_current_pr_is_noop_and_consumes_no_cycle_budget(monkeypatch, events):
@@ -166,6 +169,50 @@ def test_blocking_review_prevents_content_free_auto_rebase(monkeypatch, events):
     assert count == 0
     assert cursor == {}
     assert events == []
+
+
+def test_blocking_review_prevents_conflict_resolution_push_turn(monkeypatch, events):
+    _patch_api(monkeypatch, mergeable=False, behind=2, reviews=[{
+        "user": {"login": "reviewer"},
+        "state": "CHANGES_REQUESTED",
+        "submitted_at": "2026-07-31T11:00:00Z",
+    }])
+
+    count, cursor = poller._check_own_mergeability(
+        "o/r", "tok", "mimir-bot", {}, now=NOW,
+    )
+
+    assert count == 0
+    assert cursor == {}
+    assert events == []
+
+
+def test_conflict_attempts_share_backoff_and_named_exhaustion(monkeypatch, events):
+    _patch_api(monkeypatch, mergeable=False, behind=2)
+    cap = poller.REVIEW_REQUEST_MAX_ATTEMPTS
+    prior = {"42": {
+        "head_sha": HEAD,
+        "reason": "conflicting",
+        "last_attempt_at": "2026-07-31T10:00:00Z",
+        "attempts": cap,
+    }}
+
+    count, cursor = poller._check_own_mergeability(
+        "o/r", "tok", "mimir-bot", prior, now=NOW,
+    )
+
+    assert count == 1
+    assert cursor["42"]["attempts"] == cap + 1
+    assert events == [{
+        "signal": "pr_mergeability_rebase_gave_up",
+        "repo": "o/r",
+        "number": 42,
+        "url": "https://github.com/o/r/pull/42",
+        "head_sha": HEAD,
+        "base_sha": BASE,
+        "reason": "conflicting",
+        "attempts": cap,
+    }]
 
 
 def test_attempt_budget_backs_off_then_reports_named_exhaustion(monkeypatch, events):
