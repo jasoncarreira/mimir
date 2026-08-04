@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
+from langchain_core.tools import ToolException
+
 from .identities import AccessMetadata
 from .models import (
     NormalizedPullRequestSnapshot,
@@ -198,6 +200,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "pr_submit_review": SinkCategory.FORGE,
     "pr_inline_review_comment": SinkCategory.FORGE,
     "pr_comment": SinkCategory.FORGE,
+    "issue_comment": SinkCategory.FORGE,
     "pr_rerequest_review": SinkCategory.FORGE,
     "unsupported_operation": SinkCategory.FORGE,
     "repo_checkout": SinkCategory.FORGE,
@@ -308,6 +311,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_submit_review": ToolFlowDirection.SINK,
     "pr_inline_review_comment": ToolFlowDirection.SINK,
     "pr_comment": ToolFlowDirection.SINK,
+    "issue_comment": ToolFlowDirection.SINK,
     "pr_rerequest_review": ToolFlowDirection.SINK,
     "unsupported_operation": ToolFlowDirection.SINK,
     "repo_checkout": ToolFlowDirection.BOTH,
@@ -448,6 +452,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "issue_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -508,13 +513,14 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
-    "custom": frozenset(TRIGGER_CAPABILITY_TIERS),
+    "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {"issue_comment"},
     "heartbeat": frozenset({
         "write_file", "edit_file", "shell_exec", "bash_async",
         "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
@@ -4072,6 +4078,7 @@ def _forge_repository_scope_mismatch(
 ) -> tuple[str, str] | None:
     """Return the first repository result that is outside a forge sink scope."""
     expected_repo = getattr(scope, "canonical_repo", None)
+    expected_issue = getattr(scope, "issue_number", None)
     expected_pr = getattr(scope, "pr_number", None)
     expected_head = getattr(scope, "observed_head_sha", None)
     for source in getattr(ifc_labels, "sources", ()):
@@ -4087,6 +4094,13 @@ def _forge_repository_scope_mismatch(
         source_repo = match.group("repo")
         source_pr = int(match.group("pr"))
         source_head = match.group("head")
+        if isinstance(expected_issue, int):
+            if not (
+                isinstance(expected_repo, str)
+                and source_repo.casefold() == expected_repo.casefold()
+            ):
+                return source_repo, str(source_pr)
+            continue
         if not (
             isinstance(expected_repo, str)
             and source_repo.casefold() == expected_repo.casefold()
@@ -5307,6 +5321,7 @@ class OperationCatalog:
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "issue_comment",
         "approve_declassification",
         "list_channels",
         "list_schedules",
@@ -6238,8 +6253,51 @@ class ToolRegistry:
         repo_pr_action_scope = None
         repo_review_state = None
         repo_review_state_refusal = None
+        issue_target = None
         if auth_context is not None:
-            if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+            if (
+                tool_name == "issue_comment"
+                and preliminary_service is not None
+                and not service_can_invoke_operation(preliminary_service, tool_name)
+            ):
+                pass
+            elif tool_name == "issue_comment":
+                repository_sources = tuple(
+                    source for source in getattr(ifc_labels, "sources", ())
+                    if getattr(source, "domain", None) == "repository"
+                )
+                if not repository_sources:
+                    return ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=not enforce,
+                        reason="issue_repository_source_required",
+                        required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                        would_block=True,
+                    )
+                from .tools.forge import resolve_issue_comment_target
+
+                try:
+                    issue_target = resolve_issue_comment_target(
+                        (arguments or {}).get("repository"),
+                        (arguments or {}).get("issue"),
+                    )
+                except ToolException as exc:
+                    return ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=not enforce,
+                        reason="issue_destination_resolution_failed",
+                        required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce,
+                        would_block=True,
+                        refusal_detail=str(exc),
+                    )
+                repo_pr_action_scope = issue_target
+            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 tool_arguments = arguments or {}
                 discovered = getattr(
                     auth_context, "server_discovered_pr_states", None,
@@ -6305,6 +6363,8 @@ class ToolRegistry:
             )
         )
         sink_target = target_channel
+        if issue_target is not None:
+            sink_target = issue_target.sink_destination
         if (
             sink_category == SinkCategory.SAME_CHANNEL
             and not sink_target
@@ -7284,6 +7344,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "pr_submit_review": "bound_pull_request",
     "pr_inline_review_comment": "bound_pull_request",
     "pr_comment": "bound_pull_request",
+    "issue_comment": "configured_repository_issue",
     "pr_rerequest_review": "bound_pull_request",
     "unsupported_operation": "bound_pull_request",
     "repo_checkout": "bound_pull_request",

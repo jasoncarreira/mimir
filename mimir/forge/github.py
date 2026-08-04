@@ -19,6 +19,7 @@ from .client import (
     FileProjection,
     ForgeError,
     ForgeResponseTooLarge,
+    IssueTarget,
     PullRequestProjection,
     ReviewProjection,
     ReviewRequestProjection,
@@ -174,6 +175,7 @@ class GitHubForgeClient:
         body: Mapping[str, Any] | None = None,
         accept: str = "application/vnd.github+json",
         max_bytes: int = _MAX_RESPONSE_BYTES,
+        not_found: str = "pull request not found",
     ) -> Any:
         url = f"https://api.github.com{endpoint}"
         if body is not None and len(
@@ -197,7 +199,7 @@ class GitHubForgeClient:
             reasons = {
                 401: "authentication failed",
                 403: "operation forbidden",
-                404: "pull request not found",
+                404: not_found,
                 409: "operation conflicted",
                 422: "operation rejected",
                 429: "rate limited",
@@ -476,6 +478,57 @@ class GitHubForgeClient:
         self._confirm_effect_identity(scope)
         data = self._request(
             "POST", f"/repos/{repository}/issues/{number}/comments", body={"body": body},
+        )
+        if not isinstance(data, Mapping):
+            raise ForgeError("forge returned invalid comment result")
+        return self._comment(data)
+
+    def get_open_issue_target(self, repository: str, issue: int) -> IssueTarget:
+        """Resolve an exact open issue from server-returned identity fields."""
+        if (
+            _REPOSITORY.fullmatch(repository) is None
+            or not isinstance(issue, int)
+            or isinstance(issue, bool)
+            or issue < 1
+        ):
+            raise ForgeError("invalid issue selector")
+        target = self._request(
+            "GET", f"/repos/{repository}/issues/{issue}", not_found="issue not found",
+        )
+        if not isinstance(target, Mapping):
+            raise ForgeError("forge returned invalid issue result")
+        if target.get("pull_request") is not None:
+            raise ForgeError("target is a pull request; use the pull-request comment path")
+        if target.get("state") != "open":
+            raise ForgeError("issue is not open")
+        observed_number = target.get("number")
+        repository_url = target.get("repository_url")
+        prefix = "https://api.github.com/repos/"
+        observed_repo = (
+            repository_url.removeprefix(prefix)
+            if isinstance(repository_url, str) and repository_url.startswith(prefix)
+            else ""
+        )
+        if (
+            not isinstance(observed_number, int)
+            or isinstance(observed_number, bool)
+            or observed_number != issue
+            or _REPOSITORY.fullmatch(observed_repo) is None
+            or observed_repo.casefold() != repository.casefold()
+        ):
+            raise ForgeError("forge returned mismatched issue identity")
+        return IssueTarget(observed_repo, observed_number)
+
+    def add_issue_comment(
+        self, repository: str, issue: int, body: str,
+    ) -> CommentProjection:
+        """Comment on a server-resolved open issue, never a pull request."""
+        body = self._body(body)
+        target = self.get_open_issue_target(repository, issue)
+        data = self._request(
+            "POST",
+            f"/repos/{target.canonical_repo}/issues/{target.issue_number}/comments",
+            body={"body": body},
         )
         if not isinstance(data, Mapping):
             raise ForgeError("forge returned invalid comment result")

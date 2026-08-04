@@ -17,6 +17,7 @@ from mimir.forge import (
     CheckProjection,
     CommentProjection,
     FileProjection,
+    IssueTarget,
     PullRequestProjection,
     ReviewProjection,
     ReviewRequestProjection,
@@ -30,6 +31,7 @@ from mimir.models import (
 )
 from mimir.tools.forge import (
     FORGE_TOOLS,
+    issue_comment,
     pr_checks,
     pr_comment,
     pr_comments,
@@ -159,6 +161,14 @@ class FakeForge:
         self.calls.append(("comment", scope, body))
         return CommentProjection("1", "reviewer", body, "now", "now")
 
+    def get_open_issue_target(self, repository, issue):
+        self.calls.append(("issue_target", repository, issue))
+        return IssueTarget(repository, issue)
+
+    def add_issue_comment(self, repository, issue, body):
+        self.calls.append(("issue_comment", repository, issue, body))
+        return CommentProjection("2", "reviewer", body, "now", "now")
+
     def rerequest_review(self, scope, reviewer):
         self.calls.append(("rerequest", scope, reviewer))
 
@@ -171,11 +181,13 @@ def _reset_client() -> None:
     _reset_logger_for_tests()
 
 
-def test_tool_surface_requires_exact_repository_and_pr_selectors() -> None:
+def test_tool_surface_requires_exact_repository_and_resource_selectors() -> None:
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
-        assert {"repository", "pull_request"} <= set(properties)
-        assert not ({"repo", "pr_number", "url", "host"} & set(properties))
+        selectors = {"pull_request", "issue"} & set(properties)
+        assert "repository" in properties
+        assert len(selectors) == 1, forge_tool.name
+        assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
 
@@ -189,6 +201,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     init_logger(home / "events.jsonl", "test")
     invocations = (
         (pr_metadata, {}), (pr_files, {}), (pr_diff, {}), (pr_checks, {}),
@@ -196,6 +209,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
         (pr_submit_review, {"verdict": "approve", "body": "Looks good"}),
         (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "Fix"}),
         (pr_comment, {"body": "Fixed"}),
+        (issue_comment, {"issue": 220, "body": "Analysis"}),
         (pr_rerequest_review, {"reviewer": "reviewer"}),
         (unsupported_operation, {
             "description": "Resolve an inline review thread",
@@ -205,7 +219,9 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     node = ToolNode(list(FORGE_TOOLS))
     for index, (forge_tool, arguments) in enumerate(invocations):
-        arguments = {"repository": "owner/repo", "pull_request": 17, **arguments}
+        arguments = {"repository": "owner/repo", **arguments}
+        if forge_tool is not issue_comment:
+            arguments["pull_request"] = 17
         tool_call = {
             "name": forge_tool.name, "args": arguments,
             "id": f"forge-{index}", "type": "tool_call",
@@ -216,7 +232,8 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     assert [call[0] for call in client.calls] == [
         "metadata", "files", "diff", "checks", "reviews", "comments",
-        "review_requests", "review", "inline", "comment", "rerequest",
+        "review_requests", "review", "inline", "comment", "issue_target",
+        "issue_comment", "rerequest",
     ]
 
 
@@ -700,3 +717,57 @@ def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
     assert first["escalated"] is True
     assert second["escalated"] is True
     assert first["operation"] != second["operation"]
+
+
+def test_issue_comment_posts_to_a_server_resolved_configured_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+
+    result = issue_comment.func(repository="owner/repo", issue=220, body="analysis")
+
+    assert result["body"] == "analysis"
+    assert client.calls == [
+        ("issue_target", "owner/repo", 220),
+        ("issue_comment", "owner/repo", 220, "analysis"),
+    ]
+
+
+@pytest.mark.parametrize("issue", [0, -1, True])
+def test_issue_comment_refuses_invalid_issue_numbers_before_adapter_call(
+    issue: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+
+    with pytest.raises(ToolException, match="positive integer"):
+        issue_comment.func(repository="owner/repo", issue=issue, body="analysis")
+
+    assert client.calls == []
+
+
+def test_issue_comment_registration_and_capability_preflights() -> None:
+    assert "issue_comment" in {forge_tool.name for forge_tool in FORGE_TOOLS}
+    assert access_control._SINK_CATEGORY_MAP["issue_comment"] is access_control.SinkCategory.FORGE
+    assert access_control._TOOL_FLOW_MAP["issue_comment"] is access_control.ToolFlowDirection.SINK
+    assert access_control.TRIGGER_CAPABILITY_TIERS["issue_comment"] is (
+        access_control.CapabilityTier.SCOPED_WITH_PROVENANCE
+    )
+    assert access_control._OPERATION_SINK_DESTINATION["issue_comment"] == (
+        "configured_repository_issue"
+    )
+    assert "issue_comment" in access_control.TRIGGER_AUTHORITY_PROFILES["github"]
+    assert all(
+        "issue_comment" not in capabilities
+        for profile, capabilities in access_control.TRIGGER_AUTHORITY_PROFILES.items()
+        if profile != "github"
+    )
+    assert "issue_comment" not in access_control._TYPED_REPO_PR_TOOL_ACTIONS
+    assert access_control.get_operation_catalog().get_decision("issue_comment") is (
+        access_control.OperationDecision.ADMIN_REQUIRED
+    )
+    access_control.assert_capability_matrix_complete()
+    access_control.assert_model_tool_inventory_cataloged()

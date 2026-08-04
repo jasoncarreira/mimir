@@ -292,3 +292,54 @@ def test_adapter_rejects_oversized_bodies_and_path_injection() -> None:
         client.add_inline_review_comment(
             _scope(), path="../secret", line=1, body="comment",
         )
+
+
+def _issue_payload(*, state="open", repository="owner/repo", number=220, pr=False):
+    payload = {
+        "number": number,
+        "state": state,
+        "repository_url": f"https://api.github.com/repos/{repository}",
+    }
+    if pr:
+        payload["pull_request"] = {"url": "https://api.github.com/pulls/220"}
+    return payload
+
+
+def test_issue_comment_posts_only_after_server_resolves_exact_open_issue() -> None:
+    session = Session([
+        Response(_issue_payload()),
+        Response({
+            "id": 5, "user": {"login": "mimir"}, "body": "analysis",
+            "created_at": "now", "updated_at": "now",
+        }),
+    ])
+
+    result = GitHubForgeClient(session=session).add_issue_comment(
+        "owner/repo", 220, "analysis",
+    )
+
+    assert result.body == "analysis"
+    assert [(method, url) for method, url, _ in session.calls] == [
+        ("GET", "https://api.github.com/repos/owner/repo/issues/220"),
+        ("POST", "https://api.github.com/repos/owner/repo/issues/220/comments"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (Response(_issue_payload(pr=True)), "pull request; use the pull-request"),
+        (Response(_issue_payload(state="closed")), "issue is not open"),
+        (Response({"message": "missing"}, status=404), "issue not found"),
+        (Response(_issue_payload(repository="other/repo")), "mismatched issue identity"),
+    ],
+)
+def test_issue_comment_refuses_invalid_server_target_before_post(response, message) -> None:
+    session = Session([response])
+
+    with pytest.raises(ForgeError, match=message):
+        GitHubForgeClient(session=session).add_issue_comment(
+            "owner/repo", 220, "analysis",
+        )
+
+    assert [method for method, _url, _kwargs in session.calls] == ["GET"]

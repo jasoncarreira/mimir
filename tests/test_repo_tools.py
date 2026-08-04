@@ -608,7 +608,11 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     )
 
 
-def _clean_rebase_tools(tmp_path: Path) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
+def _clean_rebase_tools(
+    tmp_path: Path,
+    *,
+    event_type: str = "pr_mergeability_rebase",
+) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin, source, scope, old_state = _repo_scope_and_state(tmp_path)
     original_author = _git(source, "show", "-s", "--format=%an <%ae>", scope.observed_head_sha)
     _git(source, "checkout", "-q", "main")
@@ -619,7 +623,7 @@ def _clean_rebase_tools(tmp_path: Path) -> tuple[Path, Path, RepoPRActionScope, 
     _git(source, "push", "-q", "origin", "HEAD:main")
     rebase_scope = replace(
         scope,
-        event_type="pr_mergeability_rebase",
+        event_type=event_type,
         observed_base_sha=advanced_base,
     )
     state = RepoReviewState(rebase_scope)
@@ -656,6 +660,29 @@ def test_mergeability_rebase_push_uses_exact_head_lease_and_preserves_author(
         state.checkout_lease.path, "rev-parse", "HEAD",
     )
     assert cleanup_pr_checkout_lease(state.checkout_lease, review_state=state) is True
+
+
+def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> None:
+    origin, _source, scope, state = _clean_rebase_tools(
+        tmp_path, event_type="pr_changes_requested_stale",
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    assert RepoGitTools(state, runner=recording_runner).execute(GitPush()).ok
+    push = next(argv for argv in calls if "push" in argv)
+    assert (
+        f"--force-with-lease={scope.destination_ref}:{scope.observed_head_sha}"
+        in push
+    )
+    assert _git(origin, "rev-parse", scope.destination_ref) == _git(
+        state.checkout_lease.path, "rev-parse", "HEAD",
+    )
 
 
 def test_head_accepted_by_rewritten_push_is_accepted_by_cleanup_when_commit_skipped(
@@ -700,6 +727,35 @@ def test_mergeability_rebase_stale_lease_refuses_concurrent_push(tmp_path: Path)
 
     assert result.ok is False
     assert result.code == "stale_scope"
+    assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
+
+
+def test_changes_requested_rebase_stale_lease_refuses_concurrent_push(
+    tmp_path: Path,
+) -> None:
+    origin, source, scope, state = _clean_rebase_tools(
+        tmp_path, event_type="pr_changes_requested_stale",
+    )
+    _git(source, "checkout", "-q", "worklink/7")
+    (source / "concurrent.txt").write_text("concurrent\n", encoding="utf-8")
+    _git(source, "add", "concurrent.txt")
+    _git(source, "commit", "-q", "-m", "concurrent push")
+    concurrent_head = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    calls: list[tuple[str, ...]] = []
+
+    def recording_runner(argv, *, env, timeout, output_limit):
+        calls.append(argv)
+        return _bounded_subprocess_runner(
+            argv, env=env, timeout=timeout, output_limit=output_limit,
+        )
+
+    result = RepoGitTools(state, runner=recording_runner).execute(GitPush())
+
+    assert result.ok is False
+    assert result.code == "stale_scope"
+    assert any("ls-remote" in argv for argv in calls)
+    assert not any("push" in argv for argv in calls)
     assert _git(origin, "rev-parse", scope.destination_ref) == concurrent_head
 
 
@@ -937,8 +993,48 @@ def test_push_credential_is_available_only_for_exact_canonical_github_origin(
     assert refusal.value.code == "push_auth_unavailable"
 
 
-def test_force_push_guard_refuses_before_any_network_call(repo_tools, monkeypatch) -> None:
-    _origin, _source, _scope, state, _tools = repo_tools
+def test_unrelated_event_force_push_refuses_before_any_network_call(
+    repo_tools, monkeypatch,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    unrelated_scope = replace(scope, event_type="pr_review_requested")
+    state = RepoReviewState(unrelated_scope)
+    state.attach_checkout_lease(replace(
+        old_state.checkout_lease, scope_id=unrelated_scope.scope_id,
+    ))
+    tools = RepoGitTools(state, enforce=False)
+    original_raw = tools._raw
+    network_seen = False
+
+    def non_ancestor(arguments, **kwargs):
+        nonlocal network_seen
+        if arguments[:2] == ("merge-base", "--is-ancestor"):
+            return GitProcessResult(1)
+        if "ls-remote" in arguments or "push" in arguments:
+            network_seen = True
+        return original_raw(arguments, **kwargs)
+
+    monkeypatch.setattr(tools, "_raw", non_ancestor)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitPush())
+    assert refusal.value.code == "force_push_refused"
+    assert network_seen is False
+
+
+@pytest.mark.parametrize("branch", ["main", "master"])
+def test_protected_branch_force_push_refuses_from_remediation_scope(
+    repo_tools, monkeypatch, branch: str,
+) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    protected_scope = replace(scope, destination_ref=f"refs/heads/{branch}")
+    lease = replace(
+        old_state.checkout_lease,
+        scope_id=protected_scope.scope_id,
+        destination_ref=protected_scope.destination_ref,
+    )
+    _git(lease.path, "checkout", "-q", "-B", branch)
+    state = RepoReviewState(protected_scope)
+    state.attach_checkout_lease(lease)
     tools = RepoGitTools(state, enforce=False)
     original_raw = tools._raw
     network_seen = False
