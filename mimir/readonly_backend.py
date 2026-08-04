@@ -30,6 +30,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextvars import ContextVar
 from datetime import datetime
@@ -47,6 +48,7 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from deepagents.middleware import filesystem as deepagents_filesystem
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, StructuredTool
@@ -110,6 +112,10 @@ _WRITE_COLLISION = _WriteCollision("mimir-private-write-collision")
 
 
 class _WriteFailure(str):
+    pass
+
+
+class _TraversalDeadlineExceeded(Exception):
     pass
 
 
@@ -457,6 +463,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         max_glob_matches: int = _DEFAULT_MAX_GLOB_MATCHES,
         max_scan_files: int = _DEFAULT_MAX_SCAN_FILES,
         grep_timeout_seconds: int = _DEFAULT_GREP_TIMEOUT_SECONDS,
+        glob_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -465,6 +472,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         self._max_glob_matches = max_glob_matches
         self._max_scan_files = max_scan_files
         self._grep_timeout_seconds = grep_timeout_seconds
+        self._glob_timeout_seconds = glob_timeout_seconds
 
     def _is_excluded(self, path: Path, *, tool: str) -> bool:
         try:
@@ -490,16 +498,101 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             emit_hard_read_denial(tool, str(path), reason)
         return reason is not None
 
-    def _walk_files(self, root: Path, *, tool: str) -> Iterator[Path]:
-        for dirpath, dirnames, filenames in os.walk(root):
-            base = Path(dirpath)
-            dirnames[:] = sorted(
-                name for name in dirnames if not self._is_excluded(base / name, tool=tool)
+    def _walk_files(
+        self,
+        root: Path,
+        *,
+        tool: str,
+        deadline: float | None = None,
+        on_visit: Callable[[], None] | None = None,
+        descend: Callable[[Path], bool] | None = None,
+    ) -> Iterator[Path]:
+        """Walk incrementally so callers can bound and observe every entry."""
+        if deadline is None and on_visit is None and descend is None:
+            for dirpath, dirnames, filenames in os.walk(root):
+                base = Path(dirpath)
+                dirnames[:] = sorted(
+                    name
+                    for name in dirnames
+                    if not self._is_excluded(base / name, tool=tool)
+                )
+                for filename in sorted(filenames):
+                    candidate = base / filename
+                    if not self._is_excluded(candidate, tool=tool):
+                        yield candidate
+            return
+
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _TraversalDeadlineExceeded
+        directories: list[Path] = []
+        files: list[Path] = []
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise _TraversalDeadlineExceeded
+                if on_visit is not None:
+                    on_visit()
+                candidate = Path(entry.path)
+                if self._is_excluded(candidate, tool=tool):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                (directories if is_dir else files).append(candidate)
+
+        # Match the deterministic ordering of the os.walk fast path: files in
+        # the current directory first, then each child directory recursively.
+        # Sorting before yielding also makes either truncation bound retain the
+        # same prefix across filesystems and after unrelated directory churn.
+        yield from sorted(files, key=lambda path: path.name)
+        for directory in sorted(directories, key=lambda path: path.name):
+            if descend is None or descend(directory):
+                yield from self._walk_files(
+                    directory,
+                    tool=tool,
+                    deadline=deadline,
+                    on_visit=on_visit,
+                    descend=descend,
+                )
+
+    @staticmethod
+    def _glob_descender(_root: Path, pattern: str) -> Callable[[Path], bool] | None:
+        """Return safe pattern pruning without changing ``Path.match`` semantics.
+
+        A trailing slash can only name a directory, while this backend returns
+        files only, so no descendant can produce a result. Other patterns may
+        match a suffix at any depth (for example, ``src/*.py`` also matches
+        ``docs/src/x.py``), making fixed-prefix pruning unsafe.
+        """
+        if pattern.endswith("/"):
+            return lambda _directory: False
+        return None
+
+    @staticmethod
+    def _record_glob_search(
+        *,
+        pattern: str,
+        root: Path,
+        visited_entries: int,
+        elapsed_seconds: float,
+        truncated: bool,
+        reason: str | None,
+    ) -> None:
+        try:
+            from .event_logger import log_event_sync
+
+            log_event_sync(
+                "filesystem_glob_search",
+                pattern=pattern,
+                root=str(root),
+                visited_entries=visited_entries,
+                elapsed_seconds=round(elapsed_seconds, 6),
+                truncated=truncated,
+                reason=reason,
             )
-            for filename in sorted(filenames):
-                candidate = base / filename
-                if not self._is_excluded(candidate, tool=tool):
-                    yield candidate
+        except Exception:  # noqa: BLE001 - telemetry must not break file search
+            log.debug("Could not record filesystem_glob_search", exc_info=True)
 
     def _ripgrep_search(
         self, pattern: str, base_full: Path, include_glob: str | None,
@@ -735,6 +828,13 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 ),
                 matches=[],
             )
+        started = time.monotonic()
+        timeout_seconds = (
+            deepagents_filesystem.GLOB_TIMEOUT * 0.5
+            if self._glob_timeout_seconds is None
+            else self._glob_timeout_seconds
+        )
+        requested_pattern = pattern
         if pattern.startswith("/"):
             pattern = pattern.lstrip("/")
 
@@ -751,12 +851,24 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         results: list[dict[str, Any]] = []
         scanned = 0
+        visited_entries = 0
         truncated: str | None = None
         candidates: Iterator[Path]
         if search_path.is_file():
             candidates = iter([search_path])
+            visited_entries = 1
         else:
-            candidates = self._walk_files(search_path, tool="glob")
+            def record_visit() -> None:
+                nonlocal visited_entries
+                visited_entries += 1
+
+            candidates = self._walk_files(
+                search_path,
+                tool="glob",
+                deadline=started + timeout_seconds,
+                on_visit=record_visit,
+                descend=self._glob_descender(search_path, pattern),
+            )
         try:
             for candidate in candidates:
                 scanned += 1
@@ -812,6 +924,8 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 if len(results) >= self._max_glob_matches:
                     truncated = f"matched more than {self._max_glob_matches} files"
                     break
+        except _TraversalDeadlineExceeded:
+            truncated = f"ran longer than {timeout_seconds:g}s"
         except (OSError, RuntimeError, ValueError) as e:
             display_path = path if path is not None else "<default>"
             msg = f"Glob of '{display_path}' aborted partway: {e}"
@@ -820,9 +934,22 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             return GlobResult(error=msg, matches=results)
 
         results.sort(key=lambda x: x.get("path", ""))
+        elapsed = time.monotonic() - started
         if truncated:
-            _log_truncation("Glob", truncated)
-        return GlobResult(matches=results)
+            _log_truncation(
+                "Glob",
+                f"search of '{search_path}' was cut short after {visited_entries} entries: "
+                f"{truncated}",
+            )
+        self._record_glob_search(
+            pattern=requested_pattern,
+            root=search_path,
+            visited_entries=visited_entries,
+            elapsed_seconds=elapsed,
+            truncated=truncated is not None,
+            reason=truncated,
+        )
+        return GlobResult(matches=results, truncated=truncated is not None)
 
     def ls(self, path: str) -> LsResult:
         """List direct children, omitting excluded traversal roots by default."""
