@@ -7,7 +7,68 @@ All notable changes will land here. Format loosely follows
 ## [Unreleased]
 
 ### Changed
-- Version bumped to 0.7.1 for the next release.
+- Version bumped to 0.7.2 for the next release.
+
+## [0.7.2] — 2026-08-04
+
+### Fixed
+- **`glob` crashed on an omitted `path`.** The tool middleware converts an omitted
+  optional `path` to `None`, which reached the backend's path resolver and raised
+  `AttributeError: 'NoneType' object has no attribute 'startswith'`. The agent got an
+  opaque exception naming no argument, so the call was simply lost — four occurrences
+  on one deployment in a day. `None` is now treated as "search the file-tool root",
+  and genuinely invalid argument types return a refusal naming the offending argument.
+- **`glob` burned the full external deadline and recorded nothing.** The walk was
+  bounded by entry count only, and a count does not bound time, so a large tree
+  exceeded the upstream 10s deadline and the call was cancelled — discarding a useful
+  partial result and recording neither the pattern nor the root. The walk is now also
+  bounded by elapsed time, at half the upstream budget read at call time so the two
+  cannot converge across an upgrade, and returns its own truncated result naming the
+  searched root and entry count. A `filesystem_glob_search` event records the pattern,
+  resolved root, visited entries, elapsed time and truncation reason.
+- **Read-policy denials were invisible in `glob` and `ls`.** Both returned success with
+  fewer results, so the agent could not distinguish an empty directory from one it was
+  not allowed to see, and could not self-correct. A named withheld path now returns an
+  error with the reason and remediation, matching `read`; entries withheld while
+  traversing a permitted path return the permitted results plus a notice with the
+  withheld count and reason class. Withheld path names are never disclosed, and
+  naming-rule denials are omitted entirely so the presence of a secret-shaped file is
+  not advertised.
+- **Reference docs seeded into the agent home were unreadable by the agent.** The home
+  read boundary admitted only `state`, `memory`, the artifact root and the turn
+  scratch, so `<home>/docs/` was withheld — and `glob`/`ls` showed it as empty rather
+  than denied. `<home>/docs` is now a read-only root; secret-shaped names inside it
+  (`.env.*`, `.key`, `credentials/`) remain denied, and it stays unwritable. The
+  upgrade turn now names the docs that changed in that upgrade.
+- **A completed Worklink build could be discarded as a permission refusal.** A
+  substring scan for permission-denied text matched the executor's own edited source,
+  forcing a failure at exit 0 with work committed and the gate green, and the reason
+  was then dropped because failure was keyed off the exit code. The refusal is now
+  honored only when positioned as a signal or accompanied by a nonzero exit, and a
+  backend-reported failure surfaces its reason independently of the exit code.
+
+### Added
+- **Worklink builds can contribute a PR body section.** A build may write Markdown to
+  `.worklink-pr-body.md` in its checkout; the harness consumes it before staging — so
+  it never enters the diff — and places the bounded, scrubbed contents in a
+  harness-owned `Build summary` section ahead of the unchanged evidence block. This is
+  not a general PR-body write capability: the build supplies content the harness
+  places.
+
+## [0.7.1] — 2026-08-03
+
+### Fixed
+- **Upgrade reconciliation was hard-blocked from the proposal workspace it had just
+  created.** The upgrade turn opens a proposal worktree and is then told to read and
+  reconcile the changed files inside it, but the workspace was outside the turn's read
+  scope — 81 real refusals in six minutes on one deployment. The upgrade principal's
+  read roots now include the proposal root it owns. (#1363)
+- **Upgrade reconciliation could not inspect its own proposal PR.** `gh pr view` for the
+  PR the turn had just opened resolved as `admin_required` — shadow-only at the time, but
+  it would have broken the flow outright once enforcement is enabled. (#1362)
+
+### Changed
+- Version bumped to 0.7.1 and the 0.7.0 changelog completed. (#1361)
 
 ## [0.7.0] — 2026-08-03
 
