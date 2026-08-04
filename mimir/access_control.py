@@ -760,6 +760,8 @@ def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Pat
         home_root = Path(home).resolve()
         roots.extend((
             home_root / "state",
+            home_root / "skills",
+            home_root / ".mimir_builtin_skills",
             home_root / ".mimir",
             home_root / "CHANGELOG.md",
         ))
@@ -3751,6 +3753,22 @@ def _trigger_service_read_target_is_allowed(
         return False
     if is_operator_secret_read_path(resolved):
         return False
+    if home:
+        home_root = Path(home).resolve()
+        shared_skill_roots = {
+            home_root / "skills",
+            home_root / ".mimir_builtin_skills",
+        }
+        owned_skill = getattr(service, "owned_skill_directory", None)
+        owned_root = Path(owned_skill).resolve() if owned_skill else None
+        is_owned_skill_path = owned_root is not None and (
+            resolved == owned_root or resolved.is_relative_to(owned_root)
+        )
+        if root in shared_skill_roots and not is_owned_skill_path:
+            if tool_name in {"read_file", "aread"} and resolved.name != "SKILL.md":
+                return False
+            if tool_name not in {"read_file", "aread"} and not resolved.is_dir():
+                return False
     return not (
         tool_name in {"read_file", "aread"}
         and (not resolved.is_file() or file_contains_secret(resolved))

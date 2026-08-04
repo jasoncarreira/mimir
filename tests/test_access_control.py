@@ -473,6 +473,23 @@ def test_upgrade_service_read_scope_includes_docs_only_as_a_read_root(
     assert docs.resolve() not in access_control._static_service_write_roots()
 
 
+def test_service_read_scope_includes_both_home_skill_roots_without_write_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = ServicePrincipal(canonical="skills-loader", trigger="scheduled_tick")
+
+    read_roots = access_control.service_filesystem_read_roots(service)
+    write_roots = access_control._static_service_write_roots()
+
+    assert (home / "skills").resolve() in read_roots
+    assert (home / ".mimir_builtin_skills").resolve() in read_roots
+    assert (home / "skills").resolve() not in write_roots
+    assert (home / ".mimir_builtin_skills").resolve() not in write_roots
+
+
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
     tmp_path: Path,
 ) -> None:
@@ -516,6 +533,8 @@ def test_poller_read_scope_is_limited_to_its_server_bound_skill(
         path.write_text(content, encoding="utf-8")
     other_script = other_skill / "dispatch.sh"
     other_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    other_skill_md = other_skill / "SKILL.md"
+    other_skill_md.write_text("# Other skill\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     service = build_trigger_service_principal(
         canonical="poller:social-cli-feed",
@@ -536,6 +555,9 @@ def test_poller_read_scope_is_limited_to_its_server_bound_skill(
     assert access_control._trigger_service_read_target_is_allowed(
         service, "read_file", {"file_path": str(other_script)},
     ) is False
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, "read_file", {"file_path": str(other_skill_md)},
+    ) is True
     assert access_control._trigger_service_read_target_is_allowed(
         service, "read_file", {"file_path": str(secret)},
     ) is False

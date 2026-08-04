@@ -18,9 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.skills import SkillsMiddleware
 from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
+from mimir.access_control import ServicePrincipal
 from mimir.models import AuthContext
 from mimir.read_policy import framework_large_tool_results_root
 from mimir.readonly_backend import (
@@ -57,6 +59,123 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestWriteGuardBackend:
+    @pytest.mark.parametrize("is_service", [False, True], ids=["non-admin", "service"])
+    def test_skill_roots_are_readable_but_protected_names_and_writes_are_refused(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, is_service: bool,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        skill_files = []
+        protected_files = []
+        for root_name, skill_name in (
+            ("skills", "operator-skill"),
+            (".mimir_builtin_skills", "builtin-skill"),
+        ):
+            skill_dir = home / root_name / skill_name
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(f"# {skill_name}\n", encoding="utf-8")
+            skill_files.append(skill_file)
+            for relative in (".env.local", "private.key", "certificate.pem", "credentials/note.md"):
+                protected = skill_dir / relative
+                protected.parent.mkdir(parents=True, exist_ok=True)
+                protected.write_text("withheld\n", encoding="utf-8")
+                protected_files.append(protected)
+
+        service = ServicePrincipal(
+            canonical="skills-loader",
+            trigger="scheduled_tick",
+            capabilities=("read_file",),
+        )
+        auth = AuthContext(
+            principal="service:skills-loader" if is_service else "user:test",
+            canonical_principal="skills-loader" if is_service else "test",
+            roles=("service",) if is_service else ("user",),
+            event_ingress=None,
+            trigger=service.trigger if is_service else "user_message",
+            channel_id="channel",
+            interactivity=None,
+            is_service=is_service,
+            service_authority=service if is_service else None,
+            enforcement_enabled=True,
+        )
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = set_current_turn(SimpleNamespace(turn_id="skills-read", auth_context=auth))
+        try:
+            reads = [backend.read(str(path)) for path in skill_files]
+            protected_reads = [backend.read(str(path)) for path in protected_files]
+            writes = [backend.write(str(path), "replacement\n") for path in skill_files]
+        finally:
+            reset_current_turn(token)
+
+        assert [result.file_data["content"] for result in reads] == [
+            "# operator-skill\n",
+            "# builtin-skill\n",
+        ]
+        assert all(
+            result.error and "protected_name_match" in result.error
+            for result in protected_reads
+        )
+        assert all(result.error and "Write blocked" in result.error for result in writes)
+        assert [path.read_text(encoding="utf-8") for path in skill_files] == [
+            "# operator-skill\n",
+            "# builtin-skill\n",
+        ]
+
+    @pytest.mark.parametrize("is_service", [False, True], ids=["non-admin", "service"])
+    def test_skills_middleware_loads_home_sources_without_errors(
+        self,
+        home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        is_service: bool,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        sources = [home / ".mimir_builtin_skills", home / "skills"]
+        for source, skill_name in zip(sources, ("builtin-skill", "operator-skill"), strict=True):
+            skill_dir = source / skill_name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                f"name: {skill_name}\n"
+                f"description: Test {skill_name}.\n"
+                "---\n"
+                "Instructions.\n",
+                encoding="utf-8",
+            )
+
+        service = ServicePrincipal(canonical="skills-loader", trigger="scheduled_tick")
+        auth = AuthContext(
+            principal="service:skills-loader" if is_service else "user:test",
+            canonical_principal="skills-loader" if is_service else "test",
+            roles=("service",) if is_service else ("user",),
+            event_ingress=None,
+            trigger=service.trigger if is_service else "user_message",
+            channel_id="channel",
+            interactivity=None,
+            is_service=is_service,
+            service_authority=service if is_service else None,
+            enforcement_enabled=True,
+        )
+        middleware = SkillsMiddleware(
+            backend=WriteGuardBackend(root_dir=home, writable_dirs=["state"]),
+            sources=[str(source) for source in sources],
+        )
+
+        token = set_current_turn(SimpleNamespace(turn_id="skills-load", auth_context=auth))
+        try:
+            update = middleware.before_agent({}, None, {})
+        finally:
+            reset_current_turn(token)
+
+        assert update is not None
+        assert {skill["name"] for skill in update["skills_metadata"]} == {
+            "builtin-skill",
+            "operator-skill",
+        }
+        assert "skills_load_errors" not in update
+        assert not any("Skills load errors" in record.message for record in caplog.records)
+
     def test_non_admin_docs_are_readable_discoverable_and_read_only(
         self, home: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
