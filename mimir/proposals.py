@@ -65,6 +65,10 @@ CONFLICT_MARKER_RE = re.compile(r"^(?:<<<<<<<|=======$|>>>>>>>)", re.MULTILINE)
 PrOpener = Callable[[Path, str, str, str, str], "str | None"]
 
 
+class ProposalPrError(RuntimeError):
+    """The proposal branch was pushed, but the pull request was not opened."""
+
+
 def normalize_lane(lane: str | None) -> str:
     """Return a supported proposal lane name, raising ``ValueError`` if invalid."""
     value = (lane or AGENT_PROPOSAL_LANE).strip().lower()
@@ -117,7 +121,7 @@ class ProposalResult:
     pushed: bool
     pr_url: str | None
     #: None on full success; else "no_open" | "no_changes" | "secret" |
-    #: "conflict_marker" | "pushed_no_pr" | "error".
+    #: "conflict_marker" | "pr_open" | "error".
     reason: str | None
     detail: str | None = None
 
@@ -345,19 +349,21 @@ def open_proposal(
 
 
 def _default_open_pr(home: Path, branch: str, base: str, title: str, body: str) -> str | None:
-    """Open a PR via the ``gh`` CLI; return the URL. None (not an error) when
-    ``gh`` is unavailable or fails — the branch is already pushed."""
+    """Open a PR via the ``gh`` CLI or raise with the failing-step detail."""
     if shutil.which("gh") is None:
-        return None
+        raise ProposalPrError("gh pr create failed: gh executable is unavailable")
     res = _run(
         ["gh", "pr", "create", "--base", base, "--head", branch,
          "--title", title, "--body", body],
         cwd=home, capture=True,
     )
     if res.returncode != 0:
-        return None
+        detail = (res.stderr or res.stdout or "no error output").strip()
+        raise ProposalPrError(_redact(f"gh pr create failed: {detail}"))
     lines = [ln for ln in (res.stdout or "").splitlines() if ln.strip()]
-    return lines[-1].strip() if lines else None
+    if not lines:
+        raise ProposalPrError("gh pr create failed: command returned no pull-request URL")
+    return lines[-1].strip()
 
 
 def _cleanup_worktree(home: Path, worktree: Path, branch: str) -> None:
@@ -460,13 +466,19 @@ def finalize_proposal(
         "Approval = merge; live files update after the merge (#340)."
     )
     opener = open_pr or _default_open_pr
-    pr_url = opener(home, branch, base, safe_title, body)
+    try:
+        pr_url = opener(home, branch, base, safe_title, body)
+    except ProposalPrError as exc:
+        pr_url = None
+        pr_error = str(exc)
+    else:
+        pr_error = "gh pr create failed: pull-request opener returned no URL"
     _cleanup_worktree(home, wt, branch)
     if pr_url:
         return ProposalResult(ok=True, branch=branch, pushed=True, pr_url=pr_url, reason=None)
     return ProposalResult(
-        ok=True, branch=branch, pushed=True, pr_url=None, reason="pushed_no_pr",
-        detail="branch pushed; open the PR manually (gh unavailable or failed)",
+        ok=False, branch=branch, pushed=True, pr_url=None, reason="pr_open",
+        detail=pr_error,
     )
 
 
@@ -729,6 +741,7 @@ __all__ = (
     "OpenResult",
     "render_open_proposals_block",
     "ProposalResult",
+    "ProposalPrError",
     "ProposalCleanupRecord",
     "cleanup_resolved_proposal_branches",
     "open_proposal",

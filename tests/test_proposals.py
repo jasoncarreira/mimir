@@ -22,6 +22,7 @@ from mimir.proposals import (
     finalize_proposal,
     list_open_proposals,
     open_proposal,
+    ProposalPrError,
     render_open_proposals_block,
     normalize_lane,
 )
@@ -269,14 +270,35 @@ def test_finalize_proposes_prompts_only_change(home: Path) -> None:
     assert "prompts-only revision" in shown
 
 
-def test_finalize_pushes_without_pr_when_opener_returns_none(home: Path) -> None:
+def test_finalize_reports_failure_when_pr_is_not_opened(home: Path) -> None:
     r = open_proposal(home)
     assert r.ok
     (r.worktree / "memory" / "core" / "40-learned-behaviors.md").write_text(
         SEED + "- x\n", encoding="utf-8"
     )
     res = finalize_proposal(home, title="t", rationale="r", open_pr=lambda *a: None)
-    assert res.ok and res.pushed and res.pr_url is None and res.reason == "pushed_no_pr"
+    assert not res.ok and res.pushed and res.pr_url is None and res.reason == "pr_open"
+    assert "returned no URL" in (res.detail or "")
+
+
+def test_finalize_preserves_pr_create_failure_detail(home: Path) -> None:
+    r = open_proposal(home)
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nchanged\n", encoding="utf-8"
+    )
+
+    def fail_open(*args):
+        raise ProposalPrError("gh pr create failed: authentication required")
+
+    res = finalize_proposal(home, title="t", rationale="r", open_pr=fail_open)
+
+    assert not res.ok and res.pushed and res.reason == "pr_open"
+    assert res.detail == "gh pr create failed: authentication required"
+    assert list_open_proposals(home) == []
+    assert f"refs/heads/{res.branch}" in _git(
+        "ls-remote", "--heads", "origin", res.branch, cwd=home
+    ).stdout
 
 
 def test_finalize_selects_requested_lane(home: Path) -> None:

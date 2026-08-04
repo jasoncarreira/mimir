@@ -676,8 +676,21 @@ def check_and_open_defaults_upgrade(
                 conflicts=False,
                 auto_submit=submitted,
             )
-        # Leave the proposal open and spend a reconciliation turn rather than
-        # strand a valid worktree just because PR creation/push failed.
+        if submitted.pushed:
+            # finalize_proposal removes the worktree after pushing. A failed PR
+            # open is therefore not a proposal the reconciliation turn can
+            # recover; keep the pending baseline and retry on the next startup.
+            return DefaultsUpgradeResult(
+                ok=False,
+                action="error",
+                version=version,
+                detail=submitted.detail or submitted.reason,
+                proposal=opened,
+                conflicts=False,
+                auto_submit=submitted,
+            )
+        # Push/commit failures retain the worktree, so a reconciliation turn can
+        # inspect it and retry submission.
         return DefaultsUpgradeResult(
             ok=True,
             action="proposal_opened",

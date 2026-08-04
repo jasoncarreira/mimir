@@ -271,6 +271,67 @@ def test_clean_upgrade_can_auto_submit_without_reconciliation_turn(
     assert _git("rev-parse", "--verify", du.PENDING_PREVIOUS_REF, cwd=home, check=False).returncode != 0
 
 
+def test_version_bump_opens_upgrade_pull_request_end_to_end(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+    _defaults(monkeypatch, identity="identity v2\n", heartbeat="heartbeat v2\n")
+    opened_prs: list[dict[str, str]] = []
+
+    def open_pr(home_arg, branch, base, title, body):
+        opened_prs.append({"branch": branch, "base": base, "title": title, "body": body})
+        return "https://github.example/home/pull/17"
+
+    monkeypatch.setattr("mimir.proposals._default_open_pr", open_pr)
+
+    result = du.check_and_open_defaults_upgrade(
+        home, version="1.1.0", auto_submit_clean=True,
+    )
+
+    assert result.ok and result.action == "auto_submitted"
+    assert result.auto_submit and result.auto_submit.pr_url == "https://github.example/home/pull/17"
+    assert len(opened_prs) == 1
+    assert opened_prs[0]["branch"].startswith("upgrade/defaults-1-1-0-")
+    assert opened_prs[0]["base"] == "main"
+    assert opened_prs[0]["title"] == "Upgrade mimir defaults to 1.1.0"
+    assert "Proposal lane: `upgrade`" in opened_prs[0]["body"]
+    assert f"refs/heads/{opened_prs[0]['branch']}" in _git(
+        "ls-remote", "--heads", "origin", opened_prs[0]["branch"], cwd=home
+    ).stdout
+    assert list_open_proposals(home, lane="upgrade") == []
+
+
+def test_auto_submit_pr_open_failure_is_not_reported_as_upgrade_success(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+    _defaults(monkeypatch, identity="identity v2\n", heartbeat="heartbeat v2\n")
+
+    monkeypatch.setattr(
+        du,
+        "finalize_proposal",
+        lambda *a, **k: du.ProposalResult(
+            ok=False,
+            branch="upgrade/defaults-1-1-0-123",
+            pushed=True,
+            pr_url=None,
+            reason="pr_open",
+            detail="gh pr create failed: authentication required",
+        ),
+    )
+
+    result = du.check_and_open_defaults_upgrade(
+        home, version="1.1.0", auto_submit_clean=True,
+    )
+
+    assert not result.ok and result.action == "error"
+    assert result.detail == "gh pr create failed: authentication required"
+    assert (home / du.LAST_SYNCED_VERSION_FILE).read_text(encoding="utf-8") == "1.0.0\n"
+    assert _git("rev-parse", "--verify", du.PENDING_PREVIOUS_REF, cwd=home).returncode == 0
+
+
 @pytest.mark.asyncio
 async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_path: Path) -> None:
     home = tmp_path / "home"
