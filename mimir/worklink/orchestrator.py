@@ -14,8 +14,11 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import stat
 import subprocess
+import unicodedata
 import warnings
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -49,11 +52,16 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
+from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import contains_secret
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
+_PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
+_PR_BODY_SECTION_MAX_BYTES = 4000
+_PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
+_EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 
 # --- feature-factory autonomous adapter (chainlink #833) --------------------
 # The factory self-drives every gate and writes run.json.terminal_result at a
@@ -683,6 +691,7 @@ class WorklinkRunner:
         persisted handle)."""
         selected_name = backend.name
         raw = await backend.interpret(order, compute_result)
+        pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
         # A backend may report failure without the executor process exiting
@@ -784,6 +793,7 @@ class WorklinkRunner:
                 issue,
                 lease.branch,
                 validation.evidence,
+                pr_body_section=pr_body_section,
                 base=lease.base_ref,
                 runner=runner,
             )
@@ -2420,10 +2430,11 @@ def _open_pr(
     branch: str,
     evidence: WorklinkEvidence,
     *,
+    pr_body_section: str | None = None,
     base: str,
     runner: Runner,
 ) -> str:
-    body = (
+    evidence_block = (
         f"Closes chainlink #{issue.issue_id}.\n\n"
         f"Worklink evidence:\n"
         f"- Base: `{base}`\n"
@@ -2434,6 +2445,13 @@ def _open_pr(
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
         f"- Transcript: `{evidence.transcript or '(none)'}`\n"
     )
+    body = evidence_block
+    if pr_body_section:
+        body = (
+            f"Closes chainlink #{issue.issue_id}.\n\n"
+            f"Build summary:\n\n{pr_body_section}\n\n"
+            + evidence_block.split("\n\n", 1)[1]
+        )
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     repo_slug = _repo_slug(repo, runner=runner)
     if repo_slug:
@@ -2446,6 +2464,43 @@ def _open_pr(
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "gh pr create failed")
     return result.stdout.strip().splitlines()[-1]
+
+
+def _read_pr_body_section(checkout: Path) -> str | None:
+    """Consume the build's optional PR narrative without adding it to the diff."""
+    path = checkout / _PR_BODY_SECTION_FILE
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, _PR_BODY_SECTION_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+        path.unlink(missing_ok=True)
+
+    text = raw.decode("utf-8", errors="replace")
+    text = unicodedata.normalize("NFKC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = "".join(
+        char if char in "\n\t" or not unicodedata.category(char).startswith("C") else " "
+        for char in text
+    )
+    text = redact_text(text).strip()
+    # A build-authored lookalike must not precede the canonical parser anchor.
+    text = _EVIDENCE_HEADING_RE.sub("[Build-authored evidence heading removed]", text)
+    encoded = text.encode("utf-8")
+    truncated = len(raw) > _PR_BODY_SECTION_MAX_BYTES or len(encoded) > _PR_BODY_SECTION_MAX_BYTES
+    if truncated:
+        prefix_limit = _PR_BODY_SECTION_MAX_BYTES - len(
+            _PR_BODY_SECTION_TRUNCATED.encode("utf-8")
+        )
+        text = encoded[:prefix_limit].decode("utf-8", errors="ignore").rstrip()
+        text += _PR_BODY_SECTION_TRUNCATED
+    return text or None
 
 
 def _repo_remote_url(repo: Path, *, runner: Runner | None = None) -> str | None:

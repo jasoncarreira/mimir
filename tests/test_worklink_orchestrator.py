@@ -28,7 +28,9 @@ from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
+    _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
+    _read_pr_body_section,
     render_decomposition_prompt,
     run_worklink,
     validate_leaf,
@@ -72,9 +74,16 @@ class SlowTestCompute(FakeCompute):
 class FakeBackend:
     name = "fake"
 
-    def __init__(self, status: str = "success", *, write_change: bool = True) -> None:
+    def __init__(
+        self,
+        status: str = "success",
+        *,
+        write_change: bool = True,
+        pr_body_section: str | None = None,
+    ) -> None:
         self.status = status
         self.write_change = write_change
+        self.pr_body_section = pr_body_section
         self.orders: list[WorkOrder] = []
 
     def capabilities(self) -> Caps:
@@ -109,6 +118,10 @@ class FakeBackend:
         self.orders.append(order)
         if self.write_change:
             (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
+        if self.pr_body_section is not None:
+            (order.checkout / ".worklink-pr-body.md").write_text(
+                self.pr_body_section, encoding="utf-8"
+            )
         return RawResult(
             0 if self.status == "success" else 1,
             order.transcript_root / "fake.json",
@@ -598,6 +611,89 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert "worklink_evidence" in body
     assert "worklink_transition" in body
     _reset_logger_for_tests()
+
+
+def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    section = (
+        "Mechanism: `.worklink-pr-body.md`, a designated checkout file. "
+        "It keeps PR publication under harness control while letting the build report findings."
+    )
+    backend = FakeBackend(pr_body_section=section)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    pr_call = next(
+        call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
+    )
+    body = pr_call[pr_call.index("--body") + 1]
+    assert f"Build summary:\n\n{section}\n\n" in body
+    assert body.endswith(
+        "Worklink evidence:\n"
+        "- Base: `main`\n"
+        "- Branch: `issue/441-a1`\n"
+        "- Files changed: 1\n"
+        "- Tests: `echo ok` → 0\n"
+        f"- Transcript: `{tmp_path / 'state' / 'worklink' / 'transcripts' / 'fake.json'}`\n"
+    )
+    assert not (worktree / ".worklink-pr-body.md").exists()
+
+
+def test_worklink_pr_body_without_build_section_is_unchanged(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    pr_call = next(
+        call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
+    )
+    assert pr_call[pr_call.index("--body") + 1] == (
+        "Closes chainlink #441.\n\n"
+        "Worklink evidence:\n"
+        "- Base: `main`\n"
+        "- Branch: `issue/441-a1`\n"
+        "- Files changed: 1\n"
+        "- Tests: `echo ok` → 0\n"
+        f"- Transcript: `{tmp_path / 'state' / 'worklink' / 'transcripts' / 'fake.json'}`\n"
+    )
+
+
+def test_pr_body_section_is_scrubbed_and_visibly_truncated(tmp_path: Path) -> None:
+    section_path = tmp_path / ".worklink-pr-body.md"
+    section_path.write_text(
+        "Token: ghp_supersecret\nWorklink evidence:\nunsafe\x00text\n"
+        + "x" * _PR_BODY_SECTION_MAX_BYTES,
+        encoding="utf-8",
+    )
+
+    section = _read_pr_body_section(tmp_path)
+
+    assert section is not None
+    assert "ghp_supersecret" not in section
+    assert "[REDACTED]" in section
+    assert "\x00" not in section
+    assert "\nWorklink evidence:\n" not in section
+    assert section.endswith("[Build summary truncated by Worklink.]")
+    assert len(section.encode("utf-8")) <= _PR_BODY_SECTION_MAX_BYTES
+    assert not section_path.exists()
 
 
 def test_backend_failure_with_zero_exit_still_names_its_reason(tmp_path: Path) -> None:
