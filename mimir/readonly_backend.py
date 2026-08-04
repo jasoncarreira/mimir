@@ -51,6 +51,7 @@ from deepagents.backends.protocol import (
 from deepagents.middleware import filesystem as deepagents_filesystem
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.tools import ToolRuntime
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
@@ -78,6 +79,9 @@ _DEFAULT_GREP_TIMEOUT_SECONDS = 10
 MAX_GREP_CONTEXT_LINES = 200
 _grep_context: ContextVar[tuple[int, int]] = ContextVar(
     "mimir_grep_context", default=(0, 0),
+)
+_read_withheld_notices: ContextVar[list[str] | None] = ContextVar(
+    "mimir_read_withheld_notices", default=None,
 )
 _FILESYSTEM_TOOLS = [
     "ls",
@@ -351,9 +355,127 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
             args_schema=GrepWithContextSchema,
         )
 
+    @staticmethod
+    def _append_withheld_notices(message: ToolMessage, notices: list[str]) -> ToolMessage:
+        if not notices or message.status != "success":
+            return message
+        return message.model_copy(update={
+            "content": f"{message.content}\n\n{' '.join(notices)}",
+        })
+
+    def _create_ls_tool(self) -> BaseTool:
+        stock_tool = super()._create_ls_tool()
+
+        def sync_ls(runtime: ToolRuntime, path: str) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = stock_tool.func(runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        async def async_ls(runtime: ToolRuntime, path: str) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = await stock_tool.coroutine(runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        for wrapper in (sync_ls, async_ls):
+            wrapper.__annotations__["runtime"] = ToolRuntime
+        return StructuredTool.from_function(
+            name="ls",
+            description=stock_tool.description,
+            func=sync_ls,
+            coroutine=async_ls,
+            infer_schema=False,
+            args_schema=stock_tool.args_schema,
+        )
+
+    def _create_glob_tool(self) -> BaseTool:
+        stock_tool = super()._create_glob_tool()
+
+        def sync_glob(
+            pattern: str,
+            runtime: ToolRuntime,
+            path: str | None = None,
+        ) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = stock_tool.func(pattern=pattern, runtime=runtime, path=path)
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        async def async_glob(
+            pattern: str,
+            runtime: ToolRuntime,
+            path: str | None = None,
+        ) -> ToolMessage:
+            notices: list[str] = []
+            token = _read_withheld_notices.set(notices)
+            try:
+                message = await stock_tool.coroutine(
+                    pattern=pattern, runtime=runtime, path=path,
+                )
+            finally:
+                _read_withheld_notices.reset(token)
+            return self._append_withheld_notices(message, notices)
+
+        for wrapper in (sync_glob, async_glob):
+            wrapper.__annotations__["runtime"] = ToolRuntime
+        return StructuredTool.from_function(
+            name="glob",
+            description=stock_tool.description,
+            func=sync_glob,
+            coroutine=async_glob,
+            infer_schema=False,
+            args_schema=stock_tool.args_schema,
+        )
+
 
 def _log_truncation(op: str, reason: str) -> None:
     log.warning("%s truncated: %s; narrow the path or pattern", op, reason)
+
+
+def _read_denied_message(reason: str) -> str:
+    guidance = {
+        "core_memory_block": "Use an allowed memory or state path instead.",
+        "protected_name_match": "Use a non-secret source or an authorized secret interface.",
+        "service_scoped_read_boundary": "Use a path inside this service's configured read roots.",
+        "mimir_home_read_boundary": "Use an allowed state path instead.",
+        "protected_read_result": "For published PR content, use pr_files or pr_diff.",
+    }.get(reason, "Choose an allowed read target.")
+    return f"Read denied: {reason}. {guidance}"
+
+
+def _withheld_notice(reason_counts: dict[str, int]) -> str | None:
+    counted = []
+    for reason, count in sorted(reason_counts.items()):
+        if reason not in {"mimir_home_read_boundary", "service_scoped_read_boundary"}:
+            # Naming-rule denials are intentionally silent: even a coarse reason would
+            # disclose that a secret-shaped file exists in the requested listing.
+            continue
+        noun = "entry" if count == 1 else "entries"
+        counted.append(f"{count} {noun} ({reason})")
+    if not counted:
+        return None
+    return (
+        f"Note: read policy withheld {', '.join(counted)}. "
+        "The permitted results above are valid but incomplete."
+    )
+
+
+def _publish_withheld_notice(reason_counts: dict[str, int]) -> str | None:
+    notice = _withheld_notice(reason_counts)
+    channel = _read_withheld_notices.get()
+    if notice is not None and channel is not None:
+        channel.append(notice)
+    return notice
 
 
 def _contextualize_grep_matches(
@@ -474,7 +596,13 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         self._grep_timeout_seconds = grep_timeout_seconds
         self._glob_timeout_seconds = glob_timeout_seconds
 
-    def _is_excluded(self, path: Path, *, tool: str) -> bool:
+    def _is_excluded(
+        self,
+        path: Path,
+        *,
+        tool: str,
+        on_withheld: Callable[[str], None] | None = None,
+    ) -> bool:
         try:
             rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
         except (OSError, RuntimeError, ValueError):
@@ -496,6 +624,8 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             from .read_policy import emit_hard_read_denial
 
             emit_hard_read_denial(tool, str(path), reason)
+            if on_withheld is not None:
+                on_withheld(reason)
         return reason is not None
 
     def _walk_files(
@@ -506,6 +636,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         deadline: float | None = None,
         on_visit: Callable[[], None] | None = None,
         descend: Callable[[Path], bool] | None = None,
+        on_withheld: Callable[[str], None] | None = None,
     ) -> Iterator[Path]:
         """Walk incrementally so callers can bound and observe every entry."""
         if deadline is None and on_visit is None and descend is None:
@@ -514,11 +645,15 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 dirnames[:] = sorted(
                     name
                     for name in dirnames
-                    if not self._is_excluded(base / name, tool=tool)
+                    if not self._is_excluded(
+                        base / name, tool=tool, on_withheld=on_withheld,
+                    )
                 )
                 for filename in sorted(filenames):
                     candidate = base / filename
-                    if not self._is_excluded(candidate, tool=tool):
+                    if not self._is_excluded(
+                        candidate, tool=tool, on_withheld=on_withheld,
+                    ):
                         yield candidate
             return
 
@@ -533,7 +668,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 if on_visit is not None:
                     on_visit()
                 candidate = Path(entry.path)
-                if self._is_excluded(candidate, tool=tool):
+                if self._is_excluded(
+                    candidate, tool=tool, on_withheld=on_withheld,
+                ):
                     continue
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
@@ -554,6 +691,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     deadline=deadline,
                     on_visit=on_visit,
                     descend=descend,
+                    on_withheld=on_withheld,
                 )
 
     @staticmethod
@@ -843,6 +981,19 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         try:
             search_path = self.cwd if path is None or path == "/" else self._resolve_path(path)
+            from .read_policy import (
+                is_mimir_home_root,
+                non_admin_read_filter_enabled,
+                protected_read_result_reason,
+            )
+
+            if non_admin_read_filter_enabled() and not is_mimir_home_root(search_path):
+                reason = protected_read_result_reason(search_path)
+                if reason is not None:
+                    from .read_policy import emit_hard_read_denial
+
+                    emit_hard_read_denial("glob", str(search_path), reason)
+                    return GlobResult(error=_read_denied_message(reason), matches=[])
             if not search_path.exists():
                 return GlobResult(matches=[])
         except (OSError, RuntimeError) as e:
@@ -853,6 +1004,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         scanned = 0
         visited_entries = 0
         truncated: str | None = None
+        withheld: dict[str, int] = {}
+
+        def record_withheld(reason: str) -> None:
+            withheld[reason] = withheld.get(reason, 0) + 1
+
         candidates: Iterator[Path]
         if search_path.is_file():
             candidates = iter([search_path])
@@ -868,6 +1024,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 deadline=started + timeout_seconds,
                 on_visit=record_visit,
                 descend=self._glob_descender(search_path, pattern),
+                on_withheld=record_withheld,
             )
         try:
             for candidate in candidates:
@@ -889,6 +1046,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     from .read_policy import emit_hard_read_denial
 
                     emit_hard_read_denial("glob", str(matched_path), reason)
+                    record_withheld(reason)
                     continue
                 try:
                     is_file = matched_path.is_file()
@@ -935,6 +1093,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         results.sort(key=lambda x: x.get("path", ""))
         elapsed = time.monotonic() - started
+        _publish_withheld_notice(withheld)
         if truncated:
             _log_truncation(
                 "Glob",
@@ -949,19 +1108,47 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             truncated=truncated is not None,
             reason=truncated,
         )
-        return GlobResult(matches=results, truncated=truncated is not None)
+        return GlobResult(
+            matches=results,
+            truncated=truncated is not None,
+        )
 
     def ls(self, path: str) -> LsResult:
         """List direct children, omitting excluded traversal roots by default."""
+        from .read_policy import (
+            is_mimir_home_root,
+            non_admin_read_filter_enabled,
+            protected_read_result_reason,
+        )
+
+        filtering = non_admin_read_filter_enabled()
+        if filtering:
+            try:
+                requested = self._resolve_path(path)
+                reason = (
+                    None
+                    if is_mimir_home_root(requested)
+                    else protected_read_result_reason(requested)
+                )
+            except (OSError, RuntimeError, ValueError):
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("ls", path, "unresolved_read_target")
+                return LsResult(error="Read denied: unresolved path")
+            if reason is not None:
+                from .read_policy import emit_hard_read_denial
+
+                emit_hard_read_denial("ls", str(requested), reason)
+                return LsResult(error=_read_denied_message(reason))
+
         result = super().ls(path)
         entries = result.entries or []
         filtered = [
             entry for entry in entries
             if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
         ]
-        from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
-
-        if non_admin_read_filter_enabled():
+        withheld: dict[str, int] = {}
+        if filtering:
             safe = []
             for entry in filtered:
                 try:
@@ -972,6 +1159,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     emit_hard_read_denial(
                         "ls", str(entry.get("path", "")), "unresolved_read_target",
                     )
+                    withheld["unresolved_read_target"] = (
+                        withheld.get("unresolved_read_target", 0) + 1
+                    )
                     continue
                 reason = protected_read_result_reason(resolved)
                 if reason is None:
@@ -980,7 +1170,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     from .read_policy import emit_hard_read_denial
 
                     emit_hard_read_denial("ls", str(resolved), reason)
+                    withheld[reason] = withheld.get(reason, 0) + 1
             filtered = safe
+        _publish_withheld_notice(withheld)
         return LsResult(error=result.error, entries=filtered)
 
 
@@ -1048,14 +1240,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     @staticmethod
     def _read_denied_message(reason: str) -> str:
-        guidance = {
-            "core_memory_block": "Use an allowed memory or state path instead.",
-            "protected_name_match": "Use a non-secret source or an authorized secret interface.",
-            "service_scoped_read_boundary": "Use a path inside this service's configured read roots.",
-            "mimir_home_read_boundary": "Use an allowed state path instead.",
-            "protected_read_result": "For published PR content, use pr_files or pr_diff.",
-        }.get(reason, "Choose an allowed read target.")
-        return f"Read denied: {reason}. {guidance}"
+        return _read_denied_message(reason)
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):

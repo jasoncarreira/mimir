@@ -1709,6 +1709,141 @@ class TestBuildFileToolRoutes:
         assert ".worktrees" not in names
         assert "node_modules" not in names
 
+    def test_denied_named_target_errors_for_ls_and_glob_without_disclosing_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = tmp_path / "home"
+        (home / "logs").mkdir(parents=True)
+        (home / "logs" / "withheld-name.md").write_text("private\n", encoding="utf-8")
+        (home / "state").mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="named-denial", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+            ls_result = backend.ls("/logs")
+            glob_result = backend.glob("*.md", path="/logs")
+        finally:
+            reset_current_turn(token)
+
+        for error in (ls_result.error, glob_result.error):
+            assert error == (
+                "Read denied: mimir_home_read_boundary. Use an allowed state path instead."
+            )
+            assert "logs" not in error
+            assert "withheld-name" not in error
+        assert glob_result.matches == []
+
+    def test_allowed_root_returns_partial_results_with_scope_denial_notices(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = tmp_path / "home"
+        (home / "state").mkdir(parents=True)
+        (home / "state" / "visible.txt").write_text("visible\n", encoding="utf-8")
+        (home / "withheld-subtree").mkdir()
+        (home / "withheld-subtree" / "hidden.txt").write_text("hidden\n", encoding="utf-8")
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="partial-denial", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+            glob_result = backend.glob("**/*.txt", path="/")
+            middleware = MimirFilesystemMiddleware(backend=backend)
+            tools = {tool.name: tool for tool in middleware.tools}
+            ls_message = tools["ls"].func(
+                path="/", runtime=SimpleNamespace(tool_call_id="partial-ls"),
+            )
+            glob_message = tools["glob"].func(
+                pattern="**/*.txt", path="/",
+                runtime=SimpleNamespace(tool_call_id="partial-glob"),
+            )
+        finally:
+            reset_current_turn(token)
+
+        assert [match["path"] for match in glob_result.matches or []] == [
+            "/state/visible.txt",
+        ]
+        assert glob_result.error is None
+        assert glob_result.truncated is False
+        for message in (ls_message, glob_message):
+            assert message.status == "success"
+            assert "1 entry (mimir_home_read_boundary)" in str(message.content)
+            assert "hit its time limit" not in str(message.content)
+            assert "Narrow the search" not in str(message.content)
+            assert "withheld-subtree" not in str(message.content)
+            assert "hidden.txt" not in str(message.content)
+        assert "/state/" in str(ls_message.content)
+        assert "/state/visible.txt" in str(glob_message.content)
+
+    def test_protected_name_partial_withhold_does_not_advertise_presence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "safe.txt").write_text("safe\n", encoding="utf-8")
+        (root / "credentials.json").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+        auth = AuthContext(
+            principal="u", canonical_principal="u", roles=("user",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="protected-name", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=root, virtual_mode=True)
+            middleware = MimirFilesystemMiddleware(backend=backend)
+            tools = {tool.name: tool for tool in middleware.tools}
+            ls_message = tools["ls"].func(
+                path="/", runtime=SimpleNamespace(tool_call_id="protected-ls"),
+            )
+            glob_message = tools["glob"].func(
+                pattern="*.txt", path="/",
+                runtime=SimpleNamespace(tool_call_id="protected-glob"),
+            )
+        finally:
+            reset_current_turn(token)
+
+        for message in (ls_message, glob_message):
+            content = str(message.content)
+            assert message.status == "success"
+            assert "protected_name_match" not in content
+            assert "read policy withheld" not in content
+            assert "credentials.json" not in content
+
+    def test_admin_ls_and_glob_have_no_withheld_signal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = tmp_path / "home"
+        (home / "docs").mkdir(parents=True)
+        (home / "docs" / "visible.md").write_text("visible\n", encoding="utf-8")
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="admin", canonical_principal="admin", roles=("admin",),
+            event_ingress=None, trigger="user_message", channel_id="c",
+            interactivity=None, enforcement_enabled=True,
+        )
+        token = set_current_turn(SimpleNamespace(turn_id="admin-read", auth_context=auth))
+        try:
+            backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
+            ls_result = backend.ls("/docs")
+            glob_result = backend.glob("**/*.md", path="/")
+        finally:
+            reset_current_turn(token)
+
+        assert [entry["path"] for entry in ls_result.entries or []] == ["/docs/visible.md"]
+        assert [match["path"] for match in glob_result.matches or []] == ["/docs/visible.md"]
+        assert ls_result.error is None
+        assert glob_result.error is None
+        assert glob_result.truncated is False
+
     def test_non_admin_grep_and_ls_skip_secret_bearing_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
