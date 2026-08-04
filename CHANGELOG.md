@@ -7,7 +7,57 @@ All notable changes will land here. Format loosely follows
 ## [Unreleased]
 
 ### Changed
-- Version bumped to 0.7.2 for the next release.
+- Version bumped to 0.7.3 for the next release.
+
+## [0.7.3] — 2026-08-04
+
+### Fixed
+- **The agent could not read its own skills, and nothing said so.** The home read
+  boundary admitted only `state`, `memory`, `docs`, the artifact root and the turn
+  scratch, so `<home>/skills` and `<home>/.mimir_builtin_skills` were refused and the
+  skills loader silently loaded nothing on non-admin and service turns. The silence was
+  the reason it survived: before a named denied read returned an error, `ls` on those
+  directories succeeded and returned empty, so the loader had nothing to report —
+  mimirbot's log holds nine starts across four days with no such warning, and the first
+  one appeared eleven minutes after the disclosure fix shipped. Pollers kept firing
+  throughout, because their manifests are read by mimir's own poller loader rather than
+  by the skills middleware, which is much of why the failure looked like nothing was
+  wrong. Both roots are now readable at all three read-policy sites and in service read
+  scope, and remain unwritable. Service access to a shared root is limited to `SKILL.md`
+  while full access stays scoped to the principal's own `owned_skill_directory`, so one
+  poller does not gain every other skill's files; protected-name rules still apply
+  inside both roots, making this a location admitted and not a naming exemption. (#1158)
+- **The social-cli skill documented an outbox filename dispatch does not read.** The
+  skill told the agent to write `<state_dir>/outbox.yaml`, but social-cli defaults
+  `state.platformIsolation` to true, and `dispatch --platform <p>` then resolves
+  `outbox-<p>.yaml` and takes no fallback to the shared path. Worse, both pollers
+  rendered that same wrong path into every wake-up prompt, so the runtime kept
+  instructing the agent into the failure — which is quiet in both directions: a missing
+  outbox prints `No outbox file found at <path>, skipping.` and exits 0, and the stale
+  `outbox.yaml` left behind then fails every later write to that path with "already
+  exists". Measured on muninn over 2026-08-02..04: 24 failed reads of `outbox-bsky.yaml`
+  and 44 write refusals on `outbox.yaml`. That home had already filed the filename
+  mismatch twice, plus two more issue notes for its downstream effects — a write
+  refused on an existing outbox, and stale queued actions firing from a prior session.
+  The hints now derive `outbox-<platform>.yaml` and the matching `--platform` from the
+  event's platform; the skill documents all three resolution rules, including that a
+  no-platform dispatch *can* fall back to the shared file while a platform-specific one
+  cannot, and that a stale suffixed file therefore wins over a fresh shared one. The
+  seeded `.gitignore` now covers the suffixed outboxes, which were the one transient it
+  did not ignore.
+- **A proposal that pushed but failed to open a PR was reported as recoverable.** The
+  upgrade path left such a proposal marked open so a reconciliation turn could retry,
+  but `finalize_proposal` removes the worktree once it has pushed — so there was nothing
+  left to recover and a real failure was reported as a non-error. It now returns
+  `ok=False` when the push succeeded and the PR did not, and retains the worktree only
+  for push or commit failures, which do leave it in place.
+
+### Changed
+- **`submit_proposal` failures are typed rather than stringly-reported.** Failures
+  raised no error and returned a message, so a caller could not tell failure from
+  success without parsing prose. They now raise `ProposalSubmissionError` carrying
+  `reason` and `lane`, and PR-open failures raise `ProposalPrError` for its three modes:
+  `gh` unavailable, `gh` failure, and a command that returns no pull-request URL.
 
 ## [0.7.2] — 2026-08-04
 
