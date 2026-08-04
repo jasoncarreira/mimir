@@ -292,3 +292,58 @@ def test_adapter_rejects_oversized_bodies_and_path_injection() -> None:
         client.add_inline_review_comment(
             _scope(), path="../secret", line=1, body="comment",
         )
+
+
+def test_issue_comment_refuses_a_pull_request_number() -> None:
+    """A PR must not be commentable through the issue path.
+
+    GitHub serves both from `/issues/{n}/comments`, so without this check the
+    narrower issue capability would let a caller comment on any pull request in a
+    configured repository while bypassing the server-discovered review authority
+    that `add_pull_request_comment` requires.
+    """
+    session = Session([
+        Response({"number": 220, "state": "open", "pull_request": {"url": "…"}}),
+    ])
+    client = GitHubForgeClient(session=session)
+
+    with pytest.raises(ForgeError, match="target is a pull request"):
+        client.add_issue_comment("owner/repo", 220, "analysis")
+
+    assert [call[0] for call in session.calls] == ["GET"]
+
+
+def test_issue_comment_refuses_a_closed_issue() -> None:
+    client = GitHubForgeClient(session=Session([
+        Response({"number": 220, "state": "closed"}),
+    ]))
+
+    with pytest.raises(ForgeError, match="issue is not open"):
+        client.add_issue_comment("owner/repo", 220, "analysis")
+
+
+def test_issue_comment_posts_to_the_issue_endpoint() -> None:
+    session = Session([
+        Response({"number": 220, "state": "open"}),
+        Response({"id": 5, "user": {"login": "mimir"}, "body": "analysis",
+                  "created_at": "now", "updated_at": "now"}),
+    ])
+    client = GitHubForgeClient(session=session)
+
+    result = client.add_issue_comment("owner/repo", 220, "analysis")
+
+    assert result.body == "analysis"
+    methods_urls = [(call[0], call[1]) for call in session.calls]
+    assert methods_urls == [
+        ("GET", "https://api.github.com/repos/owner/repo/issues/220"),
+        ("POST", "https://api.github.com/repos/owner/repo/issues/220/comments"),
+    ]
+
+
+def test_issue_comment_rejects_an_oversized_body_before_any_request() -> None:
+    session = Session([])
+    client = GitHubForgeClient(session=session)
+
+    with pytest.raises(ForgeError, match="oversized body"):
+        client.add_issue_comment("owner/repo", 220, "x" * 65_537)
+    assert session.calls == []

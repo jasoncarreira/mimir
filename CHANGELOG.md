@@ -48,6 +48,14 @@ All notable changes will land here. Format loosely follows
   backend-reported failure surfaces its reason independently of the exit code.
 
 ### Added
+- **A typed `issue_comment` tool.** The review poller could comment on a pull
+  request but not on an issue: `gh issue comment` is not in the `repo_review` shell
+  allowlist, so a prepared analysis had to be relayed by hand. Rather than widen the
+  shell allowlist — the same widening that once leaked credentials through `gh`'s
+  `--jq` filter — issues get a typed tool alongside `pr_comment`, bound to
+  repositories in `GITHUB_REPOS`. It refuses pull-request numbers: GitHub serves both
+  from `/issues/{n}/comments`, so without that check the narrower issue capability
+  would bypass the server-discovered review authority `pr_comment` requires.
 - **Worklink builds can contribute a PR body section.** A build may write Markdown to
   `.worklink-pr-body.md` in its checkout; the harness consumes it before staging — so
   it never enters the diff — and places the bounded, scrubbed contents in a

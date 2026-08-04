@@ -43,6 +43,7 @@ from mimir.tools.forge import (
     pr_submit_review,
     set_forge_client,
     unsupported_operation,
+    issue_comment,
 )
 from mimir.tools.repo import repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
@@ -159,6 +160,10 @@ class FakeForge:
         self.calls.append(("comment", scope, body))
         return CommentProjection("1", "reviewer", body, "now", "now")
 
+    def add_issue_comment(self, repository, issue, body):
+        self.calls.append(("issue_comment", repository, issue, body))
+        return CommentProjection("2", "reviewer", body, "now", "now")
+
     def rerequest_review(self, scope, reviewer):
         self.calls.append(("rerequest", scope, reviewer))
 
@@ -172,10 +177,18 @@ def _reset_client() -> None:
 
 
 def test_tool_surface_requires_exact_repository_and_pr_selectors() -> None:
+    """Every forge tool addresses its target by exact selector, never an alias.
+
+    A tool selects a pull request by ``pull_request`` or an issue by ``issue``,
+    and exactly one of the two — a tool offering both would let the caller name a
+    target the authorization path did not bind.
+    """
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
-        assert {"repository", "pull_request"} <= set(properties)
-        assert not ({"repo", "pr_number", "url", "host"} & set(properties))
+        selectors = {"pull_request", "issue"} & set(properties)
+        assert "repository" in properties, forge_tool.name
+        assert len(selectors) == 1, (forge_tool.name, selectors)
+        assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
 
@@ -700,3 +713,94 @@ def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
     assert first["escalated"] is True
     assert second["escalated"] is True
     assert first["operation"] != second["operation"]
+
+
+def test_issue_comment_posts_to_a_configured_repository(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+    result = issue_comment.func(repository="owner/repo", issue=220, body="analysis")
+
+    assert result["body"] == "analysis"
+    assert ("issue_comment", "owner/repo", 220, "analysis") in client.calls
+
+
+def test_issue_comment_refuses_an_unconfigured_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+    with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
+        issue_comment.func(repository="other/elsewhere", issue=220, body="analysis")
+    assert not client.calls
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"repository": "not-a-slug", "issue": 1, "body": "x"}, "owner/repo"),
+        ({"repository": "owner/repo", "issue": 0, "body": "x"}, "positive integer"),
+        ({"repository": "owner/repo", "issue": True, "body": "x"}, "positive integer"),
+        ({"repository": "owner/repo", "issue": 1, "body": "   "}, "non-empty text"),
+    ],
+)
+def test_issue_comment_rejects_malformed_selectors(
+    kwargs, match, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``issue=True`` matters: bool is an int subclass and would pass as issue 1."""
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+    with pytest.raises(ToolException, match=match):
+        issue_comment.func(**kwargs)
+    assert not client.calls
+
+
+def test_issue_comment_is_registered_and_authorized() -> None:
+    """Pin activation, not just behaviour.
+
+    The tool is only reachable if it is in ``FORGE_TOOLS`` and carries its
+    authorization entries. Every behavioural test here calls ``issue_comment.func``
+    directly, so all of them still pass if the registration is dropped — the tool
+    just silently disappears from the agent's surface.
+    """
+    from mimir.access_control import (
+        OperationDecision,
+        TRIGGER_AUTHORITY_PROFILES,
+        TRIGGER_CAPABILITY_TIERS,
+        _OPERATION_SINK_DESTINATION,
+        _SINK_CATEGORY_MAP,
+        _TOOL_FLOW_MAP,
+        _TYPED_REPO_PR_TOOL_ACTIONS,
+        assert_capability_matrix_complete,
+        assert_model_tool_inventory_cataloged,
+        get_operation_catalog,
+    )
+
+    assert "issue_comment" in {forge_tool.name for forge_tool in FORGE_TOOLS}
+    assert "issue_comment" in _SINK_CATEGORY_MAP
+    assert "issue_comment" in _TOOL_FLOW_MAP
+    assert "issue_comment" in TRIGGER_CAPABILITY_TIERS
+    assert "issue_comment" in TRIGGER_AUTHORITY_PROFILES["github"]
+    # Registering an IFC sink without a destination extraction leaves the matrix
+    # incomplete, which blocks enforcement everywhere rather than failing here.
+    assert "issue_comment" in _OPERATION_SINK_DESTINATION
+    assert_capability_matrix_complete()
+    # An uncataloged model-bound tool blocks enforcement the same way, and the
+    # decision must be admin_required rather than resource_scoped: keys of
+    # _FORGE_TOOL_ACTIONS route through the pull-request scope test, which an
+    # issue comment can never satisfy.
+    assert get_operation_catalog().get_decision("issue_comment") is (
+        OperationDecision.ADMIN_REQUIRED
+    )
+    assert "issue_comment" not in _TYPED_REPO_PR_TOOL_ACTIONS
+    assert_model_tool_inventory_cataloged()

@@ -198,6 +198,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "pr_submit_review": SinkCategory.FORGE,
     "pr_inline_review_comment": SinkCategory.FORGE,
     "pr_comment": SinkCategory.FORGE,
+    "issue_comment": SinkCategory.FORGE,
     "pr_rerequest_review": SinkCategory.FORGE,
     "unsupported_operation": SinkCategory.FORGE,
     "repo_checkout": SinkCategory.FORGE,
@@ -308,6 +309,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_submit_review": ToolFlowDirection.SINK,
     "pr_inline_review_comment": ToolFlowDirection.SINK,
     "pr_comment": ToolFlowDirection.SINK,
+    "issue_comment": ToolFlowDirection.SINK,
     "pr_rerequest_review": ToolFlowDirection.SINK,
     "unsupported_operation": ToolFlowDirection.SINK,
     "repo_checkout": ToolFlowDirection.BOTH,
@@ -448,6 +450,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "issue_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -508,6 +511,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
+        "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
@@ -5307,6 +5311,7 @@ class OperationCatalog:
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "issue_comment",
         "approve_declassification",
         "list_channels",
         "list_schedules",
@@ -7284,6 +7289,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "pr_submit_review": "bound_pull_request",
     "pr_inline_review_comment": "bound_pull_request",
     "pr_comment": "bound_pull_request",
+    "issue_comment": "configured_repository_issue",
     "pr_rerequest_review": "bound_pull_request",
     "unsupported_operation": "bound_pull_request",
     "repo_checkout": "bound_pull_request",

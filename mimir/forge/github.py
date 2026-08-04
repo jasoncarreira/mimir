@@ -481,6 +481,35 @@ class GitHubForgeClient:
             raise ForgeError("forge returned invalid comment result")
         return self._comment(data)
 
+    def add_issue_comment(
+        self, repository: str, issue: int, body: str,
+    ) -> CommentProjection:
+        """Comment on an open ISSUE, refusing pull-request numbers.
+
+        GitHub serves issue and pull-request conversation from the same
+        ``/issues/{n}/comments`` endpoint, so this path must reject pull requests
+        explicitly. Without that check it would be a way to comment on any pull
+        request in a configured repository while bypassing the server-discovered
+        review authority that ``add_pull_request_comment`` requires — a narrower
+        capability that silently subsumes a broader, better-bound one.
+        """
+        body = self._body(body)
+        target = self._request("GET", f"/repos/{repository}/issues/{issue}")
+        if not isinstance(target, Mapping):
+            raise ForgeError("forge returned invalid issue result")
+        if target.get("pull_request") is not None:
+            raise ForgeError(
+                "target is a pull request; use the pull-request comment path"
+            )
+        if target.get("state") != "open":
+            raise ForgeError("issue is not open")
+        data = self._request(
+            "POST", f"/repos/{repository}/issues/{issue}/comments", body={"body": body},
+        )
+        if not isinstance(data, Mapping):
+            raise ForgeError("forge returned invalid comment result")
+        return self._comment(data)
+
     def rerequest_review(self, scope: RepoPRActionScope, reviewer: str) -> None:
         repository, number = self._target(scope)
         if _REVIEWER.fullmatch(reviewer) is None:
