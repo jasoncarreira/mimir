@@ -39,6 +39,12 @@ _FILTER_KEY_RE = re.compile(r"filter\.([^.\x00]+)\.(clean|smudge|process)")
 _MERGE_KEY_RE = re.compile(r"merge\.([^.\x00]+)\.driver")
 _RECENT_AGENT_PUSH_LIMIT = 1024
 _URL_USERINFO_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,31}://)[^/@\s]+@")
+_HISTORY_REWRITE_EVENT_TYPES = frozenset({
+    "pr_changes_requested_stale",
+    "pr_mergeability_rebase",
+    "pr_mergeability_conflicting",
+})
+_PROTECTED_BRANCH_REFS = frozenset({"refs/heads/main", "refs/heads/master"})
 _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
 _recent_agent_pushes_lock = threading.Lock()
 
@@ -897,10 +903,11 @@ class RepoGitTools:
                 "merge-base", "--is-ancestor", self._scope.observed_head_sha,
                 self._expected_head,
             ))
-            rewritten_rebase = self._scope.event_type in {
-                "pr_mergeability_rebase", "pr_mergeability_conflicting",
-            }
-            if ancestry.returncode != 0 and not rewritten_rebase:
+            rewritten_history = ancestry.returncode != 0
+            if rewritten_history and (
+                self._scope.event_type not in _HISTORY_REWRITE_EVENT_TYPES
+                or self._scope.destination_ref in _PROTECTED_BRANCH_REFS
+            ):
                 raise GitRefusal("force_push_refused", "push would not be a fast-forward")
             try:
                 push_remote, auth_env, sensitive_values = self._push_remote()
@@ -920,7 +927,7 @@ class RepoGitTools:
                         False, "stale_scope", stderr=self._stranded_work_message(),
                     )
                 push_args = ["push", "--porcelain"]
-                if rewritten_rebase:
+                if rewritten_history:
                     push_args.append(
                         f"--force-with-lease={self._scope.destination_ref}:"
                         f"{self._scope.observed_head_sha}"
