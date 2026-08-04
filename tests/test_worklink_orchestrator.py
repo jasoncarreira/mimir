@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -694,6 +695,23 @@ def test_pr_body_section_is_scrubbed_and_visibly_truncated(tmp_path: Path) -> No
     assert section.endswith("[Build summary truncated by Worklink.]")
     assert len(section.encode("utf-8")) <= _PR_BODY_SECTION_MAX_BYTES
     assert not section_path.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+def test_pr_body_section_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    section_path = tmp_path / ".worklink-pr-body.md"
+    os.mkfifo(section_path)
+
+    assert _read_pr_body_section(tmp_path) is None
+    assert not section_path.exists()
+
+
+def test_pr_body_section_rejects_directory_without_raising(tmp_path: Path) -> None:
+    section_path = tmp_path / ".worklink-pr-body.md"
+    section_path.mkdir()
+
+    assert _read_pr_body_section(tmp_path) is None
+    assert section_path.is_dir()
 
 
 def test_backend_failure_with_zero_exit_still_names_its_reason(tmp_path: Path) -> None:

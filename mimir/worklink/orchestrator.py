@@ -2470,10 +2470,18 @@ def _read_pr_body_section(checkout: Path) -> str | None:
     """Consume the build's optional PR narrative without adding it to the diff."""
     path = checkout / _PR_BODY_SECTION_FILE
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
     except OSError:
         if path.is_symlink():
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -2481,7 +2489,10 @@ def _read_pr_body_section(checkout: Path) -> str | None:
         raw = os.read(fd, _PR_BODY_SECTION_MAX_BYTES + 1)
     finally:
         os.close(fd)
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     text = raw.decode("utf-8", errors="replace")
     text = unicodedata.normalize("NFKC", text.replace("\r\n", "\n").replace("\r", "\n"))
