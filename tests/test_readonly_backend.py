@@ -10,6 +10,7 @@ working against the full home tree.
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -1423,6 +1424,98 @@ class TestBuildFileToolRoutes:
         assert result.matches == []
         assert result.error is None
         assert "scanned more than 2 files" in caplog.text
+
+    def test_glob_records_completed_search(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        (repo / "src" / "pkg").mkdir(parents=True)
+        (repo / "src" / "pkg" / "app.py").write_text("x\n")
+        (repo / "docs" / "large").mkdir(parents=True)
+        for index in range(20):
+            (repo / "docs" / "large" / f"ignored-{index}.py").write_text("x\n")
+        events = []
+        monkeypatch.setattr(
+            "mimir.event_logger.log_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.glob("src/**/*.py", path="/")
+
+        assert [match["path"] for match in result.matches or []] == ["/src/pkg/app.py"]
+        assert result.truncated is False
+        assert events == [(
+            "filesystem_glob_search",
+            {
+                "pattern": "src/**/*.py",
+                "root": str(repo),
+                "visited_entries": 25,
+                "elapsed_seconds": events[0][1]["elapsed_seconds"],
+                "truncated": False,
+                "reason": None,
+            },
+        )]
+
+    def test_glob_prunes_directory_only_pattern_without_hiding_file_matches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        (repo / "one" / "nested").mkdir(parents=True)
+        (repo / "one" / "nested" / "file.txt").write_text("x\n")
+        (repo / "two" / "nested").mkdir(parents=True)
+        (repo / "two" / "nested" / "file.txt").write_text("x\n")
+        events = []
+        monkeypatch.setattr(
+            "mimir.event_logger.log_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+
+        result = backend.glob("nested/", path="/")
+
+        assert result.matches == []
+        assert result.truncated is False
+        assert events[0][1]["visited_entries"] == 2
+
+    def test_large_glob_returns_time_truncation_before_external_deadline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for directory_index in range(40):
+            directory = repo / f"directory-{directory_index:02d}"
+            directory.mkdir()
+            for file_index in range(100):
+                (directory / f"file-{file_index:03d}.txt").touch()
+        events = []
+        monkeypatch.setattr(
+            "mimir.event_logger.log_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            glob_timeout_seconds=0.001,
+            max_scan_files=100_000,
+        )
+
+        started = time.monotonic()
+        result = backend.glob("**/*.py", path="/")
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0
+        assert result.error is None
+        assert result.truncated is True
+        assert str(repo) in caplog.text
+        assert "was cut short" in caplog.text
+        kind, fields = events[-1]
+        assert kind == "filesystem_glob_search"
+        assert fields["pattern"] == "**/*.py"
+        assert fields["root"] == str(repo)
+        assert fields["visited_entries"] > 0
+        assert fields["truncated"] is True
+        assert fields["reason"] == "ran longer than 0.001s"
 
     def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
