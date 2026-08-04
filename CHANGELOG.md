@@ -19,9 +19,11 @@ All notable changes will land here. Format loosely follows
   (`force_push_refused`). The capability was already implemented and already safe:
   an `ls-remote` pre-check confirms the remote head still matches the observed head
   and returns `stale_scope` otherwise. All three remediation triggers already shared
-  one validation path, so the asymmetry was a single set membership. On PR #1377 the
-  rebased commit survived only because the lease-preservation bundle had captured it.
-  (#1157)
+  one validation path, so the asymmetry was a single set membership. `main` and
+  `master` remain unforceable from every scope on this path, and the force flag is
+  now attached only to pushes whose history has actually diverged rather than to
+  every push from a rewrite-capable trigger. On PR #1377 the rebased commit survived
+  only because the lease-preservation bundle had captured it. (#1157)
 - **`glob` crashed on an omitted `path`.** The tool middleware converts an omitted
   optional `path` to `None`, which reached the backend's path resolver and raised
   `AttributeError: 'NoneType' object has no attribute 'startswith'`. The agent got an
@@ -66,8 +68,12 @@ All notable changes will land here. Format loosely follows
   GitHub serves both from `/issues/{n}/comments` and without that check the narrower
   issue capability would bypass the server-discovered review authority `pr_comment`
   requires. The destination is a server-fetched issue rather than the caller's
-  selector, and repository-derived data may only flow to an issue in the same
-  repository. (#1156)
+  selector, validated against the identity the server returns. An issue comment
+  requires the turn to hold at least one repository-derived source, and that
+  source's repository must match the issue's; the resource within the repository
+  need not, so a turn that read a pull request may comment on an issue in the same
+  repository, while cross-repository flow is denied. Granted to the review poller
+  only, and not inherited by custom trigger profiles. (#1156)
 - **Worklink builds can contribute a PR body section.** A build may write Markdown to
   `.worklink-pr-body.md` in its checkout; the harness consumes it before staging — so
   it never enters the diff — and places the bounded, scrubbed contents in a
