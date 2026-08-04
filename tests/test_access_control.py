@@ -7930,3 +7930,66 @@ def test_repo_review_push_is_bound_to_the_event_branch_not_the_namespace() -> No
         f"{event_branch}:refs/tags/v1",
     ):
         assert not _repo_review_push_refspec(refspec, event_branch), refspec
+
+
+def test_issue_comment_authorization_requires_and_matches_repository_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.forge import IssueTarget
+    from mimir.tools.forge import set_forge_client
+
+    class IssueForge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        def get_open_issue_target(self, repository, issue):
+            self.calls.append(("resolve", repository, issue))
+            return IssueTarget(repository, issue)
+
+    client = IssueForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "repo-a/project,repo-b/project")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("issue_comment",), creation_path="test",
+    )
+    source = SourceLabel(
+        principal="service:poller:github-activity", domain="repository",
+        resource_id=f"repo-a/project#pull/5@{'a' * 40}", bridge_instance="forge",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:poller:github-activity"}),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="informational",
+    )
+    labels = InformationFlowLabels().with_channel("poller:test").with_source(source)
+    auth = _service_auth(service, labels)
+    registry = ToolRegistry()
+
+    try:
+        same_repo = registry.authorize_tool(
+            "issue_comment", auth, enforce=True,
+            arguments={"repository": "repo-a/project", "issue": 220, "body": "analysis"},
+        )
+        other_repo = registry.authorize_tool(
+            "issue_comment", auth, enforce=True,
+            arguments={"repository": "repo-b/project", "issue": 220, "body": "analysis"},
+        )
+        no_source = registry.authorize_tool(
+            "issue_comment", _service_auth(service, InformationFlowLabels()), enforce=True,
+            arguments={"repository": "repo-b/project", "issue": 220, "body": "analysis"},
+        )
+    finally:
+        set_forge_client(None)
+
+    assert same_repo.allowed is True
+    assert same_repo.resolved_sink_target == "repo-a/project#issue/220"
+    assert other_repo.allowed is False
+    assert other_repo.reason == "ifc_label_blocked:forge"
+    # This source-presence gate runs before server resolution, so an unbound turn
+    # cannot choose any configured repository and does not trigger a forge fetch.
+    assert no_source.allowed is False
+    assert no_source.reason == "issue_repository_source_required"
+    assert client.calls == [
+        ("resolve", "repo-a/project", 220),
+        ("resolve", "repo-b/project", 220),
+    ]
