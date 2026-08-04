@@ -1713,8 +1713,8 @@ class TestBuildFileToolRoutes:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         home = tmp_path / "home"
-        (home / "docs").mkdir(parents=True)
-        (home / "docs" / "withheld-name.md").write_text("private\n", encoding="utf-8")
+        (home / "logs").mkdir(parents=True)
+        (home / "logs" / "withheld-name.md").write_text("private\n", encoding="utf-8")
         (home / "state").mkdir()
         monkeypatch.setenv("MIMIR_HOME", str(home))
         auth = AuthContext(
@@ -1725,8 +1725,8 @@ class TestBuildFileToolRoutes:
         token = set_current_turn(SimpleNamespace(turn_id="named-denial", auth_context=auth))
         try:
             backend = _RootAwareFilesystemBackend(root_dir=home, virtual_mode=True)
-            ls_result = backend.ls("/docs")
-            glob_result = backend.glob("*.md", path="/docs")
+            ls_result = backend.ls("/logs")
+            glob_result = backend.glob("*.md", path="/logs")
         finally:
             reset_current_turn(token)
 
@@ -1734,7 +1734,7 @@ class TestBuildFileToolRoutes:
             assert error == (
                 "Read denied: mimir_home_read_boundary. Use an allowed state path instead."
             )
-            assert "docs" not in error
+            assert "logs" not in error
             assert "withheld-name" not in error
         assert glob_result.matches == []
 
