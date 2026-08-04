@@ -55,6 +55,21 @@ All notable changes will land here. Format loosely follows
   not a general PR-body write capability: the build supplies content the harness
   places.
 
+## [0.7.1] — 2026-08-03
+
+### Fixed
+- **Upgrade reconciliation was hard-blocked from the proposal workspace it had just
+  created.** The upgrade turn opens a proposal worktree and is then told to read and
+  reconcile the changed files inside it, but the workspace was outside the turn's read
+  scope — 81 real refusals in six minutes on one deployment. The upgrade principal's
+  read roots now include the proposal root it owns. (#1363)
+- **Upgrade reconciliation could not inspect its own proposal PR.** `gh pr view` for the
+  PR the turn had just opened resolved as `admin_required` — shadow-only at the time, but
+  it would have broken the flow outright once enforcement is enabled. (#1362)
+
+### Changed
+- Version bumped to 0.7.1 and the 0.7.0 changelog completed. (#1361)
+
 ## [0.7.0] — 2026-08-03
 
 ### Fixed (landed 2026-08-03, before the 0.7.0 tag)
