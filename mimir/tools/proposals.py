@@ -20,7 +20,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 
 from ..proposals import (
     abandon_proposal as _abandon_proposal,
@@ -34,6 +34,15 @@ from ..event_logger import log_event
 def _home() -> Path | None:
     home_env = os.environ.get("MIMIR_HOME")
     return Path(home_env) if home_env else None
+
+
+class ProposalSubmissionError(ToolException):
+    """Typed failure signal for proposal submission in either lane."""
+
+    def __init__(self, message: str, *, reason: str, lane: str):
+        super().__init__(message)
+        self.reason = reason
+        self.lane = lane
 
 
 @tool
@@ -104,9 +113,17 @@ async def submit_proposal(title: str, rationale: str, lane: str = "agent") -> st
     """
     home = _home()
     if home is None:
-        return "submit_proposal failed: MIMIR_HOME not set — surface to the operator."
+        raise ProposalSubmissionError(
+            "submit_proposal failed: MIMIR_HOME not set — surface to the operator.",
+            reason="missing_home",
+            lane=lane,
+        )
     if not (title and rationale):
-        return "submit_proposal failed: title and rationale are both required."
+        raise ProposalSubmissionError(
+            "submit_proposal failed: title and rationale are both required.",
+            reason="invalid_arguments",
+            lane=lane,
+        )
     result = await asyncio.to_thread(
         _finalize_proposal, home, title=title, rationale=rationale, lane=lane
     )
@@ -121,26 +138,31 @@ async def submit_proposal(title: str, rationale: str, lane: str = "agent") -> st
             "Nothing changed in the live files yet — it applies only after they "
             "merge."
         )
-    if result.ok:  # pushed but no PR opened (gh unavailable/failed)
-        return (
-            f"Pushed branch {result.branch}, but couldn't open the PR "
-            f"automatically ({result.detail}). Ask the operator to open a PR "
-            f"from that branch."
-        )
     if result.reason == "no_open":
-        return (
+        message = (
             f"submit_proposal: no `{lane}` proposal is open. Call open_proposal(lane={lane!r}) first, "
             "then edit the files."
         )
-    if result.reason == "no_changes":
-        return (
+    elif result.reason == "no_changes":
+        message = (
             "submit_proposal: you haven't changed anything under the proposal's "
             "memory/core/ or prompts/ yet — edit a file first, or call "
             "abandon_proposal."
         )
-    if result.reason == "secret":
-        return f"submit_proposal blocked: {result.detail}"
-    return f"submit_proposal failed ({result.reason}): {result.detail or ''}"
+    elif result.reason == "secret":
+        message = f"submit_proposal blocked: {result.detail}"
+    elif result.reason == "pr_open" and result.pushed:
+        message = (
+            f"submit_proposal failed after pushing branch {result.branch}: "
+            f"{result.detail or 'pull request was not opened'}"
+        )
+    else:
+        message = f"submit_proposal failed ({result.reason}): {result.detail or ''}"
+    raise ProposalSubmissionError(
+        message,
+        reason=result.reason or "unknown",
+        lane=lane,
+    )
 
 
 @tool
@@ -167,5 +189,6 @@ async def abandon_proposal(lane: str = "agent") -> str:
 __all__ = (
     "open_proposal",
     "submit_proposal",
+    "ProposalSubmissionError",
     "abandon_proposal",
 )

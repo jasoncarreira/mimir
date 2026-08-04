@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from mimir.proposals import OpenResult, ProposalResult
 from mimir.tools import proposals as tp
 
@@ -120,8 +122,11 @@ def test_submit_tool_no_open(monkeypatch, tmp_path) -> None:
             ok=False, branch=None, pushed=False, pr_url=None, reason="no_open", detail="x"
         ),
     )
-    out = _inv(tp.submit_proposal, title="t", rationale="r", lane="upgrade")
-    assert "no `upgrade` proposal is open" in out
+    with pytest.raises(tp.ProposalSubmissionError) as raised:
+        _inv(tp.submit_proposal, title="t", rationale="r", lane="upgrade")
+    assert raised.value.reason == "no_open"
+    assert raised.value.lane == "upgrade"
+    assert "no `upgrade` proposal is open" in str(raised.value)
 
 
 def test_submit_tool_secret(monkeypatch, tmp_path) -> None:
@@ -133,16 +138,40 @@ def test_submit_tool_secret(monkeypatch, tmp_path) -> None:
             reason="secret", detail="contains a secret-shaped token",
         ),
     )
-    assert "secret" in _inv(
-        tp.submit_proposal, title="t", rationale="r"
-    ).lower()
+    with pytest.raises(tp.ProposalSubmissionError, match="secret") as raised:
+        _inv(tp.submit_proposal, title="t", rationale="r")
+    assert raised.value.reason == "secret"
+    assert raised.value.lane == "agent"
 
 
 def test_submit_tool_requires_fields(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    assert "required" in _inv(
-        tp.submit_proposal, title="", rationale="r"
-    ).lower()
+    with pytest.raises(tp.ProposalSubmissionError, match="required") as raised:
+        _inv(tp.submit_proposal, title="", rationale="r")
+    assert raised.value.reason == "invalid_arguments"
+
+
+@pytest.mark.parametrize("lane", ["agent", "upgrade"])
+def test_submit_tool_pr_failure_is_typed_for_every_lane(monkeypatch, tmp_path, lane) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        tp, "_finalize_proposal",
+        lambda home, **k: ProposalResult(
+            ok=False,
+            branch=f"{lane}/change",
+            pushed=True,
+            pr_url=None,
+            reason="pr_open",
+            detail="gh pr create failed: authentication required",
+        ),
+    )
+
+    with pytest.raises(tp.ProposalSubmissionError) as raised:
+        _inv(tp.submit_proposal, title="t", rationale="r", lane=lane)
+
+    assert raised.value.reason == "pr_open"
+    assert raised.value.lane == lane
+    assert "gh pr create failed" in str(raised.value)
 
 
 # ─── abandon ─────────────────────────────────────────────────────────
