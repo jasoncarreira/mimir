@@ -79,6 +79,16 @@ class CommentProjection:
 
 
 @dataclass(frozen=True)
+class IssueTarget:
+    canonical_repo: str
+    issue_number: int
+
+    @property
+    def sink_destination(self) -> str:
+        return f"{self.canonical_repo}#issue/{self.issue_number}"
+
+
+@dataclass(frozen=True)
 class ReviewRequestProjection:
     reviewer: str
     kind: str
@@ -117,6 +127,12 @@ class ForgeClient(Protocol):
 
     def add_pull_request_comment(
         self, scope: RepoPRActionScope, body: str,
+    ) -> CommentProjection: ...
+
+    def get_open_issue_target(self, repository: str, issue: int) -> IssueTarget: ...
+
+    def add_issue_comment(
+        self, repository: str, issue: int, body: str,
     ) -> CommentProjection: ...
 
     def rerequest_review(self, scope: RepoPRActionScope, reviewer: str) -> None: ...

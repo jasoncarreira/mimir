@@ -16,7 +16,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..forge import ForgeClient, ForgeError, ReviewVerdict
+from ..forge import ForgeClient, ForgeError, IssueTarget, ReviewVerdict
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
@@ -26,6 +26,7 @@ from .refusals import ToolPolicyRefusal
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
+_REPOSITORY = re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _ESCALATION_DESCRIPTION_MAX_BYTES = 4_096
 _ESCALATION_ATTEMPT_MAX_BYTES = 512
@@ -288,6 +289,33 @@ def _body(value: str) -> str:
     return value
 
 
+def _repository(value: str) -> str:
+    if not isinstance(value, str) or _REPOSITORY.fullmatch(value) is None:
+        raise ToolPolicyRefusal(
+            "repository must be text shaped 'owner/repo'; for example, repository='octocat/hello'"
+        )
+    return value
+
+
+def _issue_number(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ToolPolicyRefusal("issue must be a positive integer; for example, issue=220")
+    return value
+
+
+def resolve_issue_comment_target(repository: str, issue: int) -> IssueTarget:
+    """Fetch and validate the exact configured issue used as the IFC sink."""
+    repo = _repository(repository)
+    number = _issue_number(issue)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal(
+            "issue comment rejected: repository is not configured in GITHUB_REPOS"
+        )
+    return _call(lambda: _client_for_repository(repo).get_open_issue_target(repo, number))
+
+
 def _path(value: str) -> str:
     path = Path(value)
     if (
@@ -447,6 +475,21 @@ def pr_comment(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     return asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
+
+
+@tool
+def issue_comment(
+    repository: str,
+    issue: int,
+    body: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Add one comment to a server-resolved open issue in a configured repository."""
+    safe_body = _body(body)
+    target = resolve_issue_comment_target(repository, issue)
+    return asdict(_call(lambda: _client_for_repository(target.canonical_repo).add_issue_comment(
+        target.canonical_repo, target.issue_number, safe_body,
+    )))
 
 
 @tool
@@ -622,6 +665,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_submit_review,
     pr_inline_review_comment,
     pr_comment,
+    issue_comment,
     pr_rerequest_review,
     unsupported_operation,
 ))
