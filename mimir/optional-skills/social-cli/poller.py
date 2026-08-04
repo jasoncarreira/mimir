@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """Bluesky + X notification poller backed by the `social-cli` tool.
 
-Runs `social-cli sync` (which writes `inbox.yaml` in the working
-directory), then walks the parsed YAML and emits one JSONL event
+Runs `social-cli sync` (which writes one `inbox-<platform>.yaml` per
+platform in the working directory), then walks the parsed YAML and emits one JSONL event
 per never-before-seen notification ID.
 
 The poller does NOT call `social-cli dispatch` — that's the agent's
-job (decide what to do, write `outbox.yaml`, then dispatch). The
-poller's only responsibility is signaling that there's something
-new to look at. Re-emit prevention is cursor-side: we track which
-notification IDs we've already surfaced, and skip them on subsequent
-polls even if they're still pending in inbox.yaml (i.e. the agent
-hasn't dispatched yet).
+job (decide what to do, write `outbox-<platform>.yaml`, then
+dispatch). The poller's only responsibility is signaling that
+there's something new to look at. Re-emit prevention is cursor-side:
+we track which notification IDs we've already surfaced, and skip
+them on subsequent polls even if they're still pending in
+inbox-<platform>.yaml (i.e. the agent hasn't dispatched yet).
 
 This matters because social-cli's `sync` merges new notifications
-into inbox.yaml without removing pending ones — it's a "pending work
+into inbox-<platform>.yaml without removing pending ones — it's a "pending work
 queue," not an append-only log. Without our cursor, every poll
 would re-emit every un-dispatched mention until the agent finally
 handled it, spamming the agent across cron cycles.
 
-Working dir: STATE_DIR. social-cli reads/writes inbox.yaml,
-processed-*.yaml, etc. in cwd, so we cd into STATE_DIR before
+Working dir: STATE_DIR. social-cli reads/writes
+inbox-<platform>.yaml, processed-*.yaml, etc. in cwd, so we cd into STATE_DIR before
 invoking it. The operator-supplied `.env` (credentials) must live
 there too.
 
@@ -118,7 +118,8 @@ def _save_cursor(ids: list[str]) -> None:
 
 def _sync(platforms: list[str], limit: int, users_dir: str | None,
           bin_path: str) -> None:
-    """Run `social-cli sync` in STATE_DIR so inbox.yaml lands there.
+    """Run `social-cli sync` in STATE_DIR so the per-platform
+    inbox-<platform>.yaml files land there.
 
     Per-platform flag style: ``--platform bsky --platform x`` (one
     flag per platform — matches social-cli's documented multi-value
@@ -143,8 +144,8 @@ def _sync(platforms: list[str], limit: int, users_dir: str | None,
             proc.returncode, cmd, proc.stdout, proc.stderr,
         )
     # social-cli sync prints a brief summary to stdout; ignore it
-    # for the poller's purposes — the data we care about is in
-    # inbox.yaml on disk.
+    # for the poller's purposes — the data we care about is in the
+    # inbox-<platform>.yaml files on disk.
 
 
 def _load_inbox(platforms: list[str]) -> list[dict]:
@@ -317,8 +318,17 @@ def _format_event(notif: dict) -> dict | None:
     # ("mention from X / > text / id: ...") doesn't tell the agent
     # WHERE to send the reply, so the default reach is ``send_message``
     # — which routes to Discord/Slack, NOT back to Bluesky/X. Caught
-    # by muninn-mimir 2026-05-23. Per-event overhead ~250 chars;
+    # by muninn-mimir 2026-05-23. Per-event overhead ~400 chars
+    # (was ~250; the suffix warning below adds a measured +150);
     # bounded by ``batch_size`` (default 3 for notifications).
+    #
+    # The filename MUST carry the platform suffix. ``dispatch``
+    # resolves ``outbox-<platform>.yaml`` whenever social-cli's
+    # ``state.platformIsolation`` is on (its default), and the
+    # ``--platform`` path takes no legacy fallback to a shared
+    # ``outbox.yaml`` — it logs "No outbox file found" and exits 0.
+    # This hint named the unsuffixed file until 2026-08-04: the same
+    # defect ``_load_inbox`` already documents on the read side.
     #
     # For ``like`` / ``follow`` / ``repost`` notifications (where the
     # user is signaling, not asking), the agent may decide no
@@ -326,13 +336,15 @@ def _format_event(notif: dict) -> dict | None:
     # to acknowledge.
     target_id = post_id or nid
     action_hint = (
-        "\n\n→ To reply or react: append to <STATE_DIR>/outbox.yaml + "
-        "run `social-cli dispatch`.\n"
+        f"\n\n→ To reply or react: append to <STATE_DIR>/outbox-{platform}.yaml"
+        f" + run `social-cli dispatch --platform {platform}`.\n"
         "  Minimal shape:\n"
         "    dispatch:\n"
         f"      - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
         f"      - like:  {{ platform: {platform}, id: \"{target_id}\" }}\n"
         f"      - ignore: {{ id: \"{nid}\", reason: \"...\" }}   # skip without action\n"
+        f"  The -{platform} suffix is required: dispatch reads outbox-{platform}.yaml\n"
+        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
         f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
     )
     prompt = (
@@ -371,7 +383,7 @@ _STATE_GITIGNORE = """\
 outbox_archive/
 feed-*.yaml
 inbox-*.yaml
-outbox.yaml
+outbox*.yaml
 dispatch_result-*.yaml
 *-new.yaml
 cursor.json
@@ -412,7 +424,7 @@ def main() -> int:
     users_dir = os.environ.get("MIMIR_SOCIAL_USERS_DIR", "").strip() or None
     bin_path = os.environ.get("SOCIAL_CLI_BIN", "").strip() or "social-cli"
 
-    # Step 1: sync — populates inbox.yaml in STATE_DIR.
+    # Step 1: sync — populates inbox-<platform>.yaml in STATE_DIR.
     try:
         _sync(platforms, limit, users_dir, bin_path)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:

@@ -2,16 +2,23 @@
 # Convenience wrapper: dispatch a poller's social-cli outbox from the correct
 # STATE_DIR with its credentials loaded.
 #
-# social-cli reads ATPROTO_HANDLE / X_API_KEY / ... from the environment and its
-# outbox.yaml from the working directory. When dispatch is invoked from outside
-# the poller's STATE_DIR — e.g. an agent Bash call that doesn't cd first, or a
-# context where the .env in cwd isn't auto-sourced — neither the credentials nor
-# the outbox are found and the dispatch silently no-ops or errors. This wrapper
-# cds into STATE_DIR, sources its .env if present, and runs dispatch there.
+# social-cli reads ATPROTO_HANDLE / X_API_KEY / ... from the environment, and its
+# outbox from the working directory — ``outbox-<platform>.yaml`` under the default
+# platformIsolation, a bare ``outbox.yaml`` only when isolation is off. When
+# dispatch is invoked from outside the poller's STATE_DIR — e.g. an agent Bash
+# call that doesn't cd first, or a context where the .env in cwd isn't
+# auto-sourced — neither the credentials nor the outbox are found and the
+# dispatch silently no-ops or errors. This wrapper cds into STATE_DIR, sources
+# its .env if present, and runs dispatch there.
 #
 # Usage: dispatch-outbox.sh <state_dir> [<platform>]
-#   state_dir : the poller's STATE_DIR (holds .env + outbox.yaml)
-#   platform  : optional — bsky | x. Omit to dispatch all configured platforms.
+#   state_dir : the poller's STATE_DIR (holds .env + outbox-<platform>.yaml)
+#   platform  : optional — bsky | x. Passing it reads ``outbox-<platform>.yaml``
+#               and takes NO fallback: a bare ``outbox.yaml`` is skipped with
+#               "No outbox file found" and exit 0. Omitting it dispatches every
+#               ``outbox-*.yaml`` present, falling back to a shared
+#               ``outbox.yaml`` only when no suffixed file exists — so a stale
+#               suffixed file silently wins over a fresh shared one.
 #
 # Honors SOCIAL_CLI_BIN (same override the pollers use) to locate the binary.
 set -euo pipefail

@@ -1,6 +1,6 @@
 ---
 name: social-cli
-description: "Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill."
+description: "Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox-<platform>.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill."
 ---
 
 # social-cli — Bluesky + X social loop
@@ -33,7 +33,7 @@ the platforms credentials are configured for.
 
 **Guarantees**:
 - Inbox-driven responses (mentions / replies / follows / likes) route
-  through `<state_dir>/outbox.yaml` + `social-cli dispatch`, **NOT** via
+  through `<state_dir>/outbox-<platform>.yaml` + `social-cli dispatch`, **NOT** via
   `send_message` (different surface — see the "`send_message` goes to chat
   channels, NOT to Bluesky / X" section).
 - Dispatch validates per-action and continues on per-action failure;
@@ -63,7 +63,25 @@ The poller surfaces notifications. The agent responds:
    up to 5 deep). The poller surfaces a summary of `threadContext`
    in the wake-up prompt — see "Thread context" below.
 
-2. **Write `outbox.yaml`** in the same dir with a `dispatch:` list.
+2. **Write `outbox-<platform>.yaml`** in the same dir with a `dispatch:`
+   list — e.g. `outbox-bsky.yaml`. `social-cli` defaults
+   `state.platformIsolation` to **true**, and the suffixed name is the
+   only one that works under every invocation. Which file `dispatch`
+   actually opens, with isolation on:
+
+   | invocation | file read |
+   |---|---|
+   | `dispatch --platform bsky` | `outbox-bsky.yaml`, **no fallback** — a bare `outbox.yaml` is skipped |
+   | `dispatch` (no platform) | every `outbox-*.yaml` present; falls back to a shared `outbox.yaml` **only if none exist** |
+   | `dispatch --file <path>` | exactly that path |
+
+   Two consequences worth internalizing. A bare `outbox.yaml` is
+   invisible to the `--platform` form the pollers tell you to use. And
+   because the no-platform form prefers suffixed files, a **stale**
+   `outbox-bsky.yaml` silently wins over a fresh `outbox.yaml`. Only
+   write the shared `outbox.yaml` if this deployment has explicitly set
+   `platformIsolation: false`.
+
    Common action shapes inline below — see `AGENT_GUIDE.md` for the
    full grammar (annotate / quote-post / platform-per-text overrides
    / dispatch hooks / etc.).
@@ -107,17 +125,34 @@ The poller surfaces notifications. The agent responds:
 
    When the poller wakes you with multiple notifications in one
    turn (it batches up to 3 — see "Wake batching" below), compose
-   a **single `outbox.yaml`** with one dispatch entry per
+   a **single outbox file per platform** with one dispatch entry per
    notification, then run `dispatch` **once**.
 
 3. **Dispatch:**
    ```bash
-   cd $STATE_DIR && social-cli dispatch
+   cd $STATE_DIR && social-cli dispatch --platform bsky
+   # --platform must match the outbox-<platform>.yaml you wrote
+   # omit it to dispatch every outbox-*.yaml present
    # add --dry-run to validate without posting
    ```
    Dispatch validates, executes per-action (one failure doesn't
-   block the rest), archives `outbox.yaml`, and removes dispatched
-   notifications from the per-platform `inbox-<platform>.yaml` files.
+   block the rest), **moves** the outbox it read into
+   `outbox_archive/<timestamp>_outbox-<platform>.yaml` — so a dispatched
+   outbox is gone from its original path, not merely copied — and removes
+   dispatched notifications from the per-platform `inbox-<platform>.yaml`
+   files.
+
+   **A missing outbox is a silent no-op.** If the file dispatch expects is
+   not there it prints `No outbox file found at <path>, skipping.` and
+   exits 0. Writing the wrong filename therefore looks like success: check
+   `dispatch_result-<platform>.yaml` for `status: ok` and the expected
+   `targetId`, and confirm the outbox you wrote is gone. A stale
+   `outbox.yaml` left in the state dir is never consumed by the
+   `--platform` form, and a later `write_file` to that path then fails
+   with "already exists" — remove it once you have confirmed from the
+   receipt that its contents were dispatched. (A bare `dispatch` would
+   pick it up, but only while no `outbox-*.yaml` exists, which makes it
+   a latent surprise rather than a reliable path.)
 
    **Convenience wrapper:** if you're dispatching from outside the
    poller's STATE_DIR (so the cwd `.env` isn't auto-sourced), use the
@@ -268,8 +303,8 @@ Notes:
 
 `send_message` and `react` deliver to Discord / Slack / web channels
 — whichever bridges the operator has wired up. **Bluesky and X are
-not bridge channels.** Their reply path is `outbox.yaml` +
-`social-cli dispatch`.
+not bridge channels.** Their reply path is `outbox-<platform>.yaml`
++ `social-cli dispatch --platform <platform>`.
 
 If you saw a Bluesky or X post you want to respond to (reply, like,
 repost), that response goes through the outbox above, never through
@@ -294,7 +329,7 @@ the outbox — quick commands bypass the inbox pipeline, so the
 notification stays "pending" and re-emerges on next sync. The
 poller's emitted-cursor stops the re-fire from reaching you, but
 the inbox itself silently leaks. Replies to inbox items belong in
-`outbox.yaml`.
+`outbox-<platform>.yaml`.
 
 Quick commands are fine for proactive posts:
 
@@ -383,11 +418,12 @@ AgentEvent per batch, not per item. With N new items the agent wakes
 - **Feed** (`batch_size: 10`): 27 posts = 3 turns of up to 10. Bigger
   batches because timeline scanning is bulk-context, not 1:1 reply.
 
-For notifications, compose one `outbox.yaml` per turn covering all
-items surfaced that turn, then `dispatch` once. For feed turns the
-agent typically just observes; if it decides to engage with a feed
-post, that engagement goes through the same `outbox.yaml` →
-`dispatch` path (or a one-shot `social-cli post`/`reply`).
+For notifications, compose one `outbox-<platform>.yaml` per platform
+per turn covering all items surfaced that turn, then `dispatch` once.
+For feed turns the agent typically just observes; if it decides to
+engage with a feed post, that engagement goes through the same
+`outbox-<platform>.yaml` → `dispatch` path (or a one-shot
+`social-cli post`/`reply`).
 
 ## Cursor model — two cursors, both needed
 
@@ -414,9 +450,10 @@ and that's `cwd` for any `social-cli` invocation it makes.
 **`social-cli-notifications/`:**
 
 - `.env` — credentials (operator-managed, mode 600)
-- `inbox.yaml` — social-cli's notification queue
-- `outbox.yaml` — agent-written dispatch actions
-- `outbox_archive/` — successfully dispatched outboxes
+- `inbox-{bsky,x}.yaml` — social-cli's per-platform notification queue
+- `outbox-{bsky,x}.yaml` — agent-written dispatch actions (the
+  `-<platform>` suffix is what `dispatch` reads — see step 2)
+- `outbox_archive/` — dispatched outboxes, **moved** here by `dispatch`
 - `processed-{bsky,x}.yaml` — social-cli's processed state
 - `dispatch_result-*.yaml`, `sent_ledger-*.yaml` — audit trail
 - `emitted.json` — poller cursor
@@ -425,6 +462,7 @@ and that's `cwd` for any `social-cli` invocation it makes.
 
 - `.env` — credentials (symlink to the notifications poller's `.env`)
 - `feed-{bsky,x}.yaml` — social-cli's per-platform timeline output
+- `outbox-{bsky,x}.yaml` — agent-written, when a feed turn engages
 - `emitted.json` — feed poller cursor
 
 Don't move social-cli's files out of `STATE_DIR` — every command
@@ -484,9 +522,9 @@ Not emitting?
 
 1. **Binary on PATH:** `docker exec <agent> which social-cli`
 2. **Sync works:** `cd $STATE_DIR && social-cli sync -p bsky` →
-   populates `inbox.yaml` without errors
+   populates `inbox-bsky.yaml` without errors
 3. **.env present:** `ls -la $STATE_DIR` shows mode-600 `.env`
-4. **Inbox vs cursor:** if `inbox.yaml` has items but the poller
+4. **Inbox vs cursor:** if `inbox-<platform>.yaml` has items but the poller
    isn't emitting, those IDs are in `emitted.json` already. Delete
    it to reset; next poll re-fires.
 5. **Stderr:** `events.jsonl` shows `poller_stderr` lines from
@@ -499,4 +537,5 @@ Not emitting?
   outbox response within the same turn.
 - `social-cli dispatch` exits 0 (or 2 with `dispatch_result.yaml`
   noting per-action outcomes — partial failure is recoverable).
-- `inbox.yaml` after dispatch contains only un-acted-on items.
+- `inbox-<platform>.yaml` after dispatch contains only un-acted-on
+  items.
