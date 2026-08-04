@@ -454,19 +454,18 @@ def _read_denied_message(reason: str) -> str:
 
 
 def _withheld_notice(reason_counts: dict[str, int]) -> str | None:
-    if not reason_counts:
-        return None
     counted = []
-    coarse = []
     for reason, count in sorted(reason_counts.items()):
-        if reason in {"mimir_home_read_boundary", "service_scoped_read_boundary"}:
-            noun = "entry" if count == 1 else "entries"
-            counted.append(f"{count} {noun} ({reason})")
-        else:
-            coarse.append(reason)
-    details = counted + [f"one or more entries ({reason})" for reason in coarse]
+        if reason not in {"mimir_home_read_boundary", "service_scoped_read_boundary"}:
+            # Naming-rule denials are intentionally silent: even a coarse reason would
+            # disclose that a secret-shaped file exists in the requested listing.
+            continue
+        noun = "entry" if count == 1 else "entries"
+        counted.append(f"{count} {noun} ({reason})")
+    if not counted:
+        return None
     return (
-        f"Note: read policy withheld {', '.join(details)}. "
+        f"Note: read policy withheld {', '.join(counted)}. "
         "The permitted results above are valid but incomplete."
     )
 
@@ -1094,7 +1093,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         results.sort(key=lambda x: x.get("path", ""))
         elapsed = time.monotonic() - started
-        withheld_notice = _publish_withheld_notice(withheld)
+        _publish_withheld_notice(withheld)
         if truncated:
             _log_truncation(
                 "Glob",
@@ -1111,7 +1110,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         )
         return GlobResult(
             matches=results,
-            truncated=truncated is not None or withheld_notice is not None,
+            truncated=truncated is not None,
         )
 
     def ls(self, path: str) -> LsResult:

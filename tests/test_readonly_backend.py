@@ -1772,16 +1772,18 @@ class TestBuildFileToolRoutes:
             "/state/visible.txt",
         ]
         assert glob_result.error is None
-        assert glob_result.truncated is True
+        assert glob_result.truncated is False
         for message in (ls_message, glob_message):
             assert message.status == "success"
             assert "1 entry (mimir_home_read_boundary)" in str(message.content)
+            assert "hit its time limit" not in str(message.content)
+            assert "Narrow the search" not in str(message.content)
             assert "withheld-subtree" not in str(message.content)
             assert "hidden.txt" not in str(message.content)
         assert "/state/" in str(ls_message.content)
         assert "/state/visible.txt" in str(glob_message.content)
 
-    def test_protected_name_partial_notice_has_no_count_or_name(
+    def test_protected_name_partial_withhold_does_not_advertise_presence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         root = tmp_path / "repo"
@@ -1812,8 +1814,8 @@ class TestBuildFileToolRoutes:
         for message in (ls_message, glob_message):
             content = str(message.content)
             assert message.status == "success"
-            assert "one or more entries (protected_name_match)" in content
-            assert "1 entry (protected_name_match)" not in content
+            assert "protected_name_match" not in content
+            assert "read policy withheld" not in content
             assert "credentials.json" not in content
 
     def test_admin_ls_and_glob_have_no_withheld_signal(
