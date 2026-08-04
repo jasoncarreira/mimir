@@ -807,8 +807,27 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             max_lines=self._max_grep_matches,
         )
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:  # noqa: C901, PLR0912
+    def glob(
+        self, pattern: str, path: str | None = None,
+    ) -> GlobResult:  # noqa: C901, PLR0912
         """Find files matching a glob pattern without walking excluded trees forever."""
+        if not isinstance(pattern, str):
+            return GlobResult(
+                error=(
+                    "Invalid glob argument 'pattern': expected a string, "
+                    f"got {type(pattern).__name__}. Retry with a glob pattern such as '**/*.py'."
+                ),
+                matches=[],
+            )
+        if path is not None and not isinstance(path, str):
+            return GlobResult(
+                error=(
+                    "Invalid glob argument 'path': expected a string or null, "
+                    f"got {type(path).__name__}. Retry with an absolute search path, or omit "
+                    "'path' to search the file-tool root."
+                ),
+                matches=[],
+            )
         started = time.monotonic()
         timeout_seconds = (
             deepagents_filesystem.GLOB_TIMEOUT * 0.5
@@ -823,11 +842,12 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             return GlobResult(error="Path traversal not allowed in glob pattern", matches=[])
 
         try:
-            search_path = self.cwd if path == "/" else self._resolve_path(path)
+            search_path = self.cwd if path is None or path == "/" else self._resolve_path(path)
             if not search_path.exists():
                 return GlobResult(matches=[])
         except (OSError, RuntimeError) as e:
-            return GlobResult(error=f"Error globbing path '{path}': {e}", matches=[])
+            display_path = path if path is not None else "<default>"
+            return GlobResult(error=f"Error globbing path '{display_path}': {e}", matches=[])
 
         results: list[dict[str, Any]] = []
         scanned = 0
@@ -907,7 +927,8 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         except _TraversalDeadlineExceeded:
             truncated = f"ran longer than {timeout_seconds:g}s"
         except (OSError, RuntimeError, ValueError) as e:
-            msg = f"Glob of '{path}' aborted partway: {e}"
+            display_path = path if path is not None else "<default>"
+            msg = f"Glob of '{display_path}' aborted partway: {e}"
             log.warning("%s", msg, exc_info=True)
             results.sort(key=lambda x: x.get("path", ""))
             return GlobResult(error=msg, matches=results)
@@ -1142,7 +1163,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             ])
         return result
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         result = super().glob(pattern, path)
         if result.error is None:
             self._publish_read_paths([
@@ -1152,7 +1173,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             ])
         return result
 
-    async def aglob(self, pattern: str, path: str = "/") -> GlobResult:
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
         result = await super().aglob(pattern, path)
         if result.error is None:
             self._publish_read_paths([
