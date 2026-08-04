@@ -48,6 +48,7 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
+from deepagents.middleware import filesystem as deepagents_filesystem
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool, StructuredTool
@@ -74,7 +75,6 @@ _DEFAULT_MAX_GREP_MATCHES = 2_000
 _DEFAULT_MAX_GLOB_MATCHES = 2_000
 _DEFAULT_MAX_SCAN_FILES = 20_000
 _DEFAULT_GREP_TIMEOUT_SECONDS = 10
-_DEFAULT_GLOB_TIMEOUT_SECONDS = 10.0
 MAX_GREP_CONTEXT_LINES = 200
 _grep_context: ContextVar[tuple[int, int]] = ContextVar(
     "mimir_grep_context", default=(0, 0),
@@ -463,7 +463,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         max_glob_matches: int = _DEFAULT_MAX_GLOB_MATCHES,
         max_scan_files: int = _DEFAULT_MAX_SCAN_FILES,
         grep_timeout_seconds: int = _DEFAULT_GREP_TIMEOUT_SECONDS,
-        glob_timeout_seconds: float = _DEFAULT_GLOB_TIMEOUT_SECONDS,
+        glob_timeout_seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -524,6 +524,8 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         if deadline is not None and time.monotonic() >= deadline:
             raise _TraversalDeadlineExceeded
+        directories: list[Path] = []
+        files: list[Path] = []
         with os.scandir(root) as entries:
             for entry in entries:
                 if deadline is not None and time.monotonic() >= deadline:
@@ -537,17 +539,22 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     is_dir = entry.is_dir(follow_symlinks=False)
                 except OSError:
                     continue
-                if is_dir:
-                    if descend is None or descend(candidate):
-                        yield from self._walk_files(
-                            candidate,
-                            tool=tool,
-                            deadline=deadline,
-                            on_visit=on_visit,
-                            descend=descend,
-                        )
-                else:
-                    yield candidate
+                (directories if is_dir else files).append(candidate)
+
+        # Match the deterministic ordering of the os.walk fast path: files in
+        # the current directory first, then each child directory recursively.
+        # Sorting before yielding also makes either truncation bound retain the
+        # same prefix across filesystems and after unrelated directory churn.
+        yield from sorted(files, key=lambda path: path.name)
+        for directory in sorted(directories, key=lambda path: path.name):
+            if descend is None or descend(directory):
+                yield from self._walk_files(
+                    directory,
+                    tool=tool,
+                    deadline=deadline,
+                    on_visit=on_visit,
+                    descend=descend,
+                )
 
     @staticmethod
     def _glob_descender(_root: Path, pattern: str) -> Callable[[Path], bool] | None:
@@ -803,6 +810,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
     def glob(self, pattern: str, path: str = "/") -> GlobResult:  # noqa: C901, PLR0912
         """Find files matching a glob pattern without walking excluded trees forever."""
         started = time.monotonic()
+        timeout_seconds = (
+            deepagents_filesystem.GLOB_TIMEOUT * 0.5
+            if self._glob_timeout_seconds is None
+            else self._glob_timeout_seconds
+        )
         requested_pattern = pattern
         if pattern.startswith("/"):
             pattern = pattern.lstrip("/")
@@ -833,7 +845,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             candidates = self._walk_files(
                 search_path,
                 tool="glob",
-                deadline=started + self._glob_timeout_seconds,
+                deadline=started + timeout_seconds,
                 on_visit=record_visit,
                 descend=self._glob_descender(search_path, pattern),
             )
@@ -893,7 +905,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     truncated = f"matched more than {self._max_glob_matches} files"
                     break
         except _TraversalDeadlineExceeded:
-            truncated = f"ran longer than {self._glob_timeout_seconds:g}s"
+            truncated = f"ran longer than {timeout_seconds:g}s"
         except (OSError, RuntimeError, ValueError) as e:
             msg = f"Glob of '{path}' aborted partway: {e}"
             log.warning("%s", msg, exc_info=True)

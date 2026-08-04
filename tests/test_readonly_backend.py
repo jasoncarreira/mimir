@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,17 @@ from mimir.readonly_backend import (
     _RootAwareFilesystemBackend,
     build_file_tool_routes,
 )
+
+
+class _ScandirEntries(AbstractContextManager):
+    def __init__(self, entries):
+        self._entries = entries
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __exit__(self, *exc_info):
+        return None
 
 
 @pytest.fixture
@@ -1425,6 +1437,54 @@ class TestBuildFileToolRoutes:
         assert result.error is None
         assert "scanned more than 2 files" in caplog.text
 
+    def test_bounded_glob_truncation_is_deterministic(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        (repo / "src").mkdir(parents=True)
+        for name in ("b.py", "a.py"):
+            (repo / "src" / name).write_text("x\n")
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_glob_matches=1,
+        )
+        original_scandir = os.scandir
+
+        def reverse_scandir(path):
+            entries = list(original_scandir(path))
+            entries.reverse()
+            return _ScandirEntries(entries)
+
+        monkeypatch.setattr(os, "scandir", reverse_scandir)
+
+        result = backend.glob("**/*.py", path="/")
+
+        assert [match["path"] for match in result.matches or []] == ["/src/a.py"]
+
+    def test_default_glob_timeout_tracks_half_the_upstream_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.py").write_text("x\n")
+        deadlines = []
+        backend = _RootAwareFilesystemBackend(root_dir=repo, virtual_mode=True)
+        original_walk = backend._walk_files
+
+        def record_deadline(root, **kwargs):
+            deadlines.append(kwargs["deadline"])
+            return original_walk(root, **kwargs)
+
+        monkeypatch.setattr(backend, "_walk_files", record_deadline)
+        monkeypatch.setattr("mimir.readonly_backend.deepagents_filesystem.GLOB_TIMEOUT", 8.0)
+        started = time.monotonic()
+
+        result = backend.glob("**/*.py", path="/")
+
+        assert result.error is None
+        assert deadlines[0] == pytest.approx(started + 4.0, abs=0.1)
+
     def test_glob_records_completed_search(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1516,6 +1576,36 @@ class TestBuildFileToolRoutes:
         assert fields["visited_entries"] > 0
         assert fields["truncated"] is True
         assert fields["reason"] == "ran longer than 0.001s"
+
+    def test_glob_visited_count_has_no_common_case_regression(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for directory_index in range(20):
+            directory = repo / f"directory-{directory_index:02d}"
+            directory.mkdir()
+            for file_index in range(100):
+                (directory / f"file-{file_index:03d}.txt").touch()
+        events = []
+        monkeypatch.setattr(
+            "mimir.event_logger.log_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            max_scan_files=100_000,
+        )
+
+        started = time.perf_counter()
+        result = backend.glob("**/*.py", path="/")
+        elapsed = time.perf_counter() - started
+
+        assert result.error is None
+        assert result.truncated is False
+        assert events[-1][1]["visited_entries"] == 2_020
+        assert elapsed < 1.0
 
     def test_ls_hides_expensive_traversal_roots(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
