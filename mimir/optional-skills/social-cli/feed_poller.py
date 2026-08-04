@@ -174,15 +174,22 @@ def _format_event(post: dict) -> dict | None:
     # the agent's instinct is to reach for ``send_message`` — which
     # routes to a Discord/Slack channel, NOT back to Bluesky/X. Caught
     # by muninn-mimir 2026-05-23: a Bluesky feed post the agent wanted
-    # to reply to landed in Discord instead. Per-event overhead ~270
-    # chars; bounded by ``batch_size`` (default 10 for feed).
+    # to reply to landed in Discord instead. Per-event overhead ~420
+    # chars (was ~270; the suffix warning adds a measured +150);
+    # bounded by ``batch_size`` (default 10 for feed).
+    #
+    # The platform suffix is mandatory — see the longer note on the
+    # matching hint in ``poller.py``.
     action_hint = (
         "\n\n→ To engage with this post (reply / like / repost): append to "
-        "<STATE_DIR>/outbox.yaml + run `social-cli dispatch`.\n"
+        f"<STATE_DIR>/outbox-{platform}.yaml + run"
+        f" `social-cli dispatch --platform {platform}`.\n"
         "  Minimal shape:\n"
         "    dispatch:\n"
         f"      - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
         f"      - like:  {{ platform: {platform}, id: \"{pid}\" }}\n"
+        f"  The -{platform} suffix is required: dispatch reads outbox-{platform}.yaml\n"
+        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
         f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
     )
     prompt = (
@@ -218,7 +225,7 @@ _STATE_GITIGNORE = """\
 outbox_archive/
 feed-*.yaml
 inbox-*.yaml
-outbox.yaml
+outbox*.yaml
 dispatch_result-*.yaml
 *-new.yaml
 cursor.json

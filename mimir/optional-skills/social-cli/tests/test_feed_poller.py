@@ -269,6 +269,26 @@ def test_load_feed_degrades_without_pyyaml(fresh_feed_poller, monkeypatch, tmp_p
     assert fresh_feed_poller._load_feed(path) == []
 
 
+def test_action_hint_names_the_platform_suffixed_outbox(
+    fresh_feed_poller, monkeypatch, capsys, tmp_path,
+):
+    """Same regression as the notifications poller: the feed hint must name
+    ``outbox-<platform>.yaml`` plus a matching ``--platform``, because
+    ``dispatch --platform`` never falls back to a shared ``outbox.yaml``.
+    """
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
+    _write_feed(tmp_path, "bsky", [_post("p1")])
+    _stub_fetch(monkeypatch, fresh_feed_poller)
+
+    fresh_feed_poller.main()
+    prompt = _capture_emits(capsys)[0]["prompt"]
+
+    assert "<STATE_DIR>/outbox-bsky.yaml" in prompt
+    assert "social-cli dispatch --platform bsky" in prompt
+    assert "<STATE_DIR>/outbox.yaml" not in prompt
+    assert "No outbox file found" in prompt
+
+
 def test_seeds_state_gitignore(fresh_feed_poller, tmp_path):
     """Feed poller seeds the same carve-out .gitignore (write-if-missing)."""
     fresh_feed_poller._seed_state_gitignore()
@@ -279,6 +299,10 @@ def test_seeds_state_gitignore(fresh_feed_poller, tmp_path):
         if ln.strip() and not ln.strip().startswith("#")
     ]
     assert "outbox_archive/" in active and "feed-*.yaml" in active
+    # a feed turn that decides to engage writes outbox-<platform>.yaml
+    assert "outbox*.yaml" in active
+    import fnmatch
+    assert any(fnmatch.fnmatch("outbox-bsky.yaml", pat) for pat in active)
     assert not any(
         ("session-" in ln) or ("sent_ledger" in ln) or ln.startswith("config")
         for ln in active

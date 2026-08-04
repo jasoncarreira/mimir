@@ -400,6 +400,49 @@ def test_own_handle_missing_env_returns_empty(fresh_poller, monkeypatch, tmp_pat
     assert handle == ""
 
 
+def test_action_hint_names_the_platform_suffixed_outbox(
+    fresh_poller, monkeypatch, capsys, tmp_path,
+):
+    """The wake-up hint must name ``outbox-<platform>.yaml`` and a matching
+    ``dispatch --platform <platform>``.
+
+    Regression for the silent no-op: ``dispatch --platform bsky`` resolves
+    ``outbox-bsky.yaml`` and takes no fallback to a shared ``outbox.yaml`` —
+    it logs "No outbox file found" and exits 0. A hint naming the unsuffixed
+    file therefore instructs the agent into a guaranteed miss that looks like
+    success. muninn-mimir filed this five times before the hint was fixed.
+    """
+    _write_inbox(tmp_path, [_notif("n1", platform="bsky")])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    fresh_poller.main()
+    prompt = _capture_emits(capsys)[0]["prompt"]
+
+    assert "<STATE_DIR>/outbox-bsky.yaml" in prompt
+    assert "social-cli dispatch --platform bsky" in prompt
+    # the unsuffixed path must not be offered as the thing to write
+    assert "<STATE_DIR>/outbox.yaml" not in prompt
+    assert "append to <STATE_DIR>/outbox.yaml" not in prompt
+    # and the reason the suffix matters travels with it
+    assert "No outbox file found" in prompt
+
+
+def test_action_hint_suffix_tracks_the_platform(
+    fresh_poller, monkeypatch, capsys, tmp_path,
+):
+    """The suffix is derived from the notification's platform, not hardcoded."""
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "x")
+    _write_inbox(tmp_path, [_notif("n1", platform="x")], platforms=["x"])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+
+    fresh_poller.main()
+    prompt = _capture_emits(capsys)[0]["prompt"]
+
+    assert "<STATE_DIR>/outbox-x.yaml" in prompt
+    assert "social-cli dispatch --platform x" in prompt
+    assert "outbox-bsky.yaml" not in prompt
+
+
 def test_seeds_state_gitignore(fresh_poller, tmp_path):
     """Seeds a carve-out .gitignore: transient/secret ignored, durable kept."""
     fresh_poller._seed_state_gitignore()
@@ -410,6 +453,12 @@ def test_seeds_state_gitignore(fresh_poller, tmp_path):
         if ln.strip() and not ln.strip().startswith("#")
     ]
     assert "outbox_archive/" in active and "*.sh" in active and "emitted.json" in active
+    # the agent writes outbox-<platform>.yaml under isolation, so the ignore
+    # rule must cover the suffixed names too — not just a bare outbox.yaml
+    assert "outbox*.yaml" in active
+    import fnmatch
+    assert any(fnmatch.fnmatch("outbox-bsky.yaml", pat) for pat in active)
+    assert any(fnmatch.fnmatch("outbox.yaml", pat) for pat in active)
     # durable state must NOT be an active ignore rule (tracked via the home allowlist)
     assert not any(
         ("session-" in ln) or ("sent_ledger" in ln) or ln.startswith("config")
