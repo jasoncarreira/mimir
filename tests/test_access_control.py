@@ -211,6 +211,34 @@ def test_non_admin_virtual_and_real_state_paths_resolve_identically(
     ]
 
 
+def test_non_admin_read_allows_seeded_doc_but_not_protected_doc_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    docs = home / "docs"
+    docs.mkdir(parents=True)
+    (home / "state").mkdir()
+    readme = docs / "README.md"
+    env_example = docs / ".env.example"
+    readme.write_text("docs\n", encoding="utf-8")
+    env_example.write_text("secret-shaped\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    registry = ToolRegistry()
+    allowed = registry.authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": "/docs/README.md"},
+    )
+    denied = registry.authorize_tool(
+        "read_file", _read_auth(), enforce=True,
+        arguments={"file_path": "/docs/.env.example"},
+    )
+
+    assert allowed.allowed is True
+    assert denied.allowed is False
+    assert denied.reason == "read_scope"
+
+
 @pytest.mark.parametrize("path", ["/memory/core/profile.md", "/logs/agent.log"])
 def test_non_admin_virtual_non_state_home_paths_remain_denied(
     path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -416,6 +444,33 @@ def test_service_turns_read_admitted_home_surfaces_under_enforcement(
         ] == content
     finally:
         reset_current_turn(token)
+
+
+def test_upgrade_service_read_scope_includes_docs_only_as_a_read_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    docs = home / "docs"
+    docs.mkdir(parents=True)
+    readme = docs / "README.md"
+    readme.write_text("upgrade context\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("upgrade")
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(turn_id="upgrade-docs", auth_context=auth))
+    try:
+        roots = access_control.service_filesystem_read_roots(service)
+        decision = ToolRegistry().authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(readme)},
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert docs.resolve() in roots
+    assert decision.allowed is True, decision.reason
+    assert docs.resolve() not in access_control._static_service_write_roots()
 
 
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(

@@ -83,6 +83,7 @@ async def _start_mcp_servers(
     mcp_manager = MCPManager(
         policy_store_path=home / "state" / "mcp-policy.json"
     ) if home is not None else MCPManager()
+    _doc_changes: dict[str, str] = {}
     try:
         mcp_tools = await mcp_manager.start_servers(mcp_configs)
     except Exception as exc:  # noqa: BLE001 — log + continue
@@ -1462,6 +1463,7 @@ def build_app(config: Config) -> web.Application:
                         config.home,
                         defaults_result,
                         dispatcher.enqueue,
+                        doc_changes=_doc_changes,
                     )
                     if upgrade_enqueued:
                         await log_event(
