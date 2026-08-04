@@ -57,6 +57,54 @@ def home(tmp_path: Path) -> Path:
 
 
 class TestWriteGuardBackend:
+    def test_non_admin_docs_are_readable_discoverable_and_read_only(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        docs = home / "docs"
+        docs.mkdir()
+        (docs / "README.md").write_text("reference docs\n", encoding="utf-8")
+        protected = (
+            docs / ".env.example",
+            docs / ".env.local",
+            docs / "private.key",
+            docs / "certificate.pem",
+            docs / "credentials" / "notes.md",
+        )
+        for path in protected:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("withheld\n", encoding="utf-8")
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        auth = AuthContext(
+            principal="user:test",
+            canonical_principal="test",
+            roles=("user",),
+            event_ingress=None,
+            trigger="user_message",
+            channel_id="channel",
+            interactivity=None,
+            is_service=False,
+            enforcement_enabled=True,
+        )
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = set_current_turn(SimpleNamespace(turn_id="docs-read", auth_context=auth))
+        try:
+            read = backend.read("/docs/README.md")
+            glob = backend.glob("*.md", path="/docs")
+            listing = backend.ls("/docs")
+            write = backend.write("/docs/agent-note.md", "blocked\n")
+            denied = [backend.read(str(path)) for path in protected]
+        finally:
+            reset_current_turn(token)
+
+        assert read.error is None
+        assert read.file_data["content"] == "reference docs\n"
+        assert [match["path"] for match in glob.matches] == ["/docs/README.md"]
+        assert [entry["path"] for entry in listing.entries] == ["/docs/README.md"]
+        assert "Write blocked" in (write.error or "")
+        assert not (docs / "agent-note.md").exists()
+        assert all(result.error and "protected_name_match" in result.error for result in denied)
+
     def test_service_turn_offloads_large_result_and_reads_it_back(
         self, home: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

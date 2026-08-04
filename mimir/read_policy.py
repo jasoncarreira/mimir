@@ -258,6 +258,7 @@ def is_protected_read_path(path: Path) -> bool:
     if home is not None and (resolved == home or resolved.is_relative_to(home)):
         state = home / "state"
         memory = home / "memory"
+        docs = home / "docs"
         artifact_root = framework_large_tool_results_root(home)
         from .access_control import current_turn_scratch_root
 
@@ -267,6 +268,8 @@ def is_protected_read_path(path: Path) -> bool:
             or resolved.is_relative_to(state)
             or resolved == memory
             or resolved.is_relative_to(memory)
+            or resolved == docs
+            or resolved.is_relative_to(docs)
             or artifact_root is not None
             and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
             or turn_scratch is not None
@@ -538,6 +541,7 @@ def configured_non_admin_read_roots() -> tuple[Path, ...]:
     roots = [
         home / "state",
         home / "memory",
+        home / "docs",
         *((artifact_root,) if artifact_root is not None else ()),
         *((turn_scratch,) if turn_scratch is not None else ()),
         *configured_paths,
@@ -594,6 +598,7 @@ def resolve_non_admin_read_target(
         home = Path(home_raw).resolve(strict=True)
         state = (home / "state").resolve(strict=True)
         memory = (home / "memory").resolve(strict=False)
+        docs = (home / "docs").resolve(strict=False)
         artifact_root = framework_large_tool_results_root(home)
         from .access_control import current_turn_scratch_root
 
@@ -637,6 +642,8 @@ def resolve_non_admin_read_target(
         or resolved.is_relative_to(state)
         or resolved == memory
         or resolved.is_relative_to(memory)
+        or resolved == docs
+        or resolved.is_relative_to(docs)
         or artifact_root is not None
         and (resolved == artifact_root or resolved.is_relative_to(artifact_root))
         or turn_scratch is not None

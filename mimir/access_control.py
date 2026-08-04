@@ -770,6 +770,8 @@ def service_filesystem_read_roots(service: ServicePrincipal | None) -> tuple[Pat
         getattr(service, "canonical", None) == "system"
         and getattr(service, "trigger", None) == "upgrade"
     ):
+        if home:
+            roots.append(Path(home).resolve() / "docs")
         proposal_root = _upgrade_proposals_root()
         if proposal_root is not None:
             roots.append(proposal_root)

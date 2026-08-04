@@ -312,6 +312,77 @@ async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_upgrade_reconciliation_turn_names_only_changed_readable_docs(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    wt = home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="proposal_opened",
+        version="1.1.0",
+        proposal=du.OpenResult(ok=True, branch="upgrade/defaults", worktree=wt),
+    )
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    assert await du.enqueue_upgrade_reconciliation_turn(
+        home,
+        result,
+        fake_enqueue,
+        doc_changes={
+            "docs/code-building-pipeline.md": "updated",
+            "docs/new-reference.md": "created",
+            "docs/unchanged.md": "unchanged",
+            "docs/deleted.md": "skipped_deleted",
+            "docs/.env.example": "updated",
+        },
+    )
+    content = events[0].content
+    assert "## Updated reference docs" in content
+    assert "`/docs/code-building-pipeline.md`" in content
+    assert "`/docs/new-reference.md`" in content
+    assert "not a prerequisite" in content
+    assert "unchanged.md" not in content
+    assert "deleted.md" not in content
+    assert ".env.example" not in content
+
+
+@pytest.mark.asyncio
+async def test_upgrade_reconciliation_turn_has_no_empty_docs_section(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    result = du.DefaultsUpgradeResult(
+        ok=True,
+        action="proposal_opened",
+        version="1.1.0",
+        proposal=du.OpenResult(
+            ok=True, branch="upgrade/defaults", worktree=home / "proposal",
+        ),
+    )
+    events = []
+
+    async def fake_enqueue(event):
+        events.append(event)
+        return True
+
+    assert await du.enqueue_upgrade_reconciliation_turn(
+        home,
+        result,
+        fake_enqueue,
+        doc_changes={"docs/README.md": "unchanged"},
+    )
+    assert "Updated reference docs" not in events[0].content
+    assert "{changed_docs_section}" not in events[0].content
+
+
+@pytest.mark.asyncio
 async def test_upgrade_reconciliation_turn_uses_configured_operator_channel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

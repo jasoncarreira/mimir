@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -704,6 +704,8 @@ async def enqueue_upgrade_reconciliation_turn(
     home: Path,
     result: DefaultsUpgradeResult,
     enqueue: Callable[[AgentEvent], Awaitable[bool]],
+    *,
+    doc_changes: Mapping[str, str] | None = None,
 ) -> bool:
     """Fire the agent-facing upgrade turn when reconciliation is needed.
 
@@ -733,16 +735,35 @@ async def enqueue_upgrade_reconciliation_turn(
         )
     worktree = result.proposal.worktree
     branch = result.proposal.branch
+    changed_docs = sorted(
+        path for path, status in (doc_changes or {}).items()
+        if status in {"created", "updated"}
+        and Path(path).parts[:1] == ("docs",)
+        and Path(path).suffix.lower() == ".md"
+    )
+    changed_docs_section = ""
+    if changed_docs:
+        changed_docs_section = (
+            "\n\n## Updated reference docs\n\n"
+            "The following reference docs changed in this upgrade. Read any that are "
+            "relevant as context for the reconciliation; this is not a prerequisite "
+            "for proposal submission:\n\n"
+            + "\n".join(f"- `/{path}`" for path in changed_docs)
+        )
     replacements = {
         "{version}": result.version,
         "{action}": result.action,
         "{branch}": branch or "(unknown)",
         "{worktree}": str(worktree),
         "{conflicts}": str(result.conflicts).lower(),
+        "{changed_docs_section}": changed_docs_section,
     }
+    has_changed_docs_placeholder = "{changed_docs_section}" in prompt
     content = prompt
     for placeholder, value in replacements.items():
         content = content.replace(placeholder, value)
+    if changed_docs_section and not has_changed_docs_placeholder:
+        content += changed_docs_section
     operator_channel = os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", "").strip()
     channel_instruction = (
         f"Send the notification to the configured operator alert channel "
