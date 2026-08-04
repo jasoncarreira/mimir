@@ -1406,6 +1406,45 @@ class TestBuildFileToolRoutes:
         assert result.error is None
         assert "Glob truncated" in caplog.text
 
+    def test_glob_tool_omitted_path_searches_root_without_exception(
+        self, tmp_path: Path,
+    ) -> None:
+        """DeepAgents forwards an omitted optional glob path as ``None``."""
+        (tmp_path / "match.py").write_text("x\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+        middleware = MimirFilesystemMiddleware(backend=backend)
+        glob_tool = next(tool for tool in middleware.tools if tool.name == "glob")
+
+        result = glob_tool.func(
+            pattern="*.py",
+            runtime=SimpleNamespace(tool_call_id="glob-default-root"),
+        )
+
+        assert result.status == "success"
+        assert result.content == "['/match.py']"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "argument", "retry_text"),
+        [
+            ({"pattern": None}, "pattern", "glob pattern"),
+            ({"pattern": "*.py", "path": 42}, "path", "omit 'path'"),
+        ],
+    )
+    def test_glob_invalid_arguments_return_actionable_errors(
+        self,
+        tmp_path: Path,
+        kwargs: dict[str, object],
+        argument: str,
+        retry_text: str,
+    ) -> None:
+        backend = _RootAwareFilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+
+        result = backend.glob(**kwargs)  # type: ignore[arg-type]
+
+        assert result.matches == []
+        assert f"argument '{argument}'" in (result.error or "")
+        assert retry_text in (result.error or "")
+
     def test_glob_reports_scan_truncation_before_matching(self, tmp_path: Path, caplog) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
