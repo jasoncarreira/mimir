@@ -1,6 +1,6 @@
 ---
 name: social-cli
-description: "Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill."
+description: "Bluesky + X social loop. The bundled notifications poller runs `social-cli sync` on cron (default `*/15`), parses the per-platform `inbox-<platform>.yaml` files, and wakes the agent in batches of up to 3 never-seen notifications per turn. The optional feed poller runs `social-cli feed` every 2h for timeline scanning. Agent reads inbox, writes `outbox-<platform>.yaml`, runs `social-cli dispatch`. Also supports one-shot commands (post/reply/thread/like). Opt-in: install the skill, drop `.env` credentials into `<home>/state/pollers/social-cli-notifications/`. Companion to the `pollers` framework skill and the `world-scanning` skill."
 ---
 
 # social-cli — Bluesky + X social loop
@@ -33,7 +33,7 @@ the platforms credentials are configured for.
 
 **Guarantees**:
 - Inbox-driven responses (mentions / replies / follows / likes) route
-  through `<state_dir>/outbox.yaml` + `social-cli dispatch`, **NOT** via
+  through `<state_dir>/outbox-<platform>.yaml` + `social-cli dispatch`, **NOT** via
   `send_message` (different surface — see the "`send_message` goes to chat
   channels, NOT to Bluesky / X" section).
 - Dispatch validates per-action and continues on per-action failure;
@@ -63,7 +63,12 @@ The poller surfaces notifications. The agent responds:
    up to 5 deep). The poller surfaces a summary of `threadContext`
    in the wake-up prompt — see "Thread context" below.
 
-2. **Write `outbox.yaml`** in the same dir with a `dispatch:` list.
+2. **Write `outbox-<platform>.yaml`** in the same dir with a `dispatch:`
+   list — e.g. `outbox-bsky.yaml`. `social-cli` defaults
+   `state.platformIsolation` to **true**, and under isolation `dispatch`
+   reads `outbox-<platform>.yaml`; it never looks at a shared
+   `outbox.yaml`. Only write the shared `outbox.yaml` if this deployment
+   has explicitly set `platformIsolation: false`.
    Common action shapes inline below — see `AGENT_GUIDE.md` for the
    full grammar (annotate / quote-post / platform-per-text overrides
    / dispatch hooks / etc.).
@@ -107,7 +112,7 @@ The poller surfaces notifications. The agent responds:
 
    When the poller wakes you with multiple notifications in one
    turn (it batches up to 3 — see "Wake batching" below), compose
-   a **single `outbox.yaml`** with one dispatch entry per
+   a **single outbox file per platform** with one dispatch entry per
    notification, then run `dispatch` **once**.
 
 3. **Dispatch:**
@@ -116,8 +121,21 @@ The poller surfaces notifications. The agent responds:
    # add --dry-run to validate without posting
    ```
    Dispatch validates, executes per-action (one failure doesn't
-   block the rest), archives `outbox.yaml`, and removes dispatched
-   notifications from the per-platform `inbox-<platform>.yaml` files.
+   block the rest), **moves** the outbox it read into
+   `outbox_archive/<timestamp>_outbox-<platform>.yaml` — so a dispatched
+   outbox is gone from its original path, not merely copied — and removes
+   dispatched notifications from the per-platform `inbox-<platform>.yaml`
+   files.
+
+   **A missing outbox is a silent no-op.** If the file dispatch expects is
+   not there it prints `No outbox file found at <path>, skipping.` and
+   exits 0. Writing the wrong filename therefore looks like success: check
+   `dispatch_result-<platform>.yaml` for `status: ok` and the expected
+   `targetId`, and confirm the outbox you wrote is gone. If a stale
+   `outbox.yaml` is sitting in the state dir, dispatch under isolation
+   will never consume it and a later `write_file` to that path will fail
+   with "already exists" — remove it once you have confirmed from the
+   receipt that its contents were dispatched.
 
    **Convenience wrapper:** if you're dispatching from outside the
    poller's STATE_DIR (so the cwd `.env` isn't auto-sourced), use the
