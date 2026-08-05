@@ -18,7 +18,10 @@ needed to prove the behaviour under test.
 """
 from __future__ import annotations
 
+import ast
+import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -40,13 +43,89 @@ from mimir.server import (
 )
 
 
+def _production_call_sites(call_name: str) -> set[str]:
+    root = Path(__file__).resolve().parent.parent
+    sites: set[str] = set()
+    for path in (root / "mimir").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if isinstance(function, ast.Name) and function.id == call_name:
+                sites.add(path.relative_to(root).as_posix())
+            elif isinstance(function, ast.Attribute) and function.attr == call_name:
+                sites.add(path.relative_to(root).as_posix())
+    return sites
+
+
+def test_runtime_is_only_production_agent_constructor() -> None:
+    assert _production_call_sites("Agent") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_global_buffer_writer() -> None:
+    assert _production_call_sites("set_global_buffer") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_mcp_tools_writer() -> None:
+    assert _production_call_sites("set_mcp_tools") == {"mimir/runtime.py"}
+
+
+def test_production_global_writers_are_confined() -> None:
+    root = Path(__file__).resolve().parent.parent
+    setter_names = {
+        "set_indexer",
+        "set_index_generator",
+        "set_turns_log_path",
+        "set_channel_registry",
+        "set_identity_resolver",
+        "set_dispatcher",
+        "set_scheduler",
+        "set_commitments_store",
+        "set_spawn_config",
+        "set_shell_job_registry",
+    }
+    sites: set[str] = set()
+    for path in (root / "mimir").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"tools", "web_tools"}
+                and node.func.attr in setter_names | {"set_home"}
+            ):
+                sites.add(path.relative_to(root).as_posix())
+    assert sites == {"mimir/runtime.py"}
+
+    server_tree = ast.parse(
+        (root / "mimir" / "server.py").read_text(encoding="utf-8")
+    )
+    module_assignments = [
+        node
+        for node in server_tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
+    assert not any(
+        target.id == "_STARTUP_BACKGROUND_TASKS"
+        for node in module_assignments
+        for target in (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MCP production startup wiring
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_start_mcp_servers_publishes_tools_and_policy_attention(
+async def test_start_mcp_servers_returns_tools_and_policy_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from dataclasses import replace
@@ -78,23 +157,17 @@ async def test_start_mcp_servers_publishes_tools_and_policy_attention(
     manager = MagicMock()
     manager.start_servers = AsyncMock(return_value=[tool])
     manager.shutdown = AsyncMock()
-    published: list[Any] = []
     events: list[tuple[str, dict[str, Any]]] = []
-
-    monkeypatch.setattr("mimir.mcp_client.MCPManager", lambda: manager)
-    monkeypatch.setattr("mimir.tools.set_mcp_tools", lambda tools: published.extend(tools))
 
     async def capture(kind: str, **fields: Any) -> None:
         events.append((kind, fields))
 
     monkeypatch.setattr("mimir.server.log_event", capture)
-    app = web.Application()
-
-    await _start_mcp_servers(app, [config])
+    returned_manager, tools = await _start_mcp_servers(manager, [config])
 
     manager.start_servers.assert_awaited_once_with([config])
-    assert published == [tool]
-    assert app["mcp_manager"] is manager
+    assert tools == [tool]
+    assert returned_manager is manager
     assert events[0] == (
         "mcp_servers_ready",
         {"count": 1, "tool_names": ["mcp_demo_read_item"]},
@@ -102,6 +175,89 @@ async def test_start_mcp_servers_publishes_tools_and_policy_attention(
     attention = next(fields for kind, fields in events if kind == "mcp_policy_attention_required")
     assert attention["count"] >= 1
     assert any(issue.get("actual_policy") == "policy-v1" for issue in attention["issues"])
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager() -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock()
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is None
+    assert tools == []
+    manager.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails() -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock(side_effect=RuntimeError("shutdown failed"))
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is manager
+    assert tools == []
+
+
+def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _RuntimeFieldProxy, _RuntimeSlot
+
+    slot = _RuntimeSlot()
+    proxy = _RuntimeFieldProxy(slot, "turn_event_bus")
+    with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
+        proxy.subscribe("channel")
+
+    bus = SimpleNamespace(subscribe=lambda channel: f"queue:{channel}")
+    slot.bundle = SimpleNamespace(turn_event_bus=bus)
+    assert proxy.subscribe("channel") == "queue:channel"
+
+
+@pytest.mark.asyncio
+async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    config = SimpleNamespace(
+        operator_alert_channel="ops",
+        pairing_operator_digest_delay_seconds=60.0,
+        pairing_dm_auto_reply_enabled=True,
+        pairing_dm_auto_reply_interval_seconds=60.0,
+        pairing_dm_auto_reply_text="pending",
+        pairing_pending_max=100,
+    )
+    notifier = _PairingNotifier(config, channels)
+    await notifier.notify_operator(
+        canonical="alice",
+        display="Alice",
+        platform="slack",
+        channel_id="dm-alice",
+        delivery="dm",
+    )
+    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-alice")
+    await asyncio.sleep(0)
+    operator_task = notifier._operator_task
+    dm_task = notifier._dm_reply_task
+
+    await notifier.aclose()
+    await notifier.aclose()
+
+    assert notifier._operator_task is None
+    assert notifier._dm_reply_task is None
+    assert notifier._operator_pending == []
+    assert notifier._dm_reply_queue.empty()
+    assert operator_task is not None and operator_task.cancelled()
+    assert dm_task is not None and dm_task.done()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
