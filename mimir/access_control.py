@@ -8075,3 +8075,40 @@ def create_auth_context(
         ),
         origin_ref=event.source_id,
     )
+
+
+@dataclass(frozen=True)
+class _LocalOperatorResolver:
+    principal: str
+
+    def resolve(self, author: str | None) -> str | None:
+        return author
+
+    def access_metadata(self, author: str | None) -> AccessMetadata:
+        if author == self.principal:
+            return AccessMetadata(roles=("admin",))
+        return AccessMetadata()
+
+    def resolve_channel(self, channel_id: str | None) -> str | None:
+        return channel_id
+
+
+def create_local_operator_auth_context(
+    *,
+    principal: str,
+    trigger: str,
+    channel_id: str | None,
+    enforce: bool = False,
+) -> "AuthContext":
+    from .models import AgentEvent
+
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=channel_id,
+        author=principal,
+    )
+    return create_auth_context(
+        event,
+        _LocalOperatorResolver(principal),
+        enforce=enforce,
+    )
