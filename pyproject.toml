@@ -70,6 +70,9 @@ codex-plus = [
 mcp = [
     "mcp>=1.27",
 ]
+acp = [
+    "agent-client-protocol==0.12.0",
+]
 # LongMemEval bench harness — pulls the workspace ``saga`` package
 # (the bench shell, not the runtime memory backend). Only meaningful
 # when running ``benchmarks/longmemeval_via_*/`` from a workspace
@@ -118,6 +121,7 @@ dev = [
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.6,<0.1",
     "mcp>=1.27",
+    "agent-client-protocol==0.12.0",
     # mimir.saga.vector_index uses FAISS for ANN search; without it
     # the index degrades to an empty-result stub and tests asserting
     # on indexed-atom counts (test_saga_correctness_regressions,
@@ -133,7 +137,7 @@ dev = [
 ]
 
 [project.scripts]
-mimir = "mimir.cli:main"
+mimir = "mimir.entrypoint:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -277,6 +281,7 @@ dev = [
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.6,<0.1",
     "mcp>=1.27",
+    "agent-client-protocol==0.12.0",
     "faiss-cpu>=1.13",
     "botocore>=1.35",
 ]
