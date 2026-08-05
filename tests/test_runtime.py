@@ -485,6 +485,72 @@ def test_core_phase_contains_only_adapter_prerequisites(
     assert os.environ["SAGA_CONFIG"] == str(tmp_path / "saga.toml")
 
 
+def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The synchronous cycle breaker must not assemble any runtime graph."""
+    import mimir.agent
+    import mimir.channel_registry
+    import mimir.chat_skills
+    import mimir.commitments
+    import mimir.dispatcher
+    import mimir.history
+    import mimir.identities
+    import mimir.index
+    import mimir.saga_client
+    import mimir.scheduler
+    import mimir.search
+    import mimir.session_manager
+    import mimir.subagent_inbox
+    import mimir.turn_event_bus
+    import mimir.turn_logger
+    from mimir.saga import _config_io
+
+    class Resolver:
+        def __init__(self, *, home: Path) -> None:
+            self.home = home
+
+        def reload(self) -> int:
+            return 2
+
+    def forbidden(label: str) -> Any:
+        def construct(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError(f"core phase constructed prohibited {label}")
+
+        return construct
+
+    monkeypatch.setattr(mimir.identities, "IdentityResolver", Resolver)
+    monkeypatch.setattr(
+        mimir.chat_skills.ChatSkillRegistry,
+        "from_config",
+        lambda config: "chat-registry",
+    )
+    monkeypatch.setattr(_config_io, "get_config", lambda: lambda *args: "saga.db")
+    for module, attribute in (
+        (mimir.agent, "Agent"),
+        (mimir.channel_registry, "ChannelRegistry"),
+        (mimir.commitments, "CommitmentsStore"),
+        (mimir.dispatcher, "Dispatcher"),
+        (mimir.history, "MessageBuffer"),
+        (mimir.index, "IndexGenerator"),
+        (mimir.saga_client, "make_saga_client"),
+        (mimir.scheduler, "Scheduler"),
+        (mimir.search, "Indexer"),
+        (mimir.session_manager, "SessionManager"),
+        (mimir.subagent_inbox, "SubagentInbox"),
+        (mimir.turn_event_bus, "TurnEventBus"),
+        (mimir.turn_logger, "TurnLogger"),
+    ):
+        monkeypatch.setattr(module, attribute, forbidden(attribute))
+
+    core = runtime.create_core_services(_config(tmp_path))
+
+    assert core.aliases_loaded == 2
+    assert core.chat_skill_registry == "chat-registry"
+    assert core.saga_db_path == tmp_path / ".mimir" / "saga.db"
+
+
 def test_core_preserves_saga_config_and_db_path_behavior(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1544,3 +1610,61 @@ async def test_non_web_entrypoint_builds_and_closes_real_agent_graph(
     assert dispatcher._run_turn is None
     assert scheduler._arbiter is None
     assert not owner_tasks
+
+
+def test_non_web_runtime_construction_does_not_import_server_in_fresh_process() -> None:
+    """Construction, not merely importing ``runtime``, stays web-independent."""
+    script = """
+import asyncio
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+home = Path(tempfile.mkdtemp())
+os.environ[\"MIMIR_HOME\"] = str(home)
+os.environ[\"MIMIR_MODEL_SPEC\"] = \"anthropic:test\"
+
+from mimir import runtime
+from mimir.channel_registry import ChannelRegistry
+from mimir.config import Config
+from mimir.dispatcher import Dispatcher
+from mimir.saga import _config_io
+from mimir.scheduler import Scheduler
+
+assert \"mimir.server\" not in sys.modules
+_config_io.reload_config()
+config = Config.from_env()
+core = runtime.create_core_services(config)
+dispatcher = Dispatcher(config, resolver=core.identity_resolver)
+scheduler = Scheduler(
+    config.home / \"scheduler.yaml\",
+    dispatcher.enqueue,
+    home=config.home,
+    scheduler_tz=config.scheduler_tz,
+)
+
+async def main():
+    bundle = await runtime.create_agent_runtime(
+        config,
+        core,
+        runtime.RuntimeAdapters(
+            dispatcher=dispatcher,
+            scheduler=scheduler,
+            channels=ChannelRegistry(),
+            pairing_notifier=object(),
+            spawn_background_task=lambda coroutine, name: asyncio.create_task(coroutine, name=name),
+        ),
+    )
+    assert \"mimir.server\" not in sys.modules
+    await bundle.aclose()
+
+asyncio.run(main())
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
