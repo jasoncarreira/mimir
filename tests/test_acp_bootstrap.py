@@ -59,6 +59,26 @@ def test_acp_dependency_is_optional_exact_and_does_not_change_mcp_ranges() -> No
     assert dependency_group["dev"].count("mcp>=1.27") == 1
 
 
+def test_lock_is_consistent_and_contains_exact_acp_version() -> None:
+    completed = subprocess.run(
+        ["uv", "lock", "--check"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr.decode()
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+    acp_packages = [
+        package
+        for package in lock["package"]
+        if package["name"] == "agent-client-protocol"
+    ]
+    assert len(acp_packages) == 1
+    assert acp_packages[0]["version"] == "0.12.0"
+
+
 def test_entrypoint_dispatches_acp_without_importing_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     import mimir.entrypoint as entrypoint
 
@@ -107,11 +127,33 @@ def test_dependency_probe_checks_only_exact_acp_metadata_and_module(
 
 
 def test_missing_dependency_emits_only_install_instruction() -> None:
-    completed = _run_script(
-        "from mimir.acp import bootstrap; "
-        "bootstrap._dependencies_available=lambda:False; "
-        "raise SystemExit(bootstrap.main([]))"
-    )
+    source = r'''
+import importlib.abc
+import importlib.metadata
+import sys
+
+real_version = importlib.metadata.version
+
+def blocked_version(name):
+    if name == "agent-client-protocol":
+        raise importlib.metadata.PackageNotFoundError(name)
+    return real_version(name)
+
+class BlockAcp(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "acp" or fullname.startswith("acp."):
+            raise ModuleNotFoundError(fullname)
+        return None
+
+importlib.metadata.version = blocked_version
+for name in tuple(sys.modules):
+    if name == "acp" or name.startswith("acp."):
+        del sys.modules[name]
+sys.meta_path.insert(0, BlockAcp())
+from mimir.acp.bootstrap import main
+raise SystemExit(main([]))
+'''
+    completed = _run_script(source)
     assert completed.returncode == 2
     assert completed.stdout == b""
     assert completed.stderr == (
@@ -128,6 +170,35 @@ def test_arguments_are_rejected_after_dependency_check() -> None:
     assert completed.stderr == (
         b"mimir acp accepts no arguments; authenticate in-band over JSON-RPC.\n"
     )
+
+
+def test_host_import_error_is_sanitized_runtime_failure() -> None:
+    source = r'''
+import importlib.abc
+import importlib.util
+import sys
+
+class Loader(importlib.abc.Loader):
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise ImportError("internal startup detail")
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "mimir.acp.host":
+            return importlib.util.spec_from_loader(fullname, Loader())
+        return None
+
+sys.meta_path.insert(0, Finder())
+from mimir.acp.bootstrap import main
+raise SystemExit(main([]))
+'''
+    completed = _run_script(source)
+    assert completed.returncode == 1
+    assert completed.stdout == b""
+    assert completed.stderr == b"ACP host failed.\n"
 
 
 def test_stdout_is_reserved_before_host_import_and_closed_after_run() -> None:

@@ -60,16 +60,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_stderr(USAGE_ERROR)
             status = 2
         else:
-            try:
-                host = importlib.import_module("mimir.acp.host")
-            except (ImportError, ModuleNotFoundError):
-                _write_stderr(INSTALL_INSTRUCTION)
-                status = 2
-            else:
-                result = host.run(frame_file)
-                status = 0 if result is None else int(result)
-                if status not in (0, 1):
-                    status = 1
+            host = importlib.import_module("mimir.acp.host")
+            result = host.run(frame_file)
+            status = 0 if result is None else int(result)
+            if status not in (0, 1):
+                status = 1
     except (BrokenPipeError, ConnectionResetError):
         status = 0
     except BaseException:
