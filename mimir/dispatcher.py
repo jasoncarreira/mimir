@@ -139,24 +139,26 @@ class Dispatcher:
             return True
         return channel_id in self._in_flight
 
-    def set_run_turn(self, run_turn: TurnRunner) -> None:
+    def set_run_turn(self, run_turn: TurnRunner | None) -> None:
         """Late-bind the runner. Used to break the agent ↔ dispatcher
         ↔ scheduler initialization cycle in server.py."""
         self._run_turn = run_turn
 
-    def set_on_inject(self, on_inject: "InjectCallback") -> None:
+    def set_on_inject(self, on_inject: "InjectCallback | None") -> None:
         """Late-bind the inject callback (chainlink #376 PR 4). Invoked with the
         event when a mid-turn message is folded into a running turn, so the agent
         records it in chat history at its true arrival time."""
         self._on_inject = on_inject
 
-    def set_on_event(self, on_event: "EventObserver") -> None:
+    def set_on_event(self, on_event: "EventObserver | None") -> None:
         """Late-bind a best-effort per-event observer (DM-channel capture).
         Fired fire-and-forget for each enqueued ``user_message`` — never
         blocks or fails admission."""
         self._on_event = on_event
 
-    def set_on_pairing_required(self, on_pairing_required: "PairingObserver") -> None:
+    def set_on_pairing_required(
+        self, on_pairing_required: "PairingObserver | None"
+    ) -> None:
         """Late-bind the denied-DM pairing observer.
 
         Fired only after access-control denial and before returning False from
@@ -164,7 +166,9 @@ class Dispatcher:
         """
         self._on_pairing_required = on_pairing_required
 
-    def set_on_channel_idle(self, on_channel_idle: ChannelIdleCallback) -> None:
+    def set_on_channel_idle(
+        self, on_channel_idle: ChannelIdleCallback | None
+    ) -> None:
         """Late-bind cleanup for state keyed by retired channel IDs."""
         self._on_channel_idle = on_channel_idle
 

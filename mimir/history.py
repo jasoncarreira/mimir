@@ -110,7 +110,7 @@ def _utc_now_iso() -> str:
 _global_buffer: "MessageBuffer | None" = None
 
 
-def set_global_buffer(buf: "MessageBuffer") -> None:
+def set_global_buffer(buf: MessageBuffer | None) -> None:
     """Register the process's single ``MessageBuffer``. Called once by
     ``server.py`` after the buffer is constructed + replayed."""
     global _global_buffer

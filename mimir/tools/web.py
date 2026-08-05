@@ -61,7 +61,7 @@ _authorized_fetch_urls: ContextVar[frozenset[str] | None] = ContextVar(
 )
 
 
-def set_home(home: Path) -> None:
+def set_home(home: Path | None) -> None:
     """Mimir home path. Used to compute the fetch-cache directory."""
     global _home
     _home = home

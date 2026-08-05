@@ -106,12 +106,12 @@ class SessionManager:
     def _idle_seconds_value(self) -> int:
         return self._idle_seconds
 
-    def set_on_idle(self, on_idle: OnIdle) -> None:
+    def set_on_idle(self, on_idle: OnIdle | None) -> None:
         """Register the idle callback after construction (avoids circular
         wiring: session manager → dispatcher → agent → run_turn)."""
         self._on_idle = on_idle
 
-    def set_is_busy(self, is_busy: IsBusy) -> None:
+    def set_is_busy(self, is_busy: IsBusy | None) -> None:
         """Register the dispatcher's busy predicate. When the timer fires and
         the channel is busy, we defer instead of synthesizing — the
         conversation isn't actually parked, just slow."""

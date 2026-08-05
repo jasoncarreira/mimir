@@ -182,7 +182,7 @@ _ON_COMPLETE: Optional[Callable[[Any], None]] = None
 
 
 def set_shell_job_registry(
-    registry: ShellJobRegistry,
+    registry: ShellJobRegistry | None,
     on_complete: Callable[[Any], None] | None = None,
 ) -> None:
     """Wire the per-process ShellJobRegistry into the async-shell tools.
@@ -196,7 +196,7 @@ def set_shell_job_registry(
     """
     global _REGISTRY, _ON_COMPLETE
     _REGISTRY = registry
-    _ON_COMPLETE = on_complete
+    _ON_COMPLETE = on_complete if registry is not None else None
 
 
 @tool(
