@@ -17,10 +17,11 @@ uv run pytest -q                        # the whole suite
 ```
 
 A test that passes alone and fails in the full suite is **not flaky** — it is
-asserting shared state. See *Don't assert on state another test can mutate* in
-CONTRIBUTING.md, which also covers why a before/after delta is not sufficient on
-its own. This has now happened twice: once against `sys.modules`, once against
-`asyncio.all_tasks()`.
+asserting ambient state it does not own. See *Don't assert on ambient state you
+don't own* in CONTRIBUTING.md, which distinguishes that from the legitimate case of
+asserting on state the component owns, and covers why a before/after delta is not
+sufficient on its own. This has now happened twice: once against `sys.modules`,
+once against `asyncio.all_tasks()`.
 
 **Don't trust a venv you didn't sync from this branch's lock.** Each checkout's
 `.venv` resolves from *its own* `uv.lock`, so pointing another tree's interpreter
@@ -32,13 +33,6 @@ review, re-run it on the unmodified base and compare the dependency pin.
 **Never `uv run` or `uv sync` against a live deployment checkout.** In a sandbox
 or worktree it is correct and expected. Against a running deployment it recreates
 the venv underneath the live process. Use `.venv/bin/python` directly there.
-
-## Commits and identity
-
-Commits here are authored as `Jason Carreira <jcarreira@gmail.com>`. A
-`[includeIf "gitdir:~/projects/odin/mimir/"]` rule in the operator's `~/.gitconfig`
-already sets this for every worktree and sandbox under that path — do not override
-`user.name` or `user.email`, and do not substitute a work address.
 
 ## Branches and merging
 

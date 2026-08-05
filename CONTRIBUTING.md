@@ -71,21 +71,28 @@ asserting shared state.** Fix the assertion, not the ordering. Do not reach for
 ordering plugins, `importlib.reload`, or fixtures that reset globals — those hide
 the coupling instead of removing it.
 
-### Don't assert on state another test can mutate
+### Don't assert on ambient state you don't own
 
-A test may not assert on state that any other test in the same process can
-change. That includes:
+Asserting on mutable process state is fine when that state is the *subject* of the
+test and the test owns it — verifying that a component sets an environment variable
+or handles the working directory correctly is a legitimate test, provided the change
+is scoped and restored (`monkeypatch`) or isolated in a child process.
+
+The problem is asserting on **ambient** state: shared state outside the ownership of
+your test or the component under test, which any other test in the process may also
+touch. Two kinds have bitten this repo:
 
 - **Import-time state** — `sys.modules`, import caches, registries, singletons,
-  module-level mutable defaults, environment variables, the working directory.
+  module-level mutable defaults. Fails at collection, because importing a sibling
+  test module is enough to populate it.
 - **Live runtime state** — the event loop's task set (`asyncio.all_tasks()`), open
-  transports and connections, threads, timers, and anything else that can change
-  *while your test is awaiting*.
+  transports and connections, threads, timers. Fails during an `await`, when a task
+  another test leaked finishes or spawns inside your measurement window — so it can
+  fail even against a clean baseline.
 
-Both have bitten this repo. The first kind fails at collection, because importing
-a sibling test module is enough to populate `sys.modules`. The second fails during
-an `await`, when a task another test leaked finishes or spawns inside your
-measurement window — so it can fail even against a clean baseline.
+The distinction is ownership, not mutability. `monkeypatch.setenv` on a variable your
+component reads is owned and restored. A bare read of the whole event loop's task set
+is ambient, because everything that ran before you shares it.
 
 To prove a negative — "this module does not import X", "nothing reaches Y", "no
 adapter was started", "no task was created" — pick one:
