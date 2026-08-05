@@ -464,6 +464,17 @@ async def test_memory_get_tool_no_client():
     assert "no SagaStore configured" in out
 
 
+def test_memory_client_can_be_cleared(client):
+    from mimir.tools.memory import _MEMORY_STATE, set_memory_client
+
+    set_memory_client(client)
+    assert _MEMORY_STATE["client"] is client
+
+    set_memory_client(None)
+
+    assert _MEMORY_STATE["client"] is None
+
+
 @pytest.mark.asyncio
 async def test_client_recent_session_boundaries(client, monkeypatch):
     _patch_provider(monkeypatch)

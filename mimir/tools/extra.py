@@ -205,7 +205,7 @@ async def rebuild_index(scope: str = "all") -> str:
 _TURN_STATE: dict[str, Optional[Path]] = {"turns_log_path": None}
 
 
-def set_turns_log_path(path: Path) -> None:
+def set_turns_log_path(path: Path | None) -> None:
     """Inject the path to turns.jsonl."""
     _TURN_STATE["turns_log_path"] = path
 

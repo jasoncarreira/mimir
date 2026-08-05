@@ -763,6 +763,9 @@ class Scheduler:
             self._on_job_missed, EVENT_JOB_MISSED,
         )
 
+    def set_arbiter(self, arbiter: Any | None) -> None:
+        self._arbiter = arbiter
+
     def _on_job_missed(self, event: JobExecutionEvent) -> None:
         """APScheduler listener for EVENT_JOB_MISSED.
 
@@ -3179,7 +3182,7 @@ class Scheduler:
         if self._loop_watchdog_beat_task is not None:
             self._loop_watchdog_beat_task.cancel()
             self._loop_watchdog_beat_task = None
-        if self._started:
+        if self._started or self._scheduler.running:
             self._scheduler.shutdown(wait=False)
             self._started = False
 

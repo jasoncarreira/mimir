@@ -491,3 +491,15 @@ async def test_set_is_busy_can_be_wired_after_construction():
     await mgr._fire_idle(s.saga_session_id, "c1")
     assert fired == []
     assert "c1" in mgr._sessions  # still alive, deferred
+
+
+def test_session_callbacks_can_be_cleared():
+    async def on_idle(session: ChannelSession) -> None:
+        return None
+
+    mgr = SessionManager(on_idle=on_idle, is_busy=lambda channel_id: True)
+    mgr.set_on_idle(None)
+    mgr.set_is_busy(None)
+
+    assert mgr._on_idle is None
+    assert mgr._is_busy is None
