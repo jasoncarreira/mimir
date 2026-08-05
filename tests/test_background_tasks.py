@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from mimir.background_tasks import spawn_background
+from mimir import background_tasks
+from mimir.background_tasks import cancel_background_tasks, spawn_background
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 
 
@@ -111,3 +112,98 @@ async def test_spawn_background_done_callback_swallows_logging_failure(monkeypat
     await _drain_task_callback()
 
     assert task not in tasks
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_cancels_clears_and_returns_errors():
+    tasks: set[asyncio.Task[Any]] = set()
+    cancelled = asyncio.Event()
+    failure = RuntimeError("background failure")
+
+    async def wait_until_cancelled() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def succeed() -> str:
+        return "done"
+
+    async def fail() -> None:
+        raise failure
+
+    waiting_task = asyncio.create_task(wait_until_cancelled(), name="waiting")
+    successful_task = asyncio.create_task(succeed(), name="successful")
+    failed_task = asyncio.create_task(fail(), name="failed")
+    tasks.update((waiting_task, successful_task, failed_task))
+    await asyncio.sleep(0)
+
+    errors = await cancel_background_tasks(tasks, label="test cleanup")
+
+    assert not tasks
+    assert waiting_task.cancelled()
+    assert cancelled.is_set()
+    assert successful_task.result() == "done"
+    assert errors == [failure]
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_times_out_cancellation_resistant_task_after_five_seconds(
+    monkeypatch,
+):
+    tasks: set[asyncio.Task[Any]] = set()
+    started = [asyncio.Event(), asyncio.Event()]
+    release = asyncio.Event()
+    late_results_consumed = asyncio.Event()
+    consumed_names: set[str] = set()
+    requested_timeouts: list[float | None] = []
+    real_wait = asyncio.wait
+    real_consumer = background_tasks._consume_late_task_result
+
+    async def resistant(index: int) -> None:
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError(f"late failure {index}")
+
+    async def immediate_wait(awaitables, *, timeout=None):
+        requested_timeouts.append(timeout)
+        return await real_wait(awaitables, timeout=0)
+
+    def consume_late_result(task: asyncio.Task[Any]) -> None:
+        real_consumer(task)
+        consumed_names.add(task.get_name())
+        if len(consumed_names) == 2:
+            late_results_consumed.set()
+
+    monkeypatch.setattr(background_tasks.asyncio, "wait", immediate_wait)
+    monkeypatch.setattr(
+        background_tasks,
+        "_consume_late_task_result",
+        consume_late_result,
+    )
+
+    first = asyncio.create_task(resistant(0), name="zeta-task")
+    second = asyncio.create_task(resistant(1), name="alpha-task")
+    tasks.update((first, second))
+    await asyncio.gather(*(event.wait() for event in started))
+
+    errors = await cancel_background_tasks(tasks, label="runtime cleanup")
+
+    assert background_tasks.BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS == 5.0
+    assert requested_timeouts == [5.0]
+    assert not tasks
+    assert not first.done()
+    assert not second.done()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TimeoutError)
+    assert str(errors[0]) == (
+        "runtime cleanup: 2 background task(s) did not stop within 5.0 seconds: "
+        "alpha-task, zeta-task"
+    )
+
+    release.set()
+    await asyncio.wait_for(late_results_consumed.wait(), timeout=1.0)
+    assert consumed_names == {"alpha-task", "zeta-task"}

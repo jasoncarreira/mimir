@@ -18,6 +18,7 @@ from .redaction import redact_text
 
 log = logging.getLogger(__name__)
 _MAX_ERROR_CHARS = 500
+BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS = 5.0
 
 
 def _bounded_error(exc: BaseException) -> str:
@@ -45,6 +46,58 @@ def _discard_and_log_failure(
         )
     except Exception as callback_exc:  # noqa: BLE001
         log.warning("background task completion callback failed: %s", callback_exc)
+
+
+def _consume_late_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except BaseException:
+        pass
+
+
+async def cancel_background_tasks(
+    tasks: set[asyncio.Task[Any]],
+    *,
+    label: str,
+) -> list[BaseException]:
+    snapshot = tuple(tasks)
+    tasks.clear()
+    if not snapshot:
+        return []
+
+    for task in snapshot:
+        if not task.done():
+            task.cancel()
+
+    done, pending = await asyncio.wait(
+        snapshot,
+        timeout=BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS,
+    )
+
+    task_errors: list[tuple[str, BaseException]] = []
+    for task in done:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except BaseException as exc:
+            task_errors.append((task.get_name(), exc))
+
+    task_errors.sort(key=lambda item: (item[0], type(item[1]).__name__))
+    errors = [exc for _, exc in task_errors]
+    if pending:
+        for task in pending:
+            task.add_done_callback(_consume_late_task_result)
+        task_names = ", ".join(sorted(task.get_name() for task in pending))
+        errors.append(
+            TimeoutError(
+                f"{label}: {len(pending)} background task(s) did not stop within "
+                f"{BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS} seconds: {task_names}"
+            )
+        )
+    return errors
 
 
 def spawn_background(
