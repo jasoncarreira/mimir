@@ -80,7 +80,8 @@ def _fetch_cache_dir() -> Path:
     if _home is None:
         raise RuntimeError(
             "mimir.tools.web: set_home(...) was never called — "
-            "wire it from mimir.server:build_app before agent construction."
+            "it is wired by mimir.runtime.create_agent_runtime(); "
+            "build the agent runtime before using fetch tools."
         )
     return _home / "attachments" / "fetch-cache"
 
