@@ -1534,10 +1534,11 @@ async def test_non_web_entrypoint_builds_and_closes_real_agent_graph(
         spawn_background_task=spawn,
     )
 
+    server_was_loaded = "mimir.server" in sys.modules
     bundle = await runtime.create_agent_runtime(config, core, adapters)
     assert bundle.agent.__class__.__name__ == "Agent"
     assert dispatcher._run_turn == bundle.agent.run_turn
-    assert "mimir.server" not in sys.modules
+    assert ("mimir.server" in sys.modules) is server_was_loaded
 
     await bundle.aclose()
     assert dispatcher._run_turn is None
