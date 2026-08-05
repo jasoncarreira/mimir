@@ -15,6 +15,18 @@ members = [
 ]
 
 [[package]]
+name = "agent-client-protocol"
+version = "0.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/50/65bfb4e3e13f350a52c368cbfc4bc36a1b3b3f34a6b3f5a2e3551e1bd63b/agent_client_protocol-0.12.0.tar.gz", hash = "sha256:4d42ac680388556b038cb6dd58dbbbd1561f9e545a334c1a352cc055f98b1c79", size = 135037, upload-time = "2026-08-01T15:58:22.35Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/c7/b84b8698879464bd8f869551bac31454bed14a3a22910f65d9693f3701bd/agent_client_protocol-0.12.0-py3-none-any.whl", hash = "sha256:233626748034896214de118f5cf5a319484ad2186705fd595219afee92237ccc", size = 92992, upload-time = "2026-08-01T15:58:21.216Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1375,6 +1387,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+acp = [
+    { name = "agent-client-protocol" },
+]
 anthropic = [
     { name = "langchain-anthropic" },
 ]
@@ -1388,6 +1403,7 @@ codex-plus = [
     { name = "langchain-codex-plus" },
 ]
 dev = [
+    { name = "agent-client-protocol" },
     { name = "botocore" },
     { name = "discord-py" },
     { name = "faiss-cpu" },
@@ -1420,6 +1436,7 @@ slack = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "agent-client-protocol" },
     { name = "botocore" },
     { name = "discord-py" },
     { name = "faiss-cpu" },
@@ -1436,6 +1453,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = "==0.12.0" },
+    { name = "agent-client-protocol", marker = "extra == 'dev'", specifier = "==0.12.0" },
     { name = "aiohttp", specifier = ">=3.12" },
     { name = "apscheduler", specifier = ">=3.11" },
     { name = "botocore", marker = "extra == 'dev'", specifier = ">=1.35" },
@@ -1467,10 +1486,11 @@ requires-dist = [
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
 ]
-provides-extras = ["anthropic", "claude-code", "openai", "codex-plus", "mcp", "bench", "discord", "slack", "gepa", "dev"]
+provides-extras = ["anthropic", "claude-code", "openai", "codex-plus", "mcp", "acp", "bench", "discord", "slack", "gepa", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "agent-client-protocol", specifier = "==0.12.0" },
     { name = "botocore", specifier = ">=1.35" },
     { name = "discord-py", specifier = ">=2.6" },
     { name = "faiss-cpu", specifier = ">=1.13" },
