@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import signal
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass
+from enum import Enum, auto
 from types import FrameType
-from typing import Any, BinaryIO, Protocol, TypeVar
+from typing import Any, BinaryIO, Protocol, TypeVar, cast
 
 from .agent import MimirAcpAgent
 from .composition import AcpComposition
@@ -20,6 +22,7 @@ from .stdio import ProtocolStreams, open_protocol_streams
 _T = TypeVar("_T")
 _PEER_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError)
 _RUNTIME_ERROR = "ACP host failed."
+_DELIVERY_END = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +51,107 @@ class _Timer(Protocol):
     def join(self) -> None: ...
 
 
-TimerFactory = Callable[[float, Callable[[], None]], _Timer | asyncio.Task[Any]]
+class _Stage(Enum):
+    PROTOCOL = auto()
+    WRITER = auto()
+    RUNTIME = auto()
+    AUDIT = auto()
+    ADAPTERS = auto()
+
+
+class _StageState(Enum):
+    NOT_STARTED = auto()
+    RUNNING = auto()
+    TERMINAL = auto()
+
+
+TimerFactory = Callable[[float, Callable[[], None]], _Timer]
 StreamsFactory = Callable[[BinaryIO], Awaitable[ProtocolStreams]]
 CompositionFactory = Callable[[], Awaitable[AcpComposition]]
 ProtocolRunner = Callable[..., Awaitable[None]]
+TaskWaiter = Callable[..., Awaitable[tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]]]
+
+
+class _FrameDelivery:
+    def __init__(self, frame_file: BinaryIO) -> None:
+        self._frame_file = frame_file
+        self._queue: queue.SimpleQueue[bytes | object] = queue.SimpleQueue()
+        self._loop = asyncio.get_running_loop()
+        self._terminal = self._loop.create_future()
+        self._accepting = True
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._deliver,
+            name="acp-frame-delivery",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def closed(self) -> bool:
+        return not self._accepting
+
+    @property
+    def terminal(self) -> bool:
+        return not self._thread.is_alive()
+
+    def fileno(self) -> int:
+        return self._frame_file.fileno()
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if not self._accepting:
+            raise ConnectionResetError("protocol frame delivery is closed")
+        if self._error is not None:
+            raise self._error
+        payload = bytes(data)
+        if payload:
+            self._queue.put(payload)
+        return len(payload)
+
+    def flush(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def finish(self) -> None:
+        if not self._accepting:
+            return
+        self._accepting = False
+        self._queue.put(_DELIVERY_END)
+
+    async def wait_terminal(self) -> None:
+        await self._terminal
+        if self._error is not None:
+            raise self._error
+
+    def join(self) -> None:
+        self._thread.join()
+
+    def _deliver(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is _DELIVERY_END:
+                    break
+                remaining = memoryview(cast(bytes, item))
+                while remaining:
+                    written = self._frame_file.write(remaining)
+                    if written is None:
+                        written = len(remaining)
+                    if written <= 0:
+                        raise BrokenPipeError("protocol frame write made no progress")
+                    remaining = remaining[written:]
+                self._frame_file.flush()
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            try:
+                self._loop.call_soon_threadsafe(self._mark_terminal)
+            except RuntimeError:
+                pass
+
+    def _mark_terminal(self) -> None:
+        if not self._terminal.done():
+            self._terminal.set_result(None)
 
 
 class HostLifecycle:
@@ -63,6 +163,7 @@ class HostLifecycle:
         clock: Callable[[], float] = time.monotonic,
         timer_factory: TimerFactory = threading.Timer,
         fail_stop: Callable[[int], None] = os._exit,
+        task_waiter: TaskWaiter = asyncio.wait,
         streams_factory: StreamsFactory = open_protocol_streams,
         composition_factory: CompositionFactory = AcpComposition.create,
         agent_factory: Callable[[Any], Any] = MimirAcpAgent,
@@ -73,10 +174,13 @@ class HostLifecycle:
         self._clock = clock
         self._timer_factory = timer_factory
         self._fail_stop = fail_stop
+        self._task_waiter = task_waiter
         self._streams_factory = streams_factory
         self._composition_factory = composition_factory
         self._agent_factory = agent_factory
         self._protocol_runner = protocol_runner
+        self._delivery: _FrameDelivery | None = None
+        self._delivery_task: asyncio.Task[None] | None = None
         self._streams: ProtocolStreams | None = None
         self._composition: AcpComposition | None = None
         self._protocol_task: asyncio.Task[None] | None = None
@@ -87,9 +191,12 @@ class HostLifecycle:
         self._audit_cancel_requested: set[asyncio.Task[Any]] = set()
         self._retrieved_tasks: set[asyncio.Future[Any]] = set()
         self._host_stage_tasks: set[asyncio.Task[Any]] = set()
+        self._required_stages: set[_Stage] = {_Stage.WRITER}
+        self._stage_states = {
+            stage: _StageState.NOT_STARTED for stage in _Stage
+        }
         self._shutdown_requested = asyncio.Event()
-        self._watchdog: _Timer | asyncio.Task[Any] | None = None
-        self._watchdog_task: asyncio.Task[Any] | None = None
+        self._watchdog: _Timer | None = None
         self._watchdog_deadline: float | None = None
         self._loop_signal_handlers: set[signal.Signals] = set()
         self._fallback_signal_handlers: dict[
@@ -118,10 +225,47 @@ class HostLifecycle:
         return self._audit_pending_names
 
     async def run(self) -> int:
+        self._delivery = _FrameDelivery(self._frame_file)
+        await self._start()
+        self.stop_protocol_intake()
+        if self._protocol_task is not None:
+            await self._run_stage(_Stage.PROTOCOL, self.await_protocol_terminal)
+        await self._run_stage(_Stage.WRITER, self.close_protocol_writer)
+        if self._composition is not None:
+            await self._run_stage(_Stage.RUNTIME, self.await_runtime_driver_terminal)
+        if self._pre_composition_tasks:
+            await self._start_runtime_audit()
+        if self._composition is not None:
+            await self._run_stage(_Stage.ADAPTERS, self.close_adapters_terminal)
+        if not self._teardown_proven_terminal():
+            self._mark_failed()
+            await asyncio.Future()
+        self._remove_signal_handlers()
+        self._stop_watchdog()
+        return 1 if self._failed else 0
+
+    async def _start(self) -> None:
+        delivery = self._delivery
+        if delivery is None:
+            self._mark_failed()
+            return
         try:
-            self._streams = await self._streams_factory(self._frame_file)
-            self._pre_composition_tasks = frozenset(asyncio.all_tasks())
+            self._streams = await self._streams_factory(cast(BinaryIO, delivery))
+        except BaseException:
+            self._mark_failed()
+            return
+        self._install_signal_handlers()
+        self._pre_composition_tasks = frozenset(asyncio.all_tasks())
+        self._required_stages.add(_Stage.AUDIT)
+        try:
             self._composition = await self._composition_factory()
+        except BaseException:
+            self._mark_failed()
+            return
+        self._required_stages.update({_Stage.RUNTIME, _Stage.ADAPTERS})
+        if self._shutdown_requested.is_set():
+            return
+        try:
             agent = self._agent_factory(self._composition.bundle)
             self._protocol_task = asyncio.create_task(
                 self._protocol_runner(
@@ -131,122 +275,152 @@ class HostLifecycle:
                 ),
                 name="acp-run-agent",
             )
-            self._install_signal_handlers()
+        except BaseException:
+            self._mark_failed()
+            return
+        self._required_stages.add(_Stage.PROTOCOL)
+        try:
             await self._wait_for_shutdown_request()
-            self.stop_protocol_intake()
-            await self.await_protocol_terminal()
-            await self.close_protocol_writer()
-            await self.await_runtime_driver_terminal()
+        except BaseException:
+            self._mark_failed()
+
+    async def _run_stage(
+        self,
+        stage: _Stage,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._stage_states[stage] = _StageState.RUNNING
+        try:
+            await operation()
+        except BaseException:
+            self._mark_failed()
+        finally:
+            self._stage_states[stage] = _StageState.TERMINAL
+
+    async def _start_runtime_audit(self) -> None:
+        self._stage_states[_Stage.AUDIT] = _StageState.RUNNING
+        try:
             self._runtime_audit_task = self._create_host_stage_task(
                 self.audit_runtime_tasks_terminal(),
                 name="acp-runtime-task-audit",
             )
             await self._runtime_audit_task
-            self._retrieve_task(self._runtime_audit_task)
-            await self.close_adapters_terminal()
-            if not self._all_owned_tasks_terminal():
-                self._mark_failed()
-                await asyncio.Future()
-        except _PEER_DISCONNECT_ERRORS:
-            self._peer_disconnected = True
-            self._mark_failed_if_cleanup_incomplete()
-        except asyncio.CancelledError:
-            self._mark_failed()
-            raise
+            self._retrieve_task(self._runtime_audit_task, failure_is_error=True)
         except BaseException:
             self._mark_failed()
         finally:
-            if self._all_owned_tasks_terminal():
-                self._remove_signal_handlers()
-                self._stop_watchdog()
-        return 1 if self._failed else 0
+            self._stage_states[_Stage.AUDIT] = _StageState.TERMINAL
 
     def stop_protocol_intake(self) -> None:
         streams = self._streams
         if streams is not None:
-            streams.stop_request_intake()
+            try:
+                streams.stop_request_intake()
+            except BaseException:
+                self._mark_failed()
         self._shutdown_requested.set()
         if self._watchdog is not None:
             return
         self._watchdog_deadline = self._clock() + self._timeouts.watchdog
-        watchdog = self._timer_factory(
-            self._timeouts.watchdog,
-            lambda: self._fail_stop(1),
-        )
-        self._watchdog = watchdog
-        if isinstance(watchdog, asyncio.Task):
-            self._watchdog_task = watchdog
+        try:
+            watchdog = self._timer_factory(
+                self._timeouts.watchdog,
+                lambda: self._fail_stop(1),
+            )
+            watchdog.daemon = True
+            watchdog.start()
+        except BaseException:
+            self._mark_failed()
             return
-        watchdog.daemon = True
-        watchdog.start()
+        self._watchdog = watchdog
 
     async def await_protocol_terminal(self) -> None:
         task = self._protocol_task
         if task is None:
             self._mark_failed()
             return
-        done, _ = await asyncio.wait(
+        done, _ = await self._wait_tasks(
             {task},
             timeout=max(0.0, self._timeouts.protocol_grace),
         )
         if task not in done:
             self._protocol_cancel_requested = True
             task.cancel()
-            done, _ = await asyncio.wait(
+            done, _ = await self._wait_tasks(
                 {task},
                 timeout=max(0.0, self._timeouts.protocol_cancel),
             )
         if task not in done:
             self._mark_failed()
-            await asyncio.wait({task})
+            await self._wait_tasks({task})
         self._retrieve_protocol_task(task)
 
     async def close_protocol_writer(self) -> None:
         streams = self._streams
-        if streams is None:
+        drained = streams is None
+        closed = streams is None
+        if streams is not None:
+            try:
+                drained = await streams.drain_response_writer(
+                    timeout=max(0.0, self._timeouts.writer_drain)
+                )
+            except _PEER_DISCONNECT_ERRORS:
+                self._peer_disconnected = True
+            except BaseException:
+                self._mark_failed()
+            try:
+                closed = await streams.close_response_writer(
+                    timeout=max(0.0, self._timeouts.writer_close)
+                )
+            except _PEER_DISCONNECT_ERRORS:
+                self._peer_disconnected = True
+            except BaseException:
+                self._mark_failed()
+            if not drained or not closed:
+                if self._writer_has_peer_disconnect():
+                    self._peer_disconnected = True
+                elif not self._peer_disconnected:
+                    self._mark_failed()
+            for task in streams.writer_helper_tasks():
+                if task.done():
+                    self._retrieve_task(task)
+        delivery = self._delivery
+        if delivery is None:
             self._mark_failed()
             return
-        drained = False
-        closed = False
+        delivery.finish()
+        self._delivery_task = self._create_host_stage_task(
+            delivery.wait_terminal(),
+            name="acp-frame-delivery-terminal",
+        )
         try:
-            drained = await streams.drain_response_writer(
-                timeout=max(0.0, self._timeouts.writer_drain)
-            )
+            await self._delivery_task
         except _PEER_DISCONNECT_ERRORS:
             self._peer_disconnected = True
         except BaseException:
             self._mark_failed()
-        try:
-            closed = await streams.close_response_writer(
-                timeout=max(0.0, self._timeouts.writer_close)
-            )
-        except _PEER_DISCONNECT_ERRORS:
-            self._peer_disconnected = True
-        except BaseException:
-            self._mark_failed()
-        if not drained or not closed:
-            if self._writer_has_peer_disconnect():
-                self._peer_disconnected = True
-            elif not self._peer_disconnected:
-                self._mark_failed()
-        for task in streams.writer_helper_tasks():
-            if task.done():
-                self._retrieve_task(task)
+        if delivery.terminal:
+            delivery.join()
+        self._retrieve_task(self._delivery_task)
 
     async def await_runtime_driver_terminal(self) -> None:
         composition = self._composition
         if composition is None:
             self._mark_failed()
             return
-        driver = composition.start_runtime_close()
+        try:
+            driver = composition.start_runtime_close()
+        except BaseException:
+            self._mark_failed()
+            return
         self._runtime_driver = driver
-        done, _ = await asyncio.wait(
+        done, _ = await self._wait_tasks(
             {driver},
             timeout=max(0.0, self._timeouts.runtime_driver),
         )
         if driver not in done:
             self._mark_failed()
-            await asyncio.wait({driver})
+            await self._wait_tasks({driver})
         self._retrieve_task(driver, failure_is_error=True)
 
     async def audit_runtime_tasks_terminal(self) -> None:
@@ -254,8 +428,7 @@ class HostLifecycle:
         empty_scans = 0
         threshold_recorded = False
         while True:
-            current = asyncio.current_task()
-            candidates = self._runtime_task_candidates(current)
+            candidates = self._runtime_task_candidates(asyncio.current_task())
             self._audited_runtime_tasks.update(candidates)
             for task in tuple(self._audited_runtime_tasks):
                 if task.done():
@@ -282,7 +455,7 @@ class HostLifecycle:
                 continue
             empty_scans = 0
             if pending:
-                await asyncio.wait(
+                await self._wait_tasks(
                     pending,
                     timeout=max(0.0, self._timeouts.audit_rescan),
                 )
@@ -327,13 +500,12 @@ class HostLifecycle:
     async def _wait_for_shutdown_request(self) -> None:
         protocol_task = self._protocol_task
         if protocol_task is None:
-            self._mark_failed()
             return
         stop_waiter = self._create_host_stage_task(
             self._shutdown_requested.wait(),
             name="acp-host-shutdown-wait",
         )
-        done, _ = await asyncio.wait(
+        done, _ = await self._wait_tasks(
             {protocol_task, stop_waiter},
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -341,6 +513,19 @@ class HostLifecycle:
             stop_waiter.cancel()
         await asyncio.gather(stop_waiter, return_exceptions=True)
         self._retrieve_task(stop_waiter)
+
+    async def _wait_tasks(
+        self,
+        tasks: Iterable[asyncio.Future[Any]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        return await self._task_waiter(
+            set(tasks),
+            timeout=timeout,
+            return_when=return_when,
+        )
 
     def _runtime_task_candidates(
         self,
@@ -350,12 +535,13 @@ class HostLifecycle:
         excluded.update(self._host_stage_tasks)
         if current is not None:
             excluded.add(current)
-        if self._protocol_task is not None:
-            excluded.add(self._protocol_task)
-        if self._runtime_driver is not None:
-            excluded.add(self._runtime_driver)
-        if self._watchdog_task is not None:
-            excluded.add(self._watchdog_task)
+        for task in (
+            self._protocol_task,
+            self._runtime_driver,
+            self._delivery_task,
+        ):
+            if task is not None:
+                excluded.add(task)
         streams = self._streams
         if streams is not None:
             excluded.update(streams.writer_helper_tasks())
@@ -380,7 +566,7 @@ class HostLifecycle:
             }
             if not pending:
                 return
-            await asyncio.wait(
+            await self._wait_tasks(
                 pending,
                 timeout=min(0.1, self._remaining_watchdog_time()),
             )
@@ -462,13 +648,9 @@ class HostLifecycle:
         loop.call_soon_threadsafe(self.stop_protocol_intake)
 
     def _remove_signal_handlers(self) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None:
-            for signum in self._loop_signal_handlers:
-                loop.remove_signal_handler(signum)
+        loop = asyncio.get_running_loop()
+        for signum in self._loop_signal_handlers:
+            loop.remove_signal_handler(signum)
         self._loop_signal_handlers.clear()
         for signum, previous in self._fallback_signal_handlers.items():
             signal.signal(signum, previous)
@@ -478,31 +660,45 @@ class HostLifecycle:
         watchdog = self._watchdog
         if watchdog is None:
             return
-        if isinstance(watchdog, asyncio.Task):
-            if not watchdog.done():
-                watchdog.cancel()
-            self._retrieve_task(watchdog)
-        else:
-            watchdog.cancel()
-            watchdog.join()
+        watchdog.cancel()
+        watchdog.join()
         self._watchdog = None
 
-    def _all_owned_tasks_terminal(self) -> bool:
+    def _teardown_proven_terminal(self) -> bool:
+        if any(
+            self._stage_states[stage] is not _StageState.TERMINAL
+            for stage in self._required_stages
+        ):
+            return False
+        if self._delivery_task is None or not self._delivery_task.done():
+            return False
+        if self._delivery is None or not self._delivery.terminal:
+            return False
+        if _Stage.PROTOCOL in self._required_stages and self._protocol_task is None:
+            return False
         if self._protocol_task is not None and not self._protocol_task.done():
             return False
         if self._runtime_driver is not None and not self._runtime_driver.done():
             return False
+        if _Stage.AUDIT in self._required_stages:
+            audit_task = self._runtime_audit_task
+            if (
+                audit_task is None
+                or not audit_task.done()
+                or audit_task.cancelled()
+                or audit_task.exception() is not None
+            ):
+                return False
         if self._runtime_audit_task is not None and not self._runtime_audit_task.done():
             return False
         if any(not task.done() for task in self._audited_runtime_tasks):
             return False
-        if any(not task.done() for task in self._host_stage_tasks):
-            current = asyncio.current_task()
-            if any(
-                task is not current and not task.done()
-                for task in self._host_stage_tasks
-            ):
-                return False
+        current = asyncio.current_task()
+        if any(
+            task is not current and not task.done()
+            for task in self._host_stage_tasks
+        ):
+            return False
         streams = self._streams
         if streams is not None and any(
             not task.done() for task in streams.writer_helper_tasks()
@@ -517,10 +713,6 @@ class HostLifecycle:
 
     def _mark_failed(self) -> None:
         self._failed = True
-
-    def _mark_failed_if_cleanup_incomplete(self) -> None:
-        if not self._all_owned_tasks_terminal():
-            self._mark_failed()
 
 
 def run(frame_file: BinaryIO) -> int:

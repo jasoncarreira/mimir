@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import os
+import signal
 import subprocess
 import sys
 import textwrap
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -137,6 +141,7 @@ def _lifecycle(
     timeouts: LifecycleTimeouts | None = None,
     timers: list[_FakeTimer] | None = None,
     frame_file: io.BytesIO | None = None,
+    task_waiter: Callable[..., Awaitable[Any]] = asyncio.wait,
 ) -> HostLifecycle:
     selected_streams = streams or _FakeStreams()
     selected_composition = composition or _FakeComposition(_completed)
@@ -166,6 +171,7 @@ def _lifecycle(
         ),
         timer_factory=_timer_factory(selected_timers),
         fail_stop=lambda status: None,
+        task_waiter=task_waiter,
         streams_factory=streams_factory,
         composition_factory=composition_factory,
         agent_factory=lambda bundle: object(),
@@ -203,6 +209,54 @@ async def test_eof_shutdown_stage_order_and_descriptor_ownership() -> None:
     assert timers[0].daemon is True
     assert timers[0].cancelled is True
     assert timers[0].joined is True
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_preserves_complete_order_without_owning_descriptor() -> None:
+    frame_file = io.BytesIO()
+    composition = _FakeComposition(_completed)
+
+    class Writer:
+        def __init__(self, frame: Any) -> None:
+            self.frame = frame
+
+        def write(self, data: bytes) -> int:
+            return self.frame.write(data)
+
+    async def streams_factory(frame: Any) -> Any:
+        streams = _FakeStreams()
+        streams.response_writer = Writer(frame)
+        return streams
+
+    async def composition_factory() -> Any:
+        return composition
+
+    async def protocol_runner(
+        agent: Any,
+        *,
+        response_writer: Writer,
+        **kwargs: Any,
+    ) -> None:
+        response_writer.write(b"first\n")
+        response_writer.write(b"second\n")
+        response_writer.write(b"third\n")
+
+    lifecycle = HostLifecycle(
+        frame_file,
+        timeouts=LifecycleTimeouts(watchdog=1.0, audit_rescan=0.001),
+        timer_factory=_timer_factory([]),
+        fail_stop=lambda status: None,
+        streams_factory=streams_factory,
+        composition_factory=composition_factory,
+        agent_factory=lambda bundle: object(),
+        protocol_runner=protocol_runner,
+    )
+
+    assert await lifecycle.run() == 0
+    assert frame_file.getvalue() == b"first\nsecond\nthird\n"
+    assert frame_file.closed is False
+    assert lifecycle._delivery is not None
+    assert lifecycle._delivery.terminal
 
 
 @pytest.mark.asyncio
@@ -246,31 +300,138 @@ async def test_unexpected_protocol_failure_cleans_up_and_returns_failure() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("signum", ["SIGINT", "SIGTERM"])
-async def test_signal_stops_protocol_and_completes_cleanup(signum: str) -> None:
-    protocol_stopped = asyncio.Event()
-
-    async def protocol_runner(*args: Any, **kwargs: Any) -> None:
-        await protocol_stopped.wait()
-
+async def test_composition_startup_failure_still_closes_writer_and_audits_tasks() -> None:
     streams = _FakeStreams()
-    lifecycle = _lifecycle(streams=streams, protocol_runner=protocol_runner)
-    run_task = asyncio.create_task(lifecycle.run())
-    while lifecycle._protocol_task is None:
-        await asyncio.sleep(0)
-    lifecycle.stop_protocol_intake()
-    protocol_stopped.set()
+    timers: list[_FakeTimer] = []
+    dropped_cancelled = asyncio.Event()
+    dropped: asyncio.Task[None] | None = None
 
-    assert await run_task == 0
-    assert streams.intake_stopped
-    assert signum in {"SIGINT", "SIGTERM"}
+    async def streams_factory(frame: Any) -> Any:
+        return streams
+
+    async def composition_factory() -> Any:
+        nonlocal dropped
+
+        async def background() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                dropped_cancelled.set()
+                raise
+
+        dropped = asyncio.create_task(background(), name="failed-startup-background")
+        raise RuntimeError("startup detail")
+
+    lifecycle = HostLifecycle(
+        io.BytesIO(),
+        timeouts=LifecycleTimeouts(watchdog=1.0, audit_rescan=0.001),
+        timer_factory=_timer_factory(timers),
+        fail_stop=lambda status: None,
+        streams_factory=streams_factory,
+        composition_factory=composition_factory,
+    )
+
+    assert await lifecycle.run() == 1
+    assert streams.drain_timeout is not None
+    assert streams.close_timeout is not None
+    assert dropped is not None
+    assert dropped in lifecycle.audited_runtime_tasks
+    assert dropped_cancelled.is_set()
+    assert dropped.done()
+    assert lifecycle._stage_states[next(
+        stage for stage in lifecycle._stage_states if stage.name == "RUNTIME"
+    )].name == "NOT_STARTED"
+    assert timers[0].cancelled
+    assert timers[0].joined
 
 
 @pytest.mark.asyncio
-async def test_protocol_terminal_uses_five_plus_five_second_policy_and_cancels_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lifecycle = _lifecycle(timeouts=PRODUCTION_TIMEOUTS)
+async def test_agent_startup_failure_runs_runtime_audit_and_adapters() -> None:
+    events: list[str] = []
+    streams = _FakeStreams(events)
+    composition = _FakeComposition(_completed, events)
+    lifecycle = _lifecycle(streams=streams, composition=composition)
+    lifecycle._agent_factory = lambda bundle: (_ for _ in ()).throw(
+        RuntimeError("agent startup detail")
+    )
+
+    assert await lifecycle.run() == 1
+    assert events.index("writer-closed") < events.index("runtime-started")
+    assert events.index("runtime-started") < events.index("adapters-closed")
+    assert composition.adapter_calls[0][1] is lifecycle._runtime_audit_task
+
+
+@pytest.mark.asyncio
+async def test_writer_stage_failures_do_not_skip_runtime_audit_or_adapters() -> None:
+    events: list[str] = []
+
+    class FailingStreams(_FakeStreams):
+        async def drain_response_writer(self, timeout: float = 2.0) -> bool:
+            self.events.append("writer-drain-failed")
+            raise RuntimeError("drain detail")
+
+        async def close_response_writer(self, timeout: float = 1.0) -> bool:
+            self.events.append("writer-close-failed")
+            raise RuntimeError("close detail")
+
+    streams = FailingStreams(events)
+    composition = _FakeComposition(_completed, events)
+    lifecycle = _lifecycle(streams=streams, composition=composition)
+
+    assert await lifecycle.run() == 1
+    assert events.index("writer-close-failed") < events.index("runtime-started")
+    assert events.index("runtime-started") < events.index("adapters-closed")
+    assert lifecycle._runtime_audit_task is composition.adapter_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_runtime_driver_failure_still_runs_audit_and_adapters() -> None:
+    events: list[str] = []
+
+    async def failing_runtime_close() -> None:
+        events.append("runtime-failed")
+        raise RuntimeError("runtime detail")
+
+    composition = _FakeComposition(failing_runtime_close, events)
+    lifecycle = _lifecycle(
+        streams=_FakeStreams(events),
+        composition=composition,
+    )
+
+    assert await lifecycle.run() == 1
+    assert events.index("runtime-failed") < events.index("adapters-closed")
+    assert lifecycle._runtime_driver is not None
+    assert lifecycle._runtime_driver.done()
+    assert lifecycle._runtime_audit_task is composition.adapter_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_adapter_failure_is_terminal_before_descriptor_can_return() -> None:
+    composition = _FakeComposition(_completed)
+    adapter_attempted = asyncio.Event()
+
+    async def failing_adapters(
+        timeout: float,
+        *,
+        runtime_audit_task: asyncio.Future[Any],
+    ) -> bool:
+        adapter_attempted.set()
+        raise RuntimeError("adapter detail")
+
+    composition.close_adapters = failing_adapters
+    frame_file = io.BytesIO()
+    lifecycle = _lifecycle(composition=composition, frame_file=frame_file)
+
+    assert await lifecycle.run() == 1
+    assert adapter_attempted.is_set()
+    assert frame_file.closed is False
+    assert lifecycle._stage_states[next(
+        stage for stage in lifecycle._stage_states if stage.name == "ADAPTERS"
+    )].name == "TERMINAL"
+
+
+@pytest.mark.asyncio
+async def test_protocol_terminal_uses_five_plus_five_second_policy_and_cancels_once() -> None:
     allow_terminal = asyncio.Event()
     cancel_count = 0
 
@@ -283,7 +444,6 @@ async def test_protocol_terminal_uses_five_plus_five_second_policy_and_cancels_o
             await allow_terminal.wait()
 
     task = asyncio.create_task(resistant_protocol(), name="acp-run-agent")
-    lifecycle._protocol_task = task
     waits: list[float | None] = []
     real_wait = asyncio.wait
 
@@ -300,7 +460,11 @@ async def test_protocol_terminal_uses_five_plus_five_second_policy_and_cancels_o
         allow_terminal.set()
         return await real_wait(futures, return_when=return_when)
 
-    monkeypatch.setattr(asyncio, "wait", fake_wait)
+    lifecycle = _lifecycle(
+        timeouts=PRODUCTION_TIMEOUTS,
+        task_waiter=fake_wait,
+    )
+    lifecycle._protocol_task = task
     await lifecycle.await_protocol_terminal()
 
     assert waits[:3] == [5.0, 5.0, None]
@@ -321,9 +485,7 @@ async def test_writer_stages_use_two_and_one_second_bounds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_driver_timeout_does_not_advance_cleanup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_runtime_driver_timeout_does_not_advance_cleanup() -> None:
     allow_close = asyncio.Event()
     close_started = asyncio.Event()
 
@@ -332,8 +494,6 @@ async def test_runtime_driver_timeout_does_not_advance_cleanup(
         await allow_close.wait()
 
     composition = _FakeComposition(runtime_close)
-    lifecycle = _lifecycle(composition=composition, timeouts=PRODUCTION_TIMEOUTS)
-    lifecycle._composition = composition
     waits: list[float | None] = []
     real_wait = asyncio.wait
 
@@ -351,7 +511,12 @@ async def test_runtime_driver_timeout_does_not_advance_cleanup(
         allow_close.set()
         return await real_wait(futures, return_when=return_when)
 
-    monkeypatch.setattr(asyncio, "wait", fake_wait)
+    lifecycle = _lifecycle(
+        composition=composition,
+        timeouts=PRODUCTION_TIMEOUTS,
+        task_waiter=fake_wait,
+    )
+    lifecycle._composition = composition
     await lifecycle.await_runtime_driver_terminal()
 
     assert waits == [36.0, None]
@@ -551,34 +716,133 @@ async def test_close_adapters_receives_actual_successful_audit_task() -> None:
     ]
 
 
-def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() -> None:
-    timeouts = PRODUCTION_TIMEOUTS
-    clean_budget = (
-        timeouts.protocol_grace
-        + timeouts.protocol_cancel
-        + timeouts.writer_drain
-        + timeouts.writer_close
-        + timeouts.runtime_driver
-        + timeouts.runtime_audit
-        + timeouts.adapter_cleanup
-    )
-    clock_value = 100.0
+@pytest.mark.asyncio
+async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() -> None:
+    class Clock:
+        value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def advance(self, amount: float) -> None:
+            self.value += amount
+            checkpoints.append(self.value)
+
+    clock = Clock()
+    checkpoints: list[float] = []
     timers: list[_FakeTimer] = []
-    lifecycle = HostLifecycle(
-        io.BytesIO(),
-        timeouts=timeouts,
-        clock=lambda: clock_value,
-        timer_factory=_timer_factory(timers),
-        fail_stop=lambda status: None,
+    fail_stops: list[int] = []
+    protocol_release = asyncio.Event()
+    runtime_release = asyncio.Event()
+    audit_release = asyncio.Event()
+    protocol_waits = 0
+    real_wait = asyncio.wait
+
+    class BudgetStreams(_FakeStreams):
+        async def drain_response_writer(self, timeout: float = 2.0) -> bool:
+            assert timeout == 2.0
+            clock.advance(timeout)
+            return True
+
+        async def close_response_writer(self, timeout: float = 1.0) -> bool:
+            assert timeout == 1.0
+            clock.advance(timeout)
+            return True
+
+    async def runtime_close() -> None:
+        await runtime_release.wait()
+
+    composition = _FakeComposition(runtime_close)
+
+    async def close_adapters(
+        timeout: float,
+        *,
+        runtime_audit_task: asyncio.Future[Any],
+    ) -> bool:
+        assert timeout == 5.0
+        assert runtime_audit_task.done()
+        clock.advance(timeout)
+        composition.adapter_calls.append((timeout, runtime_audit_task))
+        return True
+
+    composition.close_adapters = close_adapters
+
+    async def protocol_runner(*args: Any, **kwargs: Any) -> None:
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await protocol_release.wait()
+
+    async def task_waiter(
+        futures: Any,
+        *,
+        timeout: float | None = None,
+        return_when: Any = asyncio.ALL_COMPLETED,
+    ) -> Any:
+        nonlocal protocol_waits
+        tasks = set(futures)
+        names = {task.get_name() for task in tasks if isinstance(task, asyncio.Task)}
+        if timeout == 5.0 and "acp-run-agent" in names:
+            protocol_waits += 1
+            clock.advance(timeout)
+            if protocol_waits == 1:
+                await asyncio.sleep(0)
+                return set(), tasks
+            await asyncio.sleep(0)
+            protocol_release.set()
+            return await real_wait(tasks)
+        if timeout == 36.0:
+            clock.advance(timeout)
+            runtime_release.set()
+            return await real_wait(tasks)
+        if timeout == 0.1 and "budget-audit-child" in names:
+            clock.advance(5.0)
+            audit_release.set()
+            return await real_wait(tasks)
+        return await real_wait(
+            tasks,
+            timeout=timeout,
+            return_when=return_when,
+        )
+
+    async def composition_factory() -> Any:
+        async def audit_child() -> None:
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await audit_release.wait()
+
+        asyncio.create_task(audit_child(), name="budget-audit-child")
+        return composition
+
+    streams = BudgetStreams()
+    lifecycle = _lifecycle(
+        streams=streams,
+        composition=composition,
+        protocol_runner=protocol_runner,
+        timeouts=PRODUCTION_TIMEOUTS,
+        timers=timers,
+        task_waiter=task_waiter,
     )
+    lifecycle._clock = clock
+    lifecycle._fail_stop = fail_stops.append
+    lifecycle._composition_factory = composition_factory
+    tasks_before = asyncio.all_tasks()
+    run_task = asyncio.create_task(lifecycle.run(), name="budget-lifecycle")
+    while lifecycle._protocol_task is None:
+        await asyncio.sleep(0)
     lifecycle.stop_protocol_intake()
 
-    assert clean_budget == 59.0
-    assert timeouts.watchdog == 65.0
-    assert timeouts.watchdog - clean_budget == 6.0
-    assert lifecycle._watchdog_deadline == 165.0
+    assert await run_task == 0
+    assert clock.value == 59.0
+    assert checkpoints == [5.0, 10.0, 12.0, 13.0, 49.0, 54.0, 59.0]
+    assert lifecycle._watchdog_deadline == 65.0
     assert timers[0].interval == 65.0
-    lifecycle._stop_watchdog()
+    assert timers[0].cancelled
+    assert timers[0].joined
+    assert fail_stops == []
+    assert all(task.done() for task in lifecycle.host_stage_tasks)
+    assert asyncio.all_tasks() == tasks_before
 
 
 def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
@@ -673,6 +937,228 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
     assert completed.returncode == 1
     assert not adapter_marker.exists()
     assert not descriptor_marker.exists()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_real_signal_completes_ordered_subprocess_cleanup(
+    signum: signal.Signals,
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX process signals are unavailable")
+    marker = tmp_path / f"signal-{signum.name}.json"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import json
+        import os
+        import sys
+        from mimir.acp.host import HostLifecycle, LifecycleTimeouts
+
+        marker = {str(marker)!r}
+        events = []
+        stopped = asyncio.Event()
+
+        class Streams:
+            def __init__(self):
+                self.request_reader = asyncio.StreamReader()
+                self.response_writer = object()
+                self.stopped = False
+            def stop_request_intake(self):
+                if self.stopped:
+                    return
+                self.stopped = True
+                events.append("intake")
+                self.request_reader.feed_eof()
+                stopped.set()
+            async def drain_response_writer(self, timeout=2.0):
+                events.append("drain")
+                return True
+            async def close_response_writer(self, timeout=1.0):
+                events.append("writer-close")
+                return True
+            def writer_helper_tasks(self):
+                return ()
+
+        class Composition:
+            bundle = object()
+            def __init__(self):
+                self.driver = None
+            def start_runtime_close(self):
+                if self.driver is None:
+                    async def close():
+                        events.append("runtime")
+                    self.driver = asyncio.create_task(close(), name="signal-runtime")
+                return self.driver
+            def explicit_adapter_tasks(self):
+                return frozenset()
+            async def close_adapters(self, timeout, *, runtime_audit_task):
+                assert runtime_audit_task.done()
+                assert runtime_audit_task.exception() is None
+                events.append("adapters")
+                return True
+
+        async def main():
+            streams = Streams()
+            composition = Composition()
+            async def streams_factory(frame):
+                return streams
+            async def composition_factory():
+                return composition
+            async def protocol_runner(*args, **kwargs):
+                os.write(2, b"READY\\n")
+                await stopped.wait()
+                events.append("protocol")
+            lifecycle = HostLifecycle(
+                sys.stdout.buffer,
+                timeouts=LifecycleTimeouts(
+                    protocol_grace=0.5,
+                    protocol_cancel=0.5,
+                    writer_drain=0.2,
+                    writer_close=0.1,
+                    runtime_driver=0.5,
+                    runtime_audit=0.2,
+                    adapter_cleanup=0.2,
+                    audit_rescan=0.01,
+                    watchdog=3.0,
+                ),
+                streams_factory=streams_factory,
+                composition_factory=composition_factory,
+                agent_factory=lambda bundle: object(),
+                protocol_runner=protocol_runner,
+            )
+            status = await lifecycle.run()
+            with open(marker, "w") as output:
+                json.dump({{"status": status, "events": events}}, output)
+            return status
+
+        raise SystemExit(asyncio.run(main()))
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stderr is not None
+    assert process.stderr.readline() == b"READY\n"
+    os.kill(process.pid, signum)
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, stderr.decode()
+    assert stdout == b""
+    result = json.loads(marker.read_text())
+    assert result["status"] == 0
+    assert result["events"] == [
+        "intake",
+        "protocol",
+        "drain",
+        "writer-close",
+        "runtime",
+        "adapters",
+    ]
+
+
+def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
+    tmp_path: Path,
+) -> None:
+    adapter_marker = tmp_path / "backpressure-adapter"
+    returned_marker = tmp_path / "backpressure-returned"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import sys
+        from mimir.acp.host import HostLifecycle, LifecycleTimeouts
+
+        adapter_marker = {str(adapter_marker)!r}
+        returned_marker = {str(returned_marker)!r}
+
+        class Writer:
+            def __init__(self, frame):
+                self.frame = frame
+            def write(self, data):
+                return self.frame.write(data)
+
+        class Streams:
+            def __init__(self, frame):
+                self.request_reader = asyncio.StreamReader()
+                self.response_writer = Writer(frame)
+            def stop_request_intake(self):
+                self.request_reader.feed_eof()
+            async def drain_response_writer(self, timeout=2.0):
+                return True
+            async def close_response_writer(self, timeout=1.0):
+                return True
+            def writer_helper_tasks(self):
+                return ()
+
+        class Composition:
+            bundle = object()
+            def __init__(self):
+                self.driver = None
+            def start_runtime_close(self):
+                if self.driver is None:
+                    self.driver = asyncio.create_task(asyncio.sleep(0))
+                return self.driver
+            def explicit_adapter_tasks(self):
+                return frozenset()
+            async def close_adapters(self, timeout, *, runtime_audit_task):
+                open(adapter_marker, "w").close()
+                return True
+
+        async def main():
+            composition = Composition()
+            async def streams_factory(frame):
+                return Streams(frame)
+            async def composition_factory():
+                return composition
+            async def protocol_runner(agent, *, response_writer, **kwargs):
+                payload = b"x" * (1024 * 1024)
+                for _ in range(32):
+                    response_writer.write(payload)
+            lifecycle = HostLifecycle(
+                sys.stdout.buffer,
+                timeouts=LifecycleTimeouts(
+                    protocol_grace=0.05,
+                    protocol_cancel=0.05,
+                    writer_drain=0.05,
+                    writer_close=0.05,
+                    runtime_driver=0.05,
+                    runtime_audit=0.05,
+                    adapter_cleanup=0.05,
+                    audit_rescan=0.005,
+                    watchdog=0.3,
+                ),
+                streams_factory=streams_factory,
+                composition_factory=composition_factory,
+                agent_factory=lambda bundle: object(),
+                protocol_runner=protocol_runner,
+            )
+            await lifecycle.run()
+            open(returned_marker, "w").close()
+
+        asyncio.run(main())
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    started = time.monotonic()
+    process.wait(timeout=5)
+    elapsed = time.monotonic() - started
+    stdout, stderr = process.communicate(timeout=2)
+
+    assert process.returncode == 1, stderr.decode()
+    assert elapsed < 2.0
+    assert stdout
+    assert not adapter_marker.exists()
+    assert not returned_marker.exists()
 
 
 def test_lifecycle_has_no_environment_or_authentication_timeout_controls() -> None:
