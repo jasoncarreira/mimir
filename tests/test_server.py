@@ -18,7 +18,14 @@ needed to prove the behaviour under test.
 """
 from __future__ import annotations
 
+import ast
+import asyncio
+import inspect
 import logging
+import sys
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -37,7 +44,155 @@ from mimir.server import (
     _handle_health,
     _handle_event,
     _handle_root,
+    build_app,
 )
+
+
+def _production_call_sites(call_name: str) -> set[str]:
+    root = Path(__file__).resolve().parent.parent
+    sites: set[str] = set()
+    for path in (root / "mimir").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if isinstance(function, ast.Name) and function.id == call_name:
+                sites.add(path.relative_to(root).as_posix())
+            elif isinstance(function, ast.Attribute) and function.attr == call_name:
+                sites.add(path.relative_to(root).as_posix())
+    return sites
+
+
+def test_runtime_is_only_production_agent_constructor() -> None:
+    assert _production_call_sites("Agent") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_global_buffer_writer() -> None:
+    assert _production_call_sites("set_global_buffer") == {"mimir/runtime.py"}
+
+
+def test_runtime_is_only_production_mcp_tools_writer() -> None:
+    assert _production_call_sites("set_mcp_tools") == {"mimir/runtime.py"}
+
+
+def _writer_call_sites(writer_names: set[str]) -> dict[str, set[str]]:
+    root = Path(__file__).resolve().parent.parent
+    sites = {name: set() for name in writer_names}
+    for path in (root / "mimir").rglob("*.py"):
+        relative = path.relative_to(root).as_posix()
+        module_name = relative.removesuffix(".py").replace("/", ".")
+        package_parts = module_name.split(".")[:-1]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        aliases: dict[str, str] = {}
+        local_writers = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in writer_names
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    prefix = package_parts[: len(package_parts) - node.level + 1]
+                    base = ".".join([*prefix, *(node.module or "").split(".")]).rstrip(".")
+                else:
+                    base = node.module or ""
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = ".".join(
+                        part for part in (base, alias.name) if part
+                    )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            writer: str | None = None
+            if isinstance(node.func, ast.Name):
+                imported = aliases.get(node.func.id, "")
+                if imported.rsplit(".", 1)[-1] in writer_names:
+                    writer = imported.rsplit(".", 1)[-1]
+                elif node.func.id in local_writers:
+                    writer = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                parts: list[str] = []
+                value: ast.expr = node.func
+                while isinstance(value, ast.Attribute):
+                    parts.append(value.attr)
+                    value = value.value
+                if isinstance(value, ast.Name):
+                    base = aliases.get(value.id)
+                    if base is not None:
+                        resolved = ".".join([base, *reversed(parts)])
+                        candidate = resolved.rsplit(".", 1)[-1]
+                        if candidate in writer_names and resolved.startswith(
+                            ("mimir.tools", "mimir.history", "mimir.event_logger")
+                        ):
+                            writer = candidate
+            if writer is not None:
+                sites[writer].add(relative)
+    return sites
+
+
+def test_production_global_writers_are_confined() -> None:
+    root = Path(__file__).resolve().parent.parent
+    expected = {
+        "init_logger": {
+            "mimir/server.py",
+            "mimir/commands/worklink.py",
+            "mimir/wiki_backlinks.py",
+        },
+        "set_github_identity_degraded_callback": {"mimir/runtime.py"},
+        "set_forge_client": {"mimir/runtime.py", "mimir/tools/forge.py"},
+        "set_memory_client": {"mimir/agent.py", "mimir/runtime.py"},
+        "set_indexer": {"mimir/runtime.py"},
+        "set_index_generator": {"mimir/runtime.py"},
+        "set_turns_log_path": {"mimir/runtime.py"},
+        "set_channel_registry": {"mimir/runtime.py"},
+        "set_identity_resolver": {"mimir/runtime.py"},
+        "set_dispatcher": {"mimir/runtime.py"},
+        "set_scheduler": {"mimir/runtime.py"},
+        "set_arbiter": {"mimir/runtime.py"},
+        "set_global_buffer": {"mimir/runtime.py"},
+        "set_commitments_store": {"mimir/runtime.py"},
+        "set_spawn_config": {"mimir/runtime.py"},
+        "set_shell_job_registry": {"mimir/runtime.py"},
+        "set_home": {"mimir/runtime.py"},
+        "set_mcp_tools": {"mimir/runtime.py"},
+    }
+    assert _writer_call_sites(set(expected)) == expected
+
+    saga_config_writers = {
+        path.relative_to(root).as_posix()
+        for path in (root / "mimir").rglob("*.py")
+        if 'os.environ["SAGA_CONFIG"] =' in path.read_text(encoding="utf-8")
+    }
+    assert saga_config_writers == {"mimir/runtime.py", "mimir/reindex.py"}
+
+    server_source = (root / "mimir" / "server.py").read_text(encoding="utf-8")
+    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id' in server_source
+    assert "_access_log.addFilter(_MaskApiKeyInAccessLog())" in server_source
+
+    server_tree = ast.parse(
+        server_source
+    )
+    module_assignments = [
+        node
+        for node in server_tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
+    assert not any(
+        target.id == "_STARTUP_BACKGROUND_TASKS"
+        for node in module_assignments
+        for target in (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -46,7 +201,7 @@ from mimir.server import (
 
 
 @pytest.mark.asyncio
-async def test_start_mcp_servers_publishes_tools_and_policy_attention(
+async def test_start_mcp_servers_returns_tools_and_policy_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from dataclasses import replace
@@ -78,23 +233,17 @@ async def test_start_mcp_servers_publishes_tools_and_policy_attention(
     manager = MagicMock()
     manager.start_servers = AsyncMock(return_value=[tool])
     manager.shutdown = AsyncMock()
-    published: list[Any] = []
     events: list[tuple[str, dict[str, Any]]] = []
-
-    monkeypatch.setattr("mimir.mcp_client.MCPManager", lambda: manager)
-    monkeypatch.setattr("mimir.tools.set_mcp_tools", lambda tools: published.extend(tools))
 
     async def capture(kind: str, **fields: Any) -> None:
         events.append((kind, fields))
 
     monkeypatch.setattr("mimir.server.log_event", capture)
-    app = web.Application()
-
-    await _start_mcp_servers(app, [config])
+    returned_manager, tools = await _start_mcp_servers(manager, [config])
 
     manager.start_servers.assert_awaited_once_with([config])
-    assert published == [tool]
-    assert app["mcp_manager"] is manager
+    assert tools == [tool]
+    assert returned_manager is manager
     assert events[0] == (
         "mcp_servers_ready",
         {"count": 1, "tool_names": ["mcp_demo_read_item"]},
@@ -102,6 +251,1168 @@ async def test_start_mcp_servers_publishes_tools_and_policy_attention(
     attention = next(fields for kind, fields in events if kind == "mcp_policy_attention_required")
     assert attention["count"] >= 1
     assert any(issue.get("actual_policy") == "policy-v1" for issue in attention["issues"])
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_failure_shuts_down_and_returns_no_manager() -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock()
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is None
+    assert tools == []
+    manager.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails() -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(side_effect=RuntimeError("start failed"))
+    manager.shutdown = AsyncMock(side_effect=RuntimeError("shutdown failed"))
+
+    returned_manager, tools = await _start_mcp_servers(manager, [object()])
+
+    assert returned_manager is manager
+    assert tools == []
+
+
+def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _RuntimeFieldProxy, _RuntimeSlot
+
+    slot = _RuntimeSlot()
+    proxy = _RuntimeFieldProxy(slot, "turn_event_bus")
+    with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
+        proxy.subscribe("channel")
+
+    bus = SimpleNamespace(subscribe=lambda channel: f"queue:{channel}")
+    slot.bundle = SimpleNamespace(turn_event_bus=bus)
+    assert proxy.subscribe("channel") == "queue:channel"
+
+
+@pytest.mark.asyncio
+async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    config = SimpleNamespace(
+        operator_alert_channel="ops",
+        pairing_operator_digest_delay_seconds=60.0,
+        pairing_dm_auto_reply_enabled=True,
+        pairing_dm_auto_reply_interval_seconds=60.0,
+        pairing_dm_auto_reply_text="pending",
+        pairing_pending_max=100,
+    )
+    notifier = _PairingNotifier(config, channels)
+    await notifier.notify_operator(
+        canonical="alice",
+        display="Alice",
+        platform="slack",
+        channel_id="dm-alice",
+        delivery="dm",
+    )
+    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-alice")
+    await asyncio.sleep(0)
+    operator_task = notifier._operator_task
+    dm_task = notifier._dm_reply_task
+
+    await notifier.aclose()
+    await notifier.aclose()
+
+    assert notifier._operator_task is None
+    assert notifier._dm_reply_task is None
+    assert notifier._operator_pending == []
+    assert notifier._dm_reply_queue.empty()
+    assert operator_task is not None and operator_task.cancelled()
+    assert dm_task is not None and dm_task.done()
+
+
+@dataclass
+class _ServerControl:
+    events: list[str] = field(default_factory=list)
+    failures: dict[str, BaseException] = field(default_factory=dict)
+    runtime_failure: BaseException | None = None
+    mcp_enabled: bool = False
+    mcp_returns_manager: bool = True
+    panel_enabled: bool = False
+    optional_bridges: bool = False
+    scheduler_should_start: bool = True
+    bundle: Any | None = None
+    app: web.Application | None = None
+    route_kwargs: dict[str, Any] = field(default_factory=dict)
+    core: Any | None = None
+    dispatcher: Any | None = None
+    scheduler: Any | None = None
+    channels: Any | None = None
+    web_chat: Any | None = None
+    mcp_manager: Any | None = None
+    panel: Any | None = None
+
+    def hit(self, name: str) -> None:
+        self.events.append(name)
+        failure = self.failures.get(name)
+        if failure is not None:
+            raise failure
+
+
+def _controlled_server_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: _ServerControl | None = None,
+) -> tuple[web.Application, _ServerControl]:
+    import mimir.background_tasks
+    import mimir.doc_seed
+    import mimir.liveness
+    import mimir.mcp_client
+    import mimir.runtime
+    import mimir.skill_install
+    import mimir.tools
+    import mimir.update_on_start
+    import mimir.worklink.autonomy
+    from mimir.config import Config
+    from mimir.history import set_global_buffer
+
+    control = control or _ServerControl()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_API_KEY", "test-key")
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
+    monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
+    monkeypatch.setenv("MIMIR_LIVENESS_BEAT_SECONDS", "0")
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path / "missing-source"))
+    monkeypatch.setenv("DISCORD_TOKEN", "")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "")
+
+    class Resolver:
+        def resolve_web_key(self, key: str) -> None:
+            return None
+
+        def has_web_keys(self) -> bool:
+            return False
+
+    resolver = Resolver()
+    chat_skills = object()
+    core = SimpleNamespace(
+        identity_resolver=resolver,
+        aliases_loaded=4,
+        saga_db_path=tmp_path / ".mimir" / "saga.db",
+        chat_skill_registry=chat_skills,
+    )
+    control.core = core
+
+    def create_core_services(config: Any) -> Any:
+        control.hit("core")
+        return core
+
+    class Dispatcher:
+        def __init__(self, config: Any, run_turn: Any = None, *, resolver: Any = None) -> None:
+            control.hit("dispatcher")
+            self.config = config
+            self.resolver = resolver
+            self._run_turn = run_turn
+            self._on_channel_idle = None
+            self._on_inject = None
+            self._on_event = None
+            self._on_pairing_required = None
+            control.dispatcher = self
+
+        def set_run_turn(self, run_turn: Any) -> None:
+            self._run_turn = run_turn
+            control.events.append("dispatcher:bound" if run_turn is not None else "dispatcher:unbound")
+
+        async def enqueue(self, event: Any) -> bool:
+            control.events.append(f"enqueue:{self._run_turn is not None}")
+            return self._run_turn is not None
+
+        async def drain(self, *, timeout: float) -> None:
+            control.hit("dispatcher:drain")
+
+        def is_channel_busy(self, channel_id: str) -> bool:
+            return False
+
+    class Scheduler:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            control.hit("scheduler")
+            self._started = False
+            self._scheduler = SimpleNamespace(running=False)
+            self._arbiter = None
+            control.scheduler = self
+
+        def __getattr__(self, name: str) -> Any:
+            if not name.startswith("add_"):
+                raise AttributeError(name)
+
+            def add(*args: Any, **kwargs: Any) -> Any:
+                control.hit(f"scheduler:{name}")
+                if name == "add_saga_consolidate_job":
+                    return control.scheduler_should_start
+                if name == "add_poller_jobs":
+                    return 0
+                return False
+
+            return add
+
+        def reload(self) -> dict[str, int]:
+            control.hit("scheduler:reload")
+            return {"registered": 0, "invalid": 0}
+
+        def start(self) -> None:
+            self._started = True
+            self._scheduler.running = True
+            control.hit("scheduler:start")
+
+        def stop(self) -> None:
+            self._started = False
+            self._scheduler.running = False
+            control.hit("scheduler:stop")
+
+        def set_arbiter(self, arbiter: Any) -> None:
+            self._arbiter = arbiter
+
+    class Channels:
+        def __init__(self) -> None:
+            self._bridges: list[Any] = []
+            control.channels = self
+
+        def register(self, bridge: Any) -> None:
+            self._bridges.append(bridge)
+            control.events.append(f"register:{type(bridge).__name__}")
+
+        def bridges(self) -> list[Any]:
+            return list(self._bridges)
+
+        async def connect_all(self) -> None:
+            control.events.append(f"bridges:bound:{control.dispatcher._run_turn is not None}")
+            control.hit("bridges:connect")
+
+        async def disconnect_all(self) -> None:
+            control.hit("bridges:disconnect")
+
+        async def send(self, *args: Any, **kwargs: Any) -> None:
+            control.hit("channels:send")
+
+        def find(self, channel_id: str) -> None:
+            return None
+
+    class BenchBridge:
+        def __init__(self, *, home: Path) -> None:
+            self.home = home
+            control.hit("bench")
+
+    class WebChatBridge:
+        def __init__(self, *, enqueue: Any, home: Path, chat_skill_registry: Any) -> None:
+            self.enqueue = enqueue
+            self.home = home
+            self.chat_skill_registry = chat_skill_registry
+            control.web_chat = self
+            control.hit("webchat")
+
+        def register_routes(self, app: web.Application) -> None:
+            control.hit("webchat:routes")
+
+            async def ok(request: web.Request) -> web.Response:
+                return web.json_response({"ok": True})
+
+            app.router.add_post("/chat", ok)
+            app.router.add_get("/chat/stream", ok)
+
+    class DiscordBridge:
+        def __init__(self, **kwargs: Any) -> None:
+            control.hit("discord")
+
+    class SlackBridge:
+        def __init__(self, **kwargs: Any) -> None:
+            control.hit("slack")
+
+    class Indexer:
+        async def start(self, **kwargs: Any) -> None:
+            control.hit("indexer:start")
+
+        async def sweep(self) -> None:
+            control.hit("indexer:sweep")
+
+    class Agent:
+        def __init__(self) -> None:
+            self._commitments = object()
+            self._rate_limits = object()
+
+        async def run_turn(self, event: Any) -> None:
+            return None
+
+    class Bundle:
+        def __init__(self, adapters: Any) -> None:
+            self.agent = Agent()
+            self.turn_logger = object()
+            self.message_buffer = object()
+            self.indexes = object()
+            self.indexer = Indexer()
+            self.saga_client = object()
+            self.sessions = object()
+            self.subagent_inbox = object()
+            self.commitments_store = SimpleNamespace(list=lambda *args, **kwargs: [])
+            self.turn_event_bus = SimpleNamespace(
+                subscribe=lambda channel: asyncio.Queue(),
+                unsubscribe=lambda channel, queue: None,
+            )
+            self.replayed_messages = 9
+            self.adapters = adapters
+            self.installed_tools: list[Any] = []
+            self.closed = False
+
+        def install_mcp_tools(self, tools: list[Any]) -> None:
+            self.installed_tools = list(tools)
+            control.hit("bundle:mcp")
+
+        async def aclose(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            self.adapters.dispatcher.set_run_turn(None)
+            set_global_buffer(None)
+            control.hit("bundle:close")
+
+    async def create_agent_runtime(config: Any, core_arg: Any, adapters: Any) -> Any:
+        control.hit("runtime")
+        if control.runtime_failure is not None:
+            raise control.runtime_failure
+        bundle = Bundle(adapters)
+        control.bundle = bundle
+        adapters.dispatcher.set_run_turn(bundle.agent.run_turn)
+        set_global_buffer(bundle.message_buffer)
+        return bundle
+
+    class ActivityPanel:
+        def __init__(self, bus: Any, channels: Any, channel_ids: Any) -> None:
+            self.bus = bus
+            self.channels = channels
+            self.channel_ids = channel_ids
+            control.panel = self
+            control.hit("panel:construct")
+
+        def start(self) -> None:
+            control.hit("panel:start")
+
+        async def stop(self) -> None:
+            control.hit("panel:stop")
+
+    class MCPManager:
+        def __init__(self, **kwargs: Any) -> None:
+            control.mcp_manager = self
+            control.hit("mcp:construct")
+
+        async def shutdown(self) -> None:
+            control.hit("mcp:shutdown")
+
+    class MCPPolicyStore:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def load_server_configs(self) -> list[Any]:
+            return []
+
+    async def start_mcp(manager: Any, configs: list[Any], **kwargs: Any) -> tuple[Any | None, list[Any]]:
+        assert control.app is not None
+        assert control.app["startup_state"].mcp_manager is manager
+        control.hit("mcp:start")
+        if control.mcp_returns_manager:
+            return manager, ["mcp-tool"]
+        return None, []
+
+    async def event(kind: str, **fields: Any) -> None:
+        control.hit(f"log:{kind}")
+
+    def register_routes(app: web.Application, **kwargs: Any) -> None:
+        control.route_kwargs = kwargs
+        control.hit("webui:routes")
+
+        async def ok(request: web.Request) -> web.Response:
+            return web.json_response({"ok": True})
+
+        app.router.add_get("/api/v1/turn-events", ok)
+
+    async def cancel_tasks(tasks: set[asyncio.Task[Any]], *, label: str) -> list[BaseException]:
+        control.hit(f"cancel:{label}")
+        return await mimir.background_tasks.cancel_background_tasks(tasks, label=label)
+
+    monkeypatch.setattr("mimir.server.init_logger", lambda *args, **kwargs: control.hit("logger"))
+    monkeypatch.setattr("mimir.server.seed_subagent_defs", lambda home: {})
+    monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
+    monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
+    monkeypatch.setattr("mimir.server.seed_prompts", lambda home: None)
+    monkeypatch.setattr("mimir.server.seed_scheduler", lambda home: None)
+    monkeypatch.setattr("mimir.server.ensure_chainlink_initialized", lambda home: None)
+    monkeypatch.setattr("mimir.server.Dispatcher", Dispatcher)
+    monkeypatch.setattr("mimir.server.Scheduler", Scheduler)
+    monkeypatch.setattr("mimir.server.ChannelRegistry", Channels)
+    monkeypatch.setattr("mimir.server.BenchBridge", BenchBridge)
+    monkeypatch.setattr("mimir.server.WebChatBridge", WebChatBridge)
+    monkeypatch.setattr("mimir.server.log_event", event)
+    monkeypatch.setattr("mimir.server.repo_binding_startup_alerts", lambda: [])
+    monkeypatch.setattr("mimir.server.reattach_inflight_worklink_runs", lambda home: [])
+    monkeypatch.setattr("mimir.server.cancel_background_tasks", cancel_tasks)
+    monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
+    monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
+    monkeypatch.setattr(mimir.runtime, "create_core_services", create_core_services)
+    monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: control.hit("preflight"))
+    monkeypatch.setattr(mimir.doc_seed, "refresh_docs", lambda home: {})
+    monkeypatch.setattr(
+        mimir.skill_install,
+        "auto_update_installed_optional_skills",
+        lambda home: SimpleNamespace(any_updates=False),
+    )
+    monkeypatch.setattr(mimir.update_on_start, "consume_startup_events", AsyncMock(return_value=0))
+    monkeypatch.setattr(mimir.update_on_start, "consume_update_digest", AsyncMock(return_value=0))
+    monkeypatch.setattr(mimir.update_on_start, "emit_version_bump_digest", AsyncMock(return_value=False))
+    monkeypatch.setattr(mimir.liveness, "detect_unclean_restart", lambda home: None)
+    monkeypatch.setattr(
+        mimir.liveness,
+        "mark_session_running",
+        lambda *args, **kwargs: control.hit("liveness:running"),
+    )
+    monkeypatch.setattr(
+        mimir.liveness,
+        "mark_clean_shutdown",
+        lambda home: control.hit("liveness:clean"),
+    )
+    monkeypatch.setattr(
+        mimir.worklink.autonomy,
+        "release_claims_for_graceful_shutdown",
+        lambda *args, **kwargs: control.hit("claims:release") or [],
+    )
+    monkeypatch.setattr(mimir.mcp_client, "MCPManager", MCPManager)
+    monkeypatch.setattr(mimir.mcp_client, "MCPPolicyStore", MCPPolicyStore)
+    monkeypatch.setitem(
+        sys.modules,
+        "mimir.bridges.discord",
+        SimpleNamespace(DiscordBridge=DiscordBridge),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mimir.bridges.slack",
+        SimpleNamespace(SlackBridge=SlackBridge),
+    )
+    monkeypatch.setattr("mimir.bridges._activity_panel.ActivityPanel", ActivityPanel)
+
+    config = Config.from_env()
+    config = replace(
+        config,
+        home=tmp_path,
+        api_key="test-key",
+        git_tracking_enabled=False,
+        liveness_beat_seconds=0,
+        activity_panel_channels=("ops",) if control.panel_enabled else (),
+        mcp_servers=[SimpleNamespace(policy_version="", server_config_id="server")]
+        if control.mcp_enabled
+        else [],
+        discord_token="discord" if control.optional_bridges else "",
+        slack_bot_token="slack-bot" if control.optional_bridges else "",
+        slack_app_token="slack-app" if control.optional_bridges else "",
+        oauth_credentials_path=None,
+        commitments_due_check_cron="",
+        minimax_usage_poll_cron="",
+    )
+    set_global_buffer(None)
+    app = build_app(config)
+    control.app = app
+    pairing_notifier = app["pairing_notifier"]
+    original_pairing_close = pairing_notifier.aclose
+
+    async def close_pairing() -> None:
+        control.hit("pairing:close")
+        await original_pairing_close()
+
+    pairing_notifier.aclose = close_pairing
+    return app, control
+
+
+async def _run_startup(app: web.Application) -> None:
+    hooks = [
+        hook
+        for hook in app.on_startup
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+    ]
+    assert len(hooks) == 1
+    await hooks[0](app)
+
+
+async def _run_cleanup(app: web.Application) -> None:
+    hooks = [
+        hook
+        for hook in app.on_cleanup
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+    ]
+    assert len(hooks) == 1
+    await hooks[0](app)
+
+
+def test_build_app_remains_synchronous_with_unchanged_signature_and_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    assert inspect.iscoroutinefunction(build_app) is False
+    assert str(inspect.signature(build_app)) == "(config: 'Config') -> 'web.Application'"
+    assert isinstance(app, web.Application)
+    assert control.events.index("preflight") < control.events.index("logger")
+    assert control.events.index("logger") < control.events.index("core")
+    assert (tmp_path / "memory" / "core").is_dir()
+    assert (tmp_path / "messages").is_dir()
+
+
+def test_build_app_constructs_core_before_unbound_adapters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    assert control.events.index("core") < control.events.index("dispatcher")
+    assert control.events.index("dispatcher") < control.events.index("scheduler")
+    assert app["dispatcher"].resolver is control.core.identity_resolver
+    assert app["dispatcher"]._run_turn is None
+    assert app["scheduler"]._started is False
+
+
+def test_server_collaborator_and_bridge_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(optional_bridges=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    assert [type(bridge).__name__ for bridge in app["channels"].bridges()] == [
+        "BenchBridge",
+        "WebChatBridge",
+        "DiscordBridge",
+        "SlackBridge",
+    ]
+    assert app["pairing_notifier"]._channels is app["channels"]
+    assert control.web_chat.chat_skill_registry is control.core.chat_skill_registry
+    assert control.web_chat.enqueue.__self__ is app["dispatcher"]
+
+
+def test_route_and_hook_parity_with_runtime_proxies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.server import _RuntimeFieldProxy
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+
+    assert {
+        ("GET", "/"),
+        ("POST", "/event"),
+        ("GET", "/health"),
+        ("POST", "/api/memory/consolidate"),
+        ("GET", "/api/v1/turn-events"),
+        ("POST", "/chat"),
+        ("GET", "/chat/stream"),
+    } <= routes
+    assert sum(
+        getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        for hook in app.on_startup
+    ) == 1
+    assert sum(
+        getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        for hook in app.on_cleanup
+    ) == 1
+    assert isinstance(control.route_kwargs["commitments_store"], _RuntimeFieldProxy)
+    assert isinstance(control.route_kwargs["turn_event_bus"], _RuntimeFieldProxy)
+    with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
+        control.route_kwargs["turn_event_bus"].subscribe("channel")
+
+
+@pytest.mark.asyncio
+async def test_startup_constructs_runtime_first_and_publishes_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    control.events.clear()
+
+    assert app["agent"] is None
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    assert control.events[0] == "runtime"
+    assert "bridges:bound:True" in control.events
+    assert app["agent"] is control.bundle.agent
+    assert app["agent_runtime"] is control.bundle
+    assert app["runtime_slot"].bundle is control.bundle
+    assert app["startup_state"].runtime_published is True
+    assert control.route_kwargs["turn_event_bus"].subscribe("channel") is not None
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_operational_startup_order_and_mcp_bundle_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    control.events.clear()
+
+    await _run_startup(app)
+    await asyncio.sleep(0)
+
+    ordered = [
+        "runtime",
+        "panel:construct",
+        "panel:start",
+        "indexer:start",
+        "bridges:connect",
+        "mcp:construct",
+        "mcp:start",
+        "bundle:mcp",
+        "scheduler:start",
+        "liveness:running",
+    ]
+    positions = [control.events.index(name) for name in ordered]
+    assert positions == sorted(positions)
+    assert app["mcp_manager"] is control.mcp_manager
+    assert control.bundle.installed_tools == ["mcp-tool"]
+    assert app["activity_panel"] is control.panel
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_bad_cron_and_mcp_start_best_effort_policies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(mcp_enabled=True, mcp_returns_manager=False)
+    control.failures["scheduler:add_saga_consolidate_job"] = ValueError("bad cron")
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    await _run_startup(app)
+
+    assert app["agent"] is control.bundle.agent
+    assert app["mcp_manager"] is None
+    assert control.bundle.installed_tools == []
+    assert "log:scheduler_invalid_cron" in control.events
+    assert "bridges:bound:True" in control.events
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_bridge_connection_keeps_per_bridge_failures_best_effort() -> None:
+    from mimir.channel_registry import ChannelRegistry
+
+    events: list[str] = []
+
+    class Bridge:
+        prefixes: tuple[str, ...] = ()
+
+        def __init__(self, name: str, failure: BaseException | None = None) -> None:
+            self.name = name
+            self.failure = failure
+
+        async def connect(self) -> None:
+            events.append(self.name)
+            if self.failure is not None:
+                raise self.failure
+
+        async def disconnect(self) -> None:
+            return None
+
+        def matches(self, channel_id: str) -> bool:
+            return False
+
+    channels = ChannelRegistry()
+    channels.register(Bridge("failed", RuntimeError("bridge unavailable")))
+    channels.register(Bridge("healthy"))
+
+    await channels.connect_all()
+
+    assert events == ["failed", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_startup_state_records_every_attempt_and_acquisition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    await _run_startup(app)
+    state = app["startup_state"]
+
+    assert state.runtime_attempted is True
+    assert state.bundle is control.bundle
+    assert state.runtime_published is True
+    assert state.activity_panel is control.panel
+    assert state.activity_panel_start_attempted is True
+    assert state.indexer_start_attempted is True
+    assert state.bridges_connect_attempted is True
+    assert state.mcp_start_attempted is True
+    assert state.mcp_manager is control.mcp_manager
+    assert state.scheduler_start_attempted is True
+    assert state.scheduler_started is True
+    assert state.liveness_mark_attempted is True
+    assert state.compensated is False
+
+    await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_failed_factory_cancels_resistant_app_tasks_and_preserves_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.background_tasks
+
+    original = LookupError("runtime failed")
+    control = _ServerControl(runtime_failure=original)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(resistant(), name="resistant-server-task")
+    app["startup_background_tasks"].add(task)
+    await started.wait()
+    monkeypatch.setattr(mimir.background_tasks, "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        with pytest.raises(LookupError) as caught:
+            await _run_startup(app)
+        assert caught.value is original
+        assert "resistant-server-task" in " ".join(getattr(original, "__notes__", []))
+        assert app["startup_background_tasks"] == set()
+        assert app["startup_state"].compensated is True
+        assert app["agent"] is None
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_liveness_write_then_raise_is_compensated_and_clears_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("liveness write failed")
+    control = _ServerControl()
+    control.failures["liveness:running"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "liveness:clean" in control.events
+    assert "bundle:close" in control.events
+    assert "pairing:close" in control.events
+    assert app["agent"] is None
+    assert app["runtime_slot"].bundle is None
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_partial_scheduler_start_is_stopped_during_compensation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("scheduler partial start")
+    control = _ServerControl()
+    control.failures["scheduler:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert app["startup_state"].scheduler_start_attempted is True
+    assert app["startup_state"].scheduler_started is False
+    assert "scheduler:stop" in control.events
+    assert control.scheduler._scheduler.running is False
+
+
+@pytest.mark.asyncio
+async def test_retained_mcp_manager_is_shutdown_on_later_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("later startup failure")
+    control = _ServerControl(mcp_enabled=True)
+    control.failures["scheduler:reload"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert control.events.index("mcp:start") < control.events.index("mcp:shutdown")
+    assert app["mcp_manager"] is None
+    assert app["startup_state"].mcp_manager is None
+
+
+@pytest.mark.asyncio
+async def test_bridge_attempt_is_disconnected_on_startup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("bridge connection failed")
+    control = _ServerControl()
+    control.failures["bridges:connect"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "bridges:disconnect" in control.events
+    assert app["startup_state"].bridges_connect_attempted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["runtime", "indexer:start"])
+async def test_startup_failure_distinguishes_factory_and_published_bundle_rollback(
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError(f"{failure_stage} failed")
+    control = _ServerControl(
+        runtime_failure=original if failure_stage == "runtime" else None,
+    )
+    if failure_stage != "runtime":
+        control.failures[failure_stage] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert ("bundle:close" in control.events) is (failure_stage != "runtime")
+    assert app["dispatcher"]._run_turn is None
+    assert app["agent_runtime"] is None
+
+
+@pytest.mark.asyncio
+async def test_partial_activity_panel_start_is_stopped_and_pairing_is_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("panel start failed")
+    control = _ServerControl(panel_enabled=True)
+    control.failures["panel:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(RuntimeError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    assert "bundle:close" in control.events
+    assert "panel:stop" in control.events
+    assert "pairing:close" in control.events
+    assert app["activity_panel"] is None
+
+
+@pytest.mark.asyncio
+async def test_startup_compensation_continues_after_errors_and_reraises_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = LookupError("startup terminal failure")
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    control.failures.update(
+        {
+            "liveness:running": original,
+            "scheduler:stop": RuntimeError("scheduler cleanup"),
+            "mcp:shutdown": RuntimeError("mcp cleanup"),
+            "bridges:disconnect": RuntimeError("bridge cleanup"),
+            "bundle:close": RuntimeError("bundle cleanup"),
+            "panel:stop": RuntimeError("panel cleanup"),
+            "pairing:close": RuntimeError("pairing cleanup"),
+        }
+    )
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    with pytest.raises(LookupError) as caught:
+        await _run_startup(app)
+
+    assert caught.value is original
+    for event_name in (
+        "scheduler:stop",
+        "mcp:shutdown",
+        "bridges:disconnect",
+        "bundle:close",
+        "panel:stop",
+        "pairing:close",
+    ):
+        assert event_name in control.events
+    assert "cleanup failure(s)" in " ".join(getattr(original, "__notes__", []))
+    assert app["agent"] is None
+    assert app["startup_state"].compensated is True
+
+
+@pytest.mark.asyncio
+async def test_server_startup_and_cleanup_resource_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    control.events.clear()
+
+    await _run_cleanup(app)
+
+    ordered = [
+        "liveness:clean",
+        "claims:release",
+        "log:shutdown",
+        "dispatcher:drain",
+        "cancel:server cleanup",
+        "scheduler:stop",
+        "bundle:close",
+        "panel:stop",
+        "pairing:close",
+        "bridges:disconnect",
+        "mcp:shutdown",
+    ]
+    positions = [control.events.index(name) for name in ordered]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_continues_aggregates_errors_and_clears_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    control.events.clear()
+    control.failures.update(
+        {
+            "liveness:clean": RuntimeError("liveness cleanup"),
+            "claims:release": RuntimeError("claims cleanup"),
+            "log:shutdown": RuntimeError("log cleanup"),
+            "dispatcher:drain": RuntimeError("drain cleanup"),
+            "cancel:server cleanup": RuntimeError("task cleanup"),
+            "scheduler:stop": RuntimeError("scheduler cleanup"),
+            "bundle:close": RuntimeError("bundle cleanup"),
+            "panel:stop": RuntimeError("panel cleanup"),
+            "pairing:close": RuntimeError("pairing cleanup"),
+            "bridges:disconnect": RuntimeError("bridge cleanup"),
+            "mcp:shutdown": RuntimeError("mcp cleanup"),
+        }
+    )
+
+    with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+        await _run_cleanup(app)
+
+    assert len(caught.value.exceptions) == 11
+    for event_name in control.failures:
+        assert event_name in control.events
+    assert app["agent"] is None
+    assert app["agent_runtime"] is None
+    assert app["runtime_slot"].bundle is None
+    assert app["startup_state"].bundle is None
+    assert app["mcp_manager"] is None
+    assert app["activity_panel"] is None
+
+
+@pytest.mark.asyncio
+async def test_normal_cleanup_resistant_task_timeout_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.background_tasks
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    await asyncio.sleep(0)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant() -> None:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(resistant(), name="cleanup-resistant-task")
+    app["startup_background_tasks"].add(task)
+    await started.wait()
+    monkeypatch.setattr(mimir.background_tasks, "BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS", 0.01)
+    control.events.clear()
+
+    try:
+        with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
+            await _run_cleanup(app)
+        assert any(
+            isinstance(error, TimeoutError) and "cleanup-resistant-task" in str(error)
+            for error in caught.value.exceptions
+        )
+        assert "scheduler:stop" in control.events
+        assert "bundle:close" in control.events
+        assert "pairing:close" in control.events
+        assert "bridges:disconnect" in control.events
+        assert app["agent"] is None
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_server_cleanup_does_not_repeat_compensated_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = RuntimeError("indexer failed")
+    control = _ServerControl()
+    control.failures["indexer:start"] = original
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    with pytest.raises(RuntimeError):
+        await _run_startup(app)
+    control.events.clear()
+
+    await _run_cleanup(app)
+
+    assert control.events == ["cancel:server cleanup"]
+
+
+def test_complete_prestartup_app_key_contract_and_benchmark_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    runtime_fields = {
+        "agent",
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        "indexer",
+        "saga_client",
+        "sessions",
+        "subagent_inbox",
+        "agent_runtime",
+        "replayed_messages",
+    }
+
+    assert all(app[field_name] is None for field_name in runtime_fields)
+    assert app["config"] is not None
+    assert app["dispatcher"] is control.dispatcher
+    assert app["scheduler"] is control.scheduler
+    assert app["channels"] is control.channels
+    assert app["pairing_notifier"] is not None
+    assert app["identity_resolver"] is control.core.identity_resolver
+    assert app["aliases_loaded"] == 4
+    assert app["seeded_subagents"] == {}
+    assert app["seeded_skills"] == {}
+    assert app["api_key"] == "test-key"
+    assert app["consolidate_guard"] is not None
+    assert app["startup_background_tasks"] == set()
+    assert app["startup_state"].runtime_attempted is False
+    assert "activity_panel" not in app
+    assert "mcp_manager" not in app
+
+
+@pytest.mark.asyncio
+async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.history import get_global_buffer
+
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    dispatcher = app["dispatcher"]
+    scheduler = app["scheduler"]
+    channels = app["channels"]
+    notifier = app["pairing_notifier"]
+
+    await _run_startup(app)
+
+    assert app["agent"] is control.bundle.agent
+    assert app["turn_logger"] is control.bundle.turn_logger
+    assert app["message_buffer"] is control.bundle.message_buffer
+    assert app["indexes"] is control.bundle.indexes
+    assert app["indexer"] is control.bundle.indexer
+    assert app["saga_client"] is control.bundle.saga_client
+    assert app["sessions"] is control.bundle.sessions
+    assert app["subagent_inbox"] is control.bundle.subagent_inbox
+    assert app["replayed_messages"] == 9
+    assert get_global_buffer() is control.bundle.message_buffer
+    assert app["dispatcher"] is dispatcher
+    assert app["scheduler"] is scheduler
+    assert app["channels"] is channels
+    assert app["pairing_notifier"] is notifier
+
+    await _run_cleanup(app)
+
+    assert all(app[field_name] is None for field_name in (
+        "agent",
+        "turn_logger",
+        "message_buffer",
+        "indexes",
+        "indexer",
+        "saga_client",
+        "sessions",
+        "subagent_inbox",
+        "agent_runtime",
+        "replayed_messages",
+    ))
+    assert get_global_buffer() is None
+    assert dispatcher._run_turn is None
+    assert app["dispatcher"] is dispatcher
+    assert app["scheduler"] is scheduler
+    assert app["channels"] is channels
+    assert app["pairing_notifier"] is notifier
+
+
+@pytest.mark.asyncio
+async def test_conditional_panel_mcp_and_dispatcher_ingress_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = _ServerControl(panel_enabled=True, mcp_enabled=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    assert app["activity_panel"] is None
+    assert "mcp_manager" not in app
+    assert await app["dispatcher"].enqueue(object()) is False
+    assert control.web_chat.enqueue.__self__ is app["dispatcher"]
+
+    await _run_startup(app)
+
+    assert app["activity_panel"] is control.panel
+    assert app["mcp_manager"] is control.mcp_manager
+    assert await app["dispatcher"].enqueue(object()) is True
+
+    await _run_cleanup(app)
+
+    assert app["activity_panel"] is None
+    assert app["mcp_manager"] is None
+    assert await app["dispatcher"].enqueue(object()) is False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
