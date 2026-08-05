@@ -1,5 +1,5 @@
 {
-  "resolve": "n=$(printf %s \"$FACTORY_INPUT\" | tr -d \"[:space:]\" | sed -n -e \"s|^#\\{0,1\\}\\([0-9][0-9]*\\)$|\\1|p\" -e \"s|^https://github.com/jasoncarreira/mimir/issues/\\([0-9][0-9]*\\)$|\\1|p\"); [ -n \"$n\" ] || exit 0; gh issue view \"$n\" --repo jasoncarreira/mimir --json number,title,body,url,state,labels,assignees --jq '{run_id:(.number|tostring)} + .'",
+  "resolve": "n=$(printf %s \"$FACTORY_INPUT\" | sed -e \"s|^[[:space:]]*||\" -e \"s|[[:space:]]*$||\" | sed -n -e \"s|^#\\{0,1\\}\\([0-9][0-9]*\\)$|\\1|p\" -e \"s|^https://github.com/jasoncarreira/mimir/issues/\\([0-9][0-9]*\\)$|\\1|p\"); [ -n \"$n\" ] || exit 0; kind=$(gh api \"repos/jasoncarreira/mimir/issues/$n\" --jq 'if .pull_request then \"pr\" else \"issue\" end') || exit 1; [ \"$kind\" = \"issue\" ] || exit 0; gh issue view \"$n\" --repo jasoncarreira/mimir --json number,title,body,url,state,labels,assignees --jq '{run_id:(.number|tostring)} + .'",
   "verify": "uv run pytest -q --tb=short",
   "publish": "gh pr create --draft --base \"$PR_BASE\" --head \"$FEATURE_BRANCH\" --title \"$PR_TITLE\" --body-file \"$PR_BODY_FILE\"",
   "publishing_identity": "jasoncarreira"
