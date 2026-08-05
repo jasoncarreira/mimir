@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -15,10 +16,37 @@ from typing import Any
 
 import pytest
 
-from mimir.acp.host import HostLifecycle, LifecycleTimeouts, PRODUCTION_TIMEOUTS
+from mimir.acp.host import (
+    HostLifecycle,
+    LifecycleTimeouts,
+    PRODUCTION_TIMEOUTS,
+    _FrameDelivery,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _wait_for_process_marker(
+    marker: Path,
+    process: subprocess.Popen[bytes],
+    timeout: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return
+        status = process.poll()
+        if status is not None:
+            raise AssertionError(f"process exited before readiness with status {status}")
+        time.sleep(0.01)
+    raise AssertionError("process readiness timed out")
+
+
+def _kill_and_reap(process: subprocess.Popen[bytes]) -> tuple[bytes, bytes]:
+    if process.poll() is None:
+        process.kill()
+    return process.communicate(timeout=5)
 
 
 class _FakeTimer:
@@ -260,6 +288,68 @@ async def test_frame_delivery_preserves_complete_order_without_owning_descriptor
 
 
 @pytest.mark.asyncio
+async def test_frame_delivery_reserves_exact_capacity_and_overflow_fails_closed() -> None:
+    class BlockingFrame:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.data = bytearray()
+
+        def write(self, data: bytes | memoryview) -> int:
+            self.started.set()
+            self.release.wait()
+            self.data.extend(data)
+            return len(data)
+
+        def flush(self) -> None:
+            return None
+
+    frame = BlockingFrame()
+    failed = asyncio.Event()
+    delivery = _FrameDelivery(frame, 10, failed.set)
+    assert delivery.write(b"123456") == 6
+    while not frame.started.is_set():
+        await asyncio.sleep(0)
+    assert delivery.write(b"7890") == 4
+
+    with pytest.raises(BufferError):
+        delivery.write(b"x")
+
+    await failed.wait()
+    assert delivery.reserved_bytes == 10
+    assert delivery.peak_reserved_bytes == 10
+    frame.release.set()
+    with pytest.raises(BufferError):
+        await delivery.wait_terminal()
+    delivery.join()
+    assert bytes(frame.data) == b"1234567890"
+    assert delivery.reserved_bytes == 0
+    assert delivery.terminal
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_sustained_ingress_remains_bounded_and_ordered() -> None:
+    frame = io.BytesIO()
+    failures: list[None] = []
+    delivery = _FrameDelivery(frame, 16, lambda: failures.append(None))
+    frames = [f"{index:03d}\n".encode() for index in range(200)]
+
+    for payload in frames:
+        while delivery.reserved_bytes > 11:
+            await asyncio.sleep(0)
+        delivery.write(payload)
+
+    delivery.finish()
+    await delivery.wait_terminal()
+    delivery.join()
+
+    assert frame.getvalue() == b"".join(frames)
+    assert delivery.peak_reserved_bytes <= 16
+    assert delivery.reserved_bytes == 0
+    assert failures == []
+
+
+@pytest.mark.asyncio
 async def test_peer_disconnect_returns_clean_only_after_cleanup_terminal() -> None:
     events: list[str] = []
     streams = _FakeStreams(events)
@@ -476,9 +566,8 @@ async def test_protocol_terminal_uses_five_plus_five_second_policy_and_cancels_o
 async def test_writer_stages_use_two_and_one_second_bounds() -> None:
     streams = _FakeStreams()
     lifecycle = _lifecycle(streams=streams, timeouts=PRODUCTION_TIMEOUTS)
-    lifecycle._streams = streams
 
-    await lifecycle.close_protocol_writer()
+    assert await lifecycle.run() == 0
 
     assert streams.drain_timeout == 2.0
     assert streams.close_timeout == 1.0
@@ -525,6 +614,30 @@ async def test_runtime_driver_timeout_does_not_advance_cleanup() -> None:
     assert composition._driver.cancelled() is False
     assert lifecycle._failed is True
     assert not composition.adapter_started.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["start-failure", "cancelled"])
+async def test_runtime_driver_without_terminal_proof_cannot_unlock_cleanup(
+    mode: str,
+) -> None:
+    class UnprovenComposition(_FakeComposition):
+        def start_runtime_close(self) -> asyncio.Task[None]:
+            if mode == "start-failure":
+                raise RuntimeError("start detail")
+            task = asyncio.create_task(asyncio.sleep(60), name="cancelled-runtime")
+            task.cancel()
+            return task
+
+    composition = UnprovenComposition(_completed)
+    lifecycle = _lifecycle(composition=composition)
+    lifecycle._composition = composition
+
+    await lifecycle.await_runtime_driver_terminal()
+
+    assert not lifecycle._runtime_driver_proven_terminal()
+    assert composition.adapter_calls == []
+    assert lifecycle._runtime_audit_task is None
 
 
 async def _run_audit(
@@ -738,10 +851,32 @@ async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() 
     protocol_waits = 0
     real_wait = asyncio.wait
 
+    class BlockingFrame:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def write(self, data: bytes | memoryview) -> int:
+            self.started.set()
+            self.release.wait()
+            return len(data)
+
+        def flush(self) -> None:
+            return None
+
+    class Writer:
+        def __init__(self, frame: Any) -> None:
+            self.frame = frame
+
+        def write(self, data: bytes) -> int:
+            return self.frame.write(data)
+
+    frame_file = BlockingFrame()
+
     class BudgetStreams(_FakeStreams):
         async def drain_response_writer(self, timeout: float = 2.0) -> bool:
             assert timeout == 2.0
-            clock.advance(timeout)
+            clock.advance(0.5)
             return True
 
         async def close_response_writer(self, timeout: float = 1.0) -> bool:
@@ -767,7 +902,12 @@ async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() 
 
     composition.close_adapters = close_adapters
 
-    async def protocol_runner(*args: Any, **kwargs: Any) -> None:
+    async def protocol_runner(
+        *args: Any,
+        response_writer: Writer,
+        **kwargs: Any,
+    ) -> None:
+        response_writer.write(b"controlled-frame")
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
@@ -790,6 +930,12 @@ async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() 
                 return set(), tasks
             await asyncio.sleep(0)
             protocol_release.set()
+            return await real_wait(tasks)
+        if timeout == 1.5 and "acp-frame-delivery-terminal" in names:
+            while not frame_file.started.is_set():
+                await asyncio.sleep(0)
+            clock.advance(timeout)
+            frame_file.release.set()
             return await real_wait(tasks)
         if timeout == 36.0:
             clock.advance(timeout)
@@ -823,10 +969,17 @@ async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() 
         timeouts=PRODUCTION_TIMEOUTS,
         timers=timers,
         task_waiter=task_waiter,
+        frame_file=frame_file,
     )
     lifecycle._clock = clock
     lifecycle._fail_stop = fail_stops.append
     lifecycle._composition_factory = composition_factory
+
+    async def streams_factory(frame: Any) -> Any:
+        streams.response_writer = Writer(frame)
+        return streams
+
+    lifecycle._streams_factory = streams_factory
     tasks_before = asyncio.all_tasks()
     run_task = asyncio.create_task(lifecycle.run(), name="budget-lifecycle")
     while lifecycle._protocol_task is None:
@@ -835,19 +988,141 @@ async def test_maximum_clean_stage_budget_completes_before_65_second_watchdog() 
 
     assert await run_task == 0
     assert clock.value == 59.0
-    assert checkpoints == [5.0, 10.0, 12.0, 13.0, 49.0, 54.0, 59.0]
+    assert checkpoints == [
+        5.0,
+        10.0,
+        10.5,
+        12.0,
+        13.0,
+        49.0,
+        54.0,
+        59.0,
+    ]
     assert lifecycle._watchdog_deadline == 65.0
     assert timers[0].interval == 65.0
     assert timers[0].cancelled
     assert timers[0].joined
     assert fail_stops == []
     assert all(task.done() for task in lifecycle.host_stage_tasks)
+    assert lifecycle._delivery is not None
+    assert lifecycle._delivery.terminal
     assert asyncio.all_tasks() == tasks_before
+
+
+@pytest.mark.parametrize("mode", ["start-failure", "cancelled"])
+def test_unproven_runtime_driver_hard_stops_before_audit_adapters_or_return(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    ready_marker = tmp_path / f"runtime-{mode}-ready"
+    audit_marker = tmp_path / f"runtime-{mode}-audit"
+    adapter_marker = tmp_path / f"runtime-{mode}-adapter"
+    returned_marker = tmp_path / f"runtime-{mode}-returned"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import io
+        from mimir.acp.host import HostLifecycle, LifecycleTimeouts
+
+        mode = {mode!r}
+        ready_marker = {str(ready_marker)!r}
+        audit_marker = {str(audit_marker)!r}
+        adapter_marker = {str(adapter_marker)!r}
+        returned_marker = {str(returned_marker)!r}
+
+        class Streams:
+            def __init__(self):
+                self.request_reader = asyncio.StreamReader()
+                self.response_writer = object()
+            def stop_request_intake(self):
+                self.request_reader.feed_eof()
+            async def drain_response_writer(self, timeout=2.0):
+                return True
+            async def close_response_writer(self, timeout=1.0):
+                return True
+            def writer_helper_tasks(self):
+                return ()
+
+        class Composition:
+            bundle = object()
+            def start_runtime_close(self):
+                open(ready_marker, "w").close()
+                if mode == "start-failure":
+                    raise RuntimeError("start detail")
+                task = asyncio.create_task(asyncio.sleep(60))
+                task.cancel()
+                return task
+            def explicit_adapter_tasks(self):
+                return frozenset()
+            async def close_adapters(self, timeout, *, runtime_audit_task):
+                open(adapter_marker, "w").close()
+                return True
+
+        async def main():
+            streams = Streams()
+            composition = Composition()
+            async def streams_factory(frame):
+                return streams
+            async def composition_factory():
+                return composition
+            async def protocol_runner(*args, **kwargs):
+                return None
+            lifecycle = HostLifecycle(
+                io.BytesIO(),
+                timeouts=LifecycleTimeouts(
+                    protocol_grace=0.01,
+                    protocol_cancel=0.01,
+                    writer_drain=0.01,
+                    writer_close=0.01,
+                    runtime_driver=0.01,
+                    runtime_audit=0.01,
+                    adapter_cleanup=0.01,
+                    audit_rescan=0.005,
+                    watchdog=0.2,
+                ),
+                streams_factory=streams_factory,
+                composition_factory=composition_factory,
+                agent_factory=lambda bundle: object(),
+                protocol_runner=protocol_runner,
+            )
+            original_audit = lifecycle.audit_runtime_tasks_terminal
+            async def marked_audit():
+                open(audit_marker, "w").close()
+                await original_audit()
+            lifecycle.audit_runtime_tasks_terminal = marked_audit
+            await lifecycle.run()
+            open(returned_marker, "w").close()
+
+        asyncio.run(main())
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = b""
+    stderr = b""
+    try:
+        _wait_for_process_marker(ready_marker, process)
+        stdout, stderr = process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            stdout, stderr = _kill_and_reap(process)
+
+    assert process.returncode == 1, stderr.decode()
+    assert stdout == b""
+    assert not audit_marker.exists()
+    assert not adapter_marker.exists()
+    assert not returned_marker.exists()
 
 
 def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
     tmp_path: Path,
 ) -> None:
+    ready_marker = tmp_path / "resistant-ready"
     adapter_marker = tmp_path / "adapter"
     descriptor_marker = tmp_path / "descriptor"
     script = textwrap.dedent(
@@ -856,6 +1131,7 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
         import io
         from mimir.acp.host import HostLifecycle, LifecycleTimeouts
 
+        ready_marker = {str(ready_marker)!r}
         adapter_marker = {str(adapter_marker)!r}
         descriptor_marker = {str(descriptor_marker)!r}
 
@@ -896,6 +1172,7 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
                     try:
                         await asyncio.Future()
                     except asyncio.CancelledError:
+                        open(ready_marker, "w").close()
                         await asyncio.Future()
                 asyncio.create_task(resistant(), name="subprocess-resistant-child")
                 return composition
@@ -925,16 +1202,24 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
         asyncio.run(main())
         """
     )
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-c", script],
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
-        timeout=5,
     )
+    stdout = b""
+    stderr = b""
+    try:
+        _wait_for_process_marker(ready_marker, process)
+        stdout, stderr = process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            stdout, stderr = _kill_and_reap(process)
 
-    assert completed.returncode == 1
+    assert process.returncode == 1, stderr.decode()
+    assert stdout == b""
     assert not adapter_marker.exists()
     assert not descriptor_marker.exists()
 
@@ -946,6 +1231,7 @@ def test_real_signal_completes_ordered_subprocess_cleanup(
 ) -> None:
     if os.name == "nt":
         pytest.skip("POSIX process signals are unavailable")
+    ready_marker = tmp_path / f"signal-{signum.name}-ready"
     marker = tmp_path / f"signal-{signum.name}.json"
     script = textwrap.dedent(
         f"""
@@ -955,6 +1241,7 @@ def test_real_signal_completes_ordered_subprocess_cleanup(
         import sys
         from mimir.acp.host import HostLifecycle, LifecycleTimeouts
 
+        ready_marker = {str(ready_marker)!r}
         marker = {str(marker)!r}
         events = []
         stopped = asyncio.Event()
@@ -1006,7 +1293,7 @@ def test_real_signal_completes_ordered_subprocess_cleanup(
             async def composition_factory():
                 return composition
             async def protocol_runner(*args, **kwargs):
-                os.write(2, b"READY\\n")
+                open(ready_marker, "w").close()
                 await stopped.wait()
                 events.append("protocol")
             lifecycle = HostLifecycle(
@@ -1042,10 +1329,15 @@ def test_real_signal_completes_ordered_subprocess_cleanup(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    assert process.stderr is not None
-    assert process.stderr.readline() == b"READY\n"
-    os.kill(process.pid, signum)
-    stdout, stderr = process.communicate(timeout=10)
+    stdout = b""
+    stderr = b""
+    try:
+        _wait_for_process_marker(ready_marker, process)
+        os.kill(process.pid, signum)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            stdout, stderr = _kill_and_reap(process)
 
     assert process.returncode == 0, stderr.decode()
     assert stdout == b""
@@ -1064,6 +1356,7 @@ def test_real_signal_completes_ordered_subprocess_cleanup(
 def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
     tmp_path: Path,
 ) -> None:
+    ready_marker = tmp_path / "backpressure-ready"
     adapter_marker = tmp_path / "backpressure-adapter"
     returned_marker = tmp_path / "backpressure-returned"
     script = textwrap.dedent(
@@ -1072,6 +1365,7 @@ def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
         import sys
         from mimir.acp.host import HostLifecycle, LifecycleTimeouts
 
+        ready_marker = {str(ready_marker)!r}
         adapter_marker = {str(adapter_marker)!r}
         returned_marker = {str(returned_marker)!r}
 
@@ -1115,6 +1409,7 @@ def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
             async def composition_factory():
                 return composition
             async def protocol_runner(agent, *, response_writer, **kwargs):
+                open(ready_marker, "w").close()
                 payload = b"x" * (1024 * 1024)
                 for _ in range(32):
                     response_writer.write(payload)
@@ -1150,9 +1445,16 @@ def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
         stderr=subprocess.PIPE,
     )
     started = time.monotonic()
-    process.wait(timeout=5)
-    elapsed = time.monotonic() - started
-    stdout, stderr = process.communicate(timeout=2)
+    stdout = b""
+    stderr = b""
+    try:
+        _wait_for_process_marker(ready_marker, process)
+        process.wait(timeout=5)
+        elapsed = time.monotonic() - started
+        stdout, stderr = process.communicate(timeout=2)
+    finally:
+        if process.poll() is None:
+            stdout, stderr = _kill_and_reap(process)
 
     assert process.returncode == 1, stderr.decode()
     assert elapsed < 2.0

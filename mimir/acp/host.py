@@ -23,6 +23,7 @@ _T = TypeVar("_T")
 _PEER_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError)
 _RUNTIME_ERROR = "ACP host failed."
 _DELIVERY_END = object()
+FRAME_DELIVERY_CAPACITY = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +74,23 @@ TaskWaiter = Callable[..., Awaitable[tuple[set[asyncio.Future[Any]], set[asyncio
 
 
 class _FrameDelivery:
-    def __init__(self, frame_file: BinaryIO) -> None:
+    def __init__(
+        self,
+        frame_file: BinaryIO,
+        capacity: int,
+        error_callback: Callable[[], None],
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError("frame delivery capacity must be positive")
         self._frame_file = frame_file
         self._queue: queue.SimpleQueue[bytes | object] = queue.SimpleQueue()
         self._loop = asyncio.get_running_loop()
         self._terminal = self._loop.create_future()
+        self._capacity = capacity
+        self._reserved_bytes = 0
+        self._peak_reserved_bytes = 0
+        self._lock = threading.Lock()
+        self._error_callback = error_callback
         self._accepting = True
         self._error: BaseException | None = None
         self._thread = threading.Thread(
@@ -95,28 +108,68 @@ class _FrameDelivery:
     def terminal(self) -> bool:
         return not self._thread.is_alive()
 
+    @property
+    def reserved_bytes(self) -> int:
+        with self._lock:
+            return self._reserved_bytes
+
+    @property
+    def peak_reserved_bytes(self) -> int:
+        with self._lock:
+            return self._peak_reserved_bytes
+
     def fileno(self) -> int:
         return self._frame_file.fileno()
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
-        if not self._accepting:
-            raise ConnectionResetError("protocol frame delivery is closed")
-        if self._error is not None:
-            raise self._error
-        payload = bytes(data)
-        if payload:
-            self._queue.put(payload)
-        return len(payload)
+        size = len(data)
+        if size == 0:
+            return 0
+        delivery_error: BaseException | None = None
+        with self._lock:
+            if not self._accepting:
+                raise ConnectionResetError("protocol frame delivery is closed")
+            if self._error is not None:
+                raise self._error
+            if size > self._capacity - self._reserved_bytes:
+                delivery_error = BufferError(
+                    "protocol frame delivery capacity exceeded"
+                )
+                self._error = delivery_error
+                self._accepting = False
+                self._queue.put(_DELIVERY_END)
+            else:
+                self._reserved_bytes += size
+                self._peak_reserved_bytes = max(
+                    self._peak_reserved_bytes,
+                    self._reserved_bytes,
+                )
+                try:
+                    payload = bytes(data)
+                except BaseException as exc:
+                    self._reserved_bytes -= size
+                    self._error = exc
+                    self._accepting = False
+                    self._queue.put(_DELIVERY_END)
+                    delivery_error = exc
+                else:
+                    self._queue.put(payload)
+        if delivery_error is not None:
+            self._loop.call_soon(self._error_callback)
+            raise delivery_error
+        return size
 
     def flush(self) -> None:
-        if self._error is not None:
-            raise self._error
+        with self._lock:
+            if self._error is not None:
+                raise self._error
 
     def finish(self) -> None:
-        if not self._accepting:
-            return
-        self._accepting = False
-        self._queue.put(_DELIVERY_END)
+        with self._lock:
+            if not self._accepting:
+                return
+            self._accepting = False
+            self._queue.put(_DELIVERY_END)
 
     async def wait_terminal(self) -> None:
         await self._terminal
@@ -141,8 +194,14 @@ class _FrameDelivery:
                         raise BrokenPipeError("protocol frame write made no progress")
                     remaining = remaining[written:]
                 self._frame_file.flush()
+                with self._lock:
+                    self._reserved_bytes -= len(cast(bytes, item))
         except BaseException as exc:
-            self._error = exc
+            with self._lock:
+                if self._error is None:
+                    self._error = exc
+                self._accepting = False
+            self._loop.call_soon_threadsafe(self._error_callback)
         finally:
             try:
                 self._loop.call_soon_threadsafe(self._mark_terminal)
@@ -164,6 +223,7 @@ class HostLifecycle:
         timer_factory: TimerFactory = threading.Timer,
         fail_stop: Callable[[int], None] = os._exit,
         task_waiter: TaskWaiter = asyncio.wait,
+        frame_delivery_capacity: int = FRAME_DELIVERY_CAPACITY,
         streams_factory: StreamsFactory = open_protocol_streams,
         composition_factory: CompositionFactory = AcpComposition.create,
         agent_factory: Callable[[Any], Any] = MimirAcpAgent,
@@ -175,6 +235,7 @@ class HostLifecycle:
         self._timer_factory = timer_factory
         self._fail_stop = fail_stop
         self._task_waiter = task_waiter
+        self._frame_delivery_capacity = frame_delivery_capacity
         self._streams_factory = streams_factory
         self._composition_factory = composition_factory
         self._agent_factory = agent_factory
@@ -225,7 +286,11 @@ class HostLifecycle:
         return self._audit_pending_names
 
     async def run(self) -> int:
-        self._delivery = _FrameDelivery(self._frame_file)
+        self._delivery = _FrameDelivery(
+            self._frame_file,
+            self._frame_delivery_capacity,
+            self._frame_delivery_failed,
+        )
         await self._start()
         self.stop_protocol_intake()
         if self._protocol_task is not None:
@@ -233,6 +298,9 @@ class HostLifecycle:
         await self._run_stage(_Stage.WRITER, self.close_protocol_writer)
         if self._composition is not None:
             await self._run_stage(_Stage.RUNTIME, self.await_runtime_driver_terminal)
+            if not self._runtime_driver_proven_terminal():
+                self._mark_failed()
+                await asyncio.Future()
         if self._pre_composition_tasks:
             await self._start_runtime_audit()
         if self._composition is not None:
@@ -243,6 +311,10 @@ class HostLifecycle:
         self._remove_signal_handlers()
         self._stop_watchdog()
         return 1 if self._failed else 0
+
+    def _frame_delivery_failed(self) -> None:
+        self._mark_failed()
+        self.stop_protocol_intake()
 
     async def _start(self) -> None:
         delivery = self._delivery
@@ -358,7 +430,7 @@ class HostLifecycle:
     async def close_protocol_writer(self) -> None:
         streams = self._streams
         drained = streams is None
-        closed = streams is None
+        drain_started = self._clock()
         if streams is not None:
             try:
                 drained = await streams.drain_response_writer(
@@ -368,6 +440,25 @@ class HostLifecycle:
                 self._peer_disconnected = True
             except BaseException:
                 self._mark_failed()
+        delivery = self._delivery
+        if delivery is None:
+            self._mark_failed()
+            return
+        delivery.finish()
+        self._delivery_task = self._create_host_stage_task(
+            delivery.wait_terminal(),
+            name="acp-frame-delivery-terminal",
+        )
+        drain_remaining = max(
+            0.0,
+            self._timeouts.writer_drain - (self._clock() - drain_started),
+        )
+        delivery_done = await self._delivery_done_within(drain_remaining)
+        if not delivery_done:
+            self._mark_failed()
+        close_started = self._clock()
+        closed = streams is None
+        if streams is not None:
             try:
                 closed = await streams.close_response_writer(
                     timeout=max(0.0, self._timeouts.writer_close)
@@ -384,24 +475,41 @@ class HostLifecycle:
             for task in streams.writer_helper_tasks():
                 if task.done():
                     self._retrieve_task(task)
-        delivery = self._delivery
-        if delivery is None:
+        if not delivery_done:
+            close_remaining = max(
+                0.0,
+                self._timeouts.writer_close - (self._clock() - close_started),
+            )
+            delivery_done = await self._delivery_done_within(close_remaining)
+        if not delivery_done:
+            await self._wait_tasks({self._delivery_task})
+        self._retrieve_delivery_task()
+        if delivery.terminal:
+            delivery.join()
+
+    async def _delivery_done_within(self, timeout: float) -> bool:
+        task = self._delivery_task
+        if task is None:
+            return False
+        if task.done():
+            return True
+        done, _ = await self._wait_tasks({task}, timeout=max(0.0, timeout))
+        return task in done
+
+    def _retrieve_delivery_task(self) -> None:
+        task = self._delivery_task
+        if task is None or task in self._retrieved_tasks or not task.done():
+            return
+        self._retrieved_tasks.add(task)
+        if task.cancelled():
             self._mark_failed()
             return
-        delivery.finish()
-        self._delivery_task = self._create_host_stage_task(
-            delivery.wait_terminal(),
-            name="acp-frame-delivery-terminal",
-        )
         try:
-            await self._delivery_task
+            task.result()
         except _PEER_DISCONNECT_ERRORS:
             self._peer_disconnected = True
         except BaseException:
             self._mark_failed()
-        if delivery.terminal:
-            delivery.join()
-        self._retrieve_task(self._delivery_task)
 
     async def await_runtime_driver_terminal(self) -> None:
         composition = self._composition
@@ -411,6 +519,9 @@ class HostLifecycle:
         try:
             driver = composition.start_runtime_close()
         except BaseException:
+            self._mark_failed()
+            return
+        if not isinstance(driver, asyncio.Task):
             self._mark_failed()
             return
         self._runtime_driver = driver
@@ -609,6 +720,15 @@ class HostLifecycle:
             return max(0.0, self._timeouts.watchdog)
         return max(0.0, deadline - self._clock())
 
+    def _runtime_driver_proven_terminal(self) -> bool:
+        driver = self._runtime_driver
+        return (
+            isinstance(driver, asyncio.Task)
+            and driver.done()
+            and not driver.cancelled()
+            and driver in self._retrieved_tasks
+        )
+
     def _writer_has_peer_disconnect(self) -> bool:
         streams = self._streams
         if streams is None:
@@ -678,8 +798,9 @@ class HostLifecycle:
             return False
         if self._protocol_task is not None and not self._protocol_task.done():
             return False
-        if self._runtime_driver is not None and not self._runtime_driver.done():
-            return False
+        if _Stage.RUNTIME in self._required_stages:
+            if not self._runtime_driver_proven_terminal():
+                return False
         if _Stage.AUDIT in self._required_stages:
             audit_task = self._runtime_audit_task
             if (
