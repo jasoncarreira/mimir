@@ -24,7 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..models import AuthContext, TurnInteractivity
+from ..access_control import create_local_operator_auth_context
 from .models import (
     CommitmentKind,
     CommitmentRecord,
@@ -34,18 +34,6 @@ from .models import (
     make_commitment_id,
 )
 from .store import CommitmentsStore
-
-
-_OPERATOR_AUTH_CONTEXT = AuthContext(
-    principal="operator",
-    canonical_principal="operator",
-    roles=("admin",),
-    event_ingress=None,
-    trigger="commitments_cli",
-    channel_id=None,
-    interactivity=TurnInteractivity.NON_INTERACTIVE,
-)
-
 
 def _parse_iso(s: str) -> float:
     """Accept an ISO-8601 string; return unix-seconds. Naive
@@ -274,7 +262,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         channel_id=args.channel,
         status=status,
         owner_principal=args.owner,
-        auth_context=_OPERATOR_AUTH_CONTEXT,
+        auth_context=create_local_operator_auth_context(
+            principal="operator",
+            trigger="commitments_cli",
+            channel_id=None,
+        ),
     )
     if not args.include_service:
         rows = [
