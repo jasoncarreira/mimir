@@ -201,6 +201,13 @@ async def test_create_uses_only_empty_unstarted_runtime_adapters(
     monkeypatch.setattr(loop, "create_server", forbidden_async)
     monkeypatch.setattr(loop, "create_connection", forbidden_async)
     tasks_before = asyncio.all_tasks()
+    # Captured, not asserted absent. pytest imports every test module during collection, and
+    # tests/test_server.py imports mimir.server at module scope, so these are already in
+    # sys.modules before this body runs, whatever composition does. What this test can honestly
+    # prove is that *this call* imports nothing new; absence at import time is proven in a child
+    # process by test_composition_import_does_not_import_forbidden_runtime_facilities above.
+    lazy_modules = ("mimir.server", "mimir.mcp_client")
+    lazy_before = {name for name in lazy_modules if name in sys.modules}
 
     result = await composition.AcpComposition.create()
 
@@ -222,8 +229,7 @@ async def test_create_uses_only_empty_unstarted_runtime_adapters(
     ]
     assert calls[-1][1:3] == (config, core)
     assert calls[-1][3] is result.adapters
-    assert "mimir.server" not in sys.modules
-    assert "mimir.mcp_client" not in sys.modules
+    assert {name for name in lazy_modules if name in sys.modules} == lazy_before
 
 
 @pytest.mark.asyncio
