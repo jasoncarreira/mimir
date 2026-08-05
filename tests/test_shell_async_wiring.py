@@ -81,7 +81,7 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
     monkeypatch.setattr(reg, "_spawned_log", spawned, raising=False)
     shell_async.set_shell_job_registry(reg, on_complete=None)
     yield reg
-    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+    shell_async.set_shell_job_registry(None, on_complete=None)
 
 
 # ─── bash_async ────────────────────────────────────────────────────
@@ -132,9 +132,21 @@ async def test_bash_async_rejects_empty_command(fake_registry: ShellJobRegistry)
 
 @pytest.mark.asyncio
 async def test_bash_async_no_registry_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+    shell_async.set_shell_job_registry(None, on_complete=None)
     out = await shell_async.bash_async.ainvoke({"command": "echo hi"})
     assert "no shell-job registry" in out
+
+
+def test_shell_registry_none_clears_registry_and_callback(tmp_path: Path) -> None:
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    completed: list[Any] = []
+    callback = completed.append
+    shell_async.set_shell_job_registry(registry, on_complete=callback)
+
+    shell_async.set_shell_job_registry(None, on_complete=callback)
+
+    assert shell_async._REGISTRY is None
+    assert shell_async._ON_COMPLETE is None
 
 
 @pytest.mark.asyncio
@@ -605,7 +617,7 @@ def fake_registry_with_channel(
     monkeypatch.setattr(ctx_mod, "get_current_turn", lambda: _FakeTurnCtx("test-ch"))
 
     yield reg
-    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+    shell_async.set_shell_job_registry(None, on_complete=None)
 
 
 @pytest.mark.asyncio
@@ -713,7 +725,7 @@ async def test_bash_async_allows_different_channel(
     out = await shell_async.bash_async.ainvoke({"command": "social-cli dispatch /file.yaml"})
     assert "Spawned job" in out  # different channel → allowed
 
-    shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+    shell_async.set_shell_job_registry(None, on_complete=None)
 
 
 @pytest.mark.asyncio
@@ -903,7 +915,7 @@ async def test_service_bash_async_graph_executes_pinned_script_with_interpreter(
             {"messages": [HumanMessage(content="run tests")]}, context=auth,
         )
     finally:
-        shell_async.set_shell_job_registry(None, on_complete=None)  # type: ignore[arg-type]
+        shell_async.set_shell_job_registry(None, on_complete=None)
 
     executed_argv, kwargs = popen_calls[-1]
     expected_argv = [

@@ -709,7 +709,7 @@ def test_get_global_buffer_returns_none_before_set():
     ``server.serve``)."""
     from mimir.history import get_global_buffer, set_global_buffer
 
-    set_global_buffer(None)  # type: ignore[arg-type]
+    set_global_buffer(None)
     assert get_global_buffer() is None
 
 
@@ -723,7 +723,41 @@ def test_set_global_buffer_makes_it_resolvable(tmp_path: Path):
     try:
         assert get_global_buffer() is buf
     finally:
-        set_global_buffer(None)  # type: ignore[arg-type]
+        set_global_buffer(None)
+
+
+def test_set_global_buffer_accepts_none_and_clears_state(tmp_path: Path):
+    from mimir.history import get_global_buffer, set_global_buffer
+
+    set_global_buffer(_make_buffer(tmp_path))
+    set_global_buffer(None)
+
+    assert get_global_buffer() is None
+
+
+def test_turns_log_path_can_be_cleared(tmp_path: Path):
+    from mimir.tools.extra import _TURN_STATE, _read_turn_record, set_turns_log_path
+
+    path = tmp_path / "turns.jsonl"
+    set_turns_log_path(path)
+    assert _TURN_STATE["turns_log_path"] is path
+
+    set_turns_log_path(None)
+
+    assert _TURN_STATE["turns_log_path"] is None
+    assert _read_turn_record("turn-1") == "get_turn failed: turns log path not configured"
+
+
+def test_web_home_can_be_cleared(tmp_path: Path):
+    from mimir.tools.web import _fetch_cache_dir, set_home
+
+    set_home(tmp_path)
+    assert _fetch_cache_dir() == tmp_path / "attachments" / "fetch-cache"
+
+    set_home(None)
+
+    with pytest.raises(RuntimeError, match="set_home"):
+        _fetch_cache_dir()
 
 
 # ── Source attribution for outbound messages (chainlink #270) ────────

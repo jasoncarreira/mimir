@@ -735,14 +735,16 @@ async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypa
     assert dispatched == []
 
 
-def test_server_build_app_wires_worklink_arbiter_and_reaper() -> None:
+def test_runtime_and_server_wire_worklink_arbiter_and_reaper() -> None:
     import inspect
+    import mimir.runtime as runtime
     import mimir.server as server
 
-    source = inspect.getsource(server.build_app)
-    assert "_agent_tools.set_arbiter(agent._arbiter)" in source
-    assert "scheduler.add_worklink_reaper_job(" in source
-    assert "MIMIR_WORKLINK_REAPER_CRON" in source
+    runtime_source = inspect.getsource(runtime._install_runtime_globals)
+    server_source = inspect.getsource(server.build_app)
+    assert "tools.set_arbiter(bundle.agent._arbiter)" in runtime_source
+    assert "scheduler.add_worklink_reaper_job(" in server_source
+    assert "MIMIR_WORKLINK_REAPER_CRON" in server_source
 
 
 # ── ready-queue poller: discovery + cap-bounded detached dispatch ───

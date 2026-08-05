@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json as _json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2872,6 +2873,53 @@ def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkey
 
     assert task.cancelled is True
     assert sched._loop_lag_task is None
+
+
+def test_scheduler_arbiter_can_be_cleared(tmp_path: Path):
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    arbiter = object()
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, arbiter=arbiter
+    )
+    assert sched._arbiter is arbiter
+
+    sched.set_arbiter(None)
+
+    assert sched._arbiter is None
+
+
+def test_agent_wires_arbiter_through_scheduler_setter():
+    from mimir.agent import Agent
+
+    source = inspect.getsource(Agent.__init__)
+    assert "scheduler.set_arbiter(self._arbiter)" in source
+    assert "scheduler._arbiter = self._arbiter" not in source
+
+
+def test_stop_handles_underlying_partial_start(tmp_path: Path):
+    async def noop(event: AgentEvent) -> bool:
+        return True
+
+    class PartialScheduler:
+        running = True
+
+        def __init__(self) -> None:
+            self.shutdown_calls: list[bool] = []
+
+        def shutdown(self, wait: bool = True) -> None:
+            self.shutdown_calls.append(wait)
+            self.running = False
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    partial = PartialScheduler()
+    sched._scheduler = partial
+
+    sched.stop()
+
+    assert partial.shutdown_calls == [False]
+    assert sched._started is False
 
 
 # ─── chainlink #234: _resolve_prompt_file symlink hardening ─────────

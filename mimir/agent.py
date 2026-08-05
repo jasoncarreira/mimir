@@ -1291,7 +1291,7 @@ class Agent:
             turns_snapshot=self._turns_snapshot,
         )
         if scheduler is not None:
-            scheduler._arbiter = self._arbiter
+            scheduler.set_arbiter(self._arbiter)
 
         # Bounded set for fire-and-forget background tasks. Without
         # retaining a reference, the asyncio task can be GC'd before

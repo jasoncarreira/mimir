@@ -27,7 +27,7 @@ from mimir.sagatools import _format_saga_payload, _provenance_tag, _trust_groups
 _MEMORY_STATE: dict[str, SagaStore | None] = {"client": None}
 
 
-def set_memory_client(client: SagaStore) -> None:
+def set_memory_client(client: SagaStore | None) -> None:
     """Inject the SagaStore instance the tool will query against."""
     _MEMORY_STATE["client"] = client
 

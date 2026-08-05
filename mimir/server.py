@@ -17,31 +17,26 @@ import os
 import re
 import signal
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
-from .agent import Agent
-from .background_tasks import spawn_background
+from .background_tasks import cancel_background_tasks, spawn_background
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
-from .chat_skills import ChatSkillRegistry, strip_chat_skill_extra
+from .chat_skills import strip_chat_skill_extra
 from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_event, log_event_sync
-from .history import MessageBuffer
 from .http_ingress import strip_bridge_authority_extra
-from .identities import IdentityResolver
-from .index import IndexGenerator
 from .models import AgentEvent, make_process_session_id
 from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
 from .rate_limits import RateLimitStore
-from .saga_client import SagaClient, make_saga_client
 from .scheduler import Scheduler
-from .search import Indexer
-from .session_manager import ChannelSession, SessionManager
+from .session_manager import ChannelSession
 from .web_channels import web_channel_for_identity
 from .skill_defs import (
     home_skills_dir,
@@ -52,8 +47,6 @@ from .skill_defs import (
 from .chainlink_bootstrap import ensure_chainlink_initialized
 from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
-from .subagent_inbox import SubagentInbox
-from .turn_logger import TurnLogger
 from .worklink.continuation import (
     stamp_http_event_ingress_extra,
     strip_worklink_hint_extra,
@@ -62,36 +55,30 @@ from . import web_ui
 
 log = logging.getLogger(__name__)
 
-_STARTUP_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
-
-
 async def _start_mcp_servers(
-    app: web.Application,
+    mcp_manager: Any,
     mcp_configs: list[Any],
     *,
     home: Path | None = None,
-) -> None:
+) -> tuple[Any | None, list[Any]]:
     """Wire configured MCP policy, tools, startup validation, and lifecycle."""
     from .mcp_client import (
-        MCPManager,
         check_stale_policy_on_startup,
         get_tool_provenance,
         validate_mcp_policy,
     )
-    from .tools import set_mcp_tools
 
-    mcp_manager = MCPManager(
-        policy_store_path=home / "state" / "mcp-policy.json"
-    ) if home is not None else MCPManager()
-    _doc_changes: dict[str, str] = {}
     try:
         mcp_tools = await mcp_manager.start_servers(mcp_configs)
     except Exception as exc:  # noqa: BLE001 — log + continue
         log.warning("MCP startup failed: %s", exc)
         mcp_tools = []
-        await mcp_manager.shutdown()
-        mcp_manager = None
-    set_mcp_tools(mcp_tools)
+        try:
+            await mcp_manager.shutdown()
+        except Exception as shutdown_exc:  # noqa: BLE001
+            log.warning("MCP shutdown after startup failure failed: %s", shutdown_exc)
+            return mcp_manager, []
+        return None, []
     if mcp_tools:
         await log_event(
             "mcp_servers_ready",
@@ -119,7 +106,7 @@ async def _start_mcp_servers(
             count=len(policy_issues),
             issues=policy_issues,
         )
-    app["mcp_manager"] = mcp_manager
+    return mcp_manager, mcp_tools
 
 
 def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
@@ -149,6 +136,29 @@ class _PairingNotifier:
         self._dm_reply_sent: set[str] = set()
         self._dm_reply_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
+
+    async def aclose(self) -> None:
+        tasks = {
+            task
+            for task in (self._operator_task, self._dm_reply_task)
+            if task is not None
+        }
+        self._operator_task = None
+        self._dm_reply_task = None
+        self._operator_pending.clear()
+        while True:
+            try:
+                self._dm_reply_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._dm_reply_queue.task_done()
+        errors = await cancel_background_tasks(tasks, label="pairing notifier")
+        if errors:
+            raise ExceptionGroup(
+                "pairing notifier cleanup failed",
+                [_cleanup_exception(error) for error in errors],
+            )
 
     async def notify_operator(
         self,
@@ -303,6 +313,104 @@ class _PairingNotifier:
                 self._dm_reply_queue.task_done()
             if interval and not self._dm_reply_queue.empty():
                 await asyncio.sleep(interval)
+
+
+@dataclass(slots=True)
+class _StartupState:
+    runtime_attempted: bool = False
+    bundle: Any | None = None
+    runtime_published: bool = False
+    activity_panel: Any | None = None
+    activity_panel_start_attempted: bool = False
+    indexer_start_attempted: bool = False
+    bridges_connect_attempted: bool = False
+    mcp_start_attempted: bool = False
+    mcp_manager: Any | None = None
+    scheduler_start_attempted: bool = False
+    scheduler_started: bool = False
+    liveness_mark_attempted: bool = False
+    compensated: bool = False
+
+
+@dataclass(slots=True)
+class _RuntimeSlot:
+    bundle: Any | None = None
+
+
+class _RuntimeFieldProxy:
+    def __init__(self, slot: _RuntimeSlot, field: str) -> None:
+        self._slot = slot
+        self._field = field
+
+    def __getattr__(self, name: str) -> Any:
+        bundle = self._slot.bundle
+        if bundle is None:
+            raise RuntimeError("agent runtime is not initialized")
+        return getattr(getattr(bundle, self._field), name)
+
+
+_RUNTIME_APP_FIELDS = (
+    "agent",
+    "turn_logger",
+    "message_buffer",
+    "indexes",
+    "indexer",
+    "saga_client",
+    "sessions",
+    "subagent_inbox",
+    "agent_runtime",
+    "replayed_messages",
+)
+
+
+def _cleanup_exception(exc: BaseException) -> Exception:
+    if isinstance(exc, Exception):
+        return exc
+    return RuntimeError(f"{type(exc).__name__}: {exc}")
+
+
+def _cleanup_note(errors: list[Exception]) -> str:
+    details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
+    return f"server startup compensation had {len(errors)} cleanup failure(s): {details}"[:2000]
+
+
+def _clear_runtime_app_state(
+    app: web.Application,
+    slot: _RuntimeSlot,
+    state: _StartupState,
+) -> None:
+    slot.bundle = None
+    for field in _RUNTIME_APP_FIELDS:
+        app[field] = None
+    if "activity_panel" in app:
+        app["activity_panel"] = None
+    if "mcp_manager" in app:
+        app["mcp_manager"] = None
+    state.bundle = None
+    state.activity_panel = None
+    state.mcp_manager = None
+    state.runtime_published = False
+
+
+def _publish_runtime(
+    app: web.Application,
+    slot: _RuntimeSlot,
+    state: _StartupState,
+    bundle: Any,
+) -> None:
+    slot.bundle = bundle
+    app["turn_logger"] = bundle.turn_logger
+    app["message_buffer"] = bundle.message_buffer
+    app["indexes"] = bundle.indexes
+    app["indexer"] = bundle.indexer
+    app["saga_client"] = bundle.saga_client
+    app["sessions"] = bundle.sessions
+    app["subagent_inbox"] = bundle.subagent_inbox
+    app["replayed_messages"] = bundle.replayed_messages
+    app["agent_runtime"] = bundle
+    app["agent"] = bundle.agent
+    state.bundle = bundle
+    state.runtime_published = True
 
 
 def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
@@ -850,6 +958,7 @@ def build_app(config: Config) -> web.Application:
     # leave operator-deleted ones deleted. No-ops unless the version changed
     # (mimir/doc_seed.py). Also seeds docs into a pre-existing home that never
     # had them (e.g. created before this feature).
+    _doc_changes: dict[str, str] = {}
     try:
         from .doc_seed import refresh_docs
         _doc_changes = refresh_docs(config.home)
@@ -862,54 +971,12 @@ def build_app(config: Config) -> web.Application:
     # Best-effort and gated on the binary, so plain pip installs are unaffected.
     ensure_chainlink_initialized(config.home)
 
-    turn_logger = TurnLogger(config.turns_log, max_turns=config.max_turns_kept)
+    from .runtime import create_core_services
 
-    # Identity reconciliation (FUTURE_WORK §6.1). Loads
-    # state/identities.yaml if present; gracefully empty otherwise.
-    identity_resolver = IdentityResolver(home=config.home)
-    aliases_loaded = identity_resolver.reload()
-
-    history_path = config.home / "messages" / "chat_history.jsonl"
-    message_buffer = MessageBuffer(
-        history_path=history_path,
-        global_max=config.history_global_max,
-        per_channel_max=config.history_per_channel_max,
-        resolver=identity_resolver,
-        cross_platform_pull=config.cross_platform_pull,
-    )
-    replayed = message_buffer.replay()
-
-    indexes = IndexGenerator(config.home)
-    indexes.mark_dirty("all")
-
-    indexer = Indexer(config.home)
-    # v0.5 §2: point saga at the per-home saga.toml. saga's config search
-    # checks ``$SAGA_CONFIG`` first (then ``$SAGA_DATA_DIR/saga.toml``,
-    # ``~/.saga/saga.toml``, package-default). mimir setup writes
-    # ``<home>/saga.toml``, which doesn't match any of those defaults, so
-    # set the env var here before the in-process saga adapter does its
-    # first import. No-op if the operator already exported SAGA_CONFIG.
-    home_saga_toml = config.home / "saga.toml"
-    if home_saga_toml.is_file() and not os.environ.get("SAGA_CONFIG"):
-        os.environ["SAGA_CONFIG"] = str(home_saga_toml)
-    # ``[storage].db_path`` from saga.toml — overridable by operators
-    # without touching code. Relative paths resolve under ``<home>/.mimir/``;
-    # absolute paths (e.g. mimirbot's ``/mimir-home/.mimir/saga.db``) are
-    # honored as-is. The default in ``mimir.saga._config_io._DEFAULTS`` is
-    # ``"saga.db"`` (relative) so a saga.toml without an explicit
-    # ``[storage]`` block lands at ``<home>/.mimir/saga.db`` — back to
-    # the historical naming after the brief ``memory.db`` interlude.
-    from .saga._config_io import get_config as _get_saga_config
-    _toml_db = _get_saga_config()("storage", "db_path", "saga.db")
-    _db_path = Path(_toml_db)
-    if not _db_path.is_absolute():
-        _db_path = config.home / ".mimir" / _db_path
-    saga_client = make_saga_client(db_path=_db_path)
-    sessions = SessionManager(
-        idle_minutes=config.saga_session_idle_minutes,
-        max_turns=config.saga_session_max_turns,
-    )
-    inbox = SubagentInbox()
+    core = create_core_services(config)
+    identity_resolver = core.identity_resolver
+    aliases_loaded = core.aliases_loaded
+    _db_path = core.saga_db_path
 
     # Channel layer (SPEC §7.2). BenchBridge always registers — it's how the
     # benchmark adapter gets outbound. WebChatBridge registers if a
@@ -920,82 +987,6 @@ def build_app(config: Config) -> web.Application:
     channels.register(BenchBridge(home=config.home))
     pairing_notifier = _PairingNotifier(config, channels)
 
-    from .tools.forge import set_github_identity_degraded_callback
-
-    degradation_recorded = False
-    degradation_alert_scheduled = False
-
-    def _github_identity_degraded(exc: Exception) -> None:
-        nonlocal degradation_recorded, degradation_alert_scheduled
-        declared_login = getattr(exc, "declared_login", "")
-        authenticated_login = getattr(exc, "authenticated_login", "")
-        if not degradation_recorded:
-            degradation_recorded = True
-            log.warning(
-                "github_identity_degraded: authenticated=%r declared=%r — coding disabled until restart",
-                authenticated_login or "unknown",
-                declared_login or "unknown",
-            )
-            log_event_sync(
-                "github_identity_degraded",
-                declared_login=declared_login or None,
-                authenticated_login=authenticated_login or None,
-                reason=str(exc),
-            )
-        alert_channel = (config.operator_alert_channel or "").strip()
-        if not alert_channel or degradation_alert_scheduled:
-            return
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            # build_app can run before the event loop; _on_startup retries.
-            return
-        degradation_alert_scheduled = True
-        text = (
-            "GitHub identity verification failed; coding capability is disabled until "
-            "the process is restarted with corrected credentials. "
-            f"Authenticated login: {authenticated_login or 'unknown'}; "
-            f"declared login: {declared_login or 'unknown'}."
-        )
-
-        async def _alert() -> None:
-            try:
-                await channels.send(alert_channel, text, final=True)
-                await log_event(
-                    "github_identity_degraded_operator_alert_sent",
-                    channel_id=alert_channel,
-                )
-            except Exception as alert_exc:  # noqa: BLE001 — degradation remains latched
-                log.warning("github identity degraded alert failed: %s", alert_exc)
-                await log_event(
-                    "github_identity_degraded_operator_alert_failed",
-                    channel_id=alert_channel,
-                    error=str(alert_exc)[:500],
-                )
-
-        spawn_background(
-            _STARTUP_BACKGROUND_TASKS,
-            _alert(),
-            name="github-identity-degraded-alert",
-        )
-
-    set_github_identity_degraded_callback(_github_identity_degraded)
-
-    # Assemble the actual model-bound surface eagerly so missing coding runtime
-    # dependencies still fail at startup. Identity mismatch instead latches the
-    # process into the already-supported coding-disabled mode.
-    from .tools import all_mimir_tools
-    coding_enabled = getattr(config, "coding_enabled", False)
-    if coding_enabled:
-        from .tools.forge import initialize_github_forge_identity
-
-        coding_enabled = initialize_github_forge_identity()
-    all_mimir_tools(coding_enabled=coding_enabled)
-
-    # Wiring order to break the (dispatcher → agent → scheduler → dispatcher)
-    # cycle: dispatcher first with no runner, then scheduler bound to its
-    # enqueue, then agent (which builds the MCP server with all of them
-    # wired up), then late-bind agent.run_turn onto the dispatcher.
     dispatcher = Dispatcher(config, resolver=identity_resolver)
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
@@ -1003,240 +994,12 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         scheduler_tz=config.scheduler_tz,
     )
-    # Commitments store — Phase 2b due-check poller + the four
-    # commitment_* langchain tools both need this. Pre-fix it was
-    # never constructed, so getattr(agent, "_commitments", None) was
-    # always None and every commitment tool returned the "no store"
-    # error. Build once, hand to Agent + the tool registry.
-    from .commitments import CommitmentsStore
-    commitments_store = CommitmentsStore(
-        path=config.commitments_log,
-        provenance_db_path=_db_path,
-    )
-    migrated_commitments = commitments_store.migrate_ownership()
-    if migrated_commitments:
-        log.info(
-            "backfilled ownership for %d commitment records",
-            migrated_commitments,
-        )
-
-    # chainlink #583 slice 1: one live turn-event bus shared by the agent
-    # (producer) and the web SSE layer (consumer) so the dashboard character
-    # animates mid-turn instead of replaying post-hoc from turns.jsonl.
-    from .turn_event_bus import TurnEventBus
-    turn_event_bus = TurnEventBus()
-    chat_skill_registry = ChatSkillRegistry.from_config(config)
-
-    agent = Agent(
-        config,
-        turn_logger,
-        message_buffer,
-        indexes,
-        indexer=indexer,
-        saga_client=saga_client,
-        session_manager=sessions,
-        scheduler=scheduler,
-        subagent_inbox=inbox,
-        channel_registry=channels,
-        dispatcher=dispatcher,
-        commitments_store=commitments_store,
-        turn_event_bus=turn_event_bus,
-        chat_skill_registry=chat_skill_registry,
-    )
-    dispatcher.set_run_turn(agent.run_turn)
-    dispatcher.set_on_channel_idle(
-        lambda channel_id: (
-            message_buffer.evict_channel(channel_id),
-            inbox.evict_channel(channel_id),
-        )
-    )
-    # chainlink #376 (PR 4): record mid-turn injected messages in chat history at
-    # inject time so they thread chronologically with the turn's mid-flight replies.
-    dispatcher.set_on_inject(agent.on_message_injected)
-
-    # First-contact DM-channel capture: the first time a user messages us on a
-    # bridge, resolve their DM channel from that bridge and cache it in
-    # identities.yaml so the agent can DM them by name later (and so it shows
-    # up in the channel registry + identity context). Fire-and-forget via the
-    # dispatcher's per-event observer — never blocks or fails a turn.
-    #
-    # Write coordination lives in the writer: ``capture_dm_channel`` shares
-    # ``_IDENTITIES_WRITE_LOCK`` with the scheduled populator (``merge_into_yaml``)
-    # so the read-modify-write of identities.yaml is atomic across both — no
-    # per-observer lock needed here.
-    async def _capture_dm_channel(event: AgentEvent) -> None:
-        try:
-            author = (event.author or "").strip()
-            author_id = (event.author_id or "").strip()
-            platform = (event.source or "").strip()
-            if not (author and author_id and platform in ("slack", "discord")):
-                return
-            # Cheap in-memory gate — first-contact only; no API call once cached.
-            if identity_resolver.dm_channel(author, platform):
-                return
-            bridge = channels.find(event.channel_id)
-            if bridge is None:
-                return
-            dm_id = await bridge.resolve_dm_channel(author_id)
-            if not dm_id:
-                return
-            from .identities_populator import capture_dm_channel
-            wrote = await asyncio.to_thread(
-                capture_dm_channel, config.home, author, platform, dm_id
-            )
-            if wrote:
-                await asyncio.to_thread(identity_resolver.reload)
-                await log_event(
-                    "dm_channel_captured",
-                    channel_id=event.channel_id,
-                    author=author,
-                    platform=platform,
-                    dm_channel=dm_id,
-                )
-        except Exception:  # noqa: BLE001 — best-effort; never disrupt inbound
-            log.debug("dm-channel capture failed", exc_info=True)
-
-    dispatcher.set_on_event(_capture_dm_channel)
-
-    async def _request_dm_pairing(event: AgentEvent, decision) -> None:
-        try:
-            author = (event.author or "").strip()
-            platform = (event.source or "").strip()
-            channel_id = (event.channel_id or "").strip()
-            is_dm = channel_id.startswith("dm-")
-            if not (
-                author
-                and platform in ("slack", "discord")
-                and channel_id
-            ):
-                return
-            from .identities_populator import request_pairing_status
-            status = await asyncio.to_thread(
-                request_pairing_status,
-                config.home,
-                author,
-                platform,
-                channel_id=channel_id,
-                author_display=event.author_display,
-                is_dm=is_dm,
-                max_pending=config.pairing_pending_max,
-            )
-            delivery = "dm" if is_dm else "public_shared_channel"
-            if status == "capped":
-                await log_event(
-                    "pairing_pending_cap_reached",
-                    channel_id=event.channel_id,
-                    author=author,
-                    author_id=event.author_id,
-                    platform=platform,
-                    delivery=delivery,
-                    max_pending=config.pairing_pending_max,
-                    reason=getattr(decision, "denial_reason", None),
-                )
-                await pairing_notifier.notify_pending_cap_reached(
-                    platform=platform,
-                    channel_id=channel_id,
-                    delivery=delivery,
-                )
-                return
-            if status != "changed":
-                return
-            await asyncio.to_thread(identity_resolver.reload)
-            canonical = (getattr(decision, "canonical_author", None) or author).strip()
-            await log_event(
-                "pairing_requested",
-                channel_id=event.channel_id,
-                author=author,
-                author_id=event.author_id,
-                canonical_author=canonical,
-                platform=platform,
-                delivery=delivery,
-                reason=getattr(decision, "denial_reason", None),
-            )
-            if is_dm:
-                await log_event(
-                    "dm_pairing_requested",
-                    channel_id=event.channel_id,
-                    author=author,
-                    author_id=event.author_id,
-                    canonical_author=canonical,
-                    platform=platform,
-                    dm_channel=channel_id,
-                    reason=getattr(decision, "denial_reason", None),
-                )
-            await pairing_notifier.notify_operator(
-                canonical=canonical,
-                display=event.author_display or author,
-                platform=platform,
-                channel_id=channel_id,
-                delivery=delivery,
-            )
-            if is_dm:
-                await pairing_notifier.maybe_reply_dm(
-                    canonical=canonical,
-                    dm_channel_id=channel_id,
-                )
-        except Exception:  # noqa: BLE001 — best-effort; never disrupt inbound
-            log.debug("dm-pairing request failed", exc_info=True)
-
-    dispatcher.set_on_pairing_required(_request_dm_pairing)
-
-    # Wire dep-injection setters on the production tool surface so
-    # langchain @tool functions can reach the same singletons the SDK
-    # tool builders received as args. Each setter is idempotent and
-    # process-scoped (module-level state). Memory-client injection is
-    # handled inside Agent.__init__ (it requires unwrapping the
-    # RecordingSagaClient chain), so it's not re-done here.
-    from . import tools as _agent_tools
-    from .tools import web as _web_tools
-    _agent_tools.set_indexer(indexer)
-    # Wire the human-readable IndexGenerator (built above) into the
-    # rebuild_index tool — without this the tool is dead and always returns
-    # "no IndexGenerator configured". Mirrors set_indexer for the search Indexer.
-    _agent_tools.set_index_generator(indexes)
-    _agent_tools.set_turns_log_path(config.turns_log)
-    _agent_tools.set_channel_registry(channels)
-    _agent_tools.set_identity_resolver(identity_resolver)
-    _agent_tools.set_dispatcher(dispatcher)
-    _agent_tools.set_scheduler(scheduler)
-    # Worklink slice-3 (#444): give the in-turn ``worklink_run`` tool the
-    # HomeostaticArbiter so autonomous dispatch sheds under resource pressure
-    # (TIGHT). The operator CLI never sets this, so ``mimir worklink run``
-    # stays un-gated by design.
-    _agent_tools.set_arbiter(agent._arbiter)
-    # Register the process's MessageBuffer globally so the
-    # ``send_message`` tool can append outbound replies. Restored
-    # after PR #181 (deepagents migration) lost the inline
-    # ``buffer.append`` calls from the SDK-era pre/post hooks.
-    from .history import set_global_buffer
-    set_global_buffer(message_buffer)
-    # Wire stores and shared coding-tool spawn configuration.
-    _agent_tools.set_commitments_store(commitments_store)
-    # Spawn tools read ``.get("default_cwd")`` from this purpose-built
-    # mapping rather than accepting the full Config.
-    _agent_tools.set_spawn_config({
-        "default_cwd": config.home,
-        "opencode_config_path": config.opencode_config_path,
-    })
-    # Async shell-job tools (bash_async / bash_jobs_list / bash_job_output)
-    # share the Agent's ShellJobRegistry; the on_complete bridge fires
-    # ``shell_job_complete`` AgentEvents back through the dispatcher
-    # so the spawning channel wakes when the subprocess exits.
-    _agent_tools.set_shell_job_registry(
-        agent._shell_jobs,
-        on_complete=agent._handle_shell_job_complete,
-    )
-    # fetch_url caches downloaded bodies under <home>/attachments/fetch-cache/.
-    # The tool itself is only registered when the active provider isn't
-    # claude_code (see all_mimir_tools); set_home is harmless when unused.
-    _web_tools.set_home(config.home)
-
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.
     web_chat = WebChatBridge(
         enqueue=dispatcher.enqueue,
         home=config.home,
-        chat_skill_registry=chat_skill_registry,
+        chat_skill_registry=core.chat_skill_registry,
     )
     channels.register(web_chat)
 
@@ -1296,44 +1059,46 @@ def build_app(config: Config) -> web.Application:
             bool(config.slack_app_token),
         )
 
-    # When a session goes idle, enqueue the synthesis turn through the same
-    # dispatcher so it runs in channel-FIFO order alongside any new traffic.
-    async def _on_session_idle(session: ChannelSession) -> None:
-        synth_event = _session_synthesis_event(session)
-        accepted = await dispatcher.enqueue(synth_event)
-        if not accepted:
-            await log_event(
-                "saga_synthesis_dispatch_failed",
-                channel_id=session.channel_id,
-                saga_session_id=session.saga_session_id,
-                reason="dispatcher_rejected",
-            )
+    startup_background_tasks: set[asyncio.Task[Any]] = set()
 
-    sessions.set_on_idle(_on_session_idle)
-    # Busy-defer (SPEC §5.6): when the session timer fires while a turn is
-    # in flight or events are queued for the channel, re-arm rather than
-    # synthesize behind the in-flight work.
-    sessions.set_is_busy(dispatcher.is_channel_busy)
+    def _spawn_runtime_task(
+        coroutine: Any,
+        name: str,
+    ) -> asyncio.Task[Any]:
+        return spawn_background(
+            startup_background_tasks,
+            coroutine,
+            name=name,
+        )
+
+    from .runtime import RuntimeAdapters, create_agent_runtime
+
+    runtime_adapters = RuntimeAdapters(
+        dispatcher=dispatcher,
+        scheduler=scheduler,
+        channels=channels,
+        pairing_notifier=pairing_notifier,
+        spawn_background_task=_spawn_runtime_task,
+    )
+    runtime_slot = _RuntimeSlot()
+    startup_state = _StartupState()
 
     app["config"] = config
-    app["agent"] = agent
     app["dispatcher"] = dispatcher
-    app["turn_logger"] = turn_logger
-    app["message_buffer"] = message_buffer
-    app["indexes"] = indexes
-    app["indexer"] = indexer
-    app["saga_client"] = saga_client
-    app["sessions"] = sessions
     app["scheduler"] = scheduler
-    app["subagent_inbox"] = inbox
     app["channels"] = channels
     app["pairing_notifier"] = pairing_notifier
     app["identity_resolver"] = identity_resolver
-    app["replayed_messages"] = replayed
     app["aliases_loaded"] = aliases_loaded
     app["seeded_subagents"] = seeded
     app["seeded_skills"] = seeded_skills_map
     app["api_key"] = config.api_key
+    app["runtime_slot"] = runtime_slot
+    app["runtime_adapters"] = runtime_adapters
+    app["startup_background_tasks"] = startup_background_tasks
+    app["startup_state"] = startup_state
+    for field in _RUNTIME_APP_FIELDS:
+        app[field] = None
     # chainlink #233: single-flight guard for POST /api/memory/consolidate.
     app["consolidate_guard"] = _ConsolidateGuard()
 
@@ -1363,7 +1128,7 @@ def build_app(config: Config) -> web.Application:
         # ``<home>/state/saga.db`` fallback — which no longer exists and
         # produced "saga db not found or unreadable" on the page.
         saga_db=_db_path,
-        commitments_store=commitments_store,
+        commitments_store=_RuntimeFieldProxy(runtime_slot, "commitments_store"),
         # Collapse the /ops Usage chart to the live subscription provider so
         # stale windows from a prior provider (e.g. Anthropic after a Codex
         # cutover, chainlink #301) don't render a second chart.
@@ -1371,36 +1136,36 @@ def build_app(config: Config) -> web.Application:
             config.model_spec,
             getattr(config, "anthropic_base_url", ""),
         ),
-        turn_event_bus=turn_event_bus,
+        turn_event_bus=_RuntimeFieldProxy(runtime_slot, "turn_event_bus"),
     )
-    activity_panel = None
     if config.activity_panel_channels:
-        from .bridges._activity_panel import ActivityPanel
-
-        activity_panel = ActivityPanel(
-            turn_event_bus,
-            channels,
-            config.activity_panel_channels,
-        )
-        app["activity_panel"] = activity_panel
+        app["activity_panel"] = None
     # Web chat bridge — POST /chat + GET /chat/stream for the local UI.
     web_chat.register_routes(app)
 
-    async def _on_startup(app: web.Application) -> None:
-        # Install the identity-degradation callback BEFORE emitting any other
-        # startup diagnostics: notify_current=True replays a degradation that
-        # already latched during earlier startup, so a mismatch cannot go
-        # unreported just because it fired before the callback existed.
-        from .tools.forge import set_github_identity_degraded_callback
+    async def _start_application(app: web.Application) -> None:
+        startup_state.runtime_attempted = True
+        bundle = await create_agent_runtime(config, core, runtime_adapters)
+        startup_state.bundle = bundle
+        _publish_runtime(app, runtime_slot, startup_state, bundle)
+        agent = bundle.agent
+        indexer = bundle.indexer
+        saga_client = bundle.saga_client
+        replayed = bundle.replayed_messages
+        if config.activity_panel_channels:
+            from .bridges._activity_panel import ActivityPanel
 
-        set_github_identity_degraded_callback(
-            _github_identity_degraded,
-            notify_current=True,
-        )
+            activity_panel = ActivityPanel(
+                bundle.turn_event_bus,
+                channels,
+                config.activity_panel_channels,
+            )
+            startup_state.activity_panel = activity_panel
+            app["activity_panel"] = activity_panel
+            startup_state.activity_panel_start_attempted = True
+            activity_panel.start()
         for alert in await asyncio.to_thread(repo_binding_startup_alerts):
             await log_event("github_repo_binding_attention_required", **alert)
-        if activity_panel is not None:
-            activity_panel.start()
         # PR 4b (docs/internal/MIMIR_HOME_GIT_TRACKING.md): idempotent bootstrap. Runs
         # before the agent starts processing turns so the post-turn
         # commit hook lands on a real repo. Sync function dispatched to
@@ -1526,7 +1291,9 @@ def build_app(config: Config) -> web.Application:
         except Exception as exc:  # noqa: BLE001
             log.warning("pre-push hook install failed for %s: %s", _src, exc)
 
+        startup_state.indexer_start_attempted = True
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
+        startup_state.bridges_connect_attempted = True
         await channels.connect_all()
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
@@ -1534,10 +1301,7 @@ def build_app(config: Config) -> web.Application:
         # mimir.tools.mcp setter. A single server failing to start is
         # logged + skipped — the agent still boots with native tools.
         # Lifecycle owner stored on app so _on_cleanup can shut it down.
-        from .tools import set_mcp_tools
-
-        set_mcp_tools([])
-        from .mcp_client import MCPPolicyStore
+        from .mcp_client import MCPManager, MCPPolicyStore
 
         try:
             stored_mcp_configs = MCPPolicyStore(
@@ -1548,7 +1312,19 @@ def build_app(config: Config) -> web.Application:
             stored_mcp_configs = []
         mcp_configs = [*config.mcp_servers, *stored_mcp_configs]
         if mcp_configs:
-            await _start_mcp_servers(app, mcp_configs, home=config.home)
+            startup_state.mcp_start_attempted = True
+            mcp_manager = MCPManager(
+                policy_store_path=config.home / "state" / "mcp-policy.json"
+            )
+            startup_state.mcp_manager = mcp_manager
+            mcp_manager, mcp_tools = await _start_mcp_servers(
+                mcp_manager,
+                mcp_configs,
+                home=config.home,
+            )
+            startup_state.mcp_manager = mcp_manager
+            app["mcp_manager"] = mcp_manager
+            bundle.install_mcp_tools(mcp_tools)
 
         # Register SAGA weekly consolidation. Bad cron logs and continues.
         # Pass home so the closure can read identities.yaml at fire time
@@ -1988,7 +1764,9 @@ def build_app(config: Config) -> web.Application:
             or reload_stats["registered"] > 0
             or installed_pollers > 0
         ):
+            startup_state.scheduler_start_attempted = True
             scheduler.start()
+            startup_state.scheduler_started = True
 
         await log_event(
             "app_started",
@@ -2047,7 +1825,7 @@ def build_app(config: Config) -> web.Application:
             log.exception("version-bump digest emit failed")
 
         spawn_background(
-            _STARTUP_BACKGROUND_TASKS,
+            startup_background_tasks,
             indexer.sweep(),
             name="mimir-startup-indexer-sweep",
         )
@@ -2079,6 +1857,7 @@ def build_app(config: Config) -> web.Application:
             _within = isinstance(_last, (int, float)) and (_now - _last) < UNCLEAN_NOTIFY_WINDOW
             _notify = not _within
             _carry_ts = _now if _notify else _last
+        startup_state.liveness_mark_attempted = True
         mark_session_running(
             config.home, started_at=_now, last_unclean_notify_ts=_carry_ts,
         )
@@ -2093,7 +1872,7 @@ def build_app(config: Config) -> web.Application:
                 # Background — the notify POSTs to ntfy/webhook (up to 8s) and
                 # must not block startup.
                 spawn_background(
-                    _STARTUP_BACKGROUND_TASKS,
+                    startup_background_tasks,
                     notify_unclean_restart(config.home, prior=_prior_session),
                     name="mimir-unclean-restart-notify",
                 )
@@ -2105,7 +1884,7 @@ def build_app(config: Config) -> web.Application:
         if config.liveness_beat_seconds > 0:
             from .liveness import liveness_beat_loop
             spawn_background(
-                _STARTUP_BACKGROUND_TASKS,
+                startup_background_tasks,
                 liveness_beat_loop(
                     config.home,
                     interval=config.liveness_beat_seconds,
@@ -2114,53 +1893,159 @@ def build_app(config: Config) -> web.Application:
                 name="mimir-liveness-beat",
             )
 
-    async def _on_cleanup(app: web.Application) -> None:
-        cleanup_started = time.monotonic()
-        # Mark this stop as clean as the VERY FIRST action — before ANY await.
-        # Reaching _on_cleanup means we received SIGTERM/SIGINT and are tearing
-        # down in order (an intended stop). mark_clean_shutdown is a fast, sync,
-        # local file write; doing it ahead of `await log_event` and the drain
-        # means a stalled await during an active turn can't let the
-        # stop_grace_period expire (SIGKILL) before the clean marker lands. That
-        # ordering bug produced spurious "unclean restart" pages on deploy
-        # recreates of a busy agent (muninn). A hard kill never reaches here, so
-        # its marker stays clean=false (→ unclean-restart notice on next boot).
-        # chainlink #507.
-        from .liveness import mark_clean_shutdown
-        mark_clean_shutdown(config.home)
-        from .worklink.autonomy import release_claims_for_graceful_shutdown
+    async def _compensate_startup(app: web.Application) -> list[Exception]:
+        errors: list[Exception] = []
 
-        release_timeout = 5.0
-        if config.drain_timeout_seconds > 0:
-            release_timeout = min(release_timeout, float(config.drain_timeout_seconds))
-        released = release_claims_for_graceful_shutdown(
-            config.home,
-            agent_id=worklink_agent_id,
-            timeout_s=release_timeout,
-        )
-        await log_event(
-            "worklink_shutdown_claims_released",
-            issue_ids=[record.issue_id for record in released],
-        )
-        await log_event("shutdown", reason="cleanup")
-        # chainlink #510: bounded graceful drain — finish in-flight turns up to
-        # the configured timeout, then exit. Keeps a deploy SIGTERM from killing
-        # live turns while staying within the compose stop_grace_period.
-        drain_timeout = config.drain_timeout_seconds
-        if drain_timeout > 0:
-            drain_timeout = max(0.0, drain_timeout - (time.monotonic() - cleanup_started))
-        await dispatcher.drain(timeout=drain_timeout)
-        scheduler.stop()
-        await sessions.shutdown()
-        await indexer.stop()
-        await saga_client.close()
-        panel = app.get("activity_panel")
-        if panel is not None:
-            await panel.stop()
-        await channels.disconnect_all()
-        mcp_manager = app.get("mcp_manager")
-        if mcp_manager is not None:
-            await mcp_manager.shutdown()
+        async def attempt(operation: Any) -> None:
+            try:
+                await operation()
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+
+        def attempt_sync(operation: Any) -> None:
+            try:
+                operation()
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+
+        try:
+            task_errors = await cancel_background_tasks(
+                startup_background_tasks,
+                label="server startup compensation",
+            )
+        except BaseException as exc:
+            errors.append(_cleanup_exception(exc))
+        else:
+            errors.extend(_cleanup_exception(error) for error in task_errors)
+        if startup_state.liveness_mark_attempted:
+            from .liveness import mark_clean_shutdown
+
+            attempt_sync(lambda: mark_clean_shutdown(config.home))
+        if startup_state.scheduler_start_attempted:
+            attempt_sync(scheduler.stop)
+        if startup_state.mcp_manager is not None:
+            await attempt(startup_state.mcp_manager.shutdown)
+        if startup_state.bridges_connect_attempted:
+            await attempt(channels.disconnect_all)
+        if startup_state.bundle is not None:
+            await attempt(startup_state.bundle.aclose)
+        if (
+            startup_state.activity_panel_start_attempted
+            and startup_state.activity_panel is not None
+        ):
+            await attempt(startup_state.activity_panel.stop)
+        await attempt(pairing_notifier.aclose)
+        try:
+            _clear_runtime_app_state(app, runtime_slot, startup_state)
+        except BaseException as exc:
+            errors.append(_cleanup_exception(exc))
+        finally:
+            startup_state.compensated = True
+        return errors
+
+    async def _on_startup(app: web.Application) -> None:
+        try:
+            await _start_application(app)
+        except BaseException as original_exception:
+            errors = await _compensate_startup(app)
+            for error in errors:
+                log.error("server startup compensation failed: %s", error)
+            if errors:
+                original_exception.add_note(_cleanup_note(errors))
+            raise
+
+    async def _on_cleanup(app: web.Application) -> None:
+        errors: list[Exception] = []
+
+        async def attempt(operation: Any) -> None:
+            try:
+                await operation()
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+
+        def attempt_sync(operation: Any) -> Any:
+            try:
+                return operation()
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+                return None
+
+        if startup_state.compensated:
+            try:
+                task_errors = await cancel_background_tasks(
+                    startup_background_tasks,
+                    label="server cleanup",
+                )
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+            else:
+                errors.extend(_cleanup_exception(error) for error in task_errors)
+            try:
+                _clear_runtime_app_state(app, runtime_slot, startup_state)
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+        else:
+            cleanup_started = time.monotonic()
+            from .liveness import mark_clean_shutdown
+
+            attempt_sync(lambda: mark_clean_shutdown(config.home))
+            from .worklink.autonomy import release_claims_for_graceful_shutdown
+
+            release_timeout = 5.0
+            if config.drain_timeout_seconds > 0:
+                release_timeout = min(
+                    release_timeout,
+                    float(config.drain_timeout_seconds),
+                )
+            released = attempt_sync(
+                lambda: release_claims_for_graceful_shutdown(
+                    config.home,
+                    agent_id=worklink_agent_id,
+                    timeout_s=release_timeout,
+                )
+            )
+            if released is not None:
+                await attempt(
+                    lambda: log_event(
+                        "worklink_shutdown_claims_released",
+                        issue_ids=[record.issue_id for record in released],
+                    )
+                )
+            await attempt(lambda: log_event("shutdown", reason="cleanup"))
+            drain_timeout = config.drain_timeout_seconds
+            if drain_timeout > 0:
+                drain_timeout = max(
+                    0.0,
+                    drain_timeout - (time.monotonic() - cleanup_started),
+                )
+            await attempt(lambda: dispatcher.drain(timeout=drain_timeout))
+            try:
+                task_errors = await cancel_background_tasks(
+                    startup_background_tasks,
+                    label="server cleanup",
+                )
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+            else:
+                errors.extend(_cleanup_exception(error) for error in task_errors)
+            attempt_sync(scheduler.stop)
+            if startup_state.bundle is not None:
+                await attempt(startup_state.bundle.aclose)
+            if startup_state.activity_panel is not None:
+                await attempt(startup_state.activity_panel.stop)
+            await attempt(pairing_notifier.aclose)
+            await attempt(channels.disconnect_all)
+            if startup_state.mcp_manager is not None:
+                await attempt(startup_state.mcp_manager.shutdown)
+            try:
+                _clear_runtime_app_state(app, runtime_slot, startup_state)
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+
+        for error in errors:
+            log.error("server cleanup failed: %s", error)
+        if errors:
+            raise ExceptionGroup("server cleanup failed", errors)
 
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)

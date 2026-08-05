@@ -1,15 +1,9 @@
-"""Regression: ``build_app`` must wire the IndexGenerator into the
+"""Regression: the runtime must wire the IndexGenerator into the
 ``rebuild_index`` tool, or the tool is dead.
 
-The bug (task: "Wire set_index_generator(indexes) in build_app"): ``build_app``
-built ``indexes = IndexGenerator(config.home)`` and wired the *search* Indexer
-via ``set_indexer(indexer)`` — but never called ``set_index_generator(indexes)``.
-So the agent could invoke ``rebuild_index`` but it always returned
-"rebuild_index failed: no IndexGenerator configured".
-
-``build_app`` is too heavy to stand up in a unit test (real saga + scheduler +
-dispatcher + bridges), so the wiring is guarded by source inspection of the
-function; the tool's behavior is covered directly.
+The composition root owns both the human-readable IndexGenerator and the search
+Indexer. The wiring is guarded by source inspection and the tool behavior is
+covered directly.
 """
 
 from __future__ import annotations
@@ -21,13 +15,13 @@ import pytest
 from mimir.tools.extra import _INDEX_GEN_STATE, rebuild_index, set_index_generator
 
 
-def test_build_app_wires_the_index_generator() -> None:
-    from mimir.server import build_app
+def test_runtime_wires_the_index_generator() -> None:
+    from mimir.runtime import _install_runtime_globals
 
-    src = inspect.getsource(build_app)
-    assert "set_index_generator(indexes)" in src, (
-        "build_app must call _agent_tools.set_index_generator(indexes) next to "
-        "set_indexer(indexer) — without it the rebuild_index tool is dead "
+    src = inspect.getsource(_install_runtime_globals)
+    assert "set_index_generator(bundle.indexes)" in src, (
+        "the runtime must install its IndexGenerator next to its Indexer — "
+        "without it the rebuild_index tool is dead "
         '("no IndexGenerator configured").'
     )
 
