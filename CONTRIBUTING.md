@@ -56,6 +56,61 @@ the PR — see `benchmarks/longmemeval_via_mimir/README.md`. Memory-backend
 changes (`mimir/saga/`) are covered by `tests/test_saga_*` in the main
 test suite — no separate `cd` is needed.
 
+### Run both, and require both green
+
+A scoped run is not evidence. Before submitting a test, run it alone **and** in
+the full suite:
+
+```bash
+uv run pytest -q tests/test_<file>.py   # your file alone
+uv run pytest -q                        # the whole suite
+```
+
+**A test that passes alone and fails in the full suite is not flaky. It is
+asserting shared state.** Fix the assertion, not the ordering. Do not reach for
+ordering plugins, `importlib.reload`, or fixtures that reset globals — those hide
+the coupling instead of removing it.
+
+### Don't assert on ambient state you don't own
+
+Asserting on mutable process state is fine when that state is the *subject* of the
+test and the test owns it — verifying that a component sets an environment variable
+or handles the working directory correctly is a legitimate test, provided the change
+is scoped and restored (`monkeypatch`) or isolated in a child process.
+
+The problem is asserting on **ambient** state: shared state outside the ownership of
+your test or the component under test, which any other test in the process may also
+touch. Two kinds have bitten this repo:
+
+- **Import-time state** — `sys.modules`, import caches, registries, singletons,
+  module-level mutable defaults. Fails at collection, because importing a sibling
+  test module is enough to populate it.
+- **Live runtime state** — the event loop's task set (`asyncio.all_tasks()`), open
+  transports and connections, threads, timers. Fails during an `await`, when a task
+  another test leaked finishes or spawns inside your measurement window — so it can
+  fail even against a clean baseline.
+
+The distinction is ownership, not mutability. `monkeypatch.setenv` on a variable your
+component reads is owned and restored. A bare read of the whole event loop's task set
+is ambient, because everything that ran before you shares it.
+
+To prove a negative — "this module does not import X", "nothing reaches Y", "no
+adapter was started", "no task was created" — pick one:
+
+1. **Scope the claim to the thing under test.** Assert no *new* task belonging to
+   your component, not equality over every task in the loop. This is usually the
+   right answer and the cheapest.
+2. **Prove it statically.** Walk the AST for imports, or read the module's own
+   declarations. Works when the property is visible in the source.
+3. **Prove it in a child process.** A fresh interpreter running only the code
+   under test. Correct but slow; reserve it for properties the other two cannot
+   express.
+
+A before/after delta is **not** sufficient on its own. Capturing state, acting,
+and re-comparing still fails when the state moves concurrently — that is exactly
+how the second kind of failure gets past review, because the test reads as
+careful.
+
 ## Reviewing
 
 PRs need one approving review before merge. The bar is "does this make the
