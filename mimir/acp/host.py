@@ -78,7 +78,7 @@ class _FrameDelivery:
         self,
         frame_file: BinaryIO,
         capacity: int,
-        error_callback: Callable[[], None],
+        error_callback: Callable[[BaseException], None],
     ) -> None:
         if capacity <= 0:
             raise ValueError("frame delivery capacity must be positive")
@@ -155,7 +155,7 @@ class _FrameDelivery:
                 else:
                     self._queue.put(payload)
         if delivery_error is not None:
-            self._loop.call_soon(self._error_callback)
+            self._loop.call_soon(self._error_callback, delivery_error)
             raise delivery_error
         return size
 
@@ -201,7 +201,7 @@ class _FrameDelivery:
                 if self._error is None:
                     self._error = exc
                 self._accepting = False
-            self._loop.call_soon_threadsafe(self._error_callback)
+            self._loop.call_soon_threadsafe(self._error_callback, exc)
         finally:
             try:
                 self._loop.call_soon_threadsafe(self._mark_terminal)
@@ -312,8 +312,17 @@ class HostLifecycle:
         self._stop_watchdog()
         return 1 if self._failed else 0
 
-    def _frame_delivery_failed(self) -> None:
-        self._mark_failed()
+    def _frame_delivery_failed(self, error: BaseException) -> None:
+        # A peer that hangs up mid-frame is a clean disconnect, not a host failure:
+        # the write/flush raises BrokenPipeError/ConnectionResetError from the
+        # physical delivery thread. ``_failed`` is sticky, so marking it here would
+        # outlive the correct classification ``_retrieve_delivery_task`` already
+        # performs on the same error, and a clean disconnect would exit 1 after a
+        # complete teardown. Intake stops either way so teardown still runs.
+        if isinstance(error, _PEER_DISCONNECT_ERRORS):
+            self._peer_disconnected = True
+        else:
+            self._mark_failed()
         self.stop_protocol_intake()
 
     async def _start(self) -> None:

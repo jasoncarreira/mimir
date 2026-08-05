@@ -218,7 +218,16 @@ async def test_create_uses_only_empty_unstarted_runtime_adapters(
     assert result.adapters.dispatcher._workers == {}
     assert result.adapters.scheduler._started is False
     assert isinstance(result.adapters.pairing_notifier, composition._AcpPairingNotifier)
-    assert asyncio.all_tasks() == tasks_before
+    # Scoped to this component, not the whole loop. Comparing every task in the
+    # running loop is ambient state: a task another test leaked can finish or spawn
+    # inside this window and fail the comparison without `create()` having done
+    # anything. The same reasoning as the sys.modules note above. See CONTRIBUTING.md.
+    acp_tasks = [
+        task
+        for task in asyncio.all_tasks() - tasks_before
+        if "acp" in (task.get_name() or "").lower()
+    ]
+    assert acp_tasks == []
     assert [entry if isinstance(entry, str) else entry[0] for entry in calls] == [
         "config",
         "core",

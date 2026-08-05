@@ -306,7 +306,7 @@ async def test_frame_delivery_reserves_exact_capacity_and_overflow_fails_closed(
 
     frame = BlockingFrame()
     failed = asyncio.Event()
-    delivery = _FrameDelivery(frame, 10, failed.set)
+    delivery = _FrameDelivery(frame, 10, lambda _error: failed.set())
     assert delivery.write(b"123456") == 6
     while not frame.started.is_set():
         await asyncio.sleep(0)
@@ -331,7 +331,7 @@ async def test_frame_delivery_reserves_exact_capacity_and_overflow_fails_closed(
 async def test_frame_delivery_sustained_ingress_remains_bounded_and_ordered() -> None:
     frame = io.BytesIO()
     failures: list[None] = []
-    delivery = _FrameDelivery(frame, 16, lambda: failures.append(None))
+    delivery = _FrameDelivery(frame, 16, lambda _error: failures.append(None))
     frames = [f"{index:03d}\n".encode() for index in range(200)]
 
     for payload in frames:
@@ -368,6 +368,73 @@ async def test_peer_disconnect_returns_clean_only_after_cleanup_terminal() -> No
     assert await lifecycle.run() == 0
     assert events.index("peer-disconnected") < events.index("adapters-closed")
     assert len(composition.adapter_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_write_peer_disconnect_exits_clean() -> None:
+    """A peer that hangs up mid-write is a clean disconnect, not a host failure.
+
+    The existing peer-disconnect coverage raises from the protocol runner, a path
+    that was already classified correctly. This drives the error from the physical
+    frame-delivery sink instead, which reaches ``_frame_delivery_failed``. That
+    callback used to mark failure unconditionally, and because the flag is sticky it
+    outlived the correct classification ``_retrieve_delivery_task`` performs on the
+    same exception — so a clean disconnect exited 1 after a complete teardown.
+    """
+    events: list[str] = []
+    lifecycle = _lifecycle(composition=_FakeComposition(_completed, events))
+
+    lifecycle._frame_delivery_failed(BrokenPipeError("peer hung up"))
+
+    assert await lifecycle.run() == 0
+    assert "adapters-closed" in events
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_flush_peer_disconnect_exits_clean() -> None:
+    """Same contract for the flush call site, which is separate from write."""
+    events: list[str] = []
+    lifecycle = _lifecycle(composition=_FakeComposition(_completed, events))
+
+    lifecycle._frame_delivery_failed(ConnectionResetError("peer reset"))
+
+    assert await lifecycle.run() == 0
+    assert "adapters-closed" in events
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_real_write_failure_still_fails() -> None:
+    """A genuine sink failure must remain a failure — the fix narrows, not removes."""
+    events: list[str] = []
+    lifecycle = _lifecycle(composition=_FakeComposition(_completed, events))
+
+    lifecycle._frame_delivery_failed(OSError("disk went away"))
+
+    assert await lifecycle.run() == 1
+    assert "adapters-closed" in events
+
+
+@pytest.mark.asyncio
+async def test_frame_delivery_sink_error_reaches_the_callback() -> None:
+    """The exception must cross the thread/loop boundary at all.
+
+    The callback previously took no argument, so the delivery thread discarded which
+    exception occurred before any classification could run. This pins that the
+    failure itself is delivered.
+    """
+    seen: list[BaseException] = []
+
+    class _BrokenSink(io.BytesIO):
+        def write(self, data: Any) -> int:  # type: ignore[override]
+            raise BrokenPipeError("peer hung up")
+
+    delivery = _FrameDelivery(_BrokenSink(), 64, seen.append)
+    delivery.write(b'{"jsonrpc":"2.0"}\n')
+    delivery.finish()
+    with pytest.raises(BrokenPipeError):
+        await delivery.wait_terminal()
+
+    assert seen and isinstance(seen[0], BrokenPipeError)
 
 
 @pytest.mark.asyncio
