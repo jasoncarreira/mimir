@@ -11,6 +11,15 @@ from zipfile import ZipFile
 REQUIRED_MEMBERS = (
     "mimir/web_auth.js",
     "mimir/bundled_docs/.env.example",
+    "mimir/acp/__init__.py",
+    "mimir/acp/__main__.py",
+    "mimir/acp/agent.py",
+    "mimir/acp/bootstrap.py",
+    "mimir/acp/composition.py",
+    "mimir/acp/host.py",
+    "mimir/acp/sdk.py",
+    "mimir/acp/stdio.py",
+    "mimir/bundled_docs/docs/acp.md",
 )
 REACT_DIST_PREFIX = "mimir/react_app/dist/"
 
