@@ -78,3 +78,15 @@ home/
 
 # GEPA pilot run outputs (chainlink #404) — generated, not committed
 evals/**/pilot_output/
+
+# feature-factory control plane and run sandboxes (never committed).
+# Required, not cosmetic: the factory's own per-merge verify refuses to run
+# when the integration worktree is dirty, and an untracked .factory/ is
+# exactly what makes it dirty — run 1396 halted at needs-human with
+# "the .factory.json verify suite cannot be replayed because the integration
+# worktree is not clean (untracked .factory/)". A local .git/info/exclude
+# does not propagate to the nested worktrees the factory creates per slice,
+# which is where verify actually runs. .factory.json is a tracked
+# declaration and is unaffected: the trailing slash matches directories only.
+.factory/
+.factory-sandboxes/
