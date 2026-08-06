@@ -2812,8 +2812,11 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
             "typed repo_test tool",
         ),
         (
+            # Single-quoted, so nothing here is an operator; the refusal comes
+            # from the allowlist -- ``python`` is not admitted at all. Same
+            # denial, same guidance, more accurate attribution.
             "python -c 'import json; print(json.dumps({}))'",
-            access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
             "no general typed equivalent",
         ),
         (
@@ -2931,7 +2934,12 @@ def test_maintenance_inline_python_with_shell_syntax_keeps_guidance() -> None:
     )
 
     assert argv is None
-    assert rule is access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
+    # Attributed to the allowlist rather than the metacharacter rule: the ``;``
+    # here sits inside quotes and is a literal, and ``python3`` is refused for
+    # not being admitted at all -- which holds for ``python3 script.py`` too,
+    # with no metacharacter anywhere. The guidance the agent acts on, asserted
+    # below, is unchanged.
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
     assert "arbitrary code execution and remains denied" in reason
     assert "no general typed equivalent" in reason
 
@@ -7697,6 +7705,100 @@ def test_maintenance_shell_profile_preserves_shared_argv_guards(command: str) ->
     import mimir.access_control as access_control
 
     assert access_control.parse_service_shell_argv(command, "maintenance") is None
+
+
+def test_quoted_metacharacter_is_a_value_not_an_operator() -> None:
+    """A conflict-scanning turn must be able to search for conflict markers.
+
+    ``<`` inside quotes is a literal. The rule scanned the raw command string,
+    so this was refused as a redirection and the turn could not do the one
+    thing it existed to do.
+    """
+    import mimir.access_control as access_control
+
+    argv = access_control.parse_service_shell_argv(
+        "grep -r '<<<<<<<' /mimir-home/scratch", "maintenance",
+    )
+    assert argv is not None
+    assert "<<<<<<<" in argv
+
+
+def test_quoted_separator_cannot_chain_a_second_command() -> None:
+    """Admitting quoted metacharacters must not admit command chaining.
+
+    The quoted ``;`` survives as ONE argv element -- a literal search pattern --
+    and the argv is exec'd with ``shell=False``, so nothing parses it as a
+    separator. Asserting the element boundary is the point: were the value ever
+    handed back to a shell, this would be two commands.
+    """
+    import mimir.access_control as access_control
+
+    argv = access_control.parse_service_shell_argv(
+        "grep -r 'a;rm -rf /' /mimir-home/scratch", "maintenance",
+    )
+    assert argv is not None
+    assert "a;rm -rf /" in argv
+    assert "rm" not in argv
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /mimir-home/state/x.md | wc -l",
+        "grep -r x /tmp > /tmp/out",
+        "grep -r x /tmp && rm -rf /",
+        "ls /mimir-home; cat /etc/passwd",
+        "grep -r x /tmp 2>&1",
+        "grep -r $(whoami) /tmp",
+    ],
+)
+def test_unquoted_operators_are_still_refused(command: str) -> None:
+    """The widening is quoting-scoped: an operator outside quotes is unchanged."""
+    import mimir.access_control as access_control
+
+    assert access_control.parse_service_shell_argv(command, "maintenance") is None
+
+
+def test_newline_is_refused_even_inside_quotes() -> None:
+    """Multi-line values go through ``--body-file``, never inline argv.
+
+    A newline inside a command string is not a legitimate argument value, so
+    quoting must not launder it. ``repo_review`` relies on this: it admits
+    ``--body-file`` beneath the scratch root precisely so bodies do not travel
+    in argv.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters('gh pr review --body "a\nb"') == ["\n"]
+    assert access_control.parse_service_shell_argv(
+        'gh pr review 7 --repo o/r --approve --body "a\nb"', "repo_review",
+    ) is None
+
+
+def test_double_quotes_do_not_make_substitution_literal() -> None:
+    """Single quotes make everything literal; double quotes do not.
+
+    A shell still performs ``$(...)`` and backtick substitution inside double
+    quotes, so treating a double-quoted value as inert would be wrong even
+    though this argv is exec'd with ``shell=False``.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters('x "$(cat /etc/passwd)"') == ["$"]
+    assert access_control._unquoted_shell_control_characters("x '$(cat /etc/passwd)'") == []
+    assert access_control._unquoted_shell_control_characters('x "`id`"') == ["`"]
+
+
+def test_escaped_quote_does_not_end_the_quoted_span() -> None:
+    """A backslash-escaped quote must not be read as closing the span.
+
+    Otherwise the scanner would fall back to treating the rest of the command as
+    unquoted and refuse metacharacters that are still inside the value.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters(r'grep "a\"b" x') == []
+    assert access_control._unquoted_shell_control_characters("grep a | b") == ["|"]
 
 
 def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:

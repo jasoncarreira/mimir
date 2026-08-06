@@ -1638,6 +1638,59 @@ def _chainlink_target_argv(target: str | None) -> list[str] | None:
     return argv if _target_matches_chainlink_command(argv) else None
 
 
+#: Refused even when quoted. A newline inside a command string is never a
+#: legitimate argument value, and ``repo_review`` deliberately routes multi-line
+#: review bodies through ``--body-file`` rather than inline ``--body``.
+_REFUSED_INSIDE_ANY_QUOTE = frozenset("\n\r")
+
+#: Single quotes make every character literal, but double quotes do NOT: a shell
+#: still performs ``$(...)`` and backtick substitution inside them. Treating
+#: ``"$(cat /etc/passwd)"`` as a literal because it is quoted would be wrong.
+_EXPANDS_INSIDE_DOUBLE_QUOTES = frozenset("$`")
+
+
+def _unquoted_shell_control_characters(target: str) -> list[str]:
+    """Return the metacharacters appearing OUTSIDE quotes in *target*, sorted.
+
+    Quoting is what separates an operator from a value. ``grep -r '<<<<<<<'``
+    searches for a conflict marker; nothing redirects. Scanning the raw string
+    treated the two alike, so a turn whose job was finding merge conflicts in a
+    workspace it had just written could not search for conflict markers -- 60 of
+    190 service-shell refusals measured on muninn, 2026-08-03..06.
+
+    Unquoted metacharacters are still refused, so a real pipe, redirection or
+    command separator is rejected exactly as before. The admitted argv is exec'd
+    with ``shell=False``, so a quoted metacharacter reaches the process as one
+    literal argument and is never parsed by anything.
+    """
+    found: set[str] = set()
+    quote: str | None = None
+    escaped = False
+    for character in target:
+        if escaped:
+            escaped = False
+            continue
+        # A backslash escapes the next character everywhere except inside single
+        # quotes, where POSIX shells pass it through literally.
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif character in _REFUSED_INSIDE_ANY_QUOTE or (
+                quote == '"' and character in _EXPANDS_INSIDE_DOUBLE_QUOTES
+            ):
+                found.add(character)
+            continue
+        if character in ("'", '"'):
+            quote = character
+            continue
+        if character in _SHELL_CONTROL_CHARACTERS:
+            found.add(character)
+    return sorted(found)
+
+
 def _arguments_match_allowlist(
     arguments: list[str],
     *,
@@ -1699,7 +1752,7 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
         return _arguments_match_allowlist(
             arguments,
             exact_options=frozenset({
-                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-s",
+                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
                 "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
                 "--files-with-matches", "--ignore-case", "--line-number",
                 "--no-messages", "--quiet", "--recursive", "--invert-match",
@@ -3235,7 +3288,7 @@ def parse_service_shell_argv_with_diagnostics(
     service command can carry a credential (``git -c http.extraheader=...``) and
     this text is returned to the model and recorded in the turn transcript.
     """
-    found = sorted(set(target) & _SHELL_CONTROL_CHARACTERS)
+    found = _unquoted_shell_control_characters(target)
     if found:
         rendered = ", ".join(repr(character) for character in found)
         try:
