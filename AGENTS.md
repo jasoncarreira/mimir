@@ -34,6 +34,34 @@ review, re-run it on the unmodified base and compare the dependency pin.
 or worktree it is correct and expected. Against a running deployment it recreates
 the venv underneath the live process. Use `.venv/bin/python` directly there.
 
+## Reading outside the diff
+
+**Stay inside the repository.** An unscoped search rooted at `$HOME` wedged a run
+for 65 minutes on a blocked write, with every health signal reading normal — the
+run looked alive the whole time.
+
+**Source missing from the tree usually means "not synced," not "not declared."**
+Read `pyproject.toml` and `uv.lock` before concluding anything: a dependency
+declared in an optional extra or a dependency group is simply absent from a `.venv`
+that never synced it, and platform markers and transitive packages leave the same
+gap. Sync the owning extra or group and read it there. Add a declaration only when
+nothing declares what the code genuinely requires, and that change is in scope.
+
+**Ask the interpreter where an import resolves; don't reconstruct a path.**
+Distribution and import names differ often enough to mislead (`pyyaml` installs as
+`yaml`), so start from a module that already imports it — `mimir/cred_verify.py`
+has `import yaml` — and let Python answer:
+
+```bash
+uv run python -c "import importlib.util as u; s = u.find_spec('yaml'); print(s.origin, s.submodule_search_locations)"
+```
+
+A path reconstructed from the import name instead breaks on editable installs,
+namespace packages, and single-file or compiled modules. Searching the tree by name
+has its own failure mode: a first-party package can share a name with the dependency
+it wraps, so the search returns our own code and reads as the dependency being
+absent.
+
 ## Branches and merging
 
 - `main` is protected: one approving review, `enforce_admins` on, required status
