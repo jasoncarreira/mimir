@@ -40,15 +40,27 @@ the venv underneath the live process. Use `.venv/bin/python` directly there.
 for 65 minutes on a blocked write, with every health signal reading normal — the
 run looked alive the whole time.
 
-**A missing API means an undeclared dependency, not a missing file.** If what you
-need isn't in the tree, declare the dependency, sync it, and read it in `.venv`.
+**Source missing from the tree usually means "not synced," not "not declared."**
+Read `pyproject.toml` and `uv.lock` before concluding anything: a dependency
+declared in an optional extra or a dependency group is simply absent from a `.venv`
+that never synced it, and platform markers and transitive packages leave the same
+gap. Sync the owning extra or group and read it there. Add a declaration only when
+nothing declares what the code genuinely requires, and that change is in scope.
 
-**Resolve a dependency's source from an import, not a search.** Distribution names
-and import names differ often enough to mislead (`agent-client-protocol` → `acp`,
-`PyYAML` → `yaml`). Find a module that already imports it and follow that name to
-`.venv/lib/python3.*/site-packages/<import name>/`. Searching by distribution name
-can also collide with first-party code — `mimir/acp/` is not the `acp` SDK — and a
-search that returns our own package reads as "the dependency is missing."
+**Ask the interpreter where an import resolves; don't reconstruct a path.**
+Distribution and import names differ often enough to mislead (`pyyaml` installs as
+`yaml`), so start from a module that already imports it — `mimir/cred_verify.py`
+has `import yaml` — and let Python answer:
+
+```bash
+uv run python -c "import importlib.util as u; s = u.find_spec('yaml'); print(s.origin, s.submodule_search_locations)"
+```
+
+A path reconstructed from the import name instead breaks on editable installs,
+namespace packages, and single-file or compiled modules. Searching the tree by name
+has its own failure mode: a first-party package can share a name with the dependency
+it wraps, so the search returns our own code and reads as the dependency being
+absent.
 
 ## Branches and merging
 
