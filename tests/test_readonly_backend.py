@@ -1783,6 +1783,53 @@ class TestBuildFileToolRoutes:
         assert fields["truncated"] is True
         assert fields["reason"] == "ran longer than 0.001s"
 
+    def test_glob_time_truncation_always_reports_forward_progress(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A time-truncated walk must have visited at least one entry.
+
+        The deadline used to be checked before the first visit, so a budget
+        that expired before the walk began reported ``truncated`` with
+        ``visited_entries=0`` — a result that says nothing about how far the
+        scan reached, and a bound that raced process scheduling instead of the
+        size of the tree. ``test_large_glob_returns_time_truncation_before_
+        external_deadline`` failed roughly 1 run in 6 under CPU contention for
+        exactly this reason, and consumed a worklink build attempt.
+
+        The budget here is already spent on entry, which is the worst case and
+        needs no timing to reproduce.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for directory_index in range(4):
+            directory = repo / f"directory-{directory_index}"
+            directory.mkdir()
+            for file_index in range(50):
+                (directory / f"file-{file_index:03d}.txt").touch()
+        events = []
+        monkeypatch.setattr(
+            "mimir.event_logger.log_event_sync",
+            lambda kind, **fields: events.append((kind, fields)),
+        )
+        backend = _RootAwareFilesystemBackend(
+            root_dir=repo,
+            virtual_mode=True,
+            glob_timeout_seconds=0.0,
+            max_scan_files=100_000,
+        )
+
+        result = backend.glob("**/*.py", path="/")
+
+        assert result.error is None
+        assert result.truncated is True
+        kind, fields = events[-1]
+        assert kind == "filesystem_glob_search"
+        assert fields["truncated"] is True
+        assert fields["visited_entries"] >= 1, (
+            "a truncated walk reported visiting nothing; the deadline fired "
+            "before any forward progress"
+        )
+
     def test_glob_visited_count_has_no_common_case_regression(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
