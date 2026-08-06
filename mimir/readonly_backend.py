@@ -637,8 +637,19 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         on_visit: Callable[[], None] | None = None,
         descend: Callable[[Path], bool] | None = None,
         on_withheld: Callable[[str], None] | None = None,
+        visited: list[bool] | None = None,
     ) -> Iterator[Path]:
-        """Walk incrementally so callers can bound and observe every entry."""
+        """Walk incrementally so callers can bound and observe every entry.
+
+        ``visited`` is the recursion-shared "has one entry been reached yet"
+        flag. The deadline is not honoured until it has, so the walk always
+        makes one entry of forward progress. Without that, a tight budget can
+        expire between the caller's ``time.monotonic()`` and the first check
+        here, and the caller reports truncation having visited nothing —
+        ``"search of '<path>' was cut short after 0 entries"``, which says
+        nothing about how far the scan reached. It also made the bound race
+        against process scheduling rather than against the size of the tree.
+        """
         if deadline is None and on_visit is None and descend is None:
             for dirpath, dirnames, filenames in os.walk(root):
                 base = Path(dirpath)
@@ -657,16 +668,23 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                         yield candidate
             return
 
-        if deadline is not None and time.monotonic() >= deadline:
+        if visited is None:
+            visited = [False]
+
+        if visited[0] and deadline is not None and time.monotonic() >= deadline:
             raise _TraversalDeadlineExceeded
         directories: list[Path] = []
         files: list[Path] = []
         with os.scandir(root) as entries:
             for entry in entries:
-                if deadline is not None and time.monotonic() >= deadline:
+                if visited[0] and deadline is not None and time.monotonic() >= deadline:
                     raise _TraversalDeadlineExceeded
                 if on_visit is not None:
                     on_visit()
+                # Set unconditionally, not only when ``on_visit`` is supplied:
+                # a deadline with no observer must still be enforced from the
+                # second entry on, or the walk would never stop.
+                visited[0] = True
                 candidate = Path(entry.path)
                 if self._is_excluded(
                     candidate, tool=tool, on_withheld=on_withheld,
@@ -692,6 +710,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     on_visit=on_visit,
                     descend=descend,
                     on_withheld=on_withheld,
+                    visited=visited,
                 )
 
     @staticmethod
