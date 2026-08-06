@@ -34,6 +34,22 @@ review, re-run it on the unmodified base and compare the dependency pin.
 or worktree it is correct and expected. Against a running deployment it recreates
 the venv underneath the live process. Use `.venv/bin/python` directly there.
 
+## Reading outside the diff
+
+**Stay inside the repository.** An unscoped search rooted at `$HOME` wedged a run
+for 65 minutes on a blocked write, with every health signal reading normal — the
+run looked alive the whole time.
+
+**A missing API means an undeclared dependency, not a missing file.** If what you
+need isn't in the tree, declare the dependency, sync it, and read it in `.venv`.
+
+**Resolve a dependency's source from an import, not a search.** Distribution names
+and import names differ often enough to mislead (`agent-client-protocol` → `acp`,
+`PyYAML` → `yaml`). Find a module that already imports it and follow that name to
+`.venv/lib/python3.*/site-packages/<import name>/`. Searching by distribution name
+can also collide with first-party code — `mimir/acp/` is not the `acp` SDK — and a
+search that returns our own package reads as "the dependency is missing."
+
 ## Branches and merging
 
 - `main` is protected: one approving review, `enforce_admins` on, required status
