@@ -320,3 +320,142 @@ class TestPollerWiring:
             manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
         )
         assert principal.declared_shell_commands == ()
+
+
+class TestReviewFindings:
+    """Regressions for the privilege-escalation findings on PR #1402."""
+
+    def test_executable_inside_a_writable_root_is_refused(self, home: Path) -> None:
+        """Finding 1. The pin is only a pin if the agent cannot replace the file.
+
+        The script rule was applied to ``script`` but not to ``path``, so a CLI
+        declared under an agent-writable location could be rewritten and then run
+        through an otherwise-admitted command shape.
+        """
+        fake = home / "scratch" / "gog"
+        fake.write_text("#!/bin/sh\necho hi\n")
+        fake.chmod(0o755)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(fake), "subcommands": [["gmail", "search"]]}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_executable_symlink_into_a_writable_root_is_refused(self, home: Path) -> None:
+        target = home / "scratch" / "gog"
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o755)
+        link = home / "scripts" / "gog"
+        link.symlink_to(target)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(link), "subcommands": [["gmail", "search"]]}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_path_must_be_a_regular_executable_file(self, home: Path) -> None:
+        with pytest.raises(ValueError, match="not a regular file"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(home / "scripts"),
+                  "subcommands": [["gmail", "search"]]}],
+                writable_roots=(),
+            )
+
+    def test_interpreter_cannot_be_hidden_behind_an_exec_alias(self, home: Path) -> None:
+        """Finding 2. Classification follows the resolved binary, not the label.
+
+        ``exec`` and ``path`` need not share a name, so classifying on ``exec``
+        let ``exec: gog`` with ``path: /usr/bin/python3`` present as an ordinary
+        CLI and skip the pinned-script rule entirely.
+        """
+        with pytest.raises(ValueError, match="only be declared with a pinned"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": "/usr/bin/python3",
+                  "subcommands": [["/tmp/whatever.py"]]}],
+                writable_roots=(),
+            )
+
+    def test_scheduler_declaration_does_not_widen_unrelated_authority(self) -> None:
+        """Finding 3. A grant adds the declared argv and nothing else.
+
+        Rebuilding the principal from the heartbeat profile would have handed any
+        job that declared one command the full heartbeat capability set --
+        send_message, fetch_url, and the typed repo/PR mutation tools.
+        """
+        import dataclasses
+
+        from mimir.access_control import get_service_principal
+
+        base = get_service_principal("scheduled_tick")
+        assert base is not None
+        declared = parse_declared_shell_commands(
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            writable_roots=(),
+        )
+        extended = dataclasses.replace(base, declared_shell_commands=declared)
+
+        assert extended.capabilities == base.capabilities
+        assert extended.sink_policies == base.sink_policies
+        assert extended.readable_domains == base.readable_domains
+        assert extended.filesystem_read_roots == base.filesystem_read_roots
+        assert extended.capability_tier == base.capability_tier
+        assert extended.declared_shell_commands != base.declared_shell_commands
+
+    def test_scheduler_yaml_round_trip_preserves_declarations(self) -> None:
+        """Finding 4. Any mutation rewrites the file; unemitted grants vanish."""
+        from mimir.scheduler import load_jobs_from_text
+        import yaml
+
+        text = (
+            "- name: morning-briefing\n"
+            "  prompt_file: morning-briefing.md\n"
+            "  cron: 0 8 * * *\n"
+            "  shell_commands:\n"
+            "    - exec: gog\n"
+            "      path: /bin/echo\n"
+            "      subcommands: [[gmail, search]]\n"
+        )
+        job = load_jobs_from_text(text)[0]
+        round_tripped = load_jobs_from_text(yaml.safe_dump([job.to_yaml_entry()]))[0]
+        assert round_tripped.shell_commands == job.shell_commands
+
+    @pytest.mark.parametrize(
+        "profile",
+        ["maintenance", "repo_review", "scheduler_read_only", "upgrade_workspace"],
+    )
+    def test_declarations_are_additive_under_every_profile(self, profile: str) -> None:
+        """Finding 5. Several branches return early; the check must precede them.
+
+        ``repo_review`` and the per-profile ``git`` handlers return on mismatch,
+        so a fallback placed after the dispatch was reachable for some profiles
+        and not others -- a GitHub poller could never use a declared CLI.
+        """
+        declared = parse_declared_shell_commands(
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            writable_roots=(),
+        )
+        assert parse_service_shell_argv(
+            "gog gmail search x", profile, declared=declared,
+        ) is not None
+
+    def test_external_rw_roots_count_as_writable(
+        self, home: Path, tmp_path_factory, monkeypatch,
+    ) -> None:
+        """Finding 1b. MIMIR_FILE_TOOL_ROOTS rw routes are part of the surface.
+
+        The root must sit OUTSIDE the home -- an overlapping entry is rejected by
+        config itself, so an in-home directory would not exercise this at all.
+        """
+        external = tmp_path_factory.mktemp("external_repo")
+        binary = external / "gog"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:rw")
+        roots = agent_writable_roots(home)
+        assert external.resolve() in roots, roots
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "gog", "path": str(binary), "subcommands": [["gmail", "search"]]}],
+                writable_roots=roots,
+            )

@@ -24,6 +24,7 @@ but back-to-back ticks of the same job serialize naturally.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -46,11 +47,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
 from .access_control import (
-    CapabilityTier,
-    TRIGGER_AUTHORITY_PROFILES,
     agent_writable_roots,
-    build_trigger_service_principal,
     builtin_trigger_service_principal,
+    get_service_principal,
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
@@ -230,6 +229,10 @@ class SchedulerJob:
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
+        # Emitted, or any scheduler mutation that rewrites the file (adding a
+        # job, changing a priority) silently strips this job's grants.
+        if self.shell_commands:
+            out["shell_commands"] = self.shell_commands
         if self.prompt:
             out["prompt"] = self.prompt
         if self.prompt_file:
@@ -984,16 +987,23 @@ class Scheduler:
             authority = builtin_trigger_service_principal("heartbeat", self._home)
             service_principal = authority.canonical
         elif job.shell_commands:
-            # Every other scheduler.yaml job otherwise falls back to the
-            # trigger-level ``scheduled_tick`` principal, so its NAME never
-            # reaches authorization and all jobs share one shell profile. A job
-            # that declares grants gets its own principal instead, which is what
-            # makes those grants addressable to it and not to its neighbours.
+            # Attach the declaration to the authority this job ALREADY has.
+            # Rebuilding from TRIGGER_AUTHORITY_PROFILES["heartbeat"] would let
+            # declaring one shell command silently grant send_message, fetch_url
+            # and the typed repo/PR mutation tools, while dropping capabilities
+            # the scheduled-tick principal carries -- a declaration must add the
+            # declared argv and nothing else.
             #
-            # A bad declaration disables the job rather than silently downgrading
-            # it to the shared principal: a job whose grants failed to load would
-            # fail every command it was configured to run, and the reason would
-            # be nowhere near the cause.
+            # A bad declaration disables the job rather than downgrading it to
+            # the undeclared principal: it would otherwise fail every command it
+            # was configured to run, with the reason nowhere near the cause.
+            base = get_service_principal("scheduled_tick")
+            if base is None:
+                log.error(
+                    "scheduler %r: no scheduled_tick authority to extend; job not fired",
+                    job.name,
+                )
+                return
             try:
                 declared = parse_declared_shell_commands(
                     job.shell_commands,
@@ -1005,20 +1015,7 @@ class Scheduler:
                     job.name, exc,
                 )
                 return
-            authority = build_trigger_service_principal(
-                canonical=f"scheduler:{job.name}",
-                trigger="scheduled_tick",
-                profile="heartbeat",
-                tier=CapabilityTier.UNBOUNDED,
-                capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["heartbeat"])),
-                roots=(self._home / "state" / "triggers" / job.name,),
-                channel_memory_directory=f"scheduler:{job.name}",
-                declared_shell_commands=declared,
-                creation_path=f"mimir.scheduler.Scheduler._fire_job:{job.name}",
-            )
-            (self._home / "state" / "triggers" / job.name).mkdir(
-                parents=True, exist_ok=True,
-            )
+            authority = dataclasses.replace(base, declared_shell_commands=declared)
             service_principal = authority.canonical
         event = AgentEvent(
             trigger="scheduled_tick",

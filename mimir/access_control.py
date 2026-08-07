@@ -1720,6 +1720,16 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
             roots.append(candidate.resolve())
         except OSError:
             continue
+    # Home folders are not the whole write surface: MIMIR_FILE_TOOL_ROOTS adds
+    # ``path:rw`` routes (and the default /tmp route), and configured repos can
+    # be rw. A declaration under any of them is agent-writable just the same.
+    for extra in (*_configured_file_write_roots(), *_configured_repo_write_roots()):
+        try:
+            resolved_extra = Path(extra).resolve()
+        except OSError:
+            continue
+        if resolved_extra not in roots:
+            roots.append(resolved_extra)
     return tuple(roots)
 
 
@@ -1762,6 +1772,22 @@ def parse_declared_shell_commands(
             # naming a binary that is not installed is a config error, and
             # deferring it surfaces later as an unexplained refusal.
             raise _declaration_error(name, f"path does not exist: {raw_path}")
+        # The EXECUTABLE gets the same immutability rule as a script. Without
+        # this, declaring a CLI under an agent-writable location lets the agent
+        # replace the binary and run anything through an admitted command shape,
+        # which would make every other check here decorative.
+        path = path.resolve()
+        if not path.is_file():
+            raise _declaration_error(name, f"path is not a regular file: {raw_path}")
+        if not os.access(path, os.X_OK):
+            raise _declaration_error(name, f"path is not executable: {raw_path}")
+        for root in resolved_writable:
+            if path == root or path.is_relative_to(root):
+                raise _declaration_error(
+                    name,
+                    f"path {raw_path} is inside the agent-writable root {root}; "
+                    "an executable the agent can replace is arbitrary code execution",
+                )
 
         options_raw = entry.get("options") or []
         if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
@@ -1786,7 +1812,15 @@ def parse_declared_shell_commands(
 
         raw_script = entry.get("script")
         script: Path | None = None
-        is_interpreter = name in _INTERPRETER_EXECUTABLES
+        # Classified on the RESOLVED binary as well as the declared name: the
+        # two need not match, so ``exec: gog`` with ``path: /usr/bin/python3``
+        # would otherwise present as a non-interpreter and skip the pinned-script
+        # rule entirely. Either name being an interpreter is enough.
+        is_interpreter = (
+            name in _INTERPRETER_EXECUTABLES
+            or path.name in _INTERPRETER_EXECUTABLES
+            or path.name.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+        )
         if raw_script is not None:
             if not isinstance(raw_script, str) or not raw_script:
                 raise _declaration_error(name, "script must be a non-empty string")
@@ -3545,6 +3579,16 @@ def parse_service_shell_argv_with_diagnostics(
             )
         return test_argv, "", None
 
+    # Consulted BEFORE the profile dispatch, not after it. Several branches
+    # (repo_review, and the per-profile ``git`` handlers) return on mismatch, so
+    # a check placed after them was reachable for some profiles and not others --
+    # a GitHub poller could never have used a declared CLI. Union semantics are
+    # what "additive" was meant to say; order here only decides which gate speaks
+    # first, and an explicit per-job grant is the more specific statement.
+    declared_argv = _declared_command_execution_argv(argv, declared)
+    if declared_argv is not None:
+        return declared_argv, "", None
+
     allowed = False
     if destination == "scheduler_read_only":
         allowed = _target_matches_read_only_shell_command(argv)
@@ -3612,13 +3656,6 @@ def parse_service_shell_argv_with_diagnostics(
             "so no command can be admitted for this principal."
         ), ServiceShellBindingRule.UNKNOWN_PROFILE
     if not allowed:
-        # Declarations are ADDITIVE: the profile is consulted first, and a job's
-        # own grants are a second chance rather than a replacement. A deployment
-        # can therefore teach one scheduled job about its own CLI without
-        # widening the profile every other job on the box shares.
-        declared_argv = _declared_command_execution_argv(argv, declared)
-        if declared_argv is not None:
-            return declared_argv, "", None
         return (
             None,
             _service_shell_not_admitted_reason(argv, destination),
