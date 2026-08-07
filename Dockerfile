@@ -85,6 +85,15 @@ RUN set -eu; \
 # without escalating to root. ``/home/mimir/`` is also where the
 # Claude Code CLI keeps its OAuth credential under ``.claude/``.
 RUN useradd -m -u 1001 -s /bin/bash mimir
+
+# The identity Worklink builds run as. Distinct from the agent user on purpose:
+# a build executes repository-controlled code, and this user must not be able to
+# write the agent home, where scheduler.yaml and skills/*/pollers.json grant
+# shell authority. It needs only its attempt checkouts under /workspace/.worklink
+# and append access to the events log; see docs/authorization.md.
+RUN useradd -M -s /usr/sbin/nologin -u 1001 worklink \
+    && mkdir -p /workspace/.worklink \
+    && chown worklink:worklink /workspace/.worklink
 USER mimir
 # Land ``docker exec -it <ctn> bash`` at a predictable home dir.
 # Docker's default of ``/`` is technically fine but operators
@@ -194,5 +203,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
-RUN chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run
+RUN chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run \
+    /etc/s6-overlay/s6-rc.d/worklink/run
 ENTRYPOINT ["/init"]

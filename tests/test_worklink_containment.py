@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from mimir.worklink.containment import (
+    containment_required,
     ContainmentPolicy,
     ContainmentUnavailable,
     contained_argv,
@@ -26,6 +27,7 @@ def test_missing_broker_raises_rather_than_falling_back(tmp_path, monkeypatch):
     Returning an "uncontained" policy here would let a caller treat it as a
     fallback. Raising forces the decision to be explicit.
     """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     launcher = tmp_path / "s6-setuidgid"
     launcher.touch()
     monkeypatch.setattr("shutil.which", lambda _name: str(launcher))
@@ -40,6 +42,7 @@ def test_missing_launcher_raises(tmp_path, monkeypatch):
     The agent runs at CapEff=0, so it cannot switch uid itself; saying so in the
     error is the difference between a fixable report and a mystery.
     """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     sock = tmp_path / "broker.sock"
     sock.touch()
     monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
@@ -50,6 +53,7 @@ def test_missing_launcher_raises(tmp_path, monkeypatch):
 
 
 def test_verified_policy_wraps_the_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     sock = tmp_path / "broker.sock"
     sock.touch()
     launcher = tmp_path / "s6-setuidgid"
@@ -70,6 +74,7 @@ def test_override_is_recorded_as_a_bypass_not_a_verification(tmp_path, monkeypat
     A single boolean would collapse the two. The policy carries both, and the
     override records its reason so a log reader can tell which happened.
     """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(tmp_path / "absent.sock"))
     policy = resolve_containment(allow_uncontained="operator: local development")
 
@@ -94,6 +99,7 @@ def test_the_contained_user_is_not_the_agent_user(tmp_path, monkeypatch):
     A deployment that sets the contained user to the agent user has containment
     in name only, and this is the cheapest place to notice.
     """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     sock = tmp_path / "broker.sock"; sock.touch()
     launcher = tmp_path / "s6-setuidgid"; launcher.touch()
     monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
@@ -116,6 +122,7 @@ def test_the_agent_cannot_drop_privilege_itself(tmp_path, monkeypatch):
     first version of this module got that wrong, and the mocked tests passed
     anyway because nothing was ever executed.
     """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     from mimir.worklink.containment import agent_can_drop_privilege
 
     monkeypatch.setattr("os.getuid", lambda: 1000)
@@ -125,3 +132,65 @@ def test_the_agent_cannot_drop_privilege_itself(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("os.getuid", lambda: 0)
     assert agent_can_drop_privilege() is True
+
+
+def test_a_non_coding_deployment_needs_no_containment(monkeypatch):
+    """Containment is gated on MIMIR_CODING_ENABLED.
+
+    A deployment with no coding tools never runs a Worklink build, so there is
+    no repository-controlled code to contain. Failing closed there would block
+    on a risk that does not exist, and an operator would read that as the
+    feature being broken.
+    """
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    assert containment_required() is False
+
+    policy = resolve_containment()          # must NOT raise
+    assert policy.not_required_reason is not None
+    assert policy.verified is False
+    assert policy.override_reason is None   # nothing was bypassed
+    assert contained_argv(policy, ["pytest", "-q"]) == ("pytest", "-q")
+
+
+def test_not_required_is_distinct_from_bypassed_and_from_verified(tmp_path, monkeypatch):
+    """Three states, not a boolean.
+
+    "verified", "operator bypassed it", and "no risk here" mean different things
+    to whoever reads the log. Collapsing them is how a bypass comes to look like
+    a pass.
+    """
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    absent = resolve_containment()
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    bypassed = resolve_containment(allow_uncontained="operator: local dev")
+
+    sock = tmp_path / "b.sock"; sock.touch()
+    launcher = tmp_path / "s6-setuidgid"; launcher.touch()
+    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
+    monkeypatch.setattr("shutil.which", lambda _n: str(launcher))
+    verified = resolve_containment()
+
+    states = {
+        (p.verified, p.override_reason is not None, p.not_required_reason is not None)
+        for p in (absent, bypassed, verified)
+    }
+    assert len(states) == 3, f"states must be distinguishable, got {states}"
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "on", "y", "TRUE"])
+def test_coding_flag_truthy_spellings_match_access_control(monkeypatch, raw):
+    """Same variable and truthy set as access_control, which cannot be imported.
+
+    config imports access_control, so importing it back would cycle. That makes
+    the duplication deliberate — and worth a test, because a silent divergence
+    would gate containment differently from the shell profiles.
+    """
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", raw)
+    assert containment_required() is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", "", "maybe"])
+def test_coding_flag_falsey_spellings(monkeypatch, raw):
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", raw)
+    assert containment_required() is False

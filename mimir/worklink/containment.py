@@ -42,6 +42,7 @@ from pathlib import Path
 
 __all__ = [
     "ContainmentUnavailable",
+    "containment_required",
     "ContainmentPolicy",
     "contained_argv",
     "resolve_containment",
@@ -76,6 +77,29 @@ class ContainmentPolicy:
     #: Set when the operator explicitly accepted running uncontained. Distinct
     #: from ``verified`` so the two are not conflatable downstream.
     override_reason: str | None = None
+    #: Set when this deployment runs no coding tools, so there is nothing to
+    #: contain. A THIRD state on purpose: "verified", "bypassed" and "not
+    #: applicable" have different meanings to anyone reading a log, and
+    #: collapsing them into one boolean is how a bypass comes to look like a
+    #: pass.
+    not_required_reason: str | None = None
+
+
+def containment_required() -> bool:
+    """Whether this deployment needs Worklink containment at all.
+
+    Gated on ``MIMIR_CODING_ENABLED``. A deployment that exposes no coding tools
+    never runs a Worklink build, so there is no repository-controlled code to
+    contain and no service to supervise. Requiring the broker there would fail
+    closed on a risk that does not exist, and an operator would reasonably read
+    that as the feature being broken.
+
+    Deliberately reads the same variable and truthy set as
+    ``access_control._service_shell_coding_enabled`` rather than importing it,
+    because ``config`` imports ``access_control`` and the reverse would cycle.
+    """
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
 
 
 def _looks_like_agent_home(path: Path) -> Path | None:
@@ -106,6 +130,17 @@ def resolve_containment(
     socket_path = broker_socket or Path(
         os.environ.get("MIMIR_WORKLINK_BROKER_SOCKET", str(DEFAULT_BROKER_SOCKET)),
     )
+
+    if not containment_required():
+        # No coding tools, so no build, so nothing to contain. Distinct from an
+        # override: nothing was bypassed, the risk is absent.
+        return ContainmentPolicy(
+            user=contained_user,
+            broker_socket=socket_path,
+            launcher=(),
+            verified=False,
+            not_required_reason="MIMIR_CODING_ENABLED is not set",
+        )
 
     if allow_uncontained:
         # An acknowledged bypass. Recorded as such so a log reader can tell it
@@ -160,7 +195,7 @@ def contained_argv(
     argv = tuple(str(part) for part in command)
     if not argv:
         raise ValueError("contained_argv requires a non-empty command")
-    if policy.override_reason is not None:
+    if policy.override_reason is not None or policy.not_required_reason is not None:
         return argv
     return (*policy.launcher, *argv)
 

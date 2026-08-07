@@ -1,0 +1,45 @@
+#!/command/with-contenv sh
+# The Worklink ready-queue poller, supervised as its OWN service under a
+# separate unprivileged user.
+#
+# Why a service rather than a poller the agent spawns: a Worklink build executes
+# repository-controlled code, and every step downstream of this process — the
+# build, the evidence gate's configured test command, and the Git steps over the
+# worker-mutated checkout — inherits this identity. Running as `worklink` is
+# what stops a build writing the agent home, where `scheduler.yaml` and
+# `skills/*/pollers.json` grant shell authority. The agent cannot drop privilege
+# itself (CapEff=0), but s6 runs as root and can, exactly as it does for the
+# agent above.
+#
+# Gated on MIMIR_CODING_ENABLED: a deployment with no coding tools never runs a
+# build, so this service has nothing to do. It exits 0 rather than looping, and
+# s6 leaves a `longrun` that exits cleanly alone.
+case "${MIMIR_CODING_ENABLED}" in
+  1|true|TRUE|True|yes|YES|on|ON|y|Y) ;;
+  *)
+    echo "worklink: MIMIR_CODING_ENABLED not set; no builds to run, not starting"
+    exec sleep infinity
+    ;;
+esac
+
+# The ready-queue poller is a ONE-SHOT script (the framework used to invoke it
+# per cron fire), so the service supplies the cadence. `mimir worklink` exposes
+# run / run-epic / status / stop -- there is no `poll` subcommand, and inventing
+# one here would fail at boot.
+#
+# A `mimir worklink poll --interval` command would be tidier than this loop and
+# would put the cadence under the same config as everything else; tracked on the
+# issue rather than done here, because the loop is what makes the containment
+# testable today.
+POLLER="${MIMIR_HOME:-/home/mimir/agent}/skills/chainlink-orchestrator/poller.py"
+if [ ! -f "$POLLER" ]; then
+  echo "worklink: poller not found at $POLLER; not starting"
+  exec sleep infinity
+fi
+
+exec s6-setuidgid worklink sh -c '
+  while true; do
+    python3 "$0" || echo "worklink: poller exited $?"
+    sleep "${MIMIR_WORKLINK_POLL_SECONDS:-600}"
+  done
+' "$POLLER"
