@@ -7775,6 +7775,40 @@ def test_newline_is_refused_even_inside_quotes() -> None:
     ) is None
 
 
+def test_backslash_newline_cannot_launder_a_newline_into_argv() -> None:
+    """A line continuation must not bypass the unconditional CR/LF refusal.
+
+    The escape branch used to run first, so a backslash immediately followed by
+    a newline was consumed as "escaped" and never tested. ``shlex.split`` then
+    preserved the newline inside the argv element -- an inline multi-line value,
+    which is the thing ``--body-file`` exists to prevent. Checked both outside
+    quotes and inside double quotes, since the escape branch is active in both.
+    """
+    import shlex
+
+    import mimir.access_control as access_control
+
+    for raw in (
+        'gh pr review 7 --repo o/r --approve --body "a\\\nb"',
+        "gh pr review 7 --repo o/r --approve --body a\\\nb",
+        "gh pr review 7 --repo o/r --approve --body \'a\\\nb\'",
+    ):
+        assert access_control._unquoted_shell_control_characters(raw) == ["\n"], raw
+        # The scan must catch it rather than relying on a later profile check:
+        # shlex would otherwise hand a newline-bearing element to the caller.
+        assert any("\n" in token for token in shlex.split(raw)), raw
+        assert access_control.parse_service_shell_argv(raw, "repo_review") is None, raw
+
+
+def test_carriage_return_is_refused_through_an_escape_too() -> None:
+    """Same ordering bug, same fix, for the other line terminator."""
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters(
+        'gh pr review --body "a\\\rb"',
+    ) == ["\r"]
+
+
 def test_double_quotes_do_not_make_substitution_literal() -> None:
     """Single quotes make everything literal; double quotes do not.
 

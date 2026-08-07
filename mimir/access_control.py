@@ -1667,6 +1667,14 @@ def _unquoted_shell_control_characters(target: str) -> list[str]:
     quote: str | None = None
     escaped = False
     for character in target:
+        # Checked FIRST, ahead of escape consumption: a backslash-newline
+        # continuation would otherwise be swallowed by the ``escaped`` branch and
+        # ``shlex.split`` would carry the newline into an argv element, which is
+        # exactly the inline multi-line value this rule exists to refuse.
+        if character in _REFUSED_INSIDE_ANY_QUOTE:
+            found.add(character)
+            escaped = False
+            continue
         if escaped:
             escaped = False
             continue
@@ -1678,9 +1686,7 @@ def _unquoted_shell_control_characters(target: str) -> list[str]:
         if quote is not None:
             if character == quote:
                 quote = None
-            elif character in _REFUSED_INSIDE_ANY_QUOTE or (
-                quote == '"' and character in _EXPANDS_INSIDE_DOUBLE_QUOTES
-            ):
+            elif quote == '"' and character in _EXPANDS_INSIDE_DOUBLE_QUOTES:
                 found.add(character)
             continue
         if character in ("'", '"'):
