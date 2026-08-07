@@ -197,6 +197,59 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [{}, "", 0, False])
+async def test_fire_refuses_a_malformed_falsey_declaration(tmp_path: Path, raw):
+    """A malformed FALSEY shell_commands must stop the job, not be ignored.
+
+    Exercised through ``_fire`` rather than the parser, because the parser
+    already rejected these values before the fix — a parser-level test passes
+    unchanged if ``_fire`` regresses to its old truthiness branch and therefore
+    guards nothing. This one fails on the pre-fix scheduler.
+    """
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue)
+    job = SchedulerJob(
+        name="briefing", prompt="x", cron="0 8 * * *", shell_commands=raw,
+    )
+    await sched._fire(job=job)
+
+    assert enqueued == [], (
+        f"a job declaring {raw!r} fired anyway; a malformed declaration must "
+        "stop the job rather than run it without its grants"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fire_treats_an_explicit_empty_declaration_as_a_no_op(tmp_path: Path):
+    """Positive control for the test above.
+
+    ``shell_commands: []`` is valid and means "declare nothing", so the job must
+    still fire — under the shared principal, since a per-job one would grant
+    nothing beyond the profile. Without this control, the test above would also
+    pass if ``_fire`` simply refused every declaration.
+    """
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue)
+    job = SchedulerJob(
+        name="briefing", prompt="x", cron="0 8 * * *", shell_commands=[],
+    )
+    await sched._fire(job=job)
+
+    assert len(enqueued) == 1
+    assert enqueued[0].service_principal == "scheduler"
+
+
 async def test_fire_reads_prompt_file_when_set(tmp_path: Path):
     """When the SchedulerJob has prompt_file set, _fire reads the file
     under <home>/prompts/ and uses its content as the event body."""

@@ -29,6 +29,13 @@ All notable changes will land here. Format loosely follows
   `date` admits no `-s`/`--set` and `tail` no `-f`/`--follow`. (#1403)
 
 ### Fixed
+- A scheduled job with a malformed but *falsey* `shell_commands` value no longer
+  fires without its declaration. `Scheduler._fire` branched on truthiness, so
+  `shell_commands: {}` or `shell_commands: ""` stored cleanly, skipped validation
+  entirely, and the job ran with no grants and no error — a job that looks
+  configured and is not. Those shapes now reach validation and stop the job the
+  same way a bad path does; an explicit empty list remains valid and means
+  "declare nothing". (#1406)
 - The `maintenance` git allowlist now covers what the shipped scheduled-tick
   prompts actually run. 49 of 190 service-shell refusals measured on a live
   deployment were `git` — the largest single command bucket — and nearly all were
