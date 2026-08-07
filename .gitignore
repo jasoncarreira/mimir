@@ -90,3 +90,7 @@ evals/**/pilot_output/
 # declaration and is unaffected: the trailing slash matches directories only.
 .factory/
 .factory-sandboxes/
+
+# A git worktree may carry a .venv symlink into the index; committing it
+# breaks CI, which then cannot create its own (os error 17).
+.venv
