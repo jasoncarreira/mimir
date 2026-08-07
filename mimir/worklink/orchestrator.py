@@ -2448,7 +2448,24 @@ def _git_push(repo: Path, branch: str, *, runner: Runner, oid: str | None = None
     than whatever HEAD points at now. Without it a process outliving the
     evidence gate could change what lands on the branch after the verdict.
     """
-    refspec = f"{oid}:refs/heads/{branch}" if oid else branch
+    if oid is None:
+        # Falling back to the moving branch here would silently drop the whole
+        # point of observing an oid: whatever HEAD points at when the push runs
+        # gets published, including anything a process outliving the evidence
+        # gate wrote. Under containment that is a fail-closed condition, not a
+        # default. Without containment there is no observation to lose, and the
+        # branch push is the pre-existing behaviour.
+        from .containment import containment_required
+
+        if containment_required():
+            raise WorklinkError(
+                "refusing to push: no commit oid was observed for this attempt, "
+                "so the push would publish whatever HEAD points at now rather "
+                "than the object the evidence gate passed",
+            )
+        refspec = branch
+    else:
+        refspec = f"{oid}:refs/heads/{branch}"
     result = runner(["git", "-C", str(repo), "push", "-u", "origin", refspec])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
@@ -2648,6 +2665,17 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
     def run(args: Sequence[str] | str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        # chainlink #1164. This is the runner _finalize actually injects, so
+        # routing containment only inside evidence._run left the gate test and
+        # local Git running as the controller in production while the isolated
+        # test of _run passed. maybe_run_contained declines anything that is not
+        # an attempt checkout (chainlink calls against the home, remote git), so
+        # this is a no-op for everything except generated-code execution.
+        from .evidence import _checkout_of, maybe_run_contained
+
+        contained = maybe_run_contained(args, _checkout_of(args, cwd), os.environ.copy())
+        if contained is not None:
+            return contained
         if isinstance(args, str):
             return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
         # Chainlink discovers its repository from cwd. Its configured home is

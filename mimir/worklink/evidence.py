@@ -340,7 +340,7 @@ def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.Co
     # build. The same applies to git over the checkout. So every step here runs
     # under the contained identity when containment is active.
     checkout = _checkout_of(args, cwd)
-    contained = _contained_runner(args, checkout, env)
+    contained = maybe_run_contained(args, checkout, env)
     if contained is not None:
         return contained
 
@@ -353,7 +353,7 @@ def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.Co
     )
 
 
-def _contained_runner(
+def maybe_run_contained(
     args: Sequence[str] | str, checkout: Path | None, env: dict[str, str],
 ) -> subprocess.CompletedProcess[str] | None:
     """Run one evidence step under the contained identity, or ``None`` to fall through.
@@ -362,6 +362,12 @@ def _contained_runner(
     required (no coding flag) or when the step has no attempt checkout to run in.
     """
     if checkout is None:
+        return None
+    if _is_under_agent_home(checkout):
+        # _runner_for_home points chainlink at the agent home. Those are
+        # controller operations on controller state -- containing them would
+        # both break chainlink and mean the worker had a home path, which is
+        # exactly what this boundary removes.
         return None
     if _talks_to_the_remote(args):
         # Push, fetch and friends are CONTROLLER operations: they need the
@@ -397,6 +403,17 @@ def _contained_runner(
     return subprocess.CompletedProcess(
         args=list(argv), returncode=result.exit_status, stdout=result.stdout, stderr=result.stderr,
     )
+
+
+def _is_under_agent_home(path: Path) -> bool:
+    raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not raw:
+        return False
+    try:
+        home = Path(raw).expanduser().resolve()
+        return home == path.resolve() or home in path.resolve().parents
+    except OSError:  # pragma: no cover
+        return False
 
 
 #: Git subcommands that contact the remote, and therefore need the controller's

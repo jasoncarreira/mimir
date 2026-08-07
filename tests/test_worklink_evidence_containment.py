@@ -107,3 +107,107 @@ def test_evidence_steps_are_inert_without_the_coding_flag(
     assert result.returncode == 0
     assert "direct" in result.stdout
     assert not (tmp_path / "spool").exists(), "no spool should have been consulted"
+
+
+# --------------------------------------------------------------------------
+# The production runner, not _run in isolation
+# --------------------------------------------------------------------------
+
+
+def test_the_injected_orchestrator_runner_routes_through_containment(
+    tmp_path: Path, coding_on: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_finalize` injects `_runner_for_home`, not `evidence._run`.
+
+    Routing containment only inside `_run` left the gate test and local Git
+    executing as the controller in production, while an isolated test of `_run`
+    passed. This drives the runner the orchestrator actually injects.
+
+    Asserts the containment entry point is CALLED and its result returned.
+    An earlier version of this test asserted the spool inbox was empty, which a
+    bypass satisfies just as well as a consumed request -- it passed against the
+    very defect it was written for.
+    """
+    import subprocess as sp
+
+    from mimir.worklink import evidence as evidence_mod
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    seen: list[Path | None] = []
+    sentinel = sp.CompletedProcess(args=["contained"], returncode=42, stdout="via-spool", stderr="")
+
+    def spy(args, resolved, env):  # noqa: ANN001, ANN202
+        seen.append(resolved)
+        return sentinel
+
+    monkeypatch.setattr(evidence_mod, "maybe_run_contained", spy)
+    runner = _runner_for_home(tmp_path / "home", "chainlink")
+    result = runner(["git", "-C", str(checkout), "status", "--porcelain"])
+
+    assert seen == [checkout], "the orchestrator's runner never reached containment"
+    assert result is sentinel, "the contained result was not returned to the caller"
+    assert result.stdout == "via-spool"
+
+
+def test_chainlink_calls_against_the_agent_home_are_never_contained(
+    tmp_path: Path, coding_on: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_runner_for_home` points chainlink at the agent home.
+
+    Those are controller operations on controller state. Containing them would
+    break chainlink AND mean the worker held a home path, which is the whole
+    thing this boundary removes.
+    """
+    from mimir.worklink.containment import request_dir
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    runner = _runner_for_home(home, "chainlink")
+    # A real binary aimed at the home, so a fall-through actually executes and
+    # the assertion is about ROUTING rather than about the command existing.
+    runner(["git", "-C", str(home), "status", "--porcelain"])
+    assert not list(request_dir(coding_on).glob("*.json")), "a home-targeted call was spooled"
+
+
+def test_push_fails_closed_without_an_observed_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falling back to the branch drops the point of observing an oid.
+
+    Whatever HEAD points at when the push runs would get published, including
+    anything a process outliving the evidence gate wrote.
+    """
+    from mimir.worklink.orchestrator import WorklinkError, _git_push
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    calls: list[list[str]] = []
+
+    def runner(args, cwd=None):  # noqa: ANN001, ANN202
+        calls.append(list(args))
+        import subprocess as sp
+
+        return sp.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    with pytest.raises(WorklinkError, match="no commit oid was observed"):
+        _git_push(tmp_path, "issue/1-a1", runner=runner, oid=None)
+    assert not calls, "nothing may be pushed when the oid is missing"
+
+
+def test_push_targets_the_observed_object_not_the_branch(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _git_push
+
+    calls: list[list[str]] = []
+
+    def runner(args, cwd=None):  # noqa: ANN001, ANN202
+        calls.append(list(args))
+        import subprocess as sp
+
+        return sp.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    _git_push(tmp_path, "issue/1-a1", runner=runner, oid="deadbeef")
+    assert "deadbeef:refs/heads/issue/1-a1" in calls[0]
