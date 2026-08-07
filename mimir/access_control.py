@@ -2852,7 +2852,7 @@ def _maintenance_git_filter_overrides(
 
 
 def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
-    """Return whether arguments after ``git -C <root>`` are admitted."""
+    """Return whether arguments after Git's global options are admitted."""
     if not arguments:
         return False
     subcommand = arguments[0]
@@ -2877,33 +2877,98 @@ def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
                 ),
             )
         )
-    if subcommand == "branch":
-        return subcommand_arguments == ["--show-current"]
-    if subcommand not in {"diff", "log", "show"}:
-        return False
-    # ``-<digits>`` is Git's bounded max-count shorthand used by the
-    # maintenance prompts (for example ``git log --oneline -5``).
-    arguments_without_count_shorthand = [
-        argument
-        for argument in subcommand_arguments
-        if not (subcommand == "log" and argument.startswith("-") and argument[1:].isdigit())
-    ]
-    return (
-        "--" not in subcommand_arguments
-        and _arguments_match_allowlist(
-            arguments_without_count_shorthand,
+    if subcommand == "log":
+        # ``-<digits>`` is Git's bounded max-count shorthand used by the
+        # maintenance prompts (for example ``git log --oneline -5``).
+        arguments_without_count_shorthand = [
+            argument
+            for argument in subcommand_arguments
+            if not (argument.startswith("-") and argument[1:].isdigit())
+        ]
+        return (
+            "--" not in subcommand_arguments
+            and _arguments_match_allowlist(
+                arguments_without_count_shorthand,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--all", "--cached", "--check",
+                    "--decorate", "--exit-code", "--full-index", "--grep",
+                    "--name-only", "--name-status", "--no-color", "--no-ext-diff",
+                    "--no-merges", "--no-patch", "--no-textconv", "--oneline",
+                    "--quiet", "--raw", "--staged", "--stat",
+                }),
+                option_prefixes=(
+                    "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                    "--until=",
+                ),
+            )
+        )
+    if subcommand == "diff":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
             exact_options=frozenset({
                 "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
                 "--exit-code", "--full-index", "--grep", "--name-only",
-                "--name-status", "--no-color", "--no-merges", "--no-patch",
-                "--no-ext-diff", "--no-textconv", "--oneline", "--quiet",
-                "--raw", "--stat", "--staged",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
             }),
             option_prefixes=(
-                "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
             ),
         )
-    )
+    if subcommand == "show":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--grep", "--name-only",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
+            }),
+            option_prefixes=(
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
+            ),
+        )
+    if subcommand == "rev-parse":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "branch":
+        listing_options = frozenset({
+            "-a", "-r", "--all", "--list", "--remotes", "--show-current",
+        })
+        return (
+            any(argument in listing_options for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=listing_options,
+            )
+        )
+    if subcommand == "cat-file":
+        return (
+            len(subcommand_arguments) == 2
+            and subcommand_arguments[0] == "-s"
+            and not subcommand_arguments[1].startswith("-")
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({"-s"}),
+            )
+        )
+    if subcommand == "ls-tree":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "ls-files":
+        return not subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    return False
 
 
 def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
@@ -2921,14 +2986,14 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     if pinned_git is None:
         return None
 
-    # The authorized command must name its repository in argv. Relying on the
-    # service process cwd would leave the actual target outside the audited
-    # authorization artifact.
-    arguments = argv[1:]
-    if arguments[:1] != ["-C"] or len(arguments) < 3 or arguments[1].startswith("-"):
-        return None
-    requested_root = arguments[1]
-    arguments = arguments[2:]
+    arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    requested_root: str | None = None
+    if arguments[:1] == ["-C"]:
+        if len(arguments) < 3 or arguments[1].startswith("-"):
+            return None
+        requested_root = arguments[1]
+        arguments = arguments[2:]
+    arguments = _git_arguments_without_restrictive_global_options(arguments)
 
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
