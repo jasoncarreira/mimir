@@ -29,6 +29,9 @@ from mimir.worklink.containment import (
 @pytest.fixture
 def coding_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    # A real account that is not this process: the identity check verifies the
+    # contained user RESOLVES and differs from the controller uid.
+    monkeypatch.setenv("MIMIR_WORKLINK_USER", "nobody")
 
 
 def test_containment_is_not_required_without_the_coding_flag(

@@ -24,9 +24,15 @@ What runs where
 ---------------
 The controller (poller and orchestrator) stays at the agent identity: it needs
 ``MIMIR_HOME`` for ``worklink.yaml``, lease state and the Chainlink claim locks,
-and it holds the GitHub push credential. Only the three steps that execute
-generated code are contained -- the build, the evidence gate's test command, and
-local Git over the checkout.
+and it holds the GitHub push credential.
+
+CURRENTLY CONTAINED: the build launch only (``compute.py``).
+
+NOT YET CONTAINED, and stated here rather than implied: the evidence gate's test
+command and local Git over the checkout still run as the controller, so generated
+code still executes at the agent identity during the gate. ``WorkerResult.head_oid``
+is observed but not yet consumed by the push. Tracked on chainlink #1164; do not
+read this module as covering them.
 
 Why a spool, and why the supervisor stays root
 ----------------------------------------------
@@ -290,13 +296,59 @@ def spawn_argv(policy: ContainmentPolicy, argv: tuple[str, ...] | list[str]) -> 
     return (launcher, policy.user, *parts)
 
 
-def _spool_is_writable_by_other(path: Path) -> bool:
-    """Whether a non-owner, non-group identity could write ``path``.
+def cancel_path(spool_root: Path, request_id: str) -> Path:
+    """Marker the controller publishes to stop an already-claimed step."""
+    return request_dir(spool_root) / f"{request_id}.cancel"
 
-    The contained user is neither the owner nor in the owning group of either
-    spool directory, so "other" is the bit that decides whether it can write.
+
+def publish_cancellation(policy: ContainmentPolicy, request_id: str) -> None:
+    """Ask the supervisor to terminate a running step.
+
+    The step runs as the contained user, so the controller cannot signal it --
+    only the root supervisor can. This is the channel for that.
     """
-    return bool(path.stat().st_mode & 0o002)
+    try:
+        cancel_path(policy.spool_root, request_id).touch()
+    except OSError:  # pragma: no cover - cancellation is best effort
+        pass
+
+
+def _contained_user_ids(user: str) -> tuple[int, int] | None:
+    try:
+        import pwd
+
+        entry = pwd.getpwnam(user)
+    except (ImportError, KeyError):
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def _verify_spool_directory(path: Path, role: str, contained_gid: int | None) -> None:
+    """Assert the contained user cannot WRITE ``path``.
+
+    Checking only the world-write bit is not enough: a directory that is
+    group-writable by a group the contained user belongs to is just as open, and
+    would have read as verified.
+    """
+    info = path.stat()
+    if info.st_mode & 0o002:
+        raise ContainmentUnavailable(
+            f"the worklink {role} {path} is world-writable, so the contained "
+            "user could rewrite its own request or forge its own result; "
+            "refusing to dispatch",
+        )
+    if contained_gid is not None and info.st_gid == contained_gid and info.st_mode & 0o020:
+        raise ContainmentUnavailable(
+            f"the worklink {role} {path} is group-writable by the contained "
+            f"user's own group (gid {contained_gid}); that is the same exposure "
+            "as world-writable, refusing to dispatch",
+        )
+    # NOT checked here: that ``results/`` is root-owned so the controller itself
+    # cannot write it. That property is real and ``prepare_spool`` establishes it
+    # (asserted separately), but it cannot be verified in a sandbox where the
+    # verifying process IS the owner -- every check would either pass vacuously
+    # or refuse every non-root deployment. It is an operator-verified property on
+    # chainlink #1164, not one claimed here.
 
 
 def resolve_containment(
@@ -335,6 +387,26 @@ def resolve_containment(
             override_reason=allow_uncontained,
         )
 
+    # The identity invariant, checked against the RUNNING process rather than
+    # trusting configuration. `MIMIR_WORKLINK_USER=mimir` would otherwise resolve
+    # as "verified" while containing nothing at all -- configuration that does
+    # not match reality is the assumption this whole leaf exists to replace.
+    ids = _contained_user_ids(contained_user)
+    if ids is None:
+        raise ContainmentUnavailable(
+            f"the contained user {contained_user!r} does not exist on this host; "
+            "the shipped image creates it, so this deployment cannot contain a "
+            "build",
+        )
+    contained_uid, contained_gid = ids
+    if contained_uid == os.getuid():
+        raise ContainmentUnavailable(
+            f"the contained user {contained_user!r} resolves to uid "
+            f"{contained_uid}, which is the uid this controller already runs as; "
+            "containing a build under the identity it is being contained FROM is "
+            "a no-op",
+        )
+
     requests = request_dir(root)
     results = result_dir(root)
     for path, role in ((requests, "request inbox"), (results, "result directory")):
@@ -344,17 +416,7 @@ def resolve_containment(
                 "worklink service creates it at start, and without it a build "
                 "would have to run as the agent user",
             )
-    # A world-writable spool hands the contained user the ability to rewrite its
-    # own request or forge the supervisor's verdict, which makes the root
-    # supervisor pointless. Refuse rather than run in a state that only looks
-    # contained.
-    for path, role in ((requests, "request inbox"), (results, "result directory")):
-        if _spool_is_writable_by_other(path):
-            raise ContainmentUnavailable(
-                f"the worklink {role} {path} is world-writable, so the contained "
-                "user could rewrite its own request or forge its own result; "
-                "refusing to dispatch",
-            )
+        _verify_spool_directory(path, role, contained_gid)
     return ContainmentPolicy(user=contained_user, spool_root=root, verified=True)
 
 

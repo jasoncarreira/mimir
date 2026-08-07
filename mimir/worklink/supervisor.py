@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from mimir.worklink.containment import (
     ContainmentPolicy,
     WorkerRequest,
     WorkerResult,
+    cancel_path,
     containment_required,
     observe_head,
     request_dir,
@@ -94,6 +96,76 @@ def prepare_spool(
     results.chmod(_RESULT_DIR_MODE)
 
 
+def _run_supervised(
+    argv: tuple[str, ...],
+    request: WorkerRequest,
+    policy: ContainmentPolicy,
+    request_id: str,
+) -> tuple[int, str, str, bool, bool]:
+    """Spawn the step, enforcing the deadline and honouring cancellation.
+
+    ``subprocess.run(timeout=...)`` alone cannot do this: a cancellation that
+    arrives after the step is claimed has to terminate a process owned by the
+    CONTAINED user, and only this service is root. The controller can publish
+    the request; it cannot signal the process.
+
+    Killed by process GROUP, because the step is started in its own session --
+    signalling only the direct child would leave a coding CLI's descendants
+    running past the deadline.
+    """
+    deadline = None if not request.timeout_seconds else time.monotonic() + request.timeout_seconds
+    cancel_marker = cancel_path(policy.spool_root, request_id)
+    proc = subprocess.Popen(  # noqa: S603 - argv is controller-constructed
+        list(argv),
+        cwd=str(request.cwd),
+        env=dict(request.env),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    timed_out = cancelled = False
+    while proc.poll() is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        if cancel_marker.exists():
+            cancelled = True
+            break
+        time.sleep(0.1)
+    if timed_out or cancelled:
+        _terminate_group(proc)
+    stdout, stderr = proc.communicate()
+    cancel_marker.unlink(missing_ok=True)
+    if timed_out:
+        stderr = f"{stderr}\nworklink: step timed out after {request.timeout_seconds}s"
+    if cancelled:
+        stderr = f"{stderr}\nworklink: step cancelled by the controller"
+    exit_status = proc.returncode if proc.returncode is not None else 124
+    if timed_out or cancelled:
+        exit_status = 124
+    return exit_status, stdout or "", stderr or "", timed_out, cancelled
+
+
+def _terminate_group(proc: subprocess.Popen[str]) -> None:
+    """SIGTERM the step's process group, then SIGKILL what survives."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):  # pragma: no cover - already gone
+        return
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):  # pragma: no cover
+            return
+        waited = 0.0
+        while waited < grace:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.1)
+            waited += 0.1
+
+
 def _publish(results: Path, request_id: str, result: WorkerResult) -> None:
     """Write a result atomically so the controller never reads a partial one."""
     tmp = results / f".{request_id}.tmp"
@@ -119,18 +191,25 @@ def handle_one_request(
 
     argv = spawn_argv(policy, request.argv)
     timed_out = False
+    cancelled = False
     try:
-        proc = runner(  # type: ignore[operator]
-            list(argv),
-            cwd=str(request.cwd),
-            env=dict(request.env),
-            capture_output=True,
-            text=True,
-            timeout=request.timeout_seconds,
-            check=False,
-        )
-        exit_status = int(proc.returncode)
-        stdout, stderr = proc.stdout or "", proc.stderr or ""
+        if spawn is not None:
+            # Injected runner (tests): no cancellation polling to do.
+            proc = runner(  # type: ignore[operator]
+                list(argv),
+                cwd=str(request.cwd),
+                env=dict(request.env),
+                capture_output=True,
+                text=True,
+                timeout=request.timeout_seconds,
+                check=False,
+            )
+            exit_status = int(proc.returncode)
+            stdout, stderr = proc.stdout or "", proc.stderr or ""
+        else:
+            exit_status, stdout, stderr, timed_out, cancelled = _run_supervised(
+                argv, request, policy, request_id,
+            )
     except subprocess.TimeoutExpired:
         timed_out = True
         exit_status, stdout, stderr = 124, "", (

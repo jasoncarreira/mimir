@@ -205,7 +205,14 @@ class _SpooledJob:
     prefix the command: the supervisor runs as root and does that per step.
     """
 
-    def __init__(self, policy: object, spec: object, command: tuple[str, ...], env: dict[str, str]) -> None:
+    def __init__(
+        self,
+        policy: object,
+        spec: object,
+        command: tuple[str, ...],
+        env: dict[str, str],
+        timeout_s: int | None = None,
+    ) -> None:
         self.stdout = asyncio.StreamReader()
         self.stderr = asyncio.StreamReader()
         self.returncode: int | None = None
@@ -215,7 +222,14 @@ class _SpooledJob:
         self._spec = spec
         self._command = command
         self._env = env
+        self._timeout_s = timeout_s
         self._request_id: str | None = None
+
+    @property
+    def request_id(self) -> str:
+        if self._request_id is None:  # pragma: no cover - submit() always runs first
+            raise RuntimeError("_SpooledJob.request_id read before submit()")
+        return self._request_id
 
     async def submit(self) -> None:
         from .containment import WorkerRequest, submit_request
@@ -226,6 +240,10 @@ class _SpooledJob:
             argv=self._command,
             cwd=Path(str(self._spec.local_checkout)),  # type: ignore[attr-defined]
             env=self._env,
+            # The CONFIGURED deadline, carried to the supervisor. Without it the
+            # supervisor's spawn has no timeout at all, and a hung generated
+            # process would hold the run until the controller's own wait expired.
+            timeout_seconds=float(self._timeout_s) if self._timeout_s else None,
             # The controller pushes the oid the SUPERVISOR read, so a process
             # surviving past the verdict cannot change what gets pushed.
             report_head=True,
@@ -238,16 +256,29 @@ class _SpooledJob:
         Feeds the captured output into the readers before returning, because the
         backend's ``collect()`` drains them concurrently and then awaits this.
         """
-        from .containment import await_result
+        from .containment import ContainmentUnavailable, await_result
 
         if self._request_id is None:  # pragma: no cover - submit() always runs first
             self.returncode = -1
             self.stdout.feed_eof()
             self.stderr.feed_eof()
             return
-        result = await asyncio.to_thread(
-            await_result, self._policy, self._request_id, timeout_seconds=_SPOOL_WAIT_SECONDS,
-        )
+        # Bounded by the step's own deadline plus slack for the supervisor to
+        # notice and publish. An unbounded wait here would let a hung build
+        # outlive its configured timeout no matter what the supervisor did.
+        budget = (float(self._timeout_s) if self._timeout_s else _DEFAULT_STEP_SECONDS) + 120.0
+        try:
+            result = await asyncio.to_thread(
+                await_result, self._policy, self._request_id, timeout_seconds=budget,
+            )
+        except ContainmentUnavailable as exc:
+            self.cancel_request()
+            self.result = None
+            self.stdout.feed_eof()
+            self.stderr.feed_data(str(exc).encode())
+            self.stderr.feed_eof()
+            self.returncode = 124
+            return
         self.result = result
         self.stdout.feed_data(result.stdout.encode())
         self.stdout.feed_eof()
@@ -256,19 +287,25 @@ class _SpooledJob:
         self.returncode = result.exit_status
 
     def cancel_request(self) -> None:
-        """Best effort: drop the request if the supervisor has not taken it yet."""
+        """Cancel the step, whether or not the supervisor has claimed it.
+
+        Unlinking the request only helps while it is still queued. For one
+        already running, the process belongs to the contained user and the
+        controller cannot signal it -- so the cancellation is published for the
+        supervisor, which is root and can.
+        """
         if self._request_id is None:
             return
-        from .containment import request_dir
+        from .containment import publish_cancellation, request_dir
 
-        path = request_dir(self._policy.spool_root) / f"{self._request_id}.json"  # type: ignore[attr-defined]
-        path.unlink(missing_ok=True)
+        root = self._policy.spool_root  # type: ignore[attr-defined]
+        (request_dir(root) / f"{self._request_id}.json").unlink(missing_ok=True)
+        publish_cancellation(self._policy, self._request_id)
 
 
-#: How long the controller waits for a supervised build. Generous: the backend's
-#: own ``wait(timeout_s)`` is the real deadline, and this only bounds the case
-#: where the supervisor is not running at all.
-_SPOOL_WAIT_SECONDS = 86400.0
+#: Fallback deadline when a spec carries none. Only bounds the pathological case
+#: of a supervisor that never publishes; a configured ``timeout_s`` always wins.
+_DEFAULT_STEP_SECONDS = 3600.0
 
 
 @dataclass
@@ -329,7 +366,7 @@ class LocalSubprocessComputeBackend:
                 for key, value in env.items()
                 if key not in {"GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"}
             }
-            proc = _SpooledJob(policy, spec, command, env)
+            proc = _SpooledJob(policy, spec, command, env, getattr(spec, "timeout_s", None))
             await proc.submit()
         else:
             try:
@@ -349,7 +386,17 @@ class LocalSubprocessComputeBackend:
             from .run_state import process_start_ticks
 
             start_ticks = process_start_ticks(pid)
-        handle = LaunchHandle(self.name, str(pid if pid is not None else "unknown"), start_ticks)
+        if isinstance(proc, _SpooledJob):
+            # A supervised build has no pid in THIS process, and the fallback
+            # identifier is the literal "unknown" -- so every concurrent spooled
+            # launch would collide on one _jobs key, and wait/cancel/cleanup
+            # could target the wrong request. worklink.yaml permits concurrent
+            # attempts, so that is reachable, not theoretical. The request id is
+            # unique and is also what a controller restart would reattach by.
+            identifier = proc.request_id
+        else:
+            identifier = str(pid if pid is not None else "unknown")
+        handle = LaunchHandle(self.name, identifier, start_ticks)
         self._jobs[handle.identifier] = (proc, spec, command)
         return handle
 

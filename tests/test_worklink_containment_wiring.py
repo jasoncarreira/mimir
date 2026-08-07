@@ -93,6 +93,9 @@ def test_build_spawns_in_process_without_the_coding_flag(
 @pytest.fixture
 def coding_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    # A real account that is not this process: the identity check verifies the
+    # contained user RESOLVES and differs from the controller uid.
+    monkeypatch.setenv("MIMIR_WORKLINK_USER", "nobody")
     root = tmp_path / "spool"
     supervisor.prepare_spool(root)
     monkeypatch.setenv("MIMIR_WORKLINK_SPOOL", str(root))
@@ -157,6 +160,9 @@ def test_dispatch_fails_closed_when_the_supervisor_is_missing(
 ) -> None:
     """Flag on but no spool: refuse, rather than run the build as the agent."""
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    # A real account that is not this process: the identity check verifies the
+    # contained user RESOLVES and differs from the controller uid.
+    monkeypatch.setenv("MIMIR_WORKLINK_USER", "nobody")
     monkeypatch.setenv("MIMIR_WORKLINK_SPOOL", str(tmp_path / "absent"))
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -164,3 +170,161 @@ def test_dispatch_fails_closed_when_the_supervisor_is_missing(
 
     with pytest.raises(ContainmentUnavailable, match="does not exist"):
         asyncio.run(backend.launch(_spec(checkout, ("true",))))
+
+
+# --------------------------------------------------------------------------
+# Regressions for the review of 21fad15c0
+# --------------------------------------------------------------------------
+
+
+def test_concurrent_spooled_builds_get_distinct_handles(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """A spooled job has no pid, and the fallback identifier is "unknown".
+
+    Every concurrent spooled launch would collide on one `_jobs` key, so
+    wait/cancel/cleanup could target the wrong request. worklink.yaml permits
+    concurrent attempts, so this is reachable.
+    """
+    backend = LocalSubprocessComputeBackend()
+
+    async def run() -> tuple[str, str]:
+        a = tmp_path / "a"
+        b = tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+        h1 = await backend.launch(_spec(a, ("true",)))
+        h2 = await backend.launch(_spec(b, ("true",)))
+        return h1.identifier, h2.identifier
+
+    first, second = asyncio.run(run())
+    assert first != second, "concurrent spooled builds collided on one handle"
+    assert "unknown" not in (first, second)
+    assert len(backend._jobs) == 2, "one job overwrote the other"
+
+
+def test_the_configured_timeout_reaches_the_supervisor(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """Without this the supervisor spawns with no deadline at all."""
+    import json
+
+    from mimir.worklink.containment import request_dir
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    backend = LocalSubprocessComputeBackend()
+    spec = _spec(checkout, ("true",))
+    asyncio.run(backend.launch(spec))
+
+    queued = list(request_dir(coding_on).glob("*.json"))
+    assert len(queued) == 1
+    payload = json.loads(queued[0].read_text())
+    assert payload["timeout_seconds"] == float(spec.timeout_s)
+
+
+def test_the_supervisor_enforces_the_deadline_on_a_hung_step(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """A hung generated process must not outlive its configured timeout.
+
+    This really does hang -- `sleep 300` with a 1s deadline -- so the assertion
+    is that the supervisor killed it, not that a mock reported it did.
+    """
+    from mimir.worklink.containment import (
+        ContainmentPolicy,
+        WorkerRequest,
+        await_result,
+        submit_request,
+    )
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    policy = ContainmentPolicy(user="nobody", spool_root=coding_on, verified=False)
+    request_id = submit_request(
+        policy,
+        WorkerRequest(
+            attempt_id="hung",
+            argv=("sh", "-c", "sleep 300"),
+            cwd=checkout,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=1.0,
+        ),
+    )
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
+
+    assert result.timed_out is True
+    assert result.exit_status == 124
+    assert "timed out" in result.stderr
+
+
+def test_cancellation_terminates_a_step_the_supervisor_already_claimed(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """Unlinking a queued request cannot stop one that is already running.
+
+    The step belongs to the contained user, so only the root supervisor can
+    signal it; the controller publishes the cancellation instead.
+    """
+    import threading
+
+    from mimir.worklink.containment import (
+        ContainmentPolicy,
+        WorkerRequest,
+        await_result,
+        publish_cancellation,
+        submit_request,
+    )
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    policy = ContainmentPolicy(user="nobody", spool_root=coding_on, verified=False)
+    request_id = submit_request(
+        policy,
+        WorkerRequest(
+            attempt_id="cancelme",
+            argv=("sh", "-c", "sleep 300"),
+            cwd=checkout,
+            env={"PATH": "/usr/bin:/bin"},
+        ),
+    )
+    threading.Timer(1.0, lambda: publish_cancellation(policy, request_id)).start()
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
+
+    assert result.exit_status == 124
+    assert "cancelled" in result.stderr
+
+
+def test_a_contained_user_matching_the_controller_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configuration that does not match reality is what this leaf replaces.
+
+    Checking only the spool's world-write bit would accept
+    MIMIR_WORKLINK_USER=<the controller> as "verified" while containing nothing.
+    """
+    import getpass
+
+    from mimir.worklink.containment import resolve_containment
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setenv("MIMIR_WORKLINK_USER", getpass.getuser())
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    with pytest.raises(ContainmentUnavailable, match="no-op"):
+        resolve_containment(spool_root=root)
+
+
+def test_an_unresolvable_contained_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink.containment import resolve_containment
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setenv("MIMIR_WORKLINK_USER", "no-such-account-here")
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    with pytest.raises(ContainmentUnavailable, match="does not exist"):
+        resolve_containment(spool_root=root)
