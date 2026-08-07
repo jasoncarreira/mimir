@@ -104,3 +104,24 @@ def test_the_contained_user_is_not_the_agent_user(tmp_path, monkeypatch):
     assert policy.user != getpass.getuser(), (
         "the contained identity must differ from the agent's own user"
     )
+
+
+def test_the_agent_cannot_drop_privilege_itself(tmp_path, monkeypatch):
+    """The premise the broker exists for, asserted rather than assumed.
+
+    An unprivileged agent cannot switch to a sibling uid: on the live deployment
+    `s6-setuidgid` as the agent user fails with "unable to set supplementary
+    group list: Operation not permitted". So the wrapped argv this module builds
+    must be SENT to the broker, never exec'd here. This test exists because the
+    first version of this module got that wrong, and the mocked tests passed
+    anyway because nothing was ever executed.
+    """
+    from mimir.worklink.containment import agent_can_drop_privilege
+
+    monkeypatch.setattr("os.getuid", lambda: 1000)
+    assert agent_can_drop_privilege() is False, (
+        "a non-root agent must not be assumed able to drop privilege; the "
+        "broker is what makes containment possible"
+    )
+    monkeypatch.setattr("os.getuid", lambda: 0)
+    assert agent_can_drop_privilege() is True

@@ -143,11 +143,19 @@ def resolve_containment(
 def contained_argv(
     policy: ContainmentPolicy, command: tuple[str, ...] | list[str],
 ) -> tuple[str, ...]:
-    """Wrap *command* so it executes as the contained identity.
+    """Return the argv to hand the BROKER, not one for this process to exec.
 
-    Returns *command* unchanged when the policy carries an explicit override, so
-    the override is honoured at exactly one place rather than being re-decided by
-    every call site.
+    The agent process cannot drop privilege itself. Verified on the live
+    deployment::
+
+        as mimir:  s6-applyuidgid: fatal: unable to set supplementary group
+                   list: Operation not permitted
+        as root:   1002
+
+    so prefixing ``s6-setuidgid worklink`` and exec'ing it here would fail every
+    time. The privilege drop happens inside the broker, which already runs as
+    root; this function only assembles the request. Callers must send the result
+    to the broker rather than spawning it.
     """
     argv = tuple(str(part) for part in command)
     if not argv:
@@ -155,3 +163,16 @@ def contained_argv(
     if policy.override_reason is not None:
         return argv
     return (*policy.launcher, *argv)
+
+
+def agent_can_drop_privilege() -> bool:
+    """True only if THIS process could switch uid on its own.
+
+    Exists so the impossibility is asserted rather than assumed. It is false on
+    the shipped deployment, which is the whole reason a broker is required; a
+    deployment where it is true has a different and larger problem.
+    """
+    try:
+        return os.getuid() == 0
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return False
