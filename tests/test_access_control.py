@@ -2883,28 +2883,6 @@ def test_repo_review_npm_install_refusal_names_missing_typed_equivalent(
     assert "no typed equivalent" in reason
 
 
-@pytest.mark.parametrize(
-    ("command", "example"),
-    [
-        ("git status --short", "git -C <dir> status --short"),
-        ("git log --since=24.hours", "git -C <dir> log --oneline"),
-    ],
-)
-def test_maintenance_git_missing_only_c_stays_refused_with_required_form(
-    command: str,
-    example: str,
-) -> None:
-    """A valid maintenance Git shape still binds its repository in argv."""
-    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
-        command, "maintenance",
-    )
-
-    assert argv is None
-    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
-    assert "repository must be named in argv with -C" in reason
-    assert example in reason
-
-
 def test_maintenance_git_guidance_does_not_misdiagnose_other_refusals() -> None:
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         "git status --verbose", "maintenance",
@@ -7459,7 +7437,7 @@ def test_maintenance_shell_fails_loudly_when_pinned_executable_is_invalid(
     assert str(expected) in caplog.text
 
 
-def test_maintenance_git_denies_bare_commands(
+def test_maintenance_git_bare_commands_use_default_root(
     maintenance_git_home: Path,
 ) -> None:
     for command in (
@@ -7467,7 +7445,65 @@ def test_maintenance_git_denies_bare_commands(
         "git log --oneline -5",
         "git diff --stat HEAD~1",
     ):
-        assert parse_service_shell_argv(command, "maintenance") is None
+        argv = parse_service_shell_argv(command, "maintenance")
+        assert argv is not None, command
+        assert argv[1:3] == ["-C", str(maintenance_git_home.resolve())]
+
+
+def test_maintenance_git_admits_observed_upgrade_inspection_argv(
+    maintenance_git_home: Path,
+) -> None:
+    proposal = (
+        maintenance_git_home / "scratch" / "proposals" / "upgrade"
+        / "upgrade_defaults-0-7-0-20260806"
+    )
+    proposal.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(proposal)], check=True)
+    oid = "a" * 40
+
+    commands = (
+        f"git -C {proposal} log --all --oneline -10",
+        f"git -C {proposal} diff --no-ext-diff --stat",
+        f"git -C {proposal} --no-pager log --oneline -10",
+        f"git -C {proposal} --no-ext-diff diff --stat",
+        f"git --no-pager -C {proposal} log --oneline -10",
+        f"git --no-ext-diff -C {proposal} diff --stat",
+        f"git -C {proposal} rev-parse HEAD",
+        f"git -C {proposal} branch -a",
+        f"git -C {proposal} cat-file -s {oid}",
+        f"git -C {proposal} ls-tree HEAD",
+        f"git -C {proposal} ls-files",
+    )
+
+    for command in commands:
+        argv = parse_service_shell_argv(command, "maintenance")
+        assert argv is not None, command
+        assert argv[1:3] == ["-C", str(proposal.resolve())]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "add memory/core.md",
+        "commit -m changed",
+        "push origin HEAD",
+        "reset --hard HEAD~1",
+        "checkout main",
+        "clean -fd",
+        "branch -d old",
+        "branch -D old",
+        "branch -m old new",
+        "branch -M old new",
+        "branch --force old HEAD",
+    ],
+)
+def test_maintenance_git_keeps_mutations_refused_with_explicit_root(
+    arguments: str,
+    maintenance_git_home: Path,
+) -> None:
+    command = f"git -C {maintenance_git_home} {arguments}"
+
+    assert parse_service_shell_argv(command, "maintenance") is None, command
 
 
 @pytest.mark.parametrize(
