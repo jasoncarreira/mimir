@@ -1705,6 +1705,7 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
     root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
     if not str(root) or str(root) == ".":
         return ()
+    root = root.resolve()
     try:
         from .config import Config
 
