@@ -469,6 +469,29 @@ class TestReviewFindings:
         )
         assert declared[0].script == (home / "scripts" / "todo.py").resolve()
 
+    def test_symlinked_home_does_not_make_scripts_undeclarable(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        real_home = tmp_path / "real-home"
+        for name in ("scripts", "scratch", "skills", "state"):
+            (real_home / name).mkdir(parents=True)
+        script = real_home / "scripts" / "todo.py"
+        script.write_text("print(1)\n")
+        home = tmp_path / "home"
+        home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+
+        roots = agent_writable_roots(home)
+        assert home.resolve() not in roots, "the resolved home sink root is excluded"
+        assert (home / "scratch").resolve() in roots, "but its rw folders are"
+
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=roots,
+        )
+        assert declared[0].script == script.resolve()
+
     def test_external_rw_roots_count_as_writable(
         self, home: Path, tmp_path_factory, monkeypatch,
     ) -> None:
