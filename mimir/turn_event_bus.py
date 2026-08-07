@@ -77,6 +77,7 @@ class TurnEventBus:
     def __init__(self, *, queue_max: int = DEFAULT_QUEUE_MAX) -> None:
         self._queue_max = queue_max
         self._subscribers: dict[str, set["asyncio.Queue[dict[str, Any]]"]] = {}
+        self._exact_turn_subscribers: dict[str, "asyncio.Queue[dict[str, Any]]"] = {}
 
     def subscribe(self, channel_id: str = WILDCARD) -> "asyncio.Queue[dict[str, Any]]":
         """Return a fresh bounded queue subscribed to ``channel_id``.
@@ -87,6 +88,23 @@ class TurnEventBus:
         queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=self._queue_max)
         self._subscribers.setdefault(channel_id, set()).add(queue)
         return queue
+
+    def subscribe_exact_turn(self, turn_id: str) -> "asyncio.Queue[dict[str, Any]]":
+        """Return the sole lossless, unbounded queue for ``turn_id``."""
+        if turn_id in self._exact_turn_subscribers:
+            raise ValueError(f"exact-turn subscriber already registered for {turn_id!r}")
+        queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
+        self._exact_turn_subscribers[turn_id] = queue
+        return queue
+
+    def unsubscribe_exact_turn(
+        self,
+        turn_id: str,
+        queue: "asyncio.Queue[dict[str, Any]]",
+    ) -> None:
+        """Remove ``queue`` when it is the active exact-turn subscriber."""
+        if self._exact_turn_subscribers.get(turn_id) is queue:
+            self._exact_turn_subscribers.pop(turn_id)
 
     def unsubscribe(self, channel_id: str, queue: "asyncio.Queue[dict[str, Any]]") -> None:
         subs = self._subscribers.get(channel_id)
@@ -104,6 +122,10 @@ class TurnEventBus:
         """
         try:
             event = scrub_turn_event(event)
+            turn_id = event.get("turn_id")
+            exact = self._exact_turn_subscribers.get(turn_id)
+            if exact is not None:
+                exact.put_nowait(event)
             channel_id = event.get("channel_id") or ""
             for key in (channel_id, WILDCARD):
                 subs = self._subscribers.get(key)
