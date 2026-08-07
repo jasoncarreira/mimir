@@ -586,12 +586,24 @@ are admitted, never *how* they may be composed.
 
 #### Failure modes
 
-A malformed declaration fails closed and loudly, at load rather than at use:
+A malformed declaration fails closed and loudly, but the two sites check at
+different moments:
 
-- a poller whose declaration is invalid is **not registered**;
-- a scheduled job whose declaration is invalid is **not fired**, rather than
-  silently downgraded to the shared principal — it would otherwise fail every
-  command it was configured to run, with the reason nowhere near the cause.
+- **Pollers validate at load.** A manifest whose declaration is invalid leaves
+  the poller **not registered** — the failure is visible when the manifest is
+  read, before the poller ever runs.
+- **Scheduled jobs validate at fire time.** `scheduler.yaml` is parsed without
+  the deployment context the path checks need, so the raw declaration is carried
+  on the job and validated immediately before the job fires. An invalid one stops
+  the job firing rather than silently downgrading it to the shared principal — it
+  would otherwise fail every command it was configured to run, with the reason
+  nowhere near the cause.
+
+That means a bad scheduler declaration is not reported at startup; it is reported
+the first time the job is due, in the scheduler log. A shape that cannot be
+parsed at all (`shell_commands: {}`, `shell_commands: ""`) is treated the same
+way as a bad path — the job does not fire. An explicit empty list is valid and
+means "declare nothing"; the job runs under the shared principal.
 
 Denials are attributed: `declared_command_mismatch` means the job declared
 commands and none matched, distinct from `profile_allowlist`, which means the

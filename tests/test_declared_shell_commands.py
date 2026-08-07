@@ -490,3 +490,22 @@ class TestReviewFindings:
                 [{"exec": "gog", "path": str(binary), "subcommands": [["gmail", "search"]]}],
                 writable_roots=roots,
             )
+
+
+@pytest.mark.parametrize("raw", [{}, "", 0, False])
+def test_malformed_falsey_scheduler_declaration_is_not_silently_ignored(raw) -> None:
+    """A falsey malformed shape must reach validation, not skip it.
+
+    `Scheduler._fire` branched on truthiness, so `shell_commands: {}` or `: ""`
+    stored fine, skipped validation entirely, and the job fired with no
+    declaration and no error — silent misconfiguration, which is the failure
+    this feature exists to prevent. Found by documenting the contract.
+    """
+    with pytest.raises(ValueError, match="must be a list"):
+        parse_declared_shell_commands(raw, writable_roots=())
+
+
+def test_an_explicit_empty_list_is_valid_and_means_nothing_declared() -> None:
+    """Distinct from malformed: `shell_commands: []` is a legitimate no-op."""
+    assert parse_declared_shell_commands([], writable_roots=()) == ()
+    assert parse_declared_shell_commands(None, writable_roots=()) == ()
