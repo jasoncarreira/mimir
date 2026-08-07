@@ -313,6 +313,32 @@ def publish_cancellation(policy: ContainmentPolicy, request_id: str) -> None:
         pass
 
 
+def publish_terminal_result(
+    policy: ContainmentPolicy,
+    request_id: str,
+    *,
+    attempt_id: str,
+    stderr: str,
+    exit_status: int = 124,
+) -> None:
+    """Publish a result for a step the supervisor will never run.
+
+    Cancelling a request that was never claimed removes the only thing that
+    would have produced a result, so without this the waiter blocks for its full
+    deadline on a step that is already gone.
+    """
+    result = WorkerResult(
+        attempt_id=attempt_id, exit_status=exit_status, stdout="", stderr=stderr, timed_out=True,
+    )
+    results = result_dir(policy.spool_root)
+    try:
+        tmp = results / f".{request_id}.cancelled.tmp"
+        tmp.write_text(json.dumps(result.to_json()), encoding="utf-8")
+        tmp.rename(results / f"{request_id}.json")
+    except OSError:  # pragma: no cover - best effort
+        pass
+
+
 def _contained_user_ids(user: str) -> tuple[int, int] | None:
     try:
         import pwd

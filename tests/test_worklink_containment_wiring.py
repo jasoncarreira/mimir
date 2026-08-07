@@ -328,3 +328,32 @@ def test_an_unresolvable_contained_user_is_refused(
     supervisor.prepare_spool(root)
     with pytest.raises(ContainmentUnavailable, match="does not exist"):
         resolve_containment(spool_root=root)
+
+
+def test_cancelling_before_the_supervisor_claims_still_publishes_a_result(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """Otherwise the waiter blocks its full deadline on a step that is gone.
+
+    Unlinking an unclaimed request removes the only thing that would ever have
+    produced a result.
+    """
+    from mimir.worklink.containment import await_result
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    backend = LocalSubprocessComputeBackend()
+
+    async def run() -> object:
+        handle = await backend.launch(_spec(checkout, ("sleep", "300")))
+        proc, _s, _c = backend._job(handle)
+        proc.cancel_request()          # never claimed: no supervisor is running
+        return proc
+
+    proc = asyncio.run(run())
+    from mimir.worklink.containment import ContainmentPolicy
+
+    policy = ContainmentPolicy(user="nobody", spool_root=coding_on, verified=False)
+    result = await_result(policy, proc.request_id, timeout_seconds=5)
+    assert result.exit_status == 124
+    assert "before the supervisor claimed it" in result.stderr

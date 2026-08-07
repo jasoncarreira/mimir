@@ -298,9 +298,27 @@ class _SpooledJob:
             return
         from .containment import publish_cancellation, request_dir
 
+        from .containment import publish_terminal_result
+
         root = self._policy.spool_root  # type: ignore[attr-defined]
-        (request_dir(root) / f"{self._request_id}.json").unlink(missing_ok=True)
-        publish_cancellation(self._policy, self._request_id)
+        request_path = request_dir(root) / f"{self._request_id}.json"
+        claimed = not request_path.exists()
+        request_path.unlink(missing_ok=True)
+        if claimed:
+            # Already running: only the root supervisor can signal a process
+            # owned by the contained user, so ask it to.
+            publish_cancellation(self._policy, self._request_id)
+            return
+        # Never claimed. Unlinking it means the supervisor will never publish a
+        # result, so the waiter would block until its full deadline for a step
+        # that is already gone. Publish the terminal result ourselves.
+        publish_terminal_result(
+            self._policy,
+            self._request_id,
+            attempt_id=f"{getattr(self._spec, 'issue_id', 'unknown')}-"
+            f"{getattr(self._spec, 'attempt', 0)}",
+            stderr="worklink: step cancelled before the supervisor claimed it",
+        )
 
 
 #: Fallback deadline when a spec carries none. Only bounds the pathological case
