@@ -748,7 +748,7 @@ class WorklinkRunner:
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_checkout_changes(lease.path, issue, runner=runner)
+            committed_oid = _commit_checkout_changes(lease.path, issue, runner=runner)
             try:
                 _ensure_clean_checkout(lease.path, runner=runner)
             except WorklinkError as exc:
@@ -792,7 +792,7 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner)
+            _git_push(lease.path, lease.branch, runner=runner, oid=committed_oid)
             pr_url = _open_pr(
                 self.repo,
                 issue,
@@ -2251,7 +2251,7 @@ def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None
             )
 
 
-def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> None:
+def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> str | None:
     add = runner(["git", "-C", str(checkout), "add", "-A"])
     if add.returncode != 0:
         raise WorklinkError((add.stderr or add.stdout).strip() or "git add failed")
@@ -2271,6 +2271,14 @@ def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Run
     ])
     if commit.returncode != 0:
         raise WorklinkError((commit.stderr or commit.stdout).strip() or "git commit failed")
+    # Resolve the object this commit produced and hand it to the push, so the
+    # push targets an IMMUTABLE oid rather than a moving ref (chainlink #1164).
+    # A process surviving past the verdict can still mutate the checkout; it
+    # cannot change which object gets pushed. Resolved through the same runner,
+    # so under containment this read happens on the contained side too.
+    head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    oid = (head.stdout or "").strip()
+    return oid if head.returncode == 0 and oid else None
 
 
 def _create_backend_checkout(
@@ -2433,8 +2441,15 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
-    result = runner(["git", "-C", str(repo), "push", "-u", "origin", branch])
+def _git_push(repo: Path, branch: str, *, runner: Runner, oid: str | None = None) -> None:
+    """Push the branch. Controller-side: this is what holds the credential.
+
+    When the commit step reported an oid, push THAT object explicitly rather
+    than whatever HEAD points at now. Without it a process outliving the
+    evidence gate could change what lands on the branch after the verdict.
+    """
+    refspec = f"{oid}:refs/heads/{branch}" if oid else branch
+    result = runner(["git", "-C", str(repo), "push", "-u", "origin", refspec])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 

@@ -310,20 +310,139 @@ def _common_status(status: str) -> str:
     return "failed"
 
 
+def _checkout_of(args: Sequence[str] | str, cwd: Path | None) -> Path | None:
+    """The attempt checkout a step operates on, for the contained request.
+
+    Most git calls here pass the checkout as ``git -C <path>`` with no ``cwd``,
+    so taking ``cwd`` alone would send them at the controller's directory.
+    """
+    if cwd is not None:
+        return Path(cwd)
+    if not isinstance(args, str):
+        parts = [str(a) for a in args]
+        if "-C" in parts:
+            index = parts.index("-C")
+            if index + 1 < len(parts):
+                return Path(parts[index + 1])
+    return None
+
+
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
     scrub_model_selection_env(env)
+
+    # chainlink #1164. The comment this replaces argued the test command is
+    # operator-configured and therefore trusted. That is true of the command
+    # STRING and irrelevant to what it EXECUTES: `pytest` reads conftest.py,
+    # `npm test` reads package.json scripts, and both were just written by the
+    # build. The same applies to git over the checkout. So every step here runs
+    # under the contained identity when containment is active.
+    checkout = _checkout_of(args, cwd)
+    contained = _contained_runner(args, checkout, env)
+    if contained is not None:
+        return contained
+
     if isinstance(args, str):
-        # Operator-configured test commands are trusted input, equivalent to
-        # poller.command; backend-generated text is never routed here.
         return subprocess.run(
             args, shell=True, cwd=cwd, env=env, capture_output=True, text=True, check=False
         )
     return subprocess.run(
         list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False
     )
+
+
+def _contained_runner(
+    args: Sequence[str] | str, checkout: Path | None, env: dict[str, str],
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one evidence step under the contained identity, or ``None`` to fall through.
+
+    Returns ``None`` -- meaning "run as before" -- when containment is not
+    required (no coding flag) or when the step has no attempt checkout to run in.
+    """
+    if checkout is None:
+        return None
+    if _talks_to_the_remote(args):
+        # Push, fetch and friends are CONTROLLER operations: they need the
+        # GitHub credential, which is deliberately never projected into a
+        # contained step. Routing them here would strip the credential and the
+        # push would simply fail to authenticate.
+        return None
+    from .containment import (
+        WorkerRequest,
+        containment_required,
+        resolve_containment,
+        run_contained,
+    )
+
+    if not containment_required():
+        return None
+    policy = resolve_containment()
+    if not policy.contained:
+        return None
+    argv = ("sh", "-c", args) if isinstance(args, str) else tuple(str(a) for a in args)
+    projected = {
+        key: value
+        for key, value in env.items()
+        if key not in {"MIMIR_HOME", "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"}
+    }
+    result = run_contained(
+        policy,
+        WorkerRequest(
+            attempt_id=f"evidence-{checkout.name}",
+            argv=argv,
+            cwd=checkout,
+            env=projected,
+            timeout_seconds=_evidence_step_timeout(),
+        ),
+    )
+    return subprocess.CompletedProcess(
+        args=list(argv), returncode=result.exit_status, stdout=result.stdout, stderr=result.stderr,
+    )
+
+
+#: Git subcommands that contact the remote, and therefore need the controller's
+#: credential. Everything else over an attempt checkout is local and contained.
+_REMOTE_GIT_SUBCOMMANDS = frozenset({"push", "fetch", "pull", "clone", "ls-remote", "remote"})
+
+
+def _talks_to_the_remote(args: Sequence[str] | str) -> bool:
+    if isinstance(args, str):
+        return False
+    parts = [str(a) for a in args]
+    if not parts or Path(parts[0]).name != "git":
+        return False
+    # Walk by index: the options that take a VALUE must consume it, or the value
+    # gets read as the subcommand -- `git -C /path push` would resolve to
+    # "/path" and a push would be routed into containment, stripping the
+    # credential it needs.
+    takes_value = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part in takes_value:
+            index += 2
+            continue
+        if part.startswith("-"):
+            index += 1
+            continue
+        return part in _REMOTE_GIT_SUBCOMMANDS
+    return False
+
+
+def _evidence_step_timeout() -> float:
+    """Deadline for a contained evidence step.
+
+    The gate's test command is the long one here; git calls finish in
+    milliseconds. Without a deadline the supervisor would spawn with none.
+    """
+    raw = os.environ.get("MIMIR_WORKLINK_EVIDENCE_TIMEOUT_S", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    return value if value > 0 else 3600.0
 
 
 def _merge_paths(*groups: list[str]) -> list[str]:
