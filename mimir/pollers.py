@@ -89,7 +89,9 @@ from .access_control import (
     ServicePrincipal,
     TRIGGER_AUTHORITY_PROFILES,
     TRIGGER_CAPABILITY_TIERS,
+    agent_writable_roots,
     build_trigger_service_principal,
+    parse_declared_shell_commands,
 )
 from .event_logger import log_event, get_events_path
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
@@ -737,6 +739,10 @@ POLLER_AUTHORITY_FIELDS = frozenset({
 })
 
 _AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
+#: Additive, and optional so every manifest written before it existed still
+#: registers. The required-key check above is deliberately "missing" rather than
+#: an exact-set comparison for that reason.
+_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands"})
 _TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -756,11 +762,11 @@ def _parse_poller_authority(
     """Strictly resolve one manifest authority declaration or raise ValueError."""
     if not isinstance(raw, dict):
         raise ValueError("authority must be an object")
-    unknown = set(raw) - _AUTHORITY_KEYS
+    unknown = set(raw) - _AUTHORITY_KEYS - _OPTIONAL_AUTHORITY_KEYS
     if unknown:
         raise ValueError(f"unknown authority fields: {', '.join(sorted(map(str, unknown)))}")
-    if set(raw) != _AUTHORITY_KEYS:
-        missing = _AUTHORITY_KEYS - set(raw)
+    missing = _AUTHORITY_KEYS - set(raw)
+    if missing:
         raise ValueError(f"missing authority fields: {', '.join(sorted(missing))}")
 
     profile = raw["profile"]
@@ -836,6 +842,17 @@ def _parse_poller_authority(
     if {"write_file", "edit_file"} & set(capabilities) and not roots:
         raise ValueError("file capabilities require at least one scoped root")
 
+    home_root = state_root.parent.parent if state_root is not None else None
+    declared_shell_commands = parse_declared_shell_commands(
+        raw.get("shell_commands"),
+        writable_roots=agent_writable_roots(home_root),
+    )
+    if declared_shell_commands and "shell_exec" not in capabilities:
+        raise ValueError(
+            "shell_commands declared without the shell_exec capability; the "
+            "capability gate runs first and would refuse every one of them",
+        )
+
     canonical = f"poller:{name}"
     return build_trigger_service_principal(
         canonical=canonical,
@@ -846,6 +863,7 @@ def _parse_poller_authority(
         roots=tuple(roots),
         owned_skill_directory=manifest_path.parent,
         channel_memory_directory=canonical,
+        declared_shell_commands=declared_shell_commands,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )
 
