@@ -44,7 +44,13 @@ from mimir.worklink.containment import (
     spawn_argv,
 )
 
-__all__ = ["prepare_spool", "handle_one_request", "serve_forever", "main"]
+__all__ = [
+    "prepare_spool",
+    "ensure_checkout_ownership",
+    "handle_one_request",
+    "serve_forever",
+    "main",
+]
 
 #: Controller writes, contained user reads only. The contained user is neither
 #: the owner nor in the owning group, so the absent "other" write bit is what
@@ -94,6 +100,43 @@ def prepare_spool(
         os.chown(results, 0, controller[1])
     requests.chmod(_REQUEST_DIR_MODE)
     results.chmod(_RESULT_DIR_MODE)
+
+
+def ensure_checkout_ownership(checkout: Path, contained_user: str) -> bool:
+    """Hand the attempt checkout to the contained user. Returns whether it did.
+
+    The controller creates the checkout (it clones the repo), so every file in
+    it is owned by the AGENT. The contained user could then read but not write
+    it, and the build would fail on its first edit.
+
+    Chowning ``/workspace/.worklink`` in the image does not cover this: attempt
+    checkouts are created per run, and a deployment can configure repositories
+    anywhere via MIMIR_FILE_TOOL_ROOTS. The handoff has to happen per attempt.
+
+    It happens HERE because the controller cannot do it: chown to another user
+    requires CAP_CHOWN, and the agent runs with CapEff=0. This service is root.
+
+    Idempotent -- a checkout already owned by the contained user is left alone,
+    so repeated steps against one attempt do not re-walk the tree.
+    """
+    ids = _lookup_ids(contained_user)
+    if ids is None or os.geteuid() != 0:
+        # Not root (tests, or a deployment without the account): nothing to hand
+        # over. The caller still runs the step; containment verification is what
+        # decides whether that is acceptable, not this.
+        return False
+    uid, gid = ids
+    try:
+        if checkout.stat().st_uid == uid:
+            return False
+    except OSError:  # pragma: no cover - checkout vanished
+        return False
+    for path in (checkout, *checkout.rglob("*")):
+        try:
+            os.chown(path, uid, gid, follow_symlinks=False)
+        except OSError:  # pragma: no cover - best effort per entry
+            continue
+    return True
 
 
 def _run_supervised(
@@ -188,6 +231,10 @@ def handle_one_request(
     request_id = str(raw.get("request_id") or request_path.stem)
     request = WorkerRequest.from_json(raw)
     runner = spawn if spawn is not None else subprocess.run
+
+    # Hand the checkout over before the step runs: the controller created it,
+    # so it is agent-owned and the contained user could not write it.
+    ensure_checkout_ownership(request.cwd, policy.user)
 
     argv = spawn_argv(policy, request.argv)
     timed_out = False

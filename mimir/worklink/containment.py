@@ -86,6 +86,8 @@ __all__ = [
     "submit_request",
     "await_result",
     "run_contained",
+    "worker_runtime_env",
+    "worker_home",
     "spawn_argv",
     "request_dir",
     "result_dir",
@@ -311,6 +313,55 @@ def publish_cancellation(policy: ContainmentPolicy, request_id: str) -> None:
         cancel_path(policy.spool_root, request_id).touch()
     except OSError:  # pragma: no cover - cancellation is best effort
         pass
+
+
+#: Controller-derived paths that must be REPLACED, not merely inherited, when a
+#: step runs as the contained user. Passing the controller's HOME through gives
+#: the worker a directory it cannot write and points every tool at the agent
+#: user's config; passing XDG through does the same for caches.
+_CONTROLLER_RUNTIME_KEYS = ("HOME", "USER", "LOGNAME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")
+
+
+def worker_runtime_env(policy: ContainmentPolicy, base: dict[str, str]) -> dict[str, str]:
+    """Project a base environment onto the contained user's own runtime.
+
+    Removing ``MIMIR_HOME`` and the GitHub tokens is not enough on its own: a
+    step still inherits the CONTROLLER's ``HOME``, ``USER`` and ``XDG_*``. That
+    is both broken and leaky -- the worker cannot write the agent user's home
+    (0700), so a coding CLI has nowhere for its config or caches, and every tool
+    that resolves a path from ``HOME`` points at the identity being contained
+    from.
+
+    So the worker gets its own home and XDG tree, derived from the account
+    itself rather than from configuration that could disagree with reality.
+    """
+    env = {
+        key: value
+        for key, value in base.items()
+        if key not in _NEVER_PROJECTED and key not in _CONTROLLER_RUNTIME_KEYS
+    }
+    home = worker_home(policy)
+    if home is None:
+        return env
+    env["HOME"] = str(home)
+    env["USER"] = policy.user
+    env["LOGNAME"] = policy.user
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    env["XDG_CACHE_HOME"] = str(home / ".cache")
+    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+    return env
+
+
+def worker_home(policy: ContainmentPolicy) -> Path | None:
+    """The contained user's own home directory, read from the account."""
+    try:
+        import pwd
+
+        entry = pwd.getpwnam(policy.user)
+    except (ImportError, KeyError):
+        return None
+    return Path(entry.pw_dir) if entry.pw_dir else None
 
 
 def publish_terminal_result(

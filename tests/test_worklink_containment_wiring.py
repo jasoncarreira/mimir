@@ -357,3 +357,83 @@ def test_cancelling_before_the_supervisor_claims_still_publishes_a_result(
     result = await_result(policy, proc.request_id, timeout_seconds=5)
     assert result.exit_status == 124
     assert "before the supervisor claimed it" in result.stderr
+
+
+def test_the_checkout_is_handed_to_the_contained_user_before_the_step_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The controller clones the repo, so the checkout is agent-owned.
+
+    Without a handoff the contained user can read it but not write it, and the
+    build fails on its first edit. Chowning /workspace/.worklink in the image
+    does not cover it: attempt checkouts are per-run, and repositories can be
+    configured anywhere.
+    """
+    calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "ensure_checkout_ownership",
+        lambda checkout, user: calls.append((checkout, user)) or False,
+    )
+    from mimir.worklink.containment import ContainmentPolicy, WorkerRequest, submit_request
+
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    policy = ContainmentPolicy(user="nobody", spool_root=root, verified=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    submit_request(
+        policy,
+        WorkerRequest(
+            attempt_id="handoff", argv=("true",), cwd=checkout, env={"PATH": "/usr/bin:/bin"},
+        ),
+    )
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    assert calls == [(checkout, "nobody")]
+
+
+def test_the_ownership_handoff_is_a_no_op_without_root(tmp_path: Path) -> None:
+    """Only this service can chown to another user; the controller has CapEff=0.
+
+    Off-root it must not pretend to have done it -- the return value is what a
+    caller would use to decide whether the boundary is real.
+    """
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    assert supervisor.ensure_checkout_ownership(checkout, "nobody") is False
+
+
+def test_the_worker_gets_its_own_runtime_home_not_the_controllers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stripping MIMIR_HOME and the tokens is only half the projection.
+
+    A step inheriting the CONTROLLER's HOME/XDG has nowhere writable for a
+    coding CLI's config or caches, and every path resolved from HOME points at
+    the identity being contained from.
+    """
+    import pwd
+
+    from mimir.worklink.containment import ContainmentPolicy, worker_runtime_env
+
+    policy = ContainmentPolicy(user="nobody", spool_root=tmp_path, verified=True)
+    base = {
+        "HOME": "/home/mimir",
+        "USER": "mimir",
+        "LOGNAME": "mimir",
+        "XDG_CONFIG_HOME": "/home/mimir/.config",
+        "MIMIR_HOME": "/home/mimir/agent",
+        "GITHUB_TOKEN": "ghp_x",
+        "PATH": "/usr/bin:/bin",
+    }
+    env = worker_runtime_env(policy, base)
+
+    assert env["PATH"] == "/usr/bin:/bin", "unrelated vars must survive"
+    for leaked in ("MIMIR_HOME", "GITHUB_TOKEN"):
+        assert leaked not in env
+    expected_home = pwd.getpwnam("nobody").pw_dir
+    if expected_home:
+        assert env["HOME"] == expected_home
+        assert env["HOME"] != "/home/mimir"
+        assert env["USER"] == "nobody"
+        assert env["XDG_CONFIG_HOME"].startswith(expected_home)

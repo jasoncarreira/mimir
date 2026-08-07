@@ -375,15 +375,15 @@ class LocalSubprocessComputeBackend:
         # quietly opt out by constructing its own subprocess.
         policy = _containment_policy()
         if policy is not None and policy.contained:
-            # Push and PR are controller-side operations. _local_child_env()
-            # passes GITHUB_TOKEN/GH_TOKEN through as "provider credentials",
-            # which predates this boundary -- the worker has no use for them and
-            # submit_request refuses to project them.
-            env = {
-                key: value
-                for key, value in env.items()
-                if key not in {"GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"}
-            }
+            # Project onto the worker's OWN runtime. Stripping the GitHub
+            # tokens (which _local_child_env passes through as "provider
+            # credentials", predating this boundary) is only half of it: the
+            # step would otherwise inherit the CONTROLLER's HOME and XDG paths,
+            # which it cannot write and which point at the identity being
+            # contained from.
+            from .containment import worker_runtime_env
+
+            env = worker_runtime_env(policy, env)
             proc = _SpooledJob(policy, spec, command, env, getattr(spec, "timeout_s", None))
             await proc.submit()
         else:

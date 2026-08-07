@@ -374,6 +374,7 @@ def _contained_runner(
         containment_required,
         resolve_containment,
         run_contained,
+        worker_runtime_env,
     )
 
     if not containment_required():
@@ -382,11 +383,7 @@ def _contained_runner(
     if not policy.contained:
         return None
     argv = ("sh", "-c", args) if isinstance(args, str) else tuple(str(a) for a in args)
-    projected = {
-        key: value
-        for key, value in env.items()
-        if key not in {"MIMIR_HOME", "GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"}
-    }
+    projected = worker_runtime_env(policy, env)
     result = run_contained(
         policy,
         WorkerRequest(
