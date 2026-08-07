@@ -158,3 +158,48 @@ def test_coding_disabled_needs_no_containment_and_runs_nothing(
     policy = resolve_containment()
     assert policy.not_required_reason is not None
     assert policy.verified is False
+
+
+def test_identity_survives_the_detached_hop(tmp_path: Path) -> None:
+    """The evidence gate and Git steps inherit the service's identity.
+
+    This is why one boundary at the top suffices. The chain is
+
+        service -> poller.py -> `mimir worklink run` (DETACHED) -> build
+                             -> evidence gate test command
+                             -> git add/commit over the checkout
+
+    and `start_new_session=True` starts a new SESSION, not a new identity, so
+    uid survives it. If that ever stopped being true, the evidence gate would
+    silently return to the agent's identity while every other test still passed
+    — the exact failure the broker design was built to avoid.
+
+    Asserted on the real process tree rather than reasoned about; the uid switch
+    itself needs a privileged parent, so this checks inheritance, which is the
+    half that can regress in Python.
+    """
+    import subprocess
+
+    script = tmp_path / "chain.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "echo \"poller=$(id -u)\"\n"
+        # the detached hop the poller performs
+        "setsid sh -c 'echo \"detached=$(id -u)\"; sh -c \"echo testcmd=\\$(id -u)\"' &\n"
+        "wait\n"
+    )
+    script.chmod(0o755)
+
+    out = subprocess.run(
+        ["/bin/sh", str(script)], capture_output=True, text=True, timeout=20,
+    ).stdout
+
+    seen = dict(
+        line.split("=", 1) for line in out.split() if "=" in line
+    )
+    assert seen, f"no uids reported: {out!r}"
+    uids = set(seen.values())
+    assert len(uids) == 1, (
+        f"identity changed across the chain: {seen}. Every downstream step must "
+        "inherit the service identity, or the evidence gate escapes containment."
+    )
