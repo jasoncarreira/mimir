@@ -45,7 +45,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
-from .access_control import builtin_trigger_service_principal
+from .access_control import (
+    CapabilityTier,
+    TRIGGER_AUTHORITY_PROFILES,
+    agent_writable_roots,
+    build_trigger_service_principal,
+    builtin_trigger_service_principal,
+    parse_declared_shell_commands,
+)
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
@@ -215,6 +222,11 @@ class SchedulerJob:
     # window, and the whole interval is silently skipped (chainlink #468).
     # Mirrors the per-job grace _CallableDef already carries; per-entry override.
     misfire_grace_time: int = 3600
+    #: Raw ``shell_commands`` from scheduler.yaml, validated at fire time into
+    #: this job's own service principal. Declared beside the cron and the prompt
+    #: because that is where the job already is, and scheduler.yaml is not
+    #: writable by any service principal.
+    shell_commands: Any = None
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
@@ -329,6 +341,7 @@ class SchedulerJob:
             deliver=deliver,
             priority=priority,
             misfire_grace_time=misfire_grace_time,
+            shell_commands=raw.get("shell_commands"),
         )
 
 
@@ -969,6 +982,43 @@ class Scheduler:
             heartbeat_root = self._home / "state" / "triggers" / "heartbeat"
             heartbeat_root.mkdir(parents=True, exist_ok=True)
             authority = builtin_trigger_service_principal("heartbeat", self._home)
+            service_principal = authority.canonical
+        elif job.shell_commands:
+            # Every other scheduler.yaml job otherwise falls back to the
+            # trigger-level ``scheduled_tick`` principal, so its NAME never
+            # reaches authorization and all jobs share one shell profile. A job
+            # that declares grants gets its own principal instead, which is what
+            # makes those grants addressable to it and not to its neighbours.
+            #
+            # A bad declaration disables the job rather than silently downgrading
+            # it to the shared principal: a job whose grants failed to load would
+            # fail every command it was configured to run, and the reason would
+            # be nowhere near the cause.
+            try:
+                declared = parse_declared_shell_commands(
+                    job.shell_commands,
+                    writable_roots=agent_writable_roots(self._home),
+                )
+            except ValueError as exc:
+                log.error(
+                    "scheduler %r: shell_commands rejected — %s; job not fired",
+                    job.name, exc,
+                )
+                return
+            authority = build_trigger_service_principal(
+                canonical=f"scheduler:{job.name}",
+                trigger="scheduled_tick",
+                profile="heartbeat",
+                tier=CapabilityTier.UNBOUNDED,
+                capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["heartbeat"])),
+                roots=(self._home / "state" / "triggers" / job.name,),
+                channel_memory_directory=f"scheduler:{job.name}",
+                declared_shell_commands=declared,
+                creation_path=f"mimir.scheduler.Scheduler._fire_job:{job.name}",
+            )
+            (self._home / "state" / "triggers" / job.name).mkdir(
+                parents=True, exist_ok=True,
+            )
             service_principal = authority.canonical
         event = AgentEvent(
             trigger="scheduled_tick",

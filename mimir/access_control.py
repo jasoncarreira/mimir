@@ -388,6 +388,10 @@ class ServicePrincipal:
     creation_path: str | None = None
     authority_profile: str | None = None
     capability_tier: CapabilityTier | None = None
+    #: Per-job shell grants, additive on top of the profile's allowlist. Declared
+    #: in scheduler.yaml or a poller manifest -- neither of which any service
+    #: principal can write -- and validated into this shape before it lands here.
+    declared_shell_commands: tuple["DeclaredShellCommand", ...] = ()
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -566,6 +570,7 @@ def build_trigger_service_principal(
     owned_skill_directory: Path | None = None,
     saga_full_corpus_read: bool = False,
     channel_memory_directory: str | None = None,
+    declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -664,6 +669,7 @@ def build_trigger_service_principal(
         creation_path=creation_path,
         authority_profile=profile,
         capability_tier=tier,
+        declared_shell_commands=declared_shell_commands,
     )
 
 
@@ -1647,6 +1653,204 @@ _REFUSED_INSIDE_ANY_QUOTE = frozenset("\n\r")
 #: still performs ``$(...)`` and backtick substitution inside them. Treating
 #: ``"$(cat /etc/passwd)"`` as a literal because it is quoted would be wrong.
 _EXPANDS_INSIDE_DOUBLE_QUOTES = frozenset("$`")
+
+
+#: Executables that can take code from argv or stdin. They may only be declared
+#: with a pinned ``script``, and never with an option that sources code inline --
+#: otherwise a grant to "run one script" is a grant to run anything.
+_INTERPRETER_EXECUTABLES = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+    "php", "lua", "Rscript", "awk", "gawk", "env", "xargs", "eval",
+})
+
+#: Options that make an interpreter read code from argv or stdin. Refused on any
+#: declaration, interpreter or not: no admitted command needs them, and one of
+#: them turns a pinned executable back into an arbitrary one.
+_CODE_FROM_ARGV_OPTIONS = frozenset({"-c", "-e", "-m", "--command", "--eval", "-"})
+
+
+@dataclass(frozen=True)
+class DeclaredShellCommand:
+    """One operator-declared command a scheduled job or poller may run.
+
+    Declared where the job itself is defined -- ``scheduler.yaml`` or a poller
+    manifest -- so mimir needs no built-in catalogue of every CLI a deployment
+    might install. What stays in code is the SHAPE: an absolute pinned path, a
+    non-empty subcommand table (so a bare binary is inexpressible, because
+    ``gog gmail search`` and ``gog gmail send`` are the same binary), an option
+    allowlist, and the interpreter rule.
+    """
+
+    executable: str
+    path: Path
+    subcommands: tuple[tuple[str, ...], ...] = ()
+    options: tuple[str, ...] = ()
+    script: Path | None = None
+
+
+def _declaration_error(name: str, detail: str) -> ValueError:
+    return ValueError(f"shell_commands[{name!r}]: {detail}")
+
+
+def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
+    """Directories the agent can write through its file tools.
+
+    Read from ``Config.folders`` so this tracks the real write guard rather than
+    a second copy of the list. A declared script must lie outside all of these --
+    note ``skills`` is ``rw``, so a script bundled inside a skill is correctly
+    refused, while ``<home>/scripts/`` is not a configured folder at all and is
+    therefore already unwritable.
+    """
+    root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
+    if not str(root) or str(root) == ".":
+        return ()
+    try:
+        from .config import Config
+
+        names = Config.from_env().writable_dirs
+    except Exception:  # noqa: BLE001 - fall back to the shipped default
+        from .config import DEFAULT_FOLDERS
+
+        names = [name for name, mode in DEFAULT_FOLDERS.items() if mode == "rw"]
+    roots: list[Path] = []
+    for name in names:
+        candidate = (root / name)
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    return tuple(roots)
+
+
+def parse_declared_shell_commands(
+    raw: object, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple[DeclaredShellCommand, ...]:
+    """Validate declared shell grants, or raise ``ValueError``.
+
+    ``writable_roots`` are the directories the agent can write through its file
+    tools (``Config.writable_dirs``). A declared script must lie outside all of
+    them: the danger of an interpreter is *arbitrary* code, not code, so a script
+    the running agent cannot modify is equivalent to a binary the operator
+    installed. Resolution follows symlinks before the check, or a link inside a
+    writable root would launder the path.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("shell_commands must be a list")
+    resolved_writable = tuple(Path(root).resolve() for root in writable_roots)
+    out: list[DeclaredShellCommand] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each shell_commands entry must be a mapping")
+        name = entry.get("exec")
+        if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
+            raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
+        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script"}
+        if unknown:
+            raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise _declaration_error(name, "path is required")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
+        if not path.exists():
+            # Fail at load, matching the existing scoped-root precedent: a grant
+            # naming a binary that is not installed is a config error, and
+            # deferring it surfaces later as an unexplained refusal.
+            raise _declaration_error(name, f"path does not exist: {raw_path}")
+
+        options_raw = entry.get("options") or []
+        if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
+            raise _declaration_error(name, "options must be a list of strings")
+        for option in options_raw:
+            if not option.startswith("-"):
+                raise _declaration_error(name, f"option must start with '-': {option!r}")
+            if option in _CODE_FROM_ARGV_OPTIONS:
+                raise _declaration_error(
+                    name,
+                    f"{option!r} sources code from argv or stdin and is never admitted",
+                )
+
+        subcommands_raw = entry.get("subcommands") or []
+        if not isinstance(subcommands_raw, list):
+            raise _declaration_error(name, "subcommands must be a list of lists")
+        subcommands: list[tuple[str, ...]] = []
+        for item in subcommands_raw:
+            if not isinstance(item, list) or not item or not all(isinstance(s, str) for s in item):
+                raise _declaration_error(name, "each subcommand must be a non-empty list of strings")
+            subcommands.append(tuple(item))
+
+        raw_script = entry.get("script")
+        script: Path | None = None
+        is_interpreter = name in _INTERPRETER_EXECUTABLES
+        if raw_script is not None:
+            if not isinstance(raw_script, str) or not raw_script:
+                raise _declaration_error(name, "script must be a non-empty string")
+            script = Path(raw_script)
+            if not script.is_absolute():
+                raise _declaration_error(name, f"script must be absolute, got {raw_script!r}")
+            resolved = script.resolve()
+            if not resolved.exists():
+                raise _declaration_error(name, f"script does not exist: {raw_script}")
+            for root in resolved_writable:
+                if resolved == root or resolved.is_relative_to(root):
+                    raise _declaration_error(
+                        name,
+                        f"script {raw_script} is inside the agent-writable root {root}; "
+                        "a script the agent can rewrite is arbitrary code execution",
+                    )
+            script = resolved
+        if is_interpreter and script is None:
+            raise _declaration_error(
+                name, "an interpreter may only be declared with a pinned 'script'",
+            )
+        if script is None and not subcommands:
+            raise _declaration_error(
+                name, "declare at least one subcommand, or a script for an interpreter",
+            )
+        out.append(DeclaredShellCommand(
+            executable=name,
+            path=path,
+            subcommands=tuple(subcommands),
+            options=tuple(options_raw),
+            script=script,
+        ))
+    return tuple(out)
+
+
+def _declared_command_execution_argv(
+    argv: list[str], declared: tuple[DeclaredShellCommand, ...],
+) -> list[str] | None:
+    """Return the pinned argv when *argv* matches a declaration, else ``None``."""
+    if not argv or not declared:
+        return None
+    for command in declared:
+        if argv[0] != command.executable:
+            continue
+        arguments = argv[1:]
+        if command.script is not None:
+            if not arguments or Path(arguments[0]).resolve() != command.script:
+                continue
+            arguments = arguments[1:]
+        elif not any(
+            tuple(arguments[:len(prefix)]) == prefix for prefix in command.subcommands
+        ):
+            continue
+        if not _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset(command.options),
+            option_prefixes=tuple(f"{o}=" for o in command.options if o.startswith("--")),
+        ):
+            continue
+        rest = argv[1:]
+        if command.script is not None:
+            rest = [str(command.script), *rest[1:]]
+        return [str(command.path), *rest]
+    return None
 
 
 def _unquoted_shell_control_characters(target: str) -> list[str]:
@@ -3053,6 +3257,7 @@ class ServiceShellBindingRule(StrEnum):
     REPOSITORY_REVIEW_STATE = "repository_review_state"
     REVIEW_BODY_CAPTURE = "review_body_capture"
     UNKNOWN_PROFILE = "unknown_profile"
+    DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
 
 
 def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
@@ -3276,6 +3481,7 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
 
 def parse_service_shell_argv_with_diagnostics(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -3406,10 +3612,22 @@ def parse_service_shell_argv_with_diagnostics(
             "so no command can be admitted for this principal."
         ), ServiceShellBindingRule.UNKNOWN_PROFILE
     if not allowed:
+        # Declarations are ADDITIVE: the profile is consulted first, and a job's
+        # own grants are a second chance rather than a replacement. A deployment
+        # can therefore teach one scheduled job about its own CLI without
+        # widening the profile every other job on the box shares.
+        declared_argv = _declared_command_execution_argv(argv, declared)
+        if declared_argv is not None:
+            return declared_argv, "", None
         return (
             None,
             _service_shell_not_admitted_reason(argv, destination),
-            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            # Distinguish "this job declared commands and none matched" from
+            # "the profile refused it" so a denial event says which gate spoke.
+            # ``destination`` keeps meaning the profile, so existing shadow-authz
+            # classification is unaffected.
+            ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH if declared
+            else ServiceShellBindingRule.PROFILE_ALLOWLIST,
         )
     pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
     return (
@@ -3421,20 +3639,22 @@ def parse_service_shell_argv_with_diagnostics(
 
 def parse_service_shell_argv_with_reason(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
-        target, destination, review_state=review_state,
+        target, destination, review_state=review_state, declared=declared,
     )
     return argv, reason
 
 
 def parse_service_shell_argv(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
-        target, destination, review_state=review_state,
+        target, destination, review_state=review_state, declared=declared,
     )[0]
 
 
@@ -3983,6 +4203,31 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     return adapter is not None and adapter(normalized, policy.destination)
 
 
+def _sink_adapter_admits(
+    adapter: Any,
+    target: str,
+    destination: str,
+    service: "ServicePrincipal | None" = None,
+    *,
+    review_state: Any = None,
+) -> bool:
+    """Invoke a sink adapter, handing the shell adapter the principal's grants.
+
+    The adapter registry is ``(target, destination) -> bool`` and deliberately
+    knows nothing about principals. Declared shell commands are per-principal, so
+    the shell adapter -- and only it -- is called through the parser directly
+    rather than through that narrow signature. Every other adapter is unchanged.
+    """
+    if adapter is None:
+        return False
+    if adapter is _target_matches_shell_profile:
+        return parse_service_shell_argv(
+            target, destination, review_state=review_state,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        ) is not None
+    return bool(adapter(target, destination))
+
+
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "configured_repo_write_roots": _target_within_configured_repo_write_roots,
@@ -4510,7 +4755,9 @@ class SinkGate:
                 adapter = _SERVICE_SINK_ADAPTERS.get(candidate.adapter)
                 triggering = getattr(auth_context, "channel_id", None)
                 if target != triggering:
-                    if adapter is None or not adapter(target, candidate.destination):
+                    if not _sink_adapter_admits(
+                        adapter, target, candidate.destination, service,
+                    ):
                         return ToolAuthorization(
                             tool_name=tool_name,
                             decision=OperationDecision.ADMIN_REQUIRED,
@@ -4579,8 +4826,9 @@ class SinkGate:
                         ) is not None
                     )
                 else:
-                    service_target_allowed = adapter(
-                        target, service_policy.destination,
+                    service_target_allowed = _sink_adapter_admits(
+                        adapter, target, service_policy.destination, service,
+                        review_state=review_state,
                     )
             if (
                 not service_target_allowed
@@ -4992,7 +5240,10 @@ def resolve_sink_target(
         return None
     policy = service.sink_policy_for(tool_name) if service is not None else None
     if policy is not None and policy.adapter == "shell_profile":
-        execution_argv = parse_service_shell_argv(target, policy.destination)
+        execution_argv = parse_service_shell_argv(
+            target, policy.destination,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
         if execution_argv is not None:
             argv = execution_argv
     return json.dumps(argv, ensure_ascii=True) if argv else None
