@@ -86,12 +86,23 @@ RUN set -eu; \
 # Claude Code CLI keeps its OAuth credential under ``.claude/``.
 RUN useradd -m -u 1001 -s /bin/bash mimir
 
-# The identity Worklink builds run as. Distinct from the agent user on purpose:
-# a build executes repository-controlled code, and this user must not be able to
-# write the agent home, where scheduler.yaml and skills/*/pollers.json grant
-# shell authority. It needs only its attempt checkouts under /workspace/.worklink
-# and append access to the events log; see docs/authorization.md.
-RUN useradd -M -s /usr/sbin/nologin -u 1001 worklink \
+# The identity Worklink BUILDS run as -- not the poller, which stays with the
+# agent (it needs MIMIR_HOME for worklink.yaml, lease state and claim locks).
+#
+# A build has a model generate code and then executes it, so what runs was
+# reviewed by nobody. This user exists so that a bad generation cannot write the
+# agent home, where scheduler.yaml and skills/*/pollers.json grant shell
+# authority. See chainlink #1164 and docs/authorization.md.
+#
+# The uid MUST differ from the agent's above -- sharing it would make the whole
+# boundary a no-op, and `useradd` fails outright on a duplicate uid, so the image
+# would not build. tests/test_root_dockerfile.py asserts the INEQUALITY rather
+# than either literal, so renumbering either user cannot silently recreate this.
+#
+# It gets a real home (-m): a build runs OpenCode/Codex, which needs a HOME, npm
+# and uv caches, and its own projected provider credential. It must never read
+# the agent user's home to get them.
+RUN useradd -m -u 1002 -s /usr/sbin/nologin worklink \
     && mkdir -p /workspace/.worklink \
     && chown worklink:worklink /workspace/.worklink
 USER mimir

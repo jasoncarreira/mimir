@@ -85,7 +85,16 @@ def test_dockerfile_creates_the_worklink_user() -> None:
     """
     text = Path("Dockerfile").read_text()
     assert "useradd" in text and "worklink" in text, "no worklink user is created"
-    assert "-u 1001 worklink" in text, "the worklink uid must be pinned and distinct"
+    agent = re.search(r"useradd[^\n]*?-u (\d+)[^\n]*?\bmimir\b", text)
+    worker = re.search(r"useradd[^\n]*?-u (\d+)[^\n]*?\bworklink\b", text)
+    assert agent and worker, "both users must be created with an explicit uid"
+    # An INEQUALITY, not a literal. An earlier revision asserted "-u 1001 worklink"
+    # while the agent was also 1001 -- the test encoded the collision as the
+    # expectation, and `useradd` would have refused to build the image at all.
+    assert agent.group(1) != worker.group(1), (
+        f"worklink uid {worker.group(1)} collides with the agent uid {agent.group(1)}; "
+        "same uid makes the whole containment boundary a no-op"
+    )
     assert "chown worklink:worklink /workspace/.worklink" in text, (
         "the contained identity must own its attempt checkouts, or builds break"
     )
@@ -99,8 +108,12 @@ def test_worklink_service_runs_as_the_contained_user() -> None:
     everything still works.
     """
     run = Path("deploy/s6-overlay/s6-rc.d/worklink/run").read_text()
-    assert "s6-setuidgid worklink" in run, "the service must drop to the worklink user"
-    assert "s6-setuidgid mimir" not in run, "must not run as the agent user"
+    assert "s6-setuidgid" not in run, (
+        "the service stays root and drops privilege per-step in the supervisor, so "
+        "that the identity reporting a build's verdict is not the identity being "
+        "reported on; a blanket drop here would undo that"
+    )
+    assert "mimir.worklink.supervisor" in run, "the service must run the supervisor"
 
 
 def test_worklink_service_is_gated_on_the_coding_flag() -> None:

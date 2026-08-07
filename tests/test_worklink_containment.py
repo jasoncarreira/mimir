@@ -1,196 +1,181 @@
-"""Worklink build steps must run as an identity that cannot write the agent home.
+"""Unit coverage for the Worklink containment policy and spool protocol.
 
-The property under test is not "a user exists" but "repository-controlled code
-cannot reach the agent home". These tests pin the parts of that which are
-decidable without a live broker; the end-to-end canary tests belong with the
-call-site integration.
+The adversarial canaries live in ``test_worklink_containment_canary.py``; this
+file covers the policy states, the spool's permission split, and the request /
+result round trip.
 """
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
 
+from mimir.worklink import supervisor
 from mimir.worklink.containment import (
-    containment_required,
     ContainmentPolicy,
     ContainmentUnavailable,
-    contained_argv,
+    WorkerRequest,
+    containment_required,
+    request_dir,
     resolve_containment,
+    result_dir,
+    spawn_argv,
 )
 
 
-def test_missing_broker_raises_rather_than_falling_back(tmp_path, monkeypatch):
-    """A missing broker is an error, never a licence to run uncontained.
-
-    Returning an "uncontained" policy here would let a caller treat it as a
-    fallback. Raising forces the decision to be explicit.
-    """
+@pytest.fixture
+def coding_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    launcher = tmp_path / "s6-setuidgid"
-    launcher.touch()
-    monkeypatch.setattr("shutil.which", lambda _name: str(launcher))
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(tmp_path / "absent.sock"))
-    with pytest.raises(ContainmentUnavailable, match="broker socket"):
-        resolve_containment()
 
 
-def test_missing_launcher_raises(tmp_path, monkeypatch):
-    """Without a privilege-dropping launcher the agent cannot contain anything.
-
-    The agent runs at CapEff=0, so it cannot switch uid itself; saying so in the
-    error is the difference between a fixable report and a mystery.
-    """
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    sock = tmp_path / "broker.sock"
-    sock.touch()
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
-    monkeypatch.setattr("shutil.which", lambda _name: None)
-    monkeypatch.setattr(Path, "exists", lambda self: self == sock)
-    with pytest.raises(ContainmentUnavailable, match="launcher"):
-        resolve_containment()
-
-
-def test_verified_policy_wraps_the_command(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    sock = tmp_path / "broker.sock"
-    sock.touch()
-    launcher = tmp_path / "s6-setuidgid"
-    launcher.touch()
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
-    monkeypatch.setattr("shutil.which", lambda _name: str(launcher))
-
-    policy = resolve_containment()
-    assert policy.verified is True
-    assert policy.override_reason is None
-    assert contained_argv(policy, ["pytest", "-q"])[:2] == (str(launcher), "worklink")
-    assert contained_argv(policy, ["pytest", "-q"])[-2:] == ("pytest", "-q")
-
-
-def test_override_is_recorded_as_a_bypass_not_a_verification(tmp_path, monkeypatch):
-    """`warned and continued` must never be indistinguishable from `verified`.
-
-    A single boolean would collapse the two. The policy carries both, and the
-    override records its reason so a log reader can tell which happened.
-    """
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(tmp_path / "absent.sock"))
-    policy = resolve_containment(allow_uncontained="operator: local development")
-
-    assert policy.verified is False
-    assert policy.override_reason == "operator: local development"
-    # and the command is NOT wrapped, at exactly one decision point
-    assert contained_argv(policy, ["pytest", "-q"]) == ("pytest", "-q")
-
-
-def test_contained_argv_refuses_an_empty_command():
-    policy = ContainmentPolicy(
-        user="worklink", broker_socket=Path("/x"), launcher=("s6", "worklink"),
-        verified=True,
-    )
-    with pytest.raises(ValueError, match="non-empty"):
-        contained_argv(policy, [])
-
-
-def test_the_contained_user_is_not_the_agent_user(tmp_path, monkeypatch):
-    """Containment means a DIFFERENT identity; the default must not be the agent.
-
-    A deployment that sets the contained user to the agent user has containment
-    in name only, and this is the cheapest place to notice.
-    """
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    sock = tmp_path / "broker.sock"; sock.touch()
-    launcher = tmp_path / "s6-setuidgid"; launcher.touch()
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
-    monkeypatch.setattr("shutil.which", lambda _name: str(launcher))
-
-    policy = resolve_containment()
-    import getpass
-    assert policy.user != getpass.getuser(), (
-        "the contained identity must differ from the agent's own user"
-    )
-
-
-def test_the_agent_cannot_drop_privilege_itself(tmp_path, monkeypatch):
-    """The premise the broker exists for, asserted rather than assumed.
-
-    An unprivileged agent cannot switch to a sibling uid: on the live deployment
-    `s6-setuidgid` as the agent user fails with "unable to set supplementary
-    group list: Operation not permitted". So the wrapped argv this module builds
-    must be SENT to the broker, never exec'd here. This test exists because the
-    first version of this module got that wrong, and the mocked tests passed
-    anyway because nothing was ever executed.
-    """
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    from mimir.worklink.containment import agent_can_drop_privilege
-
-    monkeypatch.setattr("os.getuid", lambda: 1000)
-    assert agent_can_drop_privilege() is False, (
-        "a non-root agent must not be assumed able to drop privilege; the "
-        "broker is what makes containment possible"
-    )
-    monkeypatch.setattr("os.getuid", lambda: 0)
-    assert agent_can_drop_privilege() is True
-
-
-def test_a_non_coding_deployment_needs_no_containment(monkeypatch):
-    """Containment is gated on MIMIR_CODING_ENABLED.
-
-    A deployment with no coding tools never runs a Worklink build, so there is
-    no repository-controlled code to contain. Failing closed there would block
-    on a risk that does not exist, and an operator would read that as the
-    feature being broken.
-    """
+def test_containment_is_not_required_without_the_coding_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment with no coding tools never runs a build."""
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     assert containment_required() is False
-
-    policy = resolve_containment()          # must NOT raise
+    policy = resolve_containment(spool_root=Path("/nonexistent"))
+    assert policy.state == "not_required"
+    assert policy.contained is False
     assert policy.not_required_reason is not None
-    assert policy.verified is False
-    assert policy.override_reason is None   # nothing was bypassed
-    assert contained_argv(policy, ["pytest", "-q"]) == ("pytest", "-q")
+    assert policy.override_reason is None
 
 
-def test_not_required_is_distinct_from_bypassed_and_from_verified(tmp_path, monkeypatch):
-    """Three states, not a boolean.
+def test_the_three_policy_states_stay_distinguishable(
+    tmp_path: Path, coding_enabled: None,
+) -> None:
+    """"Verified", "bypassed" and "not applicable" mean different things.
 
-    "verified", "operator bypassed it", and "no risk here" mean different things
-    to whoever reads the log. Collapsing them is how a bypass comes to look like
-    a pass.
+    Collapsing them into one boolean is how an operator bypass comes to look like
+    a passing verification in the log.
     """
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    absent = resolve_containment()
-
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-    bypassed = resolve_containment(allow_uncontained="operator: local dev")
-
-    sock = tmp_path / "b.sock"; sock.touch()
-    launcher = tmp_path / "s6-setuidgid"; launcher.touch()
-    monkeypatch.setenv("MIMIR_WORKLINK_BROKER_SOCKET", str(sock))
-    monkeypatch.setattr("shutil.which", lambda _n: str(launcher))
-    verified = resolve_containment()
-
-    states = {
-        (p.verified, p.override_reason is not None, p.not_required_reason is not None)
-        for p in (absent, bypassed, verified)
-    }
-    assert len(states) == 3, f"states must be distinguishable, got {states}"
+    supervisor.prepare_spool(tmp_path / "spool")
+    verified = resolve_containment(spool_root=tmp_path / "spool")
+    override = resolve_containment(
+        spool_root=tmp_path / "spool", allow_uncontained="operator ran it by hand",
+    )
+    assert verified.state == "verified"
+    assert override.state == "override"
+    assert len({verified.state, override.state}) == 2
+    assert override.verified is False, "an override must never read as verified"
 
 
-@pytest.mark.parametrize("raw", ["1", "true", "yes", "on", "y", "TRUE"])
-def test_coding_flag_truthy_spellings_match_access_control(monkeypatch, raw):
-    """Same variable and truthy set as access_control, which cannot be imported.
+def test_dispatch_fails_closed_when_the_spool_is_absent(coding_enabled: None) -> None:
+    """A missing supervisor is an error, not a licence to run uncontained."""
+    with pytest.raises(ContainmentUnavailable, match="does not exist"):
+        resolve_containment(spool_root=Path("/nonexistent/worklink-spool"))
 
-    config imports access_control, so importing it back would cycle. That makes
-    the duplication deliberate — and worth a test, because a silent divergence
-    would gate containment differently from the shell profiles.
+
+def test_dispatch_fails_closed_on_a_world_writable_spool(
+    tmp_path: Path, coding_enabled: None,
+) -> None:
+    """A world-writable spool lets the contained user forge its own verdict."""
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    result_dir(root).chmod(0o777)
+    with pytest.raises(ContainmentUnavailable, match="world-writable"):
+        resolve_containment(spool_root=root)
+
+
+def test_prepare_spool_denies_the_contained_user_write_access(tmp_path: Path) -> None:
+    """The permission split is the whole reason the root supervisor is worth it.
+
+    If ``worklink`` could write the request inbox it could rewrite its own
+    request; if it could write the result directory it could forge the verdict
+    that gates its own push.
     """
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", raw)
-    assert containment_required() is True
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    for path in (request_dir(root), result_dir(root)):
+        mode = path.stat().st_mode
+        assert not mode & stat.S_IWOTH, f"{path} is world-writable"
+        assert not mode & stat.S_IXOTH, f"{path} is world-traversable"
 
 
-@pytest.mark.parametrize("raw", ["0", "false", "no", "off", "", "maybe"])
-def test_coding_flag_falsey_spellings(monkeypatch, raw):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", raw)
-    assert containment_required() is False
+def test_spawn_argv_prefixes_the_privilege_drop_when_contained(tmp_path: Path) -> None:
+    """Only the supervisor execs this -- it runs as root and can drop privilege.
+
+    An earlier revision returned this prefix to the AGENT to exec, which fails
+    every time with `unable to set supplementary group list`. Its tests passed
+    only because they patched `shutil.which` and never executed anything.
+    """
+    policy = ContainmentPolicy(user="worklink", spool_root=tmp_path, verified=True)
+    argv = spawn_argv(policy, ("pytest", "-q"))
+    assert argv[-2:] == ("pytest", "-q")
+    assert "s6-setuidgid" in argv[0]
+    assert argv[1] == "worklink"
+
+
+def test_spawn_argv_does_not_drop_privilege_on_the_override_path(tmp_path: Path) -> None:
+    policy = ContainmentPolicy(
+        user="worklink", spool_root=tmp_path, verified=False, override_reason="manual",
+    )
+    assert spawn_argv(policy, ("pytest", "-q")) == ("pytest", "-q")
+
+
+def test_spawn_argv_rejects_an_empty_command(tmp_path: Path) -> None:
+    policy = ContainmentPolicy(user="worklink", spool_root=tmp_path, verified=True)
+    with pytest.raises(ValueError, match="non-empty"):
+        spawn_argv(policy, ())
+
+
+def test_request_round_trips_through_the_spool(tmp_path: Path) -> None:
+    """The real submit -> supervise -> result path, end to end."""
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    policy = ContainmentPolicy(user="worklink", spool_root=root, verified=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    from mimir.worklink.containment import await_result, submit_request
+
+    request_id = submit_request(
+        policy,
+        WorkerRequest(
+            attempt_id="round-trip",
+            argv=("sh", "-c", "echo out; echo err >&2; exit 7"),
+            cwd=checkout,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        ),
+    )
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
+
+    assert result.attempt_id == "round-trip"
+    assert result.exit_status == 7
+    assert result.ok is False
+    assert "out" in result.stdout
+    assert "err" in result.stderr
+
+
+def test_a_consumed_request_is_removed_from_the_inbox(tmp_path: Path) -> None:
+    """Otherwise the supervisor re-runs every build on every poll."""
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    policy = ContainmentPolicy(user="worklink", spool_root=root, verified=False)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    from mimir.worklink.containment import submit_request
+
+    submit_request(
+        policy,
+        WorkerRequest(attempt_id="once", argv=("true",), cwd=checkout, env={"PATH": "/usr/bin:/bin"}),
+    )
+    assert list(request_dir(root).glob("*.json"))
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    assert not list(request_dir(root).glob("*.json"))
+
+
+def test_await_result_fails_closed_when_no_supervisor_is_running(tmp_path: Path) -> None:
+    """A build whose result never arrives must not be read as a success."""
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    policy = ContainmentPolicy(user="worklink", spool_root=root, verified=False)
+    from mimir.worklink.containment import await_result
+
+    with pytest.raises(ContainmentUnavailable, match="published no result"):
+        await_result(policy, "never-submitted", timeout_seconds=0.2, poll_seconds=0.01)

@@ -88,9 +88,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
 | `MIMIR_CODING_ENABLED` | bool | `false` | Expose `spawn_open_code` to the agent. Enabling requires the `opencode` CLI on `PATH`; an unavailable CLI fails startup. |
-| `MIMIR_WORKLINK_USER` | string | `worklink` | OS user that Worklink builds run as. Must differ from the agent's user and must not be able to write the agent home: a build executes repository-controlled code, and `scheduler.yaml` and `skills/*/pollers.json` grant shell authority. Only consulted when `MIMIR_CODING_ENABLED` is set. |
-| `MIMIR_WORKLINK_BROKER_SOCKET` | path | `/run/worklink/broker.sock` | Where the containment layer expects the privilege-dropping broker. Present for deployments that supply their own; the shipped image contains builds with an s6 service instead, so this is normally unset. |
-| `MIMIR_WORKLINK_POLL_SECONDS` | int | `600` | Interval between Worklink ready-queue polls in the supervised service. The poller is a one-shot, so the service supplies the cadence. |
+| `MIMIR_WORKLINK_USER` | string | `worklink` | OS user that Worklink build steps run as. Must differ from the agent's user and must not be able to write the agent home: a build has a model generate code and then executes it, and `scheduler.yaml` and `skills/*/pollers.json` grant shell authority. The Worklink poller is **not** affected — it is the controller and stays at the agent identity. Only consulted when `MIMIR_CODING_ENABLED` is set. |
+| `MIMIR_WORKLINK_SPOOL` | path | `/run/worklink` | Where the controller publishes build-step requests and the root-supervised service publishes the results it observed. `requests/` is controller-writable and read-only to the contained user; `results/` is root-published and unreadable by it. Dispatch refuses to run if either is world-writable, since that would let a build forge the verdict gating its own push. |
 
 ## Concurrency, queue & timeouts
 

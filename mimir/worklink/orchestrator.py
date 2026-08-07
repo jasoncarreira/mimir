@@ -531,7 +531,12 @@ class WorklinkRunner:
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             started = datetime.now(UTC)
@@ -1002,7 +1007,12 @@ class WorklinkRunner:
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             spec = backend.work_spec(
@@ -1199,7 +1209,12 @@ class WorklinkRunner:
                 prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             return await self._run_detached_epic(

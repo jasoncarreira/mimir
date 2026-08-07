@@ -229,7 +229,16 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.specs[0].base_ref == "main"
     assert compute.specs[0].test_command == "echo ok"
     assert compute.specs[0].local_checkout == worktree
-    assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
+    # INVERTED by chainlink #1164. This used to assert MIMIR_HOME was projected
+    # into the build. A build has a model generate code and then executes it, and
+    # this variable is how that code would locate the agent home to append a
+    # shell_commands grant to scheduler.yaml. The work order reaches the build
+    # through ``prompt`` and its checkout instead, neither of which is under the
+    # home, so nothing legitimate needs it.
+    assert "MIMIR_HOME" not in compute.specs[0].env, (
+        "projecting MIMIR_HOME into a build hands generated code the path it "
+        "needs to grant itself shell authority"
+    )
     assert compute.cleaned == [LaunchHandle("fake_compute", "job-1")]
 
 

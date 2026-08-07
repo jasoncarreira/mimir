@@ -2,59 +2,114 @@
 
 Why this exists
 ---------------
-A Worklink build executes repository-controlled code. Until this module, every
-such step ran as the agent's own OS user, which can write ``<home>`` — including
-``scheduler.yaml`` and ``skills/*/pollers.json``, the files that grant shell
-authority. A build could append a ``shell_commands`` block granting itself any
-binary and the next scheduled tick would honour it.
+A Worklink build has a model generate code and then executes it, so what runs was
+reviewed by nobody. Until this module every such step ran as the agent's own OS
+user, which can write ``<home>`` -- including ``scheduler.yaml`` and
+``skills/*/pollers.json``, the files that grant shell authority. A bad generation
+could append a ``shell_commands`` block granting itself any binary, and the next
+scheduled tick would honour it.
 
-Containing only the build process is not enough. The evidence gate runs the
-configured test command against the worker-mutated checkout, and the controller
-then runs Git over that same checkout, so a planted test payload or ``.git`` hook
-regains agent-uid execution. Every step influenced by the checkout has to run
-contained, which is why this is a shared helper rather than a change inside one
-call site.
-
-Why a broker
+Threat model
 ------------
-The agent process runs with ``CapEff=0`` and cannot switch to a sibling uid --
-``setpriv --reuid`` returns ``Operation not permitted`` -- and unprivileged user
-namespaces are refused by the container's seccomp profile. So privilege must be
-dropped by something that already holds it. A root-supervised broker does that.
+Repository content is TRUSTED: Worklink only builds repositories the operator
+configured in ``repositories.yaml``. This module is not defending against a
+hostile ``.git/config`` or a malicious test payload planted in the tree. It is
+defending against the code the build GENERATES, and against the spec that drove
+it, which originates in issue text.
 
-The broker can ONLY drop privilege: it execs as the contained identity and
-nothing else, so a caller cannot ask it to run anything with more authority than
-the caller already had. That is what makes it safe to expose to the agent uid.
+The bar is "strictly better than today", not perfect. Today the build runs as
+the agent uid with the entire home writable.
 
-Fail closed
------------
-An autonomous dispatch whose containment cannot be established does not run.
-"Warned and continued" and "verified" must never look alike in the logs, so the
-override path is a distinct, explicitly logged decision rather than a fallback.
+What runs where
+---------------
+The controller (poller and orchestrator) stays at the agent identity: it needs
+``MIMIR_HOME`` for ``worklink.yaml``, lease state and the Chainlink claim locks,
+and it holds the GitHub push credential. Only the three steps that execute
+generated code are contained -- the build, the evidence gate's test command, and
+local Git over the checkout.
+
+Why a spool, and why the supervisor stays root
+----------------------------------------------
+The agent cannot drop privilege: ``CapEff=0``, ``setpriv --reuid`` returns
+``Operation not permitted``, unprivileged user namespaces are refused by the
+seccomp profile, and ``s6-setuidgid`` run as the agent fails with ``unable to set
+supplementary group list``. Something already privileged must do it, and s6 is
+PID 1 as root.
+
+So a root-supervised service takes requests from a spool, spawns each as
+``worklink``, and publishes what it OBSERVED -- the exit status of the process it
+spawned and the commit OID it read afterwards. The supervisor stays root rather
+than running as ``worklink`` so that the thing reporting "this build succeeded,
+at this commit" is not the same identity as the thing being reported on. That
+costs one line of service definition, not a second user.
+
+Spool permissions are where this boundary is silently lost, so they are asserted
+rather than assumed:
+
+    requests/   controller-writable, worklink READ-ONLY
+    results/    root-published, worklink NO ACCESS
+
+If ``worklink`` could write ``requests/`` it could rewrite its own request; if it
+could write ``results/`` it could forge the verdict that gates its own push. Both
+would make the root supervisor buy nothing.
+
+Deliberately NOT built (see chainlink #1164): request schema validation, replay
+handling, ``O_NOFOLLOW``, cancellation, per-attempt principals, or mediated
+provider access. Each defends against a hostile payload or a second trust domain,
+neither of which is in scope, and each costs more to maintain than it returns.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
-from dataclasses import dataclass
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
     "ContainmentUnavailable",
-    "containment_required",
     "ContainmentPolicy",
-    "contained_argv",
+    "WorkerRequest",
+    "WorkerResult",
+    "containment_required",
     "resolve_containment",
+    "submit_request",
+    "await_result",
+    "run_contained",
+    "spawn_argv",
+    "request_dir",
+    "result_dir",
 ]
 
-#: Socket the root-supervised broker listens on. Root-owned; the agent uid may
-#: connect but cannot replace it.
-DEFAULT_BROKER_SOCKET = Path("/run/worklink/broker.sock")
+#: Spool root. Outside the agent home on purpose -- the worker must hold no path
+#: under it. On tmpfs, so a request in flight does not survive a restart; a build
+#: killed by a restart is re-claimed by the controller, which is the correct
+#: outcome anyway.
+DEFAULT_SPOOL_ROOT = Path("/run/worklink")
 
-#: The identity build steps run as. Distinct from the agent user, and created by
-#: the shipped image with no write access to the agent home.
+#: The identity build steps run as. Created by the shipped image with a uid
+#: distinct from the agent's.
 DEFAULT_CONTAINED_USER = "worklink"
+
+#: Where s6 puts its tools in the shipped image, used when ``s6-setuidgid`` is
+#: not on PATH (the supervisor runs with a minimal environment).
+_S6_SETUIDGID_FALLBACK = "/package/admin/s6/command/s6-setuidgid"
+
+#: Environment variables never projected into a contained step. ``MIMIR_HOME`` is
+#: the point of the exercise; the GitHub credentials stay controller-side because
+#: push and PR are controller-side operations and the worker has no use for them.
+_NEVER_PROJECTED = frozenset(
+    {
+        "MIMIR_HOME",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+    },
+)
 
 
 class ContainmentUnavailable(RuntimeError):
@@ -70,8 +125,7 @@ class ContainmentPolicy:
     """How build steps are contained, resolved once per dispatch."""
 
     user: str
-    broker_socket: Path
-    launcher: tuple[str, ...]
+    spool_root: Path
     #: True only when every requirement was verified, never when merely assumed.
     verified: bool
     #: Set when the operator explicitly accepted running uncontained. Distinct
@@ -79,20 +133,122 @@ class ContainmentPolicy:
     override_reason: str | None = None
     #: Set when this deployment runs no coding tools, so there is nothing to
     #: contain. A THIRD state on purpose: "verified", "bypassed" and "not
-    #: applicable" have different meanings to anyone reading a log, and
-    #: collapsing them into one boolean is how a bypass comes to look like a
-    #: pass.
+    #: applicable" mean different things to whoever reads a log, and collapsing
+    #: them into one boolean is how a bypass comes to look like a pass.
     not_required_reason: str | None = None
+
+    @property
+    def contained(self) -> bool:
+        """Whether steps actually run under the contained identity."""
+        return self.verified
+
+    @property
+    def state(self) -> str:
+        """The single word to put in an event. Never derived from a boolean."""
+        if self.not_required_reason is not None:
+            return "not_required"
+        if self.override_reason is not None:
+            return "override"
+        return "verified" if self.verified else "unavailable"
+
+
+@dataclass(frozen=True)
+class WorkerRequest:
+    """One step to run under the contained identity.
+
+    ``cwd`` is always an attempt checkout. ``env`` is the FULL environment for
+    the step: it is not merged with the controller's, so a home path cannot leak
+    in by inheritance.
+    """
+
+    attempt_id: str
+    argv: tuple[str, ...]
+    cwd: Path
+    env: dict[str, str] = field(default_factory=dict)
+    timeout_seconds: float | None = None
+    #: Read the checkout's HEAD after the step and report it. The controller
+    #: pushes THAT oid rather than re-reading HEAD later, so a descendant
+    #: surviving past the verdict cannot ride along.
+    report_head: bool = False
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "attempt_id": self.attempt_id,
+            "argv": list(self.argv),
+            "cwd": str(self.cwd),
+            "env": dict(self.env),
+            "timeout_seconds": self.timeout_seconds,
+            "report_head": self.report_head,
+        }
+
+    @classmethod
+    def from_json(cls, raw: dict[str, object]) -> WorkerRequest:
+        return cls(
+            attempt_id=str(raw["attempt_id"]),
+            argv=tuple(str(a) for a in raw["argv"]),  # type: ignore[union-attr]
+            cwd=Path(str(raw["cwd"])),
+            env={str(k): str(v) for k, v in dict(raw.get("env") or {}).items()},
+            timeout_seconds=(
+                float(raw["timeout_seconds"])  # type: ignore[arg-type]
+                if raw.get("timeout_seconds") is not None
+                else None
+            ),
+            report_head=bool(raw.get("report_head")),
+        )
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    """What the SUPERVISOR observed. Never what the step reported about itself."""
+
+    attempt_id: str
+    exit_status: int
+    stdout: str
+    stderr: str
+    #: The commit the supervisor read from the checkout after the step, when
+    #: asked. The controller pushes this exact oid.
+    head_oid: str | None = None
+    timed_out: bool = False
+    #: Events the step's wrapper reported, appended BY THE CONTROLLER. The worker
+    #: never writes the event log: POSIX write permission is not append-only, so
+    #: a buggy build could truncate the record of what it did.
+    events: tuple[dict[str, object], ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_status == 0 and not self.timed_out
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "attempt_id": self.attempt_id,
+            "exit_status": self.exit_status,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "head_oid": self.head_oid,
+            "timed_out": self.timed_out,
+            "events": list(self.events),
+        }
+
+    @classmethod
+    def from_json(cls, raw: dict[str, object]) -> WorkerResult:
+        return cls(
+            attempt_id=str(raw["attempt_id"]),
+            exit_status=int(raw["exit_status"]),  # type: ignore[arg-type]
+            stdout=str(raw.get("stdout") or ""),
+            stderr=str(raw.get("stderr") or ""),
+            head_oid=(str(raw["head_oid"]) if raw.get("head_oid") else None),
+            timed_out=bool(raw.get("timed_out")),
+            events=tuple(dict(e) for e in (raw.get("events") or [])),  # type: ignore[arg-type]
+        )
 
 
 def containment_required() -> bool:
     """Whether this deployment needs Worklink containment at all.
 
     Gated on ``MIMIR_CODING_ENABLED``. A deployment that exposes no coding tools
-    never runs a Worklink build, so there is no repository-controlled code to
-    contain and no service to supervise. Requiring the broker there would fail
-    closed on a risk that does not exist, and an operator would reasonably read
-    that as the feature being broken.
+    never runs a Worklink build, so there is no generated code to contain and no
+    service to supervise. Failing closed there would block on a risk that does
+    not exist, and an operator would reasonably read that as a broken feature.
 
     Deliberately reads the same variable and truthy set as
     ``access_control._service_shell_coding_enabled`` rather than importing it,
@@ -102,33 +258,61 @@ def containment_required() -> bool:
     return bool(raw and raw.strip().lower() in {"1", "true", "yes", "on", "y"})
 
 
-def _looks_like_agent_home(path: Path) -> Path | None:
-    """Return the agent home if one is configured, else ``None``."""
-    raw = os.environ.get("MIMIR_HOME", "").strip()
-    if not raw:
-        return None
-    try:
-        return Path(raw).expanduser().resolve()
-    except OSError:
-        return None
+def request_dir(spool_root: Path) -> Path:
+    """Controller-writable, worker read-only."""
+    return spool_root / "requests"
+
+
+def result_dir(spool_root: Path) -> Path:
+    """Root-published, worker no access."""
+    return spool_root / "results"
+
+
+def spawn_argv(policy: ContainmentPolicy, argv: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """The argv the SUPERVISOR execs. Only valid in the supervisor, which is root.
+
+    Verified on the live deployment -- the agent cannot exec this itself::
+
+        as mimir:  s6-applyuidgid: fatal: unable to set supplementary group
+                   list: Operation not permitted
+        as root:   1002
+
+    An earlier revision of this module returned this prefix to the AGENT to exec,
+    which fails every time. Its tests passed only because they patched
+    ``shutil.which`` and never executed anything.
+    """
+    parts = tuple(str(a) for a in argv)
+    if not parts:
+        raise ValueError("spawn_argv requires a non-empty command")
+    if not policy.contained:
+        return parts
+    launcher = shutil.which("s6-setuidgid") or _S6_SETUIDGID_FALLBACK
+    return (launcher, policy.user, *parts)
+
+
+def _spool_is_writable_by_other(path: Path) -> bool:
+    """Whether a non-owner, non-group identity could write ``path``.
+
+    The contained user is neither the owner nor in the owning group of either
+    spool directory, so "other" is the bit that decides whether it can write.
+    """
+    return bool(path.stat().st_mode & 0o002)
 
 
 def resolve_containment(
     *,
     user: str | None = None,
-    broker_socket: Path | None = None,
+    spool_root: Path | None = None,
     allow_uncontained: str | None = None,
 ) -> ContainmentPolicy:
     """Resolve and VERIFY the containment policy, or raise.
 
     ``allow_uncontained`` is an operator override carrying its own reason. It is
-    never inferred: a missing broker is an error, not a licence to proceed.
+    never inferred: a missing spool is an error, not a licence to proceed.
     """
-    contained_user = user or os.environ.get(
-        "MIMIR_WORKLINK_USER", DEFAULT_CONTAINED_USER,
-    )
-    socket_path = broker_socket or Path(
-        os.environ.get("MIMIR_WORKLINK_BROKER_SOCKET", str(DEFAULT_BROKER_SOCKET)),
+    contained_user = user or os.environ.get("MIMIR_WORKLINK_USER", DEFAULT_CONTAINED_USER)
+    root = spool_root or Path(
+        os.environ.get("MIMIR_WORKLINK_SPOOL", str(DEFAULT_SPOOL_ROOT)),
     )
 
     if not containment_required():
@@ -136,78 +320,157 @@ def resolve_containment(
         # override: nothing was bypassed, the risk is absent.
         return ContainmentPolicy(
             user=contained_user,
-            broker_socket=socket_path,
-            launcher=(),
+            spool_root=root,
             verified=False,
             not_required_reason="MIMIR_CODING_ENABLED is not set",
         )
 
     if allow_uncontained:
-        # An acknowledged bypass. Recorded as such so a log reader can tell it
-        # apart from a passing verification -- the distinction the review asked
-        # for, and the reason this is not simply a boolean.
+        # An acknowledged bypass, recorded as such so a log reader can tell it
+        # apart from a passing verification.
         return ContainmentPolicy(
             user=contained_user,
-            broker_socket=socket_path,
-            launcher=(),
+            spool_root=root,
             verified=False,
             override_reason=allow_uncontained,
         )
 
-    launcher = shutil.which("s6-setuidgid") or "/package/admin/s6/command/s6-setuidgid"
-    if not Path(launcher).exists():
-        raise ContainmentUnavailable(
-            f"no privilege-dropping launcher found (looked for {launcher!r}); "
-            "the agent process cannot switch uid on its own (CapEff=0), so a "
-            "build cannot be contained on this deployment",
+    requests = request_dir(root)
+    results = result_dir(root)
+    for path, role in ((requests, "request inbox"), (results, "result directory")):
+        if not path.is_dir():
+            raise ContainmentUnavailable(
+                f"the worklink {role} {path} does not exist; the root-supervised "
+                "worklink service creates it at start, and without it a build "
+                "would have to run as the agent user",
+            )
+    # A world-writable spool hands the contained user the ability to rewrite its
+    # own request or forge the supervisor's verdict, which makes the root
+    # supervisor pointless. Refuse rather than run in a state that only looks
+    # contained.
+    for path, role in ((requests, "request inbox"), (results, "result directory")):
+        if _spool_is_writable_by_other(path):
+            raise ContainmentUnavailable(
+                f"the worklink {role} {path} is world-writable, so the contained "
+                "user could rewrite its own request or forge its own result; "
+                "refusing to dispatch",
+            )
+    return ContainmentPolicy(user=contained_user, spool_root=root, verified=True)
+
+
+def submit_request(policy: ContainmentPolicy, request: WorkerRequest) -> str:
+    """Publish a request atomically and return its id.
+
+    Written to a temporary name in the same directory and then ``rename``d, so
+    the supervisor never observes a half-written request. Atomicity is the ONE
+    protocol property worth paying for here; schema validation and replay
+    handling are not (the requester is the controller, not a hostile party).
+    """
+    for name in _NEVER_PROJECTED:
+        if name in request.env:
+            raise ValueError(
+                f"{name} must never be projected into a contained step; push and "
+                "PR are controller-side operations",
+            )
+    requests = request_dir(policy.spool_root)
+    request_id = f"{request.attempt_id}-{uuid.uuid4().hex[:12]}"
+    payload = json.dumps({"request_id": request_id, **request.to_json()})
+    tmp = requests / f".{request_id}.tmp"
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.rename(requests / f"{request_id}.json")
+    return request_id
+
+
+def await_result(
+    policy: ContainmentPolicy,
+    request_id: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 0.05,
+) -> WorkerResult:
+    """Block until the supervisor publishes this request's result."""
+    path = result_dir(policy.spool_root) / f"{request_id}.json"
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if path.exists():
+            return WorkerResult.from_json(json.loads(path.read_text(encoding="utf-8")))
+        if time.monotonic() >= deadline:
+            raise ContainmentUnavailable(
+                f"the worklink supervisor published no result for {request_id} "
+                f"within {timeout_seconds}s; the service may not be running",
+            )
+        time.sleep(poll_seconds)
+
+
+def run_contained(
+    policy: ContainmentPolicy,
+    request: WorkerRequest,
+    *,
+    wait_seconds: float | None = None,
+) -> WorkerResult:
+    """Run one step under the contained identity and return what was observed.
+
+    The single entry point used by the build backend, the evidence gate and the
+    local Git steps -- one call site per surface, so a future surface cannot
+    quietly skip containment by constructing its own subprocess.
+    """
+    if not policy.contained:
+        # An override or a deployment with nothing to contain. Run in-process,
+        # and let the caller's event record carry ``policy.state`` so this is
+        # never mistaken for a verified run.
+        return _run_uncontained(request)
+    request_id = submit_request(policy, request)
+    budget = wait_seconds if wait_seconds is not None else (request.timeout_seconds or 3600) + 60
+    return await_result(policy, request_id, timeout_seconds=budget)
+
+
+def _run_uncontained(request: WorkerRequest) -> WorkerResult:
+    """The override path. Same observation discipline, no privilege drop."""
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv is controller-constructed
+            list(request.argv),
+            cwd=str(request.cwd),
+            env=dict(request.env),
+            capture_output=True,
+            text=True,
+            timeout=request.timeout_seconds,
+            check=False,
         )
-    if not socket_path.exists():
-        raise ContainmentUnavailable(
-            f"the worklink broker socket {socket_path} does not exist; the "
-            "root-supervised broker is what drops privilege, and without it a "
-            "build would run as the agent user",
+    except subprocess.TimeoutExpired:
+        return WorkerResult(
+            attempt_id=request.attempt_id,
+            exit_status=124,
+            stdout="",
+            stderr=f"timed out after {request.timeout_seconds}s",
+            timed_out=True,
         )
-    return ContainmentPolicy(
-        user=contained_user,
-        broker_socket=socket_path,
-        launcher=(launcher, contained_user),
-        verified=True,
+    return WorkerResult(
+        attempt_id=request.attempt_id,
+        exit_status=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        head_oid=observe_head(request.cwd) if request.report_head else None,
     )
 
 
-def contained_argv(
-    policy: ContainmentPolicy, command: tuple[str, ...] | list[str],
-) -> tuple[str, ...]:
-    """Return the argv to hand the BROKER, not one for this process to exec.
+def observe_head(checkout: Path) -> str | None:
+    """Read the checkout's HEAD.
 
-    The agent process cannot drop privilege itself. Verified on the live
-    deployment::
-
-        as mimir:  s6-applyuidgid: fatal: unable to set supplementary group
-                   list: Operation not permitted
-        as root:   1002
-
-    so prefixing ``s6-setuidgid worklink`` and exec'ing it here would fail every
-    time. The privilege drop happens inside the broker, which already runs as
-    root; this function only assembles the request. Callers must send the result
-    to the broker rather than spawning it.
-    """
-    argv = tuple(str(part) for part in command)
-    if not argv:
-        raise ValueError("contained_argv requires a non-empty command")
-    if policy.override_reason is not None or policy.not_required_reason is not None:
-        return argv
-    return (*policy.launcher, *argv)
-
-
-def agent_can_drop_privilege() -> bool:
-    """True only if THIS process could switch uid on its own.
-
-    Exists so the impossibility is asserted rather than assumed. It is false on
-    the shipped deployment, which is the whole reason a broker is required; a
-    deployment where it is true has a different and larger problem.
+    Called by whoever is OBSERVING the step (the supervisor, or this module on
+    the override path) -- never by the step itself. The controller pushes this
+    exact oid, so a process surviving past the verdict cannot change what gets
+    pushed by mutating the checkout afterwards.
     """
     try:
-        return os.getuid() == 0
-    except AttributeError:  # pragma: no cover - non-POSIX
-        return False
+        proc = subprocess.run(  # noqa: S603
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(checkout),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    oid = proc.stdout.strip()
+    return oid if proc.returncode == 0 and oid else None

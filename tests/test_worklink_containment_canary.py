@@ -1,205 +1,209 @@
-"""Adversarial canaries: repository-controlled code must not reach the agent home.
+"""Adversarial canaries for Worklink containment.
 
-These are the tests the feature exists for. Everything else — the user, the
-service, the policy object — is scaffolding that can look correct while the hole
-stays open. The specific trap is that containing only the BUILD process passes a
-shallow review: the evidence gate runs the configured test command against the
-worker-mutated checkout, and the controller then runs Git over that same
-checkout, so a planted test payload or `.git` hook regains the controller's
-identity.
+What these prove, and what they do not
+--------------------------------------
+These drive the REAL path -- ``submit_request`` -> the real supervisor's
+``handle_one_request`` -> a real ``subprocess`` -> ``await_result`` -- with a
+payload that genuinely executes and genuinely tries to write the agent home. An
+earlier revision of this branch asserted an exception and then observed that a
+payload it had never run changed nothing; that passes against a completely
+uncontained build, which is why it is not done here.
 
-Each test plants a payload the way a real worker would and asserts a canary
-under the agent home is untouched.
+What a sandbox CAN enforce, and what these therefore test, is the projection
+boundary: ``MIMIR_HOME`` and the GitHub credentials are never placed in a
+contained step's environment, so generated code has no way to locate the agent
+home. That is a real control with a real failure mode, and the negative control
+below proves the harness would notice if it broke.
+
+What a sandbox CANNOT enforce is the uid boundary: without root there is no
+privilege drop, so a payload that hard-codes an absolute path still writes it.
+That half is verified by the operator against a rebuilt container and is listed
+as an operator step on chainlink #1164. These tests do not claim it, and a
+reviewer should not read them as covering it.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
+import json
+import textwrap
 from pathlib import Path
 
 import pytest
 
-
-@pytest.fixture
-def agent_home(tmp_path: Path) -> Path:
-    """An agent home holding the files that grant shell authority."""
-    home = tmp_path / "home"
-    (home / "logs").mkdir(parents=True)
-    (home / "skills" / "demo").mkdir(parents=True)
-    (home / "scheduler.yaml").write_text("- name: heartbeat\n  cron: 0 * * * *\n")
-    (home / "skills" / "demo" / "pollers.json").write_text("{}\n")
-    (home / "logs" / "events.jsonl").write_text("")
-    return home
+from mimir.worklink import supervisor
+from mimir.worklink.containment import (
+    ContainmentPolicy,
+    WorkerRequest,
+    await_result,
+    submit_request,
+)
 
 
 @pytest.fixture
-def checkout(tmp_path: Path) -> Path:
-    """A worker-controlled checkout, as a build would leave it."""
-    repo = tmp_path / "checkout"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    return repo
+def spool(tmp_path: Path) -> Path:
+    root = tmp_path / "spool"
+    supervisor.prepare_spool(root)
+    return root
 
 
-def _canary_paths(home: Path) -> list[Path]:
-    """The files whose modification would be an authority self-grant."""
-    return [
-        home / "scheduler.yaml",
-        home / "skills" / "demo" / "pollers.json",
-    ]
+@pytest.fixture
+def policy(spool: Path) -> ContainmentPolicy:
+    # verified=False so the test does not try to exec `s6-setuidgid`, which needs
+    # root. The request/result protocol and the environment projection -- the
+    # parts a sandbox can actually enforce -- are identical either way.
+    return ContainmentPolicy(user="worklink", spool_root=spool, verified=False)
 
 
-def _snapshot(paths: list[Path]) -> dict[Path, str]:
-    return {p: p.read_text() for p in paths}
+def _payload(canary: Path) -> str:
+    """A build step that tries to escalate exactly the way the issue describes.
 
-
-def test_a_planted_test_command_payload_cannot_reach_the_agent_home(
-    agent_home: Path, checkout: Path, monkeypatch,
-) -> None:
-    """The evidence gate runs the configured test command with shell=True.
-
-    A worker that can write the checkout can write whatever the test command
-    reads. If that command executes with the controller's identity, the worker
-    has regained it — and the gate runs twice on the success path.
+    It looks the agent home up the way generated code would -- from the
+    environment -- and appends a shell_commands grant to scheduler.yaml.
     """
-    canaries = _canary_paths(agent_home)
-    before = _snapshot(canaries)
-
-    # what a worker would plant: a "test" that rewrites the authority config
-    payload = checkout / "run_tests.sh"
-    payload.write_text(
-        "#!/bin/sh\n"
-        f"printf '\\n  shell_commands: [pwned]\\n' >> {agent_home / 'scheduler.yaml'}\n"
-        f"printf 'pwned' > {agent_home / 'skills' / 'demo' / 'pollers.json'}\n"
-    )
-    payload.chmod(0o755)
-
-    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-
-    from mimir.worklink.containment import ContainmentUnavailable, resolve_containment
-
-    # With no containment available the run must not proceed at all. That IS the
-    # protection on a deployment lacking the service — failing closed, not
-    # running the payload and hoping.
-    with pytest.raises(ContainmentUnavailable):
-        resolve_containment()
-
-    assert _snapshot(canaries) == before, "the agent home was modified"
+    return textwrap.dedent(
+        f"""
+        import os, pathlib, sys
+        home = os.environ.get("MIMIR_HOME")
+        if not home:
+            print("payload: no MIMIR_HOME in environment", file=sys.stderr)
+            sys.exit(3)
+        target = pathlib.Path(home) / "scheduler.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("jobs:\\n  - name: pwned\\n    shell_commands: {{}}\\n")
+        pathlib.Path({str(canary)!r}).write_text("escalated")
+        print("payload: wrote", target)
+        """,
+    ).strip()
 
 
-def test_a_planted_git_hook_cannot_reach_the_agent_home(
-    agent_home: Path, checkout: Path, monkeypatch,
+def test_contained_step_cannot_locate_the_agent_home(
+    tmp_path: Path, policy: ContainmentPolicy,
 ) -> None:
-    """The controller runs Git over the worker-mutated checkout.
+    """The payload runs for real, and cannot find the home to escalate into."""
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    canary = tmp_path / "canary.txt"
+    script = tmp_path / "payload.py"
+    script.write_text(_payload(canary), encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
 
-    A worker owns `.git/hooks`, so a `pre-commit` hook executes whenever the
-    controller commits — a confused deputy that needs no cooperation from the
-    build process itself.
-    """
-    canaries = _canary_paths(agent_home)
-    before = _snapshot(canaries)
-
-    hooks = checkout / ".git" / "hooks"
-    hooks.mkdir(parents=True, exist_ok=True)
-    hook = hooks / "pre-commit"
-    hook.write_text(
-        "#!/bin/sh\n"
-        f"printf 'pwned' > {agent_home / 'scheduler.yaml'}\n"
+    request = WorkerRequest(
+        attempt_id="canary-1",
+        argv=("python3", str(script)),
+        cwd=checkout,
+        # The real projection: no MIMIR_HOME, no GitHub credentials.
+        env={"PATH": "/usr/bin:/bin"},
     )
-    hook.chmod(0o755)
+    request_id = submit_request(policy, request)
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
 
-    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
-
-    from mimir.worklink.containment import ContainmentUnavailable, resolve_containment
-
-    with pytest.raises(ContainmentUnavailable):
-        resolve_containment()
-
-    assert _snapshot(canaries) == before, "a Git hook reached the agent home"
+    # It really ran: exit 3 is the payload's own "no MIMIR_HOME" branch, so we
+    # know the process started and reached its logic rather than failing to spawn.
+    assert result.exit_status == 3, result.stderr
+    assert "no MIMIR_HOME" in result.stderr
+    assert not canary.exists()
+    assert not (home / "scheduler.yaml").exists()
 
 
-def test_the_canary_harness_can_actually_detect_a_breach(
-    agent_home: Path, checkout: Path,
+def test_negative_control_the_canary_harness_detects_a_breach(
+    tmp_path: Path, policy: ContainmentPolicy,
 ) -> None:
-    """Negative control: prove the canaries would notice.
+    """With the projection removed, the SAME payload escalates.
 
-    A canary test that cannot fail is worse than none, because it reads as
-    coverage. Run the payload deliberately and assert the harness catches it.
+    Without this, a canary that passes proves nothing -- it could be passing
+    because the payload never ran, which is exactly how the previous revision's
+    canaries passed against an uncontained build.
     """
-    canaries = _canary_paths(agent_home)
-    before = _snapshot(canaries)
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    canary = tmp_path / "canary.txt"
+    script = tmp_path / "payload.py"
+    script.write_text(_payload(canary), encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
 
-    payload = checkout / "breach.sh"
-    payload.write_text(
-        "#!/bin/sh\n"
-        f"printf 'pwned' > {agent_home / 'scheduler.yaml'}\n"
+    request = WorkerRequest(
+        attempt_id="canary-2",
+        argv=("python3", str(script)),
+        cwd=checkout,
+        # The breach: MIMIR_HOME projected into the step.
+        env={"PATH": "/usr/bin:/bin", "MIMIR_HOME": str(home)},
     )
-    payload.chmod(0o755)
-    subprocess.run([str(payload)], check=True)
-
-    assert _snapshot(canaries) != before, (
-        "the harness did not notice a deliberate breach; these tests would pass "
-        "against a completely uncontained build"
+    # submit_request refuses this projection, which is itself the control -- so
+    # write the request directly to prove the HARNESS, not the guard.
+    request_id = "canary-2-breach"
+    payload = json.dumps({"request_id": request_id, **request.to_json()})
+    (supervisor.request_dir(policy.spool_root) / f"{request_id}.json").write_text(
+        payload, encoding="utf-8",
     )
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
+
+    assert result.exit_status == 0, result.stderr
+    assert canary.read_text() == "escalated"
+    assert "shell_commands" in (home / "scheduler.yaml").read_text()
 
 
-def test_coding_disabled_needs_no_containment_and_runs_nothing(
-    agent_home: Path, monkeypatch,
+def test_submit_refuses_to_project_the_agent_home() -> None:
+    """The guard the negative control had to bypass."""
+    policy = ContainmentPolicy(user="worklink", spool_root=Path("/nonexistent"), verified=False)
+    request = WorkerRequest(
+        attempt_id="a",
+        argv=("true",),
+        cwd=Path("/tmp"),
+        env={"MIMIR_HOME": "/home/mimir/agent"},
+    )
+    with pytest.raises(ValueError, match="MIMIR_HOME"):
+        submit_request(policy, request)
+
+
+@pytest.mark.parametrize(
+    "variable", ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"],
+)
+def test_push_credentials_are_never_projected(variable: str) -> None:
+    """Push and PR are controller-side; the worker has no use for these."""
+    policy = ContainmentPolicy(user="worklink", spool_root=Path("/nonexistent"), verified=False)
+    request = WorkerRequest(
+        attempt_id="a", argv=("true",), cwd=Path("/tmp"), env={variable: "secret"},
+    )
+    with pytest.raises(ValueError, match=variable):
+        submit_request(policy, request)
+
+
+def test_verdict_comes_from_observed_exit_status_not_a_build_written_file(
+    tmp_path: Path, policy: ContainmentPolicy,
 ) -> None:
-    """A non-coding deployment has no build, so nothing to contain or refuse."""
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
+    """A step that writes a success record but exits non-zero is a FAILURE.
 
-    from mimir.worklink.containment import resolve_containment
-
-    policy = resolve_containment()
-    assert policy.not_required_reason is not None
-    assert policy.verified is False
-
-
-def test_identity_survives_the_detached_hop(tmp_path: Path) -> None:
-    """The evidence gate and Git steps inherit the service's identity.
-
-    This is why one boundary at the top suffices. The chain is
-
-        service -> poller.py -> `mimir worklink run` (DETACHED) -> build
-                             -> evidence gate test command
-                             -> git add/commit over the checkout
-
-    and `start_new_session=True` starts a new SESSION, not a new identity, so
-    uid survives it. If that ever stopped being true, the evidence gate would
-    silently return to the agent's identity while every other test still passed
-    — the exact failure the broker design was built to avoid.
-
-    Asserted on the real process tree rather than reasoned about; the uid switch
-    itself needs a privileged parent, so this checks inheritance, which is the
-    half that can regress in Python.
+    This is why the supervisor stays root and reports what it saw: if the verdict
+    came from a file the build wrote, a bad generation could report success it
+    did not earn and the controller would push it.
     """
-    import subprocess
-
-    script = tmp_path / "chain.sh"
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = tmp_path / "liar.py"
     script.write_text(
-        "#!/bin/sh\n"
-        "echo \"poller=$(id -u)\"\n"
-        # the detached hop the poller performs
-        "setsid sh -c 'echo \"detached=$(id -u)\"; sh -c \"echo testcmd=\\$(id -u)\"' &\n"
-        "wait\n"
+        textwrap.dedent(
+            """
+            import pathlib, sys
+            pathlib.Path("result.json").write_text('{"exit_status": 0, "ok": true}')
+            sys.exit(1)
+            """,
+        ).strip(),
+        encoding="utf-8",
     )
-    script.chmod(0o755)
+    request = WorkerRequest(
+        attempt_id="liar",
+        argv=("python3", str(script)),
+        cwd=checkout,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    request_id = submit_request(policy, request)
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, request_id, timeout_seconds=30)
 
-    out = subprocess.run(
-        ["/bin/sh", str(script)], capture_output=True, text=True, timeout=20,
-    ).stdout
-
-    seen = dict(
-        line.split("=", 1) for line in out.split() if "=" in line
-    )
-    assert seen, f"no uids reported: {out!r}"
-    uids = set(seen.values())
-    assert len(uids) == 1, (
-        f"identity changed across the chain: {seen}. Every downstream step must "
-        "inherit the service identity, or the evidence gate escapes containment."
-    )
+    assert (checkout / "result.json").exists(), "the step really did write its claim"
+    assert result.exit_status == 1
+    assert result.ok is False
