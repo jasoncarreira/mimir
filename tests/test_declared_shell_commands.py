@@ -196,13 +196,20 @@ class TestDeclarationShape:
             )
 
     def test_the_pinned_path_is_what_executes(self) -> None:
-        """A declaration is a pin: PATH never selects the binary."""
+        """A declaration is a pin: PATH never selects the binary.
+
+        Compared against the RESOLVED path, because the declaration resolves
+        symlinks before pinning — the writable-root check would otherwise be
+        defeated by a link. On Linux ``/bin`` is a symlink to ``/usr/bin``, so a
+        hardcoded ``/bin/echo`` passes on macOS and fails in CI.
+        """
         declared = parse_declared_shell_commands([_gog()], writable_roots=())
         argv = parse_service_shell_argv(
             "gog gmail search x", "maintenance", declared=declared,
         )
         assert argv is not None
-        assert argv[0] == "/bin/echo"
+        assert argv[0] == str(Path("/bin/echo").resolve())
+        assert Path(argv[0]).is_absolute()
 
     def test_absent_declaration_is_a_no_op(self) -> None:
         assert parse_declared_shell_commands(None, writable_roots=()) == ()
