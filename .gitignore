@@ -90,3 +90,8 @@ evals/**/pilot_output/
 # declaration and is unaffected: the trailing slash matches directories only.
 .factory/
 .factory-sandboxes/
+
+# Agent-written memory. These mutate while a run works, and a tracked file changing
+# mid-run dirties the worktree, which the factory refuses to observe -- that is how
+# run 1396 wedged. They stay on disk; they simply are not version-controlled.
+.opencode/memory/
