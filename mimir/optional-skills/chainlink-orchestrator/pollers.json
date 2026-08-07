@@ -8,8 +8,19 @@
       "authority": {
         "profile": "github",
         "tier": "code-execution",
-        "capabilities": ["worklink_run", "write_file", "edit_file", "shell_exec", "bash_jobs_list", "bash_job_output", "send_message", "operator_alert"],
-        "scoped_roots": ["state"]
+        "capabilities": [
+          "worklink_run",
+          "write_file",
+          "edit_file",
+          "shell_exec",
+          "bash_jobs_list",
+          "bash_job_output",
+          "send_message",
+          "operator_alert"
+        ],
+        "scoped_roots": [
+          "state"
+        ]
       },
       "env_required": [
         "WORKLINK_REPO"
@@ -33,7 +44,9 @@
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
         "VOYAGE_API_KEY"
-      ]
+      ],
+      "enabled": false,
+      "disabled_reason": "Dispatch moved to the supervised worklink s6 service so builds run as a user that cannot write the agent home (chainlink #1164). The framework poller ran as the agent user, so a build could grant itself shell authority by editing scheduler.yaml. Re-enabling this entry reintroduces that path."
     }
   ]
 }
