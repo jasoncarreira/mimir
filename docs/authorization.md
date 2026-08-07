@@ -463,6 +463,140 @@ command, not arbitrary shell access. See the
 [`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
 default, supported command syntax, and non-Python examples.
 
+### Declared shell commands per job
+
+A scheduled job or poller may declare the shell commands it needs, **additively
+on top of** its shell profile. mimir ships no catalogue of the CLIs a deployment
+might install, so teaching one job about a deployment-specific tool needs no
+mimir release and does not widen a profile every other job on the host shares.
+
+Declare them where the job is already defined. In `<home>/scheduler.yaml`, per
+named job:
+
+```yaml
+- name: morning-briefing
+  prompt_file: morning-briefing.md
+  cron: 0 8 * * *
+  shell_commands:
+    - exec: gog
+      path: /usr/local/bin/gog
+      subcommands:
+        - [gmail, search]
+        - [calendar, events]
+      options: ["--account", "--json", "--from", "--to"]
+```
+
+In a poller manifest, inside the existing `authority` block:
+
+```json
+"authority": {
+  "profile": "custom",
+  "tier": "scoped-with-provenance",
+  "capabilities": ["shell_exec", "bash_jobs_list", "bash_job_output"],
+  "scoped_roots": ["state"],
+  "shell_commands": [
+    {"exec": "acli", "path": "/usr/local/bin/acli",
+     "subcommands": [["jira", "workitem", "search"]],
+     "options": ["--jql", "--json"]}
+  ]
+}
+```
+
+Both files are operator-owned. No service principal can write either: a poller's
+`scoped_roots` vocabulary is closed to `state` and `wiki:<slug>`, and
+`<home>/scheduler.yaml` is outside every configured writable folder. That is what
+makes a declaration an authority grant rather than a self-grant.
+
+#### Field rules
+
+The catalogue of tools is yours; the **shape** of a declaration is enforced in
+code and cannot be relaxed by configuration.
+
+| field | rule |
+|---|---|
+| `exec` | bare command name, no path separators. Matched against `argv[0]`. |
+| `path` | absolute, must exist, must be a regular executable file. Resolved (symlinks followed) and then **required to be outside every agent-writable root**. Becomes the pinned executable — PATH never selects the binary. |
+| `subcommands` | list of non-empty token lists, matched as a positional prefix against `argv[1:]`. Required unless `script` is given. |
+| `options` | allowlist. An option outside it is refused; there is no wildcard. Both `--opt value` and `--opt=value` are accepted for a listed long option. |
+| `script` | **required** for an interpreter, optional otherwise. Same absolute / resolved / outside-writable-roots rule as `path`. When present it is pinned as the first operand. |
+
+Operands are unrestricted once the subcommand prefix and options match — a Gmail
+query or a JQL string is a value, and the argv is executed with `shell=False`.
+
+#### Why a bare binary is inexpressible
+
+`subcommands` cannot be empty, because for most CLIs the subcommand *is* the
+security boundary:
+
+```
+gog gmail search ...   read
+gog gmail send ...     write
+```
+
+Both are the same executable. A declaration naming only `gog` would grant both,
+so the table is mandatory and mutating verbs are excluded by simply not listing
+them. There is no denylist to keep in sync.
+
+#### Interpreters
+
+`python3`, `sh`, `bash`, `node`, `env`, `perl`, `ruby` and similar may be declared
+**only** with a pinned `script`:
+
+```yaml
+    - exec: python3
+      path: /usr/local/bin/python3
+      script: /mimir-home/scripts/process_conditional_todos.py
+      options: []
+```
+
+The danger of an interpreter is *arbitrary* code, not code. A script the running
+agent cannot rewrite is equivalent to a binary the operator installed, so the
+script must resolve outside every agent-writable root. `-c`, `-e`, `-m` and `-`
+are refused on any declaration, interpreter or not — they source code from argv
+or stdin, which would make the pin meaningless.
+
+Classification follows the **resolved binary** as well as the declared name, so
+`exec: gog` with `path: /usr/bin/python3` is still treated as an interpreter.
+
+#### What is agent-writable
+
+The check unions the `rw` entries of `Config.folders` under home with external
+`MIMIR_FILE_TOOL_ROOTS` `:rw` routes and rw repository roots. With the shipped
+defaults that means `state/`, `memory/`, `conversation_history/`, `attachments/`,
+`scratch/` and **`skills/`** are writable — so a script bundled inside a skill is
+correctly refused.
+
+`<home>/scripts/` is not a configured folder at all and is therefore already
+unwritable, which makes it the natural home for a pinned script. The home root
+itself is *not* treated as writable; only its `rw` folders are.
+
+#### Interaction with the profile and the capability gate
+
+Two gates run in sequence, and a declaration only affects the second:
+
+1. **Capability** — is `shell_exec` in the principal's capability set? A manifest
+   declaring `shell_commands` without `shell_exec` is rejected at load, because
+   the grants would be silently inert.
+2. **Shell profile** — is this argv admitted? Declarations are consulted here,
+   in addition to the profile's own allowlist. The profile is never replaced.
+
+The argv binding is unchanged: no pipes, redirection, command substitution,
+heredocs or separators, under any declaration. A grant widens *which commands*
+are admitted, never *how* they may be composed.
+
+#### Failure modes
+
+A malformed declaration fails closed and loudly, at load rather than at use:
+
+- a poller whose declaration is invalid is **not registered**;
+- a scheduled job whose declaration is invalid is **not fired**, rather than
+  silently downgraded to the shared principal — it would otherwise fail every
+  command it was configured to run, with the reason nowhere near the cause.
+
+Denials are attributed: `declared_command_mismatch` means the job declared
+commands and none matched, distinct from `profile_allowlist`, which means the
+profile refused it and no declaration applied.
+
 ## How to extend
 
 ### Add an operation
