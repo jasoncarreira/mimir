@@ -9,14 +9,6 @@ All notable changes will land here. Format loosely follows
 ### Changed
 - Version bumped to 0.7.4 for the next release.
 
-### Pending — held for 0.7.4
-- The `maintenance` git allowlist is narrower than the shipped scheduled-tick
-  prompts run: 49 of 190 service-shell refusals measured on a live deployment are
-  `git`, the largest single command bucket, and nearly all of them are the
-  upgrade-reconciliation turn unable to inspect the proposal workspace it just
-  built. Tracked as chainlink #1162. **This release is held until that fix lands**
-  — when it does, move this entry up into 0.7.4 before tagging.
-
 ## [0.7.4] — 2026-08-07
 
 ### Added
@@ -37,6 +29,14 @@ All notable changes will land here. Format loosely follows
   `date` admits no `-s`/`--set` and `tail` no `-f`/`--follow`. (#1403)
 
 ### Fixed
+- The `maintenance` git allowlist now covers what the shipped scheduled-tick
+  prompts actually run. 49 of 190 service-shell refusals measured on a live
+  deployment were `git` — the largest single command bucket — and nearly all were
+  the upgrade-reconciliation turn unable to inspect the proposal workspace it had
+  just built. `log --all`, `diff --no-ext-diff`, `rev-parse`, `branch -a`,
+  `cat-file`, `ls-tree`, `ls-files` and `show` are admitted, each through its own
+  option allowlist; every mutation stays refused, `branch -D` and `--force`
+  included. (#1405)
 - A quoted metacharacter is a value, not a shell operator. The service-shell rule
   scanned the raw command string, so `grep -r '<<<<<<<' <path>` — a search for a
   merge conflict marker — was refused as a redirection, and a conflict-scanning
