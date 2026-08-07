@@ -445,6 +445,30 @@ class TestReviewFindings:
             "gog gmail search x", profile, declared=declared,
         ) is not None
 
+    def test_ambient_home_does_not_make_scripts_undeclarable(
+        self, home: Path, monkeypatch,
+    ) -> None:
+        """The operator-owned <home>/scripts/ must stay declarable.
+
+        ``_configured_file_write_roots()`` leads with MIMIR_HOME itself, so
+        unioning it whole classified everything under home as agent-writable --
+        including the one location the interpreter rule documents as the place a
+        pinned script should live. The earlier success test missed it because its
+        fixture home differed from the ambient MIMIR_HOME; this one sets them
+        equal, which is the real deployment shape.
+        """
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        roots = agent_writable_roots(home)
+        assert home.resolve() not in roots, "the home sink root is not itself writable"
+        assert (home / "scratch").resolve() in roots, "but its rw folders are"
+
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": "/usr/bin/python3",
+              "script": str(home / "scripts" / "todo.py")}],
+            writable_roots=roots,
+        )
+        assert declared[0].script == (home / "scripts" / "todo.py").resolve()
+
     def test_external_rw_roots_count_as_writable(
         self, home: Path, tmp_path_factory, monkeypatch,
     ) -> None:

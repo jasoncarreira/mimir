@@ -1723,7 +1723,19 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
     # Home folders are not the whole write surface: MIMIR_FILE_TOOL_ROOTS adds
     # ``path:rw`` routes (and the default /tmp route), and configured repos can
     # be rw. A declaration under any of them is agent-writable just the same.
-    for extra in (*_configured_file_write_roots(), *_configured_repo_write_roots()):
+    #
+    # ``_configured_file_write_roots()`` leads with MIMIR_HOME itself -- it is the
+    # backend's write SINK root, not a statement that everything under home is
+    # writable. Unioning it whole classified the entire home as writable, which
+    # made the documented operator-owned ``<home>/scripts/`` undeclarable and
+    # silently negated the per-folder calculation above. Only the external routes
+    # are real write surface; ``Config.folders`` already decides what inside home
+    # is writable, and it lists neither ``scripts`` nor ``prompts`` as rw.
+    external = [
+        candidate for candidate in _configured_file_write_roots()
+        if candidate.resolve() != root
+    ]
+    for extra in (*external, *_configured_repo_write_roots()):
         try:
             resolved_extra = Path(extra).resolve()
         except OSError:
