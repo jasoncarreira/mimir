@@ -7835,6 +7835,65 @@ def test_escaped_quote_does_not_end_the_quoted_span() -> None:
     assert access_control._unquoted_shell_control_characters("grep a | b") == ["|"]
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Verbatim from muninn's denial records, 2026-08-03..06.
+        ["cat", "/mimir-home/.mimir/last-booted-version"],
+        ["stat", "-c", "%y", "/mimir-home/memory/core/40-learned-behaviors.md"],
+        ["date"],
+        ["date", "-u"],
+        ["head", "-n", "50", "/mimir-home/state/heartbeat-backlog.md"],
+        ["tail", "-n", "20", "/mimir-home/logs/events.jsonl"],
+        ["stat", "--printf=%n", "/mimir-home/state/today.md"],
+    ],
+)
+def test_maintenance_admits_read_only_inspection(argv: list[str]) -> None:
+    """These are 59 of 190 service-shell refusals measured on muninn.
+
+    Widening WHICH commands may read, not what is readable: ``grep`` and ``rg``
+    are already admitted under this profile and reach the same bytes. Both
+    heartbeats need them, and a heartbeat cannot carry a per-job declaration.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._target_matches_maintenance_shell_command(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["date", "-s", "2020-01-01"],          # sets the clock
+        ["date", "--set", "2020-01-01"],
+        ["tail", "-f", "/mimir-home/logs/events.jsonl"],  # never returns
+        ["tail", "--follow", "/x"],
+        ["cat", "--unknown-option", "/x"],
+        ["head", "--bytes-of-nonsense", "/x"],
+    ],
+)
+def test_inspection_commands_admit_no_mutating_or_blocking_options(
+    argv: list[str],
+) -> None:
+    """The widening is read-only and bounded, per command.
+
+    ``date`` must not set the clock and ``tail`` must not follow -- a following
+    read never returns, which would wedge the turn rather than fail it.
+    """
+    import mimir.access_control as access_control
+
+    assert not access_control._target_matches_maintenance_shell_command(argv)
+
+
+def test_every_admitted_inspection_command_is_pinned() -> None:
+    """An admitted basename with no pin would resolve through PATH."""
+    import mimir.access_control as access_control
+
+    pins = access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS
+    for name in ("cat", "head", "tail", "stat", "date"):
+        assert name in pins, f"{name} is admitted but not pinned"
+        assert pins[name].is_absolute()
+
+
 def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:
     service = build_trigger_service_principal(
         canonical="poller:feed",

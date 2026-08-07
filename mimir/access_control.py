@@ -2747,6 +2747,14 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "jq": Path("/usr/bin/jq"),
     "rg": Path("/usr/bin/rg"),
     "chainlink": Path("/usr/local/bin/chainlink"),
+    # Read-only inspection. Admitted because the shipped scheduled-tick prompts
+    # already reach for them and had no admitted equivalent: 59 of 190 service
+    # shell refusals measured on muninn over 2026-08-03..06 were these five.
+    "cat": Path("/usr/bin/cat"),
+    "head": Path("/usr/bin/head"),
+    "tail": Path("/usr/bin/tail"),
+    "stat": Path("/usr/bin/stat"),
+    "date": Path("/usr/bin/date"),
 }
 _MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
 _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
@@ -3080,6 +3088,38 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
 
     if argv[0] == "git":
         return _maintenance_git_execution_argv(argv) is not None
+
+    # File inspection. This widens which commands may READ, not what is
+    # readable: ``grep`` and ``rg`` are already admitted and reach the same
+    # bytes. Per-command option allowlists, so nothing here can mutate --
+    # note ``date`` admits no ``-s``/``--set``, which would set the clock.
+    if argv[0] == "cat":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({
+                "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
+            }),
+        )
+    if argv[0] in {"head", "tail"}:
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({"-q", "-v", "--quiet", "--verbose"}),
+            option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        )
+    if argv[0] == "stat":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({"-t", "--terse", "-L", "--dereference"}),
+            option_prefixes=("-c", "--format=", "--printf="),
+        )
+    if argv[0] == "date":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({
+                "-u", "--utc", "-R", "--rfc-email", "-I", "--iso-8601",
+            }),
+            option_prefixes=("-d", "--date=", "--iso-8601=", "--rfc-3339="),
+        )
 
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
         resource = argv[1]
