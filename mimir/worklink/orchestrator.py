@@ -792,7 +792,16 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner, oid=committed_oid)
+            # repo_url comes from the PARENT repository, read controller-side.
+            # Naming `origin` would resolve the destination from the
+            # worker-owned checkout's config (remote.origin.url / pushurl /
+            # url.*.insteadOf), which is where the credential would go.
+            _git_push(
+                lease.path, lease.branch, runner=runner, oid=committed_oid,
+                # WorkSpec.repo_url is resolved controller-side from the PARENT
+                # repository, so it cannot be redirected by the checkout.
+                remote_url=spec.repo_url,
+            )
             pr_url = _open_pr(
                 self.repo,
                 issue,
@@ -2276,6 +2285,20 @@ def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Run
     # A process surviving past the verdict can still mutate the checkout; it
     # cannot change which object gets pushed. Resolved through the same runner,
     # so under containment this read happens on the contained side too.
+    # Prefer the ROOT observer's read. Parsing `git rev-parse` stdout takes the
+    # value from a command run on the side being judged; report_head makes the
+    # supervisor read the checkout itself.
+    from .containment import containment_required, observe_head_via_supervisor, resolve_containment
+
+    if containment_required():
+        policy = resolve_containment()
+        observed = observe_head_via_supervisor(policy, checkout)
+        if observed:
+            return observed
+        # Containment is active but the observer produced nothing: fail closed
+        # rather than silently dropping to worker-reported output, which is the
+        # provenance this exists to avoid.
+        return None
     head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
     oid = (head.stdout or "").strip()
     return oid if head.returncode == 0 and oid else None
@@ -2441,7 +2464,14 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-def _git_push(repo: Path, branch: str, *, runner: Runner, oid: str | None = None) -> None:
+def _git_push(
+    repo: Path,
+    branch: str,
+    *,
+    runner: Runner,
+    oid: str | None = None,
+    remote_url: str | None = None,
+) -> None:
     """Push the branch. Controller-side: this is what holds the credential.
 
     When the commit step reported an oid, push THAT object explicitly rather
@@ -2466,17 +2496,26 @@ def _git_push(repo: Path, branch: str, *, runner: Runner, oid: str | None = None
         refspec = branch
     else:
         refspec = f"{oid}:refs/heads/{branch}"
-    # The refspec pins WHAT is pushed; these pin what the push may EXECUTE. The
-    # checkout is worker-owned by this point, so its .git/config and hooks are
-    # worker-written: pre-push, core.sshCommand, credential.helper and
-    # diff.external all run as the controller, with the credential, unless
-    # disabled. Reuses the reviewed constant rather than restating the list.
-    from ..access_control import _MAINTENANCE_GIT_BASE_OVERRIDES
-
+    # The refspec pins WHAT is pushed; these pin what the push may EXECUTE and
+    # WHERE it goes. The checkout is worker-owned by this point, so its
+    # .git/config and hooks are worker-written.
+    #
+    # NOT _MAINTENANCE_GIT_BASE_OVERRIDES: that set includes
+    # `protocol.allow=never`, which is right for local maintenance and fatal
+    # here -- verified, a push under it dies with "transport 'https' not
+    # allowed". Reusing it wholesale would have broken every real push while the
+    # argv-inspecting test still passed.
+    destination = remote_url or "origin"
     result = runner([
-        "git", "-C", str(repo), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "git", "-C", str(repo),
+        # Nothing the checkout configures may execute during the push.
         "-c", "core.hooksPath=/dev/null",
-        "push", "-u", "origin", refspec,
+        "-c", "core.fsmonitor=",
+        "-c", "diff.external=",
+        "-c", "core.sshCommand=ssh",
+        "-c", "core.askpass=",
+        "-c", "credential.helper=",
+        "push", "-u", destination, refspec,
     ])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")

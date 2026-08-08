@@ -614,7 +614,13 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert len(pushes) == 1, f"expected exactly one push, got {pushes}"
     argv = pushes[0]
     assert argv[argv.index("-C") + 1] == str(worktree), "must push from the lease checkout"
-    assert "-u" in argv and "origin" in argv
+    assert "-u" in argv
+    # The destination must NOT be the symbolic `origin`: that resolves from the
+    # worker-owned checkout's config (remote.origin.url / pushurl /
+    # url.*.insteadOf), which is where the credential would be sent.
+    destination = argv[-2]
+    assert destination != "origin", "push destination must not be resolved from the checkout"
+    assert destination.startswith(("http", "git@", "ssh://")), f"unexpected destination {destination}"
     refspec = argv[-1]
     assert refspec.endswith("issue/441-a1"), f"unexpected refspec {refspec}"
     assert not any(

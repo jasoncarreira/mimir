@@ -265,7 +265,6 @@ def test_push_disables_what_the_worker_owned_checkout_could_execute() -> None:
     worker-written. pre-push, core.sshCommand and credential.helper would all run
     as the controller, holding the credential.
     """
-    from mimir.access_control import _MAINTENANCE_GIT_BASE_OVERRIDES
     from mimir.worklink.orchestrator import _git_push
 
     calls: list[list[str]] = []
@@ -276,12 +275,25 @@ def test_push_disables_what_the_worker_owned_checkout_could_execute() -> None:
 
         return sp.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
-    _git_push(Path("/tmp/repo"), "issue/1-a1", runner=runner, oid="deadbeef")
+    _git_push(
+        Path("/tmp/repo"), "issue/1-a1", runner=runner, oid="deadbeef",
+        remote_url="https://github.com/o/r.git",
+    )
     argv = calls[0]
-    for override in _MAINTENANCE_GIT_BASE_OVERRIDES:
-        assert override in argv, f"{override} missing from the push argv"
-    assert "core.hooksPath=/dev/null" in argv
+    for setting in (
+        "core.hooksPath=/dev/null", "core.fsmonitor=", "diff.external=",
+        "core.sshCommand=ssh", "core.askpass=", "credential.helper=",
+    ):
+        assert setting in argv, f"{setting} missing from the push argv"
     assert argv.index("push") > argv.index("-C"), "overrides must precede the subcommand"
+    # NOT _MAINTENANCE_GIT_BASE_OVERRIDES wholesale: it carries
+    # protocol.allow=never, which is right for local maintenance and fatal for a
+    # push -- verified, git dies with "transport 'https' not allowed". Reusing
+    # the constant here broke every real push while this argv check still passed.
+    assert "protocol.allow=never" not in argv, (
+        "protocol.allow=never makes the push fail with transport 'https' not allowed"
+    )
+    assert argv[-2] == "https://github.com/o/r.git", "destination must be the controller's URL"
 
 
 def test_worker_env_drops_variables_naming_the_controller_home(
@@ -354,3 +366,60 @@ def test_the_push_oid_comes_from_the_supervisors_own_read(tmp_path: Path) -> Non
     sup.serve_forever(policy, poll_seconds=0, max_iterations=1)
     result = await_result(policy, rid, timeout_seconds=30)
     assert result.head_oid == expected, "the supervisor must report the oid it read"
+
+
+def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) -> None:
+    """Executes the push instead of inspecting its argv.
+
+    The argv-inspecting test above passed while the shipped command was
+    unrunnable: _MAINTENANCE_GIT_BASE_OVERRIDES carries protocol.allow=never, so
+    every real push died with "transport 'https' not allowed". Only running one
+    catches that class of defect.
+
+    Uses a local bare remote so no network is involved.
+    """
+    import subprocess as sp
+
+    from mimir.worklink.orchestrator import _git_push
+
+    def git(*args: str, cwd: Path) -> sp.CompletedProcess[str]:
+        return sp.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    if git("init", "--bare", "-q", cwd=remote).returncode != 0:
+        pytest.skip("git unavailable")
+    work = tmp_path / "repo" / ".worklink" / "441-a1"
+    work.mkdir(parents=True)
+    git("init", "-q", cwd=work)
+    git("config", "user.email", "t@t", cwd=work)
+    git("config", "user.name", "t", cwd=work)
+    (work / "f.txt").write_text("x")
+    git("add", "-A", cwd=work)
+    git("commit", "-qm", "x", cwd=work)
+    git("branch", "-M", "issue/441-a1", cwd=work)
+    oid = git("rev-parse", "HEAD", cwd=work).stdout.strip()
+
+    # A planted hook that would fail the push if hooks were honoured.
+    hooks = work / ".git" / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/sh\necho PLANTED >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    captured: list[sp.CompletedProcess[str]] = []
+
+    def runner(args, cwd=None):  # noqa: ANN001, ANN202
+        result = sp.run(list(args), capture_output=True, text=True, check=False)
+        captured.append(result)
+        return result
+
+    _git_push(work, "issue/441-a1", runner=runner, oid=oid, remote_url=str(remote))
+
+    assert captured[0].returncode == 0, f"push failed: {captured[0].stderr}"
+    assert "PLANTED" not in captured[0].stderr, "the worker-planted pre-push hook ran"
+    landed = sp.run(
+        ["git", "rev-parse", "refs/heads/issue/441-a1"],
+        cwd=remote, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    assert landed == oid, "the observed object is what reached the remote"
