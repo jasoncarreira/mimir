@@ -89,6 +89,8 @@ __all__ = [
     "worker_runtime_env",
     "worker_home",
     "observe_head_via_supervisor",
+    "register_attempt_checkout",
+    "is_registered_attempt_checkout",
     "spawn_argv",
     "request_dir",
     "result_dir",
@@ -358,6 +360,14 @@ def worker_runtime_env(policy: ContainmentPolicy, base: dict[str, str]) -> dict[
     env["XDG_CACHE_HOME"] = str(home / ".cache")
     env["XDG_DATA_HOME"] = str(home / ".local" / "share")
     env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+    # A coding CLI resolves its config and OAuth store from these, and the
+    # controller's copies are unreadable to the worker (0600 under a 0700 home).
+    # Dropping the controller values is necessary but leaves the CLI with no
+    # config at all; point them at worker-owned locations instead. The
+    # deployment provisions the contents -- see docs/authorization.md.
+    env["OPENCODE_CONFIG"] = str(home / ".config" / "opencode" / "opencode.jsonc")
+    env["CODEX_HOME"] = str(home / ".codex")
+    env["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
     return env
 
 
@@ -668,3 +678,36 @@ def observe_head_via_supervisor(policy: ContainmentPolicy, checkout: Path) -> st
         ),
     )
     return result.head_oid
+
+
+#: Checkouts the orchestrator has actually issued for this process. Membership is
+#: the routing authority.
+_ATTEMPT_CHECKOUTS: set[Path] = set()
+
+
+def register_attempt_checkout(path: Path) -> None:
+    """Record a checkout the orchestrator created for an attempt.
+
+    The supervisor chowns whatever cwd it is handed, recursively, so the routing
+    predicate decides what may be taken from the operator. Matching on a
+    ``.worklink`` path COMPONENT was too loose: any configured repository that
+    happens to sit beneath such a directory would match. Only a checkout this
+    process actually issued may cross.
+    """
+    try:
+        _ATTEMPT_CHECKOUTS.add(path.resolve())
+    except OSError:  # pragma: no cover
+        _ATTEMPT_CHECKOUTS.add(path)
+
+
+def is_registered_attempt_checkout(path: Path) -> bool:
+    """Whether ``path`` is, or is inside, a checkout this process issued."""
+    if not _ATTEMPT_CHECKOUTS:
+        return False
+    try:
+        candidate = path.resolve()
+    except OSError:  # pragma: no cover
+        candidate = path
+    return any(
+        root == candidate or root in candidate.parents for root in _ATTEMPT_CHECKOUTS
+    )

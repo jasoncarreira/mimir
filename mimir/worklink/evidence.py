@@ -362,12 +362,19 @@ def maybe_run_contained(
     required (no coding flag) or when the step has no attempt checkout to run in.
     """
     if checkout is None or not _is_attempt_checkout(checkout):
-        # ALLOW-LIST, deliberately. A deny-list ("not the home, not remote") sent
-        # `git -C <parent repo> status` to the supervisor, which chowns the cwd
-        # recursively before executing -- handing the operator's own source
-        # repository to the worker uid. _finalize calls this runner against
-        # self.repo for dirty-path and remote-url checks, so that was reachable
-        # on every run, not a corner case. Only an attempt checkout may cross.
+        return None
+    from .containment import is_registered_attempt_checkout
+
+    if not is_registered_attempt_checkout(checkout):
+        # Two conditions, both necessary. The marker keeps the obvious cases out
+        # cheaply; registration is the authority, because a configured repository
+        # sitting under some `.worklink` directory would satisfy the marker alone
+        # and the supervisor chowns whatever cwd it is handed, recursively.
+        #
+        # A deny-list came first and was worse: "not the agent home, not remote"
+        # sent `git -C <parent repo> status` -- which _finalize runs on every
+        # run -- to the supervisor, handing the operator's own source repository
+        # to the worker uid.
         return None
     if _talks_to_the_remote(args):
         # Push, fetch and friends are CONTROLLER operations: they need the

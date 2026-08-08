@@ -47,6 +47,7 @@ from mimir.worklink.containment import (
 __all__ = [
     "prepare_spool",
     "ensure_checkout_ownership",
+    "ensure_worker_runtime",
     "handle_one_request",
     "serve_forever",
     "main",
@@ -100,6 +101,43 @@ def prepare_spool(
         os.chown(results, 0, controller[1])
     requests.chmod(_REQUEST_DIR_MODE)
     results.chmod(_RESULT_DIR_MODE)
+
+
+def ensure_worker_runtime(contained_user: str) -> bool:
+    """Create the worker's own config/cache tree, owned by it.
+
+    ``worker_runtime_env`` points OPENCODE_CONFIG / CODEX_HOME / XDG at paths
+    under the contained account's home. Those must exist and be writable by it or
+    the coding CLI fails on start -- and only this service can chown them, since
+    the controller has CapEff=0.
+
+    Contents are the deployment's job; this establishes the ownership.
+    """
+    ids = _lookup_ids(contained_user)
+    if ids is None or os.geteuid() != 0:
+        return False
+    uid, gid = ids
+    try:
+        import pwd
+
+        home = Path(pwd.getpwnam(contained_user).pw_dir)
+    except (ImportError, KeyError):  # pragma: no cover
+        return False
+    for rel in (
+        ".config/opencode", ".codex", ".claude",
+        ".cache", ".local/share", ".local/state",
+    ):
+        target = home / rel
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            os.chown(target, uid, gid)
+        except OSError:  # pragma: no cover - best effort per entry
+            continue
+    try:
+        os.chown(home, uid, gid)
+    except OSError:  # pragma: no cover
+        pass
+    return True
 
 
 def ensure_checkout_ownership(checkout: Path, contained_user: str) -> bool:
@@ -343,6 +381,7 @@ def main() -> int:
     spool_root = Path(os.environ.get("MIMIR_WORKLINK_SPOOL", str(DEFAULT_SPOOL_ROOT)))
     user = os.environ.get("MIMIR_WORKLINK_USER", DEFAULT_CONTAINED_USER)
     prepare_spool(spool_root, contained_user=user)
+    ensure_worker_runtime(user)
     policy = ContainmentPolicy(user=user, spool_root=spool_root, verified=True)
     print(f"worklink: supervising {spool_root}, spawning steps as {user}", flush=True)
     serve_forever(policy)

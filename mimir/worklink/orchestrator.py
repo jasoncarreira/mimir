@@ -2304,6 +2304,20 @@ def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Run
     return oid if head.returncode == 0 and oid else None
 
 
+def _register_attempt_checkout(lease: object) -> object:
+    """Mark a freshly created lease as eligible for contained execution.
+
+    Registration is what authorises the supervisor to take ownership of a path,
+    so it happens exactly where a checkout is created and nowhere else.
+    """
+    path = getattr(lease, "path", None)
+    if path is not None:
+        from .containment import register_attempt_checkout
+
+        register_attempt_checkout(Path(str(path)))
+    return lease
+
+
 def _create_backend_checkout(
     repo: Path,
     *,
@@ -2318,7 +2332,7 @@ def _create_backend_checkout(
     shape = checkout_shape_for_backend(backend)
     if shape is not CheckoutShape.ISOLATED_CLONE:
         raise WorklinkError(f"unsupported checkout shape for backend {backend.name}: {shape}")
-    return create_isolated_checkout(
+    return _register_attempt_checkout(create_isolated_checkout(
         repo,
         issue_id=issue_id,
         attempt=attempt,
@@ -2326,7 +2340,7 @@ def _create_backend_checkout(
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,
-    )
+    ))
 
 
 def _with_outside_checkout_detection(
@@ -2464,6 +2478,51 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
+#: Settings a worker-written ``.git/config`` could use to redirect the push or
+#: execute code during it. Removed from the CHECKOUT's own config, so the
+#: deployment's global credential helper and ssh setup keep working.
+_WORKER_SCRUBBED_GIT_KEYS = (
+    "credential.helper",
+    "core.sshCommand",
+    "core.askpass",
+    "core.pager",
+    "core.editor",
+    "uploadpack.packObjectsHook",
+)
+_WORKER_SCRUBBED_GIT_SECTIONS = ("url",)
+
+
+def _scrub_checkout_git_config(checkout: Path) -> None:
+    """Remove worker-settable redirect/execute keys from the checkout's config.
+
+    Deliberately a direct subprocess rather than the injected runner: the runner
+    routes contained work to the worker, and sanitising the worker's own config
+    through the worker would be circular.
+
+    Best effort per key -- git exits non-zero when a key is simply absent, which
+    is the common case.
+    """
+    for key in _WORKER_SCRUBBED_GIT_KEYS:
+        subprocess.run(  # noqa: S603
+            ["git", "-C", str(checkout), "config", "--local", "--unset-all", key],
+            capture_output=True, text=True, check=False,
+        )
+    for section in _WORKER_SCRUBBED_GIT_SECTIONS:
+        # url.<base>.insteadOf rewrites the destination; sections need removing
+        # wholesale because the middle component is attacker-chosen.
+        listing = subprocess.run(  # noqa: S603
+            ["git", "-C", str(checkout), "config", "--local", "--name-only", "--list"],
+            capture_output=True, text=True, check=False,
+        )
+        for line in (listing.stdout or "").splitlines():
+            if line.startswith(f"{section}.") and line.count(".") >= 2:
+                name = ".".join(line.split(".")[:-1])
+                subprocess.run(  # noqa: S603
+                    ["git", "-C", str(checkout), "config", "--local", "--remove-section", name],
+                    capture_output=True, text=True, check=False,
+                )
+
+
 def _git_push(
     repo: Path,
     branch: str,
@@ -2506,15 +2565,23 @@ def _git_push(
     # allowed". Reusing it wholesale would have broken every real push while the
     # argv-inspecting test still passed.
     destination = remote_url or "origin"
+    # Strip the worker-writable settings from the checkout's OWN config rather
+    # than overriding them on the command line.
+    #
+    # `-c credential.helper=` looked equivalent and is not: an empty value RESETS
+    # git's helper list, and -c has highest precedence, so it also removes the
+    # deployment's `gh auth setup-git` helper and leaves a token-free HTTPS URL
+    # with no credential at all. The local bare-remote regression cannot see
+    # that, because file:// transport needs no credential.
+    _scrub_checkout_git_config(repo)
     result = runner([
         "git", "-C", str(repo),
-        # Nothing the checkout configures may execute during the push.
+        # Execution settings can be overridden safely -- none of these are
+        # supplied by the deployment, so clearing them removes only the risk.
         "-c", "core.hooksPath=/dev/null",
         "-c", "core.fsmonitor=",
         "-c", "diff.external=",
-        "-c", "core.sshCommand=ssh",
         "-c", "core.askpass=",
-        "-c", "credential.helper=",
         "push", "-u", destination, refspec,
     ])
     if result.returncode != 0:
