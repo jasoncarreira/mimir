@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 
 from acp import PROTOCOL_VERSION, RequestError, run_agent
-from acp.interfaces import Agent
+from acp.interfaces import Agent, Client
 from acp.schema import (
     AgentCapabilities,
+    AgentMessageChunk,
+    AgentPlanUpdate,
     AudioContentBlock,
     AuthenticateRequest,
     AuthenticateResponse,
@@ -24,9 +26,14 @@ from acp.schema import (
     NewSessionResponse,
     PromptCapabilities,
     PromptRequest,
+    PlanEntry,
     PromptResponse,
     ResourceContentBlock,
+    SessionNotification,
     TextContentBlock,
+    ToolCallProgress,
+    ToolCallStart,
+    UserMessageChunk,
 )
 
 
@@ -43,6 +50,14 @@ def auth_required_error() -> RequestError:
 
 def method_not_found_error(method: str) -> RequestError:
     return RequestError.method_not_found(method)
+
+
+def invalid_params_error() -> RequestError:
+    return RequestError.invalid_params()
+
+
+def internal_error() -> RequestError:
+    return RequestError.internal_error()
 
 
 async def run_stdio_agent(
@@ -63,11 +78,14 @@ __all__ = [
     "AUTH_METHOD_ID",
     "Agent",
     "AgentCapabilities",
+    "AgentMessageChunk",
+    "AgentPlanUpdate",
     "AudioContentBlock",
     "AuthenticateRequest",
     "AuthenticateResponse",
     "AuthMethodAgent",
     "CancelNotification",
+    "Client",
     "ClientCapabilities",
     "EmbeddedResourceContentBlock",
     "ImageContentBlock",
@@ -82,11 +100,18 @@ __all__ = [
     "PROTOCOL_VERSION",
     "PromptCapabilities",
     "PromptRequest",
+    "PlanEntry",
     "PromptResponse",
     "RequestError",
     "ResourceContentBlock",
+    "SessionNotification",
     "TextContentBlock",
+    "ToolCallProgress",
+    "ToolCallStart",
+    "UserMessageChunk",
     "auth_required_error",
+    "internal_error",
+    "invalid_params_error",
     "method_not_found_error",
     "run_stdio_agent",
 ]

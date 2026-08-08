@@ -17,6 +17,8 @@ from mimir.acp.stdio import _DrainProtocol, _ReservedFrameTransport
 
 EXPECTED_SCHEMA_IMPORTS = {
     "AgentCapabilities",
+    "AgentMessageChunk",
+    "AgentPlanUpdate",
     "AudioContentBlock",
     "AuthenticateRequest",
     "AuthenticateResponse",
@@ -33,11 +35,16 @@ EXPECTED_SCHEMA_IMPORTS = {
     "McpCapabilities",
     "NewSessionRequest",
     "NewSessionResponse",
+    "PlanEntry",
     "PromptCapabilities",
     "PromptRequest",
     "PromptResponse",
     "ResourceContentBlock",
+    "SessionNotification",
     "TextContentBlock",
+    "ToolCallProgress",
+    "ToolCallStart",
+    "UserMessageChunk",
 }
 
 FORBIDDEN_SCHEMA_IMPORTS = {
@@ -66,6 +73,20 @@ def test_sdk_schema_import_boundary_is_exact() -> None:
     assert imports == EXPECTED_SCHEMA_IMPORTS
     assert FORBIDDEN_SCHEMA_IMPORTS.isdisjoint(vars(sdk))
     assert sdk.McpCapabilities.__name__ == "McpCapabilities"
+    assert sdk.Client.__module__ == "acp.interfaces"
+    assert set(sdk.__all__) == {
+        "AUTH_METHOD_ID",
+        "Agent",
+        "Client",
+        "PROTOCOL_VERSION",
+        "RequestError",
+        "auth_required_error",
+        "internal_error",
+        "invalid_params_error",
+        "method_not_found_error",
+        "run_stdio_agent",
+        *EXPECTED_SCHEMA_IMPORTS,
+    }
 
 
 def test_pinned_schema_aliases_and_handler_models() -> None:
@@ -82,6 +103,91 @@ def test_pinned_schema_aliases_and_handler_models() -> None:
     assert getattr(sdk.Agent.load_session, "__param_model__") is sdk.LoadSessionRequest
     assert getattr(sdk.Agent.prompt, "__param_model__") is sdk.PromptRequest
     assert getattr(sdk.Agent.cancel, "__param_model__") is sdk.CancelNotification
+
+
+def test_pinned_session_update_models_and_aliases() -> None:
+    assert sdk.SessionNotification.model_fields["session_id"].alias == "sessionId"
+    assert sdk.SessionNotification.model_fields["field_meta"].alias == "_meta"
+    assert sdk.UserMessageChunk.model_fields["message_id"].alias == "messageId"
+    assert sdk.UserMessageChunk.model_fields["field_meta"].alias == "_meta"
+    assert sdk.AgentMessageChunk.model_fields["message_id"].alias == "messageId"
+    assert sdk.AgentMessageChunk.model_fields["field_meta"].alias == "_meta"
+    assert sdk.ResourceContentBlock.model_fields["mime_type"].alias == "mimeType"
+    assert sdk.ToolCallStart.model_fields["tool_call_id"].alias == "toolCallId"
+    assert sdk.ToolCallStart.model_fields["raw_input"].alias == "rawInput"
+    assert sdk.ToolCallStart.model_fields["raw_output"].alias == "rawOutput"
+    assert sdk.ToolCallProgress.model_fields["tool_call_id"].alias == "toolCallId"
+    assert sdk.ToolCallProgress.model_fields["raw_input"].alias == "rawInput"
+    assert sdk.ToolCallProgress.model_fields["raw_output"].alias == "rawOutput"
+    assert sdk.AgentPlanUpdate.model_fields["field_meta"].alias == "_meta"
+    assert getattr(sdk.Client.session_update, "__param_model__") is sdk.SessionNotification
+
+
+def test_pinned_session_update_wire_shapes() -> None:
+    sequence = {"mimir.sequence": 4}
+    text = sdk.TextContentBlock(type="text", text="hello")
+    user = sdk.UserMessageChunk(
+        content=text,
+        sessionUpdate="user_message_chunk",
+        _meta=sequence,
+    )
+    agent = sdk.AgentMessageChunk(
+        content=text,
+        sessionUpdate="agent_message_chunk",
+        _meta=sequence,
+    )
+    tool_start = sdk.ToolCallStart(
+        toolCallId="tool-1",
+        title="example",
+        kind="other",
+        status="pending",
+        sessionUpdate="tool_call",
+        _meta=sequence,
+    )
+    tool_progress = sdk.ToolCallProgress(
+        toolCallId="tool-1",
+        status="completed",
+        rawInput={"value": 1},
+        rawOutput={"ok": True},
+        sessionUpdate="tool_call_update",
+        _meta=sequence,
+    )
+    plan = sdk.AgentPlanUpdate(
+        entries=[sdk.PlanEntry(content="work", priority="medium", status="pending")],
+        sessionUpdate="plan",
+        _meta=sequence,
+    )
+    assert user.model_dump(mode="json", by_alias=True, exclude_none=True) == {
+        "content": {"type": "text", "text": "hello"},
+        "_meta": sequence,
+        "sessionUpdate": "user_message_chunk",
+    }
+    assert agent.model_dump(mode="json", by_alias=True, exclude_none=True) == {
+        "content": {"type": "text", "text": "hello"},
+        "_meta": sequence,
+        "sessionUpdate": "agent_message_chunk",
+    }
+    assert tool_start.model_dump(mode="json", by_alias=True, exclude_none=True) == {
+        "toolCallId": "tool-1",
+        "title": "example",
+        "kind": "other",
+        "status": "pending",
+        "_meta": sequence,
+        "sessionUpdate": "tool_call",
+    }
+    assert tool_progress.model_dump(mode="json", by_alias=True, exclude_none=True) == {
+        "toolCallId": "tool-1",
+        "status": "completed",
+        "rawInput": {"value": 1},
+        "rawOutput": {"ok": True},
+        "_meta": sequence,
+        "sessionUpdate": "tool_call_update",
+    }
+    assert plan.model_dump(mode="json", by_alias=True, exclude_none=True) == {
+        "entries": [{"content": "work", "priority": "medium", "status": "pending"}],
+        "_meta": sequence,
+        "sessionUpdate": "plan",
+    }
 
 
 def test_pinned_agent_signatures() -> None:
@@ -146,6 +252,16 @@ def test_error_objects_are_exact() -> None:
         "code": -32601,
         "message": "Method not found",
         "data": {"method": "_example"},
+    }
+    assert sdk.invalid_params_error().to_error_obj() == {
+        "code": -32602,
+        "message": "Invalid params",
+        "data": None,
+    }
+    assert sdk.internal_error().to_error_obj() == {
+        "code": -32603,
+        "message": "Internal error",
+        "data": None,
     }
 
 
