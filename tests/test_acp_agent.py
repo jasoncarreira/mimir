@@ -298,24 +298,16 @@ async def test_factory_output_is_revalidated_before_storage(
 
 
 @pytest.mark.parametrize(
-    ("handler", "expected_method"),
+    "handler",
     [
-        (lambda agent: agent.new_session("/tmp", mcp_servers=object()), "session/new"),
-        (
-            lambda agent: agent.load_session(
-                "/tmp",
-                "session-id",
-                mcp_servers=object(),
-            ),
-            "session/load",
-        ),
-        (lambda agent: agent.prompt("session-id", []), "session/prompt"),
+        lambda agent: agent.new_session("/tmp", mcp_servers=object()),
+        lambda agent: agent.load_session("/tmp", "session-id", mcp_servers=object()),
+        lambda agent: agent.prompt("session-id", []),
     ],
 )
-async def test_stateful_methods_are_error_only_before_and_after_auth(
+async def test_stateful_methods_require_authentication_and_connection(
     tmp_path: Path,
     handler: Any,
-    expected_method: str,
 ) -> None:
     agent = _agent(_resolver(tmp_path))
 
@@ -330,9 +322,7 @@ async def test_stateful_methods_are_error_only_before_and_after_auth(
 
     with pytest.raises(sdk.RequestError) as post_auth:
         await handler(agent)
-    assert _error(post_auth.value) == _error(
-        sdk.method_not_found_error(expected_method)
-    )
+    assert _error(post_auth.value) == _error(sdk.internal_error())
 
 
 async def test_cancel_is_always_a_no_op(tmp_path: Path) -> None:
@@ -402,27 +392,19 @@ async def test_actual_router_uses_only_meta_key_and_emits_no_notification_respon
         ],
     )
 
-    assert responses == [
-        {"jsonrpc": "2.0", "id": 1, "result": {}},
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "error": {
-                "code": -32601,
-                "message": "Method not found",
-                "data": {"method": "session/new"},
-            },
+    assert responses[0] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert responses[1]["jsonrpc"] == "2.0"
+    assert responses[1]["id"] == 2
+    assert set(responses[1]["result"]) == {"sessionId"}
+    assert responses[2] == {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "error": {
+            "code": -32601,
+            "message": "Method not found",
+            "data": {"method": "_example"},
         },
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "error": {
-                "code": -32601,
-                "message": "Method not found",
-                "data": {"method": "_example"},
-            },
-        },
-    ]
+    }
     assert agent._auth_context is not None
     assert agent._auth_context.canonical_principal == "operator"
 
