@@ -156,3 +156,71 @@ async def test_terminal_publish_failure_stops_publication_but_closes_all_tools()
     assert dispatcher._open_tools == {}
     assert [(item.tool_call_id, item.status) for item in publisher.updates[-1:]] == [("c", "pending")]
     await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_every_send_message_lifecycle_phase_is_suppressed() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    for event_type in ["tool_call", "tool_result"]:
+        for phase in ["start", "chunk", "end"]:
+            dispatcher.enqueue(
+                {
+                    "type": event_type,
+                    "phase": phase,
+                    "id": f"{event_type}-{phase}",
+                    "tool_name": "send_message",
+                    "args": {"text": "private"},
+                    "content": "private",
+                    "status": "ok",
+                }
+            )
+    await dispatcher.drain()
+    assert publisher.updates == []
+    await finish(dispatcher)
+
+
+@pytest.mark.parametrize("status", [None, "ok", "completed", "success"])
+@pytest.mark.asyncio
+async def test_every_accepted_success_status_completes(status: str | None) -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    event = {
+        "type": "tool_result",
+        "phase": "end",
+        "id": "tool",
+        "tool_name": "search",
+        "content": "result",
+    }
+    if status is not None:
+        event["status"] = status
+    dispatcher.enqueue(event)
+    await dispatcher.drain()
+    assert [(item.status, item.tool_call_id) for item in publisher.updates] == [
+        ("pending", "tool"),
+        ("completed", "tool"),
+    ]
+    await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_is_error_discriminator_overrides_nominal_success() -> None:
+    publisher = Publisher()
+    dispatcher = UpdateDispatcher(publisher)
+    dispatcher.enqueue(
+        {
+            "type": "tool_result",
+            "phase": "end",
+            "id": "tool",
+            "tool_name": "search",
+            "status": "success",
+            "is_error": True,
+            "content": "private detail",
+        }
+    )
+    await dispatcher.drain()
+    assert [(item.status, item.tool_call_id) for item in publisher.updates] == [
+        ("pending", "tool"),
+        ("failed", "tool"),
+    ]
+    await finish(dispatcher)

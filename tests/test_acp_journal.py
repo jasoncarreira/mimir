@@ -282,3 +282,118 @@ def test_delete_marker_before_unlink_failure_and_retry(tmp_path: Path, monkeypat
     assert not record.journal_path.exists()
     assert json.loads(record.metadata_path.read_text())["replayability"] == "deleted"
     store.delete_owned_session(record.session_id, "owner")
+
+
+@pytest.mark.asyncio
+async def test_replay_send_failure_after_prefix_is_invariant_and_later_retries_all(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    record.journal_path.write_bytes(prepared_row(0) + prepared_row(1))
+
+    class PrefixFailClient(Client):
+        async def session_update(self, session_id, update) -> None:
+            if len(self.updates) == 1:
+                raise RuntimeError("transport")
+            await super().session_update(session_id, update)
+
+    client = PrefixFailClient()
+    journal = SessionJournal(store, record, client)
+    before = (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    )
+    with pytest.raises(RuntimeError, match="transport"):
+        await journal.send_replay()
+    after_failure = (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    )
+    assert after_failure == before
+    assert [item[1].field_meta["mimir.sequence"] for item in client.updates] == [0]
+    retry = Client()
+    await journal.send_replay(retry)
+    assert [item[1].field_meta["mimir.sequence"] for item in retry.updates] == [0, 1]
+    assert (
+        record.journal_path.read_bytes(),
+        record.journal_path.stat().st_mtime_ns,
+        record.metadata_path.read_bytes(),
+        record.metadata_path.stat().st_mtime_ns,
+        journal.next_sequence,
+    ) == before
+
+
+@pytest.mark.asyncio
+async def test_sent_failure_and_marker_failure_preserve_observed_send(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    client = Client()
+    journal = SessionJournal(store, record, client)
+    original = journal._append_durable
+    calls = 0
+
+    def fail_sent(body: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("sent")
+        original(body)
+
+    monkeypatch.setattr(journal, "_append_durable", fail_sent)
+    monkeypatch.setattr(store, "try_mark", lambda *args: False)
+    delivered = await journal.publish_live(update())
+    assert delivered is client.updates[0][1]
+    assert len(client.updates) == 1
+    assert json.loads(record.metadata_path.read_text())["replayability"] == "replayable"
+    with pytest.raises(RequestError, match="Internal error"):
+        await journal.publish_live(update("later"))
+    assert len(client.updates) == 1
+
+
+@pytest.mark.parametrize("operation,failure", [("ttl", "unlink"), ("ttl", "fsync"), ("delete", "unlink"), ("delete", "fsync")])
+def test_post_marker_cleanup_failure_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, failure: str) -> None:
+    store = SessionStore(tmp_path)
+    record = store.create_session("owner")
+    original_unlink = Path.unlink
+    original_fsync = store._fsync_parent
+    cleanup_calls = 0
+
+    if failure == "unlink":
+        def unlink(path: Path, *args, **kwargs) -> None:
+            nonlocal cleanup_calls
+            if path == record.journal_path and cleanup_calls == 0:
+                cleanup_calls += 1
+                raise OSError("unlink")
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+    else:
+        def fsync_parent() -> None:
+            nonlocal cleanup_calls
+            if cleanup_calls == 0:
+                cleanup_calls += 1
+                raise OSError("parent fsync")
+            original_fsync()
+
+        monkeypatch.setattr(store, "_fsync_parent", fsync_parent)
+
+    if operation == "ttl":
+        now_ns = record.journal_path.stat().st_mtime_ns + 86_400_000_000_001
+        store.sweep_expired(1, now_ns=now_ns)
+        metadata = json.loads(record.metadata_path.read_text())
+        assert metadata["replayability"] == "expired"
+        store.sweep_expired(1, now_ns=now_ns)
+    else:
+        with pytest.raises(OSError):
+            store.delete_owned_session(record.session_id, "owner")
+        metadata = json.loads(record.metadata_path.read_text())
+        assert metadata["replayability"] == "deleted"
+        store.delete_owned_session(record.session_id, "owner")
+
+    assert cleanup_calls == 1
+    assert not record.journal_path.exists()
