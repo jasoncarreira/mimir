@@ -129,6 +129,28 @@ def test_exact_turn_delivery_failure_propagates_before_lossy_fanout():
     assert _drain(bounded) == []
 
 
+def test_scrub_failure_remains_best_effort_without_exact_subscriber(monkeypatch):
+    bus = TurnEventBus()
+
+    def fail_scrub(event):
+        raise RuntimeError("scrub failed")
+
+    monkeypatch.setattr(turn_event_bus, "scrub_turn_event", fail_scrub)
+    bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
+
+
+def test_scrub_failure_propagates_with_exact_subscriber(monkeypatch):
+    bus = TurnEventBus()
+    bus.subscribe_exact_turn("t1")
+
+    def fail_scrub(event):
+        raise RuntimeError("scrub failed")
+
+    monkeypatch.setattr(turn_event_bus, "scrub_turn_event", fail_scrub)
+    with pytest.raises(RuntimeError, match="scrub failed"):
+        bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
+
+
 def test_emitter_propagates_exact_turn_delivery_failure():
     class FailingQueue(asyncio.Queue):
         def put_nowait(self, item):
@@ -140,6 +162,46 @@ def test_emitter_propagates_exact_turn_delivery_failure():
 
     with pytest.raises(RuntimeError, match="exact delivery failed"):
         emitter.turn_started()
+
+
+def test_token_chunk_propagates_exact_turn_delivery_failure():
+    from types import SimpleNamespace
+
+    class FailingQueue(asyncio.Queue):
+        def put_nowait(self, item):
+            raise RuntimeError("exact delivery failed")
+
+    bus = TurnEventBus()
+    bus._exact_turn_subscribers["t1"] = FailingQueue()
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="c")
+
+    with pytest.raises(RuntimeError, match="exact delivery failed"):
+        emitter.token_chunk(
+            SimpleNamespace(
+                tool_call_chunks=[
+                    {"index": 0, "id": "call_x", "name": "send_message", "args": ""}
+                ]
+            )
+        )
+
+
+def test_blocks_from_messages_propagates_exact_turn_delivery_failure():
+    class FailingQueue(asyncio.Queue):
+        def put_nowait(self, item):
+            raise RuntimeError("exact delivery failed")
+
+    bus = TurnEventBus()
+    bus._exact_turn_subscribers["t1"] = FailingQueue()
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="c")
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "call_x", "name": "send_message", "args": {}}],
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="exact delivery failed"):
+        emitter.blocks_from_messages(messages)
 
 
 def test_exact_and_lossy_receive_same_scrubbed_event(monkeypatch):
