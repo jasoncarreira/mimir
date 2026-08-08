@@ -256,7 +256,7 @@ class MimirAcpAgent:
         client: Client,
     ) -> PromptResponse:
         try:
-            record = self._store.load_owned(session_id, owner)
+            record = self._store.load_owned_live(session_id, owner)
             journal = self._journals.open(record, client)
         except RequestError:
             raise

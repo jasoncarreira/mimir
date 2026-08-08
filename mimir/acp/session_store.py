@@ -97,6 +97,28 @@ class SessionStore:
             raise _unavailable("io_failed") from None
         return self._record(payload, journal, metadata)
 
+    def load_owned_live(self, session_id: str, owner_principal: str) -> SessionRecord:
+        journal, metadata = self.paths(session_id)
+        try:
+            self._validate_file(metadata)
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+            self._validate_payload(payload, session_id)
+        except RequestError:
+            raise
+        except BaseException:
+            raise _invalid_session() from None
+        if payload["owner_principal"] != owner_principal:
+            raise _invalid_session()
+        if payload["lifecycle"] != "active" or payload["replayability"] not in {"replayable", "overflowed"}:
+            raise _unavailable(str(payload["replayability"]))
+        if payload["replayability"] == "replayable":
+            try:
+                self._validate_file(journal)
+            except BaseException:
+                self.try_mark(session_id, owner_principal, "io_failed")
+                raise _unavailable("io_failed") from None
+        return self._record(payload, journal, metadata)
+
     def mark(self, session_id: str, owner_principal: str, reason: Replayability) -> SessionRecord:
         journal, metadata = self.paths(session_id)
         self._validate_file(metadata)
