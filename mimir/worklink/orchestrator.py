@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
+import contextlib
 import os
 from pathlib import Path
 import re
@@ -2478,49 +2479,48 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-#: Settings a worker-written ``.git/config`` could use to redirect the push or
-#: execute code during it. Removed from the CHECKOUT's own config, so the
-#: deployment's global credential helper and ssh setup keep working.
-_WORKER_SCRUBBED_GIT_KEYS = (
-    "credential.helper",
-    "core.sshCommand",
-    "core.askpass",
-    "core.pager",
-    "core.editor",
-    "uploadpack.packObjectsHook",
-)
-_WORKER_SCRUBBED_GIT_SECTIONS = ("url",)
+#: A minimal, controller-authored repository config. Everything the push needs
+#: is passed explicitly (destination URL and oid refspec), so nothing else has
+#: to be present -- and anything absent cannot be attacker-controlled.
+_CONTROLLER_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
 
 
-def _scrub_checkout_git_config(checkout: Path) -> None:
-    """Remove worker-settable redirect/execute keys from the checkout's config.
+@contextlib.contextmanager
+def _controller_git_context(checkout: Path):
+    """Run a Git command against the checkout's OBJECTS with the controller's config.
 
-    Deliberately a direct subprocess rather than the injected runner: the runner
-    routes contained work to the worker, and sanitising the worker's own config
-    through the worker would be circular.
+    Deleting worker-set keys one by one does not work: ``include.path`` and
+    ``includeIf.*.path`` pull in a worker-controlled file that reintroduces
+    ``credential.helper``, ``core.sshCommand`` or ``url.*.insteadOf`` after the
+    delete. Verified -- unsetting credential.helper leaves it still resolving
+    through the include.
 
-    Best effort per key -- git exits non-zero when a key is simply absent, which
-    is the common case.
+    So the config is REPLACED for the duration rather than edited. There is no
+    key list to keep current and no indirection to chase, because the file the
+    worker wrote is not consulted at all.
     """
-    for key in _WORKER_SCRUBBED_GIT_KEYS:
-        subprocess.run(  # noqa: S603
-            ["git", "-C", str(checkout), "config", "--local", "--unset-all", key],
-            capture_output=True, text=True, check=False,
-        )
-    for section in _WORKER_SCRUBBED_GIT_SECTIONS:
-        # url.<base>.insteadOf rewrites the destination; sections need removing
-        # wholesale because the middle component is attacker-chosen.
-        listing = subprocess.run(  # noqa: S603
-            ["git", "-C", str(checkout), "config", "--local", "--name-only", "--list"],
-            capture_output=True, text=True, check=False,
-        )
-        for line in (listing.stdout or "").splitlines():
-            if line.startswith(f"{section}.") and line.count(".") >= 2:
-                name = ".".join(line.split(".")[:-1])
-                subprocess.run(  # noqa: S603
-                    ["git", "-C", str(checkout), "config", "--local", "--remove-section", name],
-                    capture_output=True, text=True, check=False,
-                )
+    git_dir = checkout / ".git"
+    if not git_dir.is_dir():
+        # Nothing to neutralise (a bare path or a caller that manages its own
+        # repository). Do not fabricate a config here -- creating one would be a
+        # side effect on a directory this function does not own.
+        yield
+        return
+    config = git_dir / "config"
+    stashed = git_dir / "config.worklink-controller-swap"
+    swapped = False
+    try:
+        if config.exists():
+            config.rename(stashed)
+            swapped = True
+        config.write_text(_CONTROLLER_GIT_CONFIG, encoding="utf-8")
+        yield
+    finally:
+        if swapped:
+            config.unlink(missing_ok=True)
+            stashed.rename(config)
+        elif config.exists():
+            config.unlink(missing_ok=True)
 
 
 def _git_push(
@@ -2573,17 +2573,17 @@ def _git_push(
     # deployment's `gh auth setup-git` helper and leaves a token-free HTTPS URL
     # with no credential at all. The local bare-remote regression cannot see
     # that, because file:// transport needs no credential.
-    _scrub_checkout_git_config(repo)
-    result = runner([
-        "git", "-C", str(repo),
-        # Execution settings can be overridden safely -- none of these are
-        # supplied by the deployment, so clearing them removes only the risk.
-        "-c", "core.hooksPath=/dev/null",
-        "-c", "core.fsmonitor=",
-        "-c", "diff.external=",
-        "-c", "core.askpass=",
-        "push", "-u", destination, refspec,
-    ])
+    with _controller_git_context(repo):
+        result = runner([
+            "git", "-C", str(repo),
+            # Belt and braces on top of the replaced config: these are never
+            # supplied by the deployment, so clearing them removes only risk.
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=",
+            "-c", "diff.external=",
+            "-c", "core.askpass=",
+            "push", "-u", destination, refspec,
+        ])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 
