@@ -56,28 +56,33 @@ class CoreAgent:
         self.write_todos = False
         self.pressure = 0
         self.gate: asyncio.Event | None = None
+        self.call_gates: list[asyncio.Event] | None = None
+        self.fail_calls: set[int] = set()
+        self.cancel_calls: set[int] = set()
         self.entered = asyncio.Event()
         self.subscriptions: list[Any] = []
         self.replacement_subscription: asyncio.Queue[dict[str, Any]] | None = None
 
     async def run_turn(self, event: Any, **kwargs: Any) -> None:
         self.calls.append((event, kwargs))
+        call_index = len(self.calls) - 1
         turn_id = kwargs["turn_id"]
         self.subscriptions.append(self.bus._exact_turn_subscribers.get(turn_id))
         if self.replacement_subscription is not None:
             self.bus._exact_turn_subscribers[turn_id] = self.replacement_subscription
         self.entered.set()
-        if self.gate is not None:
-            await self.gate.wait()
+        gate = self.call_gates[call_index] if self.call_gates is not None else self.gate
+        if gate is not None:
+            await gate.wait()
         common = {"turn_id": turn_id, "channel_id": event.channel_id, "seq": 1, "ts": "now"}
         for index in range(self.pressure):
             self.bus.publish({**common, "type": "reasoning", "phase": "chunk", "content": str(index)})
         tool_name = "write_todos" if self.write_todos else "lookup"
         tool_id = "canonical-tool-id"
         self.bus.publish({**common, "type": "tool_call", "phase": "start", "id": tool_id, "tool_name": tool_name})
-        if self.cancel:
+        if self.cancel or call_index in self.cancel_calls:
             raise asyncio.CancelledError
-        if self.fail:
+        if self.fail or call_index in self.fail_calls:
             raise RuntimeError("private failure detail")
         args = ({"todos": [{"content": "ship", "status": "pending"}]} if self.write_todos else {"token": "hidden", "query": "x"})
         self.bus.publish({**common, "type": "tool_call", "phase": "end", "id": tool_id, "tool_name": tool_name, "args": args})
@@ -217,7 +222,13 @@ async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> N
     assert raised.value.to_error_obj() == sdk.internal_error().to_error_obj()
     assert _types(client) == ["user_message_chunk", "tool_call", "tool_call_update"]
     assert client.updates[-1].status == "failed"
+    assert session_id not in agent._active_prompts
     assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
+
+    core.cancel = False
+    response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="after cancel")])
+    assert response.stop_reason == "end_turn"
+    assert session_id not in agent._active_prompts
 
 
 async def test_additional_directories_are_rejected_before_creation(tmp_path: Path) -> None:
@@ -248,10 +259,13 @@ async def test_one_active_prompt_per_session_and_guard_releases(tmp_path: Path) 
     assert [update.content.text for update in client.updates if update.session_update == "user_message_chunk"] == ["first"]
 
 
-async def test_connection_replacement_invalidates_and_releases_active_prompt(tmp_path: Path) -> None:
+async def test_connection_replacement_old_cleanup_preserves_successor_ownership(tmp_path: Path) -> None:
     agent, _, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id
-    core.gate = asyncio.Event()
+    old_gate = asyncio.Event()
+    successor_gate = asyncio.Event()
+    core.call_gates = [old_gate, successor_gate]
+    core.fail_calls = {0}
     running = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")]))
     await core.entered.wait()
 
@@ -259,9 +273,20 @@ async def test_connection_replacement_invalidates_and_releases_active_prompt(tmp
     agent.on_connect(replacement)
     assert session_id not in agent._active_prompts
     assert agent._environments == {}
-    core.gate.set()
+    await agent.load_session("/replacement", session_id)
+    successor = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="successor")]))
+    while len(core.calls) < 2:
+        await asyncio.sleep(0)
+    successor_token = agent._active_prompts[session_id]
+
+    old_gate.set()
     with pytest.raises(sdk.RequestError):
         await running
+    assert agent._active_prompts.get(session_id) is successor_token
+
+    successor_gate.set()
+    response = await successor
+    assert response.stop_reason == "end_turn"
     assert session_id not in agent._active_prompts
 
 
@@ -277,6 +302,12 @@ async def test_normal_core_failure_terminalizes_and_redacts(tmp_path: Path) -> N
     assert _types(client) == ["user_message_chunk", "tool_call", "tool_call_update"]
     assert client.updates[1].tool_call_id == client.updates[2].tool_call_id == "canonical-tool-id"
     assert client.updates[2].status == "failed"
+    assert session_id not in agent._active_prompts
+
+    core.fail = False
+    response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="after failure")])
+    assert response.stop_reason == "end_turn"
+    assert session_id not in agent._active_prompts
 
 
 async def test_write_todos_emits_complete_replacement_plan(tmp_path: Path) -> None:
