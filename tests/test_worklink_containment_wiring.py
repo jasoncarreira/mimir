@@ -354,6 +354,11 @@ def test_cancelling_before_the_supervisor_claims_still_publishes_a_result(
     from mimir.worklink.containment import ContainmentPolicy
 
     policy = ContainmentPolicy(user="nobody", spool_root=coding_on, verified=False)
+    # The SUPERVISOR resolves the cancellation. The controller cannot: results/
+    # is root-owned 0750 in production, so its write fails with EACCES and the
+    # waiter blocks for its full deadline. It only ever worked in tests, where
+    # the test owns the directory -- which is why this now drives the real loop.
+    supervisor.serve_forever(policy, poll_seconds=0, max_iterations=1)
     result = await_result(policy, proc.request_id, timeout_seconds=5)
     assert result.exit_status == 124
     assert "before the supervisor claimed it" in result.stderr

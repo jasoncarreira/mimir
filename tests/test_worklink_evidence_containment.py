@@ -11,6 +11,7 @@ never projected into a contained step.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -56,8 +57,8 @@ def test_remote_git_is_identified_regardless_of_leading_options(
 
 def test_the_test_command_runs_contained(tmp_path: Path, coding_on: Path) -> None:
     """The gate's command executes what the build wrote, so it runs contained."""
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
+    checkout = tmp_path / "repo" / ".worklink" / "441-a1"
+    checkout.mkdir(parents=True)
 
     import threading
 
@@ -90,8 +91,8 @@ def test_a_push_is_never_routed_into_containment(tmp_path: Path, coding_on: Path
     """
     from mimir.worklink.containment import request_dir
 
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
+    checkout = tmp_path / "repo" / ".worklink" / "441-a1"
+    checkout.mkdir(parents=True)
     _run(["git", "-C", str(checkout), "push", "-u", "origin", "nope"])
     assert not list(request_dir(coding_on).glob("*.json")), "push was spooled"
 
@@ -101,8 +102,8 @@ def test_evidence_steps_are_inert_without_the_coding_flag(
 ) -> None:
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("MIMIR_WORKLINK_SPOOL", str(tmp_path / "spool"))
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
+    checkout = tmp_path / "repo" / ".worklink" / "441-a1"
+    checkout.mkdir(parents=True)
     result = _run("echo direct", cwd=checkout)
     assert result.returncode == 0
     assert "direct" in result.stdout
@@ -133,8 +134,8 @@ def test_the_injected_orchestrator_runner_routes_through_containment(
     from mimir.worklink import evidence as evidence_mod
     from mimir.worklink.orchestrator import _runner_for_home
 
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
+    checkout = tmp_path / "repo" / ".worklink" / "441-a1"
+    checkout.mkdir(parents=True)
     seen: list[Path | None] = []
     sentinel = sp.CompletedProcess(args=["contained"], returncode=42, stdout="via-spool", stderr="")
 
@@ -211,3 +212,145 @@ def test_push_targets_the_observed_object_not_the_branch(tmp_path: Path) -> None
 
     _git_push(tmp_path, "issue/1-a1", runner=runner, oid="deadbeef")
     assert "deadbeef:refs/heads/issue/1-a1" in calls[0]
+
+
+def test_the_parent_repository_is_never_spooled(
+    tmp_path: Path, coding_on: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supervisor chowns whatever cwd it is handed, recursively.
+
+    `_finalize` runs `git -C <parent repo> status` for dirty-path checks on every
+    run. A deny-list router ("not the home, not remote") sent that to the
+    supervisor, which would have handed the operator's own source repository to
+    the worker uid. Reachable on every run, not a corner case.
+    """
+    from mimir.worklink.containment import request_dir
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    parent = tmp_path / "repo"
+    parent.mkdir()
+    # No mocking: the real router must decline, so this falls through to a direct
+    # subprocess and never reaches the spool. Mocking maybe_run_contained here
+    # would replace the very check under test.
+    runner = _runner_for_home(tmp_path / "home", "chainlink")
+    runner(["git", "-C", str(parent), "status", "--porcelain"])
+    spooled = list(request_dir(coding_on).glob("*.json"))
+    assert not spooled, f"the parent repository was spooled and would be chowned: {spooled}"
+
+
+@pytest.mark.parametrize(
+    ("path", "contained"),
+    [
+        ("repo/.worklink/441-a1", True),
+        ("repo/.worklink/441-a1/src/pkg", True),
+        ("repo", False),
+        ("repo/src", False),
+        ("home/agent", False),
+    ],
+)
+def test_only_attempt_checkouts_cross_the_boundary(
+    tmp_path: Path, path: str, contained: bool,
+) -> None:
+    from mimir.worklink.evidence import _is_attempt_checkout
+
+    target = tmp_path / path
+    target.mkdir(parents=True, exist_ok=True)
+    assert _is_attempt_checkout(target) is contained
+
+
+def test_push_disables_what_the_worker_owned_checkout_could_execute() -> None:
+    """The refspec pins WHAT is pushed; it does not pin what the push EXECUTES.
+
+    By push time the checkout is worker-owned, so its .git/config and hooks are
+    worker-written. pre-push, core.sshCommand and credential.helper would all run
+    as the controller, holding the credential.
+    """
+    from mimir.access_control import _MAINTENANCE_GIT_BASE_OVERRIDES
+    from mimir.worklink.orchestrator import _git_push
+
+    calls: list[list[str]] = []
+
+    def runner(args, cwd=None):  # noqa: ANN001, ANN202
+        calls.append(list(args))
+        import subprocess as sp
+
+        return sp.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+    _git_push(Path("/tmp/repo"), "issue/1-a1", runner=runner, oid="deadbeef")
+    argv = calls[0]
+    for override in _MAINTENANCE_GIT_BASE_OVERRIDES:
+        assert override in argv, f"{override} missing from the push argv"
+    assert "core.hooksPath=/dev/null" in argv
+    assert argv.index("push") > argv.index("-C"), "overrides must precede the subcommand"
+
+
+def test_worker_env_drops_variables_naming_the_controller_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rewriting HOME/XDG leaves variables that name a controller path outright.
+
+    OPENCODE_CONFIG=/home/mimir/... is the live example: the worker cannot read
+    it (0700) and it points at the identity being contained from.
+    """
+    from mimir.worklink.containment import ContainmentPolicy, worker_runtime_env
+
+    agent_home = tmp_path / "mimir-home"
+    agent_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
+    policy = ContainmentPolicy(user="nobody", spool_root=tmp_path, verified=True)
+    env = worker_runtime_env(
+        policy,
+        {
+            "OPENCODE_CONFIG": str(agent_home / "opencode.jsonc"),
+            "CODEX_HOME": str(agent_home / ".codex"),
+            "PATH": "/usr/bin:/bin",
+            "LANG": "en_US.UTF-8",
+        },
+    )
+    assert "OPENCODE_CONFIG" not in env
+    assert "CODEX_HOME" not in env
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["LANG"] == "en_US.UTF-8", "unrelated values must survive"
+
+
+def test_the_push_oid_comes_from_the_supervisors_own_read(tmp_path: Path) -> None:
+    """Not from `git rev-parse` stdout, which originates on the judged side."""
+    from mimir.worklink import supervisor as sup
+    from mimir.worklink.containment import (
+        ContainmentPolicy,
+        WorkerRequest,
+        await_result,
+        submit_request,
+    )
+
+    root = tmp_path / "spool"
+    sup.prepare_spool(root)
+    policy = ContainmentPolicy(user="nobody", spool_root=root, verified=False)
+    checkout = tmp_path / "repo" / ".worklink" / "441-a1"
+    checkout.mkdir(parents=True)
+    import subprocess as sp
+
+    for cmd in (["git", "init", "-q"], ["git", "add", "-A"]):
+        sp.run(cmd, cwd=checkout, capture_output=True, check=False)
+    (checkout / "f.txt").write_text("x")
+    sp.run(["git", "add", "-A"], cwd=checkout, capture_output=True, check=False)
+    sp.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "x"],
+        cwd=checkout, capture_output=True, check=False,
+    )
+    expected = sp.run(
+        ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    if not expected:
+        pytest.skip("git unavailable in this environment")
+
+    rid = submit_request(
+        policy,
+        WorkerRequest(
+            attempt_id="oid", argv=("true",), cwd=checkout,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")}, report_head=True,
+        ),
+    )
+    sup.serve_forever(policy, poll_seconds=0, max_iterations=1)
+    result = await_result(policy, rid, timeout_seconds=30)
+    assert result.head_oid == expected, "the supervisor must report the oid it read"

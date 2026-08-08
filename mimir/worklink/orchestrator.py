@@ -2466,7 +2466,18 @@ def _git_push(repo: Path, branch: str, *, runner: Runner, oid: str | None = None
         refspec = branch
     else:
         refspec = f"{oid}:refs/heads/{branch}"
-    result = runner(["git", "-C", str(repo), "push", "-u", "origin", refspec])
+    # The refspec pins WHAT is pushed; these pin what the push may EXECUTE. The
+    # checkout is worker-owned by this point, so its .git/config and hooks are
+    # worker-written: pre-push, core.sshCommand, credential.helper and
+    # diff.external all run as the controller, with the credential, unless
+    # disabled. Reuses the reviewed constant rather than restating the list.
+    from ..access_control import _MAINTENANCE_GIT_BASE_OVERRIDES
+
+    result = runner([
+        "git", "-C", str(repo), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", "core.hooksPath=/dev/null",
+        "push", "-u", "origin", refspec,
+    ])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 

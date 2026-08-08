@@ -605,7 +605,18 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     # #518: the attempt branch is pushed from the checkout that owns it (lease.path),
     # never from the parent repo — the isolated-checkout shape has the branch only
     # inside lease.path, so a parent-repo push fails "src refspec ... does not match".
-    assert ["git", "-C", str(worktree), "push", "-u", "origin", "issue/441-a1"] in calls
+    # Asserted by INTENT rather than exact argv: chainlink #1164 added the
+    # hardening overrides (the checkout is worker-owned by push time, so its
+    # hooks/config must not execute) and pins the refspec to the observed oid.
+    # Pinning the literal argv would have to be rewritten by any such change,
+    # and the property #518 cares about is which checkout it pushes FROM.
+    pushes = [c for c in calls if "push" in c and c[0] == "git"]
+    assert len(pushes) == 1, f"expected exactly one push, got {pushes}"
+    argv = pushes[0]
+    assert argv[argv.index("-C") + 1] == str(worktree), "must push from the lease checkout"
+    assert "-u" in argv and "origin" in argv
+    refspec = argv[-1]
+    assert refspec.endswith("issue/441-a1"), f"unexpected refspec {refspec}"
     assert not any(
         isinstance(c, list) and c[:3] == ["git", "-C", str(repo)] and len(c) > 3 and c[3] == "push"
         for c in calls

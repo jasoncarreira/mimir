@@ -361,13 +361,13 @@ def maybe_run_contained(
     Returns ``None`` -- meaning "run as before" -- when containment is not
     required (no coding flag) or when the step has no attempt checkout to run in.
     """
-    if checkout is None:
-        return None
-    if _is_under_agent_home(checkout):
-        # _runner_for_home points chainlink at the agent home. Those are
-        # controller operations on controller state -- containing them would
-        # both break chainlink and mean the worker had a home path, which is
-        # exactly what this boundary removes.
+    if checkout is None or not _is_attempt_checkout(checkout):
+        # ALLOW-LIST, deliberately. A deny-list ("not the home, not remote") sent
+        # `git -C <parent repo> status` to the supervisor, which chowns the cwd
+        # recursively before executing -- handing the operator's own source
+        # repository to the worker uid. _finalize calls this runner against
+        # self.repo for dirty-path and remote-url checks, so that was reachable
+        # on every run, not a corner case. Only an attempt checkout may cross.
         return None
     if _talks_to_the_remote(args):
         # Push, fetch and friends are CONTROLLER operations: they need the
@@ -405,15 +405,24 @@ def maybe_run_contained(
     )
 
 
-def _is_under_agent_home(path: Path) -> bool:
-    raw = os.environ.get("MIMIR_HOME", "").strip()
-    if not raw:
-        return False
+#: Attempt checkouts are created at ``<repo>/.worklink/<issue>-<attempt>``. That
+#: component is what marks a path as disposable, worker-owned build space rather
+#: than a repository the operator cares about.
+_ATTEMPT_CHECKOUT_MARKER = ".worklink"
+
+
+def _is_attempt_checkout(path: Path) -> bool:
+    """Whether ``path`` is inside a Worklink attempt checkout.
+
+    The supervisor chowns whatever it is handed, so this is the guard that keeps
+    it away from the parent repository and the agent home alike. Being wrong in
+    the permissive direction here is destructive, not merely over-contained.
+    """
     try:
-        home = Path(raw).expanduser().resolve()
-        return home == path.resolve() or home in path.resolve().parents
+        parts = path.resolve().parts
     except OSError:  # pragma: no cover
-        return False
+        parts = path.parts
+    return _ATTEMPT_CHECKOUT_MARKER in parts
 
 
 #: Git subcommands that contact the remote, and therefore need the controller's

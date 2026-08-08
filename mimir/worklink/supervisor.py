@@ -297,6 +297,30 @@ def serve_forever(
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
+        # A cancellation whose request was never claimed leaves no one to
+        # publish a result. The controller cannot do it either -- results/ is
+        # root-owned 0750, so its write fails with EACCES and the waiter blocks
+        # for its full deadline. This service owns that directory, so it closes
+        # the loop here.
+        for marker in sorted(requests.glob("*.cancel")):
+            request_id = marker.stem
+            if (requests / f"{request_id}.json").exists():
+                continue  # still queued; the normal path will pick it up
+            if (result_dir(policy.spool_root) / f"{request_id}.json").exists():
+                marker.unlink(missing_ok=True)
+                continue
+            _publish(
+                result_dir(policy.spool_root),
+                request_id,
+                WorkerResult(
+                    attempt_id=request_id,
+                    exit_status=124,
+                    stdout="",
+                    stderr="worklink: step cancelled before the supervisor claimed it",
+                    timed_out=True,
+                ),
+            )
+            marker.unlink(missing_ok=True)
         for entry in sorted(requests.glob("*.json")):
             try:
                 handle_one_request(policy, entry)

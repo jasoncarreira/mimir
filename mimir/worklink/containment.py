@@ -88,6 +88,7 @@ __all__ = [
     "run_contained",
     "worker_runtime_env",
     "worker_home",
+    "observe_head_via_supervisor",
     "spawn_argv",
     "request_dir",
     "result_dir",
@@ -335,10 +336,17 @@ def worker_runtime_env(policy: ContainmentPolicy, base: dict[str, str]) -> dict[
     So the worker gets its own home and XDG tree, derived from the account
     itself rather than from configuration that could disagree with reality.
     """
+    controller_homes = _controller_home_paths()
     env = {
         key: value
         for key, value in base.items()
-        if key not in _NEVER_PROJECTED and key not in _CONTROLLER_RUNTIME_KEYS
+        if key not in _NEVER_PROJECTED
+        and key not in _CONTROLLER_RUNTIME_KEYS
+        # Rewriting HOME/XDG is not enough on its own: variables that name a
+        # controller path OUTRIGHT survive it. OPENCODE_CONFIG=/home/mimir/... is
+        # the live example -- the worker cannot read it (0700) and it points at
+        # the identity being contained from.
+        and not _points_into(value, controller_homes)
     }
     home = worker_home(policy)
     if home is None:
@@ -351,6 +359,29 @@ def worker_runtime_env(policy: ContainmentPolicy, base: dict[str, str]) -> dict[
     env["XDG_DATA_HOME"] = str(home / ".local" / "share")
     env["XDG_STATE_HOME"] = str(home / ".local" / "state")
     return env
+
+
+def _controller_home_paths() -> tuple[Path, ...]:
+    """Directories a contained step must never be pointed at."""
+    paths: list[Path] = []
+    for raw in (os.environ.get("MIMIR_HOME", ""), os.path.expanduser("~")):
+        if not raw or not raw.strip():
+            continue
+        try:
+            paths.append(Path(raw).expanduser().resolve())
+        except OSError:  # pragma: no cover
+            continue
+    return tuple(paths)
+
+
+def _points_into(value: str, roots: tuple[Path, ...]) -> bool:
+    if not value or not value.startswith("/") or not roots:
+        return False
+    try:
+        candidate = Path(value).resolve()
+    except OSError:  # pragma: no cover
+        return False
+    return any(root == candidate or root in candidate.parents for root in roots)
 
 
 def worker_home(policy: ContainmentPolicy) -> Path | None:
@@ -613,3 +644,27 @@ def observe_head(checkout: Path) -> str | None:
         return None
     oid = proc.stdout.strip()
     return oid if proc.returncode == 0 and oid else None
+
+
+def observe_head_via_supervisor(policy: ContainmentPolicy, checkout: Path) -> str | None:
+    """Ask the supervisor to read HEAD and report what IT saw.
+
+    Distinct from parsing ``git rev-parse`` stdout: that is output from a command
+    run by the worker, so the value gating the push would originate on the side
+    being judged. ``report_head`` makes the root observer read the checkout after
+    the step, which is the provenance the push needs.
+    """
+    if not policy.contained:
+        return None
+    result = run_contained(
+        policy,
+        WorkerRequest(
+            attempt_id=f"observe-{checkout.name}",
+            argv=("true",),
+            cwd=checkout,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout_seconds=60.0,
+            report_head=True,
+        ),
+    )
+    return result.head_oid
