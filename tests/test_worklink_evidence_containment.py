@@ -12,6 +12,7 @@ never projected into a contained step.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -476,9 +477,37 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
         captured.append(result)
         return result
 
-    _git_push(work, "issue/441-a1", runner=runner, oid=oid, remote_url=str(remote))
+    # A worker process that survives the verdict and attacks the config path.
+    # The previous implementation renamed and rewrote <checkout>/.git/config in
+    # place, so this could redirect a controller write to an arbitrary path or
+    # swap attacker config back before git opened it.
+    victim = tmp_path / "controller-would-clobber-this"
+    attacker_stop = threading.Event()
+
+    def attack() -> None:
+        cfg = work / ".git" / "config"
+        while not attacker_stop.is_set():
+            try:
+                if not cfg.is_symlink():
+                    cfg.unlink(missing_ok=True)
+                    cfg.symlink_to(victim)
+            except OSError:
+                pass
+
+    attacker = threading.Thread(target=attack, daemon=True)
+    attacker.start()
+    try:
+        _git_push(work, "issue/441-a1", runner=runner, oid=oid, remote_url=str(remote))
+    finally:
+        attacker_stop.set()
+        attacker.join(timeout=5)
+
+    assert not victim.exists(), "the controller wrote through a worker-planted symlink"
 
     assert captured[0].returncode == 0, f"push failed: {captured[0].stderr}"
+    # Git must not have been pointed at the checkout at all.
+    pushed_from = captured[0].args[captured[0].args.index("-C") + 1]
+    assert str(work) != pushed_from, "the push ran inside the worker-owned checkout"
     assert "PLANTED" not in captured[0].stderr, "the worker-planted pre-push hook ran"
     landed = sp.run(
         ["git", "rev-parse", "refs/heads/issue/441-a1"],
@@ -494,11 +523,11 @@ def test_the_hardened_push_actually_works_against_a_real_remote(tmp_path: Path) 
         cwd=decoy, capture_output=True, text=True, check=False,
     ).stdout.strip()
     assert decoy_ref != oid, "the worker's url.*.insteadOf redirected the push"
-    # And the worker's own config is left as it was -- neutralised during the
-    # push, not destroyed.
-    assert git("config", "--get", "include.path", cwd=work).stdout.strip() == str(evil), (
-        "the worker's config must be restored after the push"
-    )
+    # No assertion that the checkout's config is "restored": the controller
+    # never modifies it now. The attacker thread above is what mangles it, and
+    # that is exactly the point -- the push succeeded, landed the right object,
+    # and honoured none of the worker's config while an attacker was actively
+    # rewriting that file.
 
 
 def test_an_unregistered_worklink_path_is_declined(

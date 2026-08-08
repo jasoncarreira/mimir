@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
 import contextlib
+import tempfile
 import os
 from pathlib import Path
 import re
@@ -2479,48 +2480,45 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-#: A minimal, controller-authored repository config. Everything the push needs
-#: is passed explicitly (destination URL and oid refspec), so nothing else has
-#: to be present -- and anything absent cannot be attacker-controlled.
-_CONTROLLER_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
-
-
 @contextlib.contextmanager
 def _controller_git_context(checkout: Path):
-    """Run a Git command against the checkout's OBJECTS with the controller's config.
+    """Yield a controller-owned bare repo that can see the checkout's objects.
 
-    Deleting worker-set keys one by one does not work: ``include.path`` and
-    ``includeIf.*.path`` pull in a worker-controlled file that reintroduces
-    ``credential.helper``, ``core.sshCommand`` or ``url.*.insteadOf`` after the
-    delete. Verified -- unsetting credential.helper leaves it still resolving
-    through the include.
+    Git never opens anything inside the checkout. An earlier version renamed and
+    rewrote ``<checkout>/.git/config`` in place, which is racy by construction:
+    the directory belongs to the worker, so a process surviving the evidence
+    verdict can replace ``config`` with a symlink before the controller writes
+    (turning that write into an arbitrary-path write AS THE CONTROLLER), or swap
+    attacker config back between the write and git opening it. You cannot make a
+    write into attacker-owned space safe by ordering it carefully.
 
-    So the config is REPLACED for the duration rather than edited. There is no
-    key list to keep current and no indirection to chase, because the file the
-    worker wrote is not consulted at all.
+    Instead the push runs from a repository created under the controller's own
+    temporary directory, mode 0700, with the checkout's object store attached
+    read-only through ``objects/info/alternates``. Alternates is consulted by the
+    object layer alone -- no config, no hooks, no remotes from the checkout.
+
+    Substituting objects is not a risk worth guarding separately: git objects are
+    content-addressed, so an oid either resolves to exactly the bytes that
+    hashed to it or does not resolve at all.
     """
-    git_dir = checkout / ".git"
-    if not git_dir.is_dir():
-        # Nothing to neutralise (a bare path or a caller that manages its own
-        # repository). Do not fabricate a config here -- creating one would be a
-        # side effect on a directory this function does not own.
-        yield
-        return
-    config = git_dir / "config"
-    stashed = git_dir / "config.worklink-controller-swap"
-    swapped = False
+    scratch = Path(tempfile.mkdtemp(prefix="worklink-push-"))
     try:
-        if config.exists():
-            config.rename(stashed)
-            swapped = True
-        config.write_text(_CONTROLLER_GIT_CONFIG, encoding="utf-8")
-        yield
+        os.chmod(scratch, 0o700)
+        bare = scratch / "git"
+        init = subprocess.run(  # noqa: S603
+            ["git", "init", "--bare", "-q", str(bare)],
+            capture_output=True, text=True, check=False,
+        )
+        if init.returncode != 0:
+            raise WorklinkError(
+                (init.stderr or init.stdout).strip() or "could not create the push context",
+            )
+        alternates = bare / "objects" / "info" / "alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(f"{checkout / '.git' / 'objects'}\n", encoding="utf-8")
+        yield bare
     finally:
-        if swapped:
-            config.unlink(missing_ok=True)
-            stashed.rename(config)
-        elif config.exists():
-            config.unlink(missing_ok=True)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _git_push(
@@ -2573,17 +2571,25 @@ def _git_push(
     # deployment's `gh auth setup-git` helper and leaves a token-free HTTPS URL
     # with no credential at all. The local bare-remote regression cannot see
     # that, because file:// transport needs no credential.
-    with _controller_git_context(repo):
-        result = runner([
-            "git", "-C", str(repo),
-            # Belt and braces on top of the replaced config: these are never
-            # supplied by the deployment, so clearing them removes only risk.
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "core.fsmonitor=",
-            "-c", "diff.external=",
-            "-c", "core.askpass=",
-            "push", "-u", destination, refspec,
-        ])
+    if oid is None:
+        # Without an oid there is nothing to push from a detached context: the
+        # branch ref lives in the checkout, which this deliberately does not
+        # read. The fail-closed branch above already covers the contained case.
+        result = runner(["git", "-C", str(repo), "push", "-u", destination, refspec])
+    else:
+        with _controller_git_context(repo) as context:
+            # Push the oid directly from the controller-owned repo. `-u` is
+            # meaningless here (no local branch to track) and `origin` does not
+            # exist in this context, which is the point -- the destination is the
+            # explicit URL the controller resolved.
+            result = runner([
+                "git", "-C", str(context),
+                "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=",
+                "-c", "diff.external=",
+                "-c", "core.askpass=",
+                "push", destination, f"{oid}:refs/heads/{branch}",
+            ])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 
