@@ -57,6 +57,10 @@ def test_wheel_guard_requires_complete_acp_seed() -> None:
         "mimir/acp/bootstrap.py",
         "mimir/acp/composition.py",
         "mimir/acp/host.py",
+        "mimir/acp/bridge.py",
+        "mimir/acp/journal.py",
+        "mimir/acp/session_store.py",
+        "mimir/acp/updates.py",
         "mimir/acp/sdk.py",
         "mimir/acp/stdio.py",
     }
