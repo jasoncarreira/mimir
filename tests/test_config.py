@@ -117,9 +117,11 @@ class TestParseSourcesTokens:
 
     def test_default_sources_string(self) -> None:
         """The default string hard-coded in from_env produces the expected set."""
-        raw = "slack,discord,bluesky,web,stdin"
+        raw = "slack,discord,bluesky,web,stdin,acp"
         result = _parse_sources(raw)
-        assert result == frozenset({"slack", "discord", "bluesky", "web", "stdin"})
+        assert result == frozenset(
+            {"slack", "discord", "bluesky", "web", "stdin", "acp"}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +499,29 @@ class TestConfigFromEnv:
         assert cfg.turns_archive_dir == tmp_path.resolve()
 
     def test_recent_sources_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Default MIMIR_RECENT_SOURCES includes the five standard channels."""
         self._base(monkeypatch)
         monkeypatch.delenv("MIMIR_RECENT_SOURCES", raising=False)
         from mimir.config import Config
-        cfg = Config.from_env()
-        # Default string is "slack,discord,bluesky,web,stdin"
-        assert isinstance(cfg.recent_sources, frozenset)
-        assert "discord" in cfg.recent_sources
-        assert "slack" in cfg.recent_sources
+
+        assert Config.from_env().recent_sources == frozenset(
+            {"slack", "discord", "bluesky", "web", "stdin", "acp"}
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("", frozenset()), ("discord", frozenset({"discord"}))],
+    )
+    def test_recent_sources_explicit_policy_is_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        value: str,
+        expected: frozenset[str],
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_RECENT_SOURCES", value)
+        from mimir.config import Config
+
+        assert Config.from_env().recent_sources == expected
 
     def test_recent_sources_star_allows_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._base(monkeypatch)
@@ -513,6 +529,31 @@ class TestConfigFromEnv:
         from mimir.config import Config
         cfg = Config.from_env()
         assert cfg.recent_sources is None
+
+    def test_acp_journal_ttl_default_and_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_ACP_JOURNAL_TTL_DAYS", raising=False)
+        from mimir.config import Config
+
+        assert Config.from_env().acp_journal_ttl_days == 7
+        monkeypatch.setenv("MIMIR_ACP_JOURNAL_TTL_DAYS", "30")
+        assert Config.from_env().acp_journal_ttl_days == 30
+
+    @pytest.mark.parametrize("value", ["", "0", "-1", "+7", "1.5", "seven"])
+    def test_acp_journal_ttl_rejects_non_positive_decimal_values(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_ACP_JOURNAL_TTL_DAYS", value)
+        from mimir.config import Config
+
+        with pytest.raises(
+            ValueError,
+            match="MIMIR_ACP_JOURNAL_TTL_DAYS must be a positive decimal integer",
+        ):
+            Config.from_env()
 
     def test_home_dotenv_loads_defaults(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("MIMIR_HOME", str(tmp_path))

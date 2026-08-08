@@ -197,6 +197,18 @@ def test_every_core_mimir_name_has_a_reference_entry():
     )
 
 
+def test_acp_journal_ttl_reference_contract():
+    rows = [
+        line
+        for line in DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| `MIMIR_ACP_JOURNAL_TTL_DAYS`")
+    ]
+    assert rows == [
+        "| `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | "
+        "Days to retain replayable ACP session journals before expiry. |"
+    ]
+
+
 def test_allowlist_entries_are_actually_read():
     stale = sorted(ALLOWLIST - _scan_core())
     assert not stale, (
