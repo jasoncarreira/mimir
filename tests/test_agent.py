@@ -4452,3 +4452,113 @@ async def test_run_turn_streams_tool_call_arg_deltas(tmp_path: Path):
     assert starts[0]["tool_name"] == "send_message"
     # The reply streamed token-by-token as tool-call arg deltas.
     assert "".join(c["args_delta"] for c in chunks) == '{"text":"hi there"}'
+
+
+async def test_run_turn_explicit_session_thread_reuses_bound_lifecycle(tmp_path: Path):
+    class _ContextCapturingAgent(_FakeAgent):
+        def __init__(self) -> None:
+            super().__init__(response_messages=[AIMessage(content="done")])
+            self.observed_context = None
+
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            self.observed_context = context
+            async for item in super().astream(
+                state,
+                config=config,
+                context=context,
+                stream_mode=stream_mode,
+            ):
+                yield item
+
+    fake_agent = _ContextCapturingAgent()
+    sessions = _FakeSessionManager()
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_agent,
+        session_manager=sessions,
+    )
+    bound_auth = AuthContext(
+        principal="owner",
+        canonical_principal="owner",
+        roles=("admin",),
+        event_ingress="acp",
+        trigger="user_message",
+        channel_id="acp:session",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp:session",
+        content="hello",
+        author="owner",
+        source="acp",
+        extra={"channel_visibility": "private"},
+        continuation_auth_context=bound_auth,
+    )
+
+    record = await agent.run_turn(
+        event,
+        turn_id="turn-explicit",
+        session_id="acp:session",
+        saga_session_id="acp:thread",
+    )
+
+    assert record.turn_id == "turn-explicit"
+    assert record.session_id == "acp:session"
+    assert record.saga_session_id == "acp:thread"
+    assert sessions.touch_calls == []
+    assert sessions.increment_calls == []
+    assert fake_agent.invocations[0]["config"]["configurable"]["thread_id"] == "acp:thread"
+    assert fake_agent.observed_context.canonical_principal == "owner"
+    assert fake_agent.observed_context.enforcement_enabled is True
+    assert fake_agent.observed_context.egress_state is bound_auth.egress_state
+
+
+async def test_run_turn_bound_cancellation_emits_error_not_success(tmp_path: Path):
+    from mimir.turn_event_bus import TurnEventBus
+
+    class _CancellingAgent(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            if False:
+                yield None
+            raise asyncio.CancelledError
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_CancellingAgent(response_messages=[]),
+    )
+    bus = TurnEventBus()
+    agent._turn_event_bus = bus
+    queue = bus.subscribe("acp:cancelled")
+    bound_auth = AuthContext(
+        principal="owner",
+        canonical_principal="owner",
+        roles=("admin",),
+        event_ingress="acp",
+        trigger="user_message",
+        channel_id="acp:cancelled",
+        interactivity=None,
+        enforcement_enabled=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await agent.run_turn(
+            AgentEvent(
+                trigger="user_message",
+                channel_id="acp:cancelled",
+                content="hello",
+                continuation_auth_context=bound_auth,
+            ),
+            turn_id="turn-cancelled",
+            session_id="acp:cancelled",
+            saga_session_id="acp:thread",
+        )
+
+    received = []
+    while not queue.empty():
+        received.append(queue.get_nowait())
+    terminal = [event for event in received if event["phase"] == "end"]
+    assert len(terminal) == 1
+    assert terminal[0]["status"] == "error"
+    assert terminal[0]["turn_id"] == "turn-cancelled"
