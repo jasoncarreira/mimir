@@ -57,6 +57,10 @@ def test_wheel_guard_requires_complete_acp_seed() -> None:
         "mimir/acp/bootstrap.py",
         "mimir/acp/composition.py",
         "mimir/acp/host.py",
+        "mimir/acp/bridge.py",
+        "mimir/acp/journal.py",
+        "mimir/acp/session_store.py",
+        "mimir/acp/updates.py",
         "mimir/acp/sdk.py",
         "mimir/acp/stdio.py",
     }
@@ -113,3 +117,9 @@ def test_dockerfile_lists_acp_as_available_extra() -> None:
 #   mcp, acp                                    (Model Context Protocol)
 #
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"''' in dockerfile
+
+
+def test_wheel_guard_matches_finite_acp_source_inventory() -> None:
+    members = {member for member in _required_wheel_members() if member.startswith("mimir/acp/")}
+    sources = {f"mimir/acp/{path.name}" for path in (ROOT / "mimir" / "acp").glob("*.py")}
+    assert members == sources
