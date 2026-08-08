@@ -101,6 +101,10 @@ def test_nonregular_journal_is_rejected_without_output(tmp_path: Path) -> None:
         store.load_owned(record.session_id, "owner")
 
 
+def test_journal_capacity_is_exactly_64_mib() -> None:
+    assert journal_module.MAX_JOURNAL_BYTES == 64 * 1024 * 1024 == 67_108_864
+
+
 @pytest.mark.asyncio
 async def test_publish_orders_prepared_fsync_send_sent_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = SessionStore(tmp_path)
@@ -189,6 +193,7 @@ async def test_capacity_equality_then_overflow_writes_no_pair_and_continues_live
     assert len(client.updates) == 3
     assert [item[1].field_meta["mimir.sequence"] for item in client.updates] == [0, 1, 2]
     assert json.loads(record.metadata_path.read_text())["replayability"] == "overflowed"
+    assert sorted(path.name for path in store.root.iterdir()) == [record.journal_path.name, record.metadata_path.name]
     assert capsys.readouterr().err.count("capacity exceeded") == 1
 
 

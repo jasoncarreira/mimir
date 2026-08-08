@@ -76,7 +76,7 @@ class CoreAgent:
             await gate.wait()
         common = {"turn_id": turn_id, "channel_id": event.channel_id, "seq": 1, "ts": "now"}
         for index in range(self.pressure):
-            self.bus.publish({**common, "type": "reasoning", "phase": "chunk", "content": str(index)})
+            self.bus.publish({**common, "type": "tool_call", "phase": "start", "id": f"pressure-{index}", "tool_name": "lookup"})
         tool_name = "write_todos" if self.write_todos else "lookup"
         tool_id = "canonical-tool-id"
         self.bus.publish({**common, "type": "tool_call", "phase": "start", "id": tool_id, "tool_name": tool_name})
@@ -431,8 +431,8 @@ async def test_exact_updates_survive_presentation_pressure(tmp_path: Path) -> No
     await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
 
     assert presentation.qsize() == 256
-    assert "tool_call" in _types(client)
-    assert [update.tool_call_id for update in client.updates if update.session_update in {"tool_call", "tool_call_update"}] == ["canonical-tool-id"] * 3
+    mapped_ids = [update.tool_call_id for update in client.updates if update.session_update in {"tool_call", "tool_call_update"}]
+    assert mapped_ids == [*(f"pressure-{index}" for index in range(300)), *(["canonical-tool-id"] * 3)]
     agent._bundle.turn_event_bus.unsubscribe(channel, presentation)
 
 
@@ -450,3 +450,39 @@ async def test_finally_unsubscribes_only_its_exact_queue_identity(tmp_path: Path
     assert core.subscriptions[0] is not replacement
     assert agent._bundle.turn_event_bus._exact_turn_subscribers[turn_id] is replacement
     agent._bundle.turn_event_bus.unsubscribe_exact_turn(turn_id, replacement)
+
+
+async def test_overflowed_session_accepts_later_live_prompts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mimir.acp.journal as journal_module
+
+    monkeypatch.setattr(journal_module, "MAX_JOURNAL_BYTES", 1)
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+
+    first = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")])
+    second = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
+
+    assert first.stop_reason == second.stop_reason == "end_turn"
+    assert len(core.calls) == 2
+    assert [update.content.text for update in client.updates if update.session_update == "user_message_chunk"] == ["first", "second"]
+    sequences = [update.field_meta["mimir.sequence"] for update in client.updates]
+    assert sequences == list(range(len(sequences)))
+    assert not agent._store.paths(session_id)[0].exists()
+    client.updates.clear()
+    with pytest.raises(sdk.RequestError, match="Session replay unavailable: overflowed"):
+        await agent.load_session("/two", session_id)
+    assert client.updates == []
+
+
+async def test_nonreplayable_marker_survives_deleted_journal_and_reconstruction(tmp_path: Path) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    agent._store.mark(session_id, "operator", "overflowed")
+    agent._store.paths(session_id)[0].unlink()
+
+    reconstructed, client, _ = await _ready(tmp_path)
+    with pytest.raises(sdk.RequestError) as raised:
+        await reconstructed.load_session("/two", session_id)
+
+    assert raised.value.to_error_obj()["message"] == "Session replay unavailable: overflowed"
+    assert client.updates == []
