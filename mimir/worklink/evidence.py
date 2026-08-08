@@ -310,20 +310,169 @@ def _common_status(status: str) -> str:
     return "failed"
 
 
+def _checkout_of(args: Sequence[str] | str, cwd: Path | None) -> Path | None:
+    """The attempt checkout a step operates on, for the contained request.
+
+    Most git calls here pass the checkout as ``git -C <path>`` with no ``cwd``,
+    so taking ``cwd`` alone would send them at the controller's directory.
+    """
+    if cwd is not None:
+        return Path(cwd)
+    if not isinstance(args, str):
+        parts = [str(a) for a in args]
+        if "-C" in parts:
+            index = parts.index("-C")
+            if index + 1 < len(parts):
+                return Path(parts[index + 1])
+    return None
+
+
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
     scrub_model_selection_env(env)
+
+    # chainlink #1164. The comment this replaces argued the test command is
+    # operator-configured and therefore trusted. That is true of the command
+    # STRING and irrelevant to what it EXECUTES: `pytest` reads conftest.py,
+    # `npm test` reads package.json scripts, and both were just written by the
+    # build. The same applies to git over the checkout. So every step here runs
+    # under the contained identity when containment is active.
+    checkout = _checkout_of(args, cwd)
+    contained = maybe_run_contained(args, checkout, env)
+    if contained is not None:
+        return contained
+
     if isinstance(args, str):
-        # Operator-configured test commands are trusted input, equivalent to
-        # poller.command; backend-generated text is never routed here.
         return subprocess.run(
             args, shell=True, cwd=cwd, env=env, capture_output=True, text=True, check=False
         )
     return subprocess.run(
         list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False
     )
+
+
+def maybe_run_contained(
+    args: Sequence[str] | str, checkout: Path | None, env: dict[str, str],
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one evidence step under the contained identity, or ``None`` to fall through.
+
+    Returns ``None`` -- meaning "run as before" -- when containment is not
+    required (no coding flag) or when the step has no attempt checkout to run in.
+    """
+    if checkout is None or not _is_attempt_checkout(checkout):
+        return None
+    from .containment import is_registered_attempt_checkout
+
+    if not is_registered_attempt_checkout(checkout):
+        # Two conditions, both necessary. The marker keeps the obvious cases out
+        # cheaply; registration is the authority, because a configured repository
+        # sitting under some `.worklink` directory would satisfy the marker alone
+        # and the supervisor chowns whatever cwd it is handed, recursively.
+        #
+        # A deny-list came first and was worse: "not the agent home, not remote"
+        # sent `git -C <parent repo> status` -- which _finalize runs on every
+        # run -- to the supervisor, handing the operator's own source repository
+        # to the worker uid.
+        return None
+    if _talks_to_the_remote(args):
+        # Push, fetch and friends are CONTROLLER operations: they need the
+        # GitHub credential, which is deliberately never projected into a
+        # contained step. Routing them here would strip the credential and the
+        # push would simply fail to authenticate.
+        return None
+    from .containment import (
+        WorkerRequest,
+        containment_required,
+        resolve_containment,
+        run_contained,
+        worker_runtime_env,
+    )
+
+    if not containment_required():
+        return None
+    policy = resolve_containment()
+    if not policy.contained:
+        return None
+    argv = ("sh", "-c", args) if isinstance(args, str) else tuple(str(a) for a in args)
+    projected = worker_runtime_env(policy, env)
+    result = run_contained(
+        policy,
+        WorkerRequest(
+            attempt_id=f"evidence-{checkout.name}",
+            argv=argv,
+            cwd=checkout,
+            env=projected,
+            timeout_seconds=_evidence_step_timeout(),
+        ),
+    )
+    return subprocess.CompletedProcess(
+        args=list(argv), returncode=result.exit_status, stdout=result.stdout, stderr=result.stderr,
+    )
+
+
+#: Attempt checkouts are created at ``<repo>/.worklink/<issue>-<attempt>``. That
+#: component is what marks a path as disposable, worker-owned build space rather
+#: than a repository the operator cares about.
+_ATTEMPT_CHECKOUT_MARKER = ".worklink"
+
+
+def _is_attempt_checkout(path: Path) -> bool:
+    """Whether ``path`` is inside a Worklink attempt checkout.
+
+    The supervisor chowns whatever it is handed, so this is the guard that keeps
+    it away from the parent repository and the agent home alike. Being wrong in
+    the permissive direction here is destructive, not merely over-contained.
+    """
+    try:
+        parts = path.resolve().parts
+    except OSError:  # pragma: no cover
+        parts = path.parts
+    return _ATTEMPT_CHECKOUT_MARKER in parts
+
+
+#: Git subcommands that contact the remote, and therefore need the controller's
+#: credential. Everything else over an attempt checkout is local and contained.
+_REMOTE_GIT_SUBCOMMANDS = frozenset({"push", "fetch", "pull", "clone", "ls-remote", "remote"})
+
+
+def _talks_to_the_remote(args: Sequence[str] | str) -> bool:
+    if isinstance(args, str):
+        return False
+    parts = [str(a) for a in args]
+    if not parts or Path(parts[0]).name != "git":
+        return False
+    # Walk by index: the options that take a VALUE must consume it, or the value
+    # gets read as the subcommand -- `git -C /path push` would resolve to
+    # "/path" and a push would be routed into containment, stripping the
+    # credential it needs.
+    takes_value = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part in takes_value:
+            index += 2
+            continue
+        if part.startswith("-"):
+            index += 1
+            continue
+        return part in _REMOTE_GIT_SUBCOMMANDS
+    return False
+
+
+def _evidence_step_timeout() -> float:
+    """Deadline for a contained evidence step.
+
+    The gate's test command is the long one here; git calls finish in
+    milliseconds. Without a deadline the supervisor would spawn with none.
+    """
+    raw = os.environ.get("MIMIR_WORKLINK_EVIDENCE_TIMEOUT_S", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    return value if value > 0 else 3600.0
 
 
 def _merge_paths(*groups: list[str]) -> list[str]:

@@ -229,7 +229,16 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
     assert compute.specs[0].base_ref == "main"
     assert compute.specs[0].test_command == "echo ok"
     assert compute.specs[0].local_checkout == worktree
-    assert compute.specs[0].env["MIMIR_HOME"] == str(tmp_path)
+    # INVERTED by chainlink #1164. This used to assert MIMIR_HOME was projected
+    # into the build. A build has a model generate code and then executes it, and
+    # this variable is how that code would locate the agent home to append a
+    # shell_commands grant to scheduler.yaml. The work order reaches the build
+    # through ``prompt`` and its checkout instead, neither of which is under the
+    # home, so nothing legitimate needs it.
+    assert "MIMIR_HOME" not in compute.specs[0].env, (
+        "projecting MIMIR_HOME into a build hands generated code the path it "
+        "needs to grant itself shell authority"
+    )
     assert compute.cleaned == [LaunchHandle("fake_compute", "job-1")]
 
 
@@ -596,7 +605,24 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     # #518: the attempt branch is pushed from the checkout that owns it (lease.path),
     # never from the parent repo — the isolated-checkout shape has the branch only
     # inside lease.path, so a parent-repo push fails "src refspec ... does not match".
-    assert ["git", "-C", str(worktree), "push", "-u", "origin", "issue/441-a1"] in calls
+    # Asserted by INTENT rather than exact argv: chainlink #1164 added the
+    # hardening overrides (the checkout is worker-owned by push time, so its
+    # hooks/config must not execute) and pins the refspec to the observed oid.
+    # Pinning the literal argv would have to be rewritten by any such change,
+    # and the property #518 cares about is which checkout it pushes FROM.
+    pushes = [c for c in calls if "push" in c and c[0] == "git"]
+    assert len(pushes) == 1, f"expected exactly one push, got {pushes}"
+    argv = pushes[0]
+    assert argv[argv.index("-C") + 1] == str(worktree), "must push from the lease checkout"
+    assert "-u" in argv
+    # The destination must NOT be the symbolic `origin`: that resolves from the
+    # worker-owned checkout's config (remote.origin.url / pushurl /
+    # url.*.insteadOf), which is where the credential would be sent.
+    destination = argv[-2]
+    assert destination != "origin", "push destination must not be resolved from the checkout"
+    assert destination.startswith(("http", "git@", "ssh://")), f"unexpected destination {destination}"
+    refspec = argv[-1]
+    assert refspec.endswith("issue/441-a1"), f"unexpected refspec {refspec}"
     assert not any(
         isinstance(c, list) and c[:3] == ["git", "-C", str(repo)] and len(c) > 3 and c[3] == "push"
         for c in calls

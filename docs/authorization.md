@@ -502,10 +502,38 @@ In a poller manifest, inside the existing `authority` block:
 }
 ```
 
-Both files are operator-owned. No service principal can write either: a poller's
-`scoped_roots` vocabulary is closed to `state` and `wiki:<slug>`, and
-`<home>/scheduler.yaml` is outside every configured writable folder. That is what
-makes a declaration an authority grant rather than a self-grant.
+Both files are operator-owned **as far as mimir's own tools are concerned**: a
+poller's `scoped_roots` vocabulary is closed to `state` and `wiki:<slug>`, and
+`<home>/scheduler.yaml` is outside every configured writable folder. No service
+principal can reach either through `write_file`, `edit_file` or any other tool.
+That is what makes a declaration an authority grant rather than a self-grant.
+
+That guarantee is an **application** boundary, not an OS one, and the difference
+matters wherever mimir executes code it did not write. `shell_exec` and any
+spawned subprocess run as the agent's own OS user, which *can* write `<home>` —
+verified on the shipped image: the agent is uid 1000, `/mimir-home` is
+uid-1000-owned, and `scheduler.yaml` and `skills/` are writable by that uid. So a
+process that escapes the tool layer is not stopped by anything described above.
+
+What mimir enforces, and what a deployment must supply:
+
+| | Enforced by mimir | Must come from the deployment |
+|---|---|---|
+| Tool access to `scheduler.yaml` / `pollers.json` | yes — `Config.folders` + `scoped_roots` | — |
+| Shell argv admitted per profile | yes — service shell profiles | — |
+| A subprocess writing those files directly | **no** | a separate OS identity |
+
+For Worklink builds — where a model generates code and mimir then executes it —
+that identity is supplied: builds, the evidence gate's test command and local Git
+run as a distinct `worklink` user via a root-supervised service, gated on
+`MIMIR_CODING_ENABLED` (see `MIMIR_WORKLINK_USER` and `MIMIR_WORKLINK_SPOOL` in
+[configuration](configuration.md)).
+
+Other surfaces that execute repository-controlled code — `repo_test`,
+`spawn_open_code`, and feature-factory runs — still execute as the agent user and
+are tracked on chainlink #1165. Treat the operator-owned property as holding
+against mimir's tools, and as depending on OS-level separation against anything
+that runs code.
 
 #### Field rules
 

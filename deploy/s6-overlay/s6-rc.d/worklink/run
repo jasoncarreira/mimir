@@ -1,0 +1,42 @@
+#!/command/with-contenv sh
+# The Worklink build supervisor.
+#
+# This service stays ROOT. It does not run the poller -- the poller is the
+# controller, it needs MIMIR_HOME for worklink.yaml, lease state and the
+# Chainlink claim locks, and it holds the GitHub push credential, so it stays
+# with the agent. An earlier revision of this file ran the whole poller as
+# `worklink` and was not operational for exactly that reason (chainlink #1164,
+# withdrawn design (a)).
+#
+# What this supervises is the three steps that execute GENERATED code: the build,
+# the evidence gate's test command, and local Git over the checkout. It takes
+# each from the spool, spawns it as `worklink`, and publishes what it observed.
+#
+# It stays root rather than becoming `worklink` so the thing reporting "this
+# build succeeded, at this commit" is not the same identity as the thing being
+# reported on. The agent itself cannot drop privilege (CapEff=0), which is why
+# this has to be a supervised service at all.
+#
+# Gated on MIMIR_CODING_ENABLED: a deployment with no coding tools never runs a
+# build, so there is nothing to contain. It idles rather than exiting, because s6
+# would restart a longrun that exits.
+case "${MIMIR_CODING_ENABLED}" in
+  1|true|TRUE|True|yes|YES|on|ON|y|Y) ;;
+  *)
+    echo "worklink: MIMIR_CODING_ENABLED not set; no builds to supervise, idling"
+    exec sleep infinity
+    ;;
+esac
+
+# Run from the source checkout so this tracks the deployed code, matching how the
+# agent service is started. `python3 -m` rather than a console script: the venv's
+# bin/ is not necessarily on this service's PATH.
+cd /workspace/mimir 2>/dev/null || cd / || exit 1
+
+if [ -x /workspace/mimir/.venv/bin/python ]; then
+  PY=/workspace/mimir/.venv/bin/python
+else
+  PY=python3
+fi
+
+exec "$PY" -m mimir.worklink.supervisor

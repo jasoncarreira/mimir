@@ -85,6 +85,26 @@ RUN set -eu; \
 # without escalating to root. ``/home/mimir/`` is also where the
 # Claude Code CLI keeps its OAuth credential under ``.claude/``.
 RUN useradd -m -u 1001 -s /bin/bash mimir
+
+# The identity Worklink BUILDS run as -- not the poller, which stays with the
+# agent (it needs MIMIR_HOME for worklink.yaml, lease state and claim locks).
+#
+# A build has a model generate code and then executes it, so what runs was
+# reviewed by nobody. This user exists so that a bad generation cannot write the
+# agent home, where scheduler.yaml and skills/*/pollers.json grant shell
+# authority. See chainlink #1164 and docs/authorization.md.
+#
+# The uid MUST differ from the agent's above -- sharing it would make the whole
+# boundary a no-op, and `useradd` fails outright on a duplicate uid, so the image
+# would not build. tests/test_root_dockerfile.py asserts the INEQUALITY rather
+# than either literal, so renumbering either user cannot silently recreate this.
+#
+# It gets a real home (-m): a build runs OpenCode/Codex, which needs a HOME, npm
+# and uv caches, and its own projected provider credential. It must never read
+# the agent user's home to get them.
+RUN useradd -m -u 1002 -s /usr/sbin/nologin worklink \
+    && mkdir -p /workspace/.worklink \
+    && chown worklink:worklink /workspace/.worklink
 USER mimir
 # Land ``docker exec -it <ctn> bash`` at a predictable home dir.
 # Docker's default of ``/`` is technically fine but operators
@@ -194,5 +214,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
-RUN chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run
+RUN chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run \
+    /etc/s6-overlay/s6-rc.d/worklink/run
 ENTRYPOINT ["/init"]

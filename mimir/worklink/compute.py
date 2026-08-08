@@ -174,6 +174,148 @@ def _local_child_env() -> dict[str, str]:
     return env
 
 
+def _containment_policy() -> object | None:
+    """The containment policy for a local build, or ``None`` to run as today.
+
+    INERT unless ``MIMIR_CODING_ENABLED`` is set. A deployment with no coding
+    tools never runs a build, so there is nothing to contain: ``resolve_containment``
+    returns its ``not_required`` state, ``contained`` is False, and this path
+    behaves exactly as it did before chainlink #1164. Nothing is imported at
+    module scope for it and no spool is consulted.
+
+    When the flag IS set, a missing or world-writable spool raises
+    ``ContainmentUnavailable`` out of this function, which fails the launch
+    closed rather than silently running the build as the agent user.
+    """
+    from .containment import containment_required, resolve_containment
+
+    if not containment_required():
+        return None
+    return resolve_containment()
+
+
+class _SpooledJob:
+    """A build handed to the root-supervised worklink service.
+
+    Satisfies the same duck-typed contract the local backend already uses for a
+    subprocess -- ``stdout``/``stderr`` readers, ``wait()``, ``returncode``,
+    ``pid`` -- so ``wait``, ``job_alive`` and ``cancel`` need no special-casing.
+
+    The agent cannot drop privilege itself (``CapEff=0``), so it cannot simply
+    prefix the command: the supervisor runs as root and does that per step.
+    """
+
+    def __init__(
+        self,
+        policy: object,
+        spec: object,
+        command: tuple[str, ...],
+        env: dict[str, str],
+        timeout_s: int | None = None,
+    ) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self.pid: int | None = None
+        self.result: object | None = None
+        self._policy = policy
+        self._spec = spec
+        self._command = command
+        self._env = env
+        self._timeout_s = timeout_s
+        self._request_id: str | None = None
+
+    @property
+    def request_id(self) -> str:
+        if self._request_id is None:  # pragma: no cover - submit() always runs first
+            raise RuntimeError("_SpooledJob.request_id read before submit()")
+        return self._request_id
+
+    async def submit(self) -> None:
+        from .containment import WorkerRequest, submit_request
+
+        request = WorkerRequest(
+            attempt_id=f"{getattr(self._spec, 'issue_id', 'unknown')}-"
+            f"{getattr(self._spec, 'attempt', 0)}",
+            argv=self._command,
+            cwd=Path(str(self._spec.local_checkout)),  # type: ignore[attr-defined]
+            env=self._env,
+            # The CONFIGURED deadline, carried to the supervisor. Without it the
+            # supervisor's spawn has no timeout at all, and a hung generated
+            # process would hold the run until the controller's own wait expired.
+            timeout_seconds=float(self._timeout_s) if self._timeout_s else None,
+            # The controller pushes the oid the SUPERVISOR read, so a process
+            # surviving past the verdict cannot change what gets pushed.
+            report_head=True,
+        )
+        self._request_id = await asyncio.to_thread(submit_request, self._policy, request)
+
+    async def wait(self) -> None:
+        """Block until the supervisor publishes what it observed.
+
+        Feeds the captured output into the readers before returning, because the
+        backend's ``collect()`` drains them concurrently and then awaits this.
+        """
+        from .containment import ContainmentUnavailable, await_result
+
+        if self._request_id is None:  # pragma: no cover - submit() always runs first
+            self.returncode = -1
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            return
+        # Bounded by the step's own deadline plus slack for the supervisor to
+        # notice and publish. An unbounded wait here would let a hung build
+        # outlive its configured timeout no matter what the supervisor did.
+        budget = (float(self._timeout_s) if self._timeout_s else _DEFAULT_STEP_SECONDS) + 120.0
+        try:
+            result = await asyncio.to_thread(
+                await_result, self._policy, self._request_id, timeout_seconds=budget,
+            )
+        except ContainmentUnavailable as exc:
+            self.cancel_request()
+            self.result = None
+            self.stdout.feed_eof()
+            self.stderr.feed_data(str(exc).encode())
+            self.stderr.feed_eof()
+            self.returncode = 124
+            return
+        self.result = result
+        self.stdout.feed_data(result.stdout.encode())
+        self.stdout.feed_eof()
+        self.stderr.feed_data(result.stderr.encode())
+        self.stderr.feed_eof()
+        self.returncode = result.exit_status
+
+    def cancel_request(self) -> None:
+        """Cancel the step, whether or not the supervisor has claimed it.
+
+        Unlinking the request only helps while it is still queued. For one
+        already running, the process belongs to the contained user and the
+        controller cannot signal it -- so the cancellation is published for the
+        supervisor, which is root and can.
+        """
+        if self._request_id is None:
+            return
+        from .containment import publish_cancellation, request_dir
+
+        root = self._policy.spool_root  # type: ignore[attr-defined]
+        # Publish the cancellation and let the SUPERVISOR resolve it, whether the
+        # request was claimed or not. An earlier version branched on whether the
+        # request file still existed and wrote the terminal result itself; both
+        # halves were wrong. The existence check is racy against the supervisor
+        # claiming it, and results/ is root-owned 0750 in production, so the
+        # controller's write fails with EACCES -- silently, leaving the waiter
+        # blocked for its full deadline. It only ever worked in tests, where the
+        # test owns the directory.
+        publish_cancellation(self._policy, self._request_id)
+        (request_dir(root) / f"{self._request_id}.json").unlink(missing_ok=True)
+
+
+#: Fallback deadline when a spec carries none. Only bounds the pathological case
+#: of a supervisor that never publishes; a configured ``timeout_s`` always wins.
+_DEFAULT_STEP_SECONDS = 3600.0
+
+
 @dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
@@ -212,24 +354,57 @@ class LocalSubprocessComputeBackend:
         # orchestrator's per-run vars, e.g. MIMIR_HOME) wins over the passthrough.
         env = _local_child_env()
         env.update(spec.env)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(spec.local_checkout),
-                env=env,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise ComputeLaunchError(str(exc)) from exc
+
+        # chainlink #1164: a build has a model generate code and then executes
+        # it, so what runs was reviewed by nobody. When containment is active the
+        # step is handed to the root-supervised worklink service, which runs it
+        # as a user that cannot write the agent home.
+        #
+        # Resolving the policy here rather than at the call site keeps this the
+        # ONE place a local build can be launched, so a future caller cannot
+        # quietly opt out by constructing its own subprocess.
+        policy = _containment_policy()
+        if policy is not None and policy.contained:
+            # Project onto the worker's OWN runtime. Stripping the GitHub
+            # tokens (which _local_child_env passes through as "provider
+            # credentials", predating this boundary) is only half of it: the
+            # step would otherwise inherit the CONTROLLER's HOME and XDG paths,
+            # which it cannot write and which point at the identity being
+            # contained from.
+            from .containment import worker_runtime_env
+
+            env = worker_runtime_env(policy, env)
+            proc = _SpooledJob(policy, spec, command, env, getattr(spec, "timeout_s", None))
+            await proc.submit()
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(spec.local_checkout),
+                    env=env,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise ComputeLaunchError(str(exc)) from exc
         pid = getattr(proc, "pid", None)
         start_ticks = None
         if isinstance(pid, int):
             from .run_state import process_start_ticks
 
             start_ticks = process_start_ticks(pid)
-        handle = LaunchHandle(self.name, str(pid if pid is not None else "unknown"), start_ticks)
+        if isinstance(proc, _SpooledJob):
+            # A supervised build has no pid in THIS process, and the fallback
+            # identifier is the literal "unknown" -- so every concurrent spooled
+            # launch would collide on one _jobs key, and wait/cancel/cleanup
+            # could target the wrong request. worklink.yaml permits concurrent
+            # attempts, so that is reachable, not theoretical. The request id is
+            # unique and is also what a controller restart would reattach by.
+            identifier = proc.request_id
+        else:
+            identifier = str(pid if pid is not None else "unknown")
+        handle = LaunchHandle(self.name, identifier, start_ticks)
         self._jobs[handle.identifier] = (proc, spec, command)
         return handle
 
@@ -300,6 +475,12 @@ class LocalSubprocessComputeBackend:
             proc, _spec, _command = self._job(handle)
         except KeyError:
             proc = _verified_external_process(handle, self.name)
+        if isinstance(proc, _SpooledJob):
+            # A supervised build has no pid in this process to signal. Drop the
+            # request if it is still queued; one already running is bounded by
+            # the supervisor's own timeout.
+            proc.cancel_request()
+            return
         await _kill_process_group(proc)
 
     async def cleanup(self, handle: LaunchHandle) -> None:

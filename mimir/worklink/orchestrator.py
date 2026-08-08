@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
+import contextlib
 import os
 from pathlib import Path
 import re
@@ -531,7 +532,12 @@ class WorklinkRunner:
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             started = datetime.now(UTC)
@@ -743,7 +749,7 @@ class WorklinkRunner:
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_checkout_changes(lease.path, issue, runner=runner)
+            committed_oid = _commit_checkout_changes(lease.path, issue, runner=runner)
             try:
                 _ensure_clean_checkout(lease.path, runner=runner)
             except WorklinkError as exc:
@@ -787,7 +793,16 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner)
+            # repo_url comes from the PARENT repository, read controller-side.
+            # Naming `origin` would resolve the destination from the
+            # worker-owned checkout's config (remote.origin.url / pushurl /
+            # url.*.insteadOf), which is where the credential would go.
+            _git_push(
+                lease.path, lease.branch, runner=runner, oid=committed_oid,
+                # WorkSpec.repo_url is resolved controller-side from the PARENT
+                # repository, so it cannot be redirected by the checkout.
+                remote_url=spec.repo_url,
+            )
             pr_url = _open_pr(
                 self.repo,
                 issue,
@@ -1002,7 +1017,12 @@ class WorklinkRunner:
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             spec = backend.work_spec(
@@ -1199,7 +1219,12 @@ class WorklinkRunner:
                 prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
-                env={"MIMIR_HOME": str(self.home)},
+                # No MIMIR_HOME: a build has a model generate code and then
+                # runs it, and this variable is how that code would locate the
+                # agent home to append a shell_commands grant to scheduler.yaml
+                # (chainlink #1164). The work order reaches the build through
+                # ``prompt`` and its checkout, neither of which is under the home.
+                env={},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             return await self._run_detached_epic(
@@ -2236,7 +2261,7 @@ def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None
             )
 
 
-def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> None:
+def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> str | None:
     add = runner(["git", "-C", str(checkout), "add", "-A"])
     if add.returncode != 0:
         raise WorklinkError((add.stderr or add.stdout).strip() or "git add failed")
@@ -2256,6 +2281,42 @@ def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Run
     ])
     if commit.returncode != 0:
         raise WorklinkError((commit.stderr or commit.stdout).strip() or "git commit failed")
+    # Resolve the object this commit produced and hand it to the push, so the
+    # push targets an IMMUTABLE oid rather than a moving ref (chainlink #1164).
+    # A process surviving past the verdict can still mutate the checkout; it
+    # cannot change which object gets pushed. Resolved through the same runner,
+    # so under containment this read happens on the contained side too.
+    # Prefer the ROOT observer's read. Parsing `git rev-parse` stdout takes the
+    # value from a command run on the side being judged; report_head makes the
+    # supervisor read the checkout itself.
+    from .containment import containment_required, observe_head_via_supervisor, resolve_containment
+
+    if containment_required():
+        policy = resolve_containment()
+        observed = observe_head_via_supervisor(policy, checkout)
+        if observed:
+            return observed
+        # Containment is active but the observer produced nothing: fail closed
+        # rather than silently dropping to worker-reported output, which is the
+        # provenance this exists to avoid.
+        return None
+    head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    oid = (head.stdout or "").strip()
+    return oid if head.returncode == 0 and oid else None
+
+
+def _register_attempt_checkout(lease: object) -> object:
+    """Mark a freshly created lease as eligible for contained execution.
+
+    Registration is what authorises the supervisor to take ownership of a path,
+    so it happens exactly where a checkout is created and nowhere else.
+    """
+    path = getattr(lease, "path", None)
+    if path is not None:
+        from .containment import register_attempt_checkout
+
+        register_attempt_checkout(Path(str(path)))
+    return lease
 
 
 def _create_backend_checkout(
@@ -2272,7 +2333,7 @@ def _create_backend_checkout(
     shape = checkout_shape_for_backend(backend)
     if shape is not CheckoutShape.ISOLATED_CLONE:
         raise WorklinkError(f"unsupported checkout shape for backend {backend.name}: {shape}")
-    return create_isolated_checkout(
+    return _register_attempt_checkout(create_isolated_checkout(
         repo,
         issue_id=issue_id,
         attempt=attempt,
@@ -2280,7 +2341,7 @@ def _create_backend_checkout(
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,
-    )
+    ))
 
 
 def _with_outside_checkout_detection(
@@ -2418,8 +2479,111 @@ def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
-    result = runner(["git", "-C", str(repo), "push", "-u", "origin", branch])
+#: A minimal, controller-authored repository config. Everything the push needs
+#: is passed explicitly (destination URL and oid refspec), so nothing else has
+#: to be present -- and anything absent cannot be attacker-controlled.
+_CONTROLLER_GIT_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+
+
+@contextlib.contextmanager
+def _controller_git_context(checkout: Path):
+    """Run a Git command against the checkout's OBJECTS with the controller's config.
+
+    Deleting worker-set keys one by one does not work: ``include.path`` and
+    ``includeIf.*.path`` pull in a worker-controlled file that reintroduces
+    ``credential.helper``, ``core.sshCommand`` or ``url.*.insteadOf`` after the
+    delete. Verified -- unsetting credential.helper leaves it still resolving
+    through the include.
+
+    So the config is REPLACED for the duration rather than edited. There is no
+    key list to keep current and no indirection to chase, because the file the
+    worker wrote is not consulted at all.
+    """
+    git_dir = checkout / ".git"
+    if not git_dir.is_dir():
+        # Nothing to neutralise (a bare path or a caller that manages its own
+        # repository). Do not fabricate a config here -- creating one would be a
+        # side effect on a directory this function does not own.
+        yield
+        return
+    config = git_dir / "config"
+    stashed = git_dir / "config.worklink-controller-swap"
+    swapped = False
+    try:
+        if config.exists():
+            config.rename(stashed)
+            swapped = True
+        config.write_text(_CONTROLLER_GIT_CONFIG, encoding="utf-8")
+        yield
+    finally:
+        if swapped:
+            config.unlink(missing_ok=True)
+            stashed.rename(config)
+        elif config.exists():
+            config.unlink(missing_ok=True)
+
+
+def _git_push(
+    repo: Path,
+    branch: str,
+    *,
+    runner: Runner,
+    oid: str | None = None,
+    remote_url: str | None = None,
+) -> None:
+    """Push the branch. Controller-side: this is what holds the credential.
+
+    When the commit step reported an oid, push THAT object explicitly rather
+    than whatever HEAD points at now. Without it a process outliving the
+    evidence gate could change what lands on the branch after the verdict.
+    """
+    if oid is None:
+        # Falling back to the moving branch here would silently drop the whole
+        # point of observing an oid: whatever HEAD points at when the push runs
+        # gets published, including anything a process outliving the evidence
+        # gate wrote. Under containment that is a fail-closed condition, not a
+        # default. Without containment there is no observation to lose, and the
+        # branch push is the pre-existing behaviour.
+        from .containment import containment_required
+
+        if containment_required():
+            raise WorklinkError(
+                "refusing to push: no commit oid was observed for this attempt, "
+                "so the push would publish whatever HEAD points at now rather "
+                "than the object the evidence gate passed",
+            )
+        refspec = branch
+    else:
+        refspec = f"{oid}:refs/heads/{branch}"
+    # The refspec pins WHAT is pushed; these pin what the push may EXECUTE and
+    # WHERE it goes. The checkout is worker-owned by this point, so its
+    # .git/config and hooks are worker-written.
+    #
+    # NOT _MAINTENANCE_GIT_BASE_OVERRIDES: that set includes
+    # `protocol.allow=never`, which is right for local maintenance and fatal
+    # here -- verified, a push under it dies with "transport 'https' not
+    # allowed". Reusing it wholesale would have broken every real push while the
+    # argv-inspecting test still passed.
+    destination = remote_url or "origin"
+    # Strip the worker-writable settings from the checkout's OWN config rather
+    # than overriding them on the command line.
+    #
+    # `-c credential.helper=` looked equivalent and is not: an empty value RESETS
+    # git's helper list, and -c has highest precedence, so it also removes the
+    # deployment's `gh auth setup-git` helper and leaves a token-free HTTPS URL
+    # with no credential at all. The local bare-remote regression cannot see
+    # that, because file:// transport needs no credential.
+    with _controller_git_context(repo):
+        result = runner([
+            "git", "-C", str(repo),
+            # Belt and braces on top of the replaced config: these are never
+            # supplied by the deployment, so clearing them removes only risk.
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=",
+            "-c", "diff.external=",
+            "-c", "core.askpass=",
+            "push", "-u", destination, refspec,
+        ])
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 
@@ -2618,6 +2782,17 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
     def run(args: Sequence[str] | str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        # chainlink #1164. This is the runner _finalize actually injects, so
+        # routing containment only inside evidence._run left the gate test and
+        # local Git running as the controller in production while the isolated
+        # test of _run passed. maybe_run_contained declines anything that is not
+        # an attempt checkout (chainlink calls against the home, remote git), so
+        # this is a no-op for everything except generated-code execution.
+        from .evidence import _checkout_of, maybe_run_contained
+
+        contained = maybe_run_contained(args, _checkout_of(args, cwd), os.environ.copy())
+        if contained is not None:
+            return contained
         if isinstance(args, str):
             return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
         # Chainlink discovers its repository from cwd. Its configured home is
