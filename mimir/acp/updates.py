@@ -16,6 +16,7 @@ class UpdateDispatcher:
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
+        self._publication_failed = False
         self._open_tools: dict[str, str] = {}
         self._tool_args: dict[str, Any] = {}
 
@@ -45,9 +46,9 @@ class UpdateDispatcher:
 
     async def terminalize_failure(self, error: BaseException | None = None) -> None:
         self._ensure_worker()
-        await self.queue.join()
         if self._failure is None:
             self._failure = error or RuntimeError("ACP turn failed")
+        await self.queue.join()
         for tool_id, name in list(self._open_tools.items()):
             self.queue.put_nowait({"type": "_terminal", "phase": "end", "id": tool_id, "tool_name": name})
         await self.queue.join()
@@ -75,14 +76,18 @@ class UpdateDispatcher:
             try:
                 if event is None:
                     return
-                if self._failure is None or event.get("type") == "_terminal":
-                    for update in self._map(event):
-                        try:
-                            await self.publisher.publish_live(update)
-                        except BaseException as exc:
-                            if self._failure is None:
-                                self._failure = exc
-                            break
+                terminal = event.get("type") == "_terminal"
+                if self._failure is None or terminal:
+                    updates = self._map(event)
+                    if not self._publication_failed:
+                        for update in updates:
+                            try:
+                                await self.publisher.publish_live(update)
+                            except BaseException as exc:
+                                if self._failure is None:
+                                    self._failure = exc
+                                self._publication_failed = True
+                                break
             finally:
                 self.queue.task_done()
 

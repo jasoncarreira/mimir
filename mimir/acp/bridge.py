@@ -58,7 +58,7 @@ class ACPBridge(Bridge):
         )
         try:
             await publisher.publish_live(update)
-        except BaseException:
+        except Exception:
             return SendResult(sent=False, error="ACP delivery failed")
         return SendResult(sent=True, chunks=1)
 

@@ -6,7 +6,7 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from mimir._atomic import atomic_write_json
 from mimir.acp.sdk import RequestError
@@ -177,7 +177,15 @@ class SessionStore:
 
     @staticmethod
     def _record(payload: dict[str, object], journal: Path, metadata: Path) -> SessionRecord:
-        return SessionRecord(str(payload["session_id"]), str(payload["thread_id"]), str(payload["owner_principal"]), payload["lifecycle"], payload["replayability"], journal, metadata)  # type: ignore[arg-type]
+        return SessionRecord(
+            str(payload["session_id"]),
+            str(payload["thread_id"]),
+            str(payload["owner_principal"]),
+            cast(Lifecycle, payload["lifecycle"]),
+            cast(Replayability, payload["replayability"]),
+            journal,
+            metadata,
+        )
 
     @staticmethod
     def _validate_file(path: Path) -> None:

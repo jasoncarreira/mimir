@@ -117,3 +117,9 @@ def test_dockerfile_lists_acp_as_available_extra() -> None:
 #   mcp, acp                                    (Model Context Protocol)
 #
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"''' in dockerfile
+
+
+def test_wheel_guard_matches_finite_acp_source_inventory() -> None:
+    members = {member for member in _required_wheel_members() if member.startswith("mimir/acp/")}
+    sources = {f"mimir/acp/{path.name}" for path in (ROOT / "mimir" / "acp").glob("*.py")}
+    assert members == sources
