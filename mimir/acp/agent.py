@@ -75,6 +75,7 @@ class MimirAcpAgent:
         self._generation = 0
         self._environments: dict[str, tuple[int, SessionEnvironment]] = {}
         self._dispatchers: set[UpdateDispatcher] = set()
+        self._active_prompts: dict[str, object] = {}
         self._bridge = ACPBridge()
         adapters = getattr(bundle, "adapters", None)
         channels = getattr(adapters, "channels", None)
@@ -88,6 +89,7 @@ class MimirAcpAgent:
         self._client = conn
         self._generation += 1
         self._environments.clear()
+        self._active_prompts.clear()
         self._bridge._connected = True
 
     async def initialize(
@@ -236,6 +238,23 @@ class MimirAcpAgent:
         binding = self._environments.get(session_id)
         if binding is None or binding[0] != self._generation:
             raise RequestError(-32602, "Invalid session")
+        prompt_token = object()
+        if session_id in self._active_prompts:
+            raise internal_error()
+        self._active_prompts[session_id] = prompt_token
+        try:
+            return await self._run_prompt(session_id, owner, blocks, client)
+        finally:
+            if self._active_prompts.get(session_id) is prompt_token:
+                self._active_prompts.pop(session_id, None)
+
+    async def _run_prompt(
+        self,
+        session_id: str,
+        owner: str,
+        blocks: list[TextContentBlock | ResourceContentBlock],
+        client: Client,
+    ) -> PromptResponse:
         try:
             record = self._store.load_owned(session_id, owner)
             journal = self._journals.open(record, client)
