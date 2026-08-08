@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
+import mimir.turn_event_bus as turn_event_bus
 from mimir.models import AgentEvent
+from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 
 
 def _drain(queue: "asyncio.Queue[dict]") -> list[dict]:
@@ -48,6 +50,126 @@ def test_full_queue_drops_oldest_not_newest():
     drained = _drain(q)
     # Only the two NEWEST survive; the producer is never blocked.
     assert [e["n"] for e in drained] == [2, 3]
+
+
+def test_exact_lossless_single_subscriber_before_lossy(monkeypatch):
+    bus = TurnEventBus(queue_max=2)
+    exact = bus.subscribe_exact_turn("t1")
+    bounded = bus.subscribe("c")
+    offered_after_exact: list[bool] = []
+    original_offer = turn_event_bus._offer
+
+    def observe_offer(queue, event):
+        offered_after_exact.append(exact.qsize() == event["n"] + 1)
+        original_offer(queue, event)
+
+    monkeypatch.setattr(turn_event_bus, "_offer", observe_offer)
+    for i in range(5):
+        bus.publish(
+            {
+                "type": "turn",
+                "phase": "chunk",
+                "turn_id": "t1",
+                "channel_id": "c",
+                "n": i,
+            }
+        )
+
+    assert offered_after_exact == [True] * 5
+    assert [event["n"] for event in _drain(exact)] == list(range(5))
+    assert [event["n"] for event in _drain(bounded)] == [3, 4]
+
+
+def test_exact_turn_duplicate_is_refused_without_replacing_subscriber():
+    bus = TurnEventBus()
+    exact = bus.subscribe_exact_turn("t1")
+
+    with pytest.raises(ValueError, match="exact-turn subscriber already registered"):
+        bus.subscribe_exact_turn("t1")
+
+    bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
+    assert [event["turn_id"] for event in _drain(exact)] == ["t1"]
+
+
+def test_unsubscribe_exact_turn_only_removes_the_active_queue():
+    bus = TurnEventBus()
+    exact = bus.subscribe_exact_turn("t1")
+    unrelated: "asyncio.Queue[dict]" = asyncio.Queue()
+
+    bus.unsubscribe_exact_turn("t1", unrelated)
+    bus.publish({"type": "turn", "phase": "start", "turn_id": "t1"})
+    assert len(_drain(exact)) == 1
+
+    bus.unsubscribe_exact_turn("t1", exact)
+    bus.publish({"type": "turn", "phase": "end", "turn_id": "t1"})
+    assert _drain(exact) == []
+    replacement = bus.subscribe_exact_turn("t1")
+    assert replacement is not exact
+
+
+def test_exact_turn_delivery_failure_propagates_before_lossy_fanout():
+    class FailingQueue(asyncio.Queue):
+        def put_nowait(self, item):
+            raise RuntimeError("exact delivery failed")
+
+    bus = TurnEventBus()
+    bounded = bus.subscribe("c")
+    bus._exact_turn_subscribers["t1"] = FailingQueue()
+
+    with pytest.raises(RuntimeError, match="exact delivery failed"):
+        bus.publish(
+            {
+                "type": "turn",
+                "phase": "start",
+                "turn_id": "t1",
+                "channel_id": "c",
+            }
+        )
+
+    assert _drain(bounded) == []
+
+
+def test_emitter_propagates_exact_turn_delivery_failure():
+    class FailingQueue(asyncio.Queue):
+        def put_nowait(self, item):
+            raise RuntimeError("exact delivery failed")
+
+    bus = TurnEventBus()
+    bus._exact_turn_subscribers["t1"] = FailingQueue()
+    emitter = TurnEventEmitter(bus, turn_id="t1", channel_id="c")
+
+    with pytest.raises(RuntimeError, match="exact delivery failed"):
+        emitter.turn_started()
+
+
+def test_exact_and_lossy_receive_same_scrubbed_event(monkeypatch):
+    bus = TurnEventBus()
+    exact = bus.subscribe_exact_turn("t1")
+    bounded = bus.subscribe("c")
+    scrub_calls = 0
+    original_scrub = turn_event_bus.scrub_turn_event
+
+    def observe_scrub(event):
+        nonlocal scrub_calls
+        scrub_calls += 1
+        return original_scrub(event)
+
+    monkeypatch.setattr(turn_event_bus, "scrub_turn_event", observe_scrub)
+    bus.publish(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "c",
+            "password": "secret",
+        }
+    )
+
+    exact_event = exact.get_nowait()
+    bounded_event = bounded.get_nowait()
+    assert scrub_calls == 1
+    assert exact_event is bounded_event
+    assert exact_event["password"] == "[redacted]"
 
 
 def test_publish_never_raises_on_bad_state():

@@ -7,11 +7,10 @@ that gap: the turn loop publishes canonical, bracketed events as the turn
 progresses, and SSE consumers (the dossier character first) subscribe.
 
 Design notes:
-- **Ephemeral + drop-allowed.** A slow/dead subscriber's bounded queue drops
-  its OLDEST event rather than ever blocking the turn loop. Durable history
-  stays in ``turns.jsonl`` / the post-hoc live-events stream; this bus is
-  presentation-only. Missed events are self-healing — the final state is
-  always recoverable from the durable stream.
+- **Ephemeral presentation + exact turn delivery.** A slow/dead presentation
+  subscriber's bounded queue drops its OLDEST event rather than ever blocking
+  the turn loop. One subscriber per turn can instead receive every event on an
+  unbounded queue before presentation fanout.
 - **Lock-free under asyncio.** ``publish`` is synchronous and never awaits, so
   on a single-threaded event loop it runs atomically with respect to
   ``subscribe``/``unsubscribe`` (which also never await mid-mutation). That is
@@ -43,6 +42,10 @@ log = logging.getLogger(__name__)
 
 DEFAULT_QUEUE_MAX = 256
 WILDCARD = "*"
+
+
+class _ExactTurnDeliveryError(RuntimeError):
+    pass
 
 
 def _now_iso() -> str:
@@ -77,6 +80,7 @@ class TurnEventBus:
     def __init__(self, *, queue_max: int = DEFAULT_QUEUE_MAX) -> None:
         self._queue_max = queue_max
         self._subscribers: dict[str, set["asyncio.Queue[dict[str, Any]]"]] = {}
+        self._exact_turn_subscribers: dict[str, "asyncio.Queue[dict[str, Any]]"] = {}
 
     def subscribe(self, channel_id: str = WILDCARD) -> "asyncio.Queue[dict[str, Any]]":
         """Return a fresh bounded queue subscribed to ``channel_id``.
@@ -88,6 +92,23 @@ class TurnEventBus:
         self._subscribers.setdefault(channel_id, set()).add(queue)
         return queue
 
+    def subscribe_exact_turn(self, turn_id: str) -> "asyncio.Queue[dict[str, Any]]":
+        """Return the sole lossless, unbounded queue for ``turn_id``."""
+        if turn_id in self._exact_turn_subscribers:
+            raise ValueError(f"exact-turn subscriber already registered for {turn_id!r}")
+        queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
+        self._exact_turn_subscribers[turn_id] = queue
+        return queue
+
+    def unsubscribe_exact_turn(
+        self,
+        turn_id: str,
+        queue: "asyncio.Queue[dict[str, Any]]",
+    ) -> None:
+        """Remove ``queue`` when it is the active exact-turn subscriber."""
+        if self._exact_turn_subscribers.get(turn_id) is queue:
+            self._exact_turn_subscribers.pop(turn_id)
+
     def unsubscribe(self, channel_id: str, queue: "asyncio.Queue[dict[str, Any]]") -> None:
         subs = self._subscribers.get(channel_id)
         if not subs:
@@ -97,13 +118,22 @@ class TurnEventBus:
             self._subscribers.pop(channel_id, None)
 
     def publish(self, event: dict[str, Any]) -> None:
-        """Fan ``event`` out to its channel's subscribers + wildcard subscribers.
+        """Fan ``event`` out to its exact-turn, channel, and wildcard subscribers.
 
-        Synchronous and non-blocking — safe to call from the hot turn loop.
-        Never raises: a bad event must not break a turn.
+        Exact delivery errors propagate. Presentation delivery remains best-effort.
         """
         try:
             event = scrub_turn_event(event)
+        except Exception:  # noqa: BLE001 — malformed presentation events are best-effort
+            log.debug("turn-event publish failed", exc_info=True)
+            return
+
+        turn_id = event.get("turn_id")
+        exact = self._exact_turn_subscribers.get(turn_id) if isinstance(turn_id, str) else None
+        if exact is not None:
+            exact.put_nowait(event)
+
+        try:
             channel_id = event.get("channel_id") or ""
             for key in (channel_id, WILDCARD):
                 subs = self._subscribers.get(key)
@@ -113,7 +143,7 @@ class TurnEventBus:
                 # here (no await), but copy defensively against re-entrancy.
                 for queue in list(subs):
                     _offer(queue, event)
-        except Exception:  # noqa: BLE001 — publishing must never break the caller
+        except Exception:  # noqa: BLE001 — presentation delivery is best-effort
             log.debug("turn-event publish failed", exc_info=True)
 
 
@@ -122,8 +152,8 @@ class TurnEventEmitter:
 
     Scoped to one turn (own ``seq``/block counters) so concurrent turns on
     different channels never collide. Every method is a no-op when ``bus`` is
-    ``None`` (feature unwired) and swallows its own errors — emission must never
-    affect turn execution.
+    ``None`` (feature unwired). Presentation errors remain best-effort, while an
+    exact-turn delivery error reaches the caller.
     """
 
     def __init__(
@@ -192,9 +222,13 @@ class TurnEventEmitter:
                 "_auth_context": self._auth_context,
                 **payload,
             }
-            self._bus.publish(event)
-        except Exception:  # noqa: BLE001 — emission is best-effort, never fatal
+        except Exception:  # noqa: BLE001 — presentation emission is best-effort
             log.debug("turn-event emit failed", exc_info=True)
+            return
+        try:
+            self._bus.publish(event)
+        except Exception as exc:  # noqa: BLE001 — exact delivery must reach the caller
+            raise _ExactTurnDeliveryError(str(exc)) from exc
 
     def turn_started(self, trigger_event: "AgentEvent | None" = None) -> None:
         self._emit("turn", "start", **_trigger_metadata(trigger_event))
@@ -280,7 +314,9 @@ class TurnEventEmitter:
                     self._emit("tool_call", "start", id=span_id, tool_name=name or "unknown")
                 if args:
                     self._emit("tool_call", "chunk", id=span_id, args_delta=args)
-        except Exception:  # noqa: BLE001 — emission is best-effort, never fatal
+        except _ExactTurnDeliveryError:
+            raise
+        except Exception:  # noqa: BLE001 — presentation emission is best-effort
             log.debug("turn-event token_chunk failed", exc_info=True)
 
     def blocks_from_messages(self, messages: list[Any]) -> None:
@@ -314,6 +350,8 @@ class TurnEventEmitter:
         for item in events:
             try:
                 self._bracket(item)
+            except _ExactTurnDeliveryError:
+                raise
             except Exception:  # noqa: BLE001
                 log.debug("turn-event bracket failed", exc_info=True)
 
