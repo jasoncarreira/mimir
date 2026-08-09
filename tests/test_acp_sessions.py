@@ -1153,12 +1153,11 @@ async def test_cancel_boundary_prevents_permission_and_mcp_registration(tmp_path
 async def test_integrated_hands_edit_permission_wire_and_provider_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the static wrapper through the gate and both owned ACP requests."""
+    """Exercise once-only permission and terminal updates over the public wire."""
     from langchain.agents.middleware import ToolCallRequest
     from langchain_core.messages import ToolMessage
     from langgraph.runtime import Runtime
 
-    from mimir.models import AuthContext, InformationFlowLabels, TurnInteractivity
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.client_provider import hands_edit
 
@@ -1187,8 +1186,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         return await holder["peer"].route_mcp(params, is_notification)
 
     connection = sdk.Connection(
-        route, transport, state_store=sdk.StrictMessageStateStore()
+        route, transport, listening=False,
+        state_store=sdk.StrictMessageStateStore(),
     )
+    runner = asyncio.create_task(connection.main_loop())
     peer = sdk.AcpPeer(connection, agent)
     holder["peer"] = peer
     agent.on_connect(peer)
@@ -1196,145 +1197,300 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
     async def next_outgoing() -> dict[str, Any]:
         return await asyncio.wait_for(transport.outgoing.get(), 3)
 
-    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
-
-    creating = asyncio.create_task(
-        agent.new_session("/untrusted-cwd", mcp_servers=_hands("hands-server"))
-    )
-    assert await next_outgoing() == {
-        "jsonrpc": "2.0", "id": 0, "method": "mcp/connect",
-        "params": {"serverId": "hands-server"},
-    }
-    await transport.incoming.put({
-        "jsonrpc": "2.0", "id": 0, "result": {"connectionId": "opaque-1"},
-    })
-    assert await next_outgoing() == {
-        "jsonrpc": "2.0", "id": 1, "method": "mcp/message",
-        "params": {
-            "connectionId": "opaque-1", "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "mimir", "version": "0.7.4"},
-            },
-        },
-    }
-    await transport.incoming.put({
-        "jsonrpc": "2.0", "id": 1,
-        "result": {
-            "protocolVersion": "2025-03-26", "capabilities": {},
-            "serverInfo": {"name": "hands", "version": "1"},
-        },
-    })
-    assert await next_outgoing() == {
-        "jsonrpc": "2.0", "method": "mcp/message",
-        "params": {"connectionId": "opaque-1", "method": "notifications/initialized"},
-    }
-    tools_request = await next_outgoing()
-    assert tools_request == {
-        "jsonrpc": "2.0", "id": 2, "method": "mcp/message",
-        "params": {"connectionId": "opaque-1", "method": "tools/list", "params": {}},
-    }
-    await transport.incoming.put({
-        "jsonrpc": "2.0", "id": 2,
-        "result": {
-            "tools": [
-                {
-                    "name": tool.provider_name,
-                    "description": tool.description,
-                    "inputSchema": _thaw_schema(tool.input_schema),
-                    "outputSchema": _thaw_schema(tool.result_schema),
-                }
-                for tool in MIMIR_HANDS_V1.tools
-            ]
-        },
-    })
-    session_id = (await creating).session_id
-
-    async def integrated_turn(event: Any, **kwargs: Any) -> None:
-        turn_id = kwargs["turn_id"]
-        arguments = {"path": "notes.txt", "old_text": "old", "new_text": "new"}
-        bundle.turn_event_bus.publish({
-            "turn_id": turn_id, "channel_id": event.channel_id, "seq": 1,
-            "ts": "now", "type": "tool_call", "phase": "start",
-            "id": "edit-1", "tool_name": "hands_edit", "args": arguments,
+    owned_tasks: list[asyncio.Task[Any]] = []
+    try:
+        # Authentication itself refuses a real resolver-backed non-admin before
+        # any session/provider authority can be established.
+        identities_path = tmp_path / "state" / "identities.yaml"
+        identities = yaml.safe_load(identities_path.read_text(encoding="utf-8"))
+        identities["people"].append({
+            "canonical": "viewer", "display_name": "Viewer",
+            "aliases": [hash_web_key("viewer-secret")],
+            "access": {"roles": ["user"], "is_service": False},
         })
-        active = agent._active_prompts[session_id]
-        queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
-        await queue.join()
-        await active.dispatcher.drain()
-        auth = AuthContext(
-            principal="acp:admin", canonical_principal="operator", roles=("admin",),
-            event_ingress=None, trigger="user_message", channel_id=event.channel_id,
-            interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
-            ifc_labels=InformationFlowLabels(),
-        )
-        request = ToolCallRequest(
-            tool_call={
-                "name": "hands_edit", "args": arguments,
-                "id": "edit-1", "type": "tool_call",
-            },
-            tool=None, state=None, runtime=Runtime(context=auth),
-        )
-
-        async def handler(call: ToolCallRequest) -> ToolMessage:
-            result = await hands_edit.ainvoke(call.tool_call["args"])
-            return ToolMessage(
-                content=json.dumps(result), tool_call_id="edit-1", name="hands_edit"
+        identities_path.write_text(yaml.safe_dump(identities), encoding="utf-8")
+        bundle.core.identity_resolver.reload()
+        with pytest.raises(sdk.RequestError):
+            await agent.authenticate(
+                "mimir-web-key", **{"mimir.webKey": "viewer-secret"}
             )
+        assert agent._connection.auth_context is None
 
-        result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
-        assert result.status == "success"
-        assert json.loads(str(result.content)) == {"changed": True}
-
-    monkeypatch.setattr(core, "run_turn", integrated_turn)
-    prompting = asyncio.create_task(
-        agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit it")])
-    )
-    user_update = await next_outgoing()
-    assert user_update["method"] == "session/update"
-    assert user_update["params"]["sessionId"] == session_id
-    assert user_update["params"]["update"]["sessionUpdate"] == "user_message_chunk"
-    tool_update = await next_outgoing()
-    assert tool_update["method"] == "session/update"
-    assert tool_update["params"]["update"]["toolCallId"] == "edit-1"
-    assert tool_update["params"]["update"]["status"] == "pending"
-    permission = await next_outgoing()
-    assert permission == {
-        "jsonrpc": "2.0", "id": 3, "method": "session/request_permission",
-        "params": {
-            "sessionId": session_id,
-            "toolCall": {
-                "toolCallId": "edit-1", "title": "hands_edit", "kind": "other",
-                "status": "pending", "rawInput": {
-                    "path": "notes.txt", "old_text": "old", "new_text": "new",
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+        creating = asyncio.create_task(
+            agent.new_session("/untrusted-cwd", mcp_servers=_hands("hands-server"))
+        )
+        owned_tasks.append(creating)
+        assert await next_outgoing() == {
+            "jsonrpc": "2.0", "id": 0, "method": "mcp/connect",
+            "params": {"serverId": "hands-server"},
+        }
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 0, "result": {"connectionId": "opaque-1"},
+        })
+        assert await next_outgoing() == {
+            "jsonrpc": "2.0", "id": 1, "method": "mcp/message",
+            "params": {
+                "connectionId": "opaque-1", "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "mimir", "version": "0.7.4"},
                 },
             },
-            "options": [
-                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
-                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
-            ],
-        },
-    }
-    await transport.incoming.put({
-        "jsonrpc": "2.0", "id": 3,
-        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
-    })
-    provider_call = await next_outgoing()
-    assert provider_call == {
-        "jsonrpc": "2.0", "id": 4, "method": "mcp/message",
-        "params": {
-            "connectionId": "opaque-1", "method": "tools/call",
-            "params": {
-                "name": "edit",
-                "arguments": {"path": "notes.txt", "oldText": "old", "newText": "new"},
+        }
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "serverInfo": {"name": "hands", "version": "1"},
             },
-        },
-    }
-    await transport.incoming.put({
-        "jsonrpc": "2.0", "id": 4, "result": {"changed": True},
-    })
-    assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
-    assert transport.outgoing.empty()
-    await transport.incoming.put(None)
-    await connection.close()
+        })
+        assert await next_outgoing() == {
+            "jsonrpc": "2.0", "method": "mcp/message",
+            "params": {"connectionId": "opaque-1", "method": "notifications/initialized"},
+        }
+        assert await next_outgoing() == {
+            "jsonrpc": "2.0", "id": 2, "method": "mcp/message",
+            "params": {"connectionId": "opaque-1", "method": "tools/list", "params": {}},
+        }
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 2,
+            "result": {
+                "tools": [
+                    {
+                        "name": tool.provider_name,
+                        "description": tool.description,
+                        "inputSchema": _thaw_schema(tool.input_schema),
+                        "outputSchema": _thaw_schema(tool.result_schema),
+                    }
+                    for tool in MIMIR_HANDS_V1.tools
+                ]
+            },
+        })
+        session_id = (await creating).session_id
+
+        turns = iter([
+            [("edit-1", "notes-1.txt", "old-1", "new-1"),
+             ("edit-2", "notes-2.txt", "old-2", "new-2")],
+            [("edit-3", "notes-3.txt", "old-3", "new-3")],
+        ])
+
+        async def integrated_turn(event: Any, **kwargs: Any) -> None:
+            # The request uses exactly the continuation context installed by the
+            # authenticated ACP agent; the replacement core must not manufacture
+            # or strengthen authority.
+            auth = event.continuation_auth_context
+            assert auth is not None
+            assert auth.canonical_principal == "operator"
+            assert "admin" in auth.roles
+            assert auth.enforcement_enabled
+            turn_id = kwargs["turn_id"]
+            active = agent._active_prompts[session_id]
+            queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
+            seq = 0
+            for tool_id, path, old_text, new_text in next(turns):
+                arguments = {"path": path, "old_text": old_text, "new_text": new_text}
+                seq += 1
+                bundle.turn_event_bus.publish({
+                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
+                    "ts": "now", "type": "tool_call", "phase": "start",
+                    "id": tool_id, "tool_name": "hands_edit", "args": arguments,
+                })
+                await queue.join()
+                await active.dispatcher.drain()
+                request = ToolCallRequest(
+                    tool_call={
+                        "name": "hands_edit", "args": arguments,
+                        "id": tool_id, "type": "tool_call",
+                    },
+                    tool=None, state=None, runtime=Runtime(context=auth),
+                )
+
+                async def handler(call: ToolCallRequest) -> ToolMessage:
+                    result = await hands_edit.ainvoke(call.tool_call["args"])
+                    return ToolMessage(
+                        content=json.dumps(result), tool_call_id=tool_id,
+                        name="hands_edit",
+                    )
+
+                result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+                seq += 1
+                # Publish the actual middleware/handler ToolMessage through the
+                # same exact-turn event path used by the real core.
+                bundle.turn_event_bus.publish({
+                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
+                    "ts": "now", "type": "tool_call", "phase": "end",
+                    "id": tool_id, "tool_name": "hands_edit", "args": arguments,
+                })
+                seq += 1
+                bundle.turn_event_bus.publish({
+                    "turn_id": turn_id, "channel_id": event.channel_id, "seq": seq,
+                    "ts": "now", "type": "tool_result", "phase": "end",
+                    "id": result.tool_call_id, "tool_name": result.name or "hands_edit",
+                    "content": json.loads(str(result.content)) if result.status == "success"
+                    else {"error": str(result.content)},
+                    "status": result.status, "is_error": result.status == "error",
+                })
+                await queue.join()
+                await active.dispatcher.drain()
+
+        monkeypatch.setattr(core, "run_turn", integrated_turn)
+
+        def permission_request(outer_id: int, tool_id: str, path: str, old: str, new: str) -> dict[str, Any]:
+            return {
+                "jsonrpc": "2.0", "id": outer_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": tool_id, "title": "hands_edit", "kind": "other",
+                        "status": "pending", "rawInput": {
+                            "path": path, "old_text": old, "new_text": new,
+                        },
+                    },
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+                    ],
+                },
+            }
+
+        def provider_request(outer_id: int, path: str, old: str, new: str) -> dict[str, Any]:
+            return {
+                "jsonrpc": "2.0", "id": outer_id, "method": "mcp/message",
+                "params": {
+                    "connectionId": "opaque-1", "method": "tools/call",
+                    "params": {
+                        "name": "edit",
+                        "arguments": {"path": path, "oldText": old, "newText": new},
+                    },
+                },
+            }
+
+        prompting = asyncio.create_task(
+            agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit twice")])
+        )
+        owned_tasks.append(prompting)
+        user_update = await next_outgoing()
+        assert user_update["method"] == "session/update"
+        assert user_update["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        start_1 = await next_outgoing()
+        start_1_update = start_1["params"]["update"]
+        assert start_1_update["_meta"] == {"mimir.sequence": 1}
+        assert {key: value for key, value in start_1_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call", "toolCallId": "edit-1",
+            "title": "hands_edit", "kind": "other", "status": "pending",
+            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
+        }
+        progress_1 = await next_outgoing()
+        progress_1_update = progress_1["params"]["update"]
+        assert progress_1_update["_meta"] == {"mimir.sequence": 2}
+        assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
+        }
+        assert await next_outgoing() == permission_request(
+            3, "edit-1", "notes-1.txt", "old-1", "new-1"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 3,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        })
+        assert await next_outgoing() == provider_request(
+            4, "notes-1.txt", "old-1", "new-1"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 4, "result": {"changed": True},
+        })
+        terminal_1, start_2 = await next_outgoing(), await next_outgoing()
+        terminal_1_update = terminal_1["params"]["update"]
+        assert terminal_1_update["_meta"] == {"mimir.sequence": 3}
+        assert {key: value for key, value in terminal_1_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
+            "status": "completed", "rawOutput": {"changed": True},
+        }
+        start_2_update = start_2["params"]["update"]
+        assert start_2_update["_meta"] == {"mimir.sequence": 4}
+        assert {key: value for key, value in start_2_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call", "toolCallId": "edit-2",
+            "title": "hands_edit", "kind": "other", "status": "pending",
+            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
+        }
+        progress_2 = await next_outgoing()
+        progress_2_update = progress_2["params"]["update"]
+        assert progress_2_update["_meta"] == {"mimir.sequence": 5}
+        assert {key: value for key, value in progress_2_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
+        }
+        assert await next_outgoing() == permission_request(
+            5, "edit-2", "notes-2.txt", "old-2", "new-2"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 5,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        })
+        assert await next_outgoing() == provider_request(
+            6, "notes-2.txt", "old-2", "new-2"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 6, "result": {"changed": True},
+        })
+        terminal_2 = await next_outgoing()
+        terminal_2_update = terminal_2["params"]["update"]
+        assert terminal_2_update["_meta"] == {"mimir.sequence": 6}
+        assert {key: value for key, value in terminal_2_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
+            "status": "completed", "rawOutput": {"changed": True},
+        }
+        assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+
+        rejecting = asyncio.create_task(
+            agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="reject it")])
+        )
+        owned_tasks.append(rejecting)
+        assert (await next_outgoing())["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        rejected_start = (await next_outgoing())["params"]["update"]
+        assert rejected_start["_meta"] == {"mimir.sequence": 7}
+        assert {key: value for key, value in rejected_start.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call", "toolCallId": "edit-3",
+            "title": "hands_edit", "kind": "other", "status": "pending",
+            "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
+        }
+        rejected_progress = (await next_outgoing())["params"]["update"]
+        assert rejected_progress["_meta"] == {"mimir.sequence": 8}
+        assert {key: value for key, value in rejected_progress.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-3",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
+        }
+        assert await next_outgoing() == permission_request(
+            7, "edit-3", "notes-3.txt", "old-3", "new-3"
+        )
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "id": 7,
+            "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
+        })
+        rejected_terminal = await next_outgoing()
+        rejected_update = rejected_terminal["params"]["update"]
+        assert rejected_update["_meta"] == {"mimir.sequence": 9}
+        rejected_body = {
+            key: value for key, value in rejected_update.items() if key != "_meta"
+        }
+        assert rejected_body["sessionUpdate"] == "tool_call_update"
+        assert rejected_body["toolCallId"] == "edit-3"
+        assert rejected_body["status"] == "failed"
+        assert "error" in rejected_body["rawOutput"]
+        assert (await asyncio.wait_for(rejecting, 3)).stop_reason == "end_turn"
+        # A reject consumed only its permission outer ID: there is no tools/call
+        # frame, and no stale allow_once decision was retained from either call.
+        assert transport.outgoing.empty()
+
+    finally:
+        await transport.incoming.put(None)
+        await asyncio.wait_for(runner, 3)
+        await agent.on_transport_closed(peer.peer_generation)
+        await connection.close()
+        await asyncio.gather(*owned_tasks, return_exceptions=True)
