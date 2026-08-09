@@ -486,6 +486,23 @@ named job:
       options: ["--account", "--json", "--from", "--to"]
 ```
 
+A scheduled job may also select a built-in scheduler authority profile with
+`authority_profile`. If omitted, the job retains the shared `scheduled_tick`
+profile. Profile names are validated when `scheduler.yaml` is loaded; an unknown
+name disables that record rather than silently falling back. For example, the
+heartbeat schedule declares its existing authority without changing its cron:
+
+```yaml
+- name: heartbeat
+  prompt_file: heartbeat.md
+  cron: 0 * * * *
+  authority_profile: heartbeat
+```
+
+The record's `cron` remains the source for both firing cadence and the heartbeat
+staleness threshold. Removing the record or leaving its cron empty intentionally
+disables that staleness check.
+
 In a poller manifest, inside the existing `authority` block:
 
 ```json
