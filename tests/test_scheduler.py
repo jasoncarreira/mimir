@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from mimir.event_logger import init_logger
+from mimir.access_control import builtin_trigger_service_principal
 from mimir.pollers import _CircuitBreakerState, _circuit_breakers
 from mimir.models import AgentEvent
 from mimir.scheduler import (
@@ -183,7 +184,9 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
         enqueued.append(event)
         return True
 
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
     job = SchedulerJob(name="morning", prompt="review extended memory", cron="0 8 * * *")
     await sched._fire(job=job)
 
@@ -194,6 +197,31 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert e.content == "review extended memory"
     assert e.channel_id == "scheduler:morning"
     assert e.extra["schedule_name"] == "morning"
+    assert e.service_authority is not None
+    assert e.service_authority.channel_memory_directory == "scheduler:morning"
+    assert str((tmp_path / "scripts").resolve()) in e.service_authority.filesystem_read_roots
+
+
+@pytest.mark.asyncio
+async def test_fire_heartbeat_principal_is_unchanged(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home,
+    )
+    await sched._fire(job=SchedulerJob(
+        name="heartbeat", prompt="check", cron="0 * * * *",
+    ))
+
+    assert len(enqueued) == 1
+    assert enqueued[0].service_authority == builtin_trigger_service_principal(
+        "heartbeat", home,
+    )
 
 
 @pytest.mark.asyncio
@@ -248,6 +276,7 @@ async def test_fire_treats_an_explicit_empty_declaration_as_a_no_op(tmp_path: Pa
 
     assert len(enqueued) == 1
     assert enqueued[0].service_principal == "scheduler"
+    assert enqueued[0].service_authority.channel_memory_directory == "scheduler:briefing"
 
 
 async def test_fire_reads_prompt_file_when_set(tmp_path: Path):

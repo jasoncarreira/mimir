@@ -320,6 +320,13 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     """Allow memory reads except beneath a different session's channel directory."""
     home = _resolved_mimir_home()
     channel_id = getattr(auth_context, "channel_id", None)
+    authority = getattr(auth_context, "service_authority", None)
+    if (
+        getattr(authority, "canonical", None) == "scheduler"
+        and getattr(authority, "trigger", None) == "scheduled_tick"
+        and getattr(authority, "channel_memory_directory", None)
+    ):
+        channel_id = authority.channel_memory_directory
     if home is None:
         return False
     memory = home / "memory"
@@ -338,6 +345,13 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     except ValueError:
         return False
     for relative in relatives:
+        if (
+            getattr(authority, "canonical", None) == "scheduler"
+            and getattr(authority, "trigger", None) == "scheduled_tick"
+            and getattr(authority, "channel_memory_directory", None)
+            and relative.parts[:2] != ("channels", channel_id)
+        ):
+            return False
         if relative.parts[:1] == ("channels",) and len(relative.parts) > 1:
             if relative.parts[1] != channel_id:
                 return False

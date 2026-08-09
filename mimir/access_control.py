@@ -31,7 +31,7 @@ import sys
 import threading
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -698,6 +698,27 @@ def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrinci
             saga_full_corpus_read=True,
         )
     raise ValueError(f"unknown built-in authority profile: {profile!r}")
+
+
+def build_scheduled_tick_service_principal(
+    job_name: str, home: Path | None,
+) -> ServicePrincipal | None:
+    """Bind the shared scheduled-tick authority to one scheduler job's reads."""
+    base = get_service_principal("scheduled_tick")
+    if base is None:
+        return None
+    script_roots = (
+        (str((home / "scripts").resolve()),) if home is not None else ()
+    )
+    return replace(
+        base,
+        filesystem_read_roots=tuple(dict.fromkeys((
+            *base.filesystem_read_roots,
+            *script_roots,
+        ))),
+        channel_memory_directory=f"scheduler:{job_name}",
+        creation_path="mimir.scheduler.Scheduler._fire:scheduled_tick",
+    )
 
 
 def _configured_file_roots() -> list[Path]:
