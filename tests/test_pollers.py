@@ -2267,13 +2267,16 @@ async def test_run_poller_timeout_kills_child_holding_pipes(
     if not hasattr(os, "killpg") or not Path("/proc").is_dir():
         pytest.skip("process-group liveness assertion requires POSIX /proc")
 
+    poller_timeout = 0.25
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", """
 import json, os, subprocess, sys
 child = subprocess.Popen([
     sys.executable,
     "-c",
-    "import time; time.sleep(120)",
+    "import os, pathlib, time; "
+    "time.sleep(float(os.environ['CHILD_LIFETIME'])); "
+    "pathlib.Path(os.environ['STATE_DIR'], 'child.survived').touch()",
 ])
 pid_path = os.path.join(os.environ["STATE_DIR"], "child.pid")
 with open(pid_path, "w", encoding="utf-8") as f:
@@ -2284,12 +2287,12 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
         name="child-holder",
         command=f"{sys.executable} poller.py",
         cron="* * * * *",
-        env={},
+        env={"CHILD_LIFETIME": str(poller_timeout * 4)},
         skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
 
-    n = await run_poller(cfg, enqueue=enq, timeout=0.25)
+    n = await run_poller(cfg, enqueue=enq, timeout=poller_timeout)
 
     assert n == 0
     assert enq.events == []
@@ -2309,12 +2312,11 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
         # for the regression this test guards against.
         return len(fields) > 2 and fields[2] != "Z"
 
-    for _ in range(20):
-        if not child_is_still_running():
-            break
+    while child_is_still_running():
         await asyncio.sleep(0.05)
 
     assert not child_is_still_running()
+    assert not (skill_dir / "child.survived").exists()
 
 
 @pytest.mark.asyncio
