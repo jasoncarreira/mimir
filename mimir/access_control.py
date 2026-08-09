@@ -168,6 +168,8 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "execute": SinkCategory.SHELL_PROCESS,
     "aexecute": SinkCategory.SHELL_PROCESS,
     "shell": SinkCategory.SHELL_PROCESS,
+    "hands_edit": SinkCategory.EXTERNAL_MCP,
+    "hands_shell": SinkCategory.SHELL_PROCESS,
     "spawn_open_code": SinkCategory.SPAWN,
     "worklink_run": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
@@ -291,6 +293,9 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "execute": ToolFlowDirection.BOTH,
     "aexecute": ToolFlowDirection.BOTH,
     "shell": ToolFlowDirection.BOTH,
+    "hands_read": ToolFlowDirection.SOURCE,
+    "hands_edit": ToolFlowDirection.BOTH,
+    "hands_shell": ToolFlowDirection.BOTH,
     "Write": ToolFlowDirection.SINK,
     "Edit": ToolFlowDirection.SINK,
     "Read": ToolFlowDirection.SOURCE,
@@ -356,6 +361,75 @@ class ResourceScope:
     domain: str
     capabilities: frozenset[str] = frozenset()
     sink_destinations: frozenset[str] = frozenset()
+
+
+CLIENT_FILE_RESOURCE_NAMESPACE = "client-file"
+_CLIENT_FILE_UNRESERVED = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+
+
+def canonical_client_file_resource(path: object) -> str | None:
+    if not isinstance(path, str) or not path or "\x00" in path:
+        return None
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    identity = "".join(
+        chr(value) if value in _CLIENT_FILE_UNRESERVED else f"%{value:02X}"
+        for value in encoded
+    )
+    return f"{CLIENT_FILE_RESOURCE_NAMESPACE}:{identity}"
+
+
+def client_file_resource_is_canonical(resource: object) -> bool:
+    prefix = f"{CLIENT_FILE_RESOURCE_NAMESPACE}:"
+    if not isinstance(resource, str) or not resource.startswith(prefix):
+        return False
+    encoded_identity = resource[len(prefix):]
+    if not encoded_identity:
+        return False
+    decoded = bytearray()
+    index = 0
+    while index < len(encoded_identity):
+        value = encoded_identity[index]
+        if ord(value) in _CLIENT_FILE_UNRESERVED:
+            decoded.append(ord(value))
+            index += 1
+            continue
+        if (
+            value != "%"
+            or index + 2 >= len(encoded_identity)
+            or not re.fullmatch(r"[0-9A-F]{2}", encoded_identity[index + 1:index + 3])
+        ):
+            return False
+        decoded.append(int(encoded_identity[index + 1:index + 3], 16))
+        index += 3
+    try:
+        path = bytes(decoded).decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return canonical_client_file_resource(path) == resource
+
+
+@dataclass(frozen=True)
+class ClientFileResourcePolicy:
+    namespace: str
+    grant: str
+
+    def allows(self, resource: object) -> bool:
+        return (
+            self.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
+            and self.grant == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
+            and client_file_resource_is_canonical(resource)
+        )
+
+
+CLIENT_FILE_RESOURCE_POLICY = ClientFileResourcePolicy(
+    namespace=CLIENT_FILE_RESOURCE_NAMESPACE,
+    grant=f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*",
+)
 
 
 @dataclass(frozen=True)
@@ -5801,6 +5875,7 @@ class OperationCatalog:
         READ_RESOURCE_OPERATIONS
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
+        | frozenset({"hands_read"})
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -5832,6 +5907,8 @@ class OperationCatalog:
         "download_files",
         "adownload_files",
         "rebuild_index",
+        "hands_edit",
+        "hands_shell",
     })
 
     # Global rows from these operations contain protected identities,
@@ -6925,6 +7002,63 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if tool_name == "hands_read":
+                from .tools.client_provider import (
+                    MIMIR_HANDS_V1,
+                    get_turn_capability_context,
+                )
+
+                capability_context = get_turn_capability_context()
+                profile = getattr(capability_context, "profile_policy", None)
+                resource_policy = getattr(profile, "resource_policy", None)
+                resource = canonical_client_file_resource(
+                    (arguments or {}).get("path")
+                )
+                authenticated_admin = (
+                    auth_context is not None
+                    and isinstance(getattr(auth_context, "principal", None), str)
+                    and bool(auth_context.principal)
+                    and isinstance(
+                        getattr(auth_context, "canonical_principal", None), str
+                    )
+                    and bool(auth_context.canonical_principal)
+                    and "admin" in (getattr(auth_context, "roles", ()) or ())
+                )
+                admitted = (
+                    capability_context is not None
+                    and capability_context.acp_delivery is True
+                    and profile is MIMIR_HANDS_V1
+                    and resource_policy is CLIENT_FILE_RESOURCE_POLICY
+                    and resource_policy.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
+                    and resource_policy.grant
+                    == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
+                    and resource is not None
+                    and resource_policy.allows(resource)
+                    and getattr(capability_context, "lease", None) is not None
+                    and not getattr(capability_context.lease, "closed", False)
+                )
+                in_scope = authenticated_admin and admitted
+                hands_auth = ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.RESOURCE_SCOPED,
+                    allowed=in_scope or not enforce,
+                    reason=None if in_scope else "client_file_scope_denied",
+                    required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    protected_source_resources=(resource,) if in_scope else (),
+                    flow_direction=flow_direction,
+                    result_integrity="untrusted",
+                )
+                if hands_auth.is_shadow_decision:
+                    self._emit_shadow_decision(
+                        hands_auth,
+                        auth_context=auth_context,
+                        target=resource,
+                        requested_target=(arguments or {}).get("path"),
+                    )
+                return hands_auth
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
@@ -7128,6 +7262,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_test": "repository",
     "repo_diff": "repository",
     "repo_unmerged": "repository",
+    "hands_read": "client_provider",
 }
 
 # These BOTH tools return only server-created metadata inline. Their external
@@ -7164,6 +7299,7 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_test",
     "repo_diff",
     "repo_unmerged",
+    "hands_read",
 })
 
 
@@ -7767,6 +7903,7 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "hands_read": "client_provider",
     **{
         operation: "repository"
         for operation, direction in _TOOL_FLOW_MAP.items()
@@ -7818,6 +7955,8 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "execute": "shell_process",
     "aexecute": "shell_process",
     "shell": "shell_process",
+    "hands_edit": "client_provider",
+    "hands_shell": "shell_process",
     "Write": "filesystem",
     "Edit": "filesystem",
     "harness_auto_deliver": "message",
