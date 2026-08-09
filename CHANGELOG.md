@@ -2040,10 +2040,10 @@ renderers round out the release.
   outcome was attributed to the wrong tool call.
 - **Weather skill `SKILL.md` invocation-form clarity** (#392): drops the
   misleading filesystem-path parenthetical that caused a downstream
-  agent to try `python3 mimir/skills/weather/get_weather.py` (which
+  agent to try `python3 mimir/skills/weather/scripts/get_weather.py` (which
   only works from a source checkout) and report "not installed" when
   in fact the script was installed (just reachable only via
-  `python3 -m mimir.skills.weather.get_weather`). Adds an explicit
+  `python3 -m mimir.skills.weather.scripts.get_weather`). Adds an explicit
   install-verification one-liner and documents the `--help` footgun
   (the script doesn't use argparse, so `--help` becomes a city query).
 - **Poller circuit-breaker renderers** (#369, chainlink #196): more
@@ -2146,8 +2146,8 @@ stale docs pruned, license attribution corrected).
 ### Fixed
 
 - **Weather skill path resolution** (#368): `SKILL.md` now invokes via
-  `python3 -m mimir.skills.weather.get_weather` instead of the broken
-  relative path `python3 skills/weather/get_weather.py`. The latter
+  `python3 -m mimir.skills.weather.scripts.get_weather` instead of the broken
+  relative path `python3 skills/weather/scripts/get_weather.py`. The latter
   didn't resolve from the shell-tool's cwd; agents had been guessing
   path variants for days with 0/7 successful invocations on muninn.
 - **Turn-viewer inner-scroll preservation** (#367): the 5s poll's

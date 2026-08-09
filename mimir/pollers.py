@@ -1540,8 +1540,8 @@ async def run_poller(
     via ``asyncio.create_subprocess_shell``. Shell features (env-var
     expansion, pipes, redirection) are available — and skill authors
     are responsible for quoting args that contain whitespace or shell
-    metacharacters (``"python poller.py 'arg with spaces'"`` —
-    NOT ``"python poller.py arg with spaces"``). For arg-handling
+    metacharacters (``"python scripts/poller.py 'arg with spaces'"`` —
+    NOT ``"python scripts/poller.py arg with spaces"``). For arg-handling
     safety, prefer compiling the script to a single binary or quoting
     consistently in ``pollers.json``.
 

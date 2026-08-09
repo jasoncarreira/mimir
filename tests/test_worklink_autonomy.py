@@ -750,7 +750,7 @@ def test_runtime_and_server_wire_worklink_arbiter_and_reaper() -> None:
 # ── ready-queue poller: discovery + cap-bounded detached dispatch ───
 
 
-POLLER = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator" / "poller.py"
+POLLER = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator" / "scripts" / "poller.py"
 
 
 def _fake_chainlink_script(

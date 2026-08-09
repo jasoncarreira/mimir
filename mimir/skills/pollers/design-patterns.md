@@ -307,7 +307,7 @@ def emit(prompt):
 skills/my-monitor/
 ├── SKILL.md           ← skill metadata + docs
 ├── pollers.json       ← declares pollers (scheduler reads this)
-├── poller.py          ← the script
+├── scripts/poller.py  ← the script
 ├── cursor.json        ← cursor state (written by poller)
 ├── events.jsonl       ← optional local event log
 └── requirements.txt   ← if the poller has Python dependencies

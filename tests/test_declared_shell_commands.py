@@ -159,7 +159,7 @@ class TestInterpreterRule:
         self, home: Path,
     ) -> None:
         todo = home / "scripts" / "process_conditional_todos.py"
-        weather = home / ".mimir_builtin_skills" / "weather" / "get_weather.py"
+        weather = home / ".mimir_builtin_skills" / "weather" / "scripts" / "get_weather.py"
         todo.write_text("print(1)\n", encoding="utf-8")
         weather.parent.mkdir(parents=True)
         weather.write_text("print(1)\n", encoding="utf-8")

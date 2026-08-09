@@ -78,7 +78,7 @@ Poller credentials come from the agent's process environment, never hardcoded in
 {
   "pollers": [{
     "name": "my-poller",
-    "command": "python poller.py",
+    "command": "python scripts/poller.py",
     "cron": "*/5 * * * *",
     "pass_env": ["GITHUB_TOKEN", "MY_API_KEY"],
     "env": {

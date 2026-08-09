@@ -205,7 +205,7 @@ def test_production_subprocess_imports_without_mimir_or_pyyaml(tmp_path: Path):
     )
 
     result = subprocess.run(
-        ["python3", "poller.py"],
+        ["python3", "scripts/poller.py"],
         cwd=skill_dir,
         env={"PATH": "/usr/local/bin:/usr/bin:/bin", "MIMIR_HOME": str(home)},
         text=True,
