@@ -9368,6 +9368,109 @@ async def test_public_permission_late_allow_revalidates_capability(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize("change", ["lease", "transport", "generation", "epoch"])
+async def test_public_permission_late_allow_rejects_live_capability_replacement(
+    monkeypatch: pytest.MonkeyPatch, async_hook: bool, change: str,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.acp.journal import JournalLease
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Broker:
+        async def request_permission(self, _eligibility: object) -> object:
+            entered.set()
+            await release.wait()
+            return PermissionDecision.ALLOW_ONCE
+
+    broker = Broker()
+    if not async_hook:
+        broker.model_task = asyncio.current_task()
+    context = _capability_for_broker(broker)
+    context.provider.peer = SimpleNamespace(
+        closed=False, transport=SimpleNamespace(closed=False),
+    )
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_emit_tool_call_sync",
+        lambda *_args, **kwargs: events.append(kwargs),
+    )
+    handler_calls = 0
+
+    def sync_handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    async def async_handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    token = set_turn_capability_context(context)
+    task = None
+    try:
+        middleware = budget_gate.BudgetGateMiddleware()
+        if async_hook:
+            task = asyncio.create_task(
+                middleware.awrap_tool_call(_live_permission_request(), async_handler),
+            )
+        else:
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    middleware.wrap_tool_call,
+                    _live_permission_request(),
+                    sync_handler,
+                ),
+            )
+        await entered.wait()
+        if change == "lease":
+            object.__setattr__(
+                context, "lease", JournalLease("replacement-turn", 41, 17),
+            )
+        elif change == "transport":
+            context.provider.peer.transport = SimpleNamespace(closed=False)
+        elif change == "generation":
+            object.__setattr__(context, "connection_generation", 42)
+            object.__setattr__(
+                context, "lease", JournalLease("replacement-turn", 42, 17),
+            )
+        else:
+            object.__setattr__(context, "prompt_epoch", 18)
+            object.__setattr__(
+                context, "lease", JournalLease("replacement-turn", 41, 18),
+            )
+        release.set()
+        result = await task
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        reset_turn_capability_context(token)
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.content == "hands_edit permission was rejected before execution"
+    assert result.tool_call_id == "tc-auth"
+    assert handler_calls == 0
+    assert any(
+        event.get("denied") is True
+        and event.get("ok") is False
+        and event.get("error") == result.content
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
 async def test_public_sync_permission_scheduling_failure_closes_coroutine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
