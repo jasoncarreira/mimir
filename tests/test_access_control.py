@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import sys
 import os
 import shlex
 import shutil
@@ -3599,8 +3600,8 @@ def test_declaration_and_write_gate_share_skill_script_writability(
 
     declared = access_control.parse_declared_shell_commands(
         [{
-            "exec": "node",
-            "path": "/usr/bin/node",
+            "exec": "python3",
+            "path": sys.executable,
             "script": str(script),
             "options": ["--experimental-strip-types"],
         }],

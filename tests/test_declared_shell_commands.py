@@ -8,6 +8,7 @@ security content of the feature.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,8 +137,8 @@ class TestInterpreterRule:
 
         declared = parse_declared_shell_commands(
             [{
-                "exec": "node",
-                "path": "/usr/bin/node",
+                "exec": "python3",
+                "path": sys.executable,
                 "script": str(script),
                 "options": ["--experimental-strip-types"],
             }],
@@ -145,11 +146,11 @@ class TestInterpreterRule:
         )
 
         assert parse_service_shell_argv(
-            f"node {script} --experimental-strip-types",
+            f"python3 {script} --experimental-strip-types",
             "maintenance",
             declared=declared,
         ) == [
-            str(Path("/usr/bin/node").resolve()),
+            str(Path(sys.executable).resolve()),
             str(script.resolve()),
             "--experimental-strip-types",
         ]
@@ -177,16 +178,24 @@ class TestInterpreterRule:
             f"python3 {weather}", "maintenance", declared=declared,
         ) == [str(Path("/usr/bin/python3").resolve()), str(weather.resolve())]
 
-    @pytest.mark.parametrize("subdir", ["scratch", "skills"])
-    def test_script_inside_an_agent_writable_root_is_refused(
-        self, home: Path, subdir: str,
-    ) -> None:
-        """``skills`` is rw, so a skill-bundled script is write-then-execute."""
-        name = "evil.py" if subdir == "scratch" else "bundled.py"
+    def test_script_inside_an_agent_writable_root_is_refused(self, home: Path) -> None:
         with pytest.raises(ValueError, match="agent-writable root"):
             parse_declared_shell_commands(
-                [{"exec": "python3", "path": "/usr/bin/python3",
-                  "script": str(home / subdir / name)}],
+                [{"exec": "python3", "path": sys.executable,
+                  "script": str(home / "scratch" / "evil.py")}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_script_at_skill_root_remains_refused(self, home: Path) -> None:
+        """Only ``skills/<name>/scripts/**`` escapes autonomous writability."""
+        skill_root_script = home / "skills" / "ai-news" / "fetch-news.py"
+        skill_root_script.parent.mkdir(parents=True)
+        skill_root_script.write_text("print('unsafe')\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": sys.executable,
+                  "script": str(skill_root_script)}],
                 writable_roots=agent_writable_roots(home),
             )
 
