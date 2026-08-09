@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1270,8 +1271,8 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         session_id = (await creating).session_id
 
         turns = iter([
-            [("edit-1", "notes-1.txt", "old-1", "new-1"),
-             ("edit-2", "notes-2.txt", "old-2", "new-2")],
+            [("edit-1", "notes-1.txt", "old-1", "new-1")],
+            [("edit-2", "notes-2.txt", "old-2", "new-2")],
             [("edit-3", "notes-3.txt", "old-3", "new-3")],
         ])
 
@@ -1279,11 +1280,33 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             # The request uses exactly the continuation context installed by the
             # authenticated ACP agent; the replacement core must not manufacture
             # or strengthen authority.
-            auth = event.continuation_auth_context
-            assert auth is not None
-            assert auth.canonical_principal == "operator"
-            assert "admin" in auth.roles
-            assert auth.enforcement_enabled
+            bound_auth = event.continuation_auth_context
+            assert bound_auth is not None
+            assert bound_auth.canonical_principal == "operator"
+            assert "admin" in bound_auth.roles
+            assert bound_auth.enforcement_enabled
+
+            # Match CoreAgent.run_turn's bound-session IFC initialization.  The
+            # replacement classifies request context but derives every authority
+            # field exclusively from the authenticated continuation carrier.
+            from mimir.agent import _initialize_ifc_labels
+            from mimir.models import InformationFlowState
+
+            labels = _initialize_ifc_labels(
+                event,
+                event.attachment_names,
+                resolver=bundle.core.identity_resolver,
+            )
+            auth = dataclasses.replace(
+                bound_auth,
+                ifc_labels=labels,
+                ifc_state=InformationFlowState(labels=labels),
+                saga_session_id=kwargs["saga_session_id"],
+            )
+            assert auth.principal == bound_auth.principal
+            assert auth.canonical_principal == bound_auth.canonical_principal
+            assert auth.roles == bound_auth.roles
+            assert auth.enforcement_enabled == bound_auth.enforcement_enabled
             turn_id = kwargs["turn_id"]
             active = agent._active_prompts[session_id]
             queue = bundle.turn_event_bus._exact_turn_subscribers[turn_id]
@@ -1382,14 +1405,6 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "title": "hands_edit", "kind": "other", "status": "pending",
             "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
         }
-        progress_1 = await next_outgoing()
-        progress_1_update = progress_1["params"]["update"]
-        assert progress_1_update["_meta"] == {"mimir.sequence": 2}
-        assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
-            "status": "in_progress",
-            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
-        }
         assert await next_outgoing() == permission_request(
             3, "edit-1", "notes-1.txt", "old-1", "new-1"
         )
@@ -1403,26 +1418,34 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 4, "result": {"changed": True},
         })
-        terminal_1, start_2 = await next_outgoing(), await next_outgoing()
+        progress_1 = await next_outgoing()
+        progress_1_update = progress_1["params"]["update"]
+        assert progress_1_update["_meta"] == {"mimir.sequence": 2}
+        assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-1.txt", "old_text": "old-1", "new_text": "new-1"},
+        }
+        terminal_1 = await next_outgoing()
         terminal_1_update = terminal_1["params"]["update"]
         assert terminal_1_update["_meta"] == {"mimir.sequence": 3}
         assert {key: value for key, value in terminal_1_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
             "status": "completed", "rawOutput": {"changed": True},
         }
+        assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+
+        prompting_2 = asyncio.create_task(
+            agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit again")])
+        )
+        owned_tasks.append(prompting_2)
+        assert (await next_outgoing())["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        start_2 = await next_outgoing()
         start_2_update = start_2["params"]["update"]
-        assert start_2_update["_meta"] == {"mimir.sequence": 4}
+        assert start_2_update["_meta"] == {"mimir.sequence": 5}
         assert {key: value for key, value in start_2_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-2",
             "title": "hands_edit", "kind": "other", "status": "pending",
-            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
-        }
-        progress_2 = await next_outgoing()
-        progress_2_update = progress_2["params"]["update"]
-        assert progress_2_update["_meta"] == {"mimir.sequence": 5}
-        assert {key: value for key, value in progress_2_update.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
-            "status": "in_progress",
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
         assert await next_outgoing() == permission_request(
@@ -1438,14 +1461,22 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 6, "result": {"changed": True},
         })
+        progress_2 = await next_outgoing()
+        progress_2_update = progress_2["params"]["update"]
+        assert progress_2_update["_meta"] == {"mimir.sequence": 6}
+        assert {key: value for key, value in progress_2_update.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
+        }
         terminal_2 = await next_outgoing()
         terminal_2_update = terminal_2["params"]["update"]
-        assert terminal_2_update["_meta"] == {"mimir.sequence": 6}
+        assert terminal_2_update["_meta"] == {"mimir.sequence": 7}
         assert {key: value for key, value in terminal_2_update.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
             "status": "completed", "rawOutput": {"changed": True},
         }
-        assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+        assert (await asyncio.wait_for(prompting_2, 3)).stop_reason == "end_turn"
 
         rejecting = asyncio.create_task(
             agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="reject it")])
@@ -1453,17 +1484,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         owned_tasks.append(rejecting)
         assert (await next_outgoing())["params"]["update"]["sessionUpdate"] == "user_message_chunk"
         rejected_start = (await next_outgoing())["params"]["update"]
-        assert rejected_start["_meta"] == {"mimir.sequence": 7}
+        assert rejected_start["_meta"] == {"mimir.sequence": 9}
         assert {key: value for key, value in rejected_start.items() if key != "_meta"} == {
             "sessionUpdate": "tool_call", "toolCallId": "edit-3",
             "title": "hands_edit", "kind": "other", "status": "pending",
-            "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
-        }
-        rejected_progress = (await next_outgoing())["params"]["update"]
-        assert rejected_progress["_meta"] == {"mimir.sequence": 8}
-        assert {key: value for key, value in rejected_progress.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-3",
-            "status": "in_progress",
             "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
         }
         assert await next_outgoing() == permission_request(
@@ -1473,9 +1497,16 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "jsonrpc": "2.0", "id": 7,
             "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
         })
+        rejected_progress = (await next_outgoing())["params"]["update"]
+        assert rejected_progress["_meta"] == {"mimir.sequence": 10}
+        assert {key: value for key, value in rejected_progress.items() if key != "_meta"} == {
+            "sessionUpdate": "tool_call_update", "toolCallId": "edit-3",
+            "status": "in_progress",
+            "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
+        }
         rejected_terminal = await next_outgoing()
         rejected_update = rejected_terminal["params"]["update"]
-        assert rejected_update["_meta"] == {"mimir.sequence": 9}
+        assert rejected_update["_meta"] == {"mimir.sequence": 11}
         rejected_body = {
             key: value for key, value in rejected_update.items() if key != "_meta"
         }
