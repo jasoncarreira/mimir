@@ -1109,55 +1109,168 @@ async def test_request_handle_start_failure_does_not_wait_for_unregistered_id() 
 
 
 @pytest.mark.asyncio
-async def test_request_registration_is_per_invocation_under_same_method_concurrency() -> None:
+async def test_request_registration_is_per_invocation_under_same_method_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     transport = MemoryTransport()
     state = sdk.StrictMessageStateStore()
     connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
     peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    send_request = connection.send_request
+    entered = {marker: asyncio.Event() for marker in ("one", "two")}
+    proceed = {marker: asyncio.Event() for marker in ("one", "two")}
 
-    starts = await asyncio.gather(
-        peer.start_request("session/request_permission", {"marker": "one"}),
-        peer.start_request("session/request_permission", {"marker": "two"}),
+    async def controlled_send_request(method: str, params: Any = None) -> Any:
+        marker = params["marker"]
+        entered[marker].set()
+        await proceed[marker].wait()
+        return await send_request(method, params)
+
+    monkeypatch.setattr(connection, "send_request", controlled_send_request)
+    start_one = asyncio.create_task(
+        peer.start_request("session/request_permission", {"marker": "one"})
     )
-    requests = [await transport.outgoing.get(), await transport.outgoing.get()]
-    assert {handle.outer_id for handle in starts} == {request["id"] for request in requests} == {0, 1}
-    by_marker = {request["params"]["marker"]: request["id"] for request in requests}
-    await transport.incoming.put({"jsonrpc": "2.0", "id": by_marker["two"], "result": {"value": "second"}})
-    await transport.incoming.put({"jsonrpc": "2.0", "id": by_marker["one"], "result": {"value": "first"}})
-    results = await asyncio.gather(*(handle.task for handle in starts))
-    assert {result["value"] for result in results} == {"first", "second"}
-    assert state._outgoing == {}
+    await entered["one"].wait()
+    start_two = asyncio.create_task(
+        peer.start_request("session/request_permission", {"marker": "two"})
+    )
+    await entered["two"].wait()
+
+    proceed["two"].set()
+    request_two = await transport.outgoing.get()
+    handle_two = await start_two
+    proceed["one"].set()
+    request_one = await transport.outgoing.get()
+    handle_one = await start_one
+
+    assert request_one["params"]["marker"] == "one"
+    assert handle_one.outer_id == request_one["id"] == 1
+    assert request_two["params"]["marker"] == "two"
+    assert handle_two.outer_id == request_two["id"] == 0
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": request_two["id"], "result": {"marker": "two"}}
+    )
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": request_one["id"], "result": {"marker": "one"}}
+    )
+    assert await handle_one.task == {"marker": "one"}
+    assert await handle_two.task == {"marker": "two"}
     await connection.close()
 
 
 @pytest.mark.asyncio
-async def test_request_registration_cancellation_phases_leave_no_capture_or_pending_id() -> None:
+async def test_request_cancelled_after_prepare_before_registration_leaves_no_stale_pairing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     transport = MemoryTransport()
     state = sdk.StrictMessageStateStore()
     connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
     peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    send_request = connection.send_request
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    exited = asyncio.Event()
+    send_tasks: list[asyncio.Task[Any]] = []
 
-    before_registration = asyncio.create_task(peer.start_request("phase/before", {}))
-    before_registration.cancel()
+    async def controlled_send_request(method: str, params: Any = None) -> Any:
+        if params["marker"] != "cancelled":
+            return await send_request(method, params)
+        task = asyncio.current_task()
+        assert task is not None
+        send_tasks.append(task)
+        entered.set()
+        try:
+            await proceed.wait()
+            return await send_request(method, params)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(connection, "send_request", controlled_send_request)
+    cancelled = asyncio.create_task(
+        peer.start_request("session/request_permission", {"marker": "cancelled"})
+    )
+    await entered.wait()
+    cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await before_registration
-    assert state._outgoing == {}
+        await cancelled
+    await exited.wait()
+    await asyncio.gather(*send_tasks, return_exceptions=True)
+    assert all(task.done() for task in send_tasks)
+    assert transport.outgoing.empty()
 
-    registered = await peer.start_request("phase/registered", {})
+    survivor = await peer.start_request(
+        "session/request_permission", {"marker": "survivor"}
+    )
     request = await transport.outgoing.get()
-    assert registered.outer_id == request["id"] == 0
-    registered.abandon()
-    with pytest.raises(asyncio.CancelledError):
-        await registered.task
-    assert state._outgoing == {}
-    await transport.incoming.put({"jsonrpc": "2.0", "id": 0, "result": {}})
-
-    after_abandon = await peer.start_request("phase/after", {})
-    request = await transport.outgoing.get()
-    assert after_abandon.outer_id == request["id"] == 1
-    await transport.incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
-    assert await after_abandon.task == {"ok": True}
+    assert request["params"]["marker"] == "survivor"
+    assert survivor.outer_id == request["id"] == 0
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": request["id"], "result": {"marker": "survivor"}}
+    )
+    assert await survivor.task == {"marker": "survivor"}
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        state.resolve_outgoing(request["id"], {"marker": "stale"})
     await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_request_connection_closed_after_prepare_before_registration_cleans_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    send_request = connection.send_request
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+    exited = asyncio.Event()
+    send_tasks: list[asyncio.Task[Any]] = []
+
+    async def controlled_send_request(method: str, params: Any = None) -> Any:
+        task = asyncio.current_task()
+        assert task is not None
+        send_tasks.append(task)
+        entered.set()
+        try:
+            await proceed.wait()
+            return await send_request(method, params)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(connection, "send_request", controlled_send_request)
+    closing = asyncio.create_task(
+        peer.start_request("session/request_permission", {"marker": "closing"})
+    )
+    await entered.wait()
+    await connection.close()
+    proceed.set()
+    with pytest.raises(Exception):
+        await closing
+    await exited.wait()
+    await asyncio.gather(*send_tasks, return_exceptions=True)
+    assert all(task.done() for task in send_tasks)
+    assert transport.outgoing.empty()
+
+    fresh_transport = MemoryTransport()
+    fresh_state = sdk.StrictMessageStateStore()
+    fresh_connection = sdk.Connection(
+        lambda *_: asyncio.sleep(0), fresh_transport, state_store=fresh_state
+    )
+    fresh_peer = sdk.AcpPeer(fresh_connection, ContractAgent(), fresh_state)
+    fresh = await fresh_peer.start_request(
+        "session/request_permission", {"marker": "fresh"}
+    )
+    request = await fresh_transport.outgoing.get()
+    assert request["params"]["marker"] == "fresh"
+    assert fresh.outer_id == request["id"] == 0
+    await fresh_transport.incoming.put(
+        {"jsonrpc": "2.0", "id": request["id"], "result": {"marker": "fresh"}}
+    )
+    assert await fresh.task == {"marker": "fresh"}
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        fresh_state.resolve_outgoing(request["id"], {"marker": "stale"})
+    await fresh_connection.close()
 
 
 @pytest.mark.asyncio
