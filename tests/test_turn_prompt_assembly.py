@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir.access_control import build_scheduled_tick_service_principal
 from mimir.agent import (
     Agent,
     _REFLECTION_CHANNEL_ID,
@@ -878,6 +879,16 @@ async def test_session_summaries_counts_turns_off_event_loop(
     snapshot_records = kwargs["snapshot_records"]
     assert snapshot_records.__self__ is agent._turns_snapshot
     assert snapshot_records.__func__ is agent._turns_snapshot.records.__func__
+
+
+def test_reflection_channel_id_matches_the_scheduler_channel(tmp_path: Path) -> None:
+    # The constant must equal the channel the scheduler synthesizes for the
+    # `reflect` job; if these drift, reflection silently reverts to
+    # channel-scoped summaries with no error.
+    auth = build_scheduled_tick_service_principal("reflect", tmp_path)
+
+    assert auth is not None
+    assert auth.channel_memory_directory == _REFLECTION_CHANNEL_ID
 
 
 @pytest.mark.asyncio
