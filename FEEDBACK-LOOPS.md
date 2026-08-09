@@ -163,22 +163,19 @@ clause in `_render_event_line`, plus a test pair in
 **S3* (audit) — between-session.** When a saga session ends
 (`saga_session_idle_minutes` timer fires), the agent runs a
 synthesis turn that calls `saga.end_session(session_id, summary)`,
-which writes a `session_boundary` atom. Subsequent turns retrieve
+which writes the summary to SAGA's sessions table. Subsequent turns retrieve
 the most recent N session_boundaries via
 `saga.recent_session_boundaries(channel_id, count)` and surface
 them in the prompt under **`## Recent session summaries`**.
 
-**Local mirror:** `<home>/.mimir/session_boundaries.jsonl`
-(append-only). The synthesis-turn writer also appends here as a
-fallback so the prompt stays populated when saga is briefly down.
-
 **Frequency:** at session-end (idle-driven) + on every subsequent
-turn for that channel.
+turn for that channel. The weekly `scheduler:reflect` turn is the sole
+cross-channel exception and receives the configured number of most recent
+sessions directly from the same table.
 **Latency:** seconds.
 **Closes the loop:** between sessions on the same channel.
-**Call sites:** `mimir/session_manager.py`,
-`mimir/session_boundary_log.py`, `mimir/templates.py` (template),
-`mimir/prompts.py` (Recent session summaries section).
+**Call sites:** `mimir/session_manager.py`, `mimir/agent.py`,
+`mimir/session_boundary_log.py`, and `mimir/saga/reflect.py`.
 
 ### 2.3 Operator alert channel
 

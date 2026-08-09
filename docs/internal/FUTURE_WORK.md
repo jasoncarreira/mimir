@@ -980,7 +980,7 @@ Closed several long-standing items. Commit range: `bf7e3a4 .. 708647b`.
 Also shipped (not previously tracked here, captured for posterity):
 - Heartbeat tick (V0.4 §1) — autonomous-work cadence with librarian protocol + backlog. Foundation for the rest of v0.4.
 - Algedonic surfacing (V0.4 §2) — recent error/feedback signals in the turn prompt, both polarities. New `feedback.py` reads `events.jsonl` + `turns.jsonl` tail-stream.
-- Session boundary surfacing (V0.4 §3) — `## Recent session summaries` block in turn prompt; MSAM source-of-truth with local-mirror fallback at `<home>/.mimir/session_boundaries.jsonl`.
+- Session boundary surfacing (V0.4 §3) — `## Recent session summaries` block in the turn prompt, now read directly from SAGA's sessions table.
 - Mountaineering port (V0.4 §5) — five framework files verbatim from open-strix; SKILL.md adapted for the climber subagent.
 - Operator alert channel (V0.4 §6) — `MIMIR_OPERATOR_ALERT_CHANNEL` + alert skill teaching when/how to escalate.
 - Indexer exclusion list (V0.4 §7) — see §6.1 above.
