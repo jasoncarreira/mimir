@@ -36,6 +36,7 @@ that need uncapped exploration).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -1303,7 +1304,7 @@ def _permission_eligibility(
     arguments: dict[str, Any] | None,
 ) -> tuple[Any, PermissionEligibility] | None:
     context = get_turn_capability_context()
-    if context is None or context.acp_delivery is not True:
+    if context is None:
         return None
     requires_admin = (
         authorization.required_tier is AccessTier.ADMIN
@@ -1311,6 +1312,8 @@ def _permission_eligibility(
     )
     if not requires_admin:
         return None
+    if context.acp_delivery is not True:
+        raise ToolException(f"{tool_name} permission eligibility was refused")
     lease = context.lease
     structurally_allowed = (
         authorization.enforcement_enabled is True
@@ -1375,24 +1378,25 @@ def _request_permission_sync(
             return _permission_denial_message(tool_name)
     except RuntimeError:
         pass
+    coroutine: Any = None
+    future: Any = None
     try:
         coroutine = broker.request_permission(eligibility)
+        if not inspect.isawaitable(coroutine):
+            return _permission_denial_message(tool_name)
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-    except Exception:
-        close = getattr(locals().get("coroutine"), "close", None)
-        if callable(close):
-            close()
-        return _permission_denial_message(tool_name)
-    decision: PermissionDecision | None = None
-    try:
         decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
         return None if decision is PermissionDecision.ALLOW_ONCE else _permission_denial_message(tool_name)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
+        if future is None:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
         return _permission_denial_message(tool_name)
     finally:
-        if not future.done():
+        if future is not None:
             future.cancel()
-        decision = None
+        coroutine = None
 
 
 async def _request_permission_async(
@@ -1408,22 +1412,38 @@ async def _request_permission_async(
     if eligible is None:
         return None
     broker, eligibility = eligible
-    task = asyncio.create_task(broker.request_permission(eligibility))
-    decision: PermissionDecision | None = None
+    awaitable: Any = None
+    task: asyncio.Task[Any] | None = None
+    propagate_cancellation = False
     try:
+        awaitable = broker.request_permission(eligibility)
+        if not inspect.isawaitable(awaitable):
+            return _permission_denial_message(tool_name)
+        task = asyncio.create_task(awaitable)
         decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
         return None if decision is PermissionDecision.ALLOW_ONCE else _permission_denial_message(tool_name)
     except asyncio.CancelledError:
         current = asyncio.current_task()
-        if current is not None and current.cancelling():
-            raise
-        return _permission_denial_message(tool_name)
+        propagate_cancellation = current is not None and current.cancelling() > 0
+        if not propagate_cancellation:
+            return _permission_denial_message(tool_name)
     except Exception:
         return _permission_denial_message(tool_name)
     finally:
-        if not task.done():
+        if task is None:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+        else:
             task.cancel()
-        decision = None
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+        awaitable = None
+    if propagate_cancellation:
+        raise asyncio.CancelledError
+    return _permission_denial_message(tool_name)
 
 
 class BudgetGateMiddleware(AgentMiddleware):

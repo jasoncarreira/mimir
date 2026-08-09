@@ -8611,3 +8611,662 @@ async def test_acp_stale_capability_context_never_requests_permission(
 
     assert denial == "hands_edit permission was rejected before execution"
     assert broker.calls == []
+
+
+class _ImmediatePermissionBroker:
+    def __init__(self, outcome: object) -> None:
+        self.outcome = outcome
+        self.calls: list[object] = []
+
+    async def request_permission(self, eligibility: object) -> object:
+        self.calls.append(eligibility)
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _live_permission_request(admin: bool = True, tool_name: str = "hands_edit", args: object = None):
+    arguments = args if args is not None else {"path": "a", "oldText": "x", "newText": "y"}
+    request = _tool_request(_write_auth(admin=admin), tool_name=tool_name, args=arguments)
+    request.tool_call["args"] = arguments
+    return request
+
+
+def _capability_for_broker(broker: object, **changes: object):
+    from mimir.acp.journal import JournalLease
+    from mimir.tools.client_provider import MIMIR_HANDS_V1, TurnCapabilityContext
+
+    values = {
+        "permission_broker": broker,
+        "provider": _PermissionTestProvider(),
+        "profile_policy": MIMIR_HANDS_V1,
+        "connection_generation": 41,
+        "prompt_epoch": 17,
+        "acp_delivery": True,
+        "lease": JournalLease("live-turn", 41, 17),
+    }
+    values.update(changes)
+    return TurnCapabilityContext(**values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["reject_once", "cancelled", object(), RuntimeError("failed")])
+async def test_public_async_permission_denial_is_failed_result_and_audited(
+    monkeypatch: pytest.MonkeyPatch, outcome: object,
+) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker_outcome = PermissionDecision(outcome) if isinstance(outcome, str) else outcome
+    broker = _ImmediatePermissionBroker(broker_outcome)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_tool_call_sync",
+        lambda *_args, **kwargs: events.append(kwargs),
+    )
+    handler_calls = 0
+
+    async def handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(), handler,
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert result.content == "hands_edit permission was rejected before execution"
+    assert handler_calls == 0
+    assert len(broker.calls) == 1
+    assert any(event.get("denied") is True and event.get("error") == result.content for event in events)
+
+
+@pytest.mark.asyncio
+async def test_public_async_permission_allow_once_executes_once_and_is_not_cached() -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    handler_calls = 0
+
+    async def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="executed", tool_call_id=request.tool_call["id"])
+
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = BudgetGateMiddleware()
+        first = await middleware.awrap_tool_call(_live_permission_request(), handler)
+        second = await middleware.awrap_tool_call(_live_permission_request(), handler)
+    finally:
+        reset_turn_capability_context(token)
+
+    assert first.content == second.content == "executed"
+    assert handler_calls == 2
+    assert len(broker.calls) == 2
+    assert all(call.tool_call_id == "tc-auth" for call in broker.calls)
+
+
+@pytest.mark.asyncio
+async def test_public_async_permission_caller_cancellation_propagates_and_cleans_broker() -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import reset_turn_capability_context, set_turn_capability_context
+
+    entered = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    class Broker:
+        calls: list[object] = []
+
+        async def request_permission(self, eligibility: object) -> object:
+            self.calls.append(eligibility)
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+    broker = Broker()
+    handler_calls = 0
+
+    async def handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        task = asyncio.create_task(
+            BudgetGateMiddleware().awrap_tool_call(_live_permission_request(), handler),
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        reset_turn_capability_context(token)
+
+    assert cleaned.is_set()
+    assert handler_calls == 0
+    assert len(broker.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raises", "nonawaitable", "timeout"])
+async def test_public_async_permission_broker_failures_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import reset_turn_capability_context, set_turn_capability_context
+
+    calls: list[object] = []
+
+    class Broker:
+        def request_permission(self, eligibility: object):
+            calls.append(eligibility)
+            if mode == "raises":
+                raise RuntimeError("failed")
+            if mode == "nonawaitable":
+                return object()
+
+            async def pending():
+                await asyncio.sleep(10)
+
+            return pending()
+
+    monkeypatch.setattr(budget_gate, "_PERMISSION_TIMEOUT_SECONDS", 0.001)
+    token = set_turn_capability_context(_capability_for_broker(Broker()))
+    try:
+        result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(), lambda _request: pytest.fail("handler executed"),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert result.content == "hands_edit permission was rejected before execution"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_public_sync_permission_worker_owner_loop_executes_and_requests_each_time() -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    broker.model_task = asyncio.current_task()
+    handler_calls = 0
+
+    def handler(request):
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="executed", tool_call_id=request.tool_call["id"])
+
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = BudgetGateMiddleware()
+        first = await asyncio.to_thread(middleware.wrap_tool_call, _live_permission_request(), handler)
+        second = await asyncio.to_thread(middleware.wrap_tool_call, _live_permission_request(), handler)
+    finally:
+        reset_turn_capability_context(token)
+
+    assert first.content == second.content == "executed"
+    assert handler_calls == 2
+    assert len(broker.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["same", "missing", "nonrunning", "closed", "raises", "nonawaitable", "timeout"])
+async def test_public_sync_permission_loop_and_broker_failures_are_denials(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    calls: list[object] = []
+
+    class Broker:
+        def request_permission(self, eligibility: object):
+            calls.append(eligibility)
+            if mode == "raises":
+                raise RuntimeError("failed")
+            if mode == "nonawaitable":
+                return object()
+
+            async def decide():
+                if mode == "timeout":
+                    await asyncio.sleep(10)
+                return PermissionDecision.ALLOW_ONCE
+
+            return decide()
+
+    broker = Broker()
+    owned_loop = None
+    owned_task = None
+    if mode in {"same", "raises", "nonawaitable", "timeout"}:
+        broker.model_task = asyncio.current_task()
+    elif mode in {"nonrunning", "closed"}:
+        def create_owned_task():
+            loop = asyncio.new_event_loop()
+            task = loop.create_task(asyncio.sleep(0))
+            if mode == "closed":
+                task.cancel()
+                loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+                loop.close()
+            return loop, task
+
+        owned_loop, owned_task = await asyncio.to_thread(create_owned_task)
+        broker.model_task = owned_task
+    monkeypatch.setattr(budget_gate, "_PERMISSION_TIMEOUT_SECONDS", 0.001)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        if mode in {"raises", "nonawaitable", "timeout"}:
+            result = await asyncio.to_thread(
+                budget_gate.BudgetGateMiddleware().wrap_tool_call,
+                _live_permission_request(),
+                lambda _request: pytest.fail("handler executed"),
+            )
+        else:
+            result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
+                _live_permission_request(), lambda _request: pytest.fail("handler executed"),
+            )
+    finally:
+        reset_turn_capability_context(token)
+        if owned_loop is not None and not owned_loop.is_closed():
+            def close_owned_loop() -> None:
+                owned_task.cancel()
+                owned_loop.run_until_complete(asyncio.gather(owned_task, return_exceptions=True))
+                owned_loop.close()
+
+            await asyncio.to_thread(close_owned_loop)
+
+    assert result.status == "error"
+    assert result.content == "hands_edit permission was rejected before execution"
+    assert len(calls) == (1 if mode in {"raises", "nonawaitable", "timeout"} else 0)
+
+
+@pytest.mark.asyncio
+async def test_public_permission_cannot_elevate_non_admin() -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(admin=False), lambda _request: pytest.fail("handler executed"),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize("command", [None, 7, "git push --force origin main"])
+async def test_public_hands_shell_malformed_and_prohibited_precede_confirmation(
+    async_hook: bool, command: object,
+) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    args = {} if command is None else {"command": command}
+    try:
+        middleware = BudgetGateMiddleware()
+        if async_hook:
+            result = await middleware.awrap_tool_call(
+                _live_permission_request(tool_name="hands_shell", args=args),
+                lambda _request: pytest.fail("handler executed"),
+            )
+        else:
+            result = middleware.wrap_tool_call(
+                _live_permission_request(tool_name="hands_shell", args=args),
+                lambda _request: pytest.fail("handler executed"),
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+async def test_public_hands_shell_allowed_reaches_confirmation(
+    async_hook: bool,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    if not async_hook:
+        broker.model_task = asyncio.current_task()
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = BudgetGateMiddleware()
+        if async_hook:
+            result = await middleware.awrap_tool_call(
+                _live_permission_request(tool_name="hands_shell", args={"command": "printf ok"}),
+                lambda request: asyncio.sleep(
+                    0, result=ToolMessage(content="ok", tool_call_id=request.tool_call["id"]),
+                ),
+            )
+        else:
+            result = await asyncio.to_thread(
+                middleware.wrap_tool_call,
+                _live_permission_request(tool_name="hands_shell", args={"command": "printf ok"}),
+                lambda request: ToolMessage(content="ok", tool_call_id=request.tool_call["id"]),
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.content == "ok"
+    assert len(broker.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_public_model_and_tool_hooks_apply_only_acp_override() -> None:
+    from langchain_core.messages import SystemMessage, ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware, _ACP_DELIVERY_INSTRUCTION
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    class Request:
+        def __init__(self) -> None:
+            self.tools = (SimpleNamespace(name="send_message"), SimpleNamespace(name="hands_read"))
+            self.system_message = SystemMessage(content="base")
+
+        def override(self, **changes: object):
+            result = Request()
+            result.tools = changes.get("tools", self.tools)
+            result.system_message = changes.get("system_message", self.system_message)
+            return result
+
+    middleware = BudgetGateMiddleware()
+    original = Request()
+    assert middleware.wrap_model_call(original, lambda request: request) is original
+    assert await middleware.awrap_model_call(original, lambda request: asyncio.sleep(0, result=request)) is original
+    non_acp_tool = _tool_request(_write_auth(admin=True), tool_name="send_message", args={"channel_id": "c", "text": "x"})
+    assert middleware.wrap_tool_call(
+        non_acp_tool,
+        lambda request: ToolMessage(content="sent", tool_call_id=request.tool_call["id"]),
+    ).content == "sent"
+    assert (await middleware.awrap_tool_call(
+        non_acp_tool,
+        lambda request: asyncio.sleep(0, result=ToolMessage(content="sent", tool_call_id=request.tool_call["id"])),
+    )).content == "sent"
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.REJECT_ONCE)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    seen: list[object] = []
+    try:
+        sync_override = middleware.wrap_model_call(original, lambda request: seen.append(request) or request)
+        async_override = await middleware.awrap_model_call(
+            original, lambda request: asyncio.sleep(0, result=seen.append(request) or request),
+        )
+        forged = _tool_request(_write_auth(admin=True), tool_name="send_message", args={"text": "x"})
+        sync_refusal = middleware.wrap_tool_call(forged, lambda _request: pytest.fail("handler executed"))
+        async_refusal = await middleware.awrap_tool_call(
+            forged, lambda _request: pytest.fail("handler executed"),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    for overridden in (sync_override, async_override):
+        assert overridden is not original
+        assert [tool.name for tool in overridden.tools] == ["hands_read"]
+        assert overridden.system_message.content == f"base\n\n{_ACP_DELIVERY_INSTRUCTION}"
+    assert seen == [sync_override, async_override]
+    assert [tool.name for tool in original.tools] == ["send_message", "hands_read"]
+    assert original.system_message.content == "base"
+    assert sync_refusal.content == async_refusal.content == "send_message is unavailable on ACP turns; use the ACP bridge"
+    assert sync_refusal.status == async_refusal.status == "error"
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "shadow",
+        "would_block",
+        "hard",
+        "unknown",
+        "future",
+        "reason_spoof",
+        "required_tier",
+        "profile",
+        "broker",
+        "provider",
+        "lease",
+        "generation",
+        "epoch",
+        "transport",
+    ],
+)
+async def test_public_permission_structural_false_matrix_never_prompts_or_executes(
+    monkeypatch: pytest.MonkeyPatch, async_hook: bool, case: str,
+) -> None:
+    from mimir.access_control import AccessTier
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    context_changes: dict[str, object] = {}
+    authorization_changes: dict[str, object] = {}
+    if case == "shadow":
+        authorization_changes["is_shadow_decision"] = True
+    elif case == "would_block":
+        authorization_changes["would_block"] = True
+    elif case == "hard":
+        authorization_changes["allowed"] = False
+    elif case == "unknown":
+        authorization_changes["decision"] = OperationDecision.UNKNOWN
+    elif case == "future":
+        authorization_changes["decision"] = object()
+    elif case == "reason_spoof":
+        authorization_changes.update(
+            decision=OperationDecision.RESOURCE_SCOPED,
+            reason="admin_required",
+        )
+    elif case == "required_tier":
+        authorization_changes["required_tier"] = AccessTier.USER
+    elif case == "profile":
+        context_changes["profile_policy"] = object()
+    elif case == "broker":
+        context_changes["permission_broker"] = object()
+    elif case == "provider":
+        context_changes["provider"] = None
+    elif case == "lease":
+        context_changes["lease"] = None
+    elif case == "transport":
+        context_changes["acp_delivery"] = False
+
+    context = _capability_for_broker(broker, **context_changes)
+    if case == "generation":
+        context.lease.generation += 1
+    elif case == "epoch":
+        context.lease.epoch += 1
+    if authorization_changes:
+        actual_authorize = budget_gate._authorize_tool_call
+
+        def altered_authorize(*args: object, **kwargs: object):
+            authorization, denial = actual_authorize(*args, **kwargs)
+            values = dict(authorization.__dict__)
+            values.update(authorization_changes)
+            return type(authorization)(**values), denial if case == "hard" else None
+
+        monkeypatch.setattr(budget_gate, "_authorize_tool_call", altered_authorize)
+
+    handler_calls = 0
+
+    def sync_handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    async def async_handler(_request):
+        nonlocal handler_calls
+        handler_calls += 1
+        pytest.fail("handler executed")
+
+    token = set_turn_capability_context(context)
+    try:
+        middleware = budget_gate.BudgetGateMiddleware()
+        if async_hook:
+            result = await middleware.awrap_tool_call(_live_permission_request(), async_handler)
+        else:
+            result = middleware.wrap_tool_call(_live_permission_request(), sync_handler)
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+    assert broker.calls == []
+
+
+@pytest.mark.asyncio
+async def test_public_async_permission_task_scheduling_failure_closes_coroutine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import reset_turn_capability_context, set_turn_capability_context
+
+    coroutine = None
+
+    class Broker:
+        def request_permission(self, _eligibility: object):
+            nonlocal coroutine
+
+            async def decide():
+                return object()
+
+            coroutine = decide()
+            return coroutine
+
+    def fail_scheduling(_awaitable: object):
+        raise RuntimeError("scheduler unavailable")
+
+    monkeypatch.setattr(budget_gate.asyncio, "create_task", fail_scheduling)
+    token = set_turn_capability_context(_capability_for_broker(Broker()))
+    try:
+        result = await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _live_permission_request(), lambda _request: pytest.fail("handler executed"),
+        )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert coroutine.cr_frame is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
+async def test_public_hands_shell_prohibition_gate_order(
+    monkeypatch: pytest.MonkeyPatch, async_hook: bool,
+) -> None:
+    from mimir.tools import budget_gate
+    from mimir.tools.client_provider import (
+        PermissionDecision,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    order: list[str] = []
+    broker = _ImmediatePermissionBroker(PermissionDecision.ALLOW_ONCE)
+    originals = {
+        "review": budget_gate._resolve_standing_review,
+        "authorize": budget_gate._authorize_tool_call,
+        "prohibited": budget_gate._check_prohibited,
+        "budget": budget_gate._check_and_increment_or_deny,
+    }
+
+    def review(*args: object, **kwargs: object):
+        order.append("review")
+        return originals["review"](*args, **kwargs)
+
+    def authorize(*args: object, **kwargs: object):
+        order.append("authorize")
+        return originals["authorize"](*args, **kwargs)
+
+    def prohibited(*args: object, **kwargs: object):
+        order.append("prohibited")
+        return originals["prohibited"](*args, **kwargs)
+
+    def budget(*args: object, **kwargs: object):
+        order.append("budget")
+        return originals["budget"](*args, **kwargs)
+
+    monkeypatch.setattr(budget_gate, "_resolve_standing_review", review)
+    monkeypatch.setattr(budget_gate, "_authorize_tool_call", authorize)
+    monkeypatch.setattr(budget_gate, "_check_prohibited", prohibited)
+    monkeypatch.setattr(budget_gate, "_check_and_increment_or_deny", budget)
+    token = set_turn_capability_context(_capability_for_broker(broker))
+    try:
+        middleware = budget_gate.BudgetGateMiddleware()
+        request = _live_permission_request(
+            tool_name="hands_shell", args={"command": "git push --force origin main"},
+        )
+        if async_hook:
+            result = await middleware.awrap_tool_call(
+                request, lambda _request: pytest.fail("handler executed"),
+            )
+        else:
+            result = middleware.wrap_tool_call(
+                request, lambda _request: pytest.fail("handler executed"),
+            )
+    finally:
+        reset_turn_capability_context(token)
+
+    assert result.status == "error"
+    assert order == ["review", "authorize", "prohibited"]
+    assert broker.calls == []
