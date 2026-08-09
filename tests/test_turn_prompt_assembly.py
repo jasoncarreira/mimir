@@ -24,7 +24,12 @@ from pathlib import Path
 
 import pytest
 
-from mimir.agent import Agent, _filter_session_turns, _prompt_source_labels
+from mimir.agent import (
+    Agent,
+    _REFLECTION_CHANNEL_ID,
+    _filter_session_turns,
+    _prompt_source_labels,
+)
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
@@ -908,7 +913,7 @@ async def test_reflection_turn_assembles_recent_cross_channel_sessions(
     agent._config.recent_boundaries = 2
     event = AgentEvent(
         trigger="scheduled_tick",
-        channel_id="scheduler:reflect",
+        channel_id=_REFLECTION_CHANNEL_ID,
         content="reflect",
         author="service:scheduler",
     )

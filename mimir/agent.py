@@ -143,6 +143,10 @@ from .worklink.continuation import (
 
 log = logging.getLogger(__name__)
 
+# Reflection is the sole turn whose session summaries are assembled across
+# channels: its own synthetic scheduler channel has no user sessions.
+_REFLECTION_CHANNEL_ID = "scheduler:reflect"
+
 # Triggers for which saga.query() adds no value — the turn has no
 # meaningful user-authored query anchor, so the memory-inject pass
 # is skipped entirely. Extraction as a frozenset constant keeps the
@@ -4093,7 +4097,7 @@ class Agent:
             await self._assemble_session_summaries(
                 channel_id=(
                     None
-                    if event.channel_id == "scheduler:reflect"
+                    if event.channel_id == _REFLECTION_CHANNEL_ID
                     else event.channel_id
                 ),
                 auth_context=auth_context,
