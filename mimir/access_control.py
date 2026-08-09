@@ -551,6 +551,42 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     }),
 }
 
+# Scheduler records may opt into these built-in profiles. Keeping this set
+# separate prevents a scheduler entry from selecting a profile whose trigger
+# semantics require additional manifest data (for example a poller profile).
+SCHEDULER_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+
+_BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
+    "heartbeat": {
+        "canonical": "heartbeat",
+        "trigger": "scheduled_tick",
+        "tier": CapabilityTier.UNBOUNDED,
+        "root_parts": ("state", "triggers", "heartbeat"),
+        "channel_memory_directory": "scheduler:heartbeat",
+        "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
+        "saga_full_corpus_read": False,
+    },
+    "session-boundary": {
+        "canonical": "synthesis",
+        "trigger": "saga_session_end",
+        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
+        "root_parts": None,
+        "channel_memory_directory": None,
+        "creation_path": "mimir.server._on_session_idle",
+        "saga_full_corpus_read": True,
+    },
+}
+
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
+    "github": "repo_review",
+    "heartbeat": "maintenance",
+}
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
+    "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
+    "github": ("github_pr_api", "GITHUB_REPOS"),
+}
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+
 _CAPABILITY_TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -632,18 +668,16 @@ def build_trigger_service_principal(
                 json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
-            shell_profile = (
-                "repo_review" if profile == "github"
-                else "maintenance" if profile == "heartbeat"
-                else "scheduler_read_only"
+            shell_profile = _SHELL_PROFILE_BY_AUTHORITY_PROFILE.get(
+                profile, "scheduler_read_only",
             )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
         elif operation == "worklink_run":
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
-        elif operation == "fetch_url" and profile == "heartbeat":
-            policies.append(ServiceSinkPolicy(operation, "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"))
-        elif operation == "fetch_url" and profile == "github":
-            policies.append(ServiceSinkPolicy(operation, "github_pr_api", "GITHUB_REPOS"))
+        elif operation == "fetch_url":
+            fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
+            if fetch_policy is not None:
+                policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
         policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
     return ServicePrincipal(
@@ -673,31 +707,34 @@ def build_trigger_service_principal(
     )
 
 
-def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrincipal:
+def builtin_trigger_service_principal(
+    profile: str, home: Path, *, scheduler_job_name: str | None = None,
+) -> ServicePrincipal:
     """Return the authoritative built-in grant; manifests cannot replace it."""
-    if profile == "heartbeat":
-        root = (home / "state" / "triggers" / "heartbeat").resolve()
-        return build_trigger_service_principal(
-            canonical="heartbeat",
-            trigger="scheduled_tick",
-            profile=profile,
-            tier=CapabilityTier.UNBOUNDED,
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
-            roots=(root,),
-            channel_memory_directory="scheduler:heartbeat",
-            creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
-        )
-    if profile == "session-boundary":
-        return build_trigger_service_principal(
-            canonical="synthesis",
-            trigger="saga_session_end",
-            profile=profile,
-            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
-            creation_path="mimir.server._on_session_idle",
-            saga_full_corpus_read=True,
-        )
-    raise ValueError(f"unknown built-in authority profile: {profile!r}")
+    config = _BUILTIN_TRIGGER_PROFILE_CONFIG.get(profile)
+    if config is None:
+        raise ValueError(f"unknown built-in authority profile: {profile!r}")
+    root_parts = config["root_parts"]
+    roots: tuple[Path, ...] = ()
+    if root_parts is not None:
+        root = home.joinpath(*root_parts).resolve()
+        if scheduler_job_name is not None:
+            root.mkdir(parents=True, exist_ok=True)
+        roots = (root,)
+    channel_memory_directory = config["channel_memory_directory"]
+    if scheduler_job_name is not None:
+        channel_memory_directory = f"scheduler:{scheduler_job_name}"
+    return build_trigger_service_principal(
+        canonical=config["canonical"],
+        trigger=config["trigger"],
+        profile=profile,
+        tier=config["tier"],
+        capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+        roots=roots,
+        channel_memory_directory=channel_memory_directory,
+        creation_path=config["creation_path"],
+        saga_full_corpus_read=config["saga_full_corpus_read"],
+    )
 
 
 def build_scheduled_tick_service_principal(
@@ -8598,7 +8635,7 @@ def create_auth_context(
         isinstance(carried_scope, RepoPRActionScope)
         and carried_scope.provenance == "server_discovered"
         and registered_service is not None
-        and registered_service.authority_profile == "heartbeat"
+        and registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
         and event.trigger == "scheduled_tick"
         and event.service_principal == registered_service.canonical
         and event_ingress is None

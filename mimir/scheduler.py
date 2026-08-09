@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
 from .access_control import (
+    SCHEDULER_AUTHORITY_PROFILES,
     agent_writable_roots,
     build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
@@ -226,9 +227,14 @@ class SchedulerJob:
     #: because that is where the job already is, and scheduler.yaml is not
     #: writable by any service principal.
     shell_commands: Any = None
+    #: Optional built-in authority profile. An omitted profile preserves the
+    #: shared ``scheduled_tick`` authority used by ordinary jobs.
+    authority_profile: str | None = None
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
+        if self.authority_profile is not None:
+            out["authority_profile"] = self.authority_profile
         # Emitted, or any scheduler mutation that rewrites the file (adding a
         # job, changing a priority) silently strips this job's grants.
         if self.shell_commands:
@@ -265,6 +271,7 @@ class SchedulerJob:
         prompt = str(raw.get("prompt", "")).strip()
         prompt_file_raw = str(raw.get("prompt_file", "")).strip() or None
         callable_name_raw = str(raw.get("callable", "")).strip() or None
+        authority_profile = str(raw.get("authority_profile", "")).strip() or None
         cron = str(raw.get("cron", "")).strip() or None
         time_of_day = str(raw.get("time_of_day", "")).strip() or None
         channel_id = raw.get("channel_id")
@@ -300,6 +307,14 @@ class SchedulerJob:
                 misfire_grace_time = 3600
         if not name:
             raise ValueError("scheduler job missing 'name'")
+        if (
+            authority_profile is not None
+            and authority_profile not in SCHEDULER_AUTHORITY_PROFILES
+        ):
+            raise ValueError(
+                f"scheduler job {name!r}: unknown authority_profile "
+                f"{authority_profile!r}"
+            )
         # Exactly one of prompt / prompt_file / callable must be set.
         # The three are mutually exclusive — prompt+callable would
         # be ambiguous (do we run the callable or render the prompt?)
@@ -345,6 +360,7 @@ class SchedulerJob:
             priority=priority,
             misfire_grace_time=misfire_grace_time,
             shell_commands=raw.get("shell_commands"),
+            authority_profile=authority_profile,
         )
 
 
@@ -363,7 +379,14 @@ def load_jobs_from_text(text: str) -> list[SchedulerJob]:
         if not isinstance(entry, dict):
             continue
         try:
-            out.append(SchedulerJob.from_yaml_entry(entry))
+            job = SchedulerJob.from_yaml_entry(entry)
+            if job.name == "heartbeat" and job.authority_profile is None:
+                log.warning(
+                    "scheduler job 'heartbeat' declares no authority_profile; "
+                    "it will run with the shared scheduled_tick authority. Add "
+                    "'authority_profile: heartbeat' to preserve its existing grants."
+                )
+            out.append(job)
         except ValueError as exc:
             log.warning("invalid scheduler job: %s", exc)
     return out
@@ -981,12 +1004,7 @@ class Scheduler:
 
         authority = None
         service_principal = "scheduler"
-        if job.name == "heartbeat":
-            heartbeat_root = self._home / "state" / "triggers" / "heartbeat"
-            heartbeat_root.mkdir(parents=True, exist_ok=True)
-            authority = builtin_trigger_service_principal("heartbeat", self._home)
-            service_principal = authority.canonical
-        else:
+        if job.authority_profile is None:
             authority = build_scheduled_tick_service_principal(job.name, self._home)
             if authority is None:
                 log.error(
@@ -994,9 +1012,19 @@ class Scheduler:
                     job.name,
                 )
                 return
-            service_principal = authority.canonical
+        else:
+            try:
+                authority = builtin_trigger_service_principal(
+                    job.authority_profile,
+                    self._home,
+                    scheduler_job_name=job.name,
+                )
+            except ValueError as exc:
+                log.error("scheduler %r: %s; job not fired", job.name, exc)
+                return
+        service_principal = authority.canonical
 
-        if job.name != "heartbeat" and job.shell_commands is not None:
+        if job.shell_commands is not None:
             # ``is not None``, not truthiness. A malformed FALSEY value --
             # ``shell_commands: {}`` or ``: ""`` -- would otherwise skip
             # validation entirely and the job would fire with no declaration and
@@ -1004,11 +1032,8 @@ class Scheduler:
             # exists to prevent, so a shape that cannot be parsed must stop the
             # job the same way a bad path does.
             # Attach the declaration to the authority this job ALREADY has.
-            # Rebuilding from TRIGGER_AUTHORITY_PROFILES["heartbeat"] would let
-            # declaring one shell command silently grant send_message, fetch_url
-            # and the typed repo/PR mutation tools, while dropping capabilities
-            # the scheduled-tick principal carries -- a declaration must add the
-            # declared argv and nothing else.
+            # Rebuilding from another profile would change the job's authority;
+            # a declaration must add the declared argv and nothing else.
             #
             # A bad declaration disables the job rather than downgrading it to
             # the undeclared principal: it would otherwise fail every command it
@@ -1274,7 +1299,11 @@ class Scheduler:
         # Catch-up heartbeat now — through the normal arbiter gate, so
         # a still-degraded environment (e.g. cost-rate TIGHT) can
         # still veto the actual turn.
-        await self._fire(job=SchedulerJob(name="heartbeat", prompt_file="heartbeat.md"))
+        await self._fire(job=SchedulerJob(
+            name="heartbeat",
+            prompt_file="heartbeat.md",
+            authority_profile="heartbeat",
+        ))
 
     async def _fire_quota_recovery(self) -> None:
         """One-shot wake body: re-run the heartbeat through the normal
@@ -1285,7 +1314,11 @@ class Scheduler:
         # Synthetic heartbeat job: reuses the heartbeat channel + prompt
         # (prompt_file falls back to the default heartbeat prompt if the
         # operator hasn't customized prompts/heartbeat.md).
-        job = SchedulerJob(name="heartbeat", prompt_file="heartbeat.md")
+        job = SchedulerJob(
+            name="heartbeat",
+            prompt_file="heartbeat.md",
+            authority_profile="heartbeat",
+        )
         await self._fire(job=job)
 
     def rearm_quota_recovery_on_start(self) -> None:

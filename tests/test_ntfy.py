@@ -489,10 +489,32 @@ def _write_scheduler_yaml(tmp_path, cron: str = "*/45 * * * *"):
     threshold — matching the intent of the original hardcoded constant.
     """
     import yaml as _yaml
-    content = [{"name": "heartbeat", "cron": cron, "prompt_file": "heartbeat.md"}]
+    content = [{
+        "name": "heartbeat",
+        "cron": cron,
+        "prompt_file": "heartbeat.md",
+        "authority_profile": "heartbeat",
+    }]
     sched_path = tmp_path / "scheduler.yaml"
     sched_path.write_text(_yaml.safe_dump(content), encoding="utf-8")
     return sched_path
+
+
+def test_read_heartbeat_cron_ignores_authority_profile_and_disabled_records(
+    tmp_path,
+):
+    import yaml as _yaml
+
+    scheduler_yaml = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    assert ntfy._read_heartbeat_cron(scheduler_yaml) == "0 * * * *"
+
+    for records in (
+        [],
+        [{"name": "heartbeat", "prompt_file": "heartbeat.md"}],
+        [{"name": "heartbeat", "prompt_file": "heartbeat.md", "cron": ""}],
+    ):
+        scheduler_yaml.write_text(_yaml.safe_dump(records), encoding="utf-8")
+        assert ntfy._read_heartbeat_cron(scheduler_yaml) is None
 
 
 @pytest.mark.asyncio
