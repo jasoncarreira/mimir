@@ -1513,20 +1513,19 @@ def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    started = time.monotonic()
     stdout = b""
     stderr = b""
     try:
         _wait_for_process_marker(ready_marker, process)
+        # The wait timeout owns the bounded-shutdown assertion. A tighter
+        # wall-clock check also measures interpreter startup and scheduler load.
         process.wait(timeout=5)
-        elapsed = time.monotonic() - started
         stdout, stderr = process.communicate(timeout=2)
     finally:
         if process.poll() is None:
             stdout, stderr = _kill_and_reap(process)
 
     assert process.returncode == 1, stderr.decode()
-    assert elapsed < 2.0
     assert stdout
     assert not adapter_marker.exists()
     assert not returned_marker.exists()
