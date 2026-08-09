@@ -1,0 +1,56 @@
+[
+  {
+    "name": "opencode",
+    "source": "npm",
+    "package": "opencode-ai",
+    "pinned_version": "1.18.9"
+  },
+  {
+    "name": "opencode-feature-factory",
+    "source": "npm",
+    "package": "opencode-feature-factory",
+    "pinned_version": "0.2.1"
+  },
+  {
+    "name": "opencode-project-memory",
+    "source": "npm",
+    "package": "opencode-project-memory",
+    "pinned_version": "0.1.0"
+  },
+  {
+    "name": "opencode-openai-codex-auth",
+    "source": "npm",
+    "package": "opencode-openai-codex-auth",
+    "pinned_version": "4.4.0"
+  },
+  {
+    "name": "opencode-anthropic-auth",
+    "source": "npm",
+    "package": "opencode-anthropic-auth",
+    "pinned_version": "0.0.13"
+  },
+  {
+    "name": "mermaid-cli",
+    "source": "npm",
+    "package": "@mermaid-js/mermaid-cli",
+    "pinned_version": "11.16.0"
+  },
+  {
+    "name": "chainlink",
+    "source": "github-release",
+    "repo": "dollspace-gay/chainlink",
+    "pinned_version": "chainlink-1.6.0"
+  },
+  {
+    "name": "osv-scanner",
+    "source": "github-release",
+    "repo": "google/osv-scanner",
+    "pinned_version": "v2.4.0"
+  },
+  {
+    "name": "gogcli",
+    "source": "github-release",
+    "repo": "steipete/gogcli",
+    "pinned_version": "v0.9.0"
+  }
+]
