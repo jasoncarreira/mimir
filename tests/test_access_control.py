@@ -43,6 +43,8 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    Integrity,
+    IntegrityEffect,
     NormalizedPullRequestSnapshot,
     RepoPRActionScope,
     RepoPRScopeRegistry,
@@ -3474,6 +3476,218 @@ def _write_auth(*, admin: bool = False) -> AuthContext:
         enforcement_enabled=True,
         ifc_labels=InformationFlowLabels(),
     )
+
+
+def _trusted_operator_write_auth() -> AuthContext:
+    source = SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity=Integrity.TRUSTED,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=(source,),
+    )
+    return replace(
+        _write_auth(),
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        ifc_labels=labels,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "auth_factory"),
+    [
+        (
+            "poller",
+            lambda: replace(
+                _write_auth(),
+                trigger="poller",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+        ),
+        (
+            "scheduled_tick",
+            lambda: replace(
+                _write_auth(),
+                trigger="scheduled_tick",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+        ),
+        (
+            "replayed_event",
+            lambda: replace(_trusted_operator_write_auth(), event_ingress="http"),
+        ),
+        (
+            "trusted_service",
+            lambda: _service_auth(
+                get_service_principal("scheduled_tick"), InformationFlowLabels(),
+            ),
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_skill_script_writes_require_a_trusted_operator_turn(
+    case: str,
+    auth_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    auth = auth_factory()
+    assert auth is not None, case
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+    )
+
+    assert decision.allowed is False, case
+    assert decision.reason == "skill_script_write_requires_trusted_operator", case
+    assert decision.refusal_detail == (
+        "writes to skills/<skill>/scripts require a trusted operator turn"
+    )
+    compatibility_decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=False, target_channel=str(target),
+    )
+    assert compatibility_decision.allowed is False, case
+    assert compatibility_decision.reason == "skill_script_write_requires_trusted_operator"
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_trusted_operator_turn_may_write_skill_scripts(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _trusted_operator_write_auth(),
+        enforce=True,
+        target_channel=str(target),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason is None
+
+
+def test_declaration_and_write_gate_share_skill_script_writability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    script = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    script.parent.mkdir(parents=True)
+    script.write_text("console.log('ok')\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    roots = access_control.agent_writable_roots(home)
+
+    declared = access_control.parse_declared_shell_commands(
+        [{
+            "exec": "node",
+            "path": "/usr/bin/node",
+            "script": str(script),
+            "options": ["--experimental-strip-types"],
+        }],
+        writable_roots=roots,
+    )
+    write = ToolRegistry().authorize_tool(
+        "edit_file",
+        replace(
+            _write_auth(),
+            trigger="scheduled_tick",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ),
+        enforce=True,
+        target_channel=str(script),
+    )
+
+    assert access_control._agent_writable_root_for_path(
+        script, roots, trusted_operator_turn=False,
+    ) is None
+    assert declared[0].script == script.resolve()
+    assert write.allowed is False
+    assert write.reason == "skill_script_write_requires_trusted_operator"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "skills/ai-news/SKILL.md",
+        "skills/ai-news/references/sources.md",
+        "skills/ai-news/.pre-update-backup/20260710T124800Z/fetch-news.ts",
+    ],
+)
+def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
+    relative: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    upgrade_auth = replace(
+        _write_auth(admin=True),
+        trigger="upgrade",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file", upgrade_auth, enforce=True, target_channel=relative,
+    )
+
+    assert decision.allowed is True
+
+
+def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", capture)
+    auth, denial = _authorize_tool_call(
+        "write_file",
+        replace(
+            _write_auth(),
+            trigger="scheduled_tick",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ),
+        str(target),
+    )
+
+    assert auth.allowed is False
+    assert denial is not None
+    reasons = {
+        fields.get("reason") or fields.get("denial_reason")
+        for _kind, fields in captured
+    }
+    assert reasons == {"skill_script_write_requires_trusted_operator"}
+    assert reasons.isdisjoint({"read_scope", "write_scope"})
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])

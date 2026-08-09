@@ -127,6 +127,56 @@ class TestInterpreterRule:
             f"python3 {home / 'scripts' / 'todo.py'}", "maintenance", declared=declared,
         ) is not None
 
+    def test_skill_owned_script_is_declared_and_admitted_at_exec(
+        self, home: Path,
+    ) -> None:
+        script = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+        script.parent.mkdir(parents=True)
+        script.write_text("console.log('ok')\n", encoding="utf-8")
+
+        declared = parse_declared_shell_commands(
+            [{
+                "exec": "node",
+                "path": "/usr/bin/node",
+                "script": str(script),
+                "options": ["--experimental-strip-types"],
+            }],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert parse_service_shell_argv(
+            f"node {script} --experimental-strip-types",
+            "maintenance",
+            declared=declared,
+        ) == [
+            str(Path("/usr/bin/node").resolve()),
+            str(script.resolve()),
+            "--experimental-strip-types",
+        ]
+
+    def test_existing_operator_and_builtin_declarations_still_admit_at_exec(
+        self, home: Path,
+    ) -> None:
+        todo = home / "scripts" / "process_conditional_todos.py"
+        weather = home / ".mimir_builtin_skills" / "weather" / "get_weather.py"
+        todo.write_text("print(1)\n", encoding="utf-8")
+        weather.parent.mkdir(parents=True)
+        weather.write_text("print(1)\n", encoding="utf-8")
+        declared = parse_declared_shell_commands(
+            [
+                {"exec": "python3", "path": "/usr/bin/python3", "script": str(todo)},
+                {"exec": "python3", "path": "/usr/bin/python3", "script": str(weather)},
+            ],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert parse_service_shell_argv(
+            f"python3 {todo}", "maintenance", declared=declared,
+        ) == [str(Path("/usr/bin/python3").resolve()), str(todo.resolve())]
+        assert parse_service_shell_argv(
+            f"python3 {weather}", "maintenance", declared=declared,
+        ) == [str(Path("/usr/bin/python3").resolve()), str(weather.resolve())]
+
     @pytest.mark.parametrize("subdir", ["scratch", "skills"])
     def test_script_inside_an_agent_writable_root_is_refused(
         self, home: Path, subdir: str,
@@ -138,6 +188,39 @@ class TestInterpreterRule:
                 [{"exec": "python3", "path": "/usr/bin/python3",
                   "script": str(home / subdir / name)}],
                 writable_roots=agent_writable_roots(home),
+            )
+
+    @pytest.mark.parametrize(
+        "root_name",
+        [
+            "state",
+            "memory",
+            "scratch",
+            "attachments",
+            "conversation_history",
+        ],
+    )
+    def test_scripts_in_remaining_home_writable_roots_are_refused(
+        self, home: Path, root_name: str,
+    ) -> None:
+        script = home / root_name / "evil.py"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("print(1)\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3", "script": str(script)}],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_script_in_tmp_remains_refused(self, home: Path) -> None:
+        script = home.parent / "tmp-agent-script.py"
+        script.write_text("print(1)\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [{"exec": "python3", "path": "/usr/bin/python3", "script": str(script)}],
+                writable_roots=(home.parent.resolve(),),
             )
 
     def test_a_symlink_cannot_launder_the_script_path(self, home: Path) -> None:
