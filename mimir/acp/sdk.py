@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextvars import ContextVar
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -77,25 +78,75 @@ class IncomingRequestState:
     error: Any = None
 
 
+@dataclass(slots=True)
+class _StartRegistration:
+    method: str
+    future: asyncio.Future[tuple[int, asyncio.Future[Any]]]
+    abandoned: bool = False
+
+
 class StrictMessageStateStore:
     def __init__(self) -> None:
         self._outgoing: dict[int, asyncio.Future[Any]] = {}
+        self._registration: ContextVar[_StartRegistration | None] = ContextVar(
+            "acp_start_registration", default=None
+        )
+        self._abandoned: set[int] = set()
 
     def register_outgoing(self, request_id: int, method: str) -> asyncio.Future[Any]:
         if request_id in self._outgoing:
             raise AcpProtocolError("Duplicate outgoing request ID")
         future = asyncio.get_running_loop().create_future()
         self._outgoing[request_id] = future
+        registration = self._registration.get()
+        if (
+            registration is not None
+            and not registration.abandoned
+            and registration.method == method
+            and not registration.future.done()
+        ):
+            registration.future.set_result((request_id, future))
         return future
+
+    def prepare_start(self, method: str) -> tuple[_StartRegistration, Any]:
+        registration = _StartRegistration(
+            method, asyncio.get_running_loop().create_future()
+        )
+        return registration, self._registration.set(registration)
+
+    async def next_started(
+        self, registration: _StartRegistration
+    ) -> tuple[int, asyncio.Future[Any]]:
+        return await registration.future
+
+    def cancel_start(self, registration: _StartRegistration, token: Any) -> None:
+        registration.abandoned = True
+        self._registration.reset(token)
+        if not registration.future.done():
+            registration.future.cancel()
+
+    def abandon_outgoing(self, request_id: int) -> None:
+        future = self._outgoing.pop(request_id, None)
+        if future is None:
+            return
+        self._abandoned.add(request_id)
+        if not future.done():
+            future.cancel()
 
     def resolve_outgoing(self, request_id: int, result: Any) -> None:
         future = self._outgoing.pop(request_id, None)
+        if future is None and request_id in self._abandoned:
+            self._abandoned.remove(request_id)
+            return
         if future is None or future.done():
             raise AcpProtocolError("Duplicate or late response")
         future.set_result(result)
 
     def reject_outgoing(self, request_id: int, error: Any) -> None:
         future = self._outgoing.pop(request_id, None)
+        if future is None and request_id in self._abandoned:
+            self._abandoned.remove(request_id)
+            return
         if future is None or future.done():
             raise AcpProtocolError("Duplicate or late response")
         future.set_exception(error)
@@ -105,6 +156,7 @@ class StrictMessageStateStore:
             if not future.done():
                 future.set_exception(error)
         self._outgoing.clear()
+        self._abandoned.clear()
 
     def begin_incoming(self, method: str, params: Any) -> IncomingRequestState:
         return IncomingRequestState(method, params)
@@ -257,7 +309,8 @@ class PermissionCompletion:
 @runtime_checkable
 class AcpPeerCallbacks(Protocol):
     async def on_mcp_notification(
-        self, connection_id: str, method: str, params: dict[str, Any] | None
+        self, peer_generation: int, connection_id: str, method: str,
+        params: dict[str, Any] | None,
     ) -> None: ...
 
     async def on_transport_closed(self, peer_generation: int) -> None: ...
@@ -289,6 +342,14 @@ def _dump(model: BaseModel) -> dict[str, Any]:
     )
 
 
+def _copy_snapshot_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _copy_snapshot_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_copy_snapshot_json(item) for item in value]
+    return value
+
+
 def permission_request_params(
     session_id: str, snapshot: PermissionSnapshot
 ) -> dict[str, Any]:
@@ -309,7 +370,7 @@ def permission_request_params(
             "title": snapshot.title,
             "kind": snapshot.kind,
             "status": "pending",
-            "rawInput": dict(snapshot.raw_input),
+            "rawInput": _copy_snapshot_json(snapshot.raw_input),
         },
         "options": [
             {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
@@ -348,13 +409,103 @@ def validate_permission_response(value: Any) -> PermissionDecision:
     return outcome.option_id
 
 
+@dataclass(slots=True)
+class AcpRequestHandle:
+    outer_id: int
+    task: asyncio.Task[Any]
+    _store: StrictMessageStateStore
+    _abandoned: bool = False
+
+    def abandon(self) -> None:
+        if self._abandoned:
+            return
+        self._abandoned = True
+        self._store.abandon_outgoing(self.outer_id)
+        self.task.cancel()
+
+    cancel = abandon
+
+
 class AcpPeer:
-    def __init__(self, connection: Connection, agent: Agent) -> None:
+    def __init__(
+        self,
+        connection: Connection,
+        agent: Agent,
+        state_store: StrictMessageStateStore | None = None,
+    ) -> None:
         self._connection = connection
+        self._state_store = state_store
+        self._start_lock = asyncio.Lock()
         self._agent = agent
         self._active_connections: set[str] = set()
         self._used_connections: set[str] = set()
         self.peer_generation = 0
+
+    @property
+    def supports_owned_requests(self) -> bool:
+        return self._state_store is not None
+
+    async def start_request(self, method: str, params: dict[str, Any]) -> AcpRequestHandle:
+        if self._state_store is None:
+            raise AcpProtocolError("Cancellable requests require the Mimir state store")
+        registration, token = self._state_store.prepare_start(method)
+        task = asyncio.create_task(self._connection.send_request(method, params))
+        started = asyncio.create_task(self._state_store.next_started(registration))
+        outer_id: int | None = None
+        try:
+            done, _ = await asyncio.wait(
+                {task, started}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if started in done:
+                outer_id, _ = started.result()
+            else:
+                task.result()
+                raise AcpProtocolError("Outgoing request completed before registration")
+        except BaseException:
+            if outer_id is None and registration.future.done() and not registration.future.cancelled():
+                outer_id, _ = registration.future.result()
+            if outer_id is not None:
+                self._state_store.abandon_outgoing(outer_id)
+            task.cancel()
+            started.cancel()
+            raise
+        finally:
+            self._state_store.cancel_start(registration, token)
+        return AcpRequestHandle(outer_id, task, self._state_store)
+
+    async def start_tool_permission(
+        self, session_id: str, snapshot: PermissionSnapshot
+    ) -> AcpRequestHandle:
+        handle = await self.start_request(
+            PERMISSION_METHOD, permission_request_params(session_id, snapshot)
+        )
+
+        async def completion() -> PermissionCompletion:
+            try:
+                return PermissionCompletion(validate_permission_response(await handle.task))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return PermissionCompletion("reject_once", exc)
+
+        return AcpRequestHandle(
+            handle.outer_id, asyncio.create_task(completion()), handle._store
+        )
+
+    async def start_mcp_request(
+        self,
+        connection_id: str,
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> AcpRequestHandle:
+        if connection_id not in self._active_connections:
+            raise unknown_connection_error()
+        if method not in MCP_REQUEST_METHODS:
+            raise method_not_found_error(method)
+        request = MessageMcpRequest(
+            connectionId=connection_id, method=method, params=params
+        )
+        return await self.start_request(MCP_MESSAGE_METHOD, _dump(request))
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         model = SessionNotification(
@@ -403,6 +554,9 @@ class AcpPeer:
         self, session_id: str, snapshot: PermissionSnapshot
     ) -> PermissionCompletion:
         try:
+            if self._state_store is not None:
+                handle = await self.start_tool_permission(session_id, snapshot)
+                return await handle.task
             result = await self._connection.send_request(
                 PERMISSION_METHOD, permission_request_params(session_id, snapshot)
             )
@@ -436,6 +590,9 @@ class AcpPeer:
             raise unknown_connection_error()
         if method not in MCP_REQUEST_METHODS:
             raise method_not_found_error(method)
+        if self._state_store is not None:
+            handle = await self.start_mcp_request(connection_id, method, params)
+            return await handle.task
         request = MessageMcpRequest(
             connectionId=connection_id, method=method, params=params
         )
@@ -487,7 +644,9 @@ class AcpPeer:
             return None
         callback = getattr(self._agent, "on_mcp_notification", None)
         if callback is not None:
-            await callback(message.connection_id, message.method, message.params)
+            await callback(
+                self.peer_generation, message.connection_id, message.method, message.params
+            )
         return None
 
 
@@ -510,13 +669,14 @@ async def run_stdio_agent(
         return await base_router(method, params, is_notification)
 
     transport = StrictNdjsonTransport(request_reader, response_writer)
+    state_store = StrictMessageStateStore()
     connection = Connection(
         route,
         transport,
         listening=False,
-        state_store=StrictMessageStateStore(),
+        state_store=state_store,
     )
-    peer = AcpPeer(connection, agent)
+    peer = AcpPeer(connection, agent, state_store)
     holder["peer"] = peer
     primary: BaseException | None = None
     traceback = None
@@ -571,6 +731,7 @@ __all__ = [
     "AcpMcpServer",
     "AcpPeer",
     "AcpPeerCallbacks",
+    "AcpRequestHandle",
     "AcpProtocolError",
     "Agent",
     "AgentCapabilities",

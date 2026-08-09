@@ -4,21 +4,31 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any
 
-from mimir.acp.sdk import AgentPlanUpdate, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
+from mimir.acp.journal import JournalLease
+from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 
 
 class UpdateDispatcher:
-    def __init__(self, publisher: Any) -> None:
+    def __init__(
+        self,
+        publisher: Any,
+        lease: JournalLease | None = None,
+        epoch: int = 0,
+    ) -> None:
         self.publisher = publisher
+        self.lease = lease
+        self.epoch = epoch
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
         self._publication_failed = False
         self._open_tools: dict[str, str] = {}
         self._tool_args: dict[str, Any] = {}
+        self._snapshots: dict[str, PermissionSnapshot] = {}
+        self._terminalized_cancelled = False
 
     @property
     def failure(self) -> BaseException | None:
@@ -28,7 +38,12 @@ class UpdateDispatcher:
         self._ensure_worker()
         self.queue.put_nowait(_allowed_event(event))
 
-    submit = enqueue
+    async def submit(self, event: Mapping[str, Any]) -> None:
+        self.enqueue(event)
+
+    def permission_snapshot(self, tool_call_id: str) -> PermissionSnapshot | None:
+        return self._snapshots.get(tool_call_id)
+
 
     async def consume(self, source: asyncio.Queue[dict[str, Any]]) -> None:
         while True:
@@ -54,6 +69,30 @@ class UpdateDispatcher:
         await self.queue.join()
         raise RequestError(-32603, "Internal error") from self._failure
 
+    async def terminalize_cancelled(self) -> None:
+        if self._terminalized_cancelled:
+            return
+        self._terminalized_cancelled = True
+        self._ensure_worker()
+        await self.queue.join()
+        updates = [
+            ToolCallProgress(
+                sessionUpdate="tool_call_update",
+                toolCallId=tool_id,
+                status="failed",
+                rawOutput={"error": "Tool execution cancelled"},
+            )
+            for tool_id in self._open_tools
+        ]
+        self._open_tools.clear()
+        self._tool_args.clear()
+        self._snapshots.clear()
+        if hasattr(self.publisher, "close_turn"):
+            await self.publisher.close_turn(updates)
+        elif updates:
+            for update in updates:
+                await self.publisher.publish_live(update)
+
     async def close(self) -> None:
         if self._worker is None:
             return
@@ -77,12 +116,22 @@ class UpdateDispatcher:
                 if event is None:
                     return
                 terminal = event.get("type") == "_terminal"
-                if self._failure is None or terminal:
+                accepted = True
+                if self.lease is not None and not terminal:
+                    accept_event = getattr(self.publisher, "accept_event", None)
+                    if accept_event is not None:
+                        accepted = await accept_event()
+                    else:
+                        accepted = self.lease.accept()
+                if accepted and (self._failure is None or terminal):
                     updates = self._map(event)
                     if not self._publication_failed:
                         for update in updates:
                             try:
-                                await self.publisher.publish_live(update)
+                                if self.lease is None or terminal:
+                                    await self.publisher.publish_live(update)
+                                else:
+                                    await self.publisher.publish_live(update, accepted=True)
                             except BaseException as exc:
                                 if self._failure is None:
                                     self._failure = exc
@@ -113,7 +162,15 @@ class UpdateDispatcher:
                 if tool_id in self._open_tools:
                     return []
                 self._open_tools[tool_id] = name
-                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending")]
+                raw_input = _strict_json(event.get("args")) if "args" in event else {}
+                self._tool_args[tool_id] = raw_input
+                self._snapshots[tool_id] = PermissionSnapshot(
+                    tool_call_id=tool_id,
+                    title=name,
+                    kind="other",
+                    raw_input=_freeze_json(raw_input),
+                )
+                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending", rawInput=raw_input)]
             if phase == "end":
                 output: list[Any] = []
                 if tool_id not in self._open_tools:
@@ -137,6 +194,7 @@ class UpdateDispatcher:
             content = _strict_json(event.get("content"))
             output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="failed" if failed else "completed", rawOutput=content))
             self._open_tools.pop(tool_id, None)
+            self._snapshots.pop(tool_id, None)
             args = self._tool_args.pop(tool_id, None)
             if name == "write_todos" and not failed:
                 plan = _todos_plan(args)
@@ -164,6 +222,16 @@ def _strict_json(value: Any, key: str = "") -> Any:
     if isinstance(value, (list, tuple)):
         return [_strict_json(item) for item in value]
     return "[redacted]"
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return __import__("types").MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def _todos_plan(args: Any) -> AgentPlanUpdate | None:
