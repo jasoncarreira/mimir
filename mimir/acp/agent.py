@@ -284,7 +284,9 @@ class _AcpProviderConnection:
                 handle.abandon()
             raise
         finally:
-            active.progress_tokens.pop(token, None)
+            async with self.agent._boundary_lock:
+                if active.progress_tokens.get(token) is ownership:
+                    active.progress_tokens.pop(token)
             if handle is not None:
                 if handle in active.mcp_handles:
                     active.mcp_handles.remove(handle)

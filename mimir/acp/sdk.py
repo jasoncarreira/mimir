@@ -717,9 +717,9 @@ async def run_stdio_agent(
     except BaseException as exc:
         primary = exc
         traceback = exc.__traceback__
+    peer.mark_transport_dead()
     await message_queue.join()
     await asyncio.sleep(0)
-    peer.mark_transport_dead()
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
         if on_closed is not None:

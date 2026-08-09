@@ -740,6 +740,78 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     await dispatcher.close()
 
 
+@pytest.mark.parametrize("earlier_outcome", ["complete", "cancel"])
+async def test_progress_token_collision_cleanup_preserves_successor_ownership(
+    monkeypatch: pytest.MonkeyPatch, earlier_outcome: str
+) -> None:
+    calls: list[asyncio.Future[dict[str, Any]]] = []
+    entered: asyncio.Queue[None] = asyncio.Queue()
+
+    class Peer:
+        async def message_mcp(
+            self, connection_id: str, method: str, params: dict[str, Any]
+        ) -> dict[str, Any]:
+            future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+            calls.append(future)
+            entered.put_nowait(None)
+            return await future
+
+    owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
+    state = SimpleNamespace(
+        generation=7, prompt_epoch=3, provider=None, active_prompt=None
+    )
+    peer = Peer()
+    provider = agent_module._AcpProviderConnection(owner, peer, "provider-1", state)
+    state.provider = provider
+    active = SimpleNamespace(
+        generation=7,
+        epoch=3,
+        progress_tokens={},
+        mcp_handles=[],
+        mcp_request_ids=set(),
+        _is_current=lambda: state.active_prompt is active,
+    )
+    state.active_prompt = active
+    monkeypatch.setattr(
+        agent_module.uuid, "uuid4", lambda: SimpleNamespace(hex="collision")
+    )
+
+    earlier = asyncio.create_task(provider._call_tool(active, "edit", {"call": 1}))
+    await entered.get()
+    successor = asyncio.create_task(provider._call_tool(active, "edit", {"call": 2}))
+    await entered.get()
+    successor_ownership = active.progress_tokens["collision"]
+
+    if earlier_outcome == "complete":
+        calls[0].set_result({"call": 1})
+        assert await earlier == {"call": 1}
+    else:
+        earlier.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await earlier
+
+    assert active.progress_tokens["collision"] is successor_ownership
+    audit_owner = SimpleNamespace(_audit_events=[])
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "collision", "progress": 1}
+    )
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "foreign", "progress": 2}
+    )
+    assert [event["status"] for event in audit_owner._audit_events] == [
+        "accepted",
+        "ignored",
+    ]
+
+    calls[1].set_result({"call": 2})
+    assert await successor == {"call": 2}
+    assert "collision" not in active.progress_tokens
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "collision", "progress": 3}
+    )
+    assert audit_owner._audit_events[-1]["status"] == "ignored"
+
+
 async def test_explicit_cancel_drains_accepted_tool_and_terminalizes_before_response(
     tmp_path: Path,
 ) -> None:

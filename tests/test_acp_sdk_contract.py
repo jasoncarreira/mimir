@@ -7,6 +7,7 @@ import io
 import json
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1010,6 +1011,88 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
     assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
     assert instances[0].closed is True
     assert agent.closed_generations == [generation]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("main_loop_error", [None, RuntimeError("receive failed")])
+async def test_runner_marks_peer_dead_before_draining_queued_handlers(
+    monkeypatch: pytest.MonkeyPatch, main_loop_error: RuntimeError | None
+) -> None:
+    instances: list[Any] = []
+    handler_tasks: list[asyncio.Task[Any]] = []
+    rejected = asyncio.Event()
+    callback_done = asyncio.Event()
+
+    class OwnedConnection:
+        def __init__(self, route: Any, *args: Any, queue: Any, **kwargs: Any) -> None:
+            self.route = route
+            self.queue = queue
+            self.closed = False
+            instances.append(self)
+
+        async def main_loop(self) -> None:
+            await self.queue.publish(SimpleNamespace())
+
+            async def handle() -> None:
+                try:
+                    while not agent.peer.closed:
+                        await asyncio.sleep(0)
+                    await self.route("queued/request", {}, False)
+                finally:
+                    self.queue.task_done()
+
+            handler_tasks.append(asyncio.create_task(handle()))
+            await asyncio.sleep(0)
+            if main_loop_error is not None:
+                raise main_loop_error
+
+        async def close(self) -> None:
+            self.closed = True
+            await asyncio.gather(*handler_tasks)
+
+    class OwnedAgent:
+        peer: sdk.AcpPeer
+
+        def on_connect(self, peer: sdk.AcpPeer) -> int:
+            self.peer = peer
+            return 41
+
+        async def on_transport_closed(self, generation: int) -> None:
+            assert generation == 41
+            assert self.peer.closed is True
+            callback_done.set()
+
+    agent = OwnedAgent()
+
+    async def route(method: str, params: Any, is_notification: bool) -> Any:
+        assert method == "queued/request"
+        with pytest.raises(ConnectionError, match="Connection closed"):
+            await agent.peer.start_request("session/prompt", {})
+        rejected.set()
+        return None
+
+    monkeypatch.setattr(sdk, "Connection", OwnedConnection)
+    monkeypatch.setattr(sdk, "build_agent_router", lambda *args, **kwargs: route)
+    reader = asyncio.StreamReader()
+    protocol = _DrainProtocol()
+    transport = _ReservedFrameTransport(io.BytesIO(), protocol)
+    writer = asyncio.StreamWriter(transport, protocol, None, asyncio.get_running_loop())
+
+    if main_loop_error is None:
+        await asyncio.wait_for(
+            sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), 1
+        )
+    else:
+        with pytest.raises(RuntimeError, match="receive failed") as exc_info:
+            await asyncio.wait_for(
+                sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), 1
+            )
+        assert exc_info.value is main_loop_error
+
+    assert rejected.is_set()
+    assert callback_done.is_set()
+    assert instances[0].closed is True
+    assert handler_tasks and all(task.done() and not task.cancelled() for task in handler_tasks)
 
 
 def test_permission_meta_matrix_is_independent_and_cancelled_inner_meta_is_illegal() -> None:
