@@ -508,13 +508,13 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
     )
     script = home / "scripts" / "process_conditional_todos.py"
     issue_note = home / "memory" / "issues" / "scheduler-read-scope.md"
+    core_note = home / "memory" / "core" / "30-reflection-policy.md"
     denied = (
-        home / "memory" / "core" / "identity.md",
         home / ".env",
         home / "credentials" / "service.json",
         sibling_note,
     )
-    for target in (own_note, script, issue_note, *denied):
+    for target in (own_note, script, issue_note, core_note, *denied):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("ordinary test content\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
@@ -533,7 +533,7 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
         _service_auth(service, InformationFlowLabels()),
         channel_id="configured-delivery-channel",
     )
-    for target in (own_note, script, issue_note):
+    for target in (own_note, script, issue_note, core_note):
         assert access_control._trigger_service_read_target_is_allowed(
             service, "read_file", {"file_path": str(target)}, auth_context=auth,
         ) is True, target
@@ -552,6 +552,74 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
 
     for operation in ("write_file", "edit_file"):
         assert service.sink_policy_for(operation) == base.sink_policy_for(operation)
+
+
+def test_scheduled_tick_memory_scope_allows_core_and_only_its_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import is_memory_read_path_allowed
+
+    home = tmp_path / "home"
+    core = home / "memory" / "core" / "30-reflection-policy.md"
+    own = home / "memory" / "channels" / "scheduler:reflect" / "notes.md"
+    other = home / "memory" / "channels" / "scheduler:other" / "notes.md"
+    for path in (core, own, other):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ordinary test content\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = build_scheduled_tick_service_principal("reflect", home)
+    assert service is not None
+    auth = _service_auth(service, InformationFlowLabels())
+
+    assert is_memory_read_path_allowed(core, auth) is True
+    assert is_memory_read_path_allowed(own, auth) is True
+    assert is_memory_read_path_allowed(other, auth) is False
+
+
+def test_heartbeat_profile_memory_scope_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import is_memory_read_path_allowed
+
+    home = tmp_path / "home"
+    core = home / "memory" / "core" / "30-reflection-policy.md"
+    own = home / "memory" / "channels" / "delivery-channel" / "notes.md"
+    other = home / "memory" / "channels" / "scheduler:maintenance" / "notes.md"
+    for path in (core, own, other):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ordinary test content\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = access_control.builtin_trigger_service_principal(
+        "heartbeat", home, scheduler_job_name="maintenance",
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        channel_id="delivery-channel",
+    )
+
+    assert is_memory_read_path_allowed(core, auth) is True
+    assert is_memory_read_path_allowed(own, auth) is True
+    assert is_memory_read_path_allowed(other, auth) is False
+
+
+def test_operator_memory_scope_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import is_memory_read_path_allowed
+
+    home = tmp_path / "home"
+    core = home / "memory" / "core" / "30-reflection-policy.md"
+    own = home / "memory" / "channels" / "slack-C1" / "notes.md"
+    other = home / "memory" / "channels" / "slack-C2" / "notes.md"
+    for path in (core, own, other):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("ordinary test content\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _read_auth()
+
+    assert is_memory_read_path_allowed(core, auth) is True
+    assert is_memory_read_path_allowed(own, auth) is True
+    assert is_memory_read_path_allowed(other, auth) is False
 
 
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(

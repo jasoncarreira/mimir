@@ -347,8 +347,8 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
         return False
     for relative in relatives:
         if is_job_bound_tick:
-            if relative.parts[:1] == ("core",):
-                return False
+            # Core blocks are already rendered into the system prompt, so denying
+            # an explicit re-read removes no exposure.
             if (
                 relative.parts[:1] == ("channels",)
                 and relative.parts[:2] != ("channels", channel_id)
