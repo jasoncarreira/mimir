@@ -504,13 +504,14 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
         / "channel-notes.md"
     )
     script = home / "scripts" / "process_conditional_todos.py"
+    issue_note = home / "memory" / "issues" / "scheduler-read-scope.md"
     denied = (
         home / "memory" / "core" / "identity.md",
         home / ".env",
         home / "credentials" / "service.json",
         sibling_note,
     )
-    for target in (own_note, script, *denied):
+    for target in (own_note, script, issue_note, *denied):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("ordinary test content\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
@@ -529,7 +530,7 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
         _service_auth(service, InformationFlowLabels()),
         channel_id="configured-delivery-channel",
     )
-    for target in (own_note, script):
+    for target in (own_note, script, issue_note):
         assert access_control._trigger_service_read_target_is_allowed(
             service, "read_file", {"file_path": str(target)}, auth_context=auth,
         ) is True, target

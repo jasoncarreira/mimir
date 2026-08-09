@@ -321,11 +321,12 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     home = _resolved_mimir_home()
     channel_id = getattr(auth_context, "channel_id", None)
     authority = getattr(auth_context, "service_authority", None)
-    if (
+    is_job_bound_tick = (
         getattr(authority, "canonical", None) == "scheduler"
         and getattr(authority, "trigger", None) == "scheduled_tick"
-        and getattr(authority, "channel_memory_directory", None)
-    ):
+        and bool(getattr(authority, "channel_memory_directory", None))
+    )
+    if is_job_bound_tick:
         channel_id = authority.channel_memory_directory
     if home is None:
         return False
@@ -345,13 +346,14 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     except ValueError:
         return False
     for relative in relatives:
-        if (
-            getattr(authority, "canonical", None) == "scheduler"
-            and getattr(authority, "trigger", None) == "scheduled_tick"
-            and getattr(authority, "channel_memory_directory", None)
-            and relative.parts[:2] != ("channels", channel_id)
-        ):
-            return False
+        if is_job_bound_tick:
+            if relative.parts[:1] == ("core",):
+                return False
+            if (
+                relative.parts[:1] == ("channels",)
+                and relative.parts[:2] != ("channels", channel_id)
+            ):
+                return False
         if relative.parts[:1] == ("channels",) and len(relative.parts) > 1:
             if relative.parts[1] != channel_id:
                 return False
