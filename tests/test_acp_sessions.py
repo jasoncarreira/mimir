@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
+import mimir.acp.agent as agent_module
 from mimir.acp import sdk
 from mimir.acp.agent import ActivePrompt, MimirAcpAgent
 from mimir.acp.journal import JournalLease
@@ -505,7 +507,12 @@ class McpClient(Client):
         if method == "tools/list":
             return {
                 "tools": [
-                    {"name": tool.provider_name, "inputSchema": _thaw_schema(tool.input_schema)}
+                    {
+                        "name": tool.provider_name,
+                        "description": tool.description,
+                        "inputSchema": _thaw_schema(tool.input_schema),
+                        "outputSchema": _thaw_schema(tool.result_schema),
+                    }
                     for tool in MIMIR_HANDS_V1.tools
                 ]
             }
@@ -538,6 +545,8 @@ def _hands(server_id: str) -> list[dict[str, Any]]:
         [{"type": "sse", "name": "mimir-hands", "url": "https://example.test"}],
         [{"type": "acp", "name": "unknown", "serverId": "one"}],
         [{"type": "acp", "name": "mimir-hands", "serverId": ""}],
+        [{"type": "acp", "name": "mimir-hands", "serverId": "one", "_meta": "bad"}],
+        [{"type": "acp", "name": "mimir-hands", "serverId": "one", "extra": True}],
         _hands("one") + _hands("two"),
     ],
 )
@@ -613,8 +622,8 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
 
     lease = JournalLease("00000000-0000-0000-0000-000000000001", 1, 1)
     dispatcher = UpdateDispatcher(Publisher(), lease, 1)
-    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool-1", "tool_name": "hands_edit"})
-    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "a", "token": "secret"}})
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "a", "token": "secret"}})
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "changed", "token": "later"}})
     await dispatcher.drain()
     peer = Peer()
     session = SimpleNamespace(provider=SimpleNamespace(peer=peer), generation=1, record=SimpleNamespace(session_id="session-1"))
@@ -633,3 +642,225 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     with pytest.raises(asyncio.CancelledError):
         await forwarder
     await dispatcher.close()
+
+
+async def test_explicit_cancel_drains_accepted_tool_and_terminalizes_before_response(
+    tmp_path: Path,
+) -> None:
+    agent, client, core = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    core.gate = asyncio.Event()
+    prompt = asyncio.create_task(
+        agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="cancel")])
+    )
+    await core.entered.wait()
+    turn_id = core.calls[0][1]["turn_id"]
+    agent._bundle.turn_event_bus.publish(
+        {
+            "turn_id": turn_id,
+            "channel_id": agent._sessions[session_id].record.thread_id,
+            "seq": 1,
+            "ts": "now",
+            "type": "tool_call",
+            "phase": "start",
+            "id": "accepted-tool",
+            "tool_name": "hands_edit",
+            "args": {"path": "a", "token": "secret"},
+        }
+    )
+    dispatcher = agent._active_prompts[session_id].dispatcher
+    await core.subscriptions[0].join()
+    await dispatcher.drain()
+
+    await agent.cancel(session_id)
+    response = await prompt
+
+    assert response.stop_reason == "cancelled"
+    assert _types(client) == [
+        "user_message_chunk",
+        "tool_call",
+        "tool_call_update",
+    ]
+    assert client.updates[1].raw_input == {"path": "a", "token": "[redacted]"}
+    assert client.updates[2].tool_call_id == "accepted-tool"
+    assert client.updates[2].status == "failed"
+    assert client.updates[2].raw_output == {"error": "Tool execution cancelled"}
+    await agent.cancel(session_id)
+    assert agent._audit_events[-1] == {
+        "event": "acp_cancel_noop",
+        "session_id": session_id,
+    }
+
+
+async def test_journal_boundary_linearizes_prepared_delivery_sent_and_close(tmp_path: Path) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    record = agent._sessions[session_id].record
+    journal = agent._journals.open(record)
+
+    class GatedClient(Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def session_update(self, session_id: str, update: Any) -> None:
+            self.entered.set()
+            await self.release.wait()
+            await super().session_update(session_id, update)
+
+    client = GatedClient()
+    lease = JournalLease("00000000-0000-4000-8000-000000000001", 1, 1)
+    update = sdk.ToolCallStart(
+        sessionUpdate="tool_call", toolCallId="tool", title="read",
+        kind="other", status="pending", rawInput={"path": "a"},
+    )
+    publishing = asyncio.create_task(
+        journal.publish_live(update, client, turn_id=lease.turn_id, lease=lease)
+    )
+    await client.entered.wait()
+    records = [json.loads(line) for line in record.journal_path.read_text().splitlines()]
+    assert [item["kind"] for item in records] == ["prepared"]
+
+    close_attempted = asyncio.Event()
+
+    async def close_boundary() -> bool:
+        close_attempted.set()
+        return await lease.close_boundary(journal.lock)
+
+    closing = asyncio.create_task(close_boundary())
+    await close_attempted.wait()
+    assert closing.done() is False
+    client.release.set()
+    await publishing
+    assert await closing is True
+    records = [json.loads(line) for line in record.journal_path.read_text().splitlines()]
+    assert [item["kind"] for item in records] == ["prepared", "sent"]
+    assert await journal.publish_live(update, client, turn_id=lease.turn_id, lease=lease) is None
+    assert len(client.updates) == 1
+
+
+async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    state = agent._sessions[session_id]
+    resisted = asyncio.Event()
+    release = asyncio.Event()
+
+    started = asyncio.Event()
+
+    async def resistant_model() -> None:
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            resisted.set()
+            await release.wait()
+
+    async def pending_handler() -> None:
+        await asyncio.Future()
+
+    model = asyncio.create_task(resistant_model())
+    handler = asyncio.create_task(pending_handler())
+    forwarder = asyncio.create_task(pending_handler())
+    await started.wait()
+    lease = JournalLease("00000000-0000-4000-8000-000000000002", state.generation, 1)
+    publisher = SimpleNamespace(_journal=SimpleNamespace(lock=asyncio.Lock()))
+    dispatcher = UpdateDispatcher(publisher, lease, 1)
+    active = ActivePrompt(state, state.generation, 1, handler, model, forwarder, dispatcher, lease)
+    state.active_prompt = active
+    agent._active_prompts[session_id] = active
+    monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)
+
+    await agent._cancel_active(active, transport=False)
+    await resisted.wait()
+    assert state.dirty is True
+    assert agent._sessions[session_id] is state
+    assert session_id not in agent._environments
+    assert agent._execution_keys[session_id] == 1
+    with pytest.raises(sdk.RequestError):
+        await agent.prompt(session_id, [])
+
+    release.set()
+    await model
+    for task in (handler, forwarder):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_idle_and_repeated_cancel_are_structured_owned_noops(tmp_path: Path) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    await agent.cancel("missing")
+    await agent.cancel("missing")
+    assert agent._audit_events == [
+        {"event": "acp_cancel_noop", "session_id": "missing"},
+        {"event": "acp_cancel_noop", "session_id": "missing"},
+    ]
+
+
+async def test_provider_connect_and_discovery_failures_leave_no_durable_session(
+    tmp_path: Path,
+) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+
+    class FailingClient(McpClient):
+        def __init__(self, fail_connect: bool) -> None:
+            super().__init__()
+            self.fail_connect = fail_connect
+
+        async def connect_mcp(self, server_id: str) -> str:
+            if self.fail_connect:
+                raise RuntimeError("connect failed")
+            return await super().connect_mcp(server_id)
+
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if method == "tools/list":
+                return {"tools": []}
+            return await super().message_mcp(connection_id, method, params)
+
+    for fail_connect in (True, False):
+        client = FailingClient(fail_connect)
+        agent.on_connect(client)
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+        with pytest.raises(sdk.RequestError):
+            await agent.new_session("/one", mcp_servers=_hands(f"server-{fail_connect}"))
+        assert agent._sessions == {}
+        assert agent._connection.server_sessions == {}
+        assert agent._connection.connection_sessions == {}
+        assert list(agent._store.root.iterdir()) == []
+        if not fail_connect:
+            assert client.disconnects == ["connection-1"]
+
+
+async def test_failed_load_readmission_preserves_prior_provider_binding(tmp_path: Path) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+
+    class ReloadClient(McpClient):
+        fail_discovery = False
+
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if self.fail_discovery and method == "tools/list":
+                return {"tools": []}
+            return await super().message_mcp(connection_id, method, params)
+
+    client = ReloadClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+    prior = agent._sessions[session_id]
+    prior_provider = prior.provider
+    client.fail_discovery = True
+
+    with pytest.raises(sdk.RequestError):
+        await agent.load_session("/two", session_id, mcp_servers=_hands("server"))
+
+    assert agent._sessions[session_id] is prior
+    assert agent._connection.server_sessions["server"] is prior
+    assert prior_provider is not None and prior_provider.closed is False
+    assert agent._connection.connection_sessions[prior_provider.connection_id] is prior
+    assert client.disconnects == ["connection-2"]

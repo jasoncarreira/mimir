@@ -35,17 +35,15 @@ class UpdateDispatcher:
         return self._failure
 
     def enqueue(self, event: Mapping[str, Any]) -> None:
-        if self.lease is not None and not self.lease.accept():
-            return
         self._ensure_worker()
-        item = _allowed_event(event)
-        item["_lease_accepted"] = True
-        self.queue.put_nowait(item)
+        self.queue.put_nowait(_allowed_event(event))
+
+    async def submit(self, event: Mapping[str, Any]) -> None:
+        self.enqueue(event)
 
     def permission_snapshot(self, tool_call_id: str) -> PermissionSnapshot | None:
         return self._snapshots.get(tool_call_id)
 
-    submit = enqueue
 
     async def consume(self, source: asyncio.Queue[dict[str, Any]]) -> None:
         while True:
@@ -118,18 +116,22 @@ class UpdateDispatcher:
                 if event is None:
                     return
                 terminal = event.get("type") == "_terminal"
-                if self._failure is None or terminal:
+                accepted = True
+                if self.lease is not None and not terminal:
+                    accept_event = getattr(self.publisher, "accept_event", None)
+                    if accept_event is not None:
+                        accepted = await accept_event()
+                    else:
+                        accepted = self.lease.accept()
+                if accepted and (self._failure is None or terminal):
                     updates = self._map(event)
                     if not self._publication_failed:
                         for update in updates:
                             try:
-                                if self.lease is None:
+                                if self.lease is None or terminal:
                                     await self.publisher.publish_live(update)
                                 else:
-                                    await self.publisher.publish_live(
-                                        update,
-                                        accepted=bool(event.get("_lease_accepted")),
-                                    )
+                                    await self.publisher.publish_live(update, accepted=True)
                             except BaseException as exc:
                                 if self._failure is None:
                                     self._failure = exc
@@ -166,9 +168,9 @@ class UpdateDispatcher:
                     tool_call_id=tool_id,
                     title=name,
                     kind="other",
-                    raw_input=raw_input,
+                    raw_input=_freeze_json(raw_input),
                 )
-                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending")]
+                return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending", rawInput=raw_input)]
             if phase == "end":
                 output: list[Any] = []
                 if tool_id not in self._open_tools:
@@ -176,12 +178,6 @@ class UpdateDispatcher:
                     output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
                 args = _strict_json(event.get("args"))
                 self._tool_args[tool_id] = args
-                self._snapshots[tool_id] = PermissionSnapshot(
-                    tool_call_id=tool_id,
-                    title=self._open_tools[tool_id],
-                    kind="other",
-                    raw_input=args,
-                )
                 output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="in_progress", rawInput=args))
                 return output
             return []
@@ -226,6 +222,16 @@ def _strict_json(value: Any, key: str = "") -> Any:
     if isinstance(value, (list, tuple)):
         return [_strict_json(item) for item in value]
     return "[redacted]"
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return __import__("types").MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def _todos_plan(args: Any) -> AgentPlanUpdate | None:

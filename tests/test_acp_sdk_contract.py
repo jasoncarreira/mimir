@@ -129,7 +129,7 @@ def test_pinned_distribution_protocol_and_schema_boundary() -> None:
         "AGENT_METHODS", "AUTH_METHOD_ID", "CLIENT_METHODS", "MCP_CONNECT_METHOD",
         "MCP_DISCONNECT_METHOD", "MCP_INBOUND_NOTIFICATIONS", "MCP_MESSAGE_METHOD",
         "MCP_NOTIFICATION_METHODS", "MCP_REQUEST_METHODS", "PERMISSION_METHOD",
-        "AcpPeer", "AcpPeerCallbacks", "AcpProtocolError", "CancelledPermissionOutcome",
+        "AcpPeer", "AcpPeerCallbacks", "AcpRequestHandle", "AcpProtocolError", "CancelledPermissionOutcome",
         "ConnectMcpRequest", "ConnectMcpResponse", "DisconnectMcpRequest",
         "DisconnectMcpResponse", "MessageMcpNotification", "MessageMcpRequest",
         "PermissionCompletion", "PermissionDecision", "PermissionSnapshot",
@@ -1030,3 +1030,78 @@ def test_permission_meta_matrix_is_independent_and_cancelled_inner_meta_is_illeg
             )
     with pytest.raises(sdk.AcpProtocolError):
         sdk.validate_permission_response({"outcome": {"outcome": "cancelled", "_meta": None}})
+
+
+@pytest.mark.asyncio
+async def test_public_request_handle_exposes_outer_id_and_quarantines_one_late_reply() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    snapshot = sdk.PermissionSnapshot("tool", "Run", "execute", {"command": "true"})
+
+    handle = await peer.start_tool_permission("session", snapshot)
+    emitted = await transport.outgoing.get()
+    assert handle.outer_id == emitted["id"] == 0
+    assert handle.task.done() is False
+    handle.abandon()
+    with pytest.raises(asyncio.CancelledError):
+        await handle.task
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 0, "result": {"outcome": {"outcome": "cancelled"}}})
+
+    second = await peer.start_tool_permission("session", snapshot)
+    emitted_second = await transport.outgoing.get()
+    assert second.outer_id == emitted_second["id"] == 1
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}}})
+    assert (await second.task).decision == "reject_once"
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        state.resolve_outgoing(1, {})
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_handle_cancel_notification_uses_exact_outer_id_and_retains_connection() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    peer._active_connections.add("connection")
+
+    handle = await peer.start_mcp_request("connection", "tools/call", {"name": "read", "arguments": {}})
+    request = await transport.outgoing.get()
+    assert handle.outer_id == request["id"] == 0
+    await peer.notify_mcp("connection", "notifications/cancelled", {"requestId": handle.outer_id})
+    notification = await transport.outgoing.get()
+    assert notification == {
+        "jsonrpc": "2.0",
+        "method": "mcp/message",
+        "params": {
+            "connectionId": "connection",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 0},
+        },
+    }
+    handle.abandon()
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 0, "result": {"content": []}})
+    next_handle = await peer.start_mcp_request("connection", "tools/list", {})
+    next_request = await transport.outgoing.get()
+    assert next_request["id"] == next_handle.outer_id == 1
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+    assert await next_handle.task == {"tools": []}
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_request_handle_start_failure_does_not_wait_for_unregistered_id() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(
+        lambda *_: asyncio.sleep(0), transport, state_store=state
+    )
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    await connection.close()
+
+    with pytest.raises(Exception):
+        await asyncio.wait_for(
+            peer.start_request("session/request_permission", {}), timeout=0.1
+        )

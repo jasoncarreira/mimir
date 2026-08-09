@@ -31,6 +31,10 @@ class JournalLease:
         self._accepted += 1
         return True
 
+    async def close_boundary(self, lock: asyncio.Lock) -> bool:
+        async with lock:
+            return self.close()
+
     def close(self) -> bool:
         if self.closed:
             return False
@@ -66,6 +70,13 @@ class SessionJournal:
     def bind_client(self, client: Any) -> None:
         self.current_client = client
 
+    async def accept_event(self, lease: JournalLease) -> bool:
+        async with self.lock:
+            if lease.closed:
+                return False
+            lease._accepted += 1
+            return True
+
     async def publish_live(
         self,
         update: Any,
@@ -76,8 +87,10 @@ class SessionJournal:
         accepted: bool = False,
     ) -> Any:
         async with self.lock:
-            if lease is not None and lease.closed and not accepted:
-                return None
+            if lease is not None and not accepted:
+                if lease.closed:
+                    return None
+                lease._accepted += 1
             return await self._publish_locked(update, client or self.current_client, turn_id)
 
     async def close_turn(

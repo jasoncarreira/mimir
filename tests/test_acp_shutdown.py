@@ -12,10 +12,12 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import (
     HostLifecycle,
     LifecycleTimeouts,
@@ -1534,3 +1536,67 @@ def test_lifecycle_has_no_environment_or_authentication_timeout_controls() -> No
     source = Path(HostLifecycle.__module__.replace(".", "/") + ".py")
     assert "MIMIR_ACP" not in (ROOT / source).read_text()
     assert "auth" not in HostLifecycle.__init__.__annotations__
+
+
+async def test_transport_death_tears_down_only_bound_generation() -> None:
+    class Peer:
+        def __init__(self) -> None:
+            self.disconnects: list[str] = []
+
+        async def disconnect_mcp(self, connection_id: str) -> None:
+            self.disconnects.append(connection_id)
+
+    old_peer = Peer()
+    new_peer = Peer()
+    old_connection = ConnectionState(1, old_peer)
+    new_connection = ConnectionState(2, new_peer)
+    old_provider = SimpleNamespace(
+        peer=old_peer, connection_id="old-connection", closed=False
+    )
+    successor_provider = SimpleNamespace(
+        peer=new_peer, connection_id="new-connection", closed=False
+    )
+    old_state = SimpleNamespace(
+        generation=1,
+        active_prompt=None,
+        provider=old_provider,
+        record=SimpleNamespace(session_id="old-only"),
+    )
+    successor = SimpleNamespace(
+        generation=2,
+        active_prompt=None,
+        provider=successor_provider,
+        record=SimpleNamespace(session_id="shared"),
+    )
+    stale_same_id = SimpleNamespace(
+        generation=1,
+        active_prompt=None,
+        provider=old_provider,
+        record=SimpleNamespace(session_id="shared"),
+    )
+    old_connection.connection_sessions["old-connection"] = old_state
+    new_connection.connection_sessions["new-connection"] = successor
+
+    agent = object.__new__(MimirAcpAgent)
+    agent._connections = {1: old_connection, 2: new_connection}
+    agent._connection = new_connection
+    agent._client = new_peer
+    agent._bridge = SimpleNamespace(_connected=True)
+    agent._sessions = {"old-only": old_state, "shared": successor}
+    agent._environments = {"old-only": (1, object()), "shared": (2, object())}
+    agent._boundary_lock = asyncio.Lock()
+
+    old_connection.server_sessions["old"] = stale_same_id
+    await agent.on_transport_closed(1)
+    await agent.on_transport_closed(1)
+
+    assert old_connection.closed is True
+    assert old_peer.disconnects == ["old-connection"]
+    assert "old-only" not in agent._sessions
+    assert agent._sessions["shared"] is successor
+    assert agent._environments["shared"][0] == 2
+    assert successor_provider.closed is False
+    assert new_peer.disconnects == []
+    assert agent._connection is new_connection
+    assert agent._client is new_peer
+    assert agent._bridge._connected is True
