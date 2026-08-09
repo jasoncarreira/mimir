@@ -12,6 +12,7 @@ from acp.agent.router import build_agent_router
 from acp.connection import Connection
 from acp.interfaces import Agent, Client
 from acp.meta import AGENT_METHODS, CLIENT_METHODS
+from acp.task.queue import InMemoryMessageQueue
 from acp.schema import (
     AcpMcpServer,
     AgentCapabilities,
@@ -440,12 +441,30 @@ class AcpPeer:
         self._active_connections: set[str] = set()
         self._used_connections: set[str] = set()
         self.peer_generation = 0
+        self._transport_dead = False
+
+    def mark_transport_dead(self) -> None:
+        if self._transport_dead:
+            return
+        self._transport_dead = True
+        self._active_connections.clear()
+        if self._state_store is not None:
+            self._state_store.reject_all_outgoing(ConnectionError("Connection closed"))
+
+    def _require_live(self) -> None:
+        if self._transport_dead:
+            raise ConnectionError("Connection closed")
+
+    @property
+    def closed(self) -> bool:
+        return self._transport_dead
 
     @property
     def supports_owned_requests(self) -> bool:
         return self._state_store is not None
 
     async def start_request(self, method: str, params: dict[str, Any]) -> AcpRequestHandle:
+        self._require_live()
         if self._state_store is None:
             raise AcpProtocolError("Cancellable requests require the Mimir state store")
         registration, token = self._state_store.prepare_start(method)
@@ -508,6 +527,7 @@ class AcpPeer:
         return await self.start_request(MCP_MESSAGE_METHOD, _dump(request))
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        self._require_live()
         model = SessionNotification(
             session_id=session_id, update=update, field_meta=kwargs or None
         )
@@ -520,6 +540,7 @@ class AcpPeer:
         options: list[PermissionOption],
         **kwargs: Any,
     ) -> RequestPermissionResponse:
+        self._require_live()
         payload = {
             "sessionId": session_id,
             "toolCall": tool_call.model_dump(
@@ -567,6 +588,7 @@ class AcpPeer:
             return PermissionCompletion("reject_once", exc)
 
     async def connect_mcp(self, server_id: str) -> str:
+        self._require_live()
         request = ConnectMcpRequest(serverId=server_id)
         result = await self._connection.send_request(MCP_CONNECT_METHOD, _dump(request))
         try:
@@ -586,6 +608,7 @@ class AcpPeer:
         method: str,
         params: dict[str, Any] | None = None,
     ) -> Any:
+        self._require_live()
         if connection_id not in self._active_connections:
             raise unknown_connection_error()
         if method not in MCP_REQUEST_METHODS:
@@ -604,6 +627,7 @@ class AcpPeer:
         method: str,
         params: dict[str, Any] | None = None,
     ) -> None:
+        self._require_live()
         if connection_id not in self._active_connections:
             raise unknown_connection_error()
         if method not in MCP_NOTIFICATION_METHODS:
@@ -614,6 +638,7 @@ class AcpPeer:
         await self._connection.send_notification(MCP_MESSAGE_METHOD, _dump(notification))
 
     async def disconnect_mcp(self, connection_id: str) -> None:
+        self._require_live()
         if connection_id not in self._active_connections:
             raise unknown_connection_error()
         self._active_connections.remove(connection_id)
@@ -670,11 +695,13 @@ async def run_stdio_agent(
 
     transport = StrictNdjsonTransport(request_reader, response_writer)
     state_store = StrictMessageStateStore()
+    message_queue = InMemoryMessageQueue()
     connection = Connection(
         route,
         transport,
         listening=False,
         state_store=state_store,
+        queue=message_queue,
     )
     peer = AcpPeer(connection, agent, state_store)
     holder["peer"] = peer
@@ -690,6 +717,9 @@ async def run_stdio_agent(
     except BaseException as exc:
         primary = exc
         traceback = exc.__traceback__
+    await message_queue.join()
+    await asyncio.sleep(0)
+    peer.mark_transport_dead()
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
         if on_closed is not None:

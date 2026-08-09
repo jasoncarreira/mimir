@@ -99,7 +99,7 @@ class ProviderProfile:
 class TurnCapabilityContext:
     permission_broker: PermissionBroker | None
     provider: ProviderConnection
-    profile_policy: ProviderProfile
+    profile_policy: ProviderProfile | None
     connection_generation: int
     prompt_epoch: int
     acp_delivery: bool
