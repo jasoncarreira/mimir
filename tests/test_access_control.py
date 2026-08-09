@@ -574,6 +574,10 @@ def test_scheduled_tick_memory_scope_allows_core_and_only_its_channel(
     assert is_memory_read_path_allowed(core, auth) is True
     assert is_memory_read_path_allowed(own, auth) is True
     assert is_memory_read_path_allowed(other, auth) is False
+    # The bare channels directory is the one case the general check below
+    # cannot cover (it requires len(parts) > 1); enumerating it leaks the
+    # other jobs' channel names.
+    assert is_memory_read_path_allowed(home / "memory" / "channels", auth) is False
 
 
 def test_heartbeat_profile_memory_scope_is_unchanged(
