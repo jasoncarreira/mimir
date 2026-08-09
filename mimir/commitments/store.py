@@ -1,8 +1,7 @@
 """Append-only JSONL store for commitments + replay-to-state.
 
-Lives at ``<home>/.mimir/commitments.jsonl`` (alongside
-``session_boundaries.jsonl``) so the indexer doesn't walk it as
-"knowledge" content.
+Lives at ``<home>/.mimir/commitments.jsonl`` so the indexer doesn't walk it
+as "knowledge" content.
 
 Trim policy is **status-aware**, not tail-bounded by line count:
 records whose current status is ``completed | dismissed | expired``

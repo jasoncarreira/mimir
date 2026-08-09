@@ -4091,7 +4091,11 @@ class Agent:
             core_proposals_block = None
         session_summaries_block = use(
             await self._assemble_session_summaries(
-                channel_id=event.channel_id,
+                channel_id=(
+                    None
+                    if event.channel_id == "scheduler:reflect"
+                    else event.channel_id
+                ),
                 auth_context=auth_context,
             )
         )

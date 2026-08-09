@@ -100,6 +100,29 @@ def _block(content: str) -> PromptBlock:
     )
 
 
+def _insert_session_boundary(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    channel_id: str,
+    summary: str,
+    reflected_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO sessions (id, channel_id, started_at, ended_at, "
+        "summary, reflected_at, owner_principal, visibility) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'service:synthesis', 'public')",
+        (
+            session_id,
+            channel_id,
+            reflected_at,
+            reflected_at,
+            summary,
+            reflected_at,
+        ),
+    )
+
+
 def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
     auth = AuthContext(
         principal=None, canonical_principal="scheduler", roles=(),
@@ -850,6 +873,98 @@ async def test_session_summaries_counts_turns_off_event_loop(
     snapshot_records = kwargs["snapshot_records"]
     assert snapshot_records.__self__ is agent._turns_snapshot
     assert snapshot_records.__func__ is agent._turns_snapshot.records.__func__
+
+
+@pytest.mark.asyncio
+async def test_reflection_turn_assembles_recent_cross_channel_sessions(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    _insert_session_boundary(
+        conn,
+        session_id="oldest",
+        channel_id="channel-old",
+        summary="oldest boundary excluded by configured count",
+        reflected_at="2026-07-01T08:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="middle",
+        channel_id="channel-alpha",
+        summary="recent alpha boundary",
+        reflected_at="2026-07-01T09:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="newest",
+        channel_id="channel-beta",
+        summary="recent beta boundary",
+        reflected_at="2026-07-01T10:00:00+00:00",
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = 2
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:reflect",
+        content="reflect",
+        author="service:scheduler",
+    )
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            _make_ctx(event), event, saga_block=None, subagent_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "recent alpha boundary" in prompt
+    assert "recent beta boundary" in prompt
+    assert "oldest boundary excluded by configured count" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_ordinary_turn_session_summaries_remain_channel_scoped(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    _insert_session_boundary(
+        conn,
+        session_id="own",
+        channel_id="channel-alpha",
+        summary="own channel boundary",
+        reflected_at="2026-07-01T09:00:00+00:00",
+    )
+    _insert_session_boundary(
+        conn,
+        session_id="other",
+        channel_id="channel-beta",
+        summary="other channel boundary",
+        reflected_at="2026-07-01T10:00:00+00:00",
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._config.recent_boundaries = 5
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="channel-alpha",
+        content="hello",
+        author="user-a",
+    )
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            _make_ctx(event), event, saga_block=None, subagent_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "own channel boundary" in prompt
+    assert "other channel boundary" not in prompt
 
 
 @pytest.mark.asyncio
