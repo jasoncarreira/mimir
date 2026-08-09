@@ -7002,6 +7002,63 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if tool_name == "hands_read":
+                from .tools.client_provider import (
+                    MIMIR_HANDS_V1,
+                    get_turn_capability_context,
+                )
+
+                capability_context = get_turn_capability_context()
+                profile = getattr(capability_context, "profile_policy", None)
+                resource_policy = getattr(profile, "resource_policy", None)
+                resource = canonical_client_file_resource(
+                    (arguments or {}).get("path")
+                )
+                authenticated_admin = (
+                    auth_context is not None
+                    and isinstance(getattr(auth_context, "principal", None), str)
+                    and bool(auth_context.principal)
+                    and isinstance(
+                        getattr(auth_context, "canonical_principal", None), str
+                    )
+                    and bool(auth_context.canonical_principal)
+                    and "admin" in (getattr(auth_context, "roles", ()) or ())
+                )
+                admitted = (
+                    capability_context is not None
+                    and capability_context.acp_delivery is True
+                    and profile is MIMIR_HANDS_V1
+                    and resource_policy is CLIENT_FILE_RESOURCE_POLICY
+                    and resource_policy.namespace == CLIENT_FILE_RESOURCE_NAMESPACE
+                    and resource_policy.grant
+                    == f"{CLIENT_FILE_RESOURCE_NAMESPACE}:*"
+                    and resource is not None
+                    and resource_policy.allows(resource)
+                    and getattr(capability_context, "lease", None) is not None
+                    and not getattr(capability_context.lease, "closed", False)
+                )
+                in_scope = authenticated_admin and admitted
+                hands_auth = ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.RESOURCE_SCOPED,
+                    allowed=in_scope or not enforce,
+                    reason=None if in_scope else "client_file_scope_denied",
+                    required_tier=AccessTier.USER if in_scope else AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    protected_source_resources=(resource,) if in_scope else (),
+                    flow_direction=flow_direction,
+                    result_integrity="untrusted",
+                )
+                if hands_auth.is_shadow_decision:
+                    self._emit_shadow_decision(
+                        hands_auth,
+                        auth_context=auth_context,
+                        target=resource,
+                        requested_target=(arguments or {}).get("path"),
+                    )
+                return hands_auth
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
