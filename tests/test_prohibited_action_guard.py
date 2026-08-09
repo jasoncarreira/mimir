@@ -218,6 +218,10 @@ class TestIsBashTool:
         this fix, allowing force-push commands through the guard unchecked."""
         assert is_bash_tool("Bash") is True
 
+    def test_hands_shell_is_bash(self) -> None:
+        assert is_bash_tool("hands_shell") is True
+        assert is_bash_tool("client_hands_shell") is False
+
     def test_non_bash_tool_not_checked(self) -> None:
         assert is_bash_tool("send_message") is False
 

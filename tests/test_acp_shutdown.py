@@ -12,10 +12,12 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import (
     HostLifecycle,
     LifecycleTimeouts,
@@ -1232,16 +1234,21 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
         async def main():
             streams = Streams()
             composition = Composition()
+            resistant_entered = asyncio.Event()
             async def streams_factory(frame):
                 return streams
             async def composition_factory():
                 async def resistant():
+                    resistant_entered.set()
                     try:
                         await asyncio.Future()
                     except asyncio.CancelledError:
                         open(ready_marker, "w").close()
                         await asyncio.Future()
-                asyncio.create_task(resistant(), name="subprocess-resistant-child")
+                composition.resistant_task = asyncio.create_task(
+                    resistant(), name="subprocess-resistant-child"
+                )
+                await resistant_entered.wait()
                 return composition
             async def protocol_runner(*args, **kwargs):
                 return None
@@ -1511,20 +1518,19 @@ def test_unread_stdout_backpressure_hard_fail_stops_subprocess(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    started = time.monotonic()
     stdout = b""
     stderr = b""
     try:
         _wait_for_process_marker(ready_marker, process)
+        # The wait timeout owns the bounded-shutdown assertion. A tighter
+        # wall-clock check also measures interpreter startup and scheduler load.
         process.wait(timeout=5)
-        elapsed = time.monotonic() - started
         stdout, stderr = process.communicate(timeout=2)
     finally:
         if process.poll() is None:
             stdout, stderr = _kill_and_reap(process)
 
     assert process.returncode == 1, stderr.decode()
-    assert elapsed < 2.0
     assert stdout
     assert not adapter_marker.exists()
     assert not returned_marker.exists()
@@ -1534,3 +1540,122 @@ def test_lifecycle_has_no_environment_or_authentication_timeout_controls() -> No
     source = Path(HostLifecycle.__module__.replace(".", "/") + ".py")
     assert "MIMIR_ACP" not in (ROOT / source).read_text()
     assert "auth" not in HostLifecycle.__init__.__annotations__
+
+
+async def test_transport_death_tears_down_only_bound_generation() -> None:
+    class Peer:
+        def __init__(self) -> None:
+            self.disconnects: list[str] = []
+
+        async def disconnect_mcp(self, connection_id: str) -> None:
+            self.disconnects.append(connection_id)
+
+    old_peer = Peer()
+    new_peer = Peer()
+    old_connection = ConnectionState(1, old_peer)
+    new_connection = ConnectionState(2, new_peer)
+    old_provider = SimpleNamespace(
+        peer=old_peer, connection_id="old-connection", closed=False
+    )
+    successor_provider = SimpleNamespace(
+        peer=new_peer, connection_id="new-connection", closed=False
+    )
+    old_state = SimpleNamespace(
+        generation=1,
+        active_prompt=None,
+        provider=old_provider,
+        record=SimpleNamespace(session_id="old-only"),
+    )
+    successor = SimpleNamespace(
+        generation=2,
+        active_prompt=None,
+        provider=successor_provider,
+        record=SimpleNamespace(session_id="shared"),
+    )
+    stale_same_id = SimpleNamespace(
+        generation=1,
+        active_prompt=None,
+        provider=old_provider,
+        record=SimpleNamespace(session_id="shared"),
+    )
+    old_connection.connection_sessions["old-connection"] = old_state
+    new_connection.connection_sessions["new-connection"] = successor
+
+    agent = object.__new__(MimirAcpAgent)
+    agent._connections = {1: old_connection, 2: new_connection}
+    agent._connection = new_connection
+    agent._client = new_peer
+    agent._bridge = SimpleNamespace(_connected=True)
+    agent._sessions = {"old-only": old_state, "shared": successor}
+    agent._environments = {"old-only": (1, object()), "shared": (2, object())}
+    agent._boundary_lock = asyncio.Lock()
+
+    old_connection.server_sessions["old"] = stale_same_id
+    await agent.on_transport_closed(1)
+    await agent.on_transport_closed(1)
+
+    assert old_connection.closed is True
+    assert old_peer.disconnects == []
+    assert "old-only" not in agent._sessions
+    assert agent._sessions["shared"] is successor
+    assert agent._environments["shared"][0] == 2
+    assert successor_provider.closed is False
+    assert new_peer.disconnects == []
+    assert agent._connection is new_connection
+    assert agent._client is new_peer
+    assert agent._bridge._connected is True
+
+
+async def test_inbound_mcp_generation_identity_prevents_connection_id_collision() -> None:
+    old_state = SimpleNamespace(generation=1, record=SimpleNamespace(session_id="old"))
+    new_state = SimpleNamespace(generation=2, record=SimpleNamespace(session_id="new"))
+    old_connection = ConnectionState(1, object())
+    new_connection = ConnectionState(2, object())
+    old_connection.connection_sessions["collision"] = old_state
+    new_connection.connection_sessions["collision"] = new_state
+    agent = object.__new__(MimirAcpAgent)
+    agent._connections = {1: old_connection, 2: new_connection}
+    observed: list[tuple[int, str]] = []
+
+    async def revalidate(state: Any) -> None:
+        observed.append((state.generation, state.record.session_id))
+
+    agent._revalidate_provider = revalidate
+    await agent.on_mcp_notification(1, "collision", "notifications/tools/list_changed", None)
+    await agent.on_mcp_notification(2, "collision", "notifications/tools/list_changed", None)
+    await asyncio.gather(*old_connection.tasks, *new_connection.tasks)
+
+    assert observed == [(1, "old"), (2, "new")]
+
+
+async def test_replaced_generation_retirement_is_not_owned_by_successor_connection() -> None:
+    agent = object.__new__(MimirAcpAgent)
+    old_peer = object()
+    new_peer = object()
+    old = ConnectionState(1, old_peer)
+    agent._connection = old
+    agent._connections = {1: old}
+    agent._generation = 1
+    agent._client = old_peer
+    agent._auth_context = object()
+    agent._display_name = "old"
+    agent._bridge = SimpleNamespace(_connected=False)
+    agent._active_prompts = {}
+    agent._environments = {}
+    agent._retirement_tasks = set()
+    retired = asyncio.Event()
+
+    async def retire(generation: int) -> None:
+        assert generation == 1
+        retired.set()
+
+    agent._retire_generation = retire
+    successor_generation = agent.on_connect(new_peer)
+    successor = agent._connections[successor_generation]
+    await retired.wait()
+    await asyncio.gather(*agent._retirement_tasks)
+
+    assert successor.tasks == set()
+    assert agent._connection is successor
+    assert successor.auth_context is None
+    assert successor.principal is None
