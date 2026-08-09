@@ -1302,7 +1302,7 @@ def _permission_eligibility(
     tool_name: str,
     authorization: ToolAuthorization,
     arguments: dict[str, Any] | None,
-) -> tuple[Any, PermissionEligibility] | None:
+) -> tuple[Any, PermissionEligibility, tuple[Any, ...]] | None:
     context = get_turn_capability_context()
     if context is None:
         return None
@@ -1335,12 +1335,94 @@ def _permission_eligibility(
     )
     if not structurally_allowed:
         raise ToolException(f"{tool_name} permission eligibility was refused")
+    provider = context.provider
+    peer = getattr(provider, "peer", None)
+    transport = getattr(peer, "transport", None) if peer is not None else None
+    snapshot = (
+        context,
+        context.profile_policy,
+        provider,
+        context.permission_broker,
+        lease,
+        context.connection_generation,
+        context.prompt_epoch,
+        peer,
+        transport,
+    )
+    if not _permission_context_is_current(snapshot):
+        raise ToolException(f"{tool_name} permission eligibility was refused")
     return context.permission_broker, PermissionEligibility(
         tool_call_id=_tool_call_id(request),
         title=tool_name,
         kind="other",
         arguments=arguments,
-    )
+    ), snapshot
+
+
+def _permission_context_is_current(snapshot: tuple[Any, ...]) -> bool:
+    context, profile, provider, broker, lease, generation, epoch, peer, transport = snapshot
+    current = get_turn_capability_context()
+    current_peer = getattr(provider, "peer", None)
+    current_transport = getattr(current_peer, "transport", None) if current_peer is not None else None
+    if (
+        current is not context
+        or current.profile_policy is not profile
+        or current.provider is not provider
+        or current.permission_broker is not broker
+        or current.lease is not lease
+        or current.connection_generation != generation
+        or current.prompt_epoch != epoch
+        or current.acp_delivery is not True
+        or getattr(lease, "closed", True) is not False
+        or getattr(lease, "generation", None) != generation
+        or getattr(lease, "epoch", None) != epoch
+        or getattr(provider, "closed", False) is not False
+        or current_peer is not peer
+        or current_transport is not transport
+    ):
+        return False
+    for candidate in (peer, transport):
+        if candidate is not None and getattr(candidate, "closed", False) is not False:
+            return False
+        is_closing = getattr(candidate, "is_closing", None)
+        if callable(is_closing):
+            try:
+                if is_closing():
+                    return False
+            except Exception:
+                return False
+    is_current = getattr(broker, "_is_current", None)
+    if callable(is_current):
+        try:
+            if not is_current():
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _discard_permission_awaitable(awaitable: Any) -> None:
+    if isinstance(awaitable, asyncio.Future):
+        if awaitable.done():
+            return
+        loop = awaitable.get_loop()
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            awaitable.cancel()
+        elif loop.is_running() and not loop.is_closed():
+            loop.call_soon_threadsafe(awaitable.cancel)
+        elif not loop.is_closed():
+            awaitable.cancel()
+        return
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
+    cancel = getattr(awaitable, "cancel", None)
+    if callable(cancel):
+        cancel()
 
 
 def _permission_denial_message(tool_name: str) -> str:
@@ -1369,7 +1451,7 @@ def _request_permission_sync(
         return _permission_denial_message(tool_name)
     if eligible is None:
         return None
-    broker, eligibility = eligible
+    broker, eligibility, snapshot = eligible
     loop = _owner_loop_for_permission_broker(broker)
     if loop is None:
         return _permission_denial_message(tool_name)
@@ -1382,19 +1464,19 @@ def _request_permission_sync(
     future: Any = None
     try:
         coroutine = broker.request_permission(eligibility)
-        if not inspect.isawaitable(coroutine):
+        if not inspect.iscoroutine(coroutine):
             return _permission_denial_message(tool_name)
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         decision = future.result(timeout=_PERMISSION_TIMEOUT_SECONDS)
-        return None if decision is PermissionDecision.ALLOW_ONCE else _permission_denial_message(tool_name)
+        if decision is PermissionDecision.ALLOW_ONCE and _permission_context_is_current(snapshot):
+            return None
+        return _permission_denial_message(tool_name)
     except (Exception, asyncio.CancelledError):
-        if future is None:
-            close = getattr(coroutine, "close", None)
-            if callable(close):
-                close()
         return _permission_denial_message(tool_name)
     finally:
-        if future is not None:
+        if future is None:
+            _discard_permission_awaitable(coroutine)
+        else:
             future.cancel()
         coroutine = None
 
@@ -1411,17 +1493,19 @@ async def _request_permission_async(
         return _permission_denial_message(tool_name)
     if eligible is None:
         return None
-    broker, eligibility = eligible
+    broker, eligibility, snapshot = eligible
     awaitable: Any = None
     task: asyncio.Task[Any] | None = None
     propagate_cancellation = False
     try:
         awaitable = broker.request_permission(eligibility)
-        if not inspect.isawaitable(awaitable):
+        if not inspect.iscoroutine(awaitable):
             return _permission_denial_message(tool_name)
         task = asyncio.create_task(awaitable)
         decision = await asyncio.wait_for(task, timeout=_PERMISSION_TIMEOUT_SECONDS)
-        return None if decision is PermissionDecision.ALLOW_ONCE else _permission_denial_message(tool_name)
+        if decision is PermissionDecision.ALLOW_ONCE and _permission_context_is_current(snapshot):
+            return None
+        return _permission_denial_message(tool_name)
     except asyncio.CancelledError:
         current = asyncio.current_task()
         propagate_cancellation = current is not None and current.cancelling() > 0
@@ -1431,9 +1515,7 @@ async def _request_permission_async(
         return _permission_denial_message(tool_name)
     finally:
         if task is None:
-            close = getattr(awaitable, "close", None)
-            if callable(close):
-                close()
+            _discard_permission_awaitable(awaitable)
         else:
             task.cancel()
             try:
