@@ -503,6 +503,79 @@ async def test_permission_completion_exposes_cancel_and_errors_without_execution
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response,decision,has_error",
+    [
+        (
+            {"result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}},
+            "allow_once",
+            False,
+        ),
+        (
+            {"result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}}},
+            "reject_once",
+            False,
+        ),
+        ({"result": {"outcome": {"outcome": "cancelled"}}}, "cancelled", False),
+        (
+            {
+                "error": {
+                    "code": -32001,
+                    "message": "permission client error",
+                    "data": {"reason": "closed"},
+                }
+            },
+            "reject_once",
+            True,
+        ),
+    ],
+)
+async def test_public_connection_permission_completion_correlates_exact_wire_outcomes(
+    response: dict[str, Any], decision: str, has_error: bool
+) -> None:
+    transport = MemoryTransport()
+    connection = sdk.Connection(
+        lambda *_: asyncio.sleep(0),
+        transport,
+        state_store=sdk.StrictMessageStateStore(),
+    )
+    peer = sdk.AcpPeer(connection, ContractAgent())
+    snapshot = sdk.PermissionSnapshot("tool-1", "Run", "execute", {"command": "true"})
+
+    permission_task = asyncio.create_task(peer.request_tool_permission("session-1", snapshot))
+    emitted = await transport.outgoing.get()
+    assert emitted == {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "session/request_permission",
+        "params": {
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "tool-1",
+                "title": "Run",
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {"command": "true"},
+            },
+            "options": [
+                {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
+                {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
+            ],
+        },
+    }
+    await transport.incoming.put({"jsonrpc": "2.0", "id": emitted["id"], **response})
+    completion = await permission_task
+    assert completion.decision == decision
+    assert completion.executable is (decision == "allow_once" and not has_error)
+    if has_error:
+        assert isinstance(completion.error, sdk.RequestError)
+        assert completion.error.to_error_obj() == response["error"]
+    else:
+        assert completion.error is None
+    await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_actual_runner_preserves_agent_router_and_generic_outer_ids() -> None:
     requests = [
         {
@@ -752,6 +825,65 @@ async def test_public_connection_exact_bidirectional_mcp_wire_and_generic_ids() 
 
 
 @pytest.mark.asyncio
+async def test_public_connection_mcp_request_correlates_direct_client_error() -> None:
+    transport = MemoryTransport()
+    connection = sdk.Connection(
+        lambda *_: asyncio.sleep(0),
+        transport,
+        state_store=sdk.StrictMessageStateStore(),
+    )
+    peer = sdk.AcpPeer(connection, ContractAgent())
+
+    connect_task = asyncio.create_task(peer.connect_mcp("server-error"))
+    connect_request = await transport.outgoing.get()
+    assert connect_request == {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "mcp/connect",
+        "params": {"serverId": "server-error"},
+    }
+    await transport.incoming.put(
+        {
+            "jsonrpc": "2.0",
+            "id": connect_request["id"],
+            "result": {"connectionId": "connection-error"},
+        }
+    )
+    assert await connect_task == "connection-error"
+
+    message_task = asyncio.create_task(
+        peer.message_mcp(
+            "connection-error",
+            "tools/call",
+            {"name": "read", "arguments": {"path": "missing"}},
+        )
+    )
+    message_request = await transport.outgoing.get()
+    assert message_request == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "mcp/message",
+        "params": {
+            "connectionId": "connection-error",
+            "method": "tools/call",
+            "params": {"name": "read", "arguments": {"path": "missing"}},
+        },
+    }
+    client_error = {
+        "code": -32002,
+        "message": "MCP client error",
+        "data": {"serverId": "server-error"},
+    }
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": message_request["id"], "error": client_error}
+    )
+    with pytest.raises(sdk.RequestError) as exc_info:
+        await message_task
+    assert exc_info.value.to_error_obj() == client_error
+    await connection.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["success", "error"])
 async def test_public_connection_correlates_direct_results_and_rejects_duplicates(
     kind: str,
@@ -814,11 +946,22 @@ async def test_public_connection_rejects_late_after_rejection_and_closed_outcome
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["none", "connect", "closed"])
+@pytest.mark.parametrize(
+    "failure,expected_primary",
+    [
+        ("none", None),
+        ("connect", "connect failed"),
+        ("closed", "closed failed"),
+        ("close", "close failed"),
+        ("connect_close", "connect failed"),
+        ("closed_close", "closed failed"),
+    ],
+)
 async def test_runner_closes_and_generation_teardown_is_exception_safe(
-    monkeypatch: pytest.MonkeyPatch, failure: str
+    monkeypatch: pytest.MonkeyPatch, failure: str, expected_primary: str | None
 ) -> None:
     instances: list[Any] = []
+    events: list[tuple[str, int | None]] = []
 
     class OwnedConnection:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -829,20 +972,25 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
             return None
 
         async def close(self) -> None:
+            events.append(("close", None))
             self.closed = True
+            if failure in {"close", "connect_close", "closed_close"}:
+                raise RuntimeError("close failed")
 
     class OwnedAgent:
         def __init__(self) -> None:
             self.closed_generations: list[int] = []
 
         def on_connect(self, peer: sdk.AcpPeer) -> int:
-            if failure == "connect":
+            events.append(("connect", None))
+            if failure in {"connect", "connect_close"}:
                 raise RuntimeError("connect failed")
             return 37
 
         async def on_transport_closed(self, generation: int) -> None:
+            events.append(("transport_closed", generation))
             self.closed_generations.append(generation)
-            if failure == "closed":
+            if failure in {"closed", "closed_close"}:
                 raise RuntimeError("closed failed")
 
     monkeypatch.setattr(sdk, "Connection", OwnedConnection)
@@ -851,13 +999,16 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
     transport = _ReservedFrameTransport(io.BytesIO(), protocol)
     writer = asyncio.StreamWriter(transport, protocol, None, asyncio.get_running_loop())
     agent = OwnedAgent()
-    if failure == "none":
+    if expected_primary is None:
         await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
     else:
-        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        with pytest.raises(RuntimeError, match=expected_primary) as exc_info:
             await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
+        assert str(exc_info.value) == expected_primary
+    generation = 0 if failure in {"connect", "connect_close"} else 37
+    assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
     assert instances[0].closed is True
-    assert agent.closed_generations == [0 if failure == "connect" else 37]
+    assert agent.closed_generations == [generation]
 
 
 def test_permission_meta_matrix_is_independent_and_cancelled_inner_meta_is_illegal() -> None:
