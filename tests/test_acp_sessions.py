@@ -9,7 +9,10 @@ import pytest
 import yaml
 
 from mimir.acp import sdk
-from mimir.acp.agent import MimirAcpAgent
+from mimir.acp.agent import ActivePrompt, MimirAcpAgent
+from mimir.acp.journal import JournalLease
+from mimir.acp.updates import UpdateDispatcher
+from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.turn_event_bus import TurnEventBus
@@ -121,7 +124,7 @@ def _types(client: Client) -> list[str]:
 
 async def test_new_prompt_runs_bound_core_and_preserves_update_order(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
-    created = await agent.new_session("/workspace", mcp_servers=[{"name": "one"}])
+    created = await agent.new_session("/workspace")
     session_id = created.session_id
     response = await agent.prompt(
         session_id,
@@ -175,7 +178,7 @@ async def test_prompt_validates_all_blocks_before_any_update(tmp_path: Path) -> 
 
 async def test_load_replays_at_least_once_without_mutating_journal(tmp_path: Path) -> None:
     agent, client, _ = await _ready(tmp_path)
-    session_id = (await agent.new_session("/one", mcp_servers=[{"old": True}])).session_id
+    session_id = (await agent.new_session("/one")).session_id
     await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
     journal = agent._store.paths(session_id)[0]
     before = journal.read_bytes()
@@ -354,22 +357,19 @@ async def test_sweep_runs_at_start_of_each_authenticated_stateful_handler(tmp_pa
     assert calls == [7, 7, 7]
 
 
-async def test_environment_is_deep_copied_replaced_cleared_and_not_persisted(tmp_path: Path) -> None:
+async def test_malformed_provider_declaration_creates_no_state(tmp_path: Path) -> None:
     agent, _, core = await _ready(tmp_path)
-    servers = [{"name": "one", "nested": {"enabled": True}}]
-    session_id = (await agent.new_session("/one", mcp_servers=servers)).session_id
-    servers[0]["nested"]["enabled"] = False
-    environment = agent._environments[session_id][1]
-    assert environment.mcp_servers == [{"name": "one", "nested": {"enabled": True}}]
-    metadata = agent._store.paths(session_id)[1].read_text(encoding="utf-8")
-    assert "/one" not in metadata and "mcp" not in metadata.lower()
-    assert core.calls == []
 
-    await agent.load_session("/two", session_id, mcp_servers=None)
-    assert agent._environments[session_id][1].cwd == "/two"
-    assert agent._environments[session_id][1].mcp_servers is None
-    agent.on_connect(Client())
+    with pytest.raises(sdk.RequestError) as raised:
+        await agent.new_session(
+            "/one",
+            mcp_servers=[{"name": "one", "nested": {"enabled": True}}],
+        )
+
+    assert raised.value.to_error_obj()["code"] == -32602
     assert agent._environments == {}
+    assert list(agent._store.root.glob("*.meta.json")) == []
+    assert core.calls == []
 
 
 async def test_repeated_load_preserves_metadata_mtime_bytes_and_sequence(tmp_path: Path) -> None:
@@ -486,3 +486,150 @@ async def test_nonreplayable_marker_survives_deleted_journal_and_reconstruction(
 
     assert raised.value.to_error_obj()["message"] == "Session replay unavailable: overflowed"
     assert client.updates == []
+
+
+class McpClient(Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.connects: list[str] = []
+        self.disconnects: list[str] = []
+        self.notifications: list[tuple[str, str, Any]] = []
+
+    async def connect_mcp(self, server_id: str) -> str:
+        self.connects.append(server_id)
+        return f"connection-{len(self.connects)}"
+
+    async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+        if method == "initialize":
+            return {"protocolVersion": "2025-03-26", "capabilities": {}, "serverInfo": {"name": "hands", "version": "1"}}
+        if method == "tools/list":
+            return {
+                "tools": [
+                    {"name": tool.provider_name, "inputSchema": _thaw_schema(tool.input_schema)}
+                    for tool in MIMIR_HANDS_V1.tools
+                ]
+            }
+        return {"changed": True}
+
+    async def notify_mcp(self, connection_id: str, method: str, params: Any = None) -> None:
+        self.notifications.append((connection_id, method, params))
+
+    async def disconnect_mcp(self, connection_id: str) -> None:
+        self.disconnects.append(connection_id)
+
+
+def _thaw_schema(value: Any) -> Any:
+    if isinstance(value, dict) or hasattr(value, "items"):
+        return {key: _thaw_schema(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_schema(item) for item in value]
+    return value
+
+
+def _hands(server_id: str) -> list[dict[str, Any]]:
+    return [{"type": "acp", "name": "mimir-hands", "serverId": server_id}]
+
+
+@pytest.mark.parametrize(
+    "servers",
+    [
+        [{"type": "stdio", "name": "mimir-hands", "command": "hands"}],
+        [{"type": "http", "name": "mimir-hands", "url": "https://example.test"}],
+        [{"type": "sse", "name": "mimir-hands", "url": "https://example.test"}],
+        [{"type": "acp", "name": "unknown", "serverId": "one"}],
+        [{"type": "acp", "name": "mimir-hands", "serverId": ""}],
+        _hands("one") + _hands("two"),
+    ],
+)
+async def test_provider_admission_rejects_before_connect_or_state(tmp_path: Path, servers: Any) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+
+    with pytest.raises(sdk.RequestError) as raised:
+        await agent.new_session("/workspace", mcp_servers=servers)
+
+    assert raised.value.to_error_obj()["code"] == -32602
+    assert client.connects == []
+    assert agent._sessions == {}
+    assert list(agent._store.root.glob("*.meta.json")) == []
+
+
+async def test_provider_indexes_are_session_owned_and_load_uses_fresh_connection(tmp_path: Path) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    first = (await agent.new_session("/one", mcp_servers=_hands("server-a"))).session_id
+    second = (await agent.new_session("/two", mcp_servers=_hands("server-b"))).session_id
+
+    assert set(agent._connection.server_sessions) == {"server-a", "server-b"}
+    assert set(agent._connection.connection_sessions) == {"connection-1", "connection-2"}
+    assert agent._sessions[first].provider is not agent._sessions[second].provider
+
+    await agent.load_session("/reloaded", first, mcp_servers=_hands("server-a"))
+
+    assert client.connects == ["server-a", "server-b", "server-a"]
+    assert agent._sessions[first].provider.connection_id == "connection-3"
+    assert "connection-1" not in agent._connection.connection_sessions
+    assert client.disconnects == ["connection-1"]
+
+
+async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_path: Path) -> None:
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    old = McpClient()
+    old_generation = agent.on_connect(old)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server-a"))).session_id
+    successor = McpClient()
+    successor_generation = agent.on_connect(successor)
+
+    await agent.on_transport_closed(old_generation)
+
+    assert agent._generation == successor_generation
+    assert agent._connection.closed is False
+    assert session_id not in agent._environments
+
+
+async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scoped() -> None:
+    class Publisher:
+        def __init__(self) -> None:
+            self.updates: list[Any] = []
+
+        async def publish_live(self, update: Any, **kwargs: Any) -> None:
+            self.updates.append(update)
+
+    class Peer:
+        def __init__(self) -> None:
+            self.snapshots: list[Any] = []
+
+        async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
+            self.snapshots.append((session_id, snapshot))
+            return SimpleNamespace(decision="allow_once", error=None)
+
+    lease = JournalLease("00000000-0000-0000-0000-000000000001", 1, 1)
+    dispatcher = UpdateDispatcher(Publisher(), lease, 1)
+    dispatcher.enqueue({"type": "tool_call", "phase": "start", "id": "tool-1", "tool_name": "hands_edit"})
+    dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": "tool-1", "tool_name": "hands_edit", "args": {"path": "a", "token": "secret"}})
+    await dispatcher.drain()
+    peer = Peer()
+    session = SimpleNamespace(provider=SimpleNamespace(peer=peer), generation=1, record=SimpleNamespace(session_id="session-1"))
+    forwarder = asyncio.create_task(asyncio.sleep(3600))
+    active = ActivePrompt(session, 1, 1, None, None, forwarder, dispatcher, lease)
+
+    decision = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
+    lease.close()
+    stale = await active.request_permission(PermissionEligibility("tool-1", "ignored", "ignored", {"path": "a", "token": "secret"}))
+
+    assert decision is PermissionDecision.ALLOW_ONCE
+    assert stale is PermissionDecision.REJECT_ONCE
+    assert peer.snapshots[0][1].title == "hands_edit"
+    assert peer.snapshots[0][1].raw_input == {"path": "a", "token": "[redacted]"}
+    forwarder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder
+    await dispatcher.close()

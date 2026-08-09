@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import TypeAdapter
@@ -13,6 +14,33 @@ from mimir.acp.sdk import RequestError, SessionNotification
 from mimir.acp.session_store import SessionRecord, SessionStore
 
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class JournalLease:
+    turn_id: str
+    generation: int
+    epoch: int
+    closed: bool = False
+    _accepted: int = 0
+    _terminalized: bool = False
+
+    def accept(self) -> bool:
+        if self.closed:
+            return False
+        self._accepted += 1
+        return True
+
+    def close(self) -> bool:
+        if self.closed:
+            return False
+        self.closed = True
+        return True
+
+    @property
+    def accepted(self) -> int:
+        return self._accepted
+
 _UPDATE_ADAPTER = TypeAdapter(SessionNotification.model_fields["update"].annotation)
 
 
@@ -44,9 +72,33 @@ class SessionJournal:
         client: Any | None = None,
         *,
         turn_id: str | None = None,
+        lease: JournalLease | None = None,
+        accepted: bool = False,
     ) -> Any:
         async with self.lock:
+            if lease is not None and lease.closed and not accepted:
+                return None
             return await self._publish_locked(update, client or self.current_client, turn_id)
+
+    async def close_turn(
+        self,
+        lease: JournalLease,
+        terminal_updates: list[Any],
+        client: Any | None = None,
+    ) -> list[Any]:
+        async with self.lock:
+            lease.close()
+            if lease._terminalized:
+                return []
+            lease._terminalized = True
+            published = []
+            for update in terminal_updates:
+                published.append(
+                    await self._publish_locked(
+                        update, client or self.current_client, lease.turn_id
+                    )
+                )
+            return published
 
     async def _publish_locked(self, update: Any, client: Any, turn_id: str | None) -> Any:
         if self._fatal or client is None:

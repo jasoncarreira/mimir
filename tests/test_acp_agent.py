@@ -117,7 +117,7 @@ async def test_initialize_is_exact_stable_v1(
                 "audio": False,
                 "embeddedContext": False,
             },
-            "mcpCapabilities": {"http": False, "sse": False},
+            "mcpCapabilities": {"http": False, "sse": False, "acp": True},
         },
         "authMethods": [
             {

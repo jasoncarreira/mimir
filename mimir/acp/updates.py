@@ -4,29 +4,46 @@ import asyncio
 from collections.abc import Mapping
 from typing import Any
 
-from mimir.acp.sdk import AgentPlanUpdate, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
+from mimir.acp.journal import JournalLease
+from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, RequestError, ToolCallProgress, ToolCallStart
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 
 
 class UpdateDispatcher:
-    def __init__(self, publisher: Any) -> None:
+    def __init__(
+        self,
+        publisher: Any,
+        lease: JournalLease | None = None,
+        epoch: int = 0,
+    ) -> None:
         self.publisher = publisher
+        self.lease = lease
+        self.epoch = epoch
         self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
         self._publication_failed = False
         self._open_tools: dict[str, str] = {}
         self._tool_args: dict[str, Any] = {}
+        self._snapshots: dict[str, PermissionSnapshot] = {}
+        self._terminalized_cancelled = False
 
     @property
     def failure(self) -> BaseException | None:
         return self._failure
 
     def enqueue(self, event: Mapping[str, Any]) -> None:
+        if self.lease is not None and not self.lease.accept():
+            return
         self._ensure_worker()
-        self.queue.put_nowait(_allowed_event(event))
+        item = _allowed_event(event)
+        item["_lease_accepted"] = True
+        self.queue.put_nowait(item)
+
+    def permission_snapshot(self, tool_call_id: str) -> PermissionSnapshot | None:
+        return self._snapshots.get(tool_call_id)
 
     submit = enqueue
 
@@ -53,6 +70,30 @@ class UpdateDispatcher:
             self.queue.put_nowait({"type": "_terminal", "phase": "end", "id": tool_id, "tool_name": name})
         await self.queue.join()
         raise RequestError(-32603, "Internal error") from self._failure
+
+    async def terminalize_cancelled(self) -> None:
+        if self._terminalized_cancelled:
+            return
+        self._terminalized_cancelled = True
+        self._ensure_worker()
+        await self.queue.join()
+        updates = [
+            ToolCallProgress(
+                sessionUpdate="tool_call_update",
+                toolCallId=tool_id,
+                status="failed",
+                rawOutput={"error": "Tool execution cancelled"},
+            )
+            for tool_id in self._open_tools
+        ]
+        self._open_tools.clear()
+        self._tool_args.clear()
+        self._snapshots.clear()
+        if hasattr(self.publisher, "close_turn"):
+            await self.publisher.close_turn(updates)
+        elif updates:
+            for update in updates:
+                await self.publisher.publish_live(update)
 
     async def close(self) -> None:
         if self._worker is None:
@@ -82,7 +123,13 @@ class UpdateDispatcher:
                     if not self._publication_failed:
                         for update in updates:
                             try:
-                                await self.publisher.publish_live(update)
+                                if self.lease is None:
+                                    await self.publisher.publish_live(update)
+                                else:
+                                    await self.publisher.publish_live(
+                                        update,
+                                        accepted=bool(event.get("_lease_accepted")),
+                                    )
                             except BaseException as exc:
                                 if self._failure is None:
                                     self._failure = exc
@@ -113,6 +160,14 @@ class UpdateDispatcher:
                 if tool_id in self._open_tools:
                     return []
                 self._open_tools[tool_id] = name
+                raw_input = _strict_json(event.get("args")) if "args" in event else {}
+                self._tool_args[tool_id] = raw_input
+                self._snapshots[tool_id] = PermissionSnapshot(
+                    tool_call_id=tool_id,
+                    title=name,
+                    kind="other",
+                    raw_input=raw_input,
+                )
                 return [ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending")]
             if phase == "end":
                 output: list[Any] = []
@@ -121,6 +176,12 @@ class UpdateDispatcher:
                     output.append(ToolCallStart(sessionUpdate="tool_call", toolCallId=tool_id, title=name, kind="other", status="pending"))
                 args = _strict_json(event.get("args"))
                 self._tool_args[tool_id] = args
+                self._snapshots[tool_id] = PermissionSnapshot(
+                    tool_call_id=tool_id,
+                    title=self._open_tools[tool_id],
+                    kind="other",
+                    raw_input=args,
+                )
                 output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="in_progress", rawInput=args))
                 return output
             return []
@@ -137,6 +198,7 @@ class UpdateDispatcher:
             content = _strict_json(event.get("content"))
             output.append(ToolCallProgress(sessionUpdate="tool_call_update", toolCallId=tool_id, status="failed" if failed else "completed", rawOutput=content))
             self._open_tools.pop(tool_id, None)
+            self._snapshots.pop(tool_id, None)
             args = self._tool_args.pop(tool_id, None)
             if name == "write_todos" and not failed:
                 plan = _todos_plan(args)
