@@ -105,6 +105,28 @@ def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
     assert "unknown authority_profile 'heartbeet'" in caplog.text
 
 
+def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([{
+        "name": "heartbeat",
+        "prompt_file": "heartbeat.md",
+        "cron": "0 * * * *",
+    }]))
+
+    with caplog.at_level("WARNING", logger="mimir.scheduler"):
+        [job] = load_jobs(path)
+
+    assert job.name == "heartbeat"
+    assert job.authority_profile is None
+    assert (
+        "scheduler job 'heartbeat' declares no authority_profile; it will run "
+        "with the shared scheduled_tick authority"
+    ) in caplog.text
+    assert "authority_profile: heartbeat" in caplog.text
+
+
 def test_scheduler_channel_id_synthetic_for_global():
     assert _scheduler_channel_id("nightly", None) == "scheduler:nightly"
     assert _scheduler_channel_id("nightly", "real-channel") == "real-channel"

@@ -379,7 +379,14 @@ def load_jobs_from_text(text: str) -> list[SchedulerJob]:
         if not isinstance(entry, dict):
             continue
         try:
-            out.append(SchedulerJob.from_yaml_entry(entry))
+            job = SchedulerJob.from_yaml_entry(entry)
+            if job.name == "heartbeat" and job.authority_profile is None:
+                log.warning(
+                    "scheduler job 'heartbeat' declares no authority_profile; "
+                    "it will run with the shared scheduled_tick authority. Add "
+                    "'authority_profile: heartbeat' to preserve its existing grants."
+                )
+            out.append(job)
         except ValueError as exc:
             log.warning("invalid scheduler job: %s", exc)
     return out
