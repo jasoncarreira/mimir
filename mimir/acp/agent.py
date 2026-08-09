@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
 _WEB_KEY_FIELD = "mimir.webKey"
 ACP_PROMPT_CANCEL_GRACE_SECONDS = 2.0
 ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
+ACP_AUDIT_EVENT_LIMIT = 256
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -322,7 +324,9 @@ class MimirAcpAgent:
         self._dispatchers: set[UpdateDispatcher] = set()
         self._active_prompts: dict[str, ActivePrompt] = {}
         self._execution_keys: dict[str, int] = {}
-        self._audit_events: list[dict[str, Any]] = []
+        self._audit_events: deque[dict[str, Any]] = deque(
+            maxlen=ACP_AUDIT_EVENT_LIMIT
+        )
         self._boundary_lock = asyncio.Lock()
         self._bridge = ACPBridge()
         adapters = getattr(bundle, "adapters", None)

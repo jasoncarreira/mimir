@@ -968,10 +968,39 @@ async def test_idle_and_repeated_cancel_are_structured_owned_noops(
         await agent.cancel("missing")
     assert [record.message for record in caplog.records] == ["acp_cancel_noop", "acp_cancel_noop"]
     assert all(record.acp_audit["session_id"] == "missing" for record in caplog.records)
-    assert agent._audit_events == [
+    assert list(agent._audit_events) == [
         {"event": "acp_cancel_noop", "session_id": "missing"},
         {"event": "acp_cancel_noop", "session_id": "missing"},
     ]
+
+
+@pytest.mark.parametrize("notification", ["progress", "message"])
+async def test_client_notification_audit_retention_is_bounded(
+    tmp_path: Path, notification: str,
+) -> None:
+    agent, _, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    state = agent._sessions[session_id]
+    limit = agent_module.ACP_AUDIT_EVENT_LIMIT
+
+    for index in range(limit + 17):
+        if notification == "progress":
+            agent._audit_progress(
+                state,
+                {"progressToken": f"foreign-{index}", "progress": index},
+            )
+        else:
+            agent._audit_message(
+                state,
+                {"level": "info", "logger": "hands", "data": {"index": index}},
+            )
+
+    assert agent._audit_events.maxlen == limit
+    assert len(agent._audit_events) == limit
+    if notification == "progress":
+        assert all(event["status"] == "ignored" for event in agent._audit_events)
+    else:
+        assert agent._audit_events[-1]["data"] == {"index": limit + 16}
 
 
 async def test_provider_connect_and_discovery_failures_leave_no_durable_session(
