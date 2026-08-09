@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json as _json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +13,12 @@ import pytest
 import yaml
 
 from mimir.event_logger import init_logger
+from mimir.access_control import (
+    TRIGGER_AUTHORITY_PROFILES,
+    builtin_trigger_service_principal,
+    get_service_principal,
+    parse_service_shell_argv,
+)
 from mimir.pollers import _CircuitBreakerState, _circuit_breakers
 from mimir.models import AgentEvent
 from mimir.scheduler import (
@@ -72,6 +79,54 @@ def test_load_jobs_handles_missing_file(tmp_path: Path):
     assert load_jobs(tmp_path / "nope.yaml") == []
 
 
+def test_scheduler_job_authority_profile_round_trip_and_unknown_rejected(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / "scheduler.yaml"
+    write_jobs(path, [SchedulerJob(
+        name="heartbeat",
+        prompt_file="heartbeat.md",
+        cron="0 * * * *",
+        authority_profile="heartbeat",
+    )])
+
+    [job] = load_jobs(path)
+    assert job.authority_profile == "heartbeat"
+    assert job.cron == "0 * * * *"
+
+    path.write_text(yaml.safe_dump([{
+        "name": "mistyped",
+        "prompt": "x",
+        "cron": "0 * * * *",
+        "authority_profile": "heartbeet",
+    }]))
+    with caplog.at_level("WARNING", logger="mimir.scheduler"):
+        assert load_jobs(path) == []
+    assert "unknown authority_profile 'heartbeet'" in caplog.text
+
+
+def test_load_jobs_warns_when_heartbeat_omits_authority_profile(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([{
+        "name": "heartbeat",
+        "prompt_file": "heartbeat.md",
+        "cron": "0 * * * *",
+    }]))
+
+    with caplog.at_level("WARNING", logger="mimir.scheduler"):
+        [job] = load_jobs(path)
+
+    assert job.name == "heartbeat"
+    assert job.authority_profile is None
+    assert (
+        "scheduler job 'heartbeat' declares no authority_profile; it will run "
+        "with the shared scheduled_tick authority"
+    ) in caplog.text
+    assert "authority_profile: heartbeat" in caplog.text
+
+
 def test_scheduler_channel_id_synthetic_for_global():
     assert _scheduler_channel_id("nightly", None) == "scheduler:nightly"
     assert _scheduler_channel_id("nightly", "real-channel") == "real-channel"
@@ -110,7 +165,12 @@ async def test_llm_tick_registers_with_generous_misfire_grace(tmp_path: Path):
 
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     await sched.add_job(
-        SchedulerJob(name="heartbeat", prompt_file="heartbeat.md", cron="0 * * * *")
+        SchedulerJob(
+            name="heartbeat",
+            prompt_file="heartbeat.md",
+            cron="0 * * * *",
+            authority_profile="heartbeat",
+        )
     )
     apjob = sched._scheduler.get_job(f"{SCHEDULER_CHANNEL_PREFIX}heartbeat")
     assert apjob is not None
@@ -183,7 +243,9 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
         enqueued.append(event)
         return True
 
-    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue)
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
     job = SchedulerJob(name="morning", prompt="review extended memory", cron="0 8 * * *")
     await sched._fire(job=job)
 
@@ -194,6 +256,117 @@ async def test_fire_enqueues_scheduled_tick_event(tmp_path: Path):
     assert e.content == "review extended memory"
     assert e.channel_id == "scheduler:morning"
     assert e.extra["schedule_name"] == "morning"
+    assert e.service_authority is not None
+    scheduled_tick = get_service_principal("scheduled_tick")
+    assert scheduled_tick is not None
+    assert set(e.service_authority.capabilities) == set(scheduled_tick.capabilities)
+    assert e.service_authority.channel_memory_directory == "scheduler:morning"
+    assert str((tmp_path / "scripts").resolve()) in e.service_authority.filesystem_read_roots
+
+
+@pytest.mark.asyncio
+async def test_fire_heartbeat_principal_is_unchanged(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    home = tmp_path / "home"
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=home,
+    )
+    job = SchedulerJob.from_yaml_entry({
+        "name": "heartbeat",
+        "prompt": "check",
+        "cron": "0 * * * *",
+        "authority_profile": "heartbeat",
+    })
+    await sched._fire(job=job)
+
+    assert len(enqueued) == 1
+    authority = enqueued[0].service_authority
+    assert authority == builtin_trigger_service_principal(
+        "heartbeat", home,
+    )
+    assert authority is not None
+    # operator_alert is represented by its executable send_message operation;
+    # compare every other effective operation, then prove the selected profile's
+    # declared set itself is exactly the heartbeat profile.
+    expected_operations = {
+        "send_message" if capability == "operator_alert" else capability
+        for capability in TRIGGER_AUTHORITY_PROFILES["heartbeat"]
+    }
+    assert set(authority.capabilities) == expected_operations
+    assert (
+        TRIGGER_AUTHORITY_PROFILES[authority.authority_profile]
+        == TRIGGER_AUTHORITY_PROFILES["heartbeat"]
+    )
+    assert "spawn_open_code" not in authority.capabilities
+    heartbeat_root = str((home / "state" / "triggers" / "heartbeat").resolve())
+    assert any(
+        heartbeat_root in _json.loads(policy.destination)
+        for policy in authority.sink_policies
+        if policy.adapter == "trigger_service_write_roots"
+    )
+    assert Path(heartbeat_root).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_profile_declaration_is_admitted_at_argv_gate(tmp_path: Path):
+    executable = Path(shutil.which("printf") or "/usr/bin/printf").resolve()
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    await sched._fire(job=SchedulerJob(
+        name="weekly-scan",
+        prompt="scan",
+        cron="0 4 * * 0",
+        authority_profile="heartbeat",
+        shell_commands=[{
+            "exec": executable.name,
+            "path": str(executable),
+            "subcommands": [["heartbeat-profile-declaration"]],
+            "options": [],
+        }],
+    ))
+
+    [authority] = [event.service_authority for event in enqueued]
+    assert authority is not None
+    policy = authority.sink_policy_for("shell_exec")
+    assert policy is not None
+    assert parse_service_shell_argv(
+        f"{executable.name} heartbeat-profile-declaration",
+        policy.destination,
+        declared=authority.declared_shell_commands,
+    ) == [str(executable), "heartbeat-profile-declaration"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_profile_refuses_malformed_declaration(tmp_path: Path):
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=fake_enqueue, home=tmp_path,
+    )
+    await sched._fire(job=SchedulerJob(
+        name="weekly-scan",
+        prompt="scan",
+        cron="0 4 * * 0",
+        authority_profile="heartbeat",
+        shell_commands={},
+    ))
+    assert enqueued == []
 
 
 @pytest.mark.asyncio
@@ -248,6 +421,7 @@ async def test_fire_treats_an_explicit_empty_declaration_as_a_no_op(tmp_path: Pa
 
     assert len(enqueued) == 1
     assert enqueued[0].service_principal == "scheduler"
+    assert enqueued[0].service_authority.channel_memory_directory == "scheduler:briefing"
 
 
 async def test_fire_reads_prompt_file_when_set(tmp_path: Path):
@@ -3283,6 +3457,11 @@ async def test_fire_quota_recovery_enqueues_heartbeat(tmp_path: Path):
     assert len(enqueued) == 1
     assert enqueued[0].trigger == "scheduled_tick"
     assert enqueued[0].channel_id == "scheduler:heartbeat"
+    synthetic = enqueued[0].service_authority
+    scheduled = builtin_trigger_service_principal("heartbeat", home)
+    assert synthetic is not None
+    assert set(synthetic.capabilities) == set(scheduled.capabilities)
+    assert synthetic == scheduled
 
 
 @pytest.mark.asyncio
@@ -4001,6 +4180,11 @@ async def test_quota_recheck_early_clears_on_fresh_evidence(tmp_path: Path):
     assert rec["early"] is True
     assert rec["evidence"] == "fresh_quota_below_threshold"
     assert len(enqueued) == 1  # catch-up heartbeat
+    catch_up = enqueued[0].service_authority
+    scheduled = builtin_trigger_service_principal("heartbeat", home)
+    assert catch_up is not None
+    assert set(catch_up.capabilities) == set(scheduled.capabilities)
+    assert catch_up == scheduled
 
 
 @pytest.mark.asyncio

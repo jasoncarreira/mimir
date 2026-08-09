@@ -2,7 +2,7 @@
   "pollers": [
     {
       "name": "worklink-ready-queue",
-      "command": "python3 poller.py",
+      "command": "python3 scripts/poller.py",
       "cron": "*/10 * * * *",
       "priority": "normal",
       "authority": {

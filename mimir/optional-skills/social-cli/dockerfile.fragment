@@ -42,7 +42,7 @@ RUN corepack enable && corepack prepare pnpm@latest --activate \
       '#!/bin/sh' \
       'if [ "$1" = "count" ]; then' \
       '    shift' \
-      '    for helper in "${SOCIAL_CLI_COUNT_HELPER:-}" /mimir-home/skills/social-cli/count.py /mimir-home/.mimir_builtin_skills/social-cli/count.py /workspace/mimir/optional-skills/social-cli/count.py; do' \
+      '    for helper in "${SOCIAL_CLI_COUNT_HELPER:-}" /mimir-home/skills/social-cli/scripts/count.py /mimir-home/.mimir_builtin_skills/social-cli/scripts/count.py /workspace/mimir/optional-skills/social-cli/scripts/count.py; do' \
       '        if [ -n "$helper" ] && [ -f "$helper" ]; then' \
       '            exec python3 "$helper" "$@"' \
       '        fi' \

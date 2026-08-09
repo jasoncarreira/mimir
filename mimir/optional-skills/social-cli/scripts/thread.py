@@ -15,7 +15,7 @@ AT proto XRPC endpoint directly — no extra Python deps beyond
 stdlib + the optional ``pyyaml`` already used by ``poller.py``.
 
 Usage:
-  python3 thread.py <uri> [--parent-height N] [--depth N] [--json]
+  python3 scripts/thread.py <uri> [--parent-height N] [--depth N] [--json]
 
 Args:
   uri              AT URI of the focus post
@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
+STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 
 # Default PDS — bsky.social hosts most accounts. Operators on a
 # self-hosted PDS override via ``ATPROTO_PDS`` in ``.env``.

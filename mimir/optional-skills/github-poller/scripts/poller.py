@@ -77,7 +77,7 @@ def _ensure_mimir_import_path() -> None:
     Pip-installed deployments do not need this repair because ``mimir`` is already
     in site-packages.
 
-    This duplicates ``chainlink-orchestrator/poller.py``'s copy deliberately: the
+    This duplicates ``chainlink-orchestrator/scripts/poller.py``'s copy deliberately: the
     repair has to run *before* ``mimir`` is importable, so it cannot itself live in
     the ``mimir`` package. Each installed skill is a standalone directory, so a
     shared helper would have to be copied in anyway. The invariant is covered by a
@@ -91,7 +91,7 @@ def _ensure_mimir_import_path() -> None:
     # package on that same revision even if MIMIR_SOURCE_DIR points at another
     # checkout. Installed copies fail the __init__.py probe and fall through.
     script_path = globals().get("__file__")
-    candidates = [Path(script_path).resolve().parents[3]] if script_path else []
+    candidates = [Path(script_path).resolve().parents[4]] if script_path else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
@@ -135,7 +135,7 @@ _ensure_mimir_import_path()
 # means auto-reviewing every author's PR — the exact behaviour #1022 removed.
 from mimir.pollers import _github_author_is_trusted, _github_content_author
 
-STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
+STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "github-activity")
 

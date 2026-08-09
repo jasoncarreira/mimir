@@ -959,7 +959,7 @@ tool_pins:
 3. **Slice 2 — planner.** `mimir/prompt_templates/decompose.md` +
    `chainlink-orchestrator` skill + executor template-refusal test.
 4. **Slice 3 — autonomy (#444, shipped).** Ready-queue poller
-   (`chainlink-orchestrator` skill `pollers.json`/`poller.py`, `priority: normal`
+   (`chainlink-orchestrator` skill `pollers.json`/`scripts/poller.py`, `priority: normal`
    so the scheduler sheds it under TIGHT; dispatches detached `mimir worklink
    run` up to `defaults.max_concurrent`, default 2), `worklink_run` core tool
    (arbiter-gated via `HomeostaticArbiter.should_fire` + cap; operator CLI

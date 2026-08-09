@@ -2,7 +2,7 @@
   "pollers": [
     {
       "name": "github-ci-watch",
-      "command": "python3 poller.py",
+      "command": "python3 scripts/poller.py",
       "cron": "*/15 * * * *",
       "authority": {
         "profile": "github",

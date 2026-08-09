@@ -89,7 +89,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
+STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
 CONFIG_FILE = STATE_DIR / "config.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "gmail-inbox")

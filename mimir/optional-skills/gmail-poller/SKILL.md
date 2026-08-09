@@ -44,7 +44,7 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
 
    ### Mode A: Multi-account with per-account prompt routing (preferred)
 
-   Drop `config.json` alongside `poller.py` in the skill directory
+   Drop `config.json` in the skill directory that contains `scripts/poller.py`
    (i.e. `<home>/skills/gmail-poller/config.json`):
 
    ```json

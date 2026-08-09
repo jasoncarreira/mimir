@@ -36,7 +36,7 @@ event per newly-failed run (conclusion ``failure`` / ``timed_out`` /
    if ``gh auth`` isn't already configured in the environment).
 
 3. The ``pollers`` framework discovers ``pollers.json`` and runs
-   ``poller.py`` on its cron (default ``*/15 * * * *``).
+   ``scripts/poller.py`` on its cron (default ``*/15 * * * *``).
 
 ## State
 

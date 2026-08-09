@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import sys
 import os
 import shlex
 import shutil
@@ -30,6 +31,7 @@ from mimir.access_control import (
     ToolRegistry,
     authorize_action,
     authorize_inbound,
+    build_scheduled_tick_service_principal,
     build_trigger_service_principal,
     classify_protected_result,
     create_auth_context,
@@ -43,6 +45,8 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    Integrity,
+    IntegrityEffect,
     NormalizedPullRequestSnapshot,
     RepoPRActionScope,
     RepoPRScopeRegistry,
@@ -490,6 +494,66 @@ def test_service_read_scope_includes_both_home_skill_roots_without_write_scope(
     assert (home / ".mimir_builtin_skills").resolve() not in write_roots
 
 
+def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own_note = (
+        home / "memory" / "channels" / "scheduler:morning-briefing"
+        / "channel-notes.md"
+    )
+    sibling_note = (
+        home / "memory" / "channels" / "scheduler:daily-journal"
+        / "channel-notes.md"
+    )
+    script = home / "scripts" / "process_conditional_todos.py"
+    issue_note = home / "memory" / "issues" / "scheduler-read-scope.md"
+    denied = (
+        home / "memory" / "core" / "identity.md",
+        home / ".env",
+        home / "credentials" / "service.json",
+        sibling_note,
+    )
+    for target in (own_note, script, issue_note, *denied):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("ordinary test content\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    base = get_service_principal("scheduled_tick")
+    service = build_scheduled_tick_service_principal("morning-briefing", home)
+    assert base is not None and service is not None
+    assert service.channel_memory_directory == "scheduler:morning-briefing"
+    assert service.capabilities == base.capabilities
+    assert service.readable_domains == base.readable_domains
+    assert service.sink_destinations == base.sink_destinations
+    assert service.sink_policies == base.sink_policies
+    assert str((home / "scripts").resolve()) in service.filesystem_read_roots
+
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        channel_id="configured-delivery-channel",
+    )
+    for target in (own_note, script, issue_note):
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)}, auth_context=auth,
+        ) is True, target
+    for target in denied:
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)}, auth_context=auth,
+        ) is False, target
+
+    other_service = build_scheduled_tick_service_principal("daily-journal", home)
+    assert other_service is not None
+    other_auth = replace(auth, service_authority=other_service)
+    assert access_control._trigger_service_read_target_is_allowed(
+        other_service, "read_file", {"file_path": str(own_note)},
+        auth_context=other_auth,
+    ) is False
+
+    for operation in ("write_file", "edit_file"):
+        assert service.sink_policy_for(operation) == base.sink_policy_for(operation)
+
+
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
     tmp_path: Path,
 ) -> None:
@@ -522,8 +586,9 @@ def test_poller_read_scope_is_limited_to_its_server_bound_skill(
     other_skill.mkdir(parents=True)
     skill_md = own_skill / "SKILL.md"
     manifest = own_skill / "pollers.json"
-    script = own_skill / "dispatch-outbox.sh"
+    script = own_skill / "scripts" / "dispatch-outbox.sh"
     secret = own_skill / "runtime-notes.txt"
+    script.parent.mkdir()
     for path, content in (
         (skill_md, "# Social CLI\n"),
         (manifest, '{"pollers": [{"name": "social-cli-feed"}]}\n'),
@@ -3474,6 +3539,218 @@ def _write_auth(*, admin: bool = False) -> AuthContext:
         enforcement_enabled=True,
         ifc_labels=InformationFlowLabels(),
     )
+
+
+def _trusted_operator_write_auth() -> AuthContext:
+    source = SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity=Integrity.TRUSTED,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}),
+        source_channels=frozenset({"slack-C1"}),
+        sources=(source,),
+    )
+    return replace(
+        _write_auth(),
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        ifc_labels=labels,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "auth_factory"),
+    [
+        (
+            "poller",
+            lambda: replace(
+                _write_auth(),
+                trigger="poller",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+        ),
+        (
+            "scheduled_tick",
+            lambda: replace(
+                _write_auth(),
+                trigger="scheduled_tick",
+                interactivity=TurnInteractivity.NON_INTERACTIVE,
+            ),
+        ),
+        (
+            "replayed_event",
+            lambda: replace(_trusted_operator_write_auth(), event_ingress="http"),
+        ),
+        (
+            "trusted_service",
+            lambda: _service_auth(
+                get_service_principal("scheduled_tick"), InformationFlowLabels(),
+            ),
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_skill_script_writes_require_a_trusted_operator_turn(
+    case: str,
+    auth_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    auth = auth_factory()
+    assert auth is not None, case
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+    )
+
+    assert decision.allowed is False, case
+    assert decision.reason == "skill_script_write_requires_trusted_operator", case
+    assert decision.refusal_detail == (
+        "writes to skills/<skill>/scripts require a trusted operator turn"
+    )
+    compatibility_decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=False, target_channel=str(target),
+    )
+    assert compatibility_decision.allowed is False, case
+    assert compatibility_decision.reason == "skill_script_write_requires_trusted_operator"
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_trusted_operator_turn_may_write_skill_scripts(
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name,
+        _trusted_operator_write_auth(),
+        enforce=True,
+        target_channel=str(target),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason is None
+
+
+def test_declaration_and_write_gate_share_skill_script_writability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    script = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    script.parent.mkdir(parents=True)
+    script.write_text("console.log('ok')\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    roots = access_control.agent_writable_roots(home)
+
+    declared = access_control.parse_declared_shell_commands(
+        [{
+            "exec": "python3",
+            "path": sys.executable,
+            "script": str(script),
+            "options": ["--experimental-strip-types"],
+        }],
+        writable_roots=roots,
+    )
+    write = ToolRegistry().authorize_tool(
+        "edit_file",
+        replace(
+            _write_auth(),
+            trigger="scheduled_tick",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ),
+        enforce=True,
+        target_channel=str(script),
+    )
+
+    assert access_control._agent_writable_root_for_path(
+        script, roots, trusted_operator_turn=False,
+    ) is None
+    assert declared[0].script == script.resolve()
+    assert write.allowed is False
+    assert write.reason == "skill_script_write_requires_trusted_operator"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "skills/ai-news/SKILL.md",
+        "skills/ai-news/references/sources.md",
+        "skills/ai-news/.pre-update-backup/20260710T124800Z/fetch-news.ts",
+    ],
+)
+def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
+    relative: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    upgrade_auth = replace(
+        _write_auth(admin=True),
+        trigger="upgrade",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file", upgrade_auth, enforce=True, target_channel=relative,
+    )
+
+    assert decision.allowed is True
+
+
+def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    home = tmp_path / "home"
+    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", capture)
+    auth, denial = _authorize_tool_call(
+        "write_file",
+        replace(
+            _write_auth(),
+            trigger="scheduled_tick",
+            interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ),
+        str(target),
+    )
+
+    assert auth.allowed is False
+    assert denial is not None
+    reasons = {
+        fields.get("reason") or fields.get("denial_reason")
+        for _kind, fields in captured
+    }
+    assert reasons == {"skill_script_write_requires_trusted_operator"}
+    assert reasons.isdisjoint({"read_scope", "write_scope"})
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])

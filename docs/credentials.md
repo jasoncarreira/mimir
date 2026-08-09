@@ -203,7 +203,7 @@ Probe kinds:
   ``credentials.yaml``) via importlib and calls ``function`` (default
   ``"probe"``). The callable takes no args and returns
   ``(ok: bool, detail: str)``. See ``mimir/optional-skills/social-cli/
-  probe_bsky_password.py`` for an example.
+  scripts/probe_bsky_password.py`` for an example.
 
 If a skill has no ``credentials.yaml``, no credentials are registered
 on its behalf. Removing a skill (or never installing it) means

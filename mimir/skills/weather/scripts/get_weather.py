@@ -2,7 +2,7 @@
 """Get weather forecast using OpenWeatherMap API.
 
 Usage:
-  python3 get_weather.py [location] [--json]
+  python3 -m mimir.skills.weather.scripts.get_weather [location] [--json]
 
   location  City name (default: Victor,NY,US)
   --json    Output raw JSON instead of formatted text

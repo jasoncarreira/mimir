@@ -2,7 +2,7 @@
   "pollers": [
     {
       "name": "worklink-tool-pins",
-      "command": "python3 poller.py",
+      "command": "python3 scripts/poller.py",
       "cron": "0 8 * * 0",
       "priority": "low",
       "authority": {

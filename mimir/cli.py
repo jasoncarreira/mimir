@@ -223,9 +223,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     pred_p = sub.add_parser(
         "predictions",
-        help="Predictions tracking CLI (skills/predictions/script.py).",
+        help="Predictions tracking CLI (skills/predictions/scripts/predictions_cli.py).",
     )
-    from .skills.predictions import script as _predictions_script
+    from .skills.predictions.scripts import predictions_cli as _predictions_script
     _predictions_script.add_argparse(pred_p)
 
     # `mimir wiki <action>`
@@ -589,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sys.exit(_update_cmd.dispatch(args))
 
     if args.command == "predictions":
-        from .skills.predictions import script as _predictions_script
+        from .skills.predictions.scripts import predictions_cli as _predictions_script
         sys.exit(_predictions_script.run(args))
 
     if args.command == "wiki":

@@ -1,4 +1,4 @@
-"""Tests for the predictions skill CLI (mimir/skills/predictions/script.py)."""
+"""Tests for the predictions skill CLI."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.skills.predictions import script as predictions
+from mimir.skills.predictions.scripts import predictions_cli as predictions
 
 
 NOW = datetime(2026, 5, 2, 22, 0, tzinfo=timezone.utc)
