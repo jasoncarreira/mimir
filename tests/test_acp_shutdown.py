@@ -1245,7 +1245,9 @@ def test_cancellation_resistant_runtime_child_hard_fail_stops_subprocess(
                     except asyncio.CancelledError:
                         open(ready_marker, "w").close()
                         await asyncio.Future()
-                asyncio.create_task(resistant(), name="subprocess-resistant-child")
+                composition.resistant_task = asyncio.create_task(
+                    resistant(), name="subprocess-resistant-child"
+                )
                 await resistant_entered.wait()
                 return composition
             async def protocol_runner(*args, **kwargs):
