@@ -48,8 +48,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .billing import normalize_priority
 from .access_control import (
     agent_writable_roots,
+    build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
-    get_service_principal,
     parse_declared_shell_commands,
 )
 from .core_blocks import read_text_lossy
@@ -986,7 +986,17 @@ class Scheduler:
             heartbeat_root.mkdir(parents=True, exist_ok=True)
             authority = builtin_trigger_service_principal("heartbeat", self._home)
             service_principal = authority.canonical
-        elif job.shell_commands is not None:
+        else:
+            authority = build_scheduled_tick_service_principal(job.name, self._home)
+            if authority is None:
+                log.error(
+                    "scheduler %r: no scheduled_tick authority to extend; job not fired",
+                    job.name,
+                )
+                return
+            service_principal = authority.canonical
+
+        if job.name != "heartbeat" and job.shell_commands is not None:
             # ``is not None``, not truthiness. A malformed FALSEY value --
             # ``shell_commands: {}`` or ``: ""`` -- would otherwise skip
             # validation entirely and the job would fire with no declaration and
@@ -1003,13 +1013,6 @@ class Scheduler:
             # A bad declaration disables the job rather than downgrading it to
             # the undeclared principal: it would otherwise fail every command it
             # was configured to run, with the reason nowhere near the cause.
-            base = get_service_principal("scheduled_tick")
-            if base is None:
-                log.error(
-                    "scheduler %r: no scheduled_tick authority to extend; job not fired",
-                    job.name,
-                )
-                return
             try:
                 declared = parse_declared_shell_commands(
                     job.shell_commands,
@@ -1023,12 +1026,9 @@ class Scheduler:
                 return
             if declared:
                 authority = dataclasses.replace(
-                    base, declared_shell_commands=declared,
+                    authority, declared_shell_commands=declared,
                 )
                 service_principal = authority.canonical
-            # An explicit empty list parses cleanly and means "declare nothing".
-            # Fall through to the shared principal rather than building a
-            # per-job one that grants no more than the profile already does.
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),

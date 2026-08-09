@@ -31,6 +31,7 @@ from mimir.access_control import (
     ToolRegistry,
     authorize_action,
     authorize_inbound,
+    build_scheduled_tick_service_principal,
     build_trigger_service_principal,
     classify_protected_result,
     create_auth_context,
@@ -491,6 +492,66 @@ def test_service_read_scope_includes_both_home_skill_roots_without_write_scope(
     assert (home / ".mimir_builtin_skills").resolve() in read_roots
     assert (home / "skills").resolve() not in write_roots
     assert (home / ".mimir_builtin_skills").resolve() not in write_roots
+
+
+def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own_note = (
+        home / "memory" / "channels" / "scheduler:morning-briefing"
+        / "channel-notes.md"
+    )
+    sibling_note = (
+        home / "memory" / "channels" / "scheduler:daily-journal"
+        / "channel-notes.md"
+    )
+    script = home / "scripts" / "process_conditional_todos.py"
+    issue_note = home / "memory" / "issues" / "scheduler-read-scope.md"
+    denied = (
+        home / "memory" / "core" / "identity.md",
+        home / ".env",
+        home / "credentials" / "service.json",
+        sibling_note,
+    )
+    for target in (own_note, script, issue_note, *denied):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("ordinary test content\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    base = get_service_principal("scheduled_tick")
+    service = build_scheduled_tick_service_principal("morning-briefing", home)
+    assert base is not None and service is not None
+    assert service.channel_memory_directory == "scheduler:morning-briefing"
+    assert service.capabilities == base.capabilities
+    assert service.readable_domains == base.readable_domains
+    assert service.sink_destinations == base.sink_destinations
+    assert service.sink_policies == base.sink_policies
+    assert str((home / "scripts").resolve()) in service.filesystem_read_roots
+
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        channel_id="configured-delivery-channel",
+    )
+    for target in (own_note, script, issue_note):
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)}, auth_context=auth,
+        ) is True, target
+    for target in denied:
+        assert access_control._trigger_service_read_target_is_allowed(
+            service, "read_file", {"file_path": str(target)}, auth_context=auth,
+        ) is False, target
+
+    other_service = build_scheduled_tick_service_principal("daily-journal", home)
+    assert other_service is not None
+    other_auth = replace(auth, service_authority=other_service)
+    assert access_control._trigger_service_read_target_is_allowed(
+        other_service, "read_file", {"file_path": str(own_note)},
+        auth_context=other_auth,
+    ) is False
+
+    for operation in ("write_file", "edit_file"):
+        assert service.sink_policy_for(operation) == base.sink_policy_for(operation)
 
 
 def test_read_capable_service_principal_uses_declared_grant_for_repo_path(
