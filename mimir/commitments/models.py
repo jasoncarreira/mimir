@@ -6,8 +6,8 @@ accepted. JSONL events ("commitment_added" / "_delivered" / "_completed"
 in-memory current state.
 
 Why split events vs. record? Append-only event log fits mimir's
-existing patterns (events.jsonl, turns.jsonl, session_boundaries.jsonl)
-and gives us free audit history. The record is a denormalized view
+existing operational-log patterns and gives us free audit history.
+The record is a denormalized view
 useful for prompt rendering / CLI display.
 """
 

@@ -7,7 +7,8 @@ module owns the *rendering* (chainlink #63 staleness markers,
 closed_since corrective filtering) and the ``count_turns_since()``
 helper that annotates each header with a "N turns this channel" marker.
 
-History: this module used to also own a local JSONL mirror
+History: this module used to also own the local
+``<home>/.mimir/session_boundaries.jsonl`` mirror
 (``SessionBoundaryLog``) that the legacy ``saga_end_session`` tool
 populated as a fallback for the prompt path when an external SAGA
 HTTP server was briefly unreachable. mimir.saga is now in-process —

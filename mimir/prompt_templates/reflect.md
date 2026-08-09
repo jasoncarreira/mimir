@@ -70,11 +70,10 @@ Before either track, gather inputs:
   `result_subtype`, `duration_ms`, tool sequences. Distribution work
   belongs here.
 - **Recent session boundaries** — the prompt's "Recent session
-  summaries" section is channel-scoped to *this* turn (`scheduler:reflect`,
-  which has none). For cross-channel boundaries, the local mirror at
-  `<home>/.mimir/session_boundaries.jsonl` is append-only JSONL. Use
-  `read_file` pagination near the end of the file to inspect the last 50
-  boundaries across all channels; do not recreate the former shell-tail pipeline.
+  summaries" section is populated across channels for this reflection turn,
+  ordered by recency directly from SAGA's sessions table. Its boundary limit is
+  controlled by the `recent_boundaries` configuration; use the assembled section
+  rather than looking for a separate local log.
   (Don't use `memory_query` for this — it ranks by
   similarity, not recency, and may not surface boundary-typed atoms
   at all.)

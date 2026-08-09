@@ -1,9 +1,8 @@
 """Streaming tail-reader for JSONL files.
 
-Used by ``feedback.py`` (recent feedback signals from events.jsonl /
-turns.jsonl) and ``session_boundary_log.py`` (local mirror tail). Both
-read newest-first up to a small bound — typically ≤ 20 records — but
-the underlying file can grow unbounded (events.jsonl is the firehose).
+Used by operational-log readers that need recent records without loading
+the full file. They read newest-first up to a small bound, but the
+underlying file can grow unbounded (events.jsonl is the firehose).
 Loading the whole file into memory per turn is an O(file_size) memory
 spike on every prompt assembly; this module reads from the tail in
 chunks so memory use stays O(chunk_size) regardless of file length.
