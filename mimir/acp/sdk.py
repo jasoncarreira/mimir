@@ -518,18 +518,43 @@ async def run_stdio_agent(
     )
     peer = AcpPeer(connection, agent)
     holder["peer"] = peer
-    on_connect = getattr(agent, "on_connect", None)
-    if on_connect is not None:
-        generation = on_connect(peer)
-        if isinstance(generation, int) and not isinstance(generation, bool):
-            peer.peer_generation = generation
+    primary: BaseException | None = None
+    traceback = None
     try:
+        on_connect = getattr(agent, "on_connect", None)
+        if on_connect is not None:
+            generation = on_connect(peer)
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                peer.peer_generation = generation
         await connection.main_loop()
-    finally:
+    except BaseException as exc:
+        primary = exc
+        traceback = exc.__traceback__
+    try:
         on_closed = getattr(agent, "on_transport_closed", None)
         if on_closed is not None:
             await on_closed(peer.peer_generation)
-        await asyncio.shield(connection.close())
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+            traceback = exc.__traceback__
+        else:
+            primary.add_note(f"on_transport_closed also failed: {exc!r}")
+    try:
+        close_task = asyncio.create_task(connection.close())
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await close_task
+            raise
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+            traceback = exc.__traceback__
+        else:
+            primary.add_note(f"connection.close also failed: {exc!r}")
+    if primary is not None:
+        raise primary.with_traceback(traceback)
 
 
 __all__ = [
