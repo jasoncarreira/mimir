@@ -1591,7 +1591,7 @@ async def test_transport_death_tears_down_only_bound_generation() -> None:
     await agent.on_transport_closed(1)
 
     assert old_connection.closed is True
-    assert old_peer.disconnects == ["old-connection"]
+    assert old_peer.disconnects == []
     assert "old-only" not in agent._sessions
     assert agent._sessions["shared"] is successor
     assert agent._environments["shared"][0] == 2

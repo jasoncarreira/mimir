@@ -15,7 +15,7 @@ from mimir.acp import sdk
 from mimir.acp.agent import ActivePrompt, MimirAcpAgent
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
-from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context
+from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.turn_event_bus import TurnEventBus
@@ -493,6 +493,41 @@ async def test_overflowed_session_accepts_later_live_prompts(tmp_path: Path, mon
     assert client.updates == []
 
 
+async def test_providerless_public_turn_fails_closed_without_remote_authority(tmp_path: Path) -> None:
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+
+    class ProviderlessClient(Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.remote_calls: list[str] = []
+
+        async def request_tool_permission(self, *args: Any, **kwargs: Any) -> Any:
+            self.remote_calls.append("permission")
+
+        async def message_mcp(self, *args: Any, **kwargs: Any) -> Any:
+            self.remote_calls.append("provider")
+
+    client = ProviderlessClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/workspace")).session_id
+    observed: list[Any] = []
+
+    async def providerless_turn(*args: Any, **kwargs: Any) -> None:
+        context = get_turn_capability_context()
+        observed.append(context.profile_policy if context is not None else object())
+        await hands_edit.ainvoke({"path": "a", "old_text": "x", "new_text": "y"})
+
+    core.run_turn = providerless_turn
+    with pytest.raises(sdk.RequestError):
+        await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="edit")])
+
+    assert observed == [None]
+    assert client.remote_calls == []
+    assert agent._sessions[session_id].active_prompt is None
+
+
 async def test_nonreplayable_marker_survives_deleted_journal_and_reconstruction(tmp_path: Path) -> None:
     agent, _, _ = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id
@@ -513,12 +548,14 @@ class McpClient(Client):
         self.connects: list[str] = []
         self.disconnects: list[str] = []
         self.notifications: list[tuple[str, str, Any]] = []
+        self.messages: list[tuple[str, str, Any]] = []
 
     async def connect_mcp(self, server_id: str) -> str:
         self.connects.append(server_id)
         return f"connection-{len(self.connects)}"
 
     async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+        self.messages.append((connection_id, method, params))
         if method == "initialize":
             return {"protocolVersion": "2025-03-26", "capabilities": {}, "serverInfo": {"name": "hands", "version": "1"}}
         if method == "tools/list":
@@ -604,6 +641,46 @@ async def test_provider_indexes_are_session_owned_and_load_uses_fresh_connection
     assert client.disconnects == ["connection-1"]
 
 
+async def test_list_changed_revalidates_only_fresh_tools_list_serially(tmp_path: Path) -> None:
+    class StrictClient(McpClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_active = 0
+            self.max_list_active = 0
+
+        async def message_mcp(self, connection_id: str, method: str, params: Any = None) -> Any:
+            if method == "initialize" and any(call[1] == "initialize" for call in self.messages):
+                raise RuntimeError("duplicate initialize")
+            if method == "tools/list":
+                self.list_active += 1
+                self.max_list_active = max(self.max_list_active, self.list_active)
+                await asyncio.sleep(0.01)
+                try:
+                    return await super().message_mcp(connection_id, method, params)
+                finally:
+                    self.list_active -= 1
+            return await super().message_mcp(connection_id, method, params)
+
+    bundle, _ = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = StrictClient()
+    generation = agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server-a"))).session_id
+    connection_id = agent._sessions[session_id].provider.connection_id
+
+    await asyncio.gather(
+        agent.on_mcp_notification(generation, connection_id, "notifications/tools/list_changed", None),
+        agent.on_mcp_notification(generation, connection_id, "notifications/tools/list_changed", None),
+    )
+    await asyncio.gather(*agent._connections[generation].tasks)
+
+    assert [method for _, method, _ in client.messages].count("initialize") == 1
+    assert [method for _, method, _ in client.messages].count("tools/list") == 3
+    assert client.max_list_active == 1
+    assert agent._sessions[session_id].provider is not None
+
+
 async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_path: Path) -> None:
     bundle, _ = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -661,6 +738,78 @@ async def test_active_prompt_permission_uses_admitted_snapshot_and_is_once_scope
     with pytest.raises(asyncio.CancelledError):
         await forwarder
     await dispatcher.close()
+
+
+@pytest.mark.parametrize("earlier_outcome", ["complete", "cancel"])
+async def test_progress_token_collision_cleanup_preserves_successor_ownership(
+    monkeypatch: pytest.MonkeyPatch, earlier_outcome: str
+) -> None:
+    calls: list[asyncio.Future[dict[str, Any]]] = []
+    entered: asyncio.Queue[None] = asyncio.Queue()
+
+    class Peer:
+        async def message_mcp(
+            self, connection_id: str, method: str, params: dict[str, Any]
+        ) -> dict[str, Any]:
+            future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+            calls.append(future)
+            entered.put_nowait(None)
+            return await future
+
+    owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
+    state = SimpleNamespace(
+        generation=7, prompt_epoch=3, provider=None, active_prompt=None
+    )
+    peer = Peer()
+    provider = agent_module._AcpProviderConnection(owner, peer, "provider-1", state)
+    state.provider = provider
+    active = SimpleNamespace(
+        generation=7,
+        epoch=3,
+        progress_tokens={},
+        mcp_handles=[],
+        mcp_request_ids=set(),
+        _is_current=lambda: state.active_prompt is active,
+    )
+    state.active_prompt = active
+    monkeypatch.setattr(
+        agent_module.uuid, "uuid4", lambda: SimpleNamespace(hex="collision")
+    )
+
+    earlier = asyncio.create_task(provider._call_tool(active, "edit", {"call": 1}))
+    await entered.get()
+    successor = asyncio.create_task(provider._call_tool(active, "edit", {"call": 2}))
+    await entered.get()
+    successor_ownership = active.progress_tokens["collision"]
+
+    if earlier_outcome == "complete":
+        calls[0].set_result({"call": 1})
+        assert await earlier == {"call": 1}
+    else:
+        earlier.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await earlier
+
+    assert active.progress_tokens["collision"] is successor_ownership
+    audit_owner = SimpleNamespace(_audit_events=[])
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "collision", "progress": 1}
+    )
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "foreign", "progress": 2}
+    )
+    assert [event["status"] for event in audit_owner._audit_events] == [
+        "accepted",
+        "ignored",
+    ]
+
+    calls[1].set_result({"call": 2})
+    assert await successor == {"call": 2}
+    assert "collision" not in active.progress_tokens
+    MimirAcpAgent._audit_progress(
+        audit_owner, state, {"progressToken": "collision", "progress": 3}
+    )
+    assert audit_owner._audit_events[-1]["status"] == "ignored"
 
 
 async def test_explicit_cancel_drains_accepted_tool_and_terminalizes_before_response(
@@ -1193,7 +1342,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
     runner = asyncio.create_task(connection.main_loop())
     peer = sdk.AcpPeer(connection, agent)
     holder["peer"] = peer
-    agent.on_connect(peer)
+    peer.peer_generation = agent.on_connect(peer)
 
     async def next_outgoing() -> dict[str, Any]:
         return await asyncio.wait_for(transport.outgoing.get(), 3)
@@ -1378,7 +1527,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 },
             }
 
-        def provider_request(outer_id: int, path: str, old: str, new: str) -> dict[str, Any]:
+        def provider_request(outer_id: int, path: str, old: str, new: str, token: str) -> dict[str, Any]:
             return {
                 "jsonrpc": "2.0", "id": outer_id, "method": "mcp/message",
                 "params": {
@@ -1386,6 +1535,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                     "params": {
                         "name": "edit",
                         "arguments": {"path": path, "oldText": old, "newText": new},
+                        "_meta": {"progressToken": token},
                     },
                 },
             }
@@ -1412,13 +1562,47 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "jsonrpc": "2.0", "id": 3,
             "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
         })
-        assert await next_outgoing() == provider_request(
-            4, "notes-1.txt", "old-1", "new-1"
+        provider_frame = await next_outgoing()
+        progress_token = provider_frame["params"]["params"]["_meta"]["progressToken"]
+        assert isinstance(progress_token, str) and len(progress_token) >= 32
+        assert provider_frame == provider_request(
+            4, "notes-1.txt", "old-1", "new-1", progress_token
         )
+        for token, progress in ((progress_token, 1), ("foreign", 2)):
+            await transport.incoming.put({
+                "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                    "connectionId": "opaque-1", "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": progress},
+                },
+            })
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                "connectionId": "opaque-1", "method": "notifications/message",
+                "params": {"level": "info", "logger": "hands", "data": {"token": "secret", "message": "working"}},
+            },
+        })
+        for _ in range(20):
+            if len(agent._audit_events) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        assert agent._audit_events[-3]["status"] == "accepted"
+        assert agent._audit_events[-2]["status"] == "ignored"
+        assert agent._audit_events[-1]["data"] == {"token": "[redacted]", "message": "working"}
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 4, "result": {"changed": True},
         })
         progress_1 = await next_outgoing()
+        await transport.incoming.put({
+            "jsonrpc": "2.0", "method": "mcp/message", "params": {
+                "connectionId": "opaque-1", "method": "notifications/progress",
+                "params": {"progressToken": progress_token, "progress": 3},
+            },
+        })
+        for _ in range(20):
+            if len(agent._audit_events) >= 4:
+                break
+            await asyncio.sleep(0.01)
+        assert agent._audit_events[-1]["status"] == "ignored"
         progress_1_update = progress_1["params"]["update"]
         assert progress_1_update["_meta"] == {"mimir.sequence": 2}
         assert {key: value for key, value in progress_1_update.items() if key != "_meta"} == {
@@ -1455,8 +1639,11 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             "jsonrpc": "2.0", "id": 5,
             "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
         })
-        assert await next_outgoing() == provider_request(
-            6, "notes-2.txt", "old-2", "new-2"
+        provider_frame_2 = await next_outgoing()
+        progress_token_2 = provider_frame_2["params"]["params"]["_meta"]["progressToken"]
+        assert progress_token_2 != progress_token
+        assert provider_frame_2 == provider_request(
+            6, "notes-2.txt", "old-2", "new-2", progress_token_2
         )
         await transport.incoming.put({
             "jsonrpc": "2.0", "id": 6, "result": {"changed": True},
