@@ -9441,14 +9441,10 @@ async def test_public_permission_late_allow_rejects_live_capability_replacement(
             context.provider.peer.transport = SimpleNamespace(closed=False)
         elif change == "generation":
             object.__setattr__(context, "connection_generation", 42)
-            object.__setattr__(
-                context, "lease", JournalLease("replacement-turn", 42, 17),
-            )
+            context.lease.generation = 42
         else:
             object.__setattr__(context, "prompt_epoch", 18)
-            object.__setattr__(
-                context, "lease", JournalLease("replacement-turn", 41, 18),
-            )
+            context.lease.epoch = 18
         release.set()
         result = await task
     finally:
