@@ -1600,3 +1600,58 @@ async def test_transport_death_tears_down_only_bound_generation() -> None:
     assert agent._connection is new_connection
     assert agent._client is new_peer
     assert agent._bridge._connected is True
+
+
+async def test_inbound_mcp_generation_identity_prevents_connection_id_collision() -> None:
+    old_state = SimpleNamespace(generation=1, record=SimpleNamespace(session_id="old"))
+    new_state = SimpleNamespace(generation=2, record=SimpleNamespace(session_id="new"))
+    old_connection = ConnectionState(1, object())
+    new_connection = ConnectionState(2, object())
+    old_connection.connection_sessions["collision"] = old_state
+    new_connection.connection_sessions["collision"] = new_state
+    agent = object.__new__(MimirAcpAgent)
+    agent._connections = {1: old_connection, 2: new_connection}
+    observed: list[tuple[int, str]] = []
+
+    async def revalidate(state: Any) -> None:
+        observed.append((state.generation, state.record.session_id))
+
+    agent._revalidate_provider = revalidate
+    await agent.on_mcp_notification(1, "collision", "notifications/tools/list_changed", None)
+    await agent.on_mcp_notification(2, "collision", "notifications/tools/list_changed", None)
+    await asyncio.gather(*old_connection.tasks, *new_connection.tasks)
+
+    assert observed == [(1, "old"), (2, "new")]
+
+
+async def test_replaced_generation_retirement_is_not_owned_by_successor_connection() -> None:
+    agent = object.__new__(MimirAcpAgent)
+    old_peer = object()
+    new_peer = object()
+    old = ConnectionState(1, old_peer)
+    agent._connection = old
+    agent._connections = {1: old}
+    agent._generation = 1
+    agent._client = old_peer
+    agent._auth_context = object()
+    agent._display_name = "old"
+    agent._bridge = SimpleNamespace(_connected=False)
+    agent._active_prompts = {}
+    agent._environments = {}
+    agent._retirement_tasks = set()
+    retired = asyncio.Event()
+
+    async def retire(generation: int) -> None:
+        assert generation == 1
+        retired.set()
+
+    agent._retire_generation = retire
+    successor_generation = agent.on_connect(new_peer)
+    successor = agent._connections[successor_generation]
+    await retired.wait()
+    await asyncio.gather(*agent._retirement_tasks)
+
+    assert successor.tasks == set()
+    assert agent._connection is successor
+    assert successor.auth_context is None
+    assert successor.principal is None

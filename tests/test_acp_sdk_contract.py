@@ -101,7 +101,8 @@ class ContractAgent:
         self.notification_calls.append((method, params))
 
     async def on_mcp_notification(
-        self, connection_id: str, method: str, params: dict[str, Any] | None
+        self, peer_generation: int, connection_id: str, method: str,
+        params: dict[str, Any] | None,
     ) -> None:
         self.mcp_notifications.append((connection_id, method, params))
         self.mcp_event.set()
@@ -1105,3 +1106,84 @@ async def test_request_handle_start_failure_does_not_wait_for_unregistered_id() 
         await asyncio.wait_for(
             peer.start_request("session/request_permission", {}), timeout=0.1
         )
+
+
+@pytest.mark.asyncio
+async def test_request_registration_is_per_invocation_under_same_method_concurrency() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+
+    starts = await asyncio.gather(
+        peer.start_request("session/request_permission", {"marker": "one"}),
+        peer.start_request("session/request_permission", {"marker": "two"}),
+    )
+    requests = [await transport.outgoing.get(), await transport.outgoing.get()]
+    assert {handle.outer_id for handle in starts} == {request["id"] for request in requests} == {0, 1}
+    by_marker = {request["params"]["marker"]: request["id"] for request in requests}
+    await transport.incoming.put({"jsonrpc": "2.0", "id": by_marker["two"], "result": {"value": "second"}})
+    await transport.incoming.put({"jsonrpc": "2.0", "id": by_marker["one"], "result": {"value": "first"}})
+    results = await asyncio.gather(*(handle.task for handle in starts))
+    assert {result["value"] for result in results} == {"first", "second"}
+    assert state._outgoing == {}
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_request_registration_cancellation_phases_leave_no_capture_or_pending_id() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+
+    before_registration = asyncio.create_task(peer.start_request("phase/before", {}))
+    before_registration.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await before_registration
+    assert state._outgoing == {}
+
+    registered = await peer.start_request("phase/registered", {})
+    request = await transport.outgoing.get()
+    assert registered.outer_id == request["id"] == 0
+    registered.abandon()
+    with pytest.raises(asyncio.CancelledError):
+        await registered.task
+    assert state._outgoing == {}
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 0, "result": {}})
+
+    after_abandon = await peer.start_request("phase/after", {})
+    request = await transport.outgoing.get()
+    assert after_abandon.outer_id == request["id"] == 1
+    await transport.incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
+    assert await after_abandon.task == {"ok": True}
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_request_store_close_unknown_duplicate_and_abandon_contract() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        state.resolve_outgoing(404, {})
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        state.reject_outgoing(404, RuntimeError("unknown"))
+
+    handle = await peer.start_request("phase/close", {})
+    await transport.outgoing.get()
+    await connection.close()
+    with pytest.raises(Exception):
+        await handle.task
+    assert state._outgoing == {}
+
+    abandoned_state = sdk.StrictMessageStateStore()
+    future = abandoned_state.register_outgoing(7, "phase/abandon")
+    abandoned_state.abandon_outgoing(7)
+    with pytest.raises(asyncio.CancelledError):
+        await future
+    abandoned_state.resolve_outgoing(7, {})
+    with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
+        abandoned_state.resolve_outgoing(7, {})

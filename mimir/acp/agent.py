@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
 
 _WEB_KEY_FIELD = "mimir.webKey"
 ACP_PROMPT_CANCEL_GRACE_SECONDS = 2.0
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,8 @@ class ConnectionState:
     generation: int
     peer: Client
     principal: str | None = None
+    auth_context: AuthContext | None = None
+    display_name: str | None = None
     server_sessions: dict[str, SessionState] = field(default_factory=dict)
     connection_sessions: dict[str, SessionState] = field(default_factory=dict)
     used_connection_ids: set[str] = field(default_factory=set)
@@ -124,44 +128,77 @@ class ActivePrompt:
     async def request_permission(
         self, eligibility: PermissionEligibility
     ) -> ToolPermissionDecision:
-        if self.cancelling or self.journal_lease.closed:
+        agent = self.session.provider.agent if self.session.provider is not None else None
+        if agent is None:
             return ToolPermissionDecision.REJECT_ONCE
+        async with agent._boundary_lock:
+            if not self._is_current():
+                return ToolPermissionDecision.REJECT_ONCE
+            task = asyncio.create_task(self._request_permission(eligibility))
+            self.permission_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            return ToolPermissionDecision.REJECT_ONCE
+        finally:
+            self.permission_tasks.discard(task)
+
+    def _is_current(self) -> bool:
+        return (
+            not self.cancelling
+            and not self.journal_lease.closed
+            and self.session.active_prompt is self
+            and self.session.generation == self.generation
+            and self.session.prompt_epoch == self.epoch
+        )
+
+    async def _request_permission(
+        self, eligibility: PermissionEligibility
+    ) -> ToolPermissionDecision:
         await self.dispatcher.drain()
         snapshot = self.dispatcher.permission_snapshot(eligibility.tool_call_id)
         expected = _strict_arguments(eligibility.arguments)
         if snapshot is None or _thaw(snapshot.raw_input) != expected:
             return ToolPermissionDecision.REJECT_ONCE
-        peer = self.session.provider.peer if self.session.provider is not None else None
-        if peer is None or self.session.generation != self.generation:
+        provider = self.session.provider
+        peer = provider.peer if provider is not None else None
+        if peer is None:
             return ToolPermissionDecision.REJECT_ONCE
         handle: AcpRequestHandle | None = None
+        agent = provider.agent
         try:
-            if isinstance(peer, AcpPeer) and peer.supports_owned_requests:
-                handle = await peer.start_tool_permission(
-                    self.session.record.session_id, snapshot
-                )
-                self.permission_handles.append(handle)
-                task = handle.task
-            else:
-                task = asyncio.create_task(
-                    peer.request_tool_permission(self.session.record.session_id, snapshot)
-                )
-            self.permission_tasks.add(task)
-            completion = await task
+            async with agent._boundary_lock:
+                if not self._is_current() or self.session.provider is not provider:
+                    return ToolPermissionDecision.REJECT_ONCE
+                if isinstance(peer, AcpPeer) and peer.supports_owned_requests:
+                    handle = await peer.start_tool_permission(
+                        self.session.record.session_id, snapshot
+                    )
+                    if not self._is_current():
+                        handle.abandon()
+                        return ToolPermissionDecision.REJECT_ONCE
+                    self.permission_handles.append(handle)
+                    completion_task = handle.task
+                else:
+                    completion_task = asyncio.create_task(
+                        peer.request_tool_permission(self.session.record.session_id, snapshot)
+                    )
+            completion = await completion_task
         except asyncio.CancelledError:
+            if handle is not None:
+                handle.abandon()
             return ToolPermissionDecision.REJECT_ONCE
         finally:
-            if "task" in locals():
-                self.permission_tasks.discard(task)
             if handle is not None and handle in self.permission_handles:
                 self.permission_handles.remove(handle)
-        if self.cancelling or self.journal_lease.closed or completion.error is not None:
+        if not self._is_current() or completion.error is not None:
             return ToolPermissionDecision.REJECT_ONCE
         if completion.decision == "allow_once":
             return ToolPermissionDecision.ALLOW_ONCE
         if completion.decision == "cancelled":
             return ToolPermissionDecision.CANCELLED
         return ToolPermissionDecision.REJECT_ONCE
+
 
 
 class _UnavailableProvider:
@@ -179,40 +216,65 @@ class _AcpProviderConnection:
 
     async def call_tool(self, name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
         active = self.session.active_prompt
-        if self.closed or active is None or active.cancelling or active.journal_lease.closed:
-            raise RuntimeError("Client provider connection is closed")
-        handle: AcpRequestHandle | None = None
-        if isinstance(self.peer, AcpPeer) and self.peer.supports_owned_requests:
-            handle = await self.peer.start_mcp_request(
-                self.connection_id,
-                "tools/call",
-                {"name": name, "arguments": dict(arguments)},
-            )
-            active.mcp_handles.append(handle)
-            active.mcp_request_ids.add(handle.outer_id)
-            task = handle.task
-        else:
-            task = asyncio.create_task(
-                self.peer.message_mcp(
-                    self.connection_id,
-                    "tools/call",
-                    {"name": name, "arguments": dict(arguments)},
-                )
-            )
-        active.mcp_tasks.add(task)
+        async with self.agent._boundary_lock:
+            if (
+                self.closed
+                or active is None
+                or not active._is_current()
+                or self.session.provider is not self
+            ):
+                raise RuntimeError("Client provider connection is closed")
+            task = asyncio.create_task(self._call_tool(active, name, arguments))
+            active.mcp_tasks.add(task)
         try:
-            result = await task
+            return await task
         finally:
             active.mcp_tasks.discard(task)
+
+    async def _call_tool(
+        self, active: ActivePrompt, name: str, arguments: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        handle: AcpRequestHandle | None = None
+        try:
+            async with self.agent._boundary_lock:
+                if self.closed or not active._is_current() or self.session.provider is not self:
+                    raise RuntimeError("Client provider connection is closed")
+                if isinstance(self.peer, AcpPeer) and self.peer.supports_owned_requests:
+                    handle = await self.peer.start_mcp_request(
+                        self.connection_id,
+                        "tools/call",
+                        {"name": name, "arguments": dict(arguments)},
+                    )
+                    if not active._is_current():
+                        handle.abandon()
+                        raise RuntimeError("Client provider connection is closed")
+                    active.mcp_handles.append(handle)
+                    active.mcp_request_ids.add(handle.outer_id)
+                    request_task = handle.task
+                else:
+                    request_task = asyncio.create_task(
+                        self.peer.message_mcp(
+                            self.connection_id,
+                            "tools/call",
+                            {"name": name, "arguments": dict(arguments)},
+                        )
+                    )
+            result = await request_task
+        except asyncio.CancelledError:
+            if handle is not None:
+                handle.abandon()
+            raise
+        finally:
             if handle is not None:
                 if handle in active.mcp_handles:
                     active.mcp_handles.remove(handle)
                 active.mcp_request_ids.discard(handle.outer_id)
-        if self.closed or active is not self.session.active_prompt or active.journal_lease.closed:
+        if self.closed or not active._is_current() or self.session.provider is not self:
             raise RuntimeError("Stale client provider result")
         if not isinstance(result, Mapping):
             raise RuntimeError("Malformed client provider result")
         return dict(result)
+
 
 
 class MimirAcpAgent:
@@ -253,6 +315,8 @@ class MimirAcpAgent:
         self._connection = connection
         self._connections[connection.generation] = connection
         self._client = conn
+        self._auth_context = None
+        self._display_name = None
         self._bridge._connected = True
         if old is not None and old.peer is not conn and not old.closed:
             for session_id, active in tuple(self._active_prompts.items()):
@@ -264,8 +328,7 @@ class MimirAcpAgent:
             task = asyncio.create_task(self._retire_generation(old.generation))
             self._retirement_tasks.add(task)
             task.add_done_callback(self._retirement_tasks.discard)
-            connection.tasks.add(task)
-            task.add_done_callback(connection.tasks.discard)
+            task.add_done_callback(_consume_background_task)
         return connection.generation
 
     async def initialize(self, protocol_version: int, client_capabilities: ClientCapabilities | None = None, client_info: Implementation | None = None, **kwargs: Any) -> InitializeResponse:
@@ -283,6 +346,11 @@ class MimirAcpAgent:
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         self._auth_context = None
         self._display_name = None
+        connection = self._connection
+        if connection is not None:
+            connection.principal = None
+            connection.auth_context = None
+            connection.display_name = None
         try:
             raw_key = kwargs.get(_WEB_KEY_FIELD)
             if method_id != AUTH_METHOD_ID or not isinstance(raw_key, str) or not raw_key:
@@ -299,8 +367,12 @@ class MimirAcpAgent:
             raise auth_required_error() from None
         self._auth_context = auth_context
         self._display_name = identity.display_name or identity.canonical
-        if self._connection is not None:
-            self._connection.principal = identity.canonical
+        if connection is not None:
+            if self._connection is not connection or connection.closed:
+                raise auth_required_error()
+            connection.principal = identity.canonical
+            connection.auth_context = auth_context
+            connection.display_name = identity.display_name or identity.canonical
         return AuthenticateResponse()
 
     async def new_session(self, cwd: str, additional_directories: list[str] | None = None, mcp_servers: object | None = None, **kwargs: Any) -> NewSessionResponse:
@@ -407,8 +479,11 @@ class MimirAcpAgent:
         try:
             for block in blocks:
                 await journal.publish_live(UserMessageChunk(sessionUpdate="user_message_chunk", content=block), client, turn_id=turn_id, lease=lease)
-            event = AgentEvent(trigger="user_message", channel_id=record.thread_id, content=self._normalize_prompt(blocks), author=owner, author_display=self._display_name or owner, author_id=owner, source_id=turn_id, source="acp", extra={"channel_visibility": "private"}, continuation_auth_context=self._auth_context)
-            active.model_task = asyncio.create_task(self._bundle.agent.run_turn(event, turn_id=turn_id, session_id=record.thread_id, saga_session_id=record.thread_id))
+            event = AgentEvent(trigger="user_message", channel_id=record.thread_id, content=self._normalize_prompt(blocks), author=owner, author_display=self._display_name_for(state) or owner, author_id=owner, source_id=turn_id, source="acp", extra={"channel_visibility": "private"}, continuation_auth_context=self._auth_context_for(state))
+            async with self._boundary_lock:
+                if not active._is_current():
+                    raise asyncio.CancelledError
+                active.model_task = asyncio.create_task(self._bundle.agent.run_turn(event, turn_id=turn_id, session_id=record.thread_id, saga_session_id=record.thread_id))
             await active.model_task
             await queue.join()
             await dispatcher.drain()
@@ -456,9 +531,9 @@ class MimirAcpAgent:
         state = self._sessions.get(session_id)
         active = state.active_prompt if state is not None else None
         if active is None or not await self._cancel_active(active, transport=False):
-            self._audit_events.append(
-                {"event": "acp_cancel_noop", "session_id": session_id}
-            )
+            event = {"event": "acp_cancel_noop", "session_id": session_id}
+            self._audit_events.append(event)
+            _LOGGER.info("acp_cancel_noop", extra={"acp_audit": event})
         return None
 
     async def _cancel_active(self, active: ActivePrompt, *, transport: bool) -> bool:
@@ -528,25 +603,34 @@ class MimirAcpAgent:
         if connection is None or connection.closed:
             return
         connection.closed = True
-        bound = [
-            state for state in tuple(self._sessions.values())
-            if state.generation == generation
-        ]
-        for state in bound:
+        owned: dict[int, SessionState] = {}
+        for state in (*connection.server_sessions.values(), *connection.connection_sessions.values()):
+            if state.generation == generation:
+                owned[id(state)] = state
+        for session_id in connection.bound_sessions:
+            state = self._sessions.get(session_id)
+            if state is not None and state.generation == generation:
+                owned[id(state)] = state
+        disconnected: set[str] = set()
+        for state in owned.values():
             if state.active_prompt is not None and state.active_prompt.generation == generation:
                 await self._cancel_active(state.active_prompt, transport=True)
             if state.provider is not None:
                 state.provider.closed = True
                 connection.connection_sessions.pop(state.provider.connection_id, None)
-                try:
-                    await state.provider.peer.disconnect_mcp(state.provider.connection_id)
-                except BaseException:
-                    pass
+                if state.provider.connection_id not in disconnected:
+                    disconnected.add(state.provider.connection_id)
+                    try:
+                        await state.provider.peer.disconnect_mcp(state.provider.connection_id)
+                    except BaseException:
+                        pass
             if self._sessions.get(state.record.session_id) is state:
                 self._sessions.pop(state.record.session_id, None)
                 self._environments.pop(state.record.session_id, None)
         connection.server_sessions.clear()
         connection.connection_sessions.clear()
+        connection.bound_sessions.clear()
+        connection.used_connection_ids.clear()
         for task in tuple(connection.tasks):
             if task is not asyncio.current_task():
                 task.cancel()
@@ -557,10 +641,13 @@ class MimirAcpAgent:
             self._bridge._connected = False
 
 
-    async def on_mcp_notification(self, connection_id: str, method: str, params: dict[str, Any] | None) -> None:
-        connection = self._connection
+    async def on_mcp_notification(
+        self, peer_generation: int, connection_id: str, method: str,
+        params: dict[str, Any] | None,
+    ) -> None:
+        connection = self._connections.get(peer_generation)
         state = connection.connection_sessions.get(connection_id) if connection is not None else None
-        if state is None or state.generation != self._generation:
+        if state is None or state.generation != peer_generation:
             return
         if method == "notifications/tools/list_changed":
             task = asyncio.create_task(self._revalidate_provider(state))
@@ -580,13 +667,41 @@ class MimirAcpAgent:
         return None
 
     def _begin_stateful(self) -> str:
-        if self._auth_context is None or self._auth_context.canonical_principal is None:
+        connection = self._connection
+        if connection is None:
+            auth_context = self._auth_context
+        else:
+            auth_context = connection.auth_context
+        if (
+            auth_context is None
+            or auth_context.canonical_principal is None
+            or (
+                connection is not None
+                and (
+                    connection.closed
+                    or connection.generation != self._generation
+                    or connection.principal != auth_context.canonical_principal
+                )
+            )
+        ):
             raise auth_required_error()
         try:
             self._store.sweep(self._ttl_days)
         except BaseException:
             raise internal_error() from None
-        return self._auth_context.canonical_principal
+        return auth_context.canonical_principal
+
+    def _auth_context_for(self, state: SessionState) -> AuthContext | None:
+        connection = self._connections.get(state.generation)
+        if connection is None or connection.principal != state.record.owner_principal:
+            return None
+        return connection.auth_context
+
+    def _display_name_for(self, state: SessionState) -> str | None:
+        connection = self._connections.get(state.generation)
+        if connection is None or connection.principal != state.record.owner_principal:
+            return None
+        return connection.display_name
 
     def _require_client(self) -> Client:
         if self._client is None:
@@ -665,17 +780,23 @@ class MimirAcpAgent:
         expected = {tool.provider_name: tool for tool in MIMIR_HANDS_V1.tools}
         if len(listed["tools"]) != len(expected):
             raise AcpProtocolError("MCP tool profile mismatch")
+        seen: set[str] = set()
         for tool in listed["tools"]:
             if not isinstance(tool, Mapping) or set(tool) - {"name", "description", "inputSchema", "outputSchema", "annotations", "_meta"}:
                 raise AcpProtocolError("MCP tool profile mismatch")
-            policy = expected.get(tool.get("name"))
+            name = tool.get("name")
+            policy = expected.get(name)
             if (
                 policy is None
+                or name in seen
                 or tool.get("description") != policy.description
                 or tool.get("inputSchema") != _thaw(policy.input_schema)
                 or tool.get("outputSchema") != _thaw(policy.result_schema)
             ):
                 raise AcpProtocolError("MCP tool profile mismatch")
+            seen.add(name)
+        if seen != set(expected):
+            raise AcpProtocolError("MCP tool profile mismatch")
 
     async def _discard_candidate(self, state: SessionState) -> None:
         connection = self._connections.get(state.generation)
@@ -691,11 +812,14 @@ class MimirAcpAgent:
         declaration = state.declaration
         if declaration is not None and connection is not None and connection.server_sessions.get(declaration.server_id) is state:
             connection.server_sessions.pop(declaration.server_id, None)
+        if connection is not None:
+            connection.bound_sessions.discard(state.record.session_id)
 
     def _restore_state_indexes(self, state: SessionState) -> None:
         connection = self._connections.get(state.generation)
         if connection is None or connection.closed:
             return
+        connection.bound_sessions.add(state.record.session_id)
         declaration = state.declaration
         if declaration is not None:
             connection.server_sessions[declaration.server_id] = state
@@ -731,6 +855,8 @@ class MimirAcpAgent:
                 pass
         if state.declaration is not None and connection is not None and connection.server_sessions.get(state.declaration.server_id) is state:
             connection.server_sessions.pop(state.declaration.server_id, None)
+        if connection is not None:
+            connection.bound_sessions.discard(session_id)
         self._sessions.pop(session_id, None)
         self._environments.pop(session_id, None)
 

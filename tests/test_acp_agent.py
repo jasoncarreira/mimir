@@ -430,3 +430,24 @@ def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
     }
 
     assert all(not hasattr(agent, name) for name in forbidden)
+
+
+async def test_authentication_is_reset_and_checked_for_each_connection_generation(tmp_path: Path) -> None:
+    resolver = _resolver(tmp_path)
+    agent = _agent(resolver)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
+    first = SimpleNamespace()
+    first_generation = agent.on_connect(first)
+    with pytest.raises(sdk.RequestError) as unauthenticated_first:
+        await agent.new_session("/one")
+    assert _error(unauthenticated_first.value) == _error(sdk.auth_required_error())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
+    assert agent._connections[first_generation].principal == "operator"
+
+    second = SimpleNamespace()
+    second_generation = agent.on_connect(second)
+    assert agent._connections[second_generation].principal is None
+    assert agent._connections[second_generation].auth_context is None
+    with pytest.raises(sdk.RequestError) as unauthenticated_second:
+        await agent.new_session("/two")
+    assert _error(unauthenticated_second.value) == _error(sdk.auth_required_error())

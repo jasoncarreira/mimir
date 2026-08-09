@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextvars import ContextVar
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -77,11 +78,19 @@ class IncomingRequestState:
     error: Any = None
 
 
+@dataclass(slots=True)
+class _StartRegistration:
+    method: str
+    future: asyncio.Future[tuple[int, asyncio.Future[Any]]]
+    abandoned: bool = False
+
+
 class StrictMessageStateStore:
     def __init__(self) -> None:
         self._outgoing: dict[int, asyncio.Future[Any]] = {}
-        self._started: asyncio.Queue[tuple[int, str, asyncio.Future[Any]]] = asyncio.Queue()
-        self._captures: list[str] = []
+        self._registration: ContextVar[_StartRegistration | None] = ContextVar(
+            "acp_start_registration", default=None
+        )
         self._abandoned: set[int] = set()
 
     def register_outgoing(self, request_id: int, method: str) -> asyncio.Future[Any]:
@@ -89,23 +98,32 @@ class StrictMessageStateStore:
             raise AcpProtocolError("Duplicate outgoing request ID")
         future = asyncio.get_running_loop().create_future()
         self._outgoing[request_id] = future
-        if self._captures and self._captures[0] == method:
-            self._captures.pop(0)
-            self._started.put_nowait((request_id, method, future))
+        registration = self._registration.get()
+        if (
+            registration is not None
+            and not registration.abandoned
+            and registration.method == method
+            and not registration.future.done()
+        ):
+            registration.future.set_result((request_id, future))
         return future
 
-    def prepare_start(self, method: str) -> None:
-        self._captures.append(method)
+    def prepare_start(self, method: str) -> tuple[_StartRegistration, Any]:
+        registration = _StartRegistration(
+            method, asyncio.get_running_loop().create_future()
+        )
+        return registration, self._registration.set(registration)
 
-    async def next_started(self, method: str) -> tuple[int, asyncio.Future[Any]]:
-        request_id, actual_method, future = await self._started.get()
-        if actual_method != method:
-            raise AcpProtocolError("Outgoing request start order mismatch")
-        return request_id, future
+    async def next_started(
+        self, registration: _StartRegistration
+    ) -> tuple[int, asyncio.Future[Any]]:
+        return await registration.future
 
-    def cancel_start(self, method: str) -> None:
-        if self._captures and self._captures[0] == method:
-            self._captures.pop(0)
+    def cancel_start(self, registration: _StartRegistration, token: Any) -> None:
+        registration.abandoned = True
+        self._registration.reset(token)
+        if not registration.future.done():
+            registration.future.cancel()
 
     def abandon_outgoing(self, request_id: int) -> None:
         future = self._outgoing.pop(request_id, None)
@@ -291,7 +309,8 @@ class PermissionCompletion:
 @runtime_checkable
 class AcpPeerCallbacks(Protocol):
     async def on_mcp_notification(
-        self, connection_id: str, method: str, params: dict[str, Any] | None
+        self, peer_generation: int, connection_id: str, method: str,
+        params: dict[str, Any] | None,
     ) -> None: ...
 
     async def on_transport_closed(self, peer_generation: int) -> None: ...
@@ -429,30 +448,29 @@ class AcpPeer:
     async def start_request(self, method: str, params: dict[str, Any]) -> AcpRequestHandle:
         if self._state_store is None:
             raise AcpProtocolError("Cancellable requests require the Mimir state store")
-        async with self._start_lock:
-            self._state_store.prepare_start(method)
-            task = asyncio.create_task(self._connection.send_request(method, params))
-            started = asyncio.create_task(self._state_store.next_started(method))
-            try:
-                done, _ = await asyncio.wait(
-                    {task, started}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if started in done:
-                    outer_id, _ = started.result()
-                else:
-                    self._state_store.cancel_start(method)
-                    started.cancel()
-                    try:
-                        await started
-                    except asyncio.CancelledError:
-                        pass
-                    task.result()
-                    raise AcpProtocolError("Outgoing request completed before registration")
-            except BaseException:
-                task.cancel()
-                started.cancel()
-                self._state_store.cancel_start(method)
-                raise
+        registration, token = self._state_store.prepare_start(method)
+        task = asyncio.create_task(self._connection.send_request(method, params))
+        started = asyncio.create_task(self._state_store.next_started(registration))
+        outer_id: int | None = None
+        try:
+            done, _ = await asyncio.wait(
+                {task, started}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if started in done:
+                outer_id, _ = started.result()
+            else:
+                task.result()
+                raise AcpProtocolError("Outgoing request completed before registration")
+        except BaseException:
+            if outer_id is None and registration.future.done() and not registration.future.cancelled():
+                outer_id, _ = registration.future.result()
+            if outer_id is not None:
+                self._state_store.abandon_outgoing(outer_id)
+            task.cancel()
+            started.cancel()
+            raise
+        finally:
+            self._state_store.cancel_start(registration, token)
         return AcpRequestHandle(outer_id, task, self._state_store)
 
     async def start_tool_permission(
@@ -626,7 +644,9 @@ class AcpPeer:
             return None
         callback = getattr(self._agent, "on_mcp_notification", None)
         if callback is not None:
-            await callback(message.connection_id, message.method, message.params)
+            await callback(
+                self.peer_generation, message.connection_id, message.method, message.params
+            )
         return None
 
 
