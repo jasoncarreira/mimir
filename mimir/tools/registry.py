@@ -2335,6 +2335,7 @@ def all_mimir_tools(
     from .extra import file_search, get_turn, mimir_get_turn, rebuild_index, shell_exec
     from .web import web_tools_enabled
     from .shell_async import bash_async, bash_job_output, bash_jobs_list
+    from .client_provider import HANDS_TOOLS
     from .saga_ops import (
         saga_end_session,
         saga_feedback,
@@ -2387,6 +2388,7 @@ def all_mimir_tools(
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,
+        *HANDS_TOOLS,
     ]
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
     if web_search_on or fetch_url_on:

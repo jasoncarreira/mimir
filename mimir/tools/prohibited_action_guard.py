@@ -47,6 +47,7 @@ _BASH_TOOL_NAMES: frozenset[str] = frozenset({
     "bash_exec",
     "execute",
     "aexecute",
+    "hands_shell",
     "mcp__mimir__shell_exec",
     "mcp__mimir__bash_async",
 })
