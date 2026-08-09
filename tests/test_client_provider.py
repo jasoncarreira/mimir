@@ -240,19 +240,46 @@ async def test_wrappers_route_through_current_turn_provider() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hands_read_central_authorization_allows_admitted_admin() -> None:
+@pytest.mark.parametrize(
+    ("path", "resource"),
+    [
+        ("notes.txt", "client-file:notes.txt"),
+        ("/tmp/a b", "client-file:%2Ftmp%2Fa%20b"),
+        ("client/../notes.txt", "client-file:client%2F..%2Fnotes.txt"),
+        ("é\\file", "client-file:%C3%A9%5Cfile"),
+    ],
+)
+async def test_hands_read_central_authorization_allows_admitted_admin(
+    path: str, resource: str
+) -> None:
     provider = FakeProvider({"read": {"content": "trusted route"}})
-
-    assert await _invoke_authorized_read(
-        provider, "client/../notes.txt", auth_context=_admin_auth()
-    ) == {"content": "trusted route"}
-    assert provider.calls == [("read", {"path": "client/../notes.txt"})]
+    token = set_turn_capability_context(_context(provider))
+    try:
+        authorization = get_tool_registry().authorize_tool(
+            "hands_read",
+            _admin_auth(),
+            enforce=True,
+            arguments={"path": path},
+        )
+        assert authorization.allowed is True
+        assert authorization.protected_source_resources == (resource,)
+        assert provider.calls == []
+        assert await hands_read.ainvoke({"path": path}) == {
+            "content": "trusted route"
+        }
+    finally:
+        reset_turn_capability_context(token)
+    assert provider.calls == [("read", {"path": path})]
 
 
 @pytest.mark.asyncio
 async def test_hands_read_central_authorization_denies_before_provider_dispatch() -> None:
     cases = [
         (None, MIMIR_HANDS_V1, "a"),
+        (replace(_admin_auth(), principal=None), MIMIR_HANDS_V1, "a"),
+        (replace(_admin_auth(), principal=""), MIMIR_HANDS_V1, "a"),
+        (replace(_admin_auth(), canonical_principal=None), MIMIR_HANDS_V1, "a"),
+        (replace(_admin_auth(), canonical_principal=""), MIMIR_HANDS_V1, "a"),
         (replace(_admin_auth(), roles=("user",)), MIMIR_HANDS_V1, "a"),
         (_admin_auth(), None, "a"),
         (_admin_auth(), replace(MIMIR_HANDS_V1, profile_id="other"), "a"),
