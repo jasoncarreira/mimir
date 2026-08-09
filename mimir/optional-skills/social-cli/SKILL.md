@@ -47,7 +47,7 @@ the platforms credentials are configured for.
 item, even when batched); cross-post between Bluesky and X without explicit
 `platforms: [bsky, x]`; manage Discord / Slack delivery (that's
 `send_message`). For deeper thread context past sync's `parentHeight=5`,
-the bundled `thread.py` script fetches up to 100 ancestors + replies on
+the bundled `scripts/thread.py` script fetches up to 100 ancestors + replies on
 demand — see "Fetching deeper thread context" below.
 
 ## The agent's loop
@@ -159,7 +159,7 @@ The poller surfaces notifications. The agent responds:
    bundled helper instead — it cds into the dir, loads `.env`, and
    runs dispatch in one shot:
    ```bash
-   skills/social-cli/dispatch-outbox.sh $STATE_DIR [bsky|x]
+   skills/social-cli/scripts/dispatch-outbox.sh $STATE_DIR [bsky|x]
    ```
    The platform arg is optional (omit to dispatch all configured
    platforms); it honors `SOCIAL_CLI_BIN`.
@@ -241,11 +241,11 @@ deep before anyone realizes. Concrete rule of thumb:
   cases here belong in `ignore` with a reason.
 
 For ancestors more than 5 deep, sync doesn't have them — fetch
-them explicitly via `thread.py` (next section).
+them explicitly via `scripts/thread.py` (next section).
 
 ### Fetching deeper thread context
 
-The bundled `thread.py` script wraps Bluesky's `getPostThread` XRPC
+The bundled `scripts/thread.py` script wraps Bluesky's `getPostThread` XRPC
 endpoint with the operator's existing credentials (no extra auth
 config). It walks up to 100 ancestors and 100 levels of replies on
 demand — call it when the visible 5-ancestor surface in the poller
@@ -254,13 +254,13 @@ original framing, sibling replies the agent missed, etc.).
 
 ```bash
 # Defaults: parent-height 20, depth 5, YAML output to stdout.
-python3 <home>/skills/social-cli/thread.py "at://did:plc:.../app.bsky.feed.post/abc"
+python3 <home>/skills/social-cli/scripts/thread.py "at://did:plc:.../app.bsky.feed.post/abc"
 
 # Walk further up and skip the reply tree entirely.
-python3 <home>/skills/social-cli/thread.py "<uri>" --parent-height 50 --depth 0
+python3 <home>/skills/social-cli/scripts/thread.py "<uri>" --parent-height 50 --depth 0
 
 # JSON when piping into another tool.
-python3 <home>/skills/social-cli/thread.py "<uri>" --json
+python3 <home>/skills/social-cli/scripts/thread.py "<uri>" --json
 ```
 
 Output shape:

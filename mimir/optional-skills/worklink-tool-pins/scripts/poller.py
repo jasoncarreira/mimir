@@ -2,7 +2,7 @@
 """Worklink tool-pin drift poller.
 
 This file is intentionally standalone: optional pollers are launched as
-``python3 poller.py`` in a scrubbed subprocess environment, not inside mimir's
+``python3 scripts/poller.py`` in a scrubbed subprocess environment, not inside mimir's
 venv/import path. Keep this script stdlib-only and do not import ``mimir.*``.
 
 Loads the ``tool_pins`` section from ``<home>/worklink.yaml``, inventories the

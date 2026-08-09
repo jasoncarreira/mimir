@@ -882,7 +882,8 @@ async def test_poller_turn_reads_its_server_bound_skill_without_boundary_denial(
     skill = home / "skills" / "social-cli"
     state.mkdir(parents=True)
     skill.mkdir(parents=True)
-    dispatch = skill / "dispatch-outbox.sh"
+    dispatch = skill / "scripts" / "dispatch-outbox.sh"
+    dispatch.parent.mkdir()
     dispatch.write_text("#!/bin/sh\necho dispatched\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     authority = build_trigger_service_principal(
@@ -903,7 +904,7 @@ async def test_poller_turn_reads_its_server_bound_skill_without_boundary_denial(
     )
     fake_agent = _ServiceMemoryReadProbeAgent(
         WriteGuardBackend(home, ["state", "skills"]),
-        "/skills/social-cli/dispatch-outbox.sh",
+        "/skills/social-cli/scripts/dispatch-outbox.sh",
     )
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
     agent._config.access_control_enforced = True

@@ -248,7 +248,7 @@ def _load_tool_pins_poller():
 
     poller_path = (
         Path(__file__).resolve().parent.parent
-        / "mimir" / "optional-skills" / "worklink-tool-pins" / "poller.py"
+        / "mimir" / "optional-skills" / "worklink-tool-pins" / "scripts" / "poller.py"
     )
     spec = importlib.util.spec_from_file_location("wtp_poller_under_test", poller_path)
     mod = importlib.util.module_from_spec(spec)

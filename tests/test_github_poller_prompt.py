@@ -17,13 +17,13 @@ import pytest
 
 _POLLER = (
     Path(__file__).resolve().parent.parent
-    / "mimir" / "optional-skills" / "github-poller" / "poller.py"
+    / "mimir" / "optional-skills" / "github-poller" / "scripts" / "poller.py"
 )
 
 
 @pytest.fixture(scope="module")
 def poller():
-    """Load the skill's poller.py the way production runs it: as a file."""
+    """Load the skill's scripts/poller.py the way production runs it."""
     spec = importlib.util.spec_from_file_location("github_poller_under_test", _POLLER)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

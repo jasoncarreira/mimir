@@ -461,9 +461,9 @@ def prompt_and_write_env(
 def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     """Run the installed poller script once and return ``(exit_code, snippet)``.
 
-    Tries ``<python> poller.py --once`` first; if the poller doesn't accept
-    ``--once``, retries without it. Returns ``(-1, 'no poller.py found')``
-    when the skill has no ``poller.py``.
+    Tries ``<python> scripts/poller.py --once`` first; if the poller doesn't
+    accept ``--once``, retries without it. Legacy third-party skills with a
+    root-level ``poller.py`` remain supported.
 
     Uses ``sys.executable`` (the interpreter mimir itself runs under) rather
     than a bare ``python3`` on PATH: the poller's deps live in mimir's
@@ -472,7 +472,9 @@ def run_smoke_test(dest: Path, env_path: Path | None = None) -> tuple[int, str]:
     that exits 126 ("no version set") when invoked from the skill's own
     directory (no ``.tool-versions`` there).
     """
-    poller = dest / "poller.py"
+    poller = dest / "scripts" / "poller.py"
+    if not poller.is_file():
+        poller = dest / "poller.py"
     if not poller.is_file():
         return -1, "no poller.py found"
 

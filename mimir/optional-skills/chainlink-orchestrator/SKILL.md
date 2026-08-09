@@ -119,7 +119,7 @@ silently with an unlabeled executable leaf.
 
 ## Ready-queue poller (slice 3 — autonomous dispatch)
 
-`pollers.json` + `poller.py` in this skill are the autonomous execution half.
+`pollers.json` + `scripts/poller.py` in this skill are the autonomous execution half.
 Once installed and configured (see frontmatter env), the scheduler runs the
 `worklink-ready-queue` poller on its cron (default every 10 min). Each fire:
 

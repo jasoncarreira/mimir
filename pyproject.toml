@@ -218,7 +218,7 @@ include = [
     "mimir/skills/**/*",
     # Opt-in poller / integration skills (chainlink #299). Moved under the
     # package so `mimir skills install` works on pip installs, not just
-    # source trees. Ships SKILL.md + poller.py + pollers.json + tests.
+    # source trees. Ships SKILL.md + scripts + pollers.json + tests.
     "mimir/optional-skills/**/*",
     "mimir/templates/**/*",
     "mimir/react_app/dist/**/*",

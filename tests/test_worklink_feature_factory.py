@@ -25,7 +25,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-_CHAINLINK_ORCHESTRATOR = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator"
+_CHAINLINK_ORCHESTRATOR = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator" / "scripts"
 if str(_CHAINLINK_ORCHESTRATOR) not in sys.path:
     sys.path.insert(0, str(_CHAINLINK_ORCHESTRATOR))
 

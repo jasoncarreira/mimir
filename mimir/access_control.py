@@ -31,7 +31,7 @@ import sys
 import threading
 from collections.abc import Callable
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -551,6 +551,42 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     }),
 }
 
+# Scheduler records may opt into these built-in profiles. Keeping this set
+# separate prevents a scheduler entry from selecting a profile whose trigger
+# semantics require additional manifest data (for example a poller profile).
+SCHEDULER_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+
+_BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
+    "heartbeat": {
+        "canonical": "heartbeat",
+        "trigger": "scheduled_tick",
+        "tier": CapabilityTier.UNBOUNDED,
+        "root_parts": ("state", "triggers", "heartbeat"),
+        "channel_memory_directory": "scheduler:heartbeat",
+        "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
+        "saga_full_corpus_read": False,
+    },
+    "session-boundary": {
+        "canonical": "synthesis",
+        "trigger": "saga_session_end",
+        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
+        "root_parts": None,
+        "channel_memory_directory": None,
+        "creation_path": "mimir.server._on_session_idle",
+        "saga_full_corpus_read": True,
+    },
+}
+
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
+    "github": "repo_review",
+    "heartbeat": "maintenance",
+}
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
+    "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
+    "github": ("github_pr_api", "GITHUB_REPOS"),
+}
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+
 _CAPABILITY_TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -632,18 +668,16 @@ def build_trigger_service_principal(
                 json.dumps([str(root) for root in write_roots]),
             ))
         elif operation in {"shell_exec", "bash_async"}:
-            shell_profile = (
-                "repo_review" if profile == "github"
-                else "maintenance" if profile == "heartbeat"
-                else "scheduler_read_only"
+            shell_profile = _SHELL_PROFILE_BY_AUTHORITY_PROFILE.get(
+                profile, "scheduler_read_only",
             )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
         elif operation == "worklink_run":
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
-        elif operation == "fetch_url" and profile == "heartbeat":
-            policies.append(ServiceSinkPolicy(operation, "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"))
-        elif operation == "fetch_url" and profile == "github":
-            policies.append(ServiceSinkPolicy(operation, "github_pr_api", "GITHUB_REPOS"))
+        elif operation == "fetch_url":
+            fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
+            if fetch_policy is not None:
+                policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
         policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
     return ServicePrincipal(
@@ -673,31 +707,55 @@ def build_trigger_service_principal(
     )
 
 
-def builtin_trigger_service_principal(profile: str, home: Path) -> ServicePrincipal:
+def builtin_trigger_service_principal(
+    profile: str, home: Path, *, scheduler_job_name: str | None = None,
+) -> ServicePrincipal:
     """Return the authoritative built-in grant; manifests cannot replace it."""
-    if profile == "heartbeat":
-        root = (home / "state" / "triggers" / "heartbeat").resolve()
-        return build_trigger_service_principal(
-            canonical="heartbeat",
-            trigger="scheduled_tick",
-            profile=profile,
-            tier=CapabilityTier.UNBOUNDED,
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
-            roots=(root,),
-            channel_memory_directory="scheduler:heartbeat",
-            creation_path="mimir.scheduler.Scheduler._fire:heartbeat",
-        )
-    if profile == "session-boundary":
-        return build_trigger_service_principal(
-            canonical="synthesis",
-            trigger="saga_session_end",
-            profile=profile,
-            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
-            creation_path="mimir.server._on_session_idle",
-            saga_full_corpus_read=True,
-        )
-    raise ValueError(f"unknown built-in authority profile: {profile!r}")
+    config = _BUILTIN_TRIGGER_PROFILE_CONFIG.get(profile)
+    if config is None:
+        raise ValueError(f"unknown built-in authority profile: {profile!r}")
+    root_parts = config["root_parts"]
+    roots: tuple[Path, ...] = ()
+    if root_parts is not None:
+        root = home.joinpath(*root_parts).resolve()
+        if scheduler_job_name is not None:
+            root.mkdir(parents=True, exist_ok=True)
+        roots = (root,)
+    channel_memory_directory = config["channel_memory_directory"]
+    if scheduler_job_name is not None:
+        channel_memory_directory = f"scheduler:{scheduler_job_name}"
+    return build_trigger_service_principal(
+        canonical=config["canonical"],
+        trigger=config["trigger"],
+        profile=profile,
+        tier=config["tier"],
+        capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+        roots=roots,
+        channel_memory_directory=channel_memory_directory,
+        creation_path=config["creation_path"],
+        saga_full_corpus_read=config["saga_full_corpus_read"],
+    )
+
+
+def build_scheduled_tick_service_principal(
+    job_name: str, home: Path | None,
+) -> ServicePrincipal | None:
+    """Bind the shared scheduled-tick authority to one scheduler job's reads."""
+    base = get_service_principal("scheduled_tick")
+    if base is None:
+        return None
+    script_roots = (
+        (str((home / "scripts").resolve()),) if home is not None else ()
+    )
+    return replace(
+        base,
+        filesystem_read_roots=tuple(dict.fromkeys((
+            *base.filesystem_read_roots,
+            *script_roots,
+        ))),
+        channel_memory_directory=f"scheduler:{job_name}",
+        creation_path="mimir.scheduler.Scheduler._fire:scheduled_tick",
+    )
 
 
 def _configured_file_roots() -> list[Path]:
@@ -1697,10 +1755,8 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
     """Directories the agent can write through its file tools.
 
     Read from ``Config.folders`` so this tracks the real write guard rather than
-    a second copy of the list. A declared script must lie outside all of these --
-    note ``skills`` is ``rw``, so a script bundled inside a skill is correctly
-    refused, while ``<home>/scripts/`` is not a configured folder at all and is
-    therefore already unwritable.
+    a second copy of the list. Path-specific restrictions inside those roots are
+    applied by ``_agent_writable_root_for_path``.
     """
     root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
     if not str(root) or str(root) == ".":
@@ -1744,6 +1800,44 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
         if resolved_extra not in roots:
             roots.append(resolved_extra)
     return tuple(roots)
+
+
+def _agent_writable_root_for_path(
+    path: Path | str,
+    writable_roots: tuple[Path, ...],
+    *,
+    trusted_operator_turn: bool,
+) -> Path | None:
+    """Return the root through which this turn may rewrite *path*, if any.
+
+    Skill prose and package data remain autonomously writable. Executable skill
+    code is different: only the existing trusted-operator ingress predicate may
+    make ``skills/<skill>/scripts/**`` writable.
+    """
+    try:
+        candidate = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    matching: list[tuple[Path, Path]] = []
+    for raw_root in writable_roots:
+        try:
+            root = Path(raw_root).resolve()
+        except (OSError, RuntimeError):
+            continue
+        try:
+            matching.append((root, candidate.relative_to(root)))
+        except ValueError:
+            continue
+    if not matching:
+        return None
+    if any(
+        root.name == "skills"
+        and len(relative.parts) >= 2
+        and relative.parts[1] == "scripts"
+        for root, relative in matching
+    ) and not trusted_operator_turn:
+        return None
+    return max((root for root, _relative in matching), key=lambda root: len(root.parts))
 
 
 def parse_declared_shell_commands(
@@ -1794,13 +1888,15 @@ def parse_declared_shell_commands(
             raise _declaration_error(name, f"path is not a regular file: {raw_path}")
         if not os.access(path, os.X_OK):
             raise _declaration_error(name, f"path is not executable: {raw_path}")
-        for root in resolved_writable:
-            if path == root or path.is_relative_to(root):
-                raise _declaration_error(
-                    name,
-                    f"path {raw_path} is inside the agent-writable root {root}; "
-                    "an executable the agent can replace is arbitrary code execution",
-                )
+        writable_root = _agent_writable_root_for_path(
+            path, resolved_writable, trusted_operator_turn=False,
+        )
+        if writable_root is not None:
+            raise _declaration_error(
+                name,
+                f"path {raw_path} is inside the agent-writable root {writable_root}; "
+                "an executable the agent can replace is arbitrary code execution",
+            )
 
         options_raw = entry.get("options") or []
         if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
@@ -1843,13 +1939,15 @@ def parse_declared_shell_commands(
             resolved = script.resolve()
             if not resolved.exists():
                 raise _declaration_error(name, f"script does not exist: {raw_script}")
-            for root in resolved_writable:
-                if resolved == root or resolved.is_relative_to(root):
-                    raise _declaration_error(
-                        name,
-                        f"script {raw_script} is inside the agent-writable root {root}; "
-                        "a script the agent can rewrite is arbitrary code execution",
-                    )
+            writable_root = _agent_writable_root_for_path(
+                resolved, resolved_writable, trusted_operator_turn=False,
+            )
+            if writable_root is not None:
+                raise _declaration_error(
+                    name,
+                    f"script {raw_script} is inside the agent-writable root {writable_root}; "
+                    "a script the agent can rewrite is arbitrary code execution",
+                )
             script = resolved
         if is_interpreter and script is None:
             raise _declaration_error(
@@ -5725,6 +5823,56 @@ class WriteResourceAdapter:
         return not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
+    def authorize_skill_script_write(
+        cls,
+        tool_name: str,
+        target: str | None,
+        auth_context: "AuthContext | None",
+        ifc_labels: Any,
+        *,
+        enforce: bool,
+    ) -> ToolAuthorization | None:
+        """Apply the trusted-operator boundary to executable skill code."""
+        if tool_name not in cls._WRITE_OPERATIONS or not isinstance(target, str):
+            return None
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not home:
+            return None
+        roots = agent_writable_roots(home)
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = Path(home).resolve() / candidate
+        writable_for_operator = _agent_writable_root_for_path(
+            candidate, roots, trusted_operator_turn=True,
+        )
+        autonomously_writable = _agent_writable_root_for_path(
+            candidate, roots, trusted_operator_turn=False,
+        )
+        if writable_for_operator is None or autonomously_writable is not None:
+            return None
+
+        trusted_operator_turn = SinkGate._is_trusted_operator_turn(
+            ifc_labels, auth_context,
+        )
+        reason = None if trusted_operator_turn else "skill_script_write_requires_trusted_operator"
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=trusted_operator_turn,
+            reason=reason,
+            required_tier=AccessTier.USER if trusted_operator_turn else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=False,
+            would_block=not trusted_operator_turn,
+            resolved_sink_target=normalize_sink_destination(SinkCategory.FILE, target),
+            refusal_detail=(
+                None
+                if trusted_operator_turn
+                else "writes to skills/<skill>/scripts require a trusted operator turn"
+            ),
+        )
+
+    @classmethod
     def authorize_operation(
         cls,
         tool_name: str,
@@ -6726,6 +6874,16 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
+        skill_script_write = WriteResourceAdapter.authorize_skill_script_write(
+            tool_name,
+            target_channel,
+            auth_context,
+            ifc_labels,
+            enforce=enforce,
+        )
+        if skill_script_write is not None:
+            skill_script_write.flow_direction = flow_direction
+            return skill_script_write
         catalog = get_operation_catalog()
         preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (
@@ -8477,7 +8635,7 @@ def create_auth_context(
         isinstance(carried_scope, RepoPRActionScope)
         and carried_scope.provenance == "server_discovered"
         and registered_service is not None
-        and registered_service.authority_profile == "heartbeat"
+        and registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
         and event.trigger == "scheduled_tick"
         and event.service_principal == registered_service.canonical
         and event_ingress is None

@@ -2,7 +2,7 @@
   "pollers": [
     {
       "name": "social-cli-notifications",
-      "command": "python3 poller.py",
+      "command": "python3 scripts/poller.py",
       "cron": "*/15 * * * *",
       "batch_size": 3,
       "authority": {
@@ -22,7 +22,7 @@
     },
     {
       "name": "social-cli-feed",
-      "command": "python3 feed_poller.py",
+      "command": "python3 scripts/feed_poller.py",
       "cron": "0 */2 * * *",
       "batch_size": 10,
       "authority": {

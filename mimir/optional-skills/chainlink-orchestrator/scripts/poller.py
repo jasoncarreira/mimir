@@ -69,7 +69,7 @@ def _ensure_mimir_import_path() -> None:
     # package on that same revision even if MIMIR_SOURCE_DIR points at another
     # checkout. Installed copies fail the __init__.py probe and fall through.
     script_path = globals().get("__file__")
-    candidates = [Path(script_path).resolve().parents[3]] if script_path else []
+    candidates = [Path(script_path).resolve().parents[4]] if script_path else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
