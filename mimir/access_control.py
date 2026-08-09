@@ -1697,10 +1697,8 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
     """Directories the agent can write through its file tools.
 
     Read from ``Config.folders`` so this tracks the real write guard rather than
-    a second copy of the list. A declared script must lie outside all of these --
-    note ``skills`` is ``rw``, so a script bundled inside a skill is correctly
-    refused, while ``<home>/scripts/`` is not a configured folder at all and is
-    therefore already unwritable.
+    a second copy of the list. Path-specific restrictions inside those roots are
+    applied by ``_agent_writable_root_for_path``.
     """
     root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
     if not str(root) or str(root) == ".":
@@ -1744,6 +1742,44 @@ def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
         if resolved_extra not in roots:
             roots.append(resolved_extra)
     return tuple(roots)
+
+
+def _agent_writable_root_for_path(
+    path: Path | str,
+    writable_roots: tuple[Path, ...],
+    *,
+    trusted_operator_turn: bool,
+) -> Path | None:
+    """Return the root through which this turn may rewrite *path*, if any.
+
+    Skill prose and package data remain autonomously writable. Executable skill
+    code is different: only the existing trusted-operator ingress predicate may
+    make ``skills/<skill>/scripts/**`` writable.
+    """
+    try:
+        candidate = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    matching: list[tuple[Path, Path]] = []
+    for raw_root in writable_roots:
+        try:
+            root = Path(raw_root).resolve()
+        except (OSError, RuntimeError):
+            continue
+        try:
+            matching.append((root, candidate.relative_to(root)))
+        except ValueError:
+            continue
+    if not matching:
+        return None
+    if any(
+        root.name == "skills"
+        and len(relative.parts) >= 2
+        and relative.parts[1] == "scripts"
+        for root, relative in matching
+    ) and not trusted_operator_turn:
+        return None
+    return max((root for root, _relative in matching), key=lambda root: len(root.parts))
 
 
 def parse_declared_shell_commands(
@@ -1794,13 +1830,15 @@ def parse_declared_shell_commands(
             raise _declaration_error(name, f"path is not a regular file: {raw_path}")
         if not os.access(path, os.X_OK):
             raise _declaration_error(name, f"path is not executable: {raw_path}")
-        for root in resolved_writable:
-            if path == root or path.is_relative_to(root):
-                raise _declaration_error(
-                    name,
-                    f"path {raw_path} is inside the agent-writable root {root}; "
-                    "an executable the agent can replace is arbitrary code execution",
-                )
+        writable_root = _agent_writable_root_for_path(
+            path, resolved_writable, trusted_operator_turn=False,
+        )
+        if writable_root is not None:
+            raise _declaration_error(
+                name,
+                f"path {raw_path} is inside the agent-writable root {writable_root}; "
+                "an executable the agent can replace is arbitrary code execution",
+            )
 
         options_raw = entry.get("options") or []
         if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
@@ -1843,13 +1881,15 @@ def parse_declared_shell_commands(
             resolved = script.resolve()
             if not resolved.exists():
                 raise _declaration_error(name, f"script does not exist: {raw_script}")
-            for root in resolved_writable:
-                if resolved == root or resolved.is_relative_to(root):
-                    raise _declaration_error(
-                        name,
-                        f"script {raw_script} is inside the agent-writable root {root}; "
-                        "a script the agent can rewrite is arbitrary code execution",
-                    )
+            writable_root = _agent_writable_root_for_path(
+                resolved, resolved_writable, trusted_operator_turn=False,
+            )
+            if writable_root is not None:
+                raise _declaration_error(
+                    name,
+                    f"script {raw_script} is inside the agent-writable root {writable_root}; "
+                    "a script the agent can rewrite is arbitrary code execution",
+                )
             script = resolved
         if is_interpreter and script is None:
             raise _declaration_error(
@@ -5725,6 +5765,56 @@ class WriteResourceAdapter:
         return not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
+    def authorize_skill_script_write(
+        cls,
+        tool_name: str,
+        target: str | None,
+        auth_context: "AuthContext | None",
+        ifc_labels: Any,
+        *,
+        enforce: bool,
+    ) -> ToolAuthorization | None:
+        """Apply the trusted-operator boundary to executable skill code."""
+        if tool_name not in cls._WRITE_OPERATIONS or not isinstance(target, str):
+            return None
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not home:
+            return None
+        roots = agent_writable_roots(home)
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            candidate = Path(home).resolve() / candidate
+        writable_for_operator = _agent_writable_root_for_path(
+            candidate, roots, trusted_operator_turn=True,
+        )
+        autonomously_writable = _agent_writable_root_for_path(
+            candidate, roots, trusted_operator_turn=False,
+        )
+        if writable_for_operator is None or autonomously_writable is not None:
+            return None
+
+        trusted_operator_turn = SinkGate._is_trusted_operator_turn(
+            ifc_labels, auth_context,
+        )
+        reason = None if trusted_operator_turn else "skill_script_write_requires_trusted_operator"
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=trusted_operator_turn,
+            reason=reason,
+            required_tier=AccessTier.USER if trusted_operator_turn else AccessTier.ADMIN,
+            enforcement_enabled=enforce,
+            is_shadow_decision=False,
+            would_block=not trusted_operator_turn,
+            resolved_sink_target=normalize_sink_destination(SinkCategory.FILE, target),
+            refusal_detail=(
+                None
+                if trusted_operator_turn
+                else "writes to skills/<skill>/scripts require a trusted operator turn"
+            ),
+        )
+
+    @classmethod
     def authorize_operation(
         cls,
         tool_name: str,
@@ -6726,6 +6816,16 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
+        skill_script_write = WriteResourceAdapter.authorize_skill_script_write(
+            tool_name,
+            target_channel,
+            auth_context,
+            ifc_labels,
+            enforce=enforce,
+        )
+        if skill_script_write is not None:
+            skill_script_write.flow_direction = flow_direction
+            return skill_script_write
         catalog = get_operation_catalog()
         preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (
