@@ -78,9 +78,13 @@ def _run(command: str, factory_input: str, bindir: Path) -> subprocess.Completed
     )
 
 
-def test_declaration_is_valid_json_with_the_four_expected_keys() -> None:
+def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     data = json.loads(DECLARATION.read_text())
-    assert set(data) == {"resolve", "verify", "publish", "publishing_identity"}
+    # Exact, not a subset: an unrecognized key here means the factory would either refuse the
+    # declaration outright or act on something nobody reviewed. `bootstrap` joined the set when
+    # this repository opted in to feature-factory #248, so a sandbox installs its dependencies
+    # before any gate instead of discovering they are absent.
+    assert set(data) == {"resolve", "verify", "publish", "publishing_identity", "bootstrap"}
     # The declaration must not carry a credential; it may only reference the
     # environment the factory already inherits.
     blob = DECLARATION.read_text()
