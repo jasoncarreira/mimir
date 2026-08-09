@@ -59,7 +59,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
+STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "emitted.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "social-cli-notifications")
 

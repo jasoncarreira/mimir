@@ -1,7 +1,7 @@
 """Every optional-skill poller must start the way production starts it.
 
-``pollers.json`` launches these as ``python3 poller.py`` — a subprocess whose
-``sys.path[0]`` is the INSTALLED skill directory (``<home>/skills/<name>``), run
+``pollers.json`` launches these as ``python3 scripts/<entrypoint>.py`` — a
+subprocess whose ``sys.path[0]`` is the INSTALLED skill's scripts directory, run
 by whatever ``python3`` is on PATH rather than the mimir venv interpreter.
 ``PYTHONPATH`` cannot rescue it: that variable sits in ``mimir/pollers.py``'s
 ``_PROCESS_CONTROL_ENV_DENY`` and is deliberately withheld from poller
@@ -22,19 +22,20 @@ Two things make this test actually test that, both learned by being wrong:
    the repair deleted. Worthless, caught by mutation.
 2. **The poller must run from an INSTALLED COPY, not the source tree.** A second
    version ran each poller from ``mimir/optional-skills/<name>/``, where the
-   helper's script-relative ``Path(__file__).parents[3]`` candidate resolves to
+    helper's script-relative ``Path(__file__).parents[4]`` candidate resolves to
    the repo root and always succeeds. Deleting the ``MIMIR_SOURCE_DIR`` and
    ``/workspace/mimir`` candidates left the suite fully green, so the test
    asserted nothing about deployment portability. Found in review of #1233 by
    mutation, not by the test.
 
 Copying the skill to a temp directory reproduces the installed shape: no
-``parents[3]`` shortcut, so the deployment locators are the only way through.
+the source-checkout shortcut, so the deployment locators are the only way through.
 """
 
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -44,11 +45,26 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SKILL_ROOT = _ROOT / "mimir" / "optional-skills"
-_SKILLS = sorted(p for p in _SKILL_ROOT.iterdir() if (p / "poller.py").is_file())
+
+
+def _entrypoints() -> list[tuple[Path, Path]]:
+    entries: list[tuple[Path, Path]] = []
+    for manifest in sorted(_SKILL_ROOT.glob("*/pollers.json")):
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        for poller in data.get("pollers") or []:
+            scripts = [Path(token) for token in shlex.split(poller["command"]) if token.endswith(".py")]
+            assert len(scripts) == 1, f"{manifest}: cannot identify Python entrypoint"
+            entries.append((manifest.parent, scripts[0]))
+    return entries
+
+
+_ENTRYPOINTS = _entrypoints()
 
 _IMPORT_SHIM = (
-    "import importlib.util, sys\n"
-    "spec = importlib.util.spec_from_file_location('poller_under_test', 'poller.py')\n"
+    "import importlib.util, os, sys\n"
+    "entrypoint = os.environ['ENTRYPOINT']\n"
+    "sys.path.insert(0, os.path.dirname(entrypoint))\n"
+    "spec = importlib.util.spec_from_file_location('poller_under_test', entrypoint)\n"
     "mod = importlib.util.module_from_spec(spec)\n"
     "try:\n"
     "    spec.loader.exec_module(mod)\n"
@@ -93,8 +109,14 @@ def _manifest_pass_env(skill: Path) -> set[str]:
     return names
 
 
-@pytest.mark.parametrize("skill", _SKILLS, ids=lambda p: p.name)
-def test_installed_poller_entrypoint_can_resolve_mimir(skill: Path, tmp_path: Path):
+@pytest.mark.parametrize(
+    ("skill", "entrypoint"),
+    _ENTRYPOINTS,
+    ids=lambda value: value.name if isinstance(value, Path) else str(value),
+)
+def test_installed_poller_entrypoint_can_resolve_mimir(
+    skill: Path, entrypoint: Path, tmp_path: Path,
+):
     interpreter = _interpreter_without_mimir()
     if interpreter is None:
         pytest.fail(
@@ -104,18 +126,23 @@ def test_installed_poller_entrypoint_can_resolve_mimir(skill: Path, tmp_path: Pa
         )
 
     # Reproduce the installed shape: <tmp>/skills/<name>/, far from the checkout,
-    # so the helper's script-relative parents[3] candidate cannot resolve.
+    # so the helper's script-relative source-checkout candidate cannot resolve.
     installed = tmp_path / "skills" / skill.name
     shutil.copytree(skill, installed)
     assert not (installed.parents[2] / "mimir" / "__init__.py").is_file(), (
-        "the temp install must not sit beside a checkout, or parents[3] would "
+        "the temp install must not sit beside a checkout, or the script-relative path would "
         "resolve and this test would go back to proving nothing"
     )
 
     # Only manifest-declared env, exactly as the runner passes it. MIMIR_SOURCE_DIR
     # reaches the subprocess only if the skill's own pollers.json declares it — which
     # is the portability half of this check.
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "STATE_DIR": str(installed)}
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "STATE_DIR": str(installed),
+        "ENTRYPOINT": str(entrypoint),
+    }
     declared = _manifest_pass_env(skill)
     if "MIMIR_SOURCE_DIR" in declared:
         env["MIMIR_SOURCE_DIR"] = str(_ROOT)

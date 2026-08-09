@@ -29,7 +29,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent))
+STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 SEEN_FILE = STATE_DIR / "seen_run_ids.json"
 POLLER_NAME = "github-ci-watch"
 

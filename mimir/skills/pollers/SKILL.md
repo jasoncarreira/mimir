@@ -84,7 +84,7 @@ Plus any literal env vars from the `env` field, plus any pass-throughs declared 
 
 **Why STATE_DIR is separate from the skill dir**: skills are deployable artifacts (resettable via `seed_skills`, image-shippable, optionally reset on container rebuild). Cursor files are persistent runtime data — losing them means re-emitting the entire backlog of "events since cursor=0" on next run, which for a github-poller would be every PR comment in every watched repo. Mimir's filing rules separate these — skills under `skills/`, runtime state under `state/`.
 
-**Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python poller.py 'arg with spaces'"` not `"python poller.py arg with spaces"`.
+**Command parsing (`pollers.json` `command` field)**: parsed by `/bin/sh -c` via `asyncio.create_subprocess_shell`. Shell features (env-var expansion `$FOO`, pipes, redirection) are available — and you're responsible for quoting args containing whitespace or shell metacharacters: `"python scripts/poller.py 'arg with spaces'"` not `"python scripts/poller.py arg with spaces"`.
 
 **Output contract:**
 - **stdout:** JSONL (one JSON object per line). Two record shapes:
@@ -165,7 +165,7 @@ if __name__ == "__main__":
   "pollers": [
     {
       "name": "my-service-check",
-      "command": "python poller.py",
+      "command": "python scripts/poller.py",
       "cron": "*/5 * * * *",
       "authority": {
         "profile": "research",
@@ -270,7 +270,8 @@ Removing a skill: delete the directory under `<home>/skills/` and call `reload_p
 skills/my-monitor/
 ├── SKILL.md
 ├── pollers.json        ← declares pollers
-├── poller.py           ← the script
+├── scripts/
+│   └── poller.py       ← the script
 ├── cursor.json         ← poller state (managed by script)
 └── events.jsonl        ← optional local event log
 ```
@@ -308,7 +309,7 @@ See [security.md](security.md) for guidance on:
 If a poller isn't working:
 
 1. **Check it was discovered:** `reload_pollers` reports the count and names
-2. **Run it manually:** `cd skills/my-monitor && STATE_DIR=. POLLER_NAME=test python poller.py`
+2. **Run it manually:** `cd skills/my-monitor && STATE_DIR=. POLLER_NAME=test python scripts/poller.py`
 3. **Check stderr:** Poller stderr is logged as `poller_stderr` events
 4. **Check exit code:** Non-zero exits are logged as `poller_nonzero_exit`
 5. **Check JSON format:** Each stdout line must be valid JSON with at least a `prompt` key

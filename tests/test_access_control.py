@@ -586,8 +586,9 @@ def test_poller_read_scope_is_limited_to_its_server_bound_skill(
     other_skill.mkdir(parents=True)
     skill_md = own_skill / "SKILL.md"
     manifest = own_skill / "pollers.json"
-    script = own_skill / "dispatch-outbox.sh"
+    script = own_skill / "scripts" / "dispatch-outbox.sh"
     secret = own_skill / "runtime-notes.txt"
+    script.parent.mkdir()
     for path, content in (
         (skill_md, "# Social CLI\n"),
         (manifest, '{"pollers": [{"name": "social-cli-feed"}]}\n'),

@@ -183,7 +183,7 @@ jobs:
 
       - name: Run optional-skills tests (per-skill, isolated)
         # Each optional skill under mimir/optional-skills/ ships its own
-        # poller.py + tests/conftest.py. Run together they collide
+        # scripts/poller.py + tests/conftest.py. Run together they collide
         # (ImportPathMismatchError on the shared ``tests.conftest`` module
         # name, plus duplicate ``poller`` modules), which is why the main
         # suite excludes them. Run each skill's tests in its OWN pytest
