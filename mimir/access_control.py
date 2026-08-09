@@ -388,6 +388,10 @@ class ServicePrincipal:
     creation_path: str | None = None
     authority_profile: str | None = None
     capability_tier: CapabilityTier | None = None
+    #: Per-job shell grants, additive on top of the profile's allowlist. Declared
+    #: in scheduler.yaml or a poller manifest -- neither of which any service
+    #: principal can write -- and validated into this shape before it lands here.
+    declared_shell_commands: tuple["DeclaredShellCommand", ...] = ()
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -566,6 +570,7 @@ def build_trigger_service_principal(
     owned_skill_directory: Path | None = None,
     saga_full_corpus_read: bool = False,
     channel_memory_directory: str | None = None,
+    declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -664,6 +669,7 @@ def build_trigger_service_principal(
         creation_path=creation_path,
         authority_profile=profile,
         capability_tier=tier,
+        declared_shell_commands=declared_shell_commands,
     )
 
 
@@ -1638,6 +1644,310 @@ def _chainlink_target_argv(target: str | None) -> list[str] | None:
     return argv if _target_matches_chainlink_command(argv) else None
 
 
+#: Refused even when quoted. A newline inside a command string is never a
+#: legitimate argument value, and ``repo_review`` deliberately routes multi-line
+#: review bodies through ``--body-file`` rather than inline ``--body``.
+_REFUSED_INSIDE_ANY_QUOTE = frozenset("\n\r")
+
+#: Single quotes make every character literal, but double quotes do NOT: a shell
+#: still performs ``$(...)`` and backtick substitution inside them. Treating
+#: ``"$(cat /etc/passwd)"`` as a literal because it is quoted would be wrong.
+_EXPANDS_INSIDE_DOUBLE_QUOTES = frozenset("$`")
+
+
+#: Executables that can take code from argv or stdin. They may only be declared
+#: with a pinned ``script``, and never with an option that sources code inline --
+#: otherwise a grant to "run one script" is a grant to run anything.
+_INTERPRETER_EXECUTABLES = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun",
+    "php", "lua", "Rscript", "awk", "gawk", "env", "xargs", "eval",
+})
+
+#: Options that make an interpreter read code from argv or stdin. Refused on any
+#: declaration, interpreter or not: no admitted command needs them, and one of
+#: them turns a pinned executable back into an arbitrary one.
+_CODE_FROM_ARGV_OPTIONS = frozenset({"-c", "-e", "-m", "--command", "--eval", "-"})
+
+
+@dataclass(frozen=True)
+class DeclaredShellCommand:
+    """One operator-declared command a scheduled job or poller may run.
+
+    Declared where the job itself is defined -- ``scheduler.yaml`` or a poller
+    manifest -- so mimir needs no built-in catalogue of every CLI a deployment
+    might install. What stays in code is the SHAPE: an absolute pinned path, a
+    non-empty subcommand table (so a bare binary is inexpressible, because
+    ``gog gmail search`` and ``gog gmail send`` are the same binary), an option
+    allowlist, and the interpreter rule.
+    """
+
+    executable: str
+    path: Path
+    subcommands: tuple[tuple[str, ...], ...] = ()
+    options: tuple[str, ...] = ()
+    script: Path | None = None
+
+
+def _declaration_error(name: str, detail: str) -> ValueError:
+    return ValueError(f"shell_commands[{name!r}]: {detail}")
+
+
+def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
+    """Directories the agent can write through its file tools.
+
+    Read from ``Config.folders`` so this tracks the real write guard rather than
+    a second copy of the list. A declared script must lie outside all of these --
+    note ``skills`` is ``rw``, so a script bundled inside a skill is correctly
+    refused, while ``<home>/scripts/`` is not a configured folder at all and is
+    therefore already unwritable.
+    """
+    root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
+    if not str(root) or str(root) == ".":
+        return ()
+    root = root.resolve()
+    try:
+        from .config import Config
+
+        names = Config.from_env().writable_dirs
+    except Exception:  # noqa: BLE001 - fall back to the shipped default
+        from .config import DEFAULT_FOLDERS
+
+        names = [name for name, mode in DEFAULT_FOLDERS.items() if mode == "rw"]
+    roots: list[Path] = []
+    for name in names:
+        candidate = (root / name)
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    # Home folders are not the whole write surface: MIMIR_FILE_TOOL_ROOTS adds
+    # ``path:rw`` routes (and the default /tmp route), and configured repos can
+    # be rw. A declaration under any of them is agent-writable just the same.
+    #
+    # ``_configured_file_write_roots()`` leads with MIMIR_HOME itself -- it is the
+    # backend's write SINK root, not a statement that everything under home is
+    # writable. Unioning it whole classified the entire home as writable, which
+    # made the documented operator-owned ``<home>/scripts/`` undeclarable and
+    # silently negated the per-folder calculation above. Only the external routes
+    # are real write surface; ``Config.folders`` already decides what inside home
+    # is writable, and it lists neither ``scripts`` nor ``prompts`` as rw.
+    external = [
+        candidate for candidate in _configured_file_write_roots()
+        if candidate.resolve() != root
+    ]
+    for extra in (*external, *_configured_repo_write_roots()):
+        try:
+            resolved_extra = Path(extra).resolve()
+        except OSError:
+            continue
+        if resolved_extra not in roots:
+            roots.append(resolved_extra)
+    return tuple(roots)
+
+
+def parse_declared_shell_commands(
+    raw: object, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple[DeclaredShellCommand, ...]:
+    """Validate declared shell grants, or raise ``ValueError``.
+
+    ``writable_roots`` are the directories the agent can write through its file
+    tools (``Config.writable_dirs``). A declared script must lie outside all of
+    them: the danger of an interpreter is *arbitrary* code, not code, so a script
+    the running agent cannot modify is equivalent to a binary the operator
+    installed. Resolution follows symlinks before the check, or a link inside a
+    writable root would launder the path.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("shell_commands must be a list")
+    resolved_writable = tuple(Path(root).resolve() for root in writable_roots)
+    out: list[DeclaredShellCommand] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("each shell_commands entry must be a mapping")
+        name = entry.get("exec")
+        if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
+            raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
+        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script"}
+        if unknown:
+            raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise _declaration_error(name, "path is required")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
+        if not path.exists():
+            # Fail at load, matching the existing scoped-root precedent: a grant
+            # naming a binary that is not installed is a config error, and
+            # deferring it surfaces later as an unexplained refusal.
+            raise _declaration_error(name, f"path does not exist: {raw_path}")
+        # The EXECUTABLE gets the same immutability rule as a script. Without
+        # this, declaring a CLI under an agent-writable location lets the agent
+        # replace the binary and run anything through an admitted command shape,
+        # which would make every other check here decorative.
+        path = path.resolve()
+        if not path.is_file():
+            raise _declaration_error(name, f"path is not a regular file: {raw_path}")
+        if not os.access(path, os.X_OK):
+            raise _declaration_error(name, f"path is not executable: {raw_path}")
+        for root in resolved_writable:
+            if path == root or path.is_relative_to(root):
+                raise _declaration_error(
+                    name,
+                    f"path {raw_path} is inside the agent-writable root {root}; "
+                    "an executable the agent can replace is arbitrary code execution",
+                )
+
+        options_raw = entry.get("options") or []
+        if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
+            raise _declaration_error(name, "options must be a list of strings")
+        for option in options_raw:
+            if not option.startswith("-"):
+                raise _declaration_error(name, f"option must start with '-': {option!r}")
+            if option in _CODE_FROM_ARGV_OPTIONS:
+                raise _declaration_error(
+                    name,
+                    f"{option!r} sources code from argv or stdin and is never admitted",
+                )
+
+        subcommands_raw = entry.get("subcommands") or []
+        if not isinstance(subcommands_raw, list):
+            raise _declaration_error(name, "subcommands must be a list of lists")
+        subcommands: list[tuple[str, ...]] = []
+        for item in subcommands_raw:
+            if not isinstance(item, list) or not item or not all(isinstance(s, str) for s in item):
+                raise _declaration_error(name, "each subcommand must be a non-empty list of strings")
+            subcommands.append(tuple(item))
+
+        raw_script = entry.get("script")
+        script: Path | None = None
+        # Classified on the RESOLVED binary as well as the declared name: the
+        # two need not match, so ``exec: gog`` with ``path: /usr/bin/python3``
+        # would otherwise present as a non-interpreter and skip the pinned-script
+        # rule entirely. Either name being an interpreter is enough.
+        is_interpreter = (
+            name in _INTERPRETER_EXECUTABLES
+            or path.name in _INTERPRETER_EXECUTABLES
+            or path.name.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+        )
+        if raw_script is not None:
+            if not isinstance(raw_script, str) or not raw_script:
+                raise _declaration_error(name, "script must be a non-empty string")
+            script = Path(raw_script)
+            if not script.is_absolute():
+                raise _declaration_error(name, f"script must be absolute, got {raw_script!r}")
+            resolved = script.resolve()
+            if not resolved.exists():
+                raise _declaration_error(name, f"script does not exist: {raw_script}")
+            for root in resolved_writable:
+                if resolved == root or resolved.is_relative_to(root):
+                    raise _declaration_error(
+                        name,
+                        f"script {raw_script} is inside the agent-writable root {root}; "
+                        "a script the agent can rewrite is arbitrary code execution",
+                    )
+            script = resolved
+        if is_interpreter and script is None:
+            raise _declaration_error(
+                name, "an interpreter may only be declared with a pinned 'script'",
+            )
+        if script is None and not subcommands:
+            raise _declaration_error(
+                name, "declare at least one subcommand, or a script for an interpreter",
+            )
+        out.append(DeclaredShellCommand(
+            executable=name,
+            path=path,
+            subcommands=tuple(subcommands),
+            options=tuple(options_raw),
+            script=script,
+        ))
+    return tuple(out)
+
+
+def _declared_command_execution_argv(
+    argv: list[str], declared: tuple[DeclaredShellCommand, ...],
+) -> list[str] | None:
+    """Return the pinned argv when *argv* matches a declaration, else ``None``."""
+    if not argv or not declared:
+        return None
+    for command in declared:
+        if argv[0] != command.executable:
+            continue
+        arguments = argv[1:]
+        if command.script is not None:
+            if not arguments or Path(arguments[0]).resolve() != command.script:
+                continue
+            arguments = arguments[1:]
+        elif not any(
+            tuple(arguments[:len(prefix)]) == prefix for prefix in command.subcommands
+        ):
+            continue
+        if not _arguments_match_allowlist(
+            arguments,
+            exact_options=frozenset(command.options),
+            option_prefixes=tuple(f"{o}=" for o in command.options if o.startswith("--")),
+        ):
+            continue
+        rest = argv[1:]
+        if command.script is not None:
+            rest = [str(command.script), *rest[1:]]
+        return [str(command.path), *rest]
+    return None
+
+
+def _unquoted_shell_control_characters(target: str) -> list[str]:
+    """Return the metacharacters appearing OUTSIDE quotes in *target*, sorted.
+
+    Quoting is what separates an operator from a value. ``grep -r '<<<<<<<'``
+    searches for a conflict marker; nothing redirects. Scanning the raw string
+    treated the two alike, so a turn whose job was finding merge conflicts in a
+    workspace it had just written could not search for conflict markers -- 60 of
+    190 service-shell refusals measured on muninn, 2026-08-03..06.
+
+    Unquoted metacharacters are still refused, so a real pipe, redirection or
+    command separator is rejected exactly as before. The admitted argv is exec'd
+    with ``shell=False``, so a quoted metacharacter reaches the process as one
+    literal argument and is never parsed by anything.
+    """
+    found: set[str] = set()
+    quote: str | None = None
+    escaped = False
+    for character in target:
+        # Checked FIRST, ahead of escape consumption: a backslash-newline
+        # continuation would otherwise be swallowed by the ``escaped`` branch and
+        # ``shlex.split`` would carry the newline into an argv element, which is
+        # exactly the inline multi-line value this rule exists to refuse.
+        if character in _REFUSED_INSIDE_ANY_QUOTE:
+            found.add(character)
+            escaped = False
+            continue
+        if escaped:
+            escaped = False
+            continue
+        # A backslash escapes the next character everywhere except inside single
+        # quotes, where POSIX shells pass it through literally.
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character in _EXPANDS_INSIDE_DOUBLE_QUOTES:
+                found.add(character)
+            continue
+        if character in ("'", '"'):
+            quote = character
+            continue
+        if character in _SHELL_CONTROL_CHARACTERS:
+            found.add(character)
+    return sorted(found)
+
+
 def _arguments_match_allowlist(
     arguments: list[str],
     *,
@@ -1699,7 +2009,7 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
         return _arguments_match_allowlist(
             arguments,
             exact_options=frozenset({
-                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-s",
+                "-E", "-F", "-H", "-h", "-i", "-l", "-n", "-q", "-r", "-s",
                 "-v", "-w", "-x", "--extended-regexp", "--fixed-strings",
                 "--files-with-matches", "--ignore-case", "--line-number",
                 "--no-messages", "--quiet", "--recursive", "--invert-match",
@@ -2438,6 +2748,14 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "jq": Path("/usr/bin/jq"),
     "rg": Path("/usr/bin/rg"),
     "chainlink": Path("/usr/local/bin/chainlink"),
+    # Read-only inspection. Admitted because the shipped scheduled-tick prompts
+    # already reach for them and had no admitted equivalent: 59 of 190 service
+    # shell refusals measured on muninn over 2026-08-03..06 were these five.
+    "cat": Path("/usr/bin/cat"),
+    "head": Path("/usr/bin/head"),
+    "tail": Path("/usr/bin/tail"),
+    "stat": Path("/usr/bin/stat"),
+    "date": Path("/usr/bin/date"),
 }
 _MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
 _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
@@ -2535,7 +2853,7 @@ def _maintenance_git_filter_overrides(
 
 
 def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
-    """Return whether arguments after ``git -C <root>`` are admitted."""
+    """Return whether arguments after Git's global options are admitted."""
     if not arguments:
         return False
     subcommand = arguments[0]
@@ -2560,33 +2878,98 @@ def _maintenance_git_subcommand_allowed(arguments: list[str]) -> bool:
                 ),
             )
         )
-    if subcommand == "branch":
-        return subcommand_arguments == ["--show-current"]
-    if subcommand not in {"diff", "log", "show"}:
-        return False
-    # ``-<digits>`` is Git's bounded max-count shorthand used by the
-    # maintenance prompts (for example ``git log --oneline -5``).
-    arguments_without_count_shorthand = [
-        argument
-        for argument in subcommand_arguments
-        if not (subcommand == "log" and argument.startswith("-") and argument[1:].isdigit())
-    ]
-    return (
-        "--" not in subcommand_arguments
-        and _arguments_match_allowlist(
-            arguments_without_count_shorthand,
+    if subcommand == "log":
+        # ``-<digits>`` is Git's bounded max-count shorthand used by the
+        # maintenance prompts (for example ``git log --oneline -5``).
+        arguments_without_count_shorthand = [
+            argument
+            for argument in subcommand_arguments
+            if not (argument.startswith("-") and argument[1:].isdigit())
+        ]
+        return (
+            "--" not in subcommand_arguments
+            and _arguments_match_allowlist(
+                arguments_without_count_shorthand,
+                exact_options=frozenset({
+                    "-p", "--abbrev-commit", "--all", "--cached", "--check",
+                    "--decorate", "--exit-code", "--full-index", "--grep",
+                    "--name-only", "--name-status", "--no-color", "--no-ext-diff",
+                    "--no-merges", "--no-patch", "--no-textconv", "--oneline",
+                    "--quiet", "--raw", "--staged", "--stat",
+                }),
+                option_prefixes=(
+                    "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                    "--until=",
+                ),
+            )
+        )
+    if subcommand == "diff":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
             exact_options=frozenset({
                 "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
                 "--exit-code", "--full-index", "--grep", "--name-only",
-                "--name-status", "--no-color", "--no-merges", "--no-patch",
-                "--no-ext-diff", "--no-textconv", "--oneline", "--quiet",
-                "--raw", "--stat", "--staged",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
             }),
             option_prefixes=(
-                "-U", "--grep=", "--max-count=", "--since=", "--until=", "--unified=",
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
             ),
         )
-    )
+    if subcommand == "show":
+        return "--" not in subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset({
+                "-p", "--abbrev-commit", "--cached", "--check", "--decorate",
+                "--exit-code", "--full-index", "--grep", "--name-only",
+                "--name-status", "--no-color", "--no-ext-diff", "--no-merges",
+                "--no-patch", "--no-textconv", "--oneline", "--quiet", "--raw",
+                "--staged", "--stat",
+            }),
+            option_prefixes=(
+                "-U", "--grep=", "--max-count=", "--since=", "--unified=",
+                "--until=",
+            ),
+        )
+    if subcommand == "rev-parse":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "branch":
+        listing_options = frozenset({
+            "-a", "-r", "--all", "--list", "--remotes", "--show-current",
+        })
+        return (
+            any(argument in listing_options for argument in subcommand_arguments)
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=listing_options,
+            )
+        )
+    if subcommand == "cat-file":
+        return (
+            len(subcommand_arguments) == 2
+            and subcommand_arguments[0] == "-s"
+            and not subcommand_arguments[1].startswith("-")
+            and _arguments_match_allowlist(
+                subcommand_arguments,
+                exact_options=frozenset({"-s"}),
+            )
+        )
+    if subcommand == "ls-tree":
+        return bool(subcommand_arguments) and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    if subcommand == "ls-files":
+        return not subcommand_arguments and _arguments_match_allowlist(
+            subcommand_arguments,
+            exact_options=frozenset(),
+        )
+    return False
 
 
 def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
@@ -2604,14 +2987,14 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     if pinned_git is None:
         return None
 
-    # The authorized command must name its repository in argv. Relying on the
-    # service process cwd would leave the actual target outside the audited
-    # authorization artifact.
-    arguments = argv[1:]
-    if arguments[:1] != ["-C"] or len(arguments) < 3 or arguments[1].startswith("-"):
-        return None
-    requested_root = arguments[1]
-    arguments = arguments[2:]
+    arguments = _git_arguments_without_restrictive_global_options(argv[1:])
+    requested_root: str | None = None
+    if arguments[:1] == ["-C"]:
+        if len(arguments) < 3 or arguments[1].startswith("-"):
+            return None
+        requested_root = arguments[1]
+        arguments = arguments[2:]
+    arguments = _git_arguments_without_restrictive_global_options(arguments)
 
     from ._paths import PathOutsideHomeError, resolve_within_roots
 
@@ -2771,6 +3154,38 @@ def _target_matches_maintenance_shell_command(argv: list[str]) -> bool:
 
     if argv[0] == "git":
         return _maintenance_git_execution_argv(argv) is not None
+
+    # File inspection. This widens which commands may READ, not what is
+    # readable: ``grep`` and ``rg`` are already admitted and reach the same
+    # bytes. Per-command option allowlists, so nothing here can mutate --
+    # note ``date`` admits no ``-s``/``--set``, which would set the clock.
+    if argv[0] == "cat":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({
+                "-n", "--number", "-s", "--squeeze-blank", "-E", "--show-ends",
+            }),
+        )
+    if argv[0] in {"head", "tail"}:
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({"-q", "-v", "--quiet", "--verbose"}),
+            option_prefixes=("-n", "-c", "--lines=", "--bytes="),
+        )
+    if argv[0] == "stat":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({"-t", "--terse", "-L", "--dereference"}),
+            option_prefixes=("-c", "--format=", "--printf="),
+        )
+    if argv[0] == "date":
+        return _arguments_match_allowlist(
+            argv[1:],
+            exact_options=frozenset({
+                "-u", "--utc", "-R", "--rfc-email", "-I", "--iso-8601",
+            }),
+            option_prefixes=("-d", "--date=", "--iso-8601=", "--rfc-3339="),
+        )
 
     if argv[0] == "gh" and len(argv) >= 3 and argv[1] in {"pr", "issue"}:
         resource = argv[1]
@@ -2994,6 +3409,7 @@ class ServiceShellBindingRule(StrEnum):
     REPOSITORY_REVIEW_STATE = "repository_review_state"
     REVIEW_BODY_CAPTURE = "review_body_capture"
     UNKNOWN_PROFILE = "unknown_profile"
+    DECLARED_COMMAND_MISMATCH = "declared_command_mismatch"
 
 
 def service_shell_argv_for_log(target: str) -> tuple[list[str], bool]:
@@ -3217,6 +3633,7 @@ def _service_shell_not_admitted_reason(argv: list[str], destination: str) -> str
 
 def parse_service_shell_argv_with_diagnostics(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
     """Return the admitted argv, refusal reason, and stable rejecting rule.
 
@@ -3235,7 +3652,7 @@ def parse_service_shell_argv_with_diagnostics(
     service command can carry a credential (``git -c http.extraheader=...``) and
     this text is returned to the model and recorded in the turn transcript.
     """
-    found = sorted(set(target) & _SHELL_CONTROL_CHARACTERS)
+    found = _unquoted_shell_control_characters(target)
     if found:
         rendered = ", ".join(repr(character) for character in found)
         try:
@@ -3279,6 +3696,16 @@ def parse_service_shell_argv_with_diagnostics(
                 ServiceShellBindingRule.PROJECT_TEST_POLICY,
             )
         return test_argv, "", None
+
+    # Consulted BEFORE the profile dispatch, not after it. Several branches
+    # (repo_review, and the per-profile ``git`` handlers) return on mismatch, so
+    # a check placed after them was reachable for some profiles and not others --
+    # a GitHub poller could never have used a declared CLI. Union semantics are
+    # what "additive" was meant to say; order here only decides which gate speaks
+    # first, and an explicit per-job grant is the more specific statement.
+    declared_argv = _declared_command_execution_argv(argv, declared)
+    if declared_argv is not None:
+        return declared_argv, "", None
 
     allowed = False
     if destination == "scheduler_read_only":
@@ -3350,7 +3777,12 @@ def parse_service_shell_argv_with_diagnostics(
         return (
             None,
             _service_shell_not_admitted_reason(argv, destination),
-            ServiceShellBindingRule.PROFILE_ALLOWLIST,
+            # Distinguish "this job declared commands and none matched" from
+            # "the profile refused it" so a denial event says which gate spoke.
+            # ``destination`` keeps meaning the profile, so existing shadow-authz
+            # classification is unaffected.
+            ServiceShellBindingRule.DECLARED_COMMAND_MISMATCH if declared
+            else ServiceShellBindingRule.PROFILE_ALLOWLIST,
         )
     pinned, reason = _maintenance_pinned_execution_argv_with_reason(argv)
     return (
@@ -3362,20 +3794,22 @@ def parse_service_shell_argv_with_diagnostics(
 
 def parse_service_shell_argv_with_reason(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> tuple[list[str] | None, str]:
     """Compatibility view returning only the admitted argv and refusal prose."""
     argv, reason, _rule = parse_service_shell_argv_with_diagnostics(
-        target, destination, review_state=review_state,
+        target, destination, review_state=review_state, declared=declared,
     )
     return argv, reason
 
 
 def parse_service_shell_argv(
     target: str, destination: str, *, review_state: Any = None,
+    declared: tuple["DeclaredShellCommand", ...] = (),
 ) -> list[str] | None:
     """Argv-only view of :func:`parse_service_shell_argv_with_reason`."""
     return parse_service_shell_argv_with_reason(
-        target, destination, review_state=review_state,
+        target, destination, review_state=review_state, declared=declared,
     )[0]
 
 
@@ -3924,6 +4358,31 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     return adapter is not None and adapter(normalized, policy.destination)
 
 
+def _sink_adapter_admits(
+    adapter: Any,
+    target: str,
+    destination: str,
+    service: "ServicePrincipal | None" = None,
+    *,
+    review_state: Any = None,
+) -> bool:
+    """Invoke a sink adapter, handing the shell adapter the principal's grants.
+
+    The adapter registry is ``(target, destination) -> bool`` and deliberately
+    knows nothing about principals. Declared shell commands are per-principal, so
+    the shell adapter -- and only it -- is called through the parser directly
+    rather than through that narrow signature. Every other adapter is unchanged.
+    """
+    if adapter is None:
+        return False
+    if adapter is _target_matches_shell_profile:
+        return parse_service_shell_argv(
+            target, destination, review_state=review_state,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        ) is not None
+    return bool(adapter(target, destination))
+
+
 _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "configured_file_roots": _target_within_configured_write_roots,
     "configured_repo_write_roots": _target_within_configured_repo_write_roots,
@@ -4451,7 +4910,9 @@ class SinkGate:
                 adapter = _SERVICE_SINK_ADAPTERS.get(candidate.adapter)
                 triggering = getattr(auth_context, "channel_id", None)
                 if target != triggering:
-                    if adapter is None or not adapter(target, candidate.destination):
+                    if not _sink_adapter_admits(
+                        adapter, target, candidate.destination, service,
+                    ):
                         return ToolAuthorization(
                             tool_name=tool_name,
                             decision=OperationDecision.ADMIN_REQUIRED,
@@ -4520,8 +4981,9 @@ class SinkGate:
                         ) is not None
                     )
                 else:
-                    service_target_allowed = adapter(
-                        target, service_policy.destination,
+                    service_target_allowed = _sink_adapter_admits(
+                        adapter, target, service_policy.destination, service,
+                        review_state=review_state,
                     )
             if (
                 not service_target_allowed
@@ -4933,7 +5395,10 @@ def resolve_sink_target(
         return None
     policy = service.sink_policy_for(tool_name) if service is not None else None
     if policy is not None and policy.adapter == "shell_profile":
-        execution_argv = parse_service_shell_argv(target, policy.destination)
+        execution_argv = parse_service_shell_argv(
+            target, policy.destination,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
         if execution_argv is not None:
             argv = execution_argv
     return json.dumps(argv, ensure_ascii=True) if argv else None

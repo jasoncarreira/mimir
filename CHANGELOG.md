@@ -7,7 +7,66 @@ All notable changes will land here. Format loosely follows
 ## [Unreleased]
 
 ### Changed
-- Version bumped to 0.7.3 for the next release.
+- Version bumped to 0.7.4 for the next release.
+
+## [0.7.4] — 2026-08-07
+
+### Added
+- Per-job shell command grants. A scheduled job or poller declares the commands
+  it needs, in `scheduler.yaml` or its poller manifest, additively on top of its
+  shell profile — so teaching one job about a deployment's own CLI no longer
+  requires a mimir release, and no longer widens a profile every other job on the
+  box shares. mimir ships no catalogue of tools; what lives in code is the shape a
+  declaration must take: an absolute pinned path outside every agent-writable
+  root, a non-empty subcommand table (a bare binary is inexpressible, because
+  `gog gmail search` and `gog gmail send` are one executable), an option
+  allowlist, and interpreters only with a pinned script the agent cannot rewrite.
+  (#1402)
+- `cat`, `head`, `tail`, `stat` and `date` under the `maintenance` shell profile,
+  each with its own option allowlist and pin. These are 44 of 190 service-shell
+  refusals measured on a live deployment, 20 of them on the hourly heartbeat —
+  which binds a built-in principal that cannot carry per-job declarations.
+  `date` admits no `-s`/`--set` and `tail` no `-f`/`--follow`. (#1403)
+
+### Fixed
+- A scheduled job with a malformed but *falsey* `shell_commands` value no longer
+  fires without its declaration. `Scheduler._fire` branched on truthiness, so
+  `shell_commands: {}` or `shell_commands: ""` stored cleanly, skipped validation
+  entirely, and the job ran with no grants and no error — a job that looks
+  configured and is not. Those shapes now reach validation and stop the job the
+  same way a bad path does; an explicit empty list remains valid and means
+  "declare nothing". (#1406)
+- The `maintenance` git allowlist now covers what the shipped scheduled-tick
+  prompts actually run. 49 of 190 service-shell refusals measured on a live
+  deployment were `git` — the largest single command bucket — and nearly all were
+  the upgrade-reconciliation turn unable to inspect the proposal workspace it had
+  just built. `log --all`, `diff --no-ext-diff`, `rev-parse`, `branch -a`,
+  `cat-file`, `ls-tree`, `ls-files` and `show` are admitted, each through its own
+  option allowlist; every mutation stays refused, `branch -D` and `--force`
+  included. (#1405)
+- A quoted metacharacter is a value, not a shell operator. The service-shell rule
+  scanned the raw command string, so `grep -r '<<<<<<<' <path>` — a search for a
+  merge conflict marker — was refused as a redirection, and a conflict-scanning
+  turn could not search for conflict markers. Detection now follows the shell's
+  own quoting rules: unquoted operators still refused, single-quoted characters
+  literal, `$`/`` ` `` still refused inside double quotes, and CR/LF refused
+  under any quoting. (#1401)
+- A time-truncated directory walk always visits at least one entry. The deadline
+  was checked before the first visit, so a tight budget produced a truncated
+  result having visited nothing — an operator log line reading "cut short after 0
+  entries", and a bound that raced process scheduling rather than the size of the
+  tree. It failed roughly 1 run in 6 under CPU contention and cost a build
+  attempt. (#1398)
+
+### Changed
+- The feature-factory control plane and run sandboxes are gitignored. Their
+  absence made the factory's own per-merge verify refuse to run — the integration
+  worktree was never clean — so runs produced PRs whose slices were never
+  verified by the gate that exists to verify them. (#1400)
+- `AGENTS.md`/`CLAUDE.md` record the conventions an automated contributor needs:
+  run both the scoped and full suites, don't assert on ambient state you don't
+  own, and resolve a dependency's source from an import rather than a path guess.
+  (#1394, #1397)
 
 ## [0.7.3] — 2026-08-04
 

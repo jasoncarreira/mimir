@@ -24,6 +24,7 @@ but back-to-back ticks of the same job serialize naturally.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -45,7 +46,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
-from .access_control import builtin_trigger_service_principal
+from .access_control import (
+    agent_writable_roots,
+    builtin_trigger_service_principal,
+    get_service_principal,
+    parse_declared_shell_commands,
+)
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event
 from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
@@ -215,9 +221,18 @@ class SchedulerJob:
     # window, and the whole interval is silently skipped (chainlink #468).
     # Mirrors the per-job grace _CallableDef already carries; per-entry override.
     misfire_grace_time: int = 3600
+    #: Raw ``shell_commands`` from scheduler.yaml, validated at fire time into
+    #: this job's own service principal. Declared beside the cron and the prompt
+    #: because that is where the job already is, and scheduler.yaml is not
+    #: writable by any service principal.
+    shell_commands: Any = None
 
     def to_yaml_entry(self) -> dict[str, Any]:
         out: dict[str, Any] = {"name": self.name}
+        # Emitted, or any scheduler mutation that rewrites the file (adding a
+        # job, changing a priority) silently strips this job's grants.
+        if self.shell_commands:
+            out["shell_commands"] = self.shell_commands
         if self.prompt:
             out["prompt"] = self.prompt
         if self.prompt_file:
@@ -329,6 +344,7 @@ class SchedulerJob:
             deliver=deliver,
             priority=priority,
             misfire_grace_time=misfire_grace_time,
+            shell_commands=raw.get("shell_commands"),
         )
 
 
@@ -970,6 +986,49 @@ class Scheduler:
             heartbeat_root.mkdir(parents=True, exist_ok=True)
             authority = builtin_trigger_service_principal("heartbeat", self._home)
             service_principal = authority.canonical
+        elif job.shell_commands is not None:
+            # ``is not None``, not truthiness. A malformed FALSEY value --
+            # ``shell_commands: {}`` or ``: ""`` -- would otherwise skip
+            # validation entirely and the job would fire with no declaration and
+            # no error. Silent misconfiguration is the failure mode this feature
+            # exists to prevent, so a shape that cannot be parsed must stop the
+            # job the same way a bad path does.
+            # Attach the declaration to the authority this job ALREADY has.
+            # Rebuilding from TRIGGER_AUTHORITY_PROFILES["heartbeat"] would let
+            # declaring one shell command silently grant send_message, fetch_url
+            # and the typed repo/PR mutation tools, while dropping capabilities
+            # the scheduled-tick principal carries -- a declaration must add the
+            # declared argv and nothing else.
+            #
+            # A bad declaration disables the job rather than downgrading it to
+            # the undeclared principal: it would otherwise fail every command it
+            # was configured to run, with the reason nowhere near the cause.
+            base = get_service_principal("scheduled_tick")
+            if base is None:
+                log.error(
+                    "scheduler %r: no scheduled_tick authority to extend; job not fired",
+                    job.name,
+                )
+                return
+            try:
+                declared = parse_declared_shell_commands(
+                    job.shell_commands,
+                    writable_roots=agent_writable_roots(self._home),
+                )
+            except ValueError as exc:
+                log.error(
+                    "scheduler %r: shell_commands rejected — %s; job not fired",
+                    job.name, exc,
+                )
+                return
+            if declared:
+                authority = dataclasses.replace(
+                    base, declared_shell_commands=declared,
+                )
+                service_principal = authority.canonical
+            # An explicit empty list parses cleanly and means "declare nothing".
+            # Fall through to the shared principal rather than building a
+            # per-job one that grants no more than the profile already does.
         event = AgentEvent(
             trigger="scheduled_tick",
             channel_id=_scheduler_channel_id(job.name, job.channel_id),

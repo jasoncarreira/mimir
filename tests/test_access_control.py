@@ -2812,8 +2812,11 @@ def test_compound_command_refusal_says_what_to_do_instead() -> None:
             "typed repo_test tool",
         ),
         (
+            # Single-quoted, so nothing here is an operator; the refusal comes
+            # from the allowlist -- ``python`` is not admitted at all. Same
+            # denial, same guidance, more accurate attribution.
             "python -c 'import json; print(json.dumps({}))'",
-            access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS,
+            access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST,
             "no general typed equivalent",
         ),
         (
@@ -2880,28 +2883,6 @@ def test_repo_review_npm_install_refusal_names_missing_typed_equivalent(
     assert "no typed equivalent" in reason
 
 
-@pytest.mark.parametrize(
-    ("command", "example"),
-    [
-        ("git status --short", "git -C <dir> status --short"),
-        ("git log --since=24.hours", "git -C <dir> log --oneline"),
-    ],
-)
-def test_maintenance_git_missing_only_c_stays_refused_with_required_form(
-    command: str,
-    example: str,
-) -> None:
-    """A valid maintenance Git shape still binds its repository in argv."""
-    argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
-        command, "maintenance",
-    )
-
-    assert argv is None
-    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
-    assert "repository must be named in argv with -C" in reason
-    assert example in reason
-
-
 def test_maintenance_git_guidance_does_not_misdiagnose_other_refusals() -> None:
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         "git status --verbose", "maintenance",
@@ -2931,7 +2912,12 @@ def test_maintenance_inline_python_with_shell_syntax_keeps_guidance() -> None:
     )
 
     assert argv is None
-    assert rule is access_control.ServiceShellBindingRule.SHELL_CONTROL_CHARACTERS
+    # Attributed to the allowlist rather than the metacharacter rule: the ``;``
+    # here sits inside quotes and is a literal, and ``python3`` is refused for
+    # not being admitted at all -- which holds for ``python3 script.py`` too,
+    # with no metacharacter anywhere. The guidance the agent acts on, asserted
+    # below, is unchanged.
+    assert rule is access_control.ServiceShellBindingRule.PROFILE_ALLOWLIST
     assert "arbitrary code execution and remains denied" in reason
     assert "no general typed equivalent" in reason
 
@@ -7451,7 +7437,7 @@ def test_maintenance_shell_fails_loudly_when_pinned_executable_is_invalid(
     assert str(expected) in caplog.text
 
 
-def test_maintenance_git_denies_bare_commands(
+def test_maintenance_git_bare_commands_use_default_root(
     maintenance_git_home: Path,
 ) -> None:
     for command in (
@@ -7459,7 +7445,65 @@ def test_maintenance_git_denies_bare_commands(
         "git log --oneline -5",
         "git diff --stat HEAD~1",
     ):
-        assert parse_service_shell_argv(command, "maintenance") is None
+        argv = parse_service_shell_argv(command, "maintenance")
+        assert argv is not None, command
+        assert argv[1:3] == ["-C", str(maintenance_git_home.resolve())]
+
+
+def test_maintenance_git_admits_observed_upgrade_inspection_argv(
+    maintenance_git_home: Path,
+) -> None:
+    proposal = (
+        maintenance_git_home / "scratch" / "proposals" / "upgrade"
+        / "upgrade_defaults-0-7-0-20260806"
+    )
+    proposal.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(proposal)], check=True)
+    oid = "a" * 40
+
+    commands = (
+        f"git -C {proposal} log --all --oneline -10",
+        f"git -C {proposal} diff --no-ext-diff --stat",
+        f"git -C {proposal} --no-pager log --oneline -10",
+        f"git -C {proposal} --no-ext-diff diff --stat",
+        f"git --no-pager -C {proposal} log --oneline -10",
+        f"git --no-ext-diff -C {proposal} diff --stat",
+        f"git -C {proposal} rev-parse HEAD",
+        f"git -C {proposal} branch -a",
+        f"git -C {proposal} cat-file -s {oid}",
+        f"git -C {proposal} ls-tree HEAD",
+        f"git -C {proposal} ls-files",
+    )
+
+    for command in commands:
+        argv = parse_service_shell_argv(command, "maintenance")
+        assert argv is not None, command
+        assert argv[1:3] == ["-C", str(proposal.resolve())]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "add memory/core.md",
+        "commit -m changed",
+        "push origin HEAD",
+        "reset --hard HEAD~1",
+        "checkout main",
+        "clean -fd",
+        "branch -d old",
+        "branch -D old",
+        "branch -m old new",
+        "branch -M old new",
+        "branch --force old HEAD",
+    ],
+)
+def test_maintenance_git_keeps_mutations_refused_with_explicit_root(
+    arguments: str,
+    maintenance_git_home: Path,
+) -> None:
+    command = f"git -C {maintenance_git_home} {arguments}"
+
+    assert parse_service_shell_argv(command, "maintenance") is None, command
 
 
 @pytest.mark.parametrize(
@@ -7697,6 +7741,193 @@ def test_maintenance_shell_profile_preserves_shared_argv_guards(command: str) ->
     import mimir.access_control as access_control
 
     assert access_control.parse_service_shell_argv(command, "maintenance") is None
+
+
+def test_quoted_metacharacter_is_a_value_not_an_operator() -> None:
+    """A conflict-scanning turn must be able to search for conflict markers.
+
+    ``<`` inside quotes is a literal. The rule scanned the raw command string,
+    so this was refused as a redirection and the turn could not do the one
+    thing it existed to do.
+    """
+    import mimir.access_control as access_control
+
+    argv = access_control.parse_service_shell_argv(
+        "grep -r '<<<<<<<' /mimir-home/scratch", "maintenance",
+    )
+    assert argv is not None
+    assert "<<<<<<<" in argv
+
+
+def test_quoted_separator_cannot_chain_a_second_command() -> None:
+    """Admitting quoted metacharacters must not admit command chaining.
+
+    The quoted ``;`` survives as ONE argv element -- a literal search pattern --
+    and the argv is exec'd with ``shell=False``, so nothing parses it as a
+    separator. Asserting the element boundary is the point: were the value ever
+    handed back to a shell, this would be two commands.
+    """
+    import mimir.access_control as access_control
+
+    argv = access_control.parse_service_shell_argv(
+        "grep -r 'a;rm -rf /' /mimir-home/scratch", "maintenance",
+    )
+    assert argv is not None
+    assert "a;rm -rf /" in argv
+    assert "rm" not in argv
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /mimir-home/state/x.md | wc -l",
+        "grep -r x /tmp > /tmp/out",
+        "grep -r x /tmp && rm -rf /",
+        "ls /mimir-home; cat /etc/passwd",
+        "grep -r x /tmp 2>&1",
+        "grep -r $(whoami) /tmp",
+    ],
+)
+def test_unquoted_operators_are_still_refused(command: str) -> None:
+    """The widening is quoting-scoped: an operator outside quotes is unchanged."""
+    import mimir.access_control as access_control
+
+    assert access_control.parse_service_shell_argv(command, "maintenance") is None
+
+
+def test_newline_is_refused_even_inside_quotes() -> None:
+    """Multi-line values go through ``--body-file``, never inline argv.
+
+    A newline inside a command string is not a legitimate argument value, so
+    quoting must not launder it. ``repo_review`` relies on this: it admits
+    ``--body-file`` beneath the scratch root precisely so bodies do not travel
+    in argv.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters('gh pr review --body "a\nb"') == ["\n"]
+    assert access_control.parse_service_shell_argv(
+        'gh pr review 7 --repo o/r --approve --body "a\nb"', "repo_review",
+    ) is None
+
+
+def test_backslash_newline_cannot_launder_a_newline_into_argv() -> None:
+    """A line continuation must not bypass the unconditional CR/LF refusal.
+
+    The escape branch used to run first, so a backslash immediately followed by
+    a newline was consumed as "escaped" and never tested. ``shlex.split`` then
+    preserved the newline inside the argv element -- an inline multi-line value,
+    which is the thing ``--body-file`` exists to prevent. Checked both outside
+    quotes and inside double quotes, since the escape branch is active in both.
+    """
+    import shlex
+
+    import mimir.access_control as access_control
+
+    for raw in (
+        'gh pr review 7 --repo o/r --approve --body "a\\\nb"',
+        "gh pr review 7 --repo o/r --approve --body a\\\nb",
+        "gh pr review 7 --repo o/r --approve --body \'a\\\nb\'",
+    ):
+        assert access_control._unquoted_shell_control_characters(raw) == ["\n"], raw
+        # The scan must catch it rather than relying on a later profile check:
+        # shlex would otherwise hand a newline-bearing element to the caller.
+        assert any("\n" in token for token in shlex.split(raw)), raw
+        assert access_control.parse_service_shell_argv(raw, "repo_review") is None, raw
+
+
+def test_carriage_return_is_refused_through_an_escape_too() -> None:
+    """Same ordering bug, same fix, for the other line terminator."""
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters(
+        'gh pr review --body "a\\\rb"',
+    ) == ["\r"]
+
+
+def test_double_quotes_do_not_make_substitution_literal() -> None:
+    """Single quotes make everything literal; double quotes do not.
+
+    A shell still performs ``$(...)`` and backtick substitution inside double
+    quotes, so treating a double-quoted value as inert would be wrong even
+    though this argv is exec'd with ``shell=False``.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters('x "$(cat /etc/passwd)"') == ["$"]
+    assert access_control._unquoted_shell_control_characters("x '$(cat /etc/passwd)'") == []
+    assert access_control._unquoted_shell_control_characters('x "`id`"') == ["`"]
+
+
+def test_escaped_quote_does_not_end_the_quoted_span() -> None:
+    """A backslash-escaped quote must not be read as closing the span.
+
+    Otherwise the scanner would fall back to treating the rest of the command as
+    unquoted and refuse metacharacters that are still inside the value.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._unquoted_shell_control_characters(r'grep "a\"b" x') == []
+    assert access_control._unquoted_shell_control_characters("grep a | b") == ["|"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Verbatim from muninn's denial records, 2026-08-03..06.
+        ["cat", "/mimir-home/.mimir/last-booted-version"],
+        ["stat", "-c", "%y", "/mimir-home/memory/core/40-learned-behaviors.md"],
+        ["date"],
+        ["date", "-u"],
+        ["head", "-n", "50", "/mimir-home/state/heartbeat-backlog.md"],
+        ["tail", "-n", "20", "/mimir-home/logs/events.jsonl"],
+        ["stat", "--printf=%n", "/mimir-home/state/today.md"],
+    ],
+)
+def test_maintenance_admits_read_only_inspection(argv: list[str]) -> None:
+    """These are 59 of 190 service-shell refusals measured on muninn.
+
+    Widening WHICH commands may read, not what is readable: ``grep`` and ``rg``
+    are already admitted under this profile and reach the same bytes. Both
+    heartbeats need them, and a heartbeat cannot carry a per-job declaration.
+    """
+    import mimir.access_control as access_control
+
+    assert access_control._target_matches_maintenance_shell_command(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["date", "-s", "2020-01-01"],          # sets the clock
+        ["date", "--set", "2020-01-01"],
+        ["tail", "-f", "/mimir-home/logs/events.jsonl"],  # never returns
+        ["tail", "--follow", "/x"],
+        ["cat", "--unknown-option", "/x"],
+        ["head", "--bytes-of-nonsense", "/x"],
+    ],
+)
+def test_inspection_commands_admit_no_mutating_or_blocking_options(
+    argv: list[str],
+) -> None:
+    """The widening is read-only and bounded, per command.
+
+    ``date`` must not set the clock and ``tail`` must not follow -- a following
+    read never returns, which would wedge the turn rather than fail it.
+    """
+    import mimir.access_control as access_control
+
+    assert not access_control._target_matches_maintenance_shell_command(argv)
+
+
+def test_every_admitted_inspection_command_is_pinned() -> None:
+    """An admitted basename with no pin would resolve through PATH."""
+    import mimir.access_control as access_control
+
+    pins = access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS
+    for name in ("cat", "head", "tail", "stat", "date"):
+        assert name in pins, f"{name} is admitted but not pinned"
+        assert pins[name].is_absolute()
 
 
 def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:
