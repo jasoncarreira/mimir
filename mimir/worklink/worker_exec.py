@@ -282,7 +282,13 @@ def _process_group_has_live_members(process_group: int) -> bool:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 if int(fields[2]) == process_group and fields[0] not in {"Z", "X"}:
                     return True
-            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+            except (
+                FileNotFoundError,
+                PermissionError,
+                ProcessLookupError,
+                IndexError,
+                ValueError,
+            ):
                 continue
         return False
     observed = subprocess.run(
