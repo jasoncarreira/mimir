@@ -279,16 +279,16 @@ if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
 if os.environ.get("PROOF_TOKEN") != "provider-reference":
     raise SystemExit("selected provider environment reference was not projected")
 checkout = Path.cwd()
+checkout_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+os.chdir(home)
+os.fchdir(checkout_fd)
 control = Path("/tmp/worklink-negative-control")
-negative_control = subprocess.run(
-    ["sh", "-c", "printf detector-live > ../b/cross-write"],
-    cwd=control / "a",
-)
-if (
-    negative_control.returncode != 0
-    or (control / "b/cross-write").read_text() != "detector-live"
-):
+os.chdir(control / "a")
+(Path("../b") / "cross-write").write_text("detector-live")
+if (Path("../b") / "cross-write").read_text() != "detector-live":
     raise SystemExit("sibling-access negative control did not detect a cross-write")
+os.fchdir(checkout_fd)
+os.close(checkout_fd)
 sibling_relative = Path("../../1411-1/checkout")
 sibling_absolute = checkout.parent.parent / "1411-1" / "checkout"
 checks = [
@@ -315,9 +315,9 @@ checks = [
 for command in checks:
     if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         raise SystemExit(f"worker operation unexpectedly succeeded: {command}")
-checkout.joinpath("tracked").write_text("worker-modified")
-checkout.joinpath("created").write_text("worker-created")
-checkout.joinpath("deleted").unlink()
+Path("tracked").write_text("worker-modified")
+Path("created").write_text("worker-created")
+Path("deleted").unlink()
 print(f"build-euid={os.geteuid()}")
 PY
             chmod 0755 /tmp/opencode-proof
