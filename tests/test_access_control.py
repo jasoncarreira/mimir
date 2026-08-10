@@ -2637,6 +2637,114 @@ async def test_service_shell_executes_the_exact_authorized_argv(
     ]
 
 
+@pytest.mark.parametrize(
+    ("profile", "canonical", "trigger"),
+    [
+        ("maintenance", "heartbeat", "scheduled_tick"),
+        ("repo_review", "poller:github-activity", "poller"),
+    ],
+)
+def test_declared_shell_authorization_and_execution_gates_agree(
+    profile: str,
+    canonical: str,
+    trigger: str,
+    tmp_path: Path,
+) -> None:
+    """Both gates admit and refuse the same argv for per-job declarations."""
+    from mimir.tools import budget_gate
+
+    declared = access_control.parse_declared_shell_commands(
+        [{
+            "exec": "gog",
+            "path": "/bin/echo",
+            "subcommands": [["gmail", "search"]],
+        }],
+        writable_roots=(),
+    )
+    service = build_trigger_service_principal(
+        canonical=canonical,
+        trigger=trigger,
+        profile="github" if profile == "repo_review" else "heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=declared,
+        creation_path="test",
+    )
+    review_state = (
+        _review_state("o/r", 1180, "worklink/1180", str(tmp_path))
+        if profile == "repo_review"
+        else None
+    )
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=review_state,
+    )
+    policy = service.sink_policy_for("shell_exec")
+    assert policy is not None
+    adapter = access_control._SERVICE_SINK_ADAPTERS[policy.adapter]
+
+    # This command is outside every shared profile, so either execution branch
+    # fails the agreement assertion if it drops the per-job declarations.
+    assert parse_service_shell_argv("gog gmail search newer_than:24h", profile) is None
+
+    for command, expected_admitted in (
+        ("gog gmail search newer_than:24h", True),
+        ("gog gmail send --to someone@example.com", False),
+    ):
+        authorization_argv = parse_service_shell_argv(
+            command,
+            profile,
+            review_state=review_state,
+            declared=service.declared_shell_commands,
+        )
+        authorization_admitted = access_control._sink_adapter_admits(
+            adapter,
+            command,
+            policy.destination,
+            service,
+            review_state=review_state,
+        )
+        bound = budget_gate._request_for_authorized_execution(
+            _tool_request(auth, args={"command": command}),
+            "shell_exec",
+            auth,
+        )
+        bound_args = bound.tool_call["args"]
+        execution_argv = (
+            None if "mimir_shell_refusal" in bound_args
+            else bound_args.get("mimir_direct_argv")
+        )
+
+        assert execution_argv == authorization_argv
+        assert authorization_admitted is (authorization_argv is not None)
+        assert authorization_admitted is expected_admitted
+
+
+def test_undeclared_shell_principal_keeps_shared_profile_behavior() -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    command = "pwd -P"
+    authorization_argv = parse_service_shell_argv(command, "maintenance")
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": command}),
+        "shell_exec",
+        auth,
+    )
+
+    assert service.declared_shell_commands == ()
+    assert bound.tool_call["args"]["mimir_direct_argv"] == authorization_argv
+
+
 def test_service_shell_final_binding_refusal_emits_hard_denial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
