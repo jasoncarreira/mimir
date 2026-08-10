@@ -310,7 +310,7 @@ def _fd_anchored_opencode_argv(
         if command[index + 1] != str(checkout):
             raise ComputeLaunchError("enabled OpenCode --dir must name the issued checkout")
         return (*command[: index + 1], ".", *command[index + 2 :])
-    raise ComputeLaunchError("enabled OpenCode command must contain --dir for the issued checkout")
+    return command
 
 
 @dataclass

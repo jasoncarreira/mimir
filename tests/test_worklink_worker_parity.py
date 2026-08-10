@@ -184,6 +184,24 @@ async def test_enabled_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
     assert calls == [work.local_argv]
 
 
+def test_fd_anchored_opencode_argv_passes_through_non_checkout_commands() -> None:
+    checkout = Path("/authorized")
+    command = ("python", "-c", "print('ok')")
+
+    assert compute._fd_anchored_opencode_argv(command, checkout) == command
+
+
+def test_fd_anchored_opencode_argv_rejects_a_different_checkout() -> None:
+    with pytest.raises(
+        ComputeLaunchError,
+        match="enabled OpenCode --dir must name the issued checkout",
+    ):
+        compute._fd_anchored_opencode_argv(
+            ("opencode", "run", "--dir", "/other", "--", "prompt"),
+            Path("/authorized"),
+        )
+
+
 async def launch_worker(
     monkeypatch: pytest.MonkeyPatch, client: object
 ) -> tuple[LocalSubprocessComputeBackend, LaunchHandle]:
