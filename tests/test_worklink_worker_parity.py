@@ -140,6 +140,68 @@ def spec(
     )
 
 
+@pytest.mark.asyncio
+async def test_enabled_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkout = tmp_path / "checkouts" / ("a" * 64) / "1-1" / "checkout"
+    checkout.mkdir(parents=True)
+    authorization = Authorization()
+    authorization.path = checkout
+    client = WorkerClient()
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    work = spec()
+    object.__setattr__(work, "local_checkout", checkout)
+    object.__setattr__(
+        work,
+        "local_argv",
+        ("opencode", "run", "--dir", str(checkout), "--", "prompt"),
+    )
+
+    worker = LocalSubprocessComputeBackend.for_authorized_checkout(
+        authorization, worker_client=client
+    )
+    await worker.launch(work)
+
+    assert client.launched[0]["argv"] == (
+        "opencode", "run", "--dir", ".", "--", "prompt"
+    )
+    assert work.local_argv == (
+        "opencode", "run", "--dir", str(checkout), "--", "prompt"
+    )
+
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> WorkerProcess:
+        calls.append(args)
+        return WorkerProcess("direct", 5000)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    direct = LocalSubprocessComputeBackend()
+    await direct.launch(work)
+    assert calls == [work.local_argv]
+
+
+def test_fd_anchored_opencode_argv_passes_through_non_checkout_commands() -> None:
+    checkout = Path("/authorized")
+    command = ("python", "-c", "print('ok')")
+
+    assert compute._fd_anchored_opencode_argv(command, checkout) == command
+
+
+def test_fd_anchored_opencode_argv_rejects_a_different_checkout() -> None:
+    with pytest.raises(
+        ComputeLaunchError,
+        match="enabled OpenCode --dir must name the issued checkout",
+    ):
+        compute._fd_anchored_opencode_argv(
+            ("opencode", "run", "--dir", "/other", "--", "prompt"),
+            Path("/authorized"),
+        )
+
+
 async def launch_worker(
     monkeypatch: pytest.MonkeyPatch, client: object
 ) -> tuple[LocalSubprocessComputeBackend, LaunchHandle]:

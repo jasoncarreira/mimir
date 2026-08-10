@@ -79,8 +79,14 @@ async def main():
     lease = create_isolated_checkout(
         REPO, issue_id=1410, attempt=1, base="main", worker_eligible=True
     )
+    sibling = create_isolated_checkout(
+        REPO, issue_id=1411, attempt=1, base="main", worker_eligible=True
+    )
     if not lease.worker_authorized or lease.authorization is None:
         raise RuntimeError("production checkout factory did not authorize worker checkout")
+    if not sibling.worker_authorized or sibling.authorization is None:
+        raise RuntimeError("concurrent checkout factory did not authorize worker checkout")
+    sibling.path.joinpath("sibling-canary").write_text("sibling-original")
     source_object = next(REPO.joinpath(".git/objects").glob("[0-9a-f][0-9a-f]/*"))
     checkout_object = lease.path / ".git/objects" / source_object.relative_to(REPO / ".git/objects")
     if source_object.stat().st_ino == checkout_object.stat().st_ino:
@@ -154,7 +160,18 @@ test -r "$HOME/.local/share/opencode/auth.json"
         raise RuntimeError("controller evidence did not observe worker changes")
     if Path("/home/mimir/worklink-canary").read_text() != "controller-reset":
         raise RuntimeError("worker changed controller canary")
+    if sibling.path.joinpath("sibling-canary").read_text() != "sibling-original":
+        raise RuntimeError("worker changed concurrent sibling checkout")
     cleanup_checkout(lease, outcome="completed", safe_git=publication)
+    sibling_fd = sibling.authorization.duplicate_fd()
+    try:
+        sibling_publication = ControllerGitPublication.capture(
+            sibling_fd, REPO, sibling.branch, METADATA / "sibling"
+        )
+    finally:
+        os.close(sibling_fd)
+    cleanup_checkout(sibling, outcome="completed", safe_git=sibling_publication)
+    sibling_publication.close()
     publication.close()
     if lease.path.exists():
         raise RuntimeError("production checkout cleanup failed")
@@ -237,15 +254,19 @@ JSON
 JSON
             chown mimir:mimir /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
             chmod 0600 /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            install -d -o worklink -g worklink -m 0770 /tmp/worklink-negative-control/a /tmp/worklink-negative-control/b
             cat > /tmp/opencode-proof <<'PY'
 #!/opt/mimir-worklink/venv/bin/python
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 if os.geteuid() != 1002:
     raise SystemExit("coding CLI did not run as worklink")
+if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
+    raise SystemExit(f"coding CLI did not receive the FD-anchored checkout: {sys.argv}")
 home = Path(os.environ["HOME"])
 if home.parent != Path("/var/lib/mimir-worklink/homes"):
     raise SystemExit("coding CLI received an invalid HOME")
@@ -258,8 +279,29 @@ if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
 if os.environ.get("PROOF_TOKEN") != "provider-reference":
     raise SystemExit("selected provider environment reference was not projected")
 checkout = Path.cwd()
+checkout_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
 os.chdir(home)
-os.chdir(checkout)
+os.fchdir(checkout_fd)
+control = Path("/tmp/worklink-negative-control")
+os.chdir(control / "a")
+(Path("../b") / "cross-write").write_text("detector-live")
+if (Path("../b") / "cross-write").read_text() != "detector-live":
+    raise SystemExit("sibling-access negative control did not detect a cross-write")
+os.fchdir(checkout_fd)
+os.close(checkout_fd)
+sibling_relative = Path("../../1411-1/checkout")
+sibling_absolute = checkout.parent.parent / "1411-1" / "checkout"
+checks = [
+    ["cat", str(sibling_relative / "sibling-canary")],
+    ["sh", "-c", f"printf attacked > {sibling_relative / 'sibling-canary'}"],
+    ["rm", "-f", str(sibling_relative / "sibling-canary")],
+    ["cat", str(sibling_absolute / "sibling-canary")],
+    ["sh", "-c", f"printf attacked > {sibling_absolute / 'sibling-canary'}"],
+    ["rm", "-f", str(sibling_absolute / "sibling-canary")],
+]
+for command in checks:
+    if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        raise SystemExit(f"worker reached concurrent sibling checkout: {command}")
 parent = home.parent
 checks = [
     ["ls", str(parent)],
@@ -273,9 +315,9 @@ checks = [
 for command in checks:
     if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         raise SystemExit(f"worker operation unexpectedly succeeded: {command}")
-checkout.joinpath("tracked").write_text("worker-modified")
-checkout.joinpath("created").write_text("worker-created")
-checkout.joinpath("deleted").unlink()
+Path("tracked").write_text("worker-modified")
+Path("created").write_text("worker-created")
+Path("deleted").unlink()
 print(f"build-euid={os.geteuid()}")
 PY
             chmod 0755 /tmp/opencode-proof

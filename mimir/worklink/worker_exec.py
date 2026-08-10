@@ -172,11 +172,20 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
     except ValueError as exc:
         raise RuntimeError("received checkout FD is not the exact issued checkout") from exc
     if (
-        len(relative.parts) != 2
+        len(relative.parts) != 3
         or re.fullmatch(r"[0-9a-f]{64}", relative.parts[0]) is None
         or relative.parts[1] != f"{issue}-{attempt}"
+        or relative.parts[2] != "checkout"
     ):
         raise RuntimeError("received checkout FD is not the exact issued checkout")
+    boundary = resolved.parent.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(boundary.st_mode)
+        or boundary.st_uid != MIMIR_UID
+        or boundary.st_gid != WORKLINK_GID
+        or stat.S_IMODE(boundary.st_mode) != 0o700
+    ):
+        raise RuntimeError("issued checkout isolation boundary is invalid")
     if observed.st_uid != MIMIR_UID or observed.st_gid != WORKLINK_GID:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:

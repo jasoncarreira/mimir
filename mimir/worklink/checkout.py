@@ -452,8 +452,11 @@ def create_isolated_checkout(
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
     if enabled:
+        repo_parent = path.parent.parent
+        os.chown(repo_parent, MIMIR_UID, WORKLINK_GID)
+        os.chmod(repo_parent, 0o710)
         os.chown(path.parent, MIMIR_UID, WORKLINK_GID)
-        os.chmod(path.parent, 0o710)
+        os.chmod(path.parent, 0o700)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
@@ -983,13 +986,21 @@ def _isolated_checkout_path(
     working tree under concurrent load. Placing it at a sibling
     ``<repo.parent>/<worklink_dir>/<repo.name>/<issue>-<attempt>`` keeps the
     independent clone fully detached, and the ``<repo.name>`` segment keeps
-    attempts for repos that share a parent directory from colliding.
+    attempts for repos that share a parent directory from colliding. Worker
+    checkouts add ``<issue>-<attempt>/checkout``: the attempt directory is a
+    controller-owned mode-0700 pathname barrier, while the worker enters the
+    writable checkout through its issued directory FD.
     """
     if worker_authorized is None:
         worker_authorized = coding_enabled()
     if worker_authorized:
         repo_id = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
-        return _ENABLED_CHECKOUT_ROOT / repo_id / f"{issue_id}-{attempt}"
+        return (
+            _ENABLED_CHECKOUT_ROOT
+            / repo_id
+            / f"{issue_id}-{attempt}"
+            / "checkout"
+        )
     return repo.parent / worklink_dir / repo.name / f"{issue_id}-{attempt}"
 
 
@@ -1036,7 +1047,7 @@ def cleanup_checkout(
             safe_git.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
             if lease.authorization is not None:
                 lease.authorization.close()
-            shutil.rmtree(lease.path)
+            shutil.rmtree(lease.path.parent)
             return True
         shutil.rmtree(lease.path)
         delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
@@ -1114,7 +1125,9 @@ def _attempt_roots(repo: Path, worklink_dir: str) -> list[tuple[Path, bool]]:
     if relocated_root != legacy_root:
         roots.append((relocated_root, True))
     if coding_enabled():
-        enabled_root = _isolated_checkout_path(repo, worklink_dir, 0, 0, worker_authorized=True).parent
+        enabled_root = _isolated_checkout_path(
+            repo, worklink_dir, 0, 0, worker_authorized=True
+        ).parent.parent
         if enabled_root not in {legacy_root, relocated_root}:
             roots.append((enabled_root, True))
     return roots

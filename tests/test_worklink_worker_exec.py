@@ -26,7 +26,7 @@ import mimir.worklink.worker_exec as worker_exec
 
 
 def _issued(tmp_path: Path) -> Path:
-    path = tmp_path / "checkouts" / ("a" * 64) / "41-2"
+    path = tmp_path / "checkouts" / ("a" * 64) / "41-2" / "checkout"
     path.mkdir(parents=True)
     return path
 
@@ -125,6 +125,7 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
     monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
     monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
     issued.chmod(0o2770)
+    issued.parent.chmod(0o700)
 
     def request(fd: int) -> dict[str, object]:
         observed = os.fstat(fd)
@@ -135,7 +136,7 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
             "attempt": 2,
         }
 
-    arbitrary = tmp_path / "other" / ("a" * 64) / "41-2"
+    arbitrary = tmp_path / "other" / ("a" * 64) / "41-2" / "checkout"
     arbitrary.mkdir(parents=True)
     old = tmp_path / "old-issued"
     issued.rename(old)
@@ -148,6 +149,16 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
                 worker_exec._validate_checkout(fd, request(fd))
         finally:
             os.close(fd)
+
+    issued.chmod(0o2770)
+    issued.parent.chmod(0o710)
+    fd = os.open(issued, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.setattr(worker_exec.os, "readlink", lambda _name: str(issued))
+    try:
+        with pytest.raises(RuntimeError, match="isolation boundary"):
+            worker_exec._validate_checkout(fd, request(fd))
+    finally:
+        os.close(fd)
 
 
 def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path, monkeypatch) -> None:
@@ -369,7 +380,7 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
 
     boundary = Path("/tmp") / f"mimir-worker-exec-{uuid.uuid4()}"
     checkout_root = boundary / "checkouts"
-    checkout = checkout_root / ("a" * 64) / "41-2"
+    checkout = checkout_root / ("a" * 64) / "41-2" / "checkout"
     home_root = boundary / "homes"
     controller_home = boundary / "mimir-home"
     socket_path = boundary / "executor.sock"
@@ -379,6 +390,8 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
     controller_home.mkdir(mode=0o700)
     os.chown(checkout, 1001, 1002)
     checkout.chmod(0o2770)
+    os.chown(checkout.parent, 1001, 1002)
+    checkout.parent.chmod(0o700)
     os.chown(controller_home, 1001, 1001)
     canary = controller_home / "canary"
     canary.write_text("original")
@@ -472,4 +485,101 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
         worker_exec.HOME_ROOT = previous_homes
         os.close(result_read)
         listener.close()
+        shutil.rmtree(boundary, ignore_errors=True)
+
+
+def test_worker_cannot_cross_attempt_boundary_and_negative_control_is_live() -> None:
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("the shipped-image proof exercises this real uid boundary in CI")
+
+    boundary = Path("/tmp") / f"mimir-worker-siblings-{uuid.uuid4()}"
+    checkout_root = boundary / "checkouts"
+    repo_root = checkout_root / ("a" * 64)
+    first = repo_root / "41-1" / "checkout"
+    second = repo_root / "42-1" / "checkout"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    canary = second / "sibling-canary"
+    canary.write_text("original")
+    repo_root.chmod(0o710)
+    os.chown(repo_root, 1001, 1002)
+    for attempt in (first.parent, second.parent):
+        os.chown(attempt, 1001, 1002)
+    for checkout in (first, second):
+        os.chown(checkout, 1001, 1002)
+        checkout.chmod(0o2770)
+    os.chown(canary, 1001, 1002)
+    canary.chmod(0o660)
+
+    def run_worker() -> dict[str, bool]:
+        checkout_fd = os.open(first, os.O_RDONLY | os.O_DIRECTORY)
+        result_read, result_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(result_read)
+            try:
+                os.setgroups([])
+                os.setresgid(1002, 1002, 1002)
+                os.setresuid(1002, 1002, 1002)
+                os.fchdir(checkout_fd)
+                Path("own-write").write_text("owned")
+                relative = Path("../../42-1/checkout/sibling-canary")
+                observed: dict[str, bool] = {"own_write": True}
+                for name, target in (("relative", relative), ("absolute", canary)):
+                    try:
+                        target.read_text()
+                        observed[f"{name}_read"] = True
+                    except OSError:
+                        observed[f"{name}_read"] = False
+                    try:
+                        target.write_text("attacked")
+                        observed[f"{name}_write"] = True
+                    except OSError:
+                        observed[f"{name}_write"] = False
+                    try:
+                        target.unlink()
+                        observed[f"{name}_delete"] = True
+                    except OSError:
+                        observed[f"{name}_delete"] = False
+                os.write(result_write, json.dumps(observed).encode())
+                os._exit(0)
+            except BaseException as exc:
+                os.write(result_write, json.dumps({"error": repr(exc)}).encode())
+                os._exit(1)
+
+        os.close(result_write)
+        os.close(checkout_fd)
+        payload = json.loads(os.read(result_read, 65536))
+        os.close(result_read)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, payload
+        return payload
+
+    try:
+        # Negative control: these are the pre-fix executable attempt parents.
+        first.parent.chmod(0o710)
+        second.parent.chmod(0o710)
+        vulnerable = run_worker()
+        assert vulnerable["relative_read"] is True
+        assert vulnerable["relative_write"] is True
+        assert vulnerable["relative_delete"] is True
+
+        canary.write_text("original")
+        os.chown(canary, 1001, 1002)
+        canary.chmod(0o660)
+        first.parent.chmod(0o700)
+        second.parent.chmod(0o700)
+        isolated = run_worker()
+        assert isolated == {
+            "own_write": True,
+            "relative_read": False,
+            "relative_write": False,
+            "relative_delete": False,
+            "absolute_read": False,
+            "absolute_write": False,
+            "absolute_delete": False,
+        }
+        assert canary.read_text() == "original"
+        assert (first / "own-write").read_text() == "owned"
+    finally:
         shutil.rmtree(boundary, ignore_errors=True)

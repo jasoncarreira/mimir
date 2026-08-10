@@ -40,6 +40,9 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     # whatever providers it declares -- so this test passes where the variable
     # is unset and fails where it is set, which is ambient state it does not own.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     monkeypatch.setenv("PROXY_TOKEN", "referenced")
     order = WorkOrder(
         issue_id=1410,
@@ -86,6 +89,9 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     monkeypatch.setenv("HOME", str(tmp_path))
     # See the note above: HOME alone does not seal opencode config resolution.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     order = WorkOrder(
         issue_id=1410,
         checkout=tmp_path / "checkout",

@@ -29,7 +29,9 @@ from mimir.scheduler import (
     _scheduler_channel_id,
     _scheduler_loop_lag_details,
     _summarize_skill_consolidate,
+    bundled_scheduler_template_text,
     load_jobs,
+    load_jobs_from_text,
     write_jobs,
 )
 
@@ -3364,6 +3366,61 @@ def test_bundled_scheduler_template_ships_audit_ticks():
         assert (tpl_dir / job.prompt_file).is_file(), (
             f"{name} prompt_file {job.prompt_file!r} not bundled"
         )
+
+
+@pytest.mark.asyncio
+async def test_bundled_scheduler_template_authority_profiles(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    template_text = bundled_scheduler_template_text()
+    with caplog.at_level("WARNING", logger="mimir.scheduler"):
+        jobs = load_jobs_from_text(template_text)
+    assert "declares no authority_profile" not in caplog.text
+
+    enqueued: list[AgentEvent] = []
+
+    async def fake_enqueue(event: AgentEvent) -> bool:
+        enqueued.append(event)
+        return True
+
+    scheduler = Scheduler(
+        scheduler_yaml=tmp_path / "scheduler.yaml",
+        enqueue=fake_enqueue,
+        home=tmp_path,
+    )
+    for job in jobs:
+        await scheduler._fire(job=job)
+
+    authorities = {
+        event.extra["schedule_name"]: event.service_authority
+        for event in enqueued
+    }
+    expected_heartbeat_capabilities = {
+        "send_message" if capability == "operator_alert" else capability
+        for capability in TRIGGER_AUTHORITY_PROFILES["heartbeat"]
+    }
+    heartbeat = authorities["heartbeat"]
+    assert heartbeat.canonical == "heartbeat"
+    assert set(heartbeat.capabilities) == expected_heartbeat_capabilities
+
+    scheduled_tick = get_service_principal("scheduled_tick")
+    assert scheduled_tick is not None
+    for name, authority in authorities.items():
+        if name != "heartbeat":
+            assert authority.canonical == scheduled_tick.canonical
+            assert set(authority.capabilities) == set(scheduled_tick.capabilities)
+
+    mutated = yaml.safe_load(template_text)
+    heartbeat_entry = next(entry for entry in mutated if entry["name"] == "heartbeat")
+    assert heartbeat_entry.pop("authority_profile") == "heartbeat"
+    mutated_jobs = load_jobs_from_text(yaml.safe_dump(mutated))
+    mutated_heartbeat = next(job for job in mutated_jobs if job.name == "heartbeat")
+    enqueued.clear()
+    await scheduler._fire(job=mutated_heartbeat)
+
+    downgraded = enqueued[0].service_authority
+    assert set(downgraded.capabilities) == set(scheduled_tick.capabilities)
+    assert set(downgraded.capabilities) != expected_heartbeat_capabilities
 
 
 def test_audit_prompt_templates_have_frontmatter():

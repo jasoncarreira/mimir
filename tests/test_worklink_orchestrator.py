@@ -2108,8 +2108,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    checkout = tmp_path / "authorized-checkout"
-    checkout.mkdir()
+    checkout = tmp_path / ("a" * 64) / "1410-1" / "checkout"
+    checkout.mkdir(parents=True)
     (checkout / ".git" / "objects").mkdir(parents=True)
     lifecycle = []
     checkout_kwargs = {}
