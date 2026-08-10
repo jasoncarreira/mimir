@@ -6,8 +6,93 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-09
+
+Minor rather than patch because two changes require an operator to edit
+deployment configuration, and both fail *silently* if that edit is missed.
+
+### Operator actions required
+
+1. **Every `scheduler.yaml` heartbeat record needs `authority_profile: heartbeat`.**
+   Heartbeat authority is now selected by the record instead of by the job's name.
+   A heartbeat record without the key resolves to the shared `scheduled_tick`
+   grant — 53 capabilities down to 25, losing `fetch_url`, `operator_alert` and the
+   whole PR-review toolkit while gaining `spawn_open_code`. Nothing raises: the
+   heartbeat keeps firing on schedule and quietly stops being able to do its job.
+   The key is ignored by 0.7.x, so it can be added before upgrading. A record
+   named `heartbeat` that omits it now logs a warning at scheduler load.
+2. **Any declaration pinning a built-in skill script must move to `scripts/`.**
+   Executable code in shipped skills now lives at `<skill>/scripts/`. Declared
+   scripts are pinned by absolute path and declaration parsing requires the file to
+   exist, so a stale path does not merely disable that step — it fails the
+   declaration and disables the whole job. The known case is a `morning-briefing`
+   declaring `.mimir_builtin_skills/weather/get_weather.py`, which becomes
+   `.mimir_builtin_skills/weather/scripts/get_weather.py`. Update the declaration
+   *after* upgrading, since the new path does not exist until then.
+3. **Optional: delete any deployment-local `prompts/reflect.md` override.** An
+   override wins over the shipped template, so the reflection fix below does not
+   reach an agent that carries a stale copy of the prompt.
+
+### Added
+- Scheduler records may name their authority profile with `authority_profile`.
+  A record that names none keeps today's shared `scheduled_tick` authority
+  unchanged, and an unknown profile name is refused at load rather than falling
+  back to a weaker principal. (#1417)
+- A `tool-pin-drift` built-in skill that checks pinned npm packages and GitHub
+  release tags from a script, emitting JSON with per-target error isolation. The
+  script form is deliberate: a declared script's internals are not gated by the
+  shell profile, so one job gets one script rather than every scheduled job on
+  every deployment gaining `npm`. (#1414)
+- `skills/*/scripts/` is writable only on a trusted operator turn, so a skill can
+  ship and run its own code without the agent being able to rewrite what it will
+  later execute. (#1415)
+
 ### Changed
-- Version bumped to 0.7.4 for the next release.
+- Executable code in shipped skills moved from the skill root to
+  `<skill>/scripts/`, across `mimir/skills/` and `mimir/optional-skills/`, with
+  every `pollers.json` entry point updated in the same change.
+  `predictions/script.py` became `predictions/scripts/predictions_cli.py`. See
+  operator action 2. (#1416)
+- `heartbeat` is an ordinary scheduler record rather than a name special-cased in
+  code. Its effective authority is unchanged; what moved is where the selection
+  comes from. Declarations (`shell_commands`) are now parsed and applied for every
+  job including heartbeat — previously they were silently ignored on that one job,
+  so a heartbeat declaration would review cleanly, deploy, and change nothing.
+  (#1417)
+- The factory declaration gains `bootstrap` (`uv sync --locked --extra dev --extra
+  bench`, so a sandbox installs dependencies before any gate) and `pr_draft: false`
+  (so factory PRs publish ready for review — a draft cannot be merged without a
+  manual `gh pr ready` and is invisible to pollers acting on open PRs).
+  (#1418, #1424)
+- `langchain-codex-plus` pinned to 0.0.7. (#1412)
+
+### Fixed
+- Every scheduled job now has a filesystem read scope of its own. Previously only
+  the heartbeat did, so each other job resolved `channel_memory_directory` to
+  `None` and could not read its own channel notes — muninn's morning briefing
+  among them. Each job now reads its own channel memory and its skill `scripts`
+  root, and still cannot read another job's channel. (#1413)
+- A job-bound scheduled tick can read `memory/core/**` again. The read-scope work
+  above denied it, which broke the reflection and memory-hygiene workflows: both
+  document a core-memory read as required, and `reflect.md` states the read "is
+  permitted". The denial protected nothing — core blocks are already rendered into
+  the system prompt, so it blocked a `read_file` on content the model was already
+  holding while emitting a denial on every run. Caught before any release shipped
+  it. (#1420)
+- The weekly reflection turn once again sees recent session boundaries across
+  channels. Its prompt instructed reading `<home>/.mimir/session_boundaries.jsonl`,
+  a local mirror deliberately removed when SAGA moved in-process — no writer, no
+  reader. The block is now assembled cross-channel from SAGA's sessions table for
+  that turn, bounded by the `recent_boundaries` setting; every other turn stays
+  channel-scoped. (#1422)
+- A symlinked `MIMIR_HOME` no longer makes every declared shell command under home
+  unusable — an unresolved path comparison, regression from #1406. (#1407)
+- `test_run_poller_timeout_kills_child_holding_pipes` no longer fails as a function
+  of CI load. It asserted a one-second wall-clock reap budget behind a 0.25s poller
+  timeout, so it failed unrelated PRs at random; it now proves process-group killing
+  by asserting the spawned child never survives long enough to write its marker.
+  (#1421)
+- Two prerequisites for running the factory against `main`. (#1409)
 
 ## [0.7.4] — 2026-08-07
 
