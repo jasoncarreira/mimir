@@ -181,10 +181,32 @@ def main() -> None:
             test "$(stat -c %U:%G /opt/mimir-worklink/venv/bin/python)" = root:root
             test "$(stat -c %a:%u:%g /var/lib/mimir-worklink/homes)" = 710:0:1002
         """)
-        process_table = run(["docker", "top", CONTAINER, "-eo", "pid,user,args"]).stdout
-        if not any(line.split(maxsplit=2)[1] in {"1001", "mimir"} and "mimir run" in line for line in process_table.splitlines()[1:]):
+        # Read the live uids from /proc INSIDE the container.
+        #
+        # ``docker top`` is unusable for this. It runs ps on the HOST, so its
+        # ``user`` column resolves against the host's passwd database: on a
+        # GitHub runner host uid 1001 is ``runner``, so a correctly-dropped
+        # mimir service reports as ``runner`` and a name comparison fails while
+        # the container is entirely correct. Asking that host ps for a numeric
+        # ``uid`` column is not portable either — Docker Desktop's ps rejects it
+        # outright (``bad -o argument 'uid'``), so the check would then pass on
+        # GitHub and fail locally, trading one host dependency for another.
+        #
+        # /proc needs no ps at all, which also keeps this working in the shipped
+        # image, where procps is absent.
+        process_table = docker_exec("/bin/sh", "-ceu", r"""
+            for proc in /proc/[0-9]*; do
+                [ -r "$proc/cmdline" ] || continue
+                cmd=$(tr '\0' ' ' < "$proc/cmdline")
+                [ -n "$cmd" ] || continue
+                uid=$(awk '/^Uid:/ {print $2; exit}' "$proc/status" 2>/dev/null) || continue
+                printf '%s\t%s\t%s\n' "${proc#/proc/}" "$uid" "$cmd"
+            done
+        """)
+        rows = [line.split("\t", 2) for line in process_table.splitlines() if line.count("\t") >= 2]
+        if not any(uid == "1001" and "mimir run" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live mimir service is not uid 1001\n{process_table}")
-        if not any(line.split(maxsplit=2)[1] == "root" and "mimir.worklink.worker_exec" in line for line in process_table.splitlines()[1:]):
+        if not any(uid == "0" and "mimir.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
 
         setup = """

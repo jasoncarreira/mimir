@@ -34,6 +34,12 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     _write_native_files(tmp_path)
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Redirecting HOME alone does not seal config resolution: opencode_config
+    # prefers XDG_CONFIG_HOME and only falls back to HOME/.config. Left set,
+    # resolution escapes tmp_path into the real config directory and picks up
+    # whatever providers it declares -- so this test passes where the variable
+    # is unset and fails where it is set, which is ambient state it does not own.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("PROXY_TOKEN", "referenced")
     order = WorkOrder(
         issue_id=1410,
@@ -78,6 +84,8 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     _write_native_files(tmp_path)
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    # See the note above: HOME alone does not seal opencode config resolution.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     order = WorkOrder(
         issue_id=1410,
         checkout=tmp_path / "checkout",
