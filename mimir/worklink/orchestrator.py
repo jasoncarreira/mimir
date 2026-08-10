@@ -749,6 +749,22 @@ class WorklinkRunner:
                 transcript=str(raw.transcript_path) if raw.transcript_path else None,
             )
         pr_url = None
+
+        def persist_gate_handle(handle: LaunchHandle) -> None:
+            _persist_run_state(
+                self.home,
+                issue=issue,
+                attempt=attempt,
+                backend_name=selected_name,
+                compute=compute,
+                handle=handle,
+                lease=lease,
+                repo=self.repo,
+                repo_url=spec.repo_url,
+                test_command=test_cmd,
+                started_at=started,
+            )
+
         # After the #832 substrate cleanup local_subprocess is the only Worklink
         # compute substrate. Its capabilities declare shared_filesystem=True, so
         # the controller runs the diff/test re-derivation itself (no remote-fetch
@@ -772,6 +788,7 @@ class WorklinkRunner:
             safe_git=publication,
             work_spec=spec,
             compute=compute,
+            on_gate_launch=persist_gate_handle,
         )
         validation = _with_outside_checkout_detection(
             validation,
@@ -811,6 +828,7 @@ class WorklinkRunner:
                     safe_git=publication,
                     work_spec=spec,
                     compute=compute,
+                    on_gate_launch=persist_gate_handle,
                 )
                 validation = _with_outside_checkout_detection(
                     validation,

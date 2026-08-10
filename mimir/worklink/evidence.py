@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Protocol, Sequence
 
-from .compute import ComputeBackend, ComputeResult, WorkSpec
+from .compute import ComputeBackend, ComputeResult, LaunchHandle, WorkSpec
 from .dispatch_failures import terminal_error
 
 
@@ -185,6 +185,7 @@ async def observe_evidence(
     checkout_ref: str | None = None,
     work_spec: WorkSpec | None = None,
     compute: ComputeBackend | None = None,
+    on_gate_launch: Callable[[LaunchHandle], None] | None = None,
     transcript: str | None = None,
     pr_url: str | None = None,
     blocked_reason: str | None = None,
@@ -208,6 +209,7 @@ async def observe_evidence(
         safe_git=safe_git,
         work_spec=work_spec,
         compute=compute,
+        on_gate_launch=on_gate_launch,
         transcript=transcript,
         pr_url=pr_url,
         blocked_reason=blocked_reason,
@@ -235,6 +237,7 @@ async def _observe_evidence_from_ref(
     safe_git: EvidenceGit | None,
     work_spec: WorkSpec | None,
     compute: ComputeBackend | None,
+    on_gate_launch: Callable[[LaunchHandle], None] | None,
     transcript: str | None,
     pr_url: str | None,
     blocked_reason: str | None,
@@ -313,6 +316,7 @@ async def _observe_evidence_from_ref(
                     checkout=checkout,
                     work_spec=work_spec,
                     compute=compute,
+                    on_launch=on_gate_launch,
                 )
                 test = subprocess.CompletedProcess(
                     ["/bin/sh", "-c", test_command],
@@ -357,6 +361,7 @@ async def _run_compute_gate(
     checkout: Path,
     work_spec: WorkSpec,
     compute: ComputeBackend,
+    on_launch: Callable[[LaunchHandle], None] | None = None,
 ) -> ComputeResult:
     gate_spec = replace(
         work_spec,
@@ -365,6 +370,12 @@ async def _run_compute_gate(
     )
     handle = await compute.launch(gate_spec)
     try:
+        if on_launch is not None:
+            try:
+                on_launch(handle)
+            except BaseException:
+                await compute.cancel(handle)
+                raise
         return await compute.wait(handle, gate_spec.timeout_s)
     except asyncio.CancelledError:
         await compute.cancel(handle)
