@@ -74,3 +74,8 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert 'if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then' in text
     assert "mimir opencode-bootstrap --home /home/mimir" in text
     assert "OpenCode reads this XDG-global config" in text
+
+
+def test_worklink_service_run_script_is_made_executable() -> None:
+    text = _text()
+    assert "/etc/s6-overlay/s6-rc.d/worklink-execd/run" in text
