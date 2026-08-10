@@ -4,15 +4,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import ctypes
 import fcntl
+import hashlib
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
+import sys
 from typing import Any, Callable, Sequence
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
+
+MIMIR_UID = 1001
+WORKLINK_GID = 1002
+_ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
+_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+_AUTHORIZATION_FACTORY = object()
+
+
+def coding_enabled() -> bool:
+    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in _ENABLED_VALUES
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -37,6 +52,8 @@ class CheckoutLease:
     # have their own .git directory and are removed with ``shutil.rmtree`` rather
     # than ``git worktree remove``.
     isolated_checkout: bool = False
+    worker_authorized: bool = False
+    authorization: Any | None = None
 
 
 def create_worktree(
@@ -106,6 +123,7 @@ def _clone_attempt_checkout(
     *,
     runner: Runner,
     event_logger: EventLogger | None,
+    no_hardlinks: bool = False,
 ) -> None:
     """Clone ``repo`` into ``path``, degrading to an object copy if it must.
 
@@ -125,11 +143,15 @@ def _clone_attempt_checkout(
     case. An unrelated clone failure is re-raised untouched, so this never
     silently converts a real error into a slow success.
     """
-    clone = runner(["git", "clone", "--local", "--quiet", str(repo), str(path)])
+    clone_args = ["git", "clone", "--local"]
+    if no_hardlinks:
+        clone_args.append("--no-hardlinks")
+    clone_args.extend(["--quiet", str(repo), str(path)])
+    clone = runner(clone_args)
     if clone.returncode == 0:
         return
     detail = (clone.stderr or clone.stdout).strip()
-    if _HARDLINK_FAILURE_MARKER not in detail:
+    if no_hardlinks or _HARDLINK_FAILURE_MARKER not in detail:
         raise RuntimeError(detail or "git clone failed")
 
     # The failed clone leaves a partial directory; --no-hardlinks needs a clean
@@ -154,6 +176,250 @@ def _clone_attempt_checkout(
         )
 
 
+class CheckoutAuthorization:
+    __slots__ = ("path", "issue_id", "attempt", "device", "inode", "_fd")
+
+    def __init__(
+        self,
+        path: Path,
+        issue_id: int,
+        attempt: int,
+        fd: int,
+        *,
+        _factory: object | None = None,
+    ) -> None:
+        if _factory is not _AUTHORIZATION_FACTORY:
+            raise TypeError("checkout authorizations are issued by the checkout factory")
+        observed = os.fstat(fd)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise RuntimeError("authorized checkout is not a directory")
+        self.path = Path(os.path.abspath(path))
+        self.issue_id = issue_id
+        self.attempt = attempt
+        self.device = observed.st_dev
+        self.inode = observed.st_ino
+        self._fd = fd
+
+    def verify(self, local_checkout: Path | None) -> None:
+        if self._fd < 0:
+            raise ValueError("authorized checkout is closed")
+        if local_checkout is None or Path(os.path.abspath(local_checkout)) != self.path:
+            raise ValueError("work spec checkout does not match authorized checkout")
+        observed = os.stat(local_checkout, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+            self.device,
+            self.inode,
+        ):
+            raise ValueError("work spec checkout does not match authorized checkout")
+
+    def duplicate_fd(self) -> int:
+        if self._fd < 0:
+            raise ValueError("authorized checkout is closed")
+        return os.dup(self._fd)
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def __enter__(self) -> CheckoutAuthorization:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _mint_checkout_authorization(
+    path: Path, issue_id: int, attempt: int, fd: int
+) -> CheckoutAuthorization:
+    return CheckoutAuthorization(
+        path, issue_id, attempt, fd, _factory=_AUTHORIZATION_FACTORY
+    )
+
+
+def _open_issued_checkout(root: Path, relative_path: Path) -> int:
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or any(component in {".", ".."} for component in relative_path.parts)
+    ):
+        raise ValueError("issued checkout path must remain beneath its trusted root")
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    try:
+        if sys.platform.startswith("linux"):
+            class OpenHow(ctypes.Structure):
+                _fields_ = (
+                    ("flags", ctypes.c_uint64),
+                    ("mode", ctypes.c_uint64),
+                    ("resolve", ctypes.c_uint64),
+                )
+
+            how = OpenHow(flags=flags, mode=0, resolve=0x02 | 0x04 | 0x08)
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = libc.syscall(
+                437,
+                root_fd,
+                os.fsencode(relative_path),
+                ctypes.byref(how),
+                ctypes.sizeof(how),
+            )
+            if result >= 0:
+                return int(result)
+            error = ctypes.get_errno()
+            raise RuntimeError("issued checkout is unavailable or unsafe") from OSError(
+                error, os.strerror(error)
+            )
+        current_fd = os.dup(root_fd)
+        try:
+            for component in relative_path.parts:
+                next_fd = os.open(
+                    component,
+                    flags | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            retained_fd = current_fd
+            current_fd = -1
+            return retained_fd
+        finally:
+            if current_fd >= 0:
+                os.close(current_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _preflight_directory_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(value.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                observed = os.fstat(child_fd)
+                if (observed.st_dev, observed.st_ino) != (value.st_dev, value.st_ino):
+                    raise RuntimeError("checkout entry changed during normalization")
+                _preflight_directory_fd(child_fd)
+            finally:
+                os.close(child_fd)
+        elif not (stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode)):
+            raise RuntimeError(f"special checkout entry refused: {name}")
+
+
+def _copy_unlinked_file(directory_fd: int, name: str, value: os.stat_result) -> None:
+    source_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    temporary = f".mimir-normalize-{os.urandom(12).hex()}"
+    target_fd = -1
+    try:
+        observed = os.fstat(source_fd)
+        if not stat.S_ISREG(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+            value.st_dev, value.st_ino
+        ):
+            raise RuntimeError("checkout entry changed during normalization")
+        target_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        while data := os.read(source_fd, 1024 * 1024):
+            view = memoryview(data)
+            while view:
+                view = view[os.write(target_fd, view):]
+        os.fsync(target_fd)
+        os.close(target_fd)
+        target_fd = -1
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    finally:
+        os.close(source_fd)
+        if target_fd >= 0:
+            os.close(target_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _normalize_directory_fd(directory_fd: int, owner_uid: int, group_gid: int) -> None:
+    entries = os.listdir(directory_fd)
+    for name in entries:
+        value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(value.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                observed = os.fstat(child_fd)
+                if (observed.st_dev, observed.st_ino) != (value.st_dev, value.st_ino):
+                    raise RuntimeError("checkout entry changed during normalization")
+                _normalize_directory_fd(child_fd, owner_uid, group_gid)
+                os.fchown(child_fd, owner_uid, group_gid)
+                os.fchmod(child_fd, 0o2770)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(value.st_mode):
+            executable = bool(value.st_mode & 0o111)
+            if value.st_nlink > 1:
+                _copy_unlinked_file(directory_fd, name, value)
+                value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            entry_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            try:
+                observed = os.fstat(entry_fd)
+                if not stat.S_ISREG(observed.st_mode) or (
+                    observed.st_dev, observed.st_ino
+                ) != (value.st_dev, value.st_ino):
+                    raise RuntimeError("checkout entry changed during normalization")
+                os.fchown(entry_fd, owner_uid, group_gid)
+                execute_bits = value.st_mode & 0o111 if executable else 0
+                os.fchmod(entry_fd, 0o660 | execute_bits)
+            finally:
+                os.close(entry_fd)
+        elif stat.S_ISLNK(value.st_mode):
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISLNK(observed.st_mode) or (
+                observed.st_dev, observed.st_ino
+            ) != (value.st_dev, value.st_ino):
+                raise RuntimeError("checkout entry changed during normalization")
+            os.chown(name, owner_uid, group_gid, dir_fd=directory_fd, follow_symlinks=False)
+        else:
+            raise RuntimeError(f"special checkout entry refused: {name}")
+
+
+def _normalize_checkout_fd(
+    checkout_fd: int, *, owner_uid: int = MIMIR_UID, group_gid: int = WORKLINK_GID
+) -> None:
+    root = os.fstat(checkout_fd)
+    if not stat.S_ISDIR(root.st_mode):
+        raise RuntimeError("authorized checkout is not a directory")
+    _preflight_directory_fd(checkout_fd)
+    _normalize_directory_fd(checkout_fd, owner_uid, group_gid)
+    os.fchown(checkout_fd, owner_uid, group_gid)
+    os.fchmod(checkout_fd, 0o2770)
+
+
+def normalize_checkout(
+    authorization: Any,
+    *,
+    safe_git: Any,
+    owner_uid: int = MIMIR_UID,
+    group_gid: int = WORKLINK_GID,
+) -> None:
+    authorization.verify(authorization.path)
+    safe_git.run("rev-parse", "--git-dir", check=True)
+    checkout_fd = authorization.duplicate_fd()
+    try:
+        _normalize_checkout_fd(checkout_fd, owner_uid=owner_uid, group_gid=group_gid)
+    finally:
+        os.close(checkout_fd)
+
+
+
 def create_isolated_checkout(
     repo: Path,
     *,
@@ -164,6 +430,7 @@ def create_isolated_checkout(
     base_fetch: bool = True,
     event_logger: EventLogger | None = None,
     runner: Runner = _default_runner,
+    worker_eligible: bool = False,
 ) -> CheckoutLease:
     """Create an attempt-scoped local clone with its own ``.git`` directory.
 
@@ -178,9 +445,15 @@ def create_isolated_checkout(
     depend on an object directory under the scratch janitor's swept roots.
     """
 
-    path = _isolated_checkout_path(repo, worklink_dir, issue_id, attempt)
+    enabled = coding_enabled() and worker_eligible
+    path = _isolated_checkout_path(
+        repo, worklink_dir, issue_id, attempt, worker_authorized=enabled
+    )
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if enabled:
+        os.chown(path.parent, MIMIR_UID, WORKLINK_GID)
+        os.chmod(path.parent, 0o710)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
 
@@ -204,7 +477,14 @@ def create_isolated_checkout(
         )
     wanted_push_target = parent_push.stdout.strip()
 
-    _clone_attempt_checkout(repo, path, runner=runner, event_logger=event_logger)
+    previous_umask = os.umask(0o007) if enabled else None
+    try:
+        _clone_attempt_checkout(
+            repo, path, runner=runner, event_logger=event_logger, no_hardlinks=enabled
+        )
+    finally:
+        if previous_umask is not None:
+            os.umask(previous_umask)
 
     try:
         set_remote = runner(
@@ -239,9 +519,22 @@ def create_isolated_checkout(
     # does not resolve back to the parent before any backend inspects its git
     # metadata. Fail loud (and clean up the half-made checkout) rather than handing
     # codex a checkout that would walk up into the repo root.
+    authorization = None
     try:
         _assert_self_contained_checkout(path, runner=runner)
-    except RuntimeError:
+        if enabled:
+            relative_path = path.relative_to(_ENABLED_CHECKOUT_ROOT)
+            checkout_fd = _open_issued_checkout(_ENABLED_CHECKOUT_ROOT, relative_path)
+            try:
+                _normalize_checkout_fd(
+                    checkout_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+                )
+                authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
+                checkout_fd = -1
+            finally:
+                if checkout_fd >= 0:
+                    os.close(checkout_fd)
+    except (OSError, RuntimeError):
         shutil.rmtree(path, ignore_errors=True)
         raise
 
@@ -254,6 +547,8 @@ def create_isolated_checkout(
         base_ref=base,
         local_base=local_base,
         isolated_checkout=True,
+        worker_authorized=enabled,
+        authorization=authorization,
     )
 
 
@@ -672,7 +967,14 @@ class _FileLock:
         self._handle.close()
 
 
-def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attempt: int) -> Path:
+def _isolated_checkout_path(
+    repo: Path,
+    worklink_dir: str,
+    issue_id: int,
+    attempt: int,
+    *,
+    worker_authorized: bool | None = None,
+) -> Path:
     """Location for an isolated attempt checkout, OUTSIDE the parent repo (#517).
 
     Codex resolves the active git repository from the filesystem, so the clone
@@ -683,6 +985,11 @@ def _isolated_checkout_path(repo: Path, worklink_dir: str, issue_id: int, attemp
     independent clone fully detached, and the ``<repo.name>`` segment keeps
     attempts for repos that share a parent directory from colliding.
     """
+    if worker_authorized is None:
+        worker_authorized = coding_enabled()
+    if worker_authorized:
+        repo_id = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
+        return _ENABLED_CHECKOUT_ROOT / repo_id / f"{issue_id}-{attempt}"
     return repo.parent / worklink_dir / repo.name / f"{issue_id}-{attempt}"
 
 
@@ -712,11 +1019,25 @@ def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
         )
 
 
-def cleanup_checkout(lease: CheckoutLease, *, outcome: str, runner: Runner = _default_runner) -> bool:
+def cleanup_checkout(
+    lease: CheckoutLease,
+    *,
+    outcome: str,
+    runner: Runner = _default_runner,
+    safe_git: Any | None = None,
+) -> bool:
     """Remove successful attempt checkouts; retain failed/blocked attempts for autopsy."""
     if outcome != "completed":
         return False
     if lease.isolated_checkout:
+        if lease.worker_authorized:
+            if safe_git is None:
+                raise RuntimeError("authorized checkout cleanup requires safe Git")
+            safe_git.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+            if lease.authorization is not None:
+                lease.authorization.close()
+            shutil.rmtree(lease.path)
+            return True
         shutil.rmtree(lease.path)
         delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
         # Isolated-checkout branches usually exist only inside the clone that was
@@ -788,10 +1109,14 @@ def prune_attempt_checkouts(
 def _attempt_roots(repo: Path, worklink_dir: str) -> list[tuple[Path, bool]]:
     """Return ``(root, isolated_checkout)`` attempt roots for ``repo`` (#613)."""
     legacy_root = repo / worklink_dir
-    isolated_root = _isolated_checkout_path(repo, worklink_dir, 0, 0).parent
+    relocated_root = repo.parent / worklink_dir / repo.name
     roots = [(legacy_root, False)]
-    if isolated_root != legacy_root:
-        roots.append((isolated_root, True))
+    if relocated_root != legacy_root:
+        roots.append((relocated_root, True))
+    if coding_enabled():
+        enabled_root = _isolated_checkout_path(repo, worklink_dir, 0, 0, worker_authorized=True).parent
+        if enabled_root not in {legacy_root, relocated_root}:
+            roots.append((enabled_root, True))
     return roots
 
 
