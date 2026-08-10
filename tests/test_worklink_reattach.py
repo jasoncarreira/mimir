@@ -767,11 +767,35 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
     calls = []
     runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
     cancel_events = []
+    escalation_signals = []
+    escalation_waits = []
+    process_waited = []
 
     async def cancel(self, handle):
         cancel_events.append(("cancel", handle))
         if scenario == "term_kill_group_reap":
-            cancel_events.extend([("TERM", None), ("KILL", None), ("reap", None)])
+            import mimir.worklink.worker_exec as worker_exec
+
+            class Process:
+                pid = 4321
+
+                def wait(self):
+                    process_waited.append(True)
+
+            monkeypatch.setattr(
+                worker_exec.os,
+                "killpg",
+                lambda pid, sig: escalation_signals.append((pid, sig)),
+            )
+            monkeypatch.setattr(
+                worker_exec,
+                "_wait_process_group",
+                lambda pgid, deadline: escalation_waits.append((pgid, deadline)),
+            )
+            monkeypatch.setattr(
+                worker_exec, "_process_group_has_live_members", lambda pgid: True
+            )
+            worker_exec._terminate_process_group(Process(), timeout_s=0.01)
         if cancel_error is not None:
             raise cancel_error
 
@@ -811,4 +835,10 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
         for call in calls
     )
     if scenario == "term_kill_group_reap":
-        assert [event for event, _ in cancel_events] == ["cancel", "TERM", "KILL", "reap"]
+        import signal
+
+        assert escalation_signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+        assert len(escalation_waits) == 2
+        assert escalation_waits[0][1] is not None
+        assert escalation_waits[1] == (4321, None)
+        assert process_waited == [True]
