@@ -663,6 +663,7 @@ def _request_for_authorized_execution(
             target,
             policy.destination,
             review_state=review_state,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
         )
         if state_refusal is not None:
             argv = None
@@ -671,6 +672,7 @@ def _request_for_authorized_execution(
     else:
         argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
             target, policy.destination,
+            declared=getattr(service, "declared_shell_commands", ()) or (),
         )
     if argv is None:
         refused_argv, argv_truncated = service_shell_argv_for_log(target)
