@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 import os
+import posixpath
+import re
 from pathlib import Path
 import signal
+import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
@@ -63,6 +67,7 @@ class LaunchHandle:
     substrate: str
     identifier: str
     process_start_ticks: int | None = None
+    shim_pid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -174,14 +179,150 @@ def _local_child_env() -> dict[str, str]:
     return env
 
 
+_ENABLED_BASE_ENV = {
+    "USER": "worklink",
+    "LOGNAME": "worklink",
+    "SHELL": "/bin/sh",
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
+_ENABLED_SYNTHESIZED_NAMES = frozenset({
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "OPENCODE_CONFIG",
+    "OPENCODE_PERMISSION",
+})
+_ENABLED_DENIED_PREFIXES = (
+    "MIMIR_",
+    "GIT_",
+    "GH_",
+    "GITHUB_",
+    "XDG_",
+    "LD_",
+    "DYLD_",
+    "PYTHON",
+    "BASH_",
+)
+_ENABLED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_ENABLED_VALUE_BYTES = 64 * 1024
+
+
+def _refers_to_controller_home(value: str) -> bool:
+    for component in re.split(r"[=,;\s:]", value):
+        if not component.startswith("/"):
+            continue
+        normalized = posixpath.normpath(component)
+        if normalized == "/home/mimir" or normalized.startswith("/home/mimir/"):
+            return True
+    if re.search(r"(?:^|[=,;\s])/?home/mimir(?:/|$)", value):
+        return True
+    return bool(
+        re.search(r"(?:^|[=,;\s])(?:\.\./)+home/mimir(?:/|$)", value)
+    )
+
+
+def _validate_worker_value(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ComputeLaunchError(f"worker environment {name} must be a non-empty string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ComputeLaunchError(f"worker environment {name} is not UTF-8") from exc
+    if len(encoded) > _ENABLED_VALUE_BYTES:
+        raise ComputeLaunchError(f"worker environment {name} exceeds size limit")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ComputeLaunchError(f"worker environment {name} contains a forbidden character")
+    if _refers_to_controller_home(value):
+        raise ComputeLaunchError(f"worker environment {name} refers to controller home")
+    return value
+
+
+def _validate_dynamic_worker_name(name: object) -> str:
+    if not isinstance(name, str) or _ENABLED_NAME.fullmatch(name) is None:
+        raise ComputeLaunchError("worker environment name is invalid")
+    upper = name.upper()
+    if (
+        name in _ENABLED_SYNTHESIZED_NAMES
+        or upper.startswith(_ENABLED_DENIED_PREFIXES)
+        or "GITHUB" in upper
+    ):
+        raise ComputeLaunchError(f"worker environment {name} is denied")
+    return name
+
+
+def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
+    home = f"/var/lib/mimir-worklink/homes/{identifier}"
+    env = dict(_ENABLED_BASE_ENV)
+    env.update({
+        "HOME": home,
+        "XDG_CONFIG_HOME": f"{home}/.config",
+        "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_CACHE_HOME": f"{home}/.cache",
+        "OPENCODE_CONFIG": f"{home}/.config/opencode/opencode.json",
+    })
+    permission = spec.env.get("OPENCODE_PERMISSION")
+    if permission is not None:
+        value = _validate_worker_value("OPENCODE_PERMISSION", permission)
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ComputeLaunchError("invalid OPENCODE_PERMISSION") from exc
+        if not isinstance(parsed, dict):
+            raise ComputeLaunchError("invalid OPENCODE_PERMISSION")
+        env["OPENCODE_PERMISSION"] = value
+    permitted = spec.backend_config.get("pass_env", ())
+    if isinstance(permitted, (str, bytes)) or not isinstance(permitted, Sequence):
+        raise ComputeLaunchError("worker pass_env must be a sequence")
+    seen: set[str] = set()
+    for raw_name in permitted:
+        name = _validate_dynamic_worker_name(raw_name)
+        if name in seen:
+            raise ComputeLaunchError(f"worker environment {name} is duplicated")
+        seen.add(name)
+        if name not in spec.env:
+            raise ComputeLaunchError(f"worker environment {name} is missing")
+        env[name] = _validate_worker_value(name, spec.env[name])
+    unknown = set(spec.env) - seen - {"OPENCODE_PERMISSION"}
+    if unknown:
+        name = sorted(str(item) for item in unknown)[0]
+        raise ComputeLaunchError(f"worker environment {name} was not requested")
+    return env
+
+
 @dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
 
     name: str = "local_subprocess"
+    _authorized_checkout: object | None = field(default=None, repr=False)
+    _worker_client: object | None = field(default=None, repr=False)
+
+    @classmethod
+    def for_authorized_checkout(
+        cls,
+        authorization: object,
+        *,
+        worker_client: object | None = None,
+    ) -> LocalSubprocessComputeBackend:
+        if not all(
+            hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
+        ):
+            raise TypeError("authorization is not a checkout capability")
+        return cls(_authorized_checkout=authorization, _worker_client=worker_client)
 
     def __post_init__(self) -> None:
         self._jobs: dict[str, tuple[object, WorkSpec, tuple[str, ...]]] = {}
+        self._handles: dict[str, LaunchHandle] = {}
+        self._worker_clients: dict[str, object] = {}
 
     def capabilities(self) -> ComputeCaps:
         return ComputeCaps(
@@ -201,6 +342,9 @@ class LocalSubprocessComputeBackend:
         command = tuple(str(arg) for arg in spec.local_argv)
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
+        from .checkout import coding_enabled
+        if coding_enabled() and spec.backend == "opencode":
+            return await self._launch_enabled(spec, command)
         # chainlink #830: autonomous local_subprocess builds an allowlisted env
         # from the parent process — infra vars (HOME so a coding CLI finds its
         # config/plugins + provider auth files; locale/cert vars) plus provider
@@ -231,6 +375,55 @@ class LocalSubprocessComputeBackend:
             start_ticks = process_start_ticks(pid)
         handle = LaunchHandle(self.name, str(pid if pid is not None else "unknown"), start_ticks)
         self._jobs[handle.identifier] = (proc, spec, command)
+        self._handles[handle.identifier] = handle
+        return handle
+
+    async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
+        from .worker_client import WorkerClient, WorkerProjection
+
+        authorization = self._authorized_checkout
+        if authorization is None or not all(
+            hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
+        ):
+            raise ComputeLaunchError("enabled local_subprocess requires an AuthorizedCheckout")
+        projections_raw = spec.backend_config.get("worker_projections", ())
+        if isinstance(projections_raw, (str, bytes)) or not isinstance(
+            projections_raw, Sequence
+        ):
+            raise ComputeLaunchError("worker projections must be a sequence")
+        projections: list[WorkerProjection] = []
+        try:
+            for item in projections_raw:
+                projections.append(WorkerProjection(path=item.path, document=item.document))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ComputeLaunchError("worker projection is invalid") from exc
+        identifier = str(uuid.uuid4())
+        client = self._worker_client or WorkerClient(authorization)
+        try:
+            proc = await client.launch(
+                local_checkout=spec.local_checkout,
+                argv=command,
+                env={
+                    key: value
+                    for key, value in _enabled_child_env(spec, identifier).items()
+                    if key != "HOME"
+                },
+                projections=projections,
+                identifier=identifier,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ComputeLaunchError(str(exc)) from exc
+        from .run_state import process_start_ticks
+        ticks = process_start_ticks(proc.pid)
+        handle = LaunchHandle(
+            substrate=self.name,
+            identifier=identifier,
+            process_start_ticks=ticks,
+            shim_pid=proc.pid,
+        )
+        self._jobs[identifier] = (proc, spec, command)
+        self._handles[identifier] = handle
+        self._worker_clients[identifier] = client
         return handle
 
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -300,13 +493,28 @@ class LocalSubprocessComputeBackend:
             proc, _spec, _command = self._job(handle)
         except KeyError:
             proc = _verified_external_process(handle, self.name)
+        client = self._worker_clients.get(handle.identifier)
+        if client is not None:
+            await getattr(client, "cancel")(handle.identifier)
+            return
+        if handle.shim_pid is not None:
+            from .worker_client import WorkerClient
+
+            await WorkerClient(None).cancel(handle.identifier)  # type: ignore[arg-type]
+            return
         await _kill_process_group(proc)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
         self._jobs.pop(handle.identifier, None)
+        self._handles.pop(handle.identifier, None)
+        self._worker_clients.pop(handle.identifier, None)
 
     def _job(self, handle: LaunchHandle) -> tuple[object, WorkSpec, tuple[str, ...]]:
-        if handle.substrate != self.name or handle.identifier not in self._jobs:
+        if (
+            handle.substrate != self.name
+            or handle.identifier not in self._jobs
+            or self._handles.get(handle.identifier) != handle
+        ):
             raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
         return self._jobs[handle.identifier]
 
@@ -332,10 +540,19 @@ def _verified_external_process(handle: LaunchHandle, substrate: str) -> _Externa
     """Reconstruct a local handle only when its PID birth marker still matches."""
     if handle.substrate != substrate or handle.process_start_ticks is None:
         raise KeyError(f"unknown {substrate} handle: {handle.identifier}")
-    try:
-        pid = int(handle.identifier)
-    except ValueError as exc:
-        raise KeyError(f"invalid {substrate} pid: {handle.identifier}") from exc
+    if handle.shim_pid is None:
+        try:
+            pid = int(handle.identifier)
+        except ValueError as exc:
+            raise KeyError(f"invalid {substrate} pid: {handle.identifier}") from exc
+    else:
+        try:
+            parsed = uuid.UUID(handle.identifier, version=4)
+        except ValueError as exc:
+            raise KeyError(f"invalid {substrate} UUID: {handle.identifier}") from exc
+        if str(parsed) != handle.identifier:
+            raise KeyError(f"invalid {substrate} UUID: {handle.identifier}")
+        pid = handle.shim_pid
     from .run_state import process_start_ticks
 
     if process_start_ticks(pid) != handle.process_start_ticks:
