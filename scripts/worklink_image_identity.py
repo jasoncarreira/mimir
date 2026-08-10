@@ -279,14 +279,16 @@ if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
 if os.environ.get("PROOF_TOKEN") != "provider-reference":
     raise SystemExit("selected provider environment reference was not projected")
 checkout = Path.cwd()
-os.chdir(home)
-os.chdir(checkout)
 control = Path("/tmp/worklink-negative-control")
-os.chdir(control / "a")
-(Path("../b") / "cross-write").write_text("detector-live")
-if (control / "b/cross-write").read_text() != "detector-live":
+negative_control = subprocess.run(
+    ["sh", "-c", "printf detector-live > ../b/cross-write"],
+    cwd=control / "a",
+)
+if (
+    negative_control.returncode != 0
+    or (control / "b/cross-write").read_text() != "detector-live"
+):
     raise SystemExit("sibling-access negative control did not detect a cross-write")
-os.chdir(checkout)
 sibling_relative = Path("../../1411-1/checkout")
 sibling_absolute = checkout.parent.parent / "1411-1" / "checkout"
 checks = [
