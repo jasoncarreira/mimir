@@ -91,6 +91,10 @@ def test_open_pr_comment_still_emits_when_it_is_the_only_signal(
             return [_comment(42)]
         if endpoint == "repos/o/r/issues/42":
             return {"state": "open", "pull_request": {"url": "api/pr/42"}}
+        if endpoint == "repos/o/r/pulls/42":
+            return _pr(42, "head-sha")
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return []
         raise AssertionError(endpoint)
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
@@ -110,6 +114,8 @@ def test_pr_parent_lookup_failure_fails_open(
         if "/issues/comments?" in endpoint:
             return [_comment(42)]
         if endpoint == "repos/o/r/issues/42":
+            return None
+        if endpoint == "repos/o/r/pulls/42":
             return None
         raise AssertionError(endpoint)
 
@@ -155,6 +161,8 @@ def test_same_poll_comment_and_synchronize_emit_one_review_turn(
             return [_pr(42, "new-sha")]
         if "compare/old-sha...new-sha" in endpoint:
             return None
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return []
         if "/issues/comments?" in endpoint:
             return [_comment(42)]
         if endpoint == "repos/o/r/issues/42":
@@ -183,6 +191,145 @@ def test_same_poll_comment_and_synchronize_emit_one_review_turn(
     assert comment_count == 0
     assert [event["event_type"] for event in captured_emits] == ["pr_synchronize"]
     assert review_needed == {"42"}
+
+
+def test_current_head_review_suppresses_a_later_poll_from_another_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_emits: list[dict],
+) -> None:
+    reviewed = False
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return [_pr(42, "new-sha")]
+        if "compare/old-sha...new-sha" in endpoint:
+            return None
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            if not reviewed:
+                return []
+            return [{
+                "user": {"login": "mimir-carreira"},
+                "commit_id": "new-sha",
+                "state": "APPROVED",
+            }]
+        if "/issues/comments?" in endpoint:
+            return [_comment(42)]
+        if endpoint == "repos/o/r/issues/42":
+            return {"state": "open", "pull_request": {"url": "api/pr/42"}}
+        if endpoint == "repos/o/r/pulls/42":
+            return _pr(42, "new-sha")
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+    first_count, _, _ = poller._check_pr_pushes(
+        "o/r",
+        token="t",
+        me="mimir-carreira",
+        pr_heads={"42": "old-sha"},
+        review_needed_pr_numbers=set(),
+    )
+    reviewed = True
+    second_count = poller._check_issue_comments(
+        "o/r", SINCE, "t", "mimir-carreira", review_needed_pr_numbers=set(),
+    )
+
+    assert first_count + second_count == 1
+    assert [event["event_type"] for event in captured_emits] == ["pr_synchronize"]
+
+
+def test_review_on_previous_head_does_not_suppress_updated_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_emits: list[dict],
+) -> None:
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return [_pr(42, "new-sha")]
+        if "compare/old-sha...new-sha" in endpoint:
+            return None
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [{
+                "user": {"login": "mimir-carreira"},
+                "commit_id": "old-sha",
+                "state": "CHANGES_REQUESTED",
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+    count, _, _ = poller._check_pr_pushes(
+        "o/r",
+        token="t",
+        me="mimir-carreira",
+        pr_heads={"42": "old-sha"},
+        review_needed_pr_numbers=set(),
+    )
+
+    assert count == 1
+    assert [event["event_type"] for event in captured_emits] == ["pr_synchronize"]
+
+
+def test_current_head_review_suppresses_new_pr_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_emits: list[dict],
+) -> None:
+    pr = _pr(42, "head-sha")
+    pr["created_at"] = CREATED
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint == "repos/o/r/pulls?state=open&sort=created&direction=desc":
+            return [pr]
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [{
+                "user": {"login": "mimir-carreira"},
+                "commit_id": "head-sha",
+                "state": "COMMENTED",
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", lambda *args: True)
+
+    count = poller._check_prs("o/r", SINCE, "t", "mimir-carreira")
+
+    assert count == 0
+    assert captured_emits == []
+
+
+def test_current_head_review_suppresses_review_comment_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_emits: list[dict],
+) -> None:
+    review_comment = {
+        "created_at": CREATED,
+        "user": {"login": "jason"},
+        "body": "Please also consider this edge case.",
+        "html_url": "https://github.com/o/r/pull/42#discussion_r1",
+        "pull_request_url": "https://api.github.com/repos/o/r/pulls/42",
+        "path": "src/example.py",
+    }
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls/comments?"):
+            return [review_comment]
+        if endpoint == "repos/o/r/pulls/42":
+            return _pr(42, "head-sha")
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [{
+                "user": {"login": "mimir-carreira"},
+                "commit_id": "head-sha",
+                "state": "APPROVED",
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+
+    count = poller._check_pr_review_comments(
+        "o/r", SINCE, "t", "mimir-carreira",
+    )
+
+    assert count == 0
+    assert captured_emits == []
 
 
 def test_synchronize_coalesces_review_request_and_preserves_retry_state(

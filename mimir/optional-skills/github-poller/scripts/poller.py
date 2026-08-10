@@ -674,9 +674,10 @@ def _emit_pr_synchronize(
     previous_head: str,
     current_head: str,
     token: str,
+    reviewer: str,
     *,
     related_comment: str = "",
-) -> None:
+) -> bool:
     compare = _gh_api(
         f"repos/{repo}/compare/{previous_head}...{current_head}", token,
     )
@@ -708,8 +709,10 @@ def _emit_pr_synchronize(
         f"{commit_block}\n"
         f"Previous head: {previous_head[:8]}, new head: {current_head[:8]}\n{url}"
     )
-    _emit(
+    return _emit_pr_review_needed(
         prompt,
+        token=token,
+        reviewer=reviewer,
         event_type="pr_synchronize",
         repo=repo,
         number=number,
@@ -830,12 +833,21 @@ def _check_prs(
         if body:
             prompt_parts.append(body)
         prompt_parts.append(url)
-        _emit("\n".join(prompt_parts), event_type="pr_opened",
-              repo=repo, number=number, url=url, author=author,
-              head_sha=(pr.get("head") or {}).get("sha"),
-              related_comment=review_context.get(str(number), ""))
-        count += 1
-        review_needed_pr_numbers.add(str(number))
+        emitted = _emit_pr_review_needed(
+            "\n".join(prompt_parts),
+            token=token,
+            reviewer=me,
+            event_type="pr_opened",
+            repo=repo,
+            number=number,
+            url=url,
+            author=author,
+            head_sha=(pr.get("head") or {}).get("sha"),
+            related_comment=review_context.get(str(number), ""),
+        )
+        if emitted:
+            count += 1
+            review_needed_pr_numbers.add(str(number))
     return count
 
 
@@ -940,9 +952,22 @@ def _check_issue_comments(
         prompt = (
             f"New comment on {repo} #{issue_num} by @{author}: {body}\n{url}"
         )
-        _emit(prompt, event_type="issue_comment",
-              repo=repo, number=issue_num, url=url, author=author)
-        count += 1
+        if is_pr_comment or presentation_is_pr:
+            emitted = _emit_pr_review_needed(
+                prompt,
+                token=token,
+                reviewer=me,
+                event_type="issue_comment",
+                repo=repo,
+                number=issue_num,
+                url=url,
+                author=author,
+            )
+        else:
+            _emit(prompt, event_type="issue_comment",
+                  repo=repo, number=issue_num, url=url, author=author)
+            emitted = True
+        count += int(emitted)
     return count
 
 
@@ -975,9 +1000,17 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
             f"New PR review comment on {repo} #{pr_num} "
             f"by @{author}{location}: {body}\n{url}"
         )
-        _emit(prompt, event_type="pr_review_comment",
-              repo=repo, number=pr_num, url=url, path=path, author=author)
-        count += 1
+        count += int(_emit_pr_review_needed(
+            prompt,
+            token=token,
+            reviewer=me,
+            event_type="pr_review_comment",
+            repo=repo,
+            number=pr_num,
+            url=url,
+            path=path,
+            author=author,
+        ))
     return count
 
 
@@ -1104,7 +1137,7 @@ def _check_pr_pushes(
                 if not trusted_author:
                     new_heads[key] = current_sha
                 else:
-                    _emit_pr_synchronize(
+                    emitted = _emit_pr_synchronize(
                         repo,
                         number,
                         title,
@@ -1112,10 +1145,12 @@ def _check_pr_pushes(
                         prev_sha,
                         current_sha,
                         token,
+                        me,
                         related_comment=review_context.get(key, ""),
                     )
-                    count += 1
-                    review_needed_pr_numbers.add(key)
+                    if emitted:
+                        count += 1
+                        review_needed_pr_numbers.add(key)
                     new_heads[key] = current_sha
             else:
                 new_heads[key] = current_sha
@@ -1187,8 +1222,11 @@ def _check_pr_pushes(
                             f"{status_line}\n"
                             f"{url}"
                         )
-                        _emit(
+                        emitted = _emit_pr_review_needed(
                             prompt,
+                            token=token,
+                            reviewer=me,
+                            current_head_reviewed=False,
                             event_type="pr_review_requested",
                             repo=repo,
                             number=number,
@@ -1205,6 +1243,8 @@ def _check_pr_pushes(
                             base_sha=(pr.get("base") or {}).get("sha"),
                             related_comment=review_context.get(key, ""),
                         )
+                        if not emitted:
+                            continue
                         count += 1
                         review_needed_pr_numbers.add(key)
                         # The framework stashes this event after the subprocess
@@ -1274,6 +1314,45 @@ def _has_current_head_review(
         if login == reviewer and commit_id == head_sha and state in substantive:
             return True
     return False
+
+
+def _emit_pr_review_needed(
+    prompt: str,
+    *,
+    token: str,
+    reviewer: str,
+    current_head_reviewed: bool | None = None,
+    **extras: object,
+) -> bool:
+    """Emit a PR work event unless ``reviewer`` reviewed its current head.
+
+    All passes that can start a PR review turn flow through this choke point.
+    Passes with a PR snapshot supply ``head_sha``; comment passes resolve the
+    live PR so an old comment cannot make an already-reviewed head actionable.
+    API failures fail open, preserving review-request recovery semantics.
+    """
+    reviewed = current_head_reviewed
+    if reviewed is None and reviewer:
+        repo = extras.get("repo")
+        number = extras.get("number")
+        head_sha = extras.get("head_sha") or extras.get("new_head")
+        if not head_sha and isinstance(repo, str) and number is not None:
+            pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
+            if isinstance(pr, dict):
+                head_sha = (pr.get("head") or {}).get("sha")
+        reviewed = bool(
+            isinstance(repo, str)
+            and number is not None
+            and isinstance(head_sha, str)
+            and _has_current_head_review(
+                repo, number, head_sha, reviewer, token
+            )
+        )
+    if reviewed:
+        return False
+    _emit(prompt, **extras)
+    return True
+
 
 def _head_commit_date(repo: str, sha: str, token: str) -> str:
     """Committer date of ``sha`` (ISO-8601), or ``""`` when the lookup
