@@ -2261,8 +2261,9 @@ async def test_run_poller_timeout_kills_child_holding_pipes(
     """Timeout kills the whole process group, not just the shell.
 
     The poller exits after spawning a child that inherits stdout/stderr and
-    sleeps.  Killing only the shell leaves that child alive with the pipe FDs
-    open; the process-group hardening must reap it on timeout.
+    blocks indefinitely. Killing only the shell leaves that child alive with
+    the pipe FDs open; the process-group hardening must kill every live member
+    of its process group on timeout.
     """
     if not hasattr(os, "killpg") or not Path("/proc").is_dir():
         pytest.skip("process-group liveness assertion requires POSIX /proc")
@@ -2274,20 +2275,19 @@ import json, os, subprocess, sys
 child = subprocess.Popen([
     sys.executable,
     "-c",
-    "import os, pathlib, time; "
-    "time.sleep(float(os.environ['CHILD_LIFETIME'])); "
-    "pathlib.Path(os.environ['STATE_DIR'], 'child.survived').touch()",
+    "import signal; "
+    "signal.pause()",
 ])
-pid_path = os.path.join(os.environ["STATE_DIR"], "child.pid")
-with open(pid_path, "w", encoding="utf-8") as f:
-    f.write(str(child.pid))
+pgid_path = os.path.join(os.environ["STATE_DIR"], "child.pgid")
+with open(pgid_path, "w", encoding="utf-8") as f:
+    f.write(str(os.getpgrp()))
 print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 """)
     cfg = PollerConfig(
         name="child-holder",
         command=f"{sys.executable} poller.py",
         cron="* * * * *",
-        env={"CHILD_LIFETIME": str(poller_timeout * 4)},
+        env={},
         skill_dir=skill_dir,
     )
     enq = _CapturingEnqueue()
@@ -2300,23 +2300,21 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
     timeouts = [e for e in events if e["type"] == "poller_timeout"]
     assert len(timeouts) == 1
 
-    child_pid = int((skill_dir / "child.pid").read_text())
+    child_pgid = int((skill_dir / "child.pgid").read_text())
 
-    def child_is_still_running() -> bool:
-        stat_path = Path(f"/proc/{child_pid}/stat")
+    live_group_members: list[int] = []
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
         try:
-            fields = stat_path.read_text().split()
+            stat_text = stat_path.read_text()
         except (FileNotFoundError, ProcessLookupError):
-            return False
-        # Zombies may remain briefly until PID 1 reaps them; they are dead
-        # for the regression this test guards against.
-        return len(fields) > 2 and fields[2] != "Z"
+            continue
+        # Fields after the parenthesized command begin with state, parent PID,
+        # and process-group ID. Zombies are already dead and may await PID 1.
+        fields = stat_text[stat_text.rfind(")") + 2:].split()
+        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == child_pgid:
+            live_group_members.append(int(stat_path.parent.name))
 
-    while child_is_still_running():
-        await asyncio.sleep(0.05)
-
-    assert not child_is_still_running()
-    assert not (skill_dir / "child.survived").exists()
+    assert live_group_members == []
 
 
 @pytest.mark.asyncio
