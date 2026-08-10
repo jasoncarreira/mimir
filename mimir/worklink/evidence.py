@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
 import subprocess
-from typing import Callable, Sequence
+from typing import Callable, Protocol, Sequence
 
+from .compute import ComputeBackend, ComputeResult, WorkSpec
 from .dispatch_failures import terminal_error
 
 
@@ -68,6 +70,18 @@ class EvidenceValidation:
 
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class EvidenceGit(Protocol):
+    def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]: ...
+
+
+EVIDENCE_SAFE_GIT_OPERATIONS = frozenset({
+    "diff_name_only",
+    "diff_stat",
+    "status",
+    "checkout_detach",
+})
 
 
 def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
@@ -155,7 +169,7 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     return EvidenceValidation(status=status, review_ready=review_ready, reasons=tuple(reasons), evidence=evidence)
 
 
-def observe_evidence(
+async def observe_evidence(
     *,
     issue: int,
     attempt: int,
@@ -166,6 +180,11 @@ def observe_evidence(
     base_ref: str,
     backend_status: str,
     test_command: str | None,
+    safe_git: EvidenceGit | None = None,
+    head_ref: str = "HEAD",
+    checkout_ref: str | None = None,
+    work_spec: WorkSpec | None = None,
+    compute: ComputeBackend | None = None,
     transcript: str | None = None,
     pr_url: str | None = None,
     blocked_reason: str | None = None,
@@ -174,8 +193,8 @@ def observe_evidence(
     skip_test_reason: str | None = None,
     runner: Run | None = None,
 ) -> EvidenceValidation:
-    """Build evidence by observing a checkout after a backend run."""
-    return _observe_evidence_from_ref(
+    """Build evidence by observing a normalized checkout after a backend run."""
+    return await _observe_evidence_from_ref(
         issue=issue,
         attempt=attempt,
         backend=backend,
@@ -183,9 +202,12 @@ def observe_evidence(
         checkout=checkout,
         started_at=started_at,
         base_ref=base_ref,
-        head_ref="HEAD",
+        head_ref=head_ref,
         backend_status=backend_status,
         test_command=test_command,
+        safe_git=safe_git,
+        work_spec=work_spec,
+        compute=compute,
         transcript=transcript,
         pr_url=pr_url,
         blocked_reason=blocked_reason,
@@ -194,11 +216,11 @@ def observe_evidence(
         skip_test_reason=skip_test_reason,
         runner=runner,
         include_checkout_status=True,
+        checkout_ref=checkout_ref,
     )
 
 
-
-def _observe_evidence_from_ref(
+async def _observe_evidence_from_ref(
     *,
     issue: int,
     attempt: int,
@@ -210,6 +232,9 @@ def _observe_evidence_from_ref(
     head_ref: str,
     backend_status: str,
     test_command: str | None,
+    safe_git: EvidenceGit | None,
+    work_spec: WorkSpec | None,
+    compute: ComputeBackend | None,
     transcript: str | None,
     pr_url: str | None,
     blocked_reason: str | None,
@@ -223,19 +248,26 @@ def _observe_evidence_from_ref(
     pre_observed: bool = True,
 ) -> EvidenceValidation:
     runner = runner or _run
+    from .checkout import coding_enabled
+
+    worker_required = coding_enabled() and backend == "opencode"
+    if worker_required and safe_git is None:
+        raise ValueError("enabled worker evidence requires controller Git publication")
     range_ref = f"{base_ref}...{head_ref}"
-    committed = runner(["git", "-C", str(checkout), "diff", "--name-only", range_ref])
-    stat = runner(["git", "-C", str(checkout), "diff", "--stat", range_ref])
+    def git_run(*args: str) -> subprocess.CompletedProcess[str]:
+        if safe_git is not None:
+            return safe_git.run(*args)
+        return runner(["git", "-C", str(checkout), *args])
+
+    committed = git_run("diff", "--name-only", range_ref)
+    stat = git_run("diff", "--stat", range_ref)
     status = None
     if include_checkout_status:
-        status = runner([
-            "git",
-            "-C",
-            str(checkout),
+        status = git_run(
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
-        ])
+        )
     path_groups = [[line for line in committed.stdout.splitlines() if line.strip()]]
     if status is not None:
         path_groups.append(_paths_from_status(status.stdout))
@@ -257,7 +289,7 @@ def _observe_evidence_from_ref(
     tests: TestResult | None = None
     checkout_result = None
     if checkout_ref:
-        checkout_result = runner(["git", "-C", str(checkout), "checkout", "--detach", checkout_ref])
+        checkout_result = git_run("checkout", "--detach", checkout_ref)
         commands.append(
             CommandResult(
                 f"git checkout --detach {checkout_ref}",
@@ -271,7 +303,25 @@ def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            test = runner(test_command, cwd=checkout)
+            if worker_required:
+                if compute is None:
+                    raise ValueError("enabled worker evidence requires a compute backend")
+                if work_spec is None:
+                    raise ValueError("worker evidence requires the originating WorkSpec")
+                result = await _run_compute_gate(
+                    test_command,
+                    checkout=checkout,
+                    work_spec=work_spec,
+                    compute=compute,
+                )
+                test = subprocess.CompletedProcess(
+                    ["/bin/sh", "-c", test_command],
+                    result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+            else:
+                test = runner(test_command, cwd=checkout)
             tests = TestResult(test_command, test.returncode, _summarize_test_output(test))
             commands.append(CommandResult(test_command, test.returncode, _summarize(test)))
 
@@ -299,6 +349,28 @@ def _observe_evidence_from_ref(
         and (status is None or status.returncode == 0),
     )
     return validate_evidence(evidence)
+
+
+async def _run_compute_gate(
+    command: str,
+    *,
+    checkout: Path,
+    work_spec: WorkSpec,
+    compute: ComputeBackend,
+) -> ComputeResult:
+    gate_spec = replace(
+        work_spec,
+        local_checkout=checkout,
+        local_argv=("/bin/sh", "-c", command),
+    )
+    handle = await compute.launch(gate_spec)
+    try:
+        return await compute.wait(handle, gate_spec.timeout_s)
+    except asyncio.CancelledError:
+        await compute.cancel(handle)
+        raise
+    finally:
+        await compute.cleanup(handle)
 
 
 def _common_status(status: str) -> str:

@@ -1448,6 +1448,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
                 "base_fetch": True,
                 "event_logger": None,
                 "runner": runner,
+                "worker_eligible": False,
             },
         )
     ]
@@ -1872,3 +1873,456 @@ def test_commit_checkout_changes_commits_clean_diff() -> None:
 
     _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is True
+
+
+def test_authorized_startup_snapshot_uses_publication_only(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    calls = []
+
+    class Publication:
+        def run(self, *args):
+            calls.append(args)
+            if args[0] == "rev-parse":
+                return cp(args, stdout="abc123\n")
+            return cp(args, stdout="?? changed.txt\n")
+
+    def forbidden_runner(args):
+        raise AssertionError(f"controller Git fallback used: {args}")
+
+    result = orchestrator._checkout_snapshot(
+        tmp_path,
+        runner=forbidden_runner,
+        publication=Publication(),
+    )
+
+    assert result == ("abc123", "?? changed.txt\n")
+    assert calls == [
+        ("rev-parse", "HEAD"),
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+    ]
+
+
+def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    calls = []
+
+    class Publication:
+        def run(self, *args):
+            calls.append(args)
+            if args == ("diff", "--cached", "--quiet"):
+                return cp(args, returncode=1)
+            if args == ("rev-parse", "HEAD"):
+                return cp(args, stdout="a" * 40 + "\n")
+            return cp(args)
+
+        def push(self):
+            calls.append(("push",))
+            return cp(["git", "push"])
+
+    def forbidden_runner(args):
+        raise AssertionError(f"controller Git fallback used: {args}")
+
+    publication = Publication()
+    issue = IssueContext(1, "title", "body", set())
+    orchestrator._commit_checkout_changes(
+        tmp_path,
+        issue,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    orchestrator._ensure_clean_checkout(
+        tmp_path,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    orchestrator._git_push(
+        tmp_path,
+        "issue/1-a1",
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    validation = EvidenceValidation(
+        "completed",
+        True,
+        (),
+        WorklinkEvidence(
+            1,
+            1,
+            "opencode",
+            "issue/1-a1",
+            str(tmp_path),
+            "start",
+            "finish",
+            ["changed.txt"],
+            "stat",
+            [],
+            None,
+            None,
+            "completed",
+        ),
+    )
+    updated = orchestrator._with_head_sha(
+        validation,
+        tmp_path,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+
+    assert updated.evidence.head_sha == "a" * 40
+    assert ("add", "-A") in calls
+    assert ("commit", "-m", "worklink: issue #1") in calls
+    assert ("push",) in calls
+
+
+def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: Path) -> None:
+    from mimir.worklink.safe_git import ControllerGitPublication
+    import mimir.worklink.orchestrator as orchestrator
+
+    trusted = tmp_path / "trusted"
+    checkout = tmp_path / "checkout"
+    remote = tmp_path / "remote.git"
+    metadata = tmp_path / "metadata"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(trusted)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(trusted), "config", "user.name", "controller"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "config", "user.email", "controller@example.com"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "remote", "add", "origin", str(remote)], check=True)
+    (trusted / "tracked.txt").write_text("old\n")
+    subprocess.run(["git", "-C", str(trusted), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "commit", "-q", "-m", "seed"], check=True)
+    subprocess.run(["git", "clone", "-q", str(trusted), str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "-b", "issue/1-a1"], check=True)
+    fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        publication = ControllerGitPublication.capture(
+            fd,
+            trusted,
+            "issue/1-a1",
+            metadata,
+        )
+    finally:
+        os.close(fd)
+    marker = tmp_path / "executed"
+    hooks = checkout / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    included = checkout / "hostile.config"
+    included.write_text(f"[core]\n\tfsmonitor = touch {marker}\n")
+    subprocess.run(["git", "-C", str(checkout), "config", "core.hooksPath", str(hooks)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "include.path", str(included)], check=True)
+    (checkout / "tracked.txt").write_text("new\n")
+
+    try:
+        orchestrator._commit_checkout_changes(
+            checkout,
+            IssueContext(1, "title", "body", set()),
+            runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
+            publication=publication,
+        )
+        orchestrator._ensure_clean_checkout(
+            checkout,
+            runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
+            publication=publication,
+        )
+    finally:
+        publication.close()
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "delete_checkout"),
+    [
+        ("success", True),
+        ("blocked", False),
+        ("failed", False),
+        ("pre_launch_exception", False),
+        ("work_spec_exception", False),
+        ("evidence_exception", False),
+        ("commit_push_pr_exception", False),
+        ("publication_exception", False),
+    ],
+)
+def test_worker_capabilities_close_in_order_and_retain_non_success(
+    tmp_path: Path,
+    scenario: str,
+    delete_checkout: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    checkout = tmp_path / scenario
+    checkout.mkdir()
+    (checkout / "output.txt").write_text("worker output\n")
+    closed = []
+
+    class Publication:
+        def close(self):
+            closed.append("publication")
+            if scenario == "publication_exception":
+                raise RuntimeError("publication close failed")
+
+    class Authorization:
+        def close(self):
+            closed.append("authorization")
+
+    if scenario == "publication_exception":
+        with pytest.raises(RuntimeError, match="publication close failed"):
+            orchestrator._close_attempt_capabilities(
+                Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+            )
+    else:
+        orchestrator._close_attempt_capabilities(
+            Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+        )
+
+    assert closed == ["publication", "authorization"]
+    assert checkout.exists() is (not delete_checkout)
+    if not delete_checkout:
+        assert (checkout / "output.txt").read_text() == "worker output\n"
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "success",
+        "blocked",
+        "failed",
+        "work_spec_exception",
+        "pre_launch_exception",
+        "evidence_exception",
+        "commit_exception",
+        "push_exception",
+        "pr_exception",
+        "publication_exception",
+    ],
+)
+def test_authorized_runner_closes_real_attempt_capabilities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.compute import ComputeLaunchError, LocalSubprocessComputeBackend
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / "authorized-checkout"
+    checkout.mkdir()
+    (checkout / ".git" / "objects").mkdir(parents=True)
+    lifecycle = []
+    checkout_kwargs = {}
+    bound_specs = []
+
+    class Authorization:
+        def __init__(self):
+            self.closed = 0
+            self.fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+
+        def duplicate_fd(self):
+            assert self.closed == 0
+            return os.dup(self.fd)
+
+        def close(self):
+            self.closed += 1
+            lifecycle.append("authorization")
+            if self.fd >= 0:
+                os.close(self.fd)
+                self.fd = -1
+
+    authorization = Authorization()
+
+    class Publication:
+        def __init__(self):
+            self.closed = 0
+            self.calls = []
+            self.commit_seen = False
+
+        def run(self, *args, check=False):
+            assert self.closed == 0
+            self.calls.append(args)
+            if scenario == "publication_exception" and args[:2] == ("diff", "--name-only"):
+                raise RuntimeError("publication failed")
+            if args[:2] == ("diff", "--name-only"):
+                return cp(args, stdout="changed.txt\n")
+            if args[:2] == ("diff", "--stat"):
+                return cp(args, stdout=" changed.txt | 1 +\n")
+            if args[0] == "status":
+                return cp(args, stdout="" if self.commit_seen else "?? changed.txt\n")
+            if args == ("diff", "--cached", "--quiet"):
+                return cp(args, returncode=1)
+            if args == ("diff", "--cached", "-U0"):
+                return cp(args)
+            if args[0] == "commit":
+                if scenario == "commit_exception":
+                    return cp(args, returncode=1, stderr="commit failed")
+                self.commit_seen = True
+                return cp(args)
+            if args == ("rev-parse", "HEAD"):
+                return cp(args, stdout="a" * 40 + "\n")
+            return cp(args)
+
+        def push(self):
+            assert self.closed == 0
+            self.calls.append(("push",))
+            if scenario == "push_exception":
+                return cp(["git", "push"], returncode=1, stderr="push failed")
+            return cp(["git", "push"])
+
+        def close(self):
+            self.closed += 1
+            lifecycle.append("publication")
+
+    publication = Publication()
+
+    class BoundCompute:
+        name = "local_subprocess"
+
+        def capabilities(self):
+            return ComputeCaps(True, False, True, False)
+
+        async def launch(self, spec):
+            bound_specs.append(spec)
+            if scenario == "pre_launch_exception" and len(bound_specs) == 1:
+                raise ComputeLaunchError("launch failed")
+            return LaunchHandle("local_subprocess", f"job-{len(bound_specs)}")
+
+        async def wait(self, handle, timeout_s):
+            return ComputeResult(0, "build ok", "", handle=handle)
+
+        async def cleanup(self, handle):
+            return None
+
+        async def cancel(self, handle):
+            return None
+
+    bound = BoundCompute()
+
+    class WorkerBackend(FakeBackend):
+        name = "opencode"
+
+        def work_spec(self, order, **kwargs):
+            if scenario == "work_spec_exception":
+                raise RuntimeError("work spec failed")
+            return WorkSpec(
+                order.issue_id,
+                kwargs["attempt"],
+                kwargs["repo_url"],
+                kwargs["base_ref"],
+                kwargs["branch"],
+                order.prompt,
+                order.rules,
+                kwargs["test_command"],
+                self.name,
+                order.timeout_s,
+                local_checkout=order.checkout,
+                local_argv=("opencode", "run"),
+            )
+
+        async def invoke_with_startup_retry(self, invoke, **kwargs):
+            return await invoke()
+
+        async def interpret(self, order, result):
+            (order.checkout / "changed.txt").write_text("generated\n")
+            if scenario == "blocked":
+                return RawResult(
+                    0,
+                    order.transcript_root / "run.json",
+                    "blocked",
+                    None,
+                    blocked_reason="design conflict",
+                )
+            if scenario in {"failed", "pre_launch_exception"}:
+                return RawResult(
+                    1, order.transcript_root / "run.json", "failed", "build failed"
+                )
+            return RawResult(0, order.transcript_root / "run.json", "success", None)
+
+    backend = WorkerBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    def create_checkout(_repo, **kwargs):
+        checkout_kwargs.update(kwargs)
+        return CheckoutLease(
+            1410,
+            1,
+            repo,
+            checkout,
+            "issue/1410-a1",
+            "main",
+            local_base="base-sha",
+            isolated_checkout=True,
+            worker_authorized=True,
+            authorization=authorization,
+        )
+
+    def capture(*args, **kwargs):
+        lifecycle.append("publication-acquired")
+        return publication
+
+    def bind(cls, auth, **kwargs):
+        assert auth is authorization
+        lifecycle.append("authorization-bound")
+        return bound
+
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "1410"]:
+            return cp(args, stdout=ISSUE_JSON.replace('"id": 441', '"id": 1410'))
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            if scenario == "pr_exception":
+                return cp(args, returncode=1, stderr="PR failed")
+            return cp(args, stdout="https://github.com/example/repo/pull/1\n")
+        return cp(args)
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
+    monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
+    monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
+    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_authorized_checkout", classmethod(bind))
+    if scenario == "evidence_exception":
+        async def fail_evidence(**kwargs):
+            raise RuntimeError("evidence failed")
+        monkeypatch.setattr(orchestrator, "observe_evidence", fail_evidence)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            1410, backend_name="opencode", test_command="pytest -q"
+        )
+    )
+
+    assert checkout_kwargs["worker_eligible"] is True
+    assert lifecycle.count("publication-acquired") == 1
+    assert lifecycle.count("authorization-bound") == 1
+    assert lifecycle[-2:] == ["publication", "authorization"]
+    assert publication.closed == 1
+    assert authorization.closed == 1
+    expected_success = scenario == "success"
+    assert result.status == ("completed" if expected_success else ("blocked" if scenario == "blocked" else "failed"))
+    assert checkout.exists() is (not expected_success)
+    expected_launches = {
+        "work_spec_exception": 0,
+        "pre_launch_exception": 1,
+        "failed": 1,
+        "evidence_exception": 1,
+        "publication_exception": 1,
+        "blocked": 2,
+        "commit_exception": 2,
+        "success": 3,
+        "push_exception": 3,
+        "pr_exception": 3,
+    }
+    assert len(bound_specs) == expected_launches[scenario]
+    if scenario == "success":
+        assert bound_specs[0].local_argv == ("opencode", "run")
+        assert all(
+            spec.local_argv == ("/bin/sh", "-c", "pytest -q")
+            for spec in bound_specs[1:]
+        )
+        assert ("push",) in publication.calls
