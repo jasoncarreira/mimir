@@ -90,7 +90,7 @@ RUN groupadd --gid 1001 mimir \
     && useradd --no-create-home --uid 1002 --gid worklink --home-dir /nonexistent --shell /usr/sbin/nologin worklink \
     && chmod 0700 /home/mimir \
     && install -d -o root -g root -m 0711 /var/lib/mimir-worklink \
-    && install -d -o root -g mimir -m 0731 /var/lib/mimir-worklink/checkouts \
+    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts \
     && install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes
 USER mimir
 # Land ``docker exec -it <ctn> bash`` at a predictable home dir.
@@ -129,8 +129,12 @@ USER root
 RUN python3 -m venv /opt/mimir-worklink/venv \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
+COPY --chown=root:root pyproject.toml README.md LICENSE .env.example /opt/mimir-worklink/source/
+COPY --chown=root:root docs/ /opt/mimir-worklink/source/docs/
 COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
-RUN chown -R root:root /opt/mimir-worklink \
+RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source \
+    && rm -rf /opt/mimir-worklink/source \
+    && chown -R root:root /opt/mimir-worklink \
     && chmod -R go-w /opt/mimir-worklink
 USER mimir
 
@@ -211,7 +215,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 RUN install -d -o root -g root -m 0755 /usr/local/libexec \
-    && printf '%s\n' '#!/bin/sh' 'export PYTHONPATH=/opt/mimir-worklink/source' 'exec /opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd \
+    && printf '%s\n' '#!/bin/sh' 'exec /opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd \
     && chmod 0755 /usr/local/libexec/worklink-execd \
     && chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run /etc/s6-overlay/s6-rc.d/worklink-execd/run
 ENTRYPOINT ["/init"]

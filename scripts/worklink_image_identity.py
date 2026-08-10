@@ -49,79 +49,115 @@ def wait_for_runtime() -> None:
 CONTROLLER_PROOF = r"""
 from __future__ import annotations
 import asyncio
+from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
-import uuid
-from mimir.worklink.worker_client import WorkerClient
 
-CHECKOUT = Path("/var/lib/mimir-worklink/checkouts/" + "a" * 64 + "/1410-1")
+from mimir.worklink.backends.base import WorkOrder
+from mimir.worklink.backends.opencode import OpenCodeBackend
+from mimir.worklink.checkout import cleanup_checkout, create_isolated_checkout
+from mimir.worklink.compute import LocalSubprocessComputeBackend
+from mimir.worklink.evidence import observe_evidence
+from mimir.worklink.safe_git import ControllerGitPublication
 
-class Capability:
-    path = CHECKOUT
-    issue_id = 1410
-    attempt = 1
-    def __init__(self):
-        self.fd = os.open(CHECKOUT, os.O_RDONLY | os.O_DIRECTORY)
-        observed = os.fstat(self.fd)
-        self.device = observed.st_dev
-        self.inode = observed.st_ino
-    def verify(self, local_checkout):
-        if Path(local_checkout) != CHECKOUT:
-            raise RuntimeError("checkout mismatch")
-    def duplicate_fd(self):
-        return os.dup(self.fd)
-
-async def execute(label, body):
-    capability = Capability()
-    try:
-        process = await WorkerClient(capability).launch(
-            local_checkout=CHECKOUT,
-            argv=("/bin/sh", "-ceu", body),
-            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "USER": "worklink", "LOGNAME": "worklink", "SHELL": "/bin/sh", "LANG": "C.UTF-8"},
-            identifier=str(uuid.uuid4()),
-        )
-        stdout, stderr, returncode = await asyncio.gather(
-            process.stdout.read(), process.stderr.read(), process.wait()
-        )
-        if returncode != 0:
-            raise RuntimeError(f"{label} failed ({returncode}) stdout={stdout!r} stderr={stderr!r}")
-        output = stdout.decode()
-        if f"{label}-euid=1002" not in output:
-            raise RuntimeError(f"{label} did not report worker identity: {output!r}")
-    finally:
-        os.close(capability.fd)
+REPO = Path("/home/mimir/worklink-source")
+METADATA = Path("/home/mimir/worklink-publication")
+CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
+DATA = Path("/home/mimir/worklink-opencode/data")
+CLI = "/tmp/opencode-proof"
 
 async def main():
     if os.geteuid() != 1001:
         raise RuntimeError("controller proof is not running as mimir")
-    await execute("build", r'''test "$(id -u)" = 1002
-printf 'build-euid=%s\n' "$(id -u)"
-case "$HOME" in /var/lib/mimir-worklink/homes/*) ;; *) exit 20 ;; esac
-cd "$HOME"
-! ls "$(dirname "$HOME")"
-! touch "$(dirname "$HOME")/parent-write"
-! touch "$(dirname "$HOME")/sibling"
-! mv "$HOME" "$(dirname "$HOME")/moved"
-! rmdir "$HOME"
-! cat /home/mimir/worklink-canary
-! printf attacked > /home/mimir/worklink-canary
-printf worker-modified > "$OLDPWD/tracked"
-printf worker-created > "$OLDPWD/created"
-rm "$OLDPWD/deleted"
-''')
-    if Path("/home/mimir/worklink-canary").read_text() != "controller-reset":
-        raise RuntimeError("worker changed controller canary")
-    if CHECKOUT.joinpath("tracked").read_text() != "worker-modified":
-        raise RuntimeError("controller could not continue from worker edit")
-    CHECKOUT.joinpath("controller-continuation").write_text("continued")
-    await execute("gate", r'''test "$(id -u)" = 1002
-printf 'gate-euid=%s\n' "$(id -u)"
+    os.environ.update({
+        "MIMIR_CODING_ENABLED": "true",
+        "MIMIR_MODEL_SPEC": "proof:model",
+        "OPENCODE_CONFIG": str(CONFIG),
+        "XDG_DATA_HOME": str(DATA),
+    })
+    lease = create_isolated_checkout(
+        REPO, issue_id=1410, attempt=1, base="main", worker_eligible=True
+    )
+    if not lease.worker_authorized or lease.authorization is None:
+        raise RuntimeError("production checkout factory did not authorize worker checkout")
+    source_object = next(REPO.joinpath(".git/objects").glob("[0-9a-f][0-9a-f]/*"))
+    checkout_object = lease.path / ".git/objects" / source_object.relative_to(REPO / ".git/objects")
+    if source_object.stat().st_ino == checkout_object.stat().st_ino:
+        raise RuntimeError("issued checkout retained a source hardlink")
+    checkout_fd = lease.authorization.duplicate_fd()
+    try:
+        publication = ControllerGitPublication.capture(
+            checkout_fd, REPO, lease.branch, METADATA
+        )
+    finally:
+        os.close(checkout_fd)
+    compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization)
+    backend = OpenCodeBackend(bin=CLI)
+    order = WorkOrder(
+        issue_id=1410,
+        checkout=lease.path,
+        prompt="apply the runtime proof edit",
+        rules=None,
+        timeout_s=30,
+        env={},
+    )
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url=str(REPO),
+        base_ref="main",
+        branch=lease.branch,
+        test_command="unused",
+    )
+    projections = spec.backend_config.get("worker_projections", ())
+    if len(projections) != 2:
+        raise RuntimeError("configured provider config and auth were not projected")
+    handle = await compute.launch(spec)
+    try:
+        result = await compute.wait(handle, spec.timeout_s)
+    finally:
+        await compute.cleanup(handle)
+    if result.exit_code != 0 or "build-euid=1002" not in result.stdout:
+        raise RuntimeError(f"production build failed: {result}")
+    if lease.path.joinpath("tracked").read_text() != "worker-modified":
+        raise RuntimeError("controller could not observe worker edit")
+    lease.path.joinpath("controller-continuation").write_text("continued")
+    gate = await observe_evidence(
+        issue=1410,
+        attempt=1,
+        backend="opencode",
+        branch=lease.branch,
+        checkout=lease.path,
+        started_at=datetime.now(UTC),
+        base_ref=lease.local_base,
+        backend_status="completed",
+        test_command=r'''test "$(id -u)" = 1002
+printf 'gate-euid=%s\\n' "$(id -u)"
 test "$(cat tracked)" = worker-modified
 test "$(cat created)" = worker-created
 test "$(cat controller-continuation)" = continued
 ! test -e deleted
+test -r "$HOME/.config/opencode/opencode.json"
+test -r "$HOME/.local/share/opencode/auth.json"
 ! cat /home/mimir/worklink-canary
-''')
+''',
+        safe_git=publication,
+        work_spec=spec,
+        compute=compute,
+    )
+    if gate.evidence.tests is None or gate.evidence.tests.exit_code != 0:
+        raise RuntimeError(f"production evidence gate failed: {gate}")
+    if "gate-euid=1002" not in (gate.evidence.tests.summary or ""):
+        raise RuntimeError("controller did not observe evidence-gate worker identity")
+    if "tracked" not in gate.evidence.files_changed:
+        raise RuntimeError("controller evidence did not observe worker changes")
+    if Path("/home/mimir/worklink-canary").read_text() != "controller-reset":
+        raise RuntimeError("worker changed controller canary")
+    cleanup_checkout(lease, outcome="completed", safe_git=publication)
+    publication.close()
+    if lease.path.exists():
+        raise RuntimeError("production checkout cleanup failed")
 
 asyncio.run(main())
 """
@@ -156,25 +192,71 @@ def main() -> None:
             /command/s6-setuidgid mimir sh -ceu 'printf controller-writable > /home/mimir/worklink-canary; printf controller-reset > /home/mimir/worklink-canary'
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             /command/s6-setuidgid mimir sh -ceu '
-              rm -rf /home/mimir/worklink-source
+              rm -rf /home/mimir/worklink-source /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
+              git init --bare -q /home/mimir/worklink-remote.git
               git init -q /home/mimir/worklink-source
               cd /home/mimir/worklink-source
+              git remote add origin /home/mimir/worklink-remote.git
               printf base > tracked
               printf remove > deleted
               git add tracked deleted
               git -c user.name=test -c user.email=test@example.com commit -qm base
+              git branch -M main
+              git push -q -u origin main
+              git config user.name test
+              git config user.email test@example.com
+              mkdir -p /home/mimir/worklink-opencode/data/opencode
             '
-            parent=/var/lib/mimir-worklink/checkouts/""" + "a" * 64 + """
-            checkout="$parent/1410-1"
-            rm -rf "$parent"
-            install -d -o mimir -g worklink -m 0710 "$parent"
-            /command/s6-setuidgid mimir git clone --local --no-hardlinks -q /home/mimir/worklink-source "$checkout"
-            source_object=$(find /home/mimir/worklink-source/.git/objects -type f | head -n 1)
-            relative=${source_object#/home/mimir/worklink-source/.git/objects/}
-            test "$(stat -c %d:%i "$checkout/.git/objects/$relative")" != "$(stat -c %d:%i "$source_object")"
-            chown -R mimir:worklink "$checkout"
-            find "$checkout" -type d -exec chmod 2770 {} +
-            find "$checkout" -type f -exec chmod 0660 {} +
+            cat > /home/mimir/worklink-opencode/opencode.json <<'JSON'
+{"model":"proof/model","provider":{"proof":{"endpoint":"https://proof.invalid","apiKey":"{env:PROOF_TOKEN}"},"unrelated":{"apiKey":"must-not-project"}}}
+JSON
+            cat > /home/mimir/worklink-opencode/data/opencode/auth.json <<'JSON'
+{"proof":{"type":"api","key":"projected-secret"},"unrelated":{"type":"api","key":"must-not-project"}}
+JSON
+            chown mimir:mimir /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            chmod 0600 /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            cat > /tmp/opencode-proof <<'PY'
+#!/opt/mimir-worklink/venv/bin/python
+import json
+import os
+from pathlib import Path
+import subprocess
+
+if os.geteuid() != 1002:
+    raise SystemExit("coding CLI did not run as worklink")
+home = Path(os.environ["HOME"])
+if home.parent != Path("/var/lib/mimir-worklink/homes"):
+    raise SystemExit("coding CLI received an invalid HOME")
+config = json.loads((home / ".config/opencode/opencode.json").read_text())
+auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
+if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "{env:PROOF_TOKEN}"}}}:
+    raise SystemExit("selected provider configuration was not projected exactly")
+if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
+    raise SystemExit("selected provider auth was not projected exactly")
+if os.environ.get("PROOF_TOKEN") != "provider-reference":
+    raise SystemExit("selected provider environment reference was not projected")
+checkout = Path.cwd()
+os.chdir(home)
+os.chdir(checkout)
+parent = home.parent
+checks = [
+    ["ls", str(parent)],
+    ["touch", str(parent / "parent-write")],
+    ["touch", str(parent / "sibling")],
+    ["mv", str(home), str(parent / "moved")],
+    ["rmdir", str(home)],
+    ["cat", "/home/mimir/worklink-canary"],
+    ["sh", "-c", "printf attacked > /home/mimir/worklink-canary"],
+]
+for command in checks:
+    if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        raise SystemExit(f"worker operation unexpectedly succeeded: {command}")
+checkout.joinpath("tracked").write_text("worker-modified")
+checkout.joinpath("created").write_text("worker-created")
+checkout.joinpath("deleted").unlink()
+print(f"build-euid={os.geteuid()}")
+PY
+            chmod 0755 /tmp/opencode-proof
         """
         docker_exec("/bin/sh", "-ceu", setup)
         docker_exec(
@@ -183,15 +265,13 @@ def main() -> None:
         )
         docker_exec(
             "/bin/sh", "-ceu",
-            "PYTHONPATH=/opt/mimir-worklink/source /opt/mimir-worklink/venv/bin/python /tmp/worklink-runtime-proof.py",
-            user="1001:1001",
+            "PROOF_TOKEN=provider-reference /opt/mimir-worklink/venv/bin/python /tmp/worklink-runtime-proof.py",
+            user="mimir",
         )
-        checkout = "/var/lib/mimir-worklink/checkouts/" + "a" * 64 + "/1410-1"
-        docker_exec("/bin/sh", "-ceu", f"""
+        docker_exec("/bin/sh", "-ceu", """
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
-            test "$(cat {checkout}/tracked)" = worker-modified
-            test "$(cat {checkout}/controller-continuation)" = continued
             test -z "$(find /var/lib/mimir-worklink/homes -mindepth 1 -maxdepth 1 -print -quit)"
+            test -z "$(find /var/lib/mimir-worklink/checkouts -mindepth 2 -maxdepth 2 -print -quit)"
         """)
         print("worklink shipped-image identity proof passed")
     finally:

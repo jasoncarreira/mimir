@@ -19,15 +19,17 @@ def test_image_declares_distinct_fixed_controller_and_worker_identities() -> Non
 
 def test_image_provisions_protected_worklink_roots() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
-    assert "install -d -o root -g mimir -m 0731 /var/lib/mimir-worklink/checkouts" in text
+    assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts" in text
     assert "install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes" in text
 
 
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" in text
+    assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
+    assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
-    assert "PYTHONPATH=/opt/mimir-worklink/source" in text
+    assert "PYTHONPATH=" not in text
     assert "/opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec" in text
     assert "chown -R root:root /opt/mimir-worklink" in text
     assert "chmod -R go-w /opt/mimir-worklink" in text
