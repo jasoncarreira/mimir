@@ -248,6 +248,11 @@ async def _observe_evidence_from_ref(
     pre_observed: bool = True,
 ) -> EvidenceValidation:
     runner = runner or _run
+    from .checkout import coding_enabled
+
+    worker_required = coding_enabled() and backend == "opencode"
+    if worker_required and safe_git is None:
+        raise ValueError("enabled worker evidence requires controller Git publication")
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:
@@ -298,9 +303,6 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            from .checkout import coding_enabled
-
-            worker_required = coding_enabled() and backend == "opencode"
             if worker_required:
                 if compute is None:
                     raise ValueError("enabled worker evidence requires a compute backend")

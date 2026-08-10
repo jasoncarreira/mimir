@@ -633,7 +633,7 @@ class WorklinkRunner:
                 compute_result = await backend.invoke_with_startup_retry(
                     invoke_backend,
                     issue_id=issue.issue_id,
-                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner),
+                    checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner, publication=publication),
                     event_logger=_log_event,
                 )
             else:
@@ -690,19 +690,15 @@ class WorklinkRunner:
             )
         finally:
             try:
-                if publication is not None:
-                    publication.close()
+                _close_attempt_capabilities(
+                    publication,
+                    lease.authorization if lease is not None else None,
+                    lease.path if lease is not None else None,
+                    delete_checkout=delete_authorized_checkout,
+                )
             finally:
-                try:
-                    if lease is not None and lease.authorization is not None:
-                        lease.authorization.close()
-                finally:
-                    try:
-                        if delete_authorized_checkout and lease is not None:
-                            shutil.rmtree(lease.path)
-                    finally:
-                        claims.release_issue(issue.issue_id)
-                        clear_run_state(self.home, issue.issue_id)
+                claims.release_issue(issue.issue_id)
+                clear_run_state(self.home, issue.issue_id)
 
     async def _finalize(
         self,
@@ -1953,6 +1949,25 @@ def _epic_stuck_reason(
     return None
 
 
+def _close_attempt_capabilities(
+    publication: ControllerGitPublication | None,
+    authorization: Any | None,
+    checkout: Path | None,
+    *,
+    delete_checkout: bool,
+) -> None:
+    try:
+        if publication is not None:
+            publication.close()
+    finally:
+        try:
+            if authorization is not None:
+                authorization.close()
+        finally:
+            if delete_checkout and checkout is not None:
+                shutil.rmtree(checkout)
+
+
 def _cleanup_checkout_after_transition(
     lease: CheckoutLease,
     *,
@@ -2476,12 +2491,21 @@ def _dirty_paths(repo: Path, *, runner: Runner) -> list[str]:
     return _paths_from_status(status.stdout)
 
 
-def _checkout_snapshot(checkout: Path, *, runner: Runner) -> tuple[str, str]:
+def _checkout_snapshot(
+    checkout: Path,
+    *,
+    runner: Runner,
+    publication: ControllerGitPublication | None = None,
+) -> tuple[str, str]:
     """Capture committed and working state so startup retry never repeats work."""
-    head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
-    status = runner([
-        "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
-    ])
+    if publication is not None:
+        head = publication.run("rev-parse", "HEAD")
+        status = publication.run("status", "--porcelain=v1", "--untracked-files=all")
+    else:
+        head = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+        status = runner([
+            "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
+        ])
     if head.returncode != 0 or status.returncode != 0:
         raise WorklinkError(
             (head.stderr or status.stderr or head.stdout or status.stdout).strip()

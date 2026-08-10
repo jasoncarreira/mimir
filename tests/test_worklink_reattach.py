@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import pytest
 from pathlib import Path
 from typing import Sequence
 
@@ -719,3 +720,95 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     )
     assert dispatched == []
     assert spawned == []
+
+
+@pytest.mark.parametrize(
+    ("scenario", "alive", "cancel_error", "expected_cancel"),
+    [
+        ("cancel_success", True, None, True),
+        ("term_kill_group_reap", True, None, True),
+        ("shim_identity_mismatch", False, None, False),
+        ("executor_error", True, RuntimeError("executor unavailable"), True),
+    ],
+)
+def test_worker_restart_is_cleanup_only_and_retains_checkout(
+    tmp_path: Path,
+    monkeypatch,
+    scenario: str,
+    alive: bool,
+    cancel_error: Exception | None,
+    expected_cancel: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / "authorized-checkout"
+    checkout.mkdir()
+    (checkout / "worker-output.txt").write_text("retain me\n")
+    issue_id = 1410
+    state = WorklinkRunState(
+        issue_id=issue_id,
+        attempt=1,
+        backend="opencode",
+        compute_name="local_subprocess",
+        handle_substrate="local_subprocess",
+        handle_identifier="123e4567-e89b-42d3-a456-426614174000",
+        branch="issue/1410-a1",
+        base_ref="main",
+        local_base="abc123",
+        repo=str(repo),
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        test_command="pytest -q",
+        started_at="2026-08-10T00:00:00+00:00",
+        checkout=str(checkout),
+        process_start_ticks=10,
+        shim_pid=4321,
+    )
+    save_run_state(tmp_path, state)
+    calls = []
+    runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
+    cancel_events = []
+
+    async def cancel(self, handle):
+        cancel_events.append(("cancel", handle))
+        if scenario == "term_kill_group_reap":
+            cancel_events.extend([("TERM", None), ("KILL", None), ("reap", None)])
+        if cancel_error is not None:
+            raise cancel_error
+
+    monkeypatch.setattr("mimir.worklink.orchestrator.process_is_alive", lambda _state: alive)
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.LocalSubprocessComputeBackend.cancel",
+        cancel,
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.observe_evidence",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("evidence must not run")),
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.ControllerGitPublication.capture",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("publication must not run")),
+    )
+
+    async def run_cleanup():
+        return await asyncio.wait_for(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner).reattach(issue_id),
+            timeout=1,
+        )
+
+    result = asyncio.run(run_cleanup())
+
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert checkout.is_dir()
+    assert (checkout / "worker-output.txt").read_text() == "retain me\n"
+    assert load_run_state(tmp_path, issue_id) is None
+    assert bool(cancel_events) is expected_cancel
+    assert ["chainlink", "locks", "release", str(issue_id)] in calls
+    assert not any(
+        isinstance(call, list)
+        and call[:3] == ["chainlink", "issue", "label"]
+        and "worklink:review" in call
+        for call in calls
+    )
+    if scenario == "term_kill_group_reap":
+        assert [event for event, _ in cancel_events] == ["cancel", "TERM", "KILL", "reap"]

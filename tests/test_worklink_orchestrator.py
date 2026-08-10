@@ -1873,3 +1873,213 @@ def test_commit_checkout_changes_commits_clean_diff() -> None:
 
     _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is True
+
+
+def test_authorized_startup_snapshot_uses_publication_only(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    calls = []
+
+    class Publication:
+        def run(self, *args):
+            calls.append(args)
+            if args[0] == "rev-parse":
+                return cp(args, stdout="abc123\n")
+            return cp(args, stdout="?? changed.txt\n")
+
+    def forbidden_runner(args):
+        raise AssertionError(f"controller Git fallback used: {args}")
+
+    result = orchestrator._checkout_snapshot(
+        tmp_path,
+        runner=forbidden_runner,
+        publication=Publication(),
+    )
+
+    assert result == ("abc123", "?? changed.txt\n")
+    assert calls == [
+        ("rev-parse", "HEAD"),
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+    ]
+
+
+def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    calls = []
+
+    class Publication:
+        def run(self, *args):
+            calls.append(args)
+            if args == ("diff", "--cached", "--quiet"):
+                return cp(args, returncode=1)
+            if args == ("rev-parse", "HEAD"):
+                return cp(args, stdout="a" * 40 + "\n")
+            return cp(args)
+
+        def push(self):
+            calls.append(("push",))
+            return cp(["git", "push"])
+
+    def forbidden_runner(args):
+        raise AssertionError(f"controller Git fallback used: {args}")
+
+    publication = Publication()
+    issue = IssueContext(1, "title", "body", set())
+    orchestrator._commit_checkout_changes(
+        tmp_path,
+        issue,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    orchestrator._ensure_clean_checkout(
+        tmp_path,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    orchestrator._git_push(
+        tmp_path,
+        "issue/1-a1",
+        runner=forbidden_runner,
+        publication=publication,
+    )
+    validation = EvidenceValidation(
+        "completed",
+        True,
+        (),
+        WorklinkEvidence(
+            1,
+            1,
+            "opencode",
+            "issue/1-a1",
+            str(tmp_path),
+            "start",
+            "finish",
+            ["changed.txt"],
+            "stat",
+            [],
+            None,
+            None,
+            "completed",
+        ),
+    )
+    updated = orchestrator._with_head_sha(
+        validation,
+        tmp_path,
+        runner=forbidden_runner,
+        publication=publication,
+    )
+
+    assert updated.evidence.head_sha == "a" * 40
+    assert ("add", "-A") in calls
+    assert ("commit", "-m", "worklink: issue #1") in calls
+    assert ("push",) in calls
+
+
+def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: Path) -> None:
+    from mimir.worklink.safe_git import ControllerGitPublication
+    import mimir.worklink.orchestrator as orchestrator
+
+    trusted = tmp_path / "trusted"
+    checkout = tmp_path / "checkout"
+    remote = tmp_path / "remote.git"
+    metadata = tmp_path / "metadata"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(trusted)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(trusted), "config", "user.name", "controller"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "config", "user.email", "controller@example.com"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "remote", "add", "origin", str(remote)], check=True)
+    (trusted / "tracked.txt").write_text("old\n")
+    subprocess.run(["git", "-C", str(trusted), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(trusted), "commit", "-q", "-m", "seed"], check=True)
+    subprocess.run(["git", "clone", "-q", str(trusted), str(checkout)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "-b", "issue/1-a1"], check=True)
+    fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        publication = ControllerGitPublication.capture(
+            fd,
+            trusted,
+            "issue/1-a1",
+            metadata,
+        )
+    finally:
+        os.close(fd)
+    marker = tmp_path / "executed"
+    hooks = checkout / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    included = checkout / "hostile.config"
+    included.write_text(f"[core]\n\tfsmonitor = touch {marker}\n")
+    subprocess.run(["git", "-C", str(checkout), "config", "core.hooksPath", str(hooks)], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "include.path", str(included)], check=True)
+    (checkout / "tracked.txt").write_text("new\n")
+
+    try:
+        orchestrator._commit_checkout_changes(
+            checkout,
+            IssueContext(1, "title", "body", set()),
+            runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
+            publication=publication,
+        )
+        orchestrator._ensure_clean_checkout(
+            checkout,
+            runner=lambda args: (_ for _ in ()).throw(AssertionError(args)),
+            publication=publication,
+        )
+    finally:
+        publication.close()
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "delete_checkout"),
+    [
+        ("success", True),
+        ("blocked", False),
+        ("failed", False),
+        ("pre_launch_exception", False),
+        ("work_spec_exception", False),
+        ("evidence_exception", False),
+        ("commit_push_pr_exception", False),
+        ("publication_exception", False),
+    ],
+)
+def test_worker_capabilities_close_in_order_and_retain_non_success(
+    tmp_path: Path,
+    scenario: str,
+    delete_checkout: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    checkout = tmp_path / scenario
+    checkout.mkdir()
+    (checkout / "output.txt").write_text("worker output\n")
+    closed = []
+
+    class Publication:
+        def close(self):
+            closed.append("publication")
+            if scenario == "publication_exception":
+                raise RuntimeError("publication close failed")
+
+    class Authorization:
+        def close(self):
+            closed.append("authorization")
+
+    if scenario == "publication_exception":
+        with pytest.raises(RuntimeError, match="publication close failed"):
+            orchestrator._close_attempt_capabilities(
+                Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+            )
+    else:
+        orchestrator._close_attempt_capabilities(
+            Publication(), Authorization(), checkout, delete_checkout=delete_checkout
+        )
+
+    assert closed == ["publication", "authorization"]
+    assert checkout.exists() is (not delete_checkout)
+    if not delete_checkout:
+        assert (checkout / "output.txt").read_text() == "worker output\n"

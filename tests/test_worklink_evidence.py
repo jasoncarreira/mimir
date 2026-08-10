@@ -389,6 +389,15 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     compute = Compute()
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
+    class Publication:
+        def run(self, *args, check=False):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+                check=check,
+            )
+
     result = await observe_evidence(
         issue=1,
         attempt=1,
@@ -401,8 +410,29 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
         test_command="pytest -q",
         work_spec=spec,
         compute=compute,
+        safe_git=Publication(),
     )
 
     assert result.review_ready is True
     assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
     assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
+
+
+@pytest.mark.asyncio
+async def test_enabled_opencode_evidence_refuses_controller_git_fallback(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="requires controller Git publication"):
+        await observe_evidence(
+            issue=1,
+            attempt=1,
+            backend="opencode",
+            branch="branch",
+            checkout=tmp_path,
+            started_at=datetime.now(UTC),
+            base_ref="main",
+            backend_status="failed",
+            test_command=None,
+        )
