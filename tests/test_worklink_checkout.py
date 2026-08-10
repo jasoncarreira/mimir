@@ -887,9 +887,10 @@ def test_enabled_coding_uses_bounded_hashed_checkout_path(
 
     path = checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2)
 
-    assert path.parent.parent == root
-    assert len(path.parent.name) == 64
-    assert path.name == "1410-2"
+    assert path.parent.parent.parent == root
+    assert len(path.parent.parent.name) == 64
+    assert path.parent.name == "1410-2"
+    assert path.name == "checkout"
 
 
 def test_enabled_clone_uses_no_hardlinks() -> None:
@@ -983,7 +984,8 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
     try:
         assert lease.worker_authorized is True
         assert lease.authorization is not None
-        assert lease.path.parent.parent == enabled_root
+        assert lease.path.parent.parent.parent == enabled_root
+        assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
         lease.authorization.verify(lease.path)
         retained = lease.authorization.duplicate_fd()
         try:
@@ -1063,7 +1065,7 @@ def test_normalization_preflight_leaves_valid_entries_unchanged_on_special_file(
 def test_authorized_cleanup_git_sink_inventory_is_closed() -> None:
     source = inspect.getsource(cleanup_checkout)
     authorized = source.split("if lease.worker_authorized:", 1)[1].split(
-        "shutil.rmtree(lease.path)", 1
+        "shutil.rmtree(lease.path.parent)", 1
     )[0]
 
     assert 'safe_git.run("update-ref"' in authorized

@@ -52,5 +52,9 @@ def test_executor_service_recreates_ephemeral_socket_layout() -> None:
 
 def test_ci_runs_the_committed_live_image_proof() -> None:
     workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    proof = (ROOT / "scripts/worklink_image_identity.py").read_text(encoding="utf-8")
     assert "worklink-image-identity:" in workflow
     assert "uv run python scripts/worklink_image_identity.py" in workflow
+    assert "sibling-access negative control did not detect a cross-write" in proof
+    assert "worker reached concurrent sibling checkout" in proof
+    assert "issue_id=1411" in proof
