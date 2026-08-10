@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import yaml
 
+import mimir
 import mimir.acp.agent as agent_module
 from mimir.acp import sdk
 from mimir.acp.agent import ActivePrompt, MimirAcpAgent
@@ -1413,7 +1414,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
                 "connectionId": "opaque-1", "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-03-26", "capabilities": {},
-                    "clientInfo": {"name": "mimir", "version": "0.7.4"},
+                    "clientInfo": {"name": "mimir", "version": mimir.__version__},
                 },
             },
         }
