@@ -31,7 +31,7 @@ from .backends import (
     WorklinkConfig,
     checkout_shape_for_backend,
 )
-from .compute import ComputeLaunchError, ComputeResult, LaunchHandle
+from .compute import ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubprocessComputeBackend
 from .claims import ChainlinkClaims, ClaimRecord
 from .evidence import (
     EvidenceValidation,
@@ -51,10 +51,11 @@ from .run_state import (
     process_start_ticks,
     save_run_state,
 )
-from .checkout import CheckoutLease, cleanup_checkout, create_isolated_checkout
+from .checkout import CheckoutLease, cleanup_checkout, coding_enabled, create_isolated_checkout
 from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import contains_secret
+from .safe_git import ControllerGitPublication
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
@@ -361,6 +362,11 @@ class WorklinkRunner:
         )
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         selected_name = backend.name
+        worker_required = (
+            coding_enabled()
+            and isinstance(backend, OpenCodeBackend)
+            and compute.name == "local_subprocess"
+        )
         test_cmd = (
             test_command
             if test_command is not None
@@ -489,6 +495,8 @@ class WorklinkRunner:
         )
 
         lease: CheckoutLease | None = None
+        publication: ControllerGitPublication | None = None
+        delete_authorized_checkout = False
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -499,7 +507,24 @@ class WorklinkRunner:
                 base_fetch=config.defaults.base_fetch,
                 event_logger=_log_event,
                 runner=_list_runner(runner),
+                worker_eligible=worker_required,
             )
+            if worker_required:
+                if lease.authorization is None:
+                    raise WorklinkError("worker checkout did not provide authorization")
+                if not isinstance(compute, LocalSubprocessComputeBackend):
+                    raise WorklinkError("worker checkout requires local subprocess compute")
+                compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization)
+                checkout_fd = lease.authorization.duplicate_fd()
+                try:
+                    publication = ControllerGitPublication.capture(
+                        checkout_fd,
+                        self.repo,
+                        lease.branch,
+                        self.home / "state" / "worklink" / "publication",
+                    )
+                finally:
+                    os.close(checkout_fd)
             if not lease.isolated_checkout:
                 _log_event(
                     "worklink_unsafe_backend_checkout",
@@ -613,7 +638,7 @@ class WorklinkRunner:
                 )
             else:
                 compute_result = await invoke_backend()
-            return await self._finalize(
+            result = await self._finalize(
                 issue=issue,
                 claims=claims,
                 claim_record=record,
@@ -629,7 +654,14 @@ class WorklinkRunner:
                 test_cmd=test_cmd,
                 root_dirty_before=root_dirty_before,
                 runner=runner,
+                publication=publication,
             )
+            delete_authorized_checkout = bool(
+                worker_required and result.review_ready and result.pr_url
+            )
+            if delete_authorized_checkout and publication is not None:
+                publication.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
+            return result
         except Exception as exc:
             try:
                 claims.transition_issue(
@@ -657,11 +689,20 @@ class WorklinkRunner:
                 branch=lease.branch if lease else None,
             )
         finally:
-            claims.release_issue(issue.issue_id)
-            # The run reached a terminal transition (or failed): the worker no
-            # longer needs reattaching. A process killed BEFORE here leaves the
-            # state file in place for the startup reconcile.
-            clear_run_state(self.home, issue.issue_id)
+            try:
+                if publication is not None:
+                    publication.close()
+            finally:
+                try:
+                    if lease is not None and lease.authorization is not None:
+                        lease.authorization.close()
+                finally:
+                    try:
+                        if delete_authorized_checkout and lease is not None:
+                            shutil.rmtree(lease.path)
+                    finally:
+                        claims.release_issue(issue.issue_id)
+                        clear_run_state(self.home, issue.issue_id)
 
     async def _finalize(
         self,
@@ -681,6 +722,7 @@ class WorklinkRunner:
         test_cmd: str | None,
         root_dirty_before: Sequence[str],
         runner: Runner,
+        publication: ControllerGitPublication | None = None,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -715,7 +757,7 @@ class WorklinkRunner:
         # compute substrate. Its capabilities declare shared_filesystem=True, so
         # the controller runs the diff/test re-derivation itself (no remote-fetch
         # gate, no folded trusted-test job).
-        validation = observe_evidence(
+        validation = await observe_evidence(
             issue=issue.issue_id,
             attempt=attempt,
             backend=selected_name,
@@ -731,6 +773,9 @@ class WorklinkRunner:
             failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
             skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
             runner=runner,
+            safe_git=publication,
+            work_spec=spec,
+            compute=compute,
         )
         validation = _with_outside_checkout_detection(
             validation,
@@ -743,13 +788,13 @@ class WorklinkRunner:
         )
         evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
-            _commit_checkout_changes(lease.path, issue, runner=runner)
+            _commit_checkout_changes(lease.path, issue, runner=runner, publication=publication)
             try:
-                _ensure_clean_checkout(lease.path, runner=runner)
+                _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
             except WorklinkError as exc:
                 validation = _failed_validation(validation, str(exc))
             else:
-                validation = observe_evidence(
+                validation = await observe_evidence(
                     issue=issue.issue_id,
                     attempt=attempt,
                     backend=selected_name,
@@ -767,6 +812,9 @@ class WorklinkRunner:
                         "executor exited nonzero before the test gate" if executor_failed else None
                     ),
                     runner=runner,
+                    safe_git=publication,
+                    work_spec=spec,
+                    compute=compute,
                 )
                 validation = _with_outside_checkout_detection(
                     validation,
@@ -777,7 +825,7 @@ class WorklinkRunner:
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
-                validation = _with_head_sha(validation, lease.path, runner=runner)
+                validation = _with_head_sha(validation, lease.path, runner=runner, publication=publication)
             evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             # chainlink #518: push from the checkout that OWNS the attempt
@@ -787,7 +835,7 @@ class WorklinkRunner:
             # remote); pushing from ``self.repo`` fails with
             # "src refspec <branch> does not match any". This is also correct
             # for the legacy worktree shape, which shares the parent's refs.
-            _git_push(lease.path, lease.branch, runner=runner)
+            _git_push(lease.path, lease.branch, runner=runner, publication=publication)
             pr_url = _open_pr(
                 self.repo,
                 issue,
@@ -841,13 +889,15 @@ class WorklinkRunner:
             review_ready=validation.review_ready,
             pr_url=pr_url,
         )
-        cleanup_error = _cleanup_checkout_after_transition(
-            lease,
-            outcome=validation.status,
-            runner=_list_runner(runner),
-            issue_id=issue.issue_id,
-            attempt=attempt,
-        )
+        cleanup_error = None
+        if publication is None:
+            cleanup_error = _cleanup_checkout_after_transition(
+                lease,
+                outcome=validation.status,
+                runner=_list_runner(runner),
+                issue_id=issue.issue_id,
+                attempt=attempt,
+            )
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -888,6 +938,47 @@ class WorklinkRunner:
             home_path=self.home,
             event_logger=_log_event,
         )
+        if state.shim_pid is not None:
+            handle = LaunchHandle(
+                state.handle_substrate,
+                state.handle_identifier,
+                state.process_start_ticks,
+                state.shim_pid,
+            )
+            reason = "reattach: worker interrupted by controller restart"
+            try:
+                if not process_is_alive(state):
+                    reason = "reattach: worker shim identity is stale"
+                else:
+                    await LocalSubprocessComputeBackend().cancel(handle)
+            except (KeyError, RuntimeError, OSError, ValueError) as exc:
+                reason = f"reattach: worker cleanup failed: {exc}"
+            try:
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=state.attempt,
+                    reason=reason,
+                )
+            finally:
+                claims.release_issue(issue_id)
+                clear_run_state(self.home, issue_id)
+            _log_event(
+                "worklink_reattach_cleanup",
+                issue_id=issue_id,
+                attempt=state.attempt,
+                reason=reason,
+            )
+            return WorklinkRunResult(
+                issue_id,
+                state.attempt,
+                "failed",
+                checkout=Path(state.checkout) if state.checkout else None,
+                branch=state.branch,
+                reason=reason,
+            )
+
         review_ready = claims.review_ready_evidence(issue_id)
         if review_ready is not None:
             try:
@@ -967,7 +1058,12 @@ class WorklinkRunner:
                 issue_id, state.attempt, "failed", reason="reattach: compute not resumable"
             )
 
-        handle = LaunchHandle(state.handle_substrate, state.handle_identifier)
+        handle = LaunchHandle(
+            state.handle_substrate,
+            state.handle_identifier,
+            state.process_start_ticks,
+            state.shim_pid,
+        )
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         test_cmd = state.test_command
         _log_event(
@@ -2042,6 +2138,7 @@ def _persist_run_state(
             started_at=started_at.astimezone(UTC).isoformat(),
             checkout=str(lease.path),
             process_start_ticks=handle.process_start_ticks,
+            shim_pid=handle.shim_pid,
             phase="spawned",
         ),
     )
@@ -2197,7 +2294,12 @@ def _comment_evidence(
     )
 
 
-def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None:
+def _assert_staged_diff_has_no_secret(
+    checkout: Path,
+    *,
+    runner: Runner,
+    publication: ControllerGitPublication | None = None,
+) -> None:
     """Refuse (raise ``WorklinkError``) if the staged diff adds a secret-shaped
     token — OR if the scan itself cannot run.
 
@@ -2219,7 +2321,11 @@ def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None
       false positives and would block benign generated content (a placeholder
       ``token=`` value in a doc/test).
     """
-    diff = runner(["git", "-C", str(checkout), "diff", "--cached", "-U0"])
+    diff = (
+        publication.run("diff", "--cached", "-U0")
+        if publication is not None
+        else runner(["git", "-C", str(checkout), "diff", "--cached", "-U0"])
+    )
     if diff.returncode != 0:
         raise WorklinkError(
             "cannot scan staged Worklink changes for secrets "
@@ -2236,24 +2342,28 @@ def _assert_staged_diff_has_no_secret(checkout: Path, *, runner: Runner) -> None
             )
 
 
-def _commit_checkout_changes(checkout: Path, issue: IssueContext, *, runner: Runner) -> None:
-    add = runner(["git", "-C", str(checkout), "add", "-A"])
+def _commit_checkout_changes(
+    checkout: Path,
+    issue: IssueContext,
+    *,
+    runner: Runner,
+    publication: ControllerGitPublication | None = None,
+) -> None:
+    def run_git(*args: str) -> subprocess.CompletedProcess[str]:
+        if publication is not None:
+            return publication.run(*args)
+        return runner(["git", "-C", str(checkout), *args])
+
+    add = run_git("add", "-A")
     if add.returncode != 0:
         raise WorklinkError((add.stderr or add.stdout).strip() or "git add failed")
-    staged = runner(["git", "-C", str(checkout), "diff", "--cached", "--quiet"])
+    staged = run_git("diff", "--cached", "--quiet")
     if staged.returncode == 0:
         raise WorklinkError("no staged Worklink changes to commit")
     # Fail closed before commit/push/PR if the backend staged a secret (or if
     # the scan cannot run).
-    _assert_staged_diff_has_no_secret(checkout, runner=runner)
-    commit = runner([
-        "git",
-        "-C",
-        str(checkout),
-        "commit",
-        "-m",
-        f"worklink: issue #{issue.issue_id}",
-    ])
+    _assert_staged_diff_has_no_secret(checkout, runner=runner, publication=publication)
+    commit = run_git("commit", "-m", f"worklink: issue #{issue.issue_id}")
     if commit.returncode != 0:
         raise WorklinkError((commit.stderr or commit.stdout).strip() or "git commit failed")
 
@@ -2268,6 +2378,7 @@ def _create_backend_checkout(
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
     base_fetch: bool = True,
     event_logger: Callable[..., None] | None = None,
+    worker_eligible: bool = False,
 ) -> CheckoutLease:
     shape = checkout_shape_for_backend(backend)
     if shape is not CheckoutShape.ISOLATED_CLONE:
@@ -2280,6 +2391,7 @@ def _create_backend_checkout(
         base_fetch=base_fetch,
         event_logger=event_logger,
         runner=runner,
+        worker_eligible=worker_eligible,
     )
 
 
@@ -2408,18 +2520,37 @@ def _paths_from_status(output: str) -> list[str]:
     return paths
 
 
-def _ensure_clean_checkout(checkout: Path, *, runner: Runner) -> None:
-    status = runner([
-        "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
-    ])
+def _ensure_clean_checkout(
+    checkout: Path,
+    *,
+    runner: Runner,
+    publication: ControllerGitPublication | None = None,
+) -> None:
+    status = (
+        publication.run("status", "--porcelain=v1", "--untracked-files=all")
+        if publication is not None
+        else runner([
+            "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
+        ])
+    )
     if status.returncode != 0:
         raise WorklinkError((status.stderr or status.stdout).strip() or "git status failed")
     if status.stdout.strip():
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 
-def _git_push(repo: Path, branch: str, *, runner: Runner) -> None:
-    result = runner(["git", "-C", str(repo), "push", "-u", "origin", branch])
+def _git_push(
+    repo: Path,
+    branch: str,
+    *,
+    runner: Runner,
+    publication: ControllerGitPublication | None = None,
+) -> None:
+    result = (
+        publication.push()
+        if publication is not None
+        else runner(["git", "-C", str(repo), "push", "-u", "origin", branch])
+    )
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "git push failed")
 
@@ -2546,8 +2677,13 @@ def _with_head_sha(
     checkout: Path,
     *,
     runner: Runner,
+    publication: ControllerGitPublication | None = None,
 ) -> EvidenceValidation:
-    result = runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    result = (
+        publication.run("rev-parse", "HEAD")
+        if publication is not None
+        else runner(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+    )
     head_sha = result.stdout.strip() if result.returncode == 0 else ""
     if not head_sha:
         return validation

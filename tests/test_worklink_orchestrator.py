@@ -1448,6 +1448,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
                 "base_fetch": True,
                 "event_logger": None,
                 "runner": runner,
+                "worker_eligible": False,
             },
         )
     ]
