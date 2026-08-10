@@ -258,9 +258,10 @@ def stop_worklink(
             )
 
         handle = LaunchHandle(
-            state.handle_substrate,
-            state.handle_identifier,
-            state.process_start_ticks,
+            substrate=state.handle_substrate,
+            identifier=state.handle_identifier,
+            process_start_ticks=state.process_start_ticks,
+            shim_pid=state.shim_pid,
         )
         try:
             asyncio.run(LocalSubprocessComputeBackend().cancel(handle))
@@ -302,6 +303,9 @@ def reconcile_run_states(
                     reason="unparseable run state",
                 )
     for state in known_paths.values():
+        if state.shim_pid is not None:
+            alive.append(state)
+            continue
         if state.compute_name != "local_subprocess" or process_is_alive(state):
             alive.append(state)
             continue

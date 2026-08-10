@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import asyncio
 import subprocess
+import pytest
 from pathlib import Path
 from typing import Sequence
 
@@ -117,7 +119,8 @@ def test_blocked_reason_does_not_require_diff_or_tests() -> None:
     assert result.reasons == ()
 
 
-def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -127,7 +130,7 @@ def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -> None
     subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
 
-    result = observe_evidence(
+    result = await observe_evidence(
         issue=466,
         attempt=1,
         backend="codex",
@@ -225,7 +228,8 @@ def test_completed_requires_observed_diff() -> None:
     assert "diff_not_observed" in result.reasons
 
 
-def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -236,7 +240,7 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "a.txt").write_text("new\n")
 
-    result = observe_evidence(
+    result = await observe_evidence(
         issue=439,
         attempt=1,
         backend="codex",
@@ -254,7 +258,8 @@ def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Path) ->
     assert result.evidence.tests.exit_code == 0
 
 
-def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_path: Path) -> None:
     commands: list[Sequence[str] | str] = []
 
     def runner(
@@ -265,7 +270,7 @@ def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_path: P
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     unsafe_reason = "ignored earlier line\nprovider token=top-secret " + ("x" * 1200)
-    result = observe_evidence(
+    result = await observe_evidence(
         issue=1063,
         attempt=1,
         backend="opencode",
@@ -294,7 +299,8 @@ def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_path: P
     )
 
 
-def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -305,7 +311,7 @@ def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
     (repo / "new_module.py").write_text("print('new')\n")
 
-    result = observe_evidence(
+    result = await observe_evidence(
         issue=439,
         attempt=1,
         backend="codex",
@@ -321,7 +327,8 @@ def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
     assert result.evidence.files_changed == ["new_module.py"]
 
 
-def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -335,7 +342,7 @@ def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
     subprocess.run(["git", "add", "new_test.py"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "backend work"], cwd=repo, check=True)
 
-    result = observe_evidence(
+    result = await observe_evidence(
         issue=439,
         attempt=1,
         backend="codex",
@@ -349,3 +356,209 @@ def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> None:
 
     assert result.review_ready is True
     assert result.evidence.files_changed == ["new_test.py"]
+
+
+@pytest.mark.asyncio
+async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path) -> None:
+    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+
+    class Compute:
+        def __init__(self) -> None:
+            self.specs = []
+            self.cleaned = []
+
+        async def launch(self, spec):
+            self.specs.append(spec)
+            return LaunchHandle("local_subprocess", "job")
+
+        async def wait(self, handle, timeout_s):
+            return ComputeResult(0, "passed", "", handle=handle)
+
+        async def cleanup(self, handle):
+            self.cleaned.append(handle)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("old\n")
+    subprocess.run(["git", "add", "a.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("new\n")
+    spec = WorkSpec(1, 1, "url", "main", "branch", "prompt", None, "", "opencode", 30, local_checkout=repo, local_argv=("opencode",))
+    compute = Compute()
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+
+    class Publication:
+        def run(self, *args, check=False):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+                check=check,
+            )
+
+    result = await observe_evidence(
+        issue=1,
+        attempt=1,
+        backend="opencode",
+        branch="branch",
+        checkout=repo,
+        started_at=datetime.now(UTC),
+        base_ref="main",
+        backend_status="completed",
+        test_command="pytest -q",
+        work_spec=spec,
+        compute=compute,
+        safe_git=Publication(),
+    )
+
+    assert result.review_ready is True
+    assert compute.specs[0].local_argv == ("/bin/sh", "-c", "pytest -q")
+    assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
+
+
+@pytest.mark.asyncio
+async def test_enabled_opencode_evidence_refuses_controller_git_fallback(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+
+    with pytest.raises(ValueError, match="requires controller Git publication"):
+        await observe_evidence(
+            issue=1,
+            attempt=1,
+            backend="opencode",
+            branch="branch",
+            checkout=tmp_path,
+            started_at=datetime.now(UTC),
+            base_ref="main",
+            backend_status="failed",
+            test_command=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["operator_stop", "restart_cleanup"])
+async def test_live_gate_durable_handle_targets_exact_cancellation(
+    tmp_path: Path, monkeypatch, recovery: str
+) -> None:
+    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir.worklink.control import stop_worklink
+    from mimir.worklink.evidence import _run_compute_gate
+    from mimir.worklink.orchestrator import WorklinkRunner
+    from mimir.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    handle = LaunchHandle(
+        "local_subprocess",
+        "123e4567-e89b-42d3-a456-426614174099",
+        process_start_ticks=909,
+        shim_pid=808,
+    )
+    cancelled = []
+    recovery_results = []
+
+    def runner(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    async def cancel(self, observed):
+        cancelled.append(observed)
+
+    monkeypatch.setattr(
+        "mimir.worklink.control.LocalSubprocessComputeBackend.cancel", cancel
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.LocalSubprocessComputeBackend.cancel", cancel
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.control.process_is_alive", lambda state: True
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.control.process_identity_verified", lambda state: True
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.orchestrator.process_is_alive", lambda state: True
+    )
+
+    class Compute:
+        async def launch(self, spec):
+            return handle
+
+        async def wait(self, observed, timeout_s):
+            state = load_run_state(tmp_path, 1410)
+            assert state is not None
+            assert (
+                state.handle_identifier,
+                state.shim_pid,
+                state.process_start_ticks,
+            ) == (handle.identifier, handle.shim_pid, handle.process_start_ticks)
+            if recovery == "operator_stop":
+                result = await asyncio.to_thread(
+                    stop_worklink, tmp_path, 1410, runner=runner
+                )
+                recovery_results.append(result.stopped)
+            else:
+                result = await WorklinkRunner(
+                    home=tmp_path, repo=tmp_path, runner=runner
+                ).reattach(1410)
+                recovery_results.append(result.status == "failed")
+            return ComputeResult(1, "", "cancelled", handle=observed)
+
+        async def cleanup(self, observed):
+            return None
+
+        async def cancel(self, observed):
+            cancelled.append(observed)
+
+    def persist(observed):
+        save_run_state(
+            tmp_path,
+            WorklinkRunState(
+                issue_id=1410,
+                attempt=1,
+                backend="opencode",
+                compute_name="local_subprocess",
+                handle_substrate=observed.substrate,
+                handle_identifier=observed.identifier,
+                branch="issue/1410-a1",
+                base_ref="main",
+                local_base="base-sha",
+                repo=str(tmp_path),
+                repo_url="git@github.com:example/repo.git",
+                test_command="pytest -q",
+                started_at="2026-08-10T00:00:00+00:00",
+                checkout=str(checkout),
+                process_start_ticks=observed.process_start_ticks,
+                shim_pid=observed.shim_pid,
+            ),
+        )
+
+    spec = WorkSpec(
+        1410,
+        1,
+        "git@github.com:example/repo.git",
+        "main",
+        "issue/1410-a1",
+        "prompt",
+        None,
+        "pytest -q",
+        "opencode",
+        30,
+        local_checkout=checkout,
+        local_argv=("opencode", "run"),
+    )
+    await _run_compute_gate(
+        "pytest -q",
+        checkout=checkout,
+        work_spec=spec,
+        compute=Compute(),
+        on_launch=persist,
+    )
+
+    assert recovery_results == [True]
+    assert cancelled == [handle]
+    assert load_run_state(tmp_path, 1410) is None
+    assert checkout.is_dir()

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import errno
+import inspect
+import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -9,6 +13,7 @@ import pytest
 
 import mimir.worklink.checkout as checkout_module
 from mimir.worklink.checkout import (
+    CheckoutAuthorization,
     CheckoutLease,
     _assert_self_contained_checkout,
     cleanup_checkout,
@@ -853,3 +858,274 @@ def test_clone_raises_when_the_object_copy_also_fails() -> None:
         _clone_attempt_checkout(
             Path("/tmp/repo"), Path("/tmp/attempt"), runner=runner, event_logger=None,
         )
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "off"])
+def test_disabled_coding_keeps_legacy_checkout_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if value is None:
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
+
+    assert checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2) == (
+        tmp_path / ".worklink" / "repo" / "1410-2"
+    )
+
+
+def test_enabled_coding_uses_bounded_hashed_checkout_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / "enabled"
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", root)
+
+    path = checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2)
+
+    assert path.parent.parent == root
+    assert len(path.parent.name) == 64
+    assert path.name == "1410-2"
+
+
+def test_enabled_clone_uses_no_hardlinks() -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    checkout_module._clone_attempt_checkout(
+        Path("/controller/repo"),
+        Path("/var/lib/mimir-worklink/checkouts/repo/1410-1"),
+        runner=runner,
+        event_logger=None,
+        no_hardlinks=True,
+    )
+
+    assert calls == [[
+        "git", "clone", "--local", "--no-hardlinks", "--quiet",
+        "/controller/repo", "/var/lib/mimir-worklink/checkouts/repo/1410-1",
+    ]]
+
+
+def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    source = tmp_path / "source"
+    source.write_text("shared", encoding="utf-8")
+    linked = checkout / "linked"
+    linked.hardlink_to(source)
+    executable = checkout / "run"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    external = tmp_path / "external"
+    external.write_text("external", encoding="utf-8")
+    (checkout / "link").symlink_to(external)
+    original_inode = source.stat().st_ino
+    checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        checkout_module._normalize_checkout_fd(
+            checkout_fd, owner_uid=os.getuid(), group_gid=os.getgid()
+        )
+    finally:
+        os.close(checkout_fd)
+
+    assert linked.stat().st_ino != original_inode
+    assert stat.S_IMODE(checkout.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(linked.stat().st_mode) == 0o660
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o760
+    assert external.read_text(encoding="utf-8") == "external"
+
+
+def test_fd_normalization_rejects_special_files(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    os.mkfifo(checkout / "fifo")
+    checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        with pytest.raises(RuntimeError, match="special checkout entry refused"):
+            checkout_module._normalize_checkout_fd(
+                checkout_fd, owner_uid=os.getuid(), group_gid=os.getgid()
+            )
+    finally:
+        os.close(checkout_fd)
+
+
+def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    enabled_root = tmp_path / "enabled"
+    calls: list[list[str]] = []
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
+    monkeypatch.setattr(checkout_module, "MIMIR_UID", os.getuid())
+    monkeypatch.setattr(checkout_module, "WORKLINK_GID", os.getgid())
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    lease = create_isolated_checkout(
+        repo,
+        issue_id=1410,
+        attempt=1,
+        runner=runner,
+        worker_eligible=True,
+    )
+    try:
+        assert lease.worker_authorized is True
+        assert lease.authorization is not None
+        assert lease.path.parent.parent == enabled_root
+        lease.authorization.verify(lease.path)
+        retained = lease.authorization.duplicate_fd()
+        try:
+            observed = os.fstat(retained)
+            assert (observed.st_dev, observed.st_ino) == (
+                lease.authorization.device,
+                lease.authorization.inode,
+            )
+        finally:
+            os.close(retained)
+        assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+        assert stat.S_IMODE((lease.path / ".git").stat().st_mode) == 0o2770
+        clone = next(call for call in calls if call[:3] == ["git", "clone", "--local"])
+        assert "--no-hardlinks" in clone
+    finally:
+        if lease.authorization is not None:
+            lease.authorization.close()
+
+
+def test_enabled_controller_only_checkout_preserves_legacy_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", tmp_path / "enabled")
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.run(list(args), capture_output=True, text=True, check=False)
+
+    lease = create_isolated_checkout(
+        repo,
+        issue_id=1410,
+        attempt=2,
+        runner=runner,
+        worker_eligible=False,
+    )
+
+    assert lease.path == tmp_path / ".worklink" / repo.name / "1410-2"
+    assert lease.worker_authorized is False
+    assert lease.authorization is None
+    clone = next(call for call in calls if call[:3] == ["git", "clone", "--local"])
+    assert "--no-hardlinks" not in clone
+
+
+def test_normalization_preflight_leaves_valid_entries_unchanged_on_special_file(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    valid = checkout / "valid"
+    valid.write_text("unchanged", encoding="utf-8")
+    valid.chmod(0o600)
+    before = valid.stat()
+    os.mkfifo(checkout / "fifo")
+    checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+
+    try:
+        with pytest.raises(RuntimeError, match="special checkout entry refused"):
+            checkout_module._normalize_checkout_fd(
+                checkout_fd, owner_uid=os.getuid(), group_gid=os.getgid()
+            )
+    finally:
+        os.close(checkout_fd)
+
+    after = valid.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode, after.st_nlink) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+    )
+    assert valid.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_authorized_cleanup_git_sink_inventory_is_closed() -> None:
+    source = inspect.getsource(cleanup_checkout)
+    authorized = source.split("if lease.worker_authorized:", 1)[1].split(
+        "shutil.rmtree(lease.path)", 1
+    )[0]
+
+    assert 'safe_git.run("update-ref"' in authorized
+    assert "runner(" not in authorized
+    assert "subprocess." not in authorized
+
+
+
+def test_issued_checkout_open_is_root_relative_and_rejects_intermediate_symlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    issued = root / "repo-id" / "1410-1"
+    issued.mkdir(parents=True)
+    retained = checkout_module._open_issued_checkout(root, Path("repo-id/1410-1"))
+    try:
+        assert (os.fstat(retained).st_dev, os.fstat(retained).st_ino) == (
+            issued.stat().st_dev,
+            issued.stat().st_ino,
+        )
+    finally:
+        os.close(retained)
+    (root / "alias").symlink_to(root / "repo-id", target_is_directory=True)
+
+    with pytest.raises((OSError, RuntimeError)):
+        checkout_module._open_issued_checkout(root, Path("alias/1410-1"))
+
+    source = inspect.getsource(checkout_module._open_issued_checkout)
+    assert "libc.syscall" in source
+    assert "0x02 | 0x04 | 0x08" in source
+
+
+def test_linux_issued_checkout_fails_closed_without_openat2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    (root / "repo-id" / "1410-1").mkdir(parents=True)
+
+    class MissingOpenAt2:
+        @staticmethod
+        def syscall(*args: object) -> int:
+            return -1
+
+    monkeypatch.setattr(checkout_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        checkout_module.ctypes, "CDLL", lambda *args, **kwargs: MissingOpenAt2()
+    )
+    monkeypatch.setattr(checkout_module.ctypes, "get_errno", lambda: errno.ENOSYS)
+
+    with pytest.raises(RuntimeError, match="unavailable or unsafe"):
+        checkout_module._open_issued_checkout(root, Path("repo-id/1410-1"))
+
+
+@pytest.mark.parametrize("relative_path", [Path("../outside"), Path("/outside")])
+def test_non_linux_issued_checkout_rejects_paths_outside_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(checkout_module.sys, "platform", "darwin")
+
+    with pytest.raises(ValueError, match="beneath its trusted root"):
+        checkout_module._open_issued_checkout(root, relative_path)

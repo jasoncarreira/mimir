@@ -14,7 +14,11 @@ import time
 from typing import Awaitable, Callable, Sequence
 
 from ...config import model_spec_at_call_time
-from ...opencode_config import opencode_model_from_agent_spec, resolve_opencode_invocation
+from ...opencode_config import (
+    opencode_model_from_agent_spec,
+    opencode_worker_documents,
+    resolve_opencode_invocation,
+)
 from ..compute import ComputeResult, WorkSpec
 from .base import (
     Caps,
@@ -60,6 +64,23 @@ EventLogger = Callable[..., None]
 Sleeper = Callable[[float], Awaitable[None]]
 CheckoutSnapshot = Callable[[], object]
 Clock = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class WorkerProjection:
+    path: str
+    document: bytes
+
+    def __post_init__(self) -> None:
+        if self.path not in {
+            ".config/opencode/opencode.json",
+            ".local/share/opencode/auth.json",
+        }:
+            raise ValueError("worker projection destination is not permitted")
+        if len(self.document) > 1024 * 1024:
+            raise ValueError("worker projection exceeds size limit")
+        if not isinstance(json.loads(self.document), dict):
+            raise ValueError("worker projection must be a JSON object")
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,32 @@ class OpenCodeBackend:
 
         scrub_model_selection_env(env)
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
+        backend_config: dict[str, object] = {
+            "bin": self.bin,
+            "args": args,
+            "bash_allowlist": list(self.bash_allowlist),
+            "model": invocation.model,
+            "configured_model": configured_model,
+            "model_diverged": model_diverged,
+            "model_source": invocation.model_source,
+        }
+        if _coding_enabled():
+            config_document, auth_document = opencode_worker_documents(invocation)
+            projections = [
+                WorkerProjection(".config/opencode/opencode.json", config_document)
+            ]
+            if auth_document is not None:
+                projections.append(
+                    WorkerProjection(".local/share/opencode/auth.json", auth_document)
+                )
+            env = {
+                key: resolution_env[key]
+                for key in invocation.pass_env
+                if key in resolution_env
+            }
+            env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
+            backend_config["worker_projections"] = projections
+            backend_config["pass_env"] = invocation.pass_env
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -145,15 +192,7 @@ class OpenCodeBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=env,
-            backend_config={
-                "bin": self.bin,
-                "args": args,
-                "bash_allowlist": list(self.bash_allowlist),
-                "model": invocation.model,
-                "configured_model": configured_model,
-                "model_diverged": model_diverged,
-                "model_source": invocation.model_source,
-            },
+            backend_config=backend_config,
             local_checkout=order.checkout,
             local_argv=_local_argv(self.bin, args, order.checkout, prompt),
         )
@@ -264,6 +303,17 @@ class OpenCodeBackend:
             blocked_reason,
             output_overflow=result.output_overflow,
         )
+
+
+def _coding_enabled() -> bool:
+    from .. import checkout
+
+    resolver = getattr(checkout, "coding_enabled", None)
+    if resolver is not None:
+        return bool(resolver())
+    return os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 def _is_sqlite_contention(result: ComputeResult) -> bool:
