@@ -2114,6 +2114,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     lifecycle = []
     checkout_kwargs = {}
     bound_specs = []
+    persisted_gate_handles = []
 
     class Authorization:
         def __init__(self):
@@ -2186,9 +2187,28 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             bound_specs.append(spec)
             if scenario == "pre_launch_exception" and len(bound_specs) == 1:
                 raise ComputeLaunchError("launch failed")
-            return LaunchHandle("local_subprocess", f"job-{len(bound_specs)}")
+            identifiers = (
+                "123e4567-e89b-42d3-a456-426614174001",
+                "123e4567-e89b-42d3-a456-426614174002",
+                "123e4567-e89b-42d3-a456-426614174003",
+            )
+            index = len(bound_specs) - 1
+            return LaunchHandle(
+                "local_subprocess",
+                identifiers[index],
+                process_start_ticks=100 + index,
+                shim_pid=200 + index,
+            )
 
         async def wait(self, handle, timeout_s):
+            if len(bound_specs) > 1:
+                from mimir.worklink.run_state import load_run_state
+
+                state = load_run_state(tmp_path, 1410)
+                assert state is not None
+                persisted_gate_handles.append(
+                    (state.handle_identifier, state.shim_pid, state.process_start_ticks)
+                )
             return ComputeResult(0, "build ok", "", handle=handle)
 
         async def cleanup(self, handle):
@@ -2325,4 +2345,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             spec.local_argv == ("/bin/sh", "-c", "pytest -q")
             for spec in bound_specs[1:]
         )
+        assert persisted_gate_handles == [
+            ("123e4567-e89b-42d3-a456-426614174002", 201, 101),
+            ("123e4567-e89b-42d3-a456-426614174003", 202, 102),
+        ]
         assert ("push",) in publication.calls
