@@ -1363,3 +1363,31 @@ def test_blocked_marker_in_echoed_output_does_not_block_a_completed_run() -> Non
 
     assert blocked_reason_from_output(echoed, "") is None
     assert blocked_reason_from_output("done\nWORKLINK_BLOCKED: real", "") == "real"
+
+
+class _CheckoutCapability:
+    path = Path("/checkout")
+
+    def verify(self, path: Path | None) -> None:
+        pass
+
+    def duplicate_fd(self) -> int:
+        return -1
+
+
+def test_registry_compute_is_unbound_and_authorized_backends_are_fresh() -> None:
+    registry = BackendRegistry()
+    selected = registry.select_compute()
+    authorization = _CheckoutCapability()
+
+    first = selected.for_authorized_checkout(authorization)
+    second = selected.for_authorized_checkout(authorization)
+
+    assert isinstance(selected, LocalSubprocessComputeBackend)
+    assert selected._authorized_checkout is None
+    assert first is not selected
+    assert second is not selected
+    assert first is not second
+    assert first._authorized_checkout is authorization
+    assert second._authorized_checkout is authorization
+    assert first._jobs is not second._jobs
