@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 import errno
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ class WorklinkRunState:
     started_at: str
     checkout: str = ""
     process_start_ticks: int | None = None
+    shim_pid: int | None = None
     phase: str = "spawned"
     version: int = RUN_STATE_VERSION
 
@@ -53,13 +55,41 @@ class WorklinkRunState:
     def from_json(cls, data: Any) -> "WorklinkRunState":
         if not isinstance(data, dict):
             raise TypeError("worklink run state must be a JSON object")
+        version = int(data.get("version") or 1)
+        if version not in (1, 2):
+            raise ValueError("unsupported worklink run state version")
+        identifier = str(data["handle_identifier"])
+        shim_pid = int(data["shim_pid"]) if data.get("shim_pid") is not None else None
+        ticks = int(data["process_start_ticks"]) if data.get("process_start_ticks") is not None else None
+        phase = str(data.get("phase") or "spawned")
+        local_handle = str(data["handle_substrate"]) == "local_subprocess"
+        if phase == "spawned" and local_handle:
+            if shim_pid is None:
+                if not identifier.isascii() or not identifier.isdecimal():
+                    raise ValueError("direct run state requires a decimal PID handle")
+            else:
+                try:
+                    parsed = uuid.UUID(identifier, version=4)
+                except ValueError as exc:
+                    raise ValueError("worker run state requires a canonical UUIDv4 handle") from exc
+                if (
+                    version != 2
+                    or str(parsed) != identifier
+                    or shim_pid <= 0
+                    or ticks is None
+                ):
+                    raise ValueError("worker run state requires UUID, shim PID, and process start ticks")
+        elif shim_pid is not None:
+            raise ValueError("shim PID is only valid for a version-2 worker handle")
+        if phase == "claiming" and identifier != str(int(identifier)):
+            raise ValueError("claiming run state requires a controller PID")
         return cls(
             issue_id=int(data["issue_id"]),
             attempt=int(data["attempt"]),
             backend=str(data["backend"]),
             compute_name=str(data["compute_name"]),
             handle_substrate=str(data["handle_substrate"]),
-            handle_identifier=str(data["handle_identifier"]),
+            handle_identifier=identifier,
             branch=str(data["branch"]),
             base_ref=str(data["base_ref"]),
             local_base=str(data.get("local_base") or data["base_ref"]),
@@ -68,13 +98,10 @@ class WorklinkRunState:
             test_command=(str(data["test_command"]) if data.get("test_command") else None),
             started_at=str(data["started_at"]),
             checkout=str(data.get("checkout") or ""),
-            process_start_ticks=(
-                int(data["process_start_ticks"])
-                if data.get("process_start_ticks") is not None
-                else None
-            ),
-            phase=str(data.get("phase") or "spawned"),
-            version=int(data.get("version") or RUN_STATE_VERSION),
+            process_start_ticks=ticks,
+            shim_pid=shim_pid,
+            phase=phase,
+            version=version,
         )
 
 
@@ -161,15 +188,23 @@ def process_is_zombie(pid: int) -> bool:
     return observed is not None and observed[0] == "Z"
 
 
+def _state_pid(state: WorklinkRunState) -> int | None:
+    if state.shim_pid is not None:
+        return state.shim_pid
+    try:
+        return int(state.handle_identifier)
+    except ValueError:
+        return None
+
+
 def process_is_alive(state: WorklinkRunState) -> bool:
     """Probe a recorded local process without shelling out to ``ps``.
 
     Permission errors mean the process exists. A start-tick mismatch is dead for
     this run even though the reused PID itself is alive.
     """
-    try:
-        pid = int(state.handle_identifier)
-    except ValueError:
+    pid = _state_pid(state)
+    if pid is None:
         return False
     try:
         os.kill(pid, 0)
@@ -193,9 +228,8 @@ def process_identity_verified(state: WorklinkRunState) -> bool:
     """Whether it is safe to signal the PID recorded by ``state``."""
     if state.compute_name != "local_subprocess" or state.process_start_ticks is None:
         return False
-    try:
-        pid = int(state.handle_identifier)
-    except ValueError:
+    pid = _state_pid(state)
+    if pid is None:
         return False
     return process_start_ticks(pid) == state.process_start_ticks and process_is_alive(state)
 

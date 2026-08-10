@@ -9,7 +9,7 @@ metered key.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -35,6 +35,8 @@ class OpenCodeInvocation:
     auth_type: str | None
     remove_env: tuple[str, ...] = ()
     pass_env: tuple[str, ...] = ()
+    provider_config: object = field(default_factory=dict, repr=False, compare=False)
+    auth_entry: object | None = field(default=None, repr=False, compare=False)
 
 
 def opencode_config_path(
@@ -101,8 +103,8 @@ def resolve_opencode_invocation(
         source = "agent_model"
 
     provider = _provider_from_model(model)
-    env_references = _provider_env_references(native, provider)
-    auth_type, remove_env = _inspect_auth(
+    provider_config, env_references = _selected_provider_config(native, provider)
+    auth_type, remove_env, auth_entry = _inspect_auth(
         provider, values, env_references=env_references
     )
     pass_env = tuple(sorted(env_references))
@@ -114,6 +116,8 @@ def resolve_opencode_invocation(
         auth_type=auth_type,
         remove_env=remove_env,
         pass_env=pass_env,
+        provider_config=provider_config,
+        auth_entry=auth_entry,
     )
 
 
@@ -143,7 +147,7 @@ def _inspect_auth(
     env: Mapping[str, str],
     *,
     env_references: set[str],
-) -> tuple[str | None, tuple[str, ...]]:
+) -> tuple[str | None, tuple[str, ...], object | None]:
     path = opencode_auth_path(env)
     try:
         entries = _read_object(path, "OpenCode auth store") if path.exists() else {}
@@ -164,7 +168,7 @@ def _inspect_auth(
                 "OPENAI_API_KEY metered fallback. Run `opencode auth login` first."
             )
         if ambient_present or env_references:
-            return None, ()
+            return None, (), None
         raise OpenCodeAuthError(
             f"OpenCode provider {provider!r} has no credential: no stored auth entry, "
             f"no ambient {ambient_name}, and no {{env:NAME}} reference in its native "
@@ -203,7 +207,7 @@ def _inspect_auth(
     # OAuth credential is stronger: remove the conventional ambient API key so
     # the actual run cannot silently switch who pays if plugin auth regresses.
     remove = (ambient_name,) if auth_type == "oauth" else ()
-    return auth_type, remove
+    return auth_type, remove, json.loads(json.dumps(entry))
 
 
 def _read_object(path: Path, label: str) -> dict[str, object]:
@@ -219,16 +223,57 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
 _ENV_REFERENCE = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _provider_env_references(native: Mapping[str, object], provider: str) -> set[str]:
-    """Collect env references only from the selected provider's config block."""
+_SECRET_KEYS = frozenset({
+    "apikey", "key", "token", "accesstoken", "refreshtoken", "secret",
+    "password", "authorization", "credential", "credentials", "clientsecret",
+})
+_ENV_REFERENCE_FULL = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]{0,127})\}")
+
+
+def opencode_worker_documents(
+    invocation: OpenCodeInvocation,
+) -> tuple[bytes, bytes | None]:
+    if _is_github_provider(invocation.provider):
+        raise OpenCodeConfigError("GitHub providers are not eligible for worker execution")
+    references: set[str] = set()
+    _validate_provider_config(
+        invocation.provider_config, invocation.provider, references
+    )
+    config = {
+        "model": invocation.model,
+        "provider": {invocation.provider: invocation.provider_config},
+    }
+    config_document = json.dumps(
+        config, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if invocation.auth_entry is None:
+        return config_document, None
+    if invocation.auth_type not in {"api", "oauth", "wellknown"}:
+        raise OpenCodeAuthError(
+            f"OpenCode provider {invocation.provider!r} has an unsupported worker auth type"
+        )
+    auth_document = json.dumps(
+        {invocation.provider: invocation.auth_entry},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return config_document, auth_document
+
+
+def _selected_provider_config(
+    native: Mapping[str, object], provider: str
+) -> tuple[object, set[str]]:
     providers = native.get("provider")
-    if not isinstance(providers, dict):
-        return set()
-    return _native_env_references(providers.get(provider))
+    selected = providers.get(provider, {}) if isinstance(providers, dict) else {}
+    if not isinstance(selected, dict):
+        raise OpenCodeConfigError(
+            f"OpenCode provider {provider!r} has an invalid provider config"
+        )
+    copied = json.loads(json.dumps(selected))
+    return copied, _native_env_references(copied)
 
 
 def _native_env_references(value: object) -> set[str]:
-    """Collect only env names the native OpenCode config explicitly references."""
     if isinstance(value, str):
         return set(_ENV_REFERENCE.findall(value))
     if isinstance(value, dict):
@@ -242,6 +287,64 @@ def _native_env_references(value: object) -> set[str]:
             found.update(_native_env_references(nested))
         return found
     return set()
+
+
+def _validate_provider_config(
+    value: object,
+    provider: str,
+    references: set[str],
+    *,
+    key: str | None = None,
+) -> None:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower()) if key else ""
+    sensitive = normalized in _SECRET_KEYS
+    if sensitive:
+        if isinstance(value, str) and not value:
+            return
+        if isinstance(value, (dict, list)) and not value:
+            return
+        full = _ENV_REFERENCE_FULL.fullmatch(value) if isinstance(value, str) else None
+        if full is not None:
+            references.add(full.group(1))
+            return
+        if isinstance(value, str) and "{env:" in value:
+            raise OpenCodeConfigError(
+                f"OpenCode provider {provider!r} has a rejected environment reference"
+            )
+        raise OpenCodeConfigError(
+            f"OpenCode provider {provider!r} has an inline credential in field {key!r}"
+        )
+    if isinstance(value, dict):
+        for nested_key, nested in value.items():
+            if _is_github_provider(nested_key):
+                raise OpenCodeConfigError(
+                    f"OpenCode provider {provider!r} contains a GitHub provider config"
+                )
+            _validate_provider_config(
+                nested,
+                provider,
+                references,
+                key=nested_key,
+            )
+        return
+    if isinstance(value, list):
+        for nested in value:
+            _validate_provider_config(nested, provider, references, key=key)
+        return
+    if isinstance(value, str):
+        full = _ENV_REFERENCE_FULL.fullmatch(value)
+        if "{env:" in value and full is None:
+            raise OpenCodeConfigError(
+                f"OpenCode provider {provider!r} has a rejected environment reference"
+            )
+        if full is not None:
+            references.add(full.group(1))
+        return
+
+
+def _is_github_provider(provider: str) -> bool:
+    normalized = provider.strip().lower()
+    return normalized == "github" or normalized.startswith("github-")
 
 
 def _strip_jsonc(source: str) -> str:
