@@ -62,6 +62,7 @@
 # same ``deliver:`` key in pollers.json / pollers-overrides.yaml.)
 
 - name: heartbeat
+  authority_profile: heartbeat
   cron: "0 * * * *"
   channel_id: null   # synthetic scheduler:heartbeat channel
   prompt_file: heartbeat.md
