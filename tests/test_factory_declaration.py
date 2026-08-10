@@ -84,7 +84,17 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # declaration outright or act on something nobody reviewed. `bootstrap` joined the set when
     # this repository opted in to feature-factory #248, so a sandbox installs its dependencies
     # before any gate instead of discovering they are absent.
-    assert set(data) == {"resolve", "verify", "publish", "publishing_identity", "bootstrap"}
+    assert set(data) == {"resolve", "verify", "publish", "publishing_identity", "bootstrap", "pr_draft"}
+    # The value, not merely the key. Asserting presence alone would pass with `pr_draft: true`, or
+    # with `--draft` restored in `publish`, either of which silently reinstates the draft-PR problem
+    # this declaration exists to remove: `gh pr merge` refuses a draft, and a draft is invisible to a
+    # poller that acts on open PRs.
+    assert data["pr_draft"] is False
+    # And the two must agree. `publish` is currently unconsumed, so a stale `--draft` there breaks no
+    # run today -- but a declaration that says ready-for-review beside a command that says draft is a
+    # contradiction the next reader has to resolve, and whoever wires `publish` up would inherit it.
+    assert "--draft" not in data["publish"]
+    assert data["publish"].startswith("gh pr create ")
     # The declaration must not carry a credential; it may only reference the
     # environment the factory already inherits.
     blob = DECLARATION.read_text()
