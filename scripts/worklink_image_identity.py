@@ -261,9 +261,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 if os.geteuid() != 1002:
     raise SystemExit("coding CLI did not run as worklink")
+if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
+    raise SystemExit(f"coding CLI did not receive the FD-anchored checkout: {sys.argv}")
 home = Path(os.environ["HOME"])
 if home.parent != Path("/var/lib/mimir-worklink/homes"):
     raise SystemExit("coding CLI received an invalid HOME")

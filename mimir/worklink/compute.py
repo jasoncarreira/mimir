@@ -298,6 +298,21 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
     return env
 
 
+def _fd_anchored_opencode_argv(
+    command: tuple[str, ...], checkout: Path | None
+) -> tuple[str, ...]:
+    """Keep enabled OpenCode inside the checkout reached through its issued FD."""
+    if checkout is None:
+        raise ComputeLaunchError("local_subprocess requires spec.local_checkout")
+    for index, arg in enumerate(command[:-1]):
+        if arg != "--dir":
+            continue
+        if command[index + 1] != str(checkout):
+            raise ComputeLaunchError("enabled OpenCode --dir must name the issued checkout")
+        return (*command[: index + 1], ".", *command[index + 2 :])
+    raise ComputeLaunchError("enabled OpenCode command must contain --dir for the issued checkout")
+
+
 @dataclass
 class LocalSubprocessComputeBackend:
     """Run a WorkSpec as a local subprocess in the current container."""
@@ -381,6 +396,9 @@ class LocalSubprocessComputeBackend:
     async def _launch_enabled(self, spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
         from .worker_client import WorkerClient, WorkerProjection
 
+        # The executor has already fchdir'd through the issued checkout FD. An
+        # absolute --dir would re-traverse the controller-owned 0700 boundary.
+        command = _fd_anchored_opencode_argv(command, spec.local_checkout)
         authorization = self._authorized_checkout
         if authorization is None or not all(
             hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
