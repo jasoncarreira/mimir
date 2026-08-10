@@ -505,8 +505,13 @@ class LocalSubprocessComputeBackend:
         await _kill_process_group(proc)
 
     async def cleanup(self, handle: LaunchHandle) -> None:
+        known = self._handles.get(handle.identifier)
+        if known is not None and known != handle:
+            raise KeyError(f"unknown {self.name} handle: {handle.identifier}")
+        if known is None:
+            return
         self._jobs.pop(handle.identifier, None)
-        self._handles.pop(handle.identifier, None)
+        self._handles.pop(handle.identifier)
         self._worker_clients.pop(handle.identifier, None)
 
     def _job(self, handle: LaunchHandle) -> tuple[object, WorkSpec, tuple[str, ...]]:

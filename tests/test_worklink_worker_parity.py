@@ -5,8 +5,11 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import struct
 import subprocess
+import sys
+import threading
 from typing import Any
 
 import pytest
@@ -152,7 +155,7 @@ async def launch_worker(
 def direct_spec(source: str) -> WorkSpec:
     work = spec()
     object.__setattr__(work, "local_checkout", Path.cwd())
-    object.__setattr__(work, "local_argv", ("python", "-c", source))
+    object.__setattr__(work, "local_argv", (sys.executable, "-c", source))
     return work
 
 
@@ -180,33 +183,33 @@ async def test_closed_worker_direct_parity_inventory(
         "coding_disabled",
     )
     if scenario == "normal_completion":
-        client = WorkerClient(stdout=b"worker stdout\n", stderr=b"worker stderr\n")
-        backend, handle = await launch_worker(monkeypatch, client)
-        worker = await backend.wait(handle, 2)
-        assert worker == compute.ComputeResult(
-            exit_code=0,
-            stdout="worker stdout\n",
-            stderr="worker stderr\n",
-            handle=handle,
-            command=("python", "-c", "print('ok')"),
-        )
-        assert client.processes[handle.identifier].returncode == 0
-        await backend.cleanup(handle)
-        with pytest.raises(KeyError):
-            await backend.wait(handle, 1)
+        import mimir.worklink.worker_client as worker_client
 
         checkout = tmp_path / "executor-checkout"
         checkout.mkdir()
-        checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-        stdout_read, stdout_write = os.pipe()
-        stderr_read, stderr_write = os.pipe()
-        executor_id = "11111111-1111-4111-8111-111111111111"
-        responses: list[dict[str, Any]] = []
+        checkout_stat = checkout.stat()
 
-        class ExecutorConnection:
-            def send(self, payload: bytes) -> None:
-                responses.append(json.loads(payload))
+        class PipeAuthorization:
+            path = checkout
+            issue_id = 1
+            attempt = 1
+            device = checkout_stat.st_dev
+            inode = checkout_stat.st_ino
 
+            def verify(self, path: Path | None) -> None:
+                assert path == checkout
+
+            def duplicate_fd(self) -> int:
+                return os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+
+        client_socket, executor_socket = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_DGRAM
+        )
+        authorization = PipeAuthorization()
+        client = worker_client.WorkerClient(authorization)
+        monkeypatch.setattr(client, "_connect", lambda: client_socket)
+        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+        monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
         monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "worker-homes")
         worker_exec.HOME_ROOT.mkdir()
         monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *_args: None)
@@ -217,59 +220,56 @@ async def test_closed_worker_direct_parity_inventory(
             os.fchdir(fd)
 
         monkeypatch.setattr(worker_exec, "_drop_worker", enter_worker)
-        request = {
-            "version": 1,
-            "op": "launch",
-            "id": executor_id,
-            "issue": 1,
-            "attempt": 1,
-            "device": 0,
-            "inode": 0,
-            "argv": ["/bin/sh", "-c", "printf executor-output"],
-            "env": {"PATH": "/usr/bin:/bin"},
-            "projections": [],
-        }
-        executor_fds = [checkout_fd, stdout_write, stderr_write]
-        try:
-            worker_exec._handle_launch(ExecutorConnection(), request, executor_fds)
-            assert [response["status"] for response in responses] == ["started", "terminal"]
-            assert responses[-1]["exit_code"] == 0
-            assert os.read(stdout_read, 4096) == b"executor-output"
-            assert os.read(stderr_read, 4096) == b""
-            assert executor_id not in worker_exec._jobs
-            assert not (worker_exec.HOME_ROOT / executor_id).exists()
-        finally:
-            for fd in (*executor_fds, stdout_read, stderr_read):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
 
-        direct = await run_direct(
-            monkeypatch,
-            "import os; os.write(1,b'direct stdout\\n'); os.write(2,b'direct stderr\\n')",
+        def serve() -> None:
+            try:
+                worker_exec.handle_connection(executor_socket)
+            finally:
+                executor_socket.close()
+
+        server = threading.Thread(target=serve)
+        server.start()
+        source = (
+            "import os,threading; d=b'0123456789abcdef'*(64*1024+1); "
+            "ts=[threading.Thread(target=os.write,args=(fd,d)) for fd in (1,2)]; "
+            "[t.start() for t in ts]; [t.join() for t in ts]"
         )
-        assert (direct.exit_code, direct.stdout, direct.stderr) == (
-            0,
-            "direct stdout\n",
-            "direct stderr\n",
+        work = spec(env={"OPENCODE_PERMISSION": '{"edit":"allow"}'})
+        object.__setattr__(work, "local_checkout", checkout)
+        object.__setattr__(work, "local_argv", (sys.executable, "-c", source))
+        backend = LocalSubprocessComputeBackend.for_authorized_checkout(
+            authorization, worker_client=client
         )
+        handle = await backend.launch(work)
+        worker = await backend.wait(handle, 5)
+        server.join(timeout=5)
+        assert not server.is_alive()
+        assert handle.identifier not in worker_exec._jobs
+        assert not (worker_exec.HOME_ROOT / handle.identifier).exists()
+        await backend.cleanup(handle)
+        with pytest.raises(KeyError):
+            await backend.wait(handle, 1)
+
+        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+        direct_backend = LocalSubprocessComputeBackend()
+        direct_handle = await direct_backend.launch(direct_spec(source))
+        direct = await direct_backend.wait(direct_handle, 5)
+        await direct_backend.cleanup(direct_handle)
+        with pytest.raises(KeyError):
+            await direct_backend.wait(direct_handle, 1)
+        assert handle.identifier not in backend._jobs
+        assert direct_handle.identifier not in direct_backend._jobs
 
         payload = b"0123456789abcdef" * (64 * 1024 + 1)
-        large_client = WorkerClient(stdout=payload, stderr=payload)
-        large_backend, large_handle = await launch_worker(monkeypatch, large_client)
-        large_worker = await large_backend.wait(large_handle, 2)
-        await large_backend.cleanup(large_handle)
-        large_direct = await run_direct(
-            monkeypatch,
-            "import os; d=b'0123456789abcdef'*(64*1024+1); os.write(1,d); os.write(2,d)",
+        assert len(payload) > 1024 * 1024
+        assert (worker.exit_code, worker.stdout, worker.stderr) == (
+            direct.exit_code,
+            direct.stdout,
+            direct.stderr,
         )
-        assert large_worker.stdout.encode() == payload
-        assert large_worker.stderr.encode() == payload
-        assert large_direct.stdout.encode() == payload
-        assert large_direct.stderr.encode() == payload
-        assert large_worker.exit_code == large_direct.exit_code == 0
+        assert worker.stdout.encode() == payload
+        assert worker.stderr.encode() == payload
+        assert worker.exit_code == 0
 
     elif scenario == "timeout":
         client = WorkerClient(immediate=False)
@@ -448,8 +448,14 @@ async def test_closed_worker_direct_parity_inventory(
             second.process_start_ticks,
             first.shim_pid,
         )
+        with pytest.raises(KeyError):
+            await backend.wait(mismatched, 1)
         with pytest.raises(RuntimeError, match="identity no longer matches"):
             await backend.cancel(mismatched)
+        with pytest.raises(KeyError):
+            await backend.cleanup(mismatched)
+        assert first.identifier in backend._jobs
+        assert second.identifier in backend._jobs
         assert client.cancelled == []
         assert not first_wait.done()
         assert not second_wait.done()
@@ -478,6 +484,21 @@ async def test_closed_worker_direct_parity_inventory(
             direct_spec("import time; print('direct one',flush=True); time.sleep(30)")
         )
         direct_second = await direct_backend.launch(direct_spec("print('direct two')"))
+        assert direct_first.identifier != direct_second.identifier
+        direct_mismatched = LaunchHandle(
+            direct_first.substrate,
+            direct_first.identifier,
+            direct_first.process_start_ticks,
+            999,
+        )
+        with pytest.raises(KeyError):
+            await direct_backend.wait(direct_mismatched, 1)
+        with pytest.raises((KeyError, RuntimeError)):
+            await direct_backend.cancel(direct_mismatched)
+        with pytest.raises(KeyError):
+            await direct_backend.cleanup(direct_mismatched)
+        assert direct_first.identifier in direct_backend._jobs
+        assert direct_second.identifier in direct_backend._jobs
         direct_second_result = await direct_backend.wait(direct_second, 2)
         await direct_backend.cancel(direct_first)
         direct_first_result = await direct_backend.wait(direct_first, 2)
@@ -537,6 +558,31 @@ async def test_closed_worker_direct_parity_inventory(
         monkeypatch.setattr(worker_client, "WorkerClient", ForbiddenClient)
         monkeypatch.setattr(worker_client, "WorkerProjection", ForbiddenProjection)
         monkeypatch.setattr(worker_client.socket, "socket", forbidden_socket)
+
+        def disabled_spec() -> WorkSpec:
+            disabled = direct_spec(
+                "import os; print(os.environ['PARITY_DIRECT'])"
+            )
+            object.__setattr__(disabled, "env", {"PARITY_DIRECT": "unchanged"})
+            return disabled
+
+        def result_shape(result: compute.ComputeResult) -> tuple[object, ...]:
+            return (
+                result.exit_code,
+                result.stdout,
+                result.stderr,
+                result.timed_out,
+                result.output_overflow,
+                result.launch_error,
+                result.command,
+            )
+
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        baseline_backend = LocalSubprocessComputeBackend()
+        baseline_handle = await baseline_backend.launch(disabled_spec())
+        baseline = await baseline_backend.wait(baseline_handle, 2)
+        await baseline_backend.cleanup(baseline_handle)
+
         for flag in ("false", None):
             if flag is None:
                 monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
@@ -545,14 +591,10 @@ async def test_closed_worker_direct_parity_inventory(
             backend = LocalSubprocessComputeBackend.for_authorized_checkout(
                 ForbiddenAuthorization()
             )
-            disabled = direct_spec(
-                "import os; print(os.environ['PARITY_DIRECT'])"
-            )
-            object.__setattr__(disabled, "env", {"PARITY_DIRECT": "unchanged"})
-            handle = await backend.launch(disabled)
+            handle = await backend.launch(disabled_spec())
             result = await backend.wait(handle, 2)
             await backend.cleanup(handle)
-            assert result.stdout == "unchanged\n"
+            assert result_shape(result) == result_shape(baseline)
         assert touched == {
             "authorization": 0,
             "projection": 0,
