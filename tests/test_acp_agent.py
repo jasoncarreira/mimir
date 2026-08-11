@@ -405,8 +405,7 @@ async def test_actual_router_uses_only_meta_key_and_emits_no_notification_respon
             "data": {"method": "_example"},
         },
     }
-    assert agent._auth_context is not None
-    assert agent._auth_context.canonical_principal == "operator"
+    assert agent._auth_context is None
 
 
 def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
@@ -432,10 +431,9 @@ def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
     assert all(not hasattr(agent, name) for name in forbidden)
 
 
-async def test_authentication_is_reset_and_checked_for_each_connection_generation(tmp_path: Path) -> None:
+async def test_candidate_activates_only_after_admin_authentication(tmp_path: Path) -> None:
     resolver = _resolver(tmp_path)
     agent = _agent(resolver)
-    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
     first = SimpleNamespace()
     first_generation = agent.on_connect(first)
     with pytest.raises(sdk.RequestError) as unauthenticated_first:
@@ -443,11 +441,26 @@ async def test_authentication_is_reset_and_checked_for_each_connection_generatio
     assert _error(unauthenticated_first.value) == _error(sdk.auth_required_error())
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
     assert agent._connections[first_generation].principal == "operator"
+    assert agent._connection is agent._connections[first_generation]
 
     second = SimpleNamespace()
     second_generation = agent.on_connect(second)
-    assert agent._connections[second_generation].principal is None
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._generation == first_generation
+    with pytest.raises(sdk.RequestError) as invalid_candidate:
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "invalid"})
+    assert _error(invalid_candidate.value) == _error(sdk.auth_required_error())
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._auth_context is not None
+    assert agent._auth_context.canonical_principal == "operator"
     assert agent._connections[second_generation].auth_context is None
-    with pytest.raises(sdk.RequestError) as unauthenticated_second:
-        await agent.new_session("/two")
-    assert _error(unauthenticated_second.value) == _error(sdk.auth_required_error())
+
+    await agent.on_transport_closed(second_generation)
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._generation == first_generation
+    assert agent._auth_context is not None
+
+    replacement_generation = agent.on_connect(SimpleNamespace())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
+    assert agent._connection is agent._connections[replacement_generation]
+    assert agent._generation == replacement_generation

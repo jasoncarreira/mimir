@@ -290,12 +290,14 @@ async def test_connection_replacement_old_cleanup_preserves_successor_ownership(
 
     replacement = Client()
     agent.on_connect(replacement)
-    assert session_id not in agent._active_prompts
-    assert agent._environments == {}
+    assert session_id in agent._active_prompts
+    assert session_id in agent._environments
     with pytest.raises(sdk.RequestError) as unauthenticated:
         await agent.load_session("/replacement", session_id)
     assert unauthenticated.value.to_error_obj()["code"] == -32000
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    assert session_id not in agent._active_prompts
+    assert agent._environments == {}
     await agent.load_session("/replacement", session_id)
     successor = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="successor")]))
     while len(core.calls) < 2:
@@ -694,8 +696,9 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
 
     await agent.on_transport_closed(old_generation)
 
-    assert agent._generation == successor_generation
-    assert agent._connection.closed is False
+    assert agent._generation == old_generation
+    assert agent._connection is None
+    assert agent._candidate is agent._connections[successor_generation]
     assert session_id not in agent._environments
 
 
@@ -1394,7 +1397,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             await agent.authenticate(
                 "mimir-web-key", **{"mimir.webKey": "viewer-secret"}
             )
-        assert agent._connection.auth_context is None
+        assert agent._candidate.auth_context is None
 
         await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
         creating = asyncio.create_task(

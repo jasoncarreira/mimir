@@ -316,7 +316,9 @@ class MimirAcpAgent:
         self._journals = JournalCache(self._store)
         self._client: Client | None = None
         self._generation = 0
+        self._next_generation = 0
         self._connection: ConnectionState | None = None
+        self._candidate: ConnectionState | None = None
         self._connections: dict[int, ConnectionState] = {}
         self._retirement_tasks: set[asyncio.Task[Any]] = set()
         self._sessions: dict[str, SessionState] = {}
@@ -335,27 +337,10 @@ class MimirAcpAgent:
             channels.register(self._bridge)
 
     def on_connect(self, conn: Client) -> int:
-        old = self._connection
-        self._generation += 1
-        connection = ConnectionState(self._generation, conn)
-        self._connection = connection
+        self._next_generation = getattr(self, "_next_generation", self._generation) + 1
+        connection = ConnectionState(self._next_generation, conn)
         self._connections[connection.generation] = connection
-        self._client = conn
-        self._auth_context = None
-        self._display_name = None
-        self._bridge._connected = True
-        if old is not None and old.peer is not conn and not old.closed:
-            for session_id, active in tuple(self._active_prompts.items()):
-                if active.generation == old.generation:
-                    self._active_prompts.pop(session_id, None)
-            for session_id, (generation, _) in tuple(self._environments.items()):
-                if generation == old.generation:
-                    self._environments.pop(session_id, None)
-            task = asyncio.create_task(self._retire_generation(old.generation))
-            old.retirement_task = task
-            self._retirement_tasks.add(task)
-            task.add_done_callback(self._retirement_tasks.discard)
-            task.add_done_callback(_consume_background_task)
+        self._candidate = connection
         return connection.generation
 
     async def initialize(self, protocol_version: int, client_capabilities: ClientCapabilities | None = None, client_info: Implementation | None = None, **kwargs: Any) -> InitializeResponse:
@@ -371,9 +356,8 @@ class MimirAcpAgent:
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
-        self._auth_context = None
-        self._display_name = None
-        connection = self._connection
+        candidate = self._candidate
+        connection = candidate if candidate is not None else self._connection
         if connection is not None:
             connection.principal = None
             connection.auth_context = None
@@ -390,16 +374,45 @@ class MimirAcpAgent:
             if auth_context.principal != identity.canonical or auth_context.canonical_principal != identity.canonical or "admin" not in auth_context.roles or auth_context.is_service or not auth_context.enforcement_enabled:
                 raise ValueError
         except Exception:
-            self._auth_context = None
+            if connection is None or connection is self._connection:
+                self._auth_context = None
+                self._display_name = None
             raise auth_required_error() from None
-        self._auth_context = auth_context
-        self._display_name = identity.display_name or identity.canonical
-        if connection is not None:
-            if self._connection is not connection or connection.closed:
+        display_name = identity.display_name or identity.canonical
+        if connection is None:
+            self._auth_context = auth_context
+            self._display_name = display_name
+            return AuthenticateResponse()
+        if connection.closed:
+            raise auth_required_error()
+        if candidate is not None:
+            if self._candidate is not connection:
                 raise auth_required_error()
-            connection.principal = identity.canonical
-            connection.auth_context = auth_context
-            connection.display_name = identity.display_name or identity.canonical
+        elif self._connection is not connection:
+            raise auth_required_error()
+        old = self._connection
+        connection.principal = identity.canonical
+        connection.auth_context = auth_context
+        connection.display_name = display_name
+        self._connection = connection
+        self._candidate = None
+        self._generation = connection.generation
+        self._client = connection.peer
+        self._auth_context = auth_context
+        self._display_name = display_name
+        self._bridge._connected = True
+        if old is not None and old is not connection and not old.closed:
+            for session_id, active in tuple(self._active_prompts.items()):
+                if active.generation == old.generation:
+                    self._active_prompts.pop(session_id, None)
+            for session_id, (generation, _) in tuple(self._environments.items()):
+                if generation == old.generation:
+                    self._environments.pop(session_id, None)
+            task = asyncio.create_task(self._retire_generation(old.generation))
+            old.retirement_task = task
+            self._retirement_tasks.add(task)
+            task.add_done_callback(self._retirement_tasks.discard)
+            task.add_done_callback(_consume_background_task)
         return AuthenticateResponse()
 
     async def new_session(self, cwd: str, additional_directories: list[str] | None = None, mcp_servers: object | None = None, **kwargs: Any) -> NewSessionResponse:
@@ -681,9 +694,13 @@ class MimirAcpAgent:
             if task is not asyncio.current_task():
                 task.cancel()
         self._connections.pop(generation, None)
+        if getattr(self, "_candidate", None) is connection:
+            self._candidate = None
         if self._connection is connection:
             self._connection = None
             self._client = None
+            self._auth_context = None
+            self._display_name = None
             self._bridge._connected = False
 
     async def _disconnect_provider(
@@ -781,6 +798,9 @@ class MimirAcpAgent:
         return None
 
     def _begin_stateful(self) -> str:
+        candidate = self._candidate
+        if candidate is not None and not candidate.closed:
+            raise auth_required_error()
         connection = self._connection
         if connection is None:
             auth_context = self._auth_context
