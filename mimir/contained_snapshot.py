@@ -118,6 +118,13 @@ def _inventory(source: bytes, kind: GitInventoryClass) -> tuple[bytes, ...]:
     return tuple(entries[:-1] if output else ())
 
 
+def _head_revision(source: bytes) -> bytes:
+    revision = _run_git(source, (b"rev-parse", b"--verify", b"HEAD")).strip()
+    if not re.fullmatch(rb"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
+        raise SnapshotUnavailable("Snapshot unavailable")
+    return revision.lower()
+
+
 def _validate_relative_path(relative: bytes) -> None:
     if not relative or relative.startswith(b"/") or b"\0" in relative:
         raise SnapshotUnsafeEntry("Snapshot contains an unsafe entry")
@@ -127,8 +134,9 @@ def _validate_relative_path(relative: bytes) -> None:
 
 
 def _name_is_sensitive(relative: bytes) -> bool:
-    components = relative.lower().split(b"/")
-    for index, component in enumerate(components):
+    components = relative.split(b"/")
+    for index, original in enumerate(components):
+        component = original.lower()
         if component in _EXACT_SENSITIVE_NAMES:
             return True
         if component.startswith(b"service-account") and component.endswith(b".json"):
@@ -136,7 +144,7 @@ def _name_is_sensitive(relative: bytes) -> bool:
         if component.endswith(_SENSITIVE_SUFFIXES):
             return True
         if component.startswith(b".env."):
-            is_exempt_basename = index == len(components) - 1 and component == b".env.example"
+            is_exempt_basename = index == len(components) - 1 and original == b".env.example"
             if not is_exempt_basename:
                 return True
     return False
@@ -443,12 +451,13 @@ def create_git_snapshot(
         raise SnapshotUnsafeEntry("Snapshot contains an unsafe entry")
     if destination_path.exists() or destination_path.is_symlink():
         raise SnapshotUnavailable("Snapshot unavailable")
-    entries = preflight_git_snapshot(source_path, known_sensitive=known_sensitive)
     source_bytes = os.fsencode(source_path)
     destination_bytes = os.fsencode(destination_path)
+    revision = _head_revision(source_bytes)
+    entries = preflight_git_snapshot(source_path, known_sensitive=known_sensitive)
     try:
         completed = subprocess.run(
-            [b"git", b"clone", b"--no-hardlinks", b"--quiet", b"--", source_bytes, destination_bytes],
+            [b"git", b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet", b"--", source_bytes, destination_bytes],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -456,8 +465,20 @@ def create_git_snapshot(
         )
         if completed.returncode != 0:
             raise SnapshotUnavailable("Snapshot unavailable")
+        checkout = subprocess.run(
+            [b"git", b"-C", destination_bytes, b"checkout", b"--detach", b"--force", b"--quiet", revision],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if checkout.returncode != 0:
+            raise SnapshotSourceChanged("Snapshot source changed")
         for entry in entries:
             _overlay_entry(source_bytes, destination_bytes, entry)
+        verified_entries = preflight_git_snapshot(source_path, known_sensitive=known_sensitive)
+        if _head_revision(source_bytes) != revision or verified_entries != entries:
+            raise SnapshotSourceChanged("Snapshot source changed")
     except ContainedSnapshotError:
         shutil.rmtree(destination_path, ignore_errors=True)
         raise
