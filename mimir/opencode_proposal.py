@@ -100,6 +100,20 @@ def _beneath(candidate: str, home: Path) -> bool:
     return False
 
 
+def _contains_path_form(prompt: str, form: str, *, descendants: bool) -> bool:
+    start = 0
+    while (index := prompt.find(form, start)) >= 0:
+        before = prompt[index - 1] if index else ""
+        end = index + len(form)
+        after = prompt[end] if end < len(prompt) else ""
+        before_boundary = not before or before.isspace() or before in "\"'([{<"
+        after_boundary = not after or after.isspace() or after in "\"')]}>,;:!?"
+        if before_boundary and (after_boundary or (descendants and after == "/")):
+            return True
+        start = index + 1
+    return False
+
+
 def prompt_contains_sensitive_source_path(
     prompt: str,
     *,
@@ -109,7 +123,10 @@ def prompt_contains_sensitive_source_path(
     if not isinstance(prompt, str):
         raise TypeError("prompt must be a string")
     home = Path(os.path.expanduser(os.fspath(agent_home))).resolve(strict=False)
-    if any(form in prompt for form in _path_forms(agent_home)):
+    if any(
+        _contains_path_form(prompt, form, descendants=True)
+        for form in _path_forms(agent_home)
+    ):
         return "agent_home_path"
     for match in _PATH_TOKEN.finditer(prompt):
         token = match.group(0).rstrip(".,;:!?)]}")
@@ -125,24 +142,54 @@ def prompt_contains_sensitive_source_path(
         forms = _path_forms(source_path)
         if tokens.intersection(forms):
             return "config_auth_source_path"
-        for form in forms:
-            if form.startswith('"') and form.endswith('"') and form in prompt:
-                return "config_auth_source_path"
+        if any(
+            _contains_path_form(prompt, form, descendants=False)
+            for form in forms
+        ):
+            return "config_auth_source_path"
     return None
 
 
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _run_git(checkout: Path, *args: str, limit: int | None = None) -> bytes:
-    completed = subprocess.run(
-        ("git", "-C", os.fspath(checkout), *args),
-        check=False,
+    command = ("git", "-C", os.fspath(checkout), *args)
+    if limit is None:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if completed.returncode != 0:
+            raise OSError("proposal Git operation failed")
+        return completed.stdout
+    process = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
-    if completed.returncode != 0:
+    if process.stdout is None:
+        _stop_process(process)
+        raise OSError("proposal Git output unavailable")
+    output = process.stdout.read(limit)
+    if len(output) == limit:
+        process.stdout.close()
+        _stop_process(process)
+        return output
+    return_code = process.wait()
+    process.stdout.close()
+    if return_code != 0:
         raise OSError("proposal Git operation failed")
-    if limit is not None:
-        return completed.stdout[:limit]
-    return completed.stdout
+    return output
 
 
 def build_opencode_proposal(

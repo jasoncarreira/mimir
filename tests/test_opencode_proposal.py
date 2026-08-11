@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+import mimir.opencode_proposal as proposal_module
 from mimir.contained_execution import SensitiveMaterialScrubber
 from mimir.opencode_proposal import (
     ProposalBuildResult,
@@ -52,6 +53,30 @@ def test_proposal_is_lossless_and_does_not_apply_changes(tmp_path: Path) -> None
     assert (clone / "binary.dat").read_bytes() == payload
 
 
+def test_proposal_name_stream_overflow_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repository(tmp_path)
+    (repo / "file.txt").write_text("changed\n")
+    monkeypatch.setattr(proposal_module, "MAX_PROPOSAL_NAME_STREAM_BYTES", 3)
+    result = build_opencode_proposal(
+        repo, scrubber=SensitiveMaterialScrubber(home=tmp_path / "home")
+    )
+    assert result == ProposalBuildResult(None, "path_bytes")
+
+
+def test_proposal_patch_stream_overflow_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repository(tmp_path)
+    (repo / "file.txt").write_text("changed enough to exceed the tiny patch cap\n")
+    monkeypatch.setattr(proposal_module, "MAX_PROPOSAL_PATCH_BYTES", 16)
+    result = build_opencode_proposal(
+        repo, scrubber=SensitiveMaterialScrubber(home=tmp_path / "home")
+    )
+    assert result == ProposalBuildResult(None, "patch_bytes")
+
+
 def test_proposal_refuses_sensitive_patch(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     secret = "credential-value"
@@ -70,6 +95,7 @@ def test_prompt_policy_is_finite_and_preserves_other_text(tmp_path: Path) -> Non
     prompt = f"describe {tmp_path / 'unrelated'} byte-for-character"
     assert prompt_contains_sensitive_source_path(prompt, agent_home=home, source_paths=(config,)) is None
     assert prompt_contains_sensitive_source_path(f"read {config}.backup", agent_home=home, source_paths=(config,)) is None
+    assert prompt_contains_sensitive_source_path(f"read {home}-backup", agent_home=home, source_paths=(config,)) is None
 
 
 def test_artifacts_are_scrubbed_and_handle_is_relative(tmp_path: Path) -> None:
