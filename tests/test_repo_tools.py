@@ -1356,22 +1356,28 @@ def _recursive_metadata(root: Path) -> dict[str, tuple[int, int, int]]:
     }
 
 
-def _plant_repo_test_payload(lease: Path, canary: Path, pytest_executable: str) -> None:
-    (lease / "conftest.py").write_text(
+def _repo_test_conftest_payload(canary: Path) -> bytes:
+    return (
         "from pathlib import Path\n"
         "import json, os\n"
         "def pytest_sessionstart(session):\n"
-        "    Path('snapshot-executed.json').write_text(json.dumps("
-        "{'uid': os.getuid(), 'home': os.environ['HOME']}))\n"
+        "    marker = Path('snapshot-executed.json')\n"
+        "    details = {'uid': os.getuid(), 'home': os.environ['HOME'], 'attacked': True}\n"
         "    try:\n"
         f"        Path({str(canary)!r}).write_text('altered')\n"
         "    except OSError:\n"
-        "        pass\n",
-        encoding="utf-8",
-    )
+        "        details['attacked'] = False\n"
+        "    details['marker'] = 'executed'\n"
+        "    marker.write_text(json.dumps(details))\n"
+        "    print('MIMIR_PAYLOAD=' + json.dumps(details), flush=True)\n"
+    ).encode()
+
+
+def _plant_repo_test_payload(lease: Path, canary: Path, pytest_executable: str) -> None:
+    (lease / "conftest.py").write_bytes(_repo_test_conftest_payload(canary))
     (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
     (lease / "run-tests.sh").write_text(
-        f"#!/bin/sh\nexec {pytest_executable} \"$@\"\n", encoding="utf-8",
+        f"#!/bin/sh\nexec {pytest_executable} -s \"$@\"\n", encoding="utf-8",
     )
 
 
@@ -1700,8 +1706,13 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
 
     state = repo_tools[-2]
     lease = state.checkout_lease.path
-    tmp_path.chmod(0o755)
-    boundary = tmp_path / "live-repo-test"
+    restored_modes: dict[Path, int] = {}
+    for ancestor in (lease, *lease.parents):
+        restored_modes[ancestor] = stat.S_IMODE(ancestor.stat().st_mode)
+        ancestor.chmod(restored_modes[ancestor] | 0o001)
+        if ancestor == Path("/tmp"):
+            break
+    boundary = Path("/tmp") / f"mimir-repo-test-{uuid.uuid4()}"
     checkout_root = boundary / "repo-test-checkouts"
     home_root = boundary / "homes"
     controller_home = boundary / "controller-home"
@@ -1726,26 +1737,8 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         os.chown(path, 1001, 1001, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
     monkeypatch.setenv("HOME", str(controller_home))
-    (lease / "conftest.py").write_text(
-        "from pathlib import Path\n"
-        "import json, os\n"
-        "def pytest_sessionstart(session):\n"
-        "    marker = Path('snapshot-executed.json')\n"
-        "    marker.write_text('executed')\n"
-        "    attacked = True\n"
-        "    try:\n"
-        f"        Path({str(canary)!r}).write_text('altered')\n"
-        "    except OSError:\n"
-        "        attacked = False\n"
-        "    print('MIMIR_PAYLOAD=' + json.dumps({"
-        "'uid': os.getuid(), 'home': os.environ['HOME'], "
-        "'marker': marker.read_text(), 'attacked': attacked}), flush=True)\n",
-        encoding="utf-8",
-    )
-    (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
-    (lease / "run-tests.sh").write_text(
-        f"#!/bin/sh\nexec {pytest_executable} -s \"$@\"\n", encoding="utf-8",
-    )
+    _plant_repo_test_payload(lease, canary, pytest_executable)
+    assert (lease / "conftest.py").read_bytes() == _repo_test_conftest_payload(canary)
     for path in (lease / "conftest.py", lease / "test_payload.py", lease / "run-tests.sh"):
         os.chown(path, 1001, 1001)
     before = _recursive_metadata(lease)
@@ -1755,6 +1748,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     socket_path.chmod(0o666)
     listener.listen(1)
     result_read, result_write = os.pipe()
+    ready_read, ready_write = os.pipe()
     previous_roots = (
         contained_checkout.REPO_TEST_CHECKOUT_ROOT,
         worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
@@ -1769,10 +1763,19 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     controller_pid = os.fork()
     if controller_pid == 0:
         os.close(result_read)
+        os.close(ready_read)
         try:
             os.setgroups([1002])
             os.setresgid(1001, 1001, 1001)
             os.setresuid(1001, 1001, 1001)
+            assert os.access(lease, os.R_OK | os.X_OK)
+            assert any(lease.iterdir())
+            assert os.access(socket_path, os.W_OK)
+            assert stat.S_ISSOCK(socket_path.stat().st_mode)
+            assert os.access(config_home / "worklink.yaml", os.R_OK)
+            assert (config_home / "worklink.yaml").read_text(encoding="utf-8")
+            os.write(ready_write, b"controller-ready")
+            os.close(ready_write)
             contained_execution.WorkerClient = lambda capability: WorkerClient(
                 capability, socket_path=socket_path
             )
@@ -1784,8 +1787,10 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             os._exit(1)
 
     os.close(result_write)
+    os.close(ready_write)
     controller_reaped = False
     try:
+        assert os.read(ready_read, 64) == b"controller-ready"
         connection, _ = listener.accept()
         _pid, uid, _gid = struct.unpack(
             "3i",
@@ -1827,7 +1832,11 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             contained_execution.WorkerClient,
         ) = previous_roots
         os.close(result_read)
+        os.close(ready_read)
         listener.close()
+        shutil.rmtree(boundary, ignore_errors=True)
+        for ancestor, mode in restored_modes.items():
+            ancestor.chmod(mode)
 
     for payload_path in ("conftest.py", "test_payload.py", "run-tests.sh"):
         (lease / payload_path).unlink()
@@ -1854,6 +1863,7 @@ async def test_project_test_unsafe_runner_negative_control_alters_canary(
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
     monkeypatch.setenv("HOME", str(controller_home))
     _plant_repo_test_payload(lease, canary, pytest_executable)
+    assert (lease / "conftest.py").read_bytes() == _repo_test_conftest_payload(canary)
     issued: list[Path] = []
     executed = False
 
@@ -1870,7 +1880,11 @@ async def test_project_test_unsafe_runner_negative_control_alters_canary(
             check=False,
         )
         marker = json.loads((directory.path / "snapshot-executed.json").read_text(encoding="utf-8"))
-        executed = marker["home"] == str(controller_home)
+        executed = (
+            marker["home"] == str(controller_home)
+            and marker["marker"] == "executed"
+            and marker["attacked"] is True
+        )
         return CollectedExecutionResult(
             completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
         )
