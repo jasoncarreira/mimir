@@ -33,6 +33,7 @@ class UpdateDispatcher:
         except RuntimeError:
             self._producer = None
         self._failure: BaseException | None = None
+        self._overflowed = False
         self._publication_failed = False
         self._open_tools: dict[str, str] = {}
         self._tool_args: dict[str, Any] = {}
@@ -61,9 +62,13 @@ class UpdateDispatcher:
         self._queued_bytes += size
 
     async def submit(self, event: Mapping[str, Any]) -> None:
+        if self._overflowed:
+            await asyncio.sleep(0)
+            return
         try:
             self.enqueue(event)
         except RequestError:
+            self._overflowed = True
             current = asyncio.current_task()
             if self._producer is None or self._producer is current:
                 raise
@@ -73,33 +78,6 @@ class UpdateDispatcher:
     def permission_snapshot(self, tool_call_id: str) -> PermissionSnapshot | None:
         return self._snapshots.get(tool_call_id)
 
-
-    async def consume(
-        self,
-        source: asyncio.Queue[dict[str, Any]],
-        producer: asyncio.Task[Any] | None = None,
-    ) -> None:
-        try:
-            while True:
-                event = await source.get()
-                try:
-                    self.enqueue(event)
-                finally:
-                    source.task_done()
-        except RequestError:
-            owner = producer if producer is not None else self._producer
-            if owner is not None and owner is not asyncio.current_task():
-                if not owner.done():
-                    owner.cancel()
-                await asyncio.gather(owner, return_exceptions=True)
-            while True:
-                try:
-                    source.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                else:
-                    source.task_done()
-            raise
 
     async def drain(self) -> None:
         self._ensure_worker()

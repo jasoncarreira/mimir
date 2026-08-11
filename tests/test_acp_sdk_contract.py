@@ -1465,23 +1465,46 @@ async def test_input_queue_byte_limit_admits_exact_boundary(
     assert queue.pending_bytes == 0
 
 
+class ControlledWaitFor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.decision = asyncio.Event()
+        self.expire = False
+        self.calls = 0
+
+    async def __call__(self, awaitable, timeout):
+        self.calls += 1
+        if self.calls > 1:
+            return await awaitable
+        task = asyncio.ensure_future(awaitable)
+        self.started.set()
+        await self.decision.wait()
+        if self.expire:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise asyncio.TimeoutError
+        return await task
+
+
 @pytest.mark.asyncio
-async def test_input_queue_capacity_released_before_deadline_admits(
+async def test_input_queue_capacity_release_wins_before_controlled_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", 0.2)
+    timeout = ControlledWaitFor()
     queue = sdk.BoundedMessageQueue()
     for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
         await queue.publish(SimpleNamespace(message={"index": index}))
+    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
 
     waiting = asyncio.create_task(
         queue.publish(SimpleNamespace(message={"index": "waiting"}))
     )
-    await asyncio.sleep(0)
+    await timeout.started.wait()
     assert waiting.done() is False
     await queue._queue.get()
     queue.task_done()
-    await asyncio.wait_for(waiting, 0.1)
+    timeout.decision.set()
+    await waiting
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
 
     while not queue._queue.empty():
@@ -1490,27 +1513,28 @@ async def test_input_queue_capacity_released_before_deadline_admits(
 
 
 @pytest.mark.asyncio
-async def test_input_queue_capacity_held_rejects_only_after_deadline(
+async def test_input_queue_controlled_expiry_wins_before_capacity_release(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timeout = 0.05
-    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", timeout)
+    timeout = ControlledWaitFor()
     queue = sdk.BoundedMessageQueue()
     for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
         await queue.publish(SimpleNamespace(message={"index": index}))
+    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
 
-    loop = asyncio.get_running_loop()
-    started = loop.time()
     waiting = asyncio.create_task(
         queue.publish(SimpleNamespace(message={"index": "waiting"}))
     )
-    await asyncio.sleep(timeout / 2)
+    await timeout.started.wait()
     assert waiting.done() is False
+    timeout.expire = True
+    timeout.decision.set()
     with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
         await waiting
-    assert loop.time() - started >= timeout
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
 
+    await queue._queue.get()
+    queue.task_done()
     while not queue._queue.empty():
         await queue._queue.get()
         queue.task_done()
