@@ -131,9 +131,9 @@ def test_pinned_distribution_protocol_and_schema_boundary() -> None:
         "AGENT_METHODS", "AUTH_METHOD_ID", "CLIENT_METHODS", "MCP_CONNECT_METHOD",
         "MCP_DISCONNECT_METHOD", "MCP_INBOUND_NOTIFICATIONS", "MCP_MESSAGE_METHOD",
         "MCP_NOTIFICATION_METHODS", "MCP_REQUEST_METHODS", "PERMISSION_METHOD",
-        "AcpPeer", "AcpPeerCallbacks", "AcpRequestHandle", "AcpProtocolError", "BoundedMessageQueue", "CancelledPermissionOutcome",
+        "AcpPeer", "AcpPeerCallbacks", "AcpRequestHandle", "AcpProtocolError", "BoundedMessageDispatcher", "BoundedMessageQueue", "CancelledPermissionOutcome",
         "MAX_FRAME_BYTES", "MAX_PENDING_REQUESTS", "INPUT_QUEUE_MAX_ITEMS",
-        "INPUT_QUEUE_MAX_BYTES", "INPUT_QUEUE_DRAIN_TIMEOUT",
+        "INPUT_QUEUE_MAX_BYTES", "INPUT_QUEUE_DRAIN_TIMEOUT", "MAX_ACTIVE_INBOUND_RUNNERS",
         "ConnectMcpRequest", "ConnectMcpResponse", "DisconnectMcpRequest",
         "DisconnectMcpResponse", "MessageMcpNotification", "MessageMcpRequest",
         "PermissionCompletion", "PermissionDecision", "PermissionSnapshot",
@@ -700,6 +700,76 @@ class MemoryTransport:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_live_connection_bounds_active_inbound_runners() -> None:
+    limit = 4
+    total = limit * 2 + 1
+    transport = MemoryTransport()
+    release = asyncio.Event()
+    boundary = asyncio.Event()
+    handled = asyncio.Event()
+    active = 0
+    peak = 0
+    started = 0
+    completed = 0
+
+    async def route(method: str, params: Any, is_notification: bool) -> Any:
+        nonlocal active, peak, started, completed
+        del params, is_notification
+        active += 1
+        started += 1
+        peak = max(peak, active)
+        if started == limit:
+            boundary.set()
+        try:
+            await release.wait()
+            return {"method": method}
+        finally:
+            active -= 1
+            completed += 1
+            if completed == total:
+                handled.set()
+
+    def dispatcher_factory(*args: Any) -> sdk.BoundedMessageDispatcher:
+        return sdk.BoundedMessageDispatcher(*args, max_active=limit)
+
+    queue = sdk.BoundedMessageQueue()
+    connection = sdk.Connection(
+        route,
+        transport,
+        queue=queue,
+        dispatcher_factory=dispatcher_factory,
+    )
+    request_ids: list[int] = []
+    for index in range(total):
+        message: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": f"blocked/{index}",
+            "params": {},
+        }
+        if index % 2 == 0:
+            message["id"] = index
+            request_ids.append(index)
+        await transport.incoming.put(message)
+
+    await asyncio.wait_for(boundary.wait(), 1)
+    while not transport.incoming.empty():
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert started == peak == limit
+
+    release.set()
+    await asyncio.wait_for(handled.wait(), 1)
+    await asyncio.wait_for(queue.join(), 1)
+    responses = [await transport.outgoing.get() for _ in request_ids]
+    assert sorted(response["id"] for response in responses) == request_ids
+
+    await transport.incoming.put(None)
+    assert connection._recv_task is not None
+    await asyncio.wait_for(connection._recv_task, 1)
+    await connection.close()
 
 
 @pytest.mark.parametrize(

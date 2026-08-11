@@ -13,6 +13,7 @@ from acp.agent.router import build_agent_router
 from acp.connection import Connection
 from acp.interfaces import Agent, Client
 from acp.meta import AGENT_METHODS, CLIENT_METHODS
+from acp.task import DefaultMessageDispatcher
 from acp.task.queue import InMemoryMessageQueue
 from acp.schema import (
     AcpMcpServer,
@@ -70,6 +71,7 @@ MAX_PENDING_REQUESTS = 64
 INPUT_QUEUE_MAX_ITEMS = 64
 INPUT_QUEUE_MAX_BYTES = 8 * 1024 * 1024
 INPUT_QUEUE_DRAIN_TIMEOUT = 2.0
+MAX_ACTIVE_INBOUND_RUNNERS = 64
 
 
 class AcpProtocolError(RuntimeError):
@@ -750,6 +752,9 @@ class BoundedMessageQueue(InMemoryMessageQueue):
             self._release_last(size)
             raise
 
+    def close_nowait(self) -> None:
+        self._closed = True
+
     def task_done(self) -> None:
         if self._sizes:
             self._pending_bytes -= self._sizes.popleft()
@@ -770,6 +775,81 @@ class BoundedMessageQueue(InMemoryMessageQueue):
         if message is None:
             return 0
         return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+class BoundedMessageDispatcher(DefaultMessageDispatcher):
+    def __init__(
+        self,
+        queue: BoundedMessageQueue,
+        supervisor: Any,
+        store: Any,
+        request_runner: Any,
+        notification_runner: Any,
+        *,
+        max_active: int = MAX_ACTIVE_INBOUND_RUNNERS,
+    ) -> None:
+        super().__init__(
+            queue=queue,
+            supervisor=supervisor,
+            store=store,
+            request_runner=request_runner,
+            notification_runner=notification_runner,
+        )
+        if max_active <= 0:
+            raise ValueError("max_active must be positive")
+        self._runner_slots = asyncio.BoundedSemaphore(max_active)
+
+    async def stop(self) -> None:
+        self._queue.close_nowait()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _dispatch_request(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+        try:
+            record = self._store.begin_incoming(
+                message.get("method", ""), message.get("params")
+            )
+        except BaseException:
+            self._runner_slots.release()
+            raise
+
+        async def runner() -> None:
+            try:
+                result = await self._request_runner(message)
+            except Exception as exc:
+                self._store.fail_incoming(record, exc)
+                raise
+            else:
+                self._store.complete_incoming(record, result)
+            finally:
+                self._runner_slots.release()
+
+        self._create_runner(runner(), "mimir.acp.Dispatcher.request")
+
+    async def _dispatch_notification(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+
+        async def runner() -> None:
+            try:
+                await self._notification_runner(message)
+            finally:
+                self._runner_slots.release()
+
+        self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
+
+    def _create_runner(self, coroutine: Any, name: str) -> None:
+        try:
+            self._supervisor.create(coroutine, name=name)
+        except BaseException:
+            coroutine.close()
+            self._runner_slots.release()
+            raise
 
 
 async def run_stdio_agent(
@@ -799,6 +879,7 @@ async def run_stdio_agent(
         listening=False,
         state_store=state_store,
         queue=message_queue,
+        dispatcher_factory=BoundedMessageDispatcher,
     )
     peer = AcpPeer(connection, agent, state_store)
     holder["peer"] = peer
@@ -815,7 +896,10 @@ async def run_stdio_agent(
         primary = exc
         traceback = exc.__traceback__
     peer.mark_transport_dead()
-    await message_queue.join()
+    try:
+        await asyncio.wait_for(message_queue.join(), INPUT_QUEUE_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
     await asyncio.sleep(0)
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
@@ -859,12 +943,14 @@ __all__ = [
     "INPUT_QUEUE_MAX_ITEMS",
     "INPUT_QUEUE_MAX_BYTES",
     "INPUT_QUEUE_DRAIN_TIMEOUT",
+    "MAX_ACTIVE_INBOUND_RUNNERS",
     "PERMISSION_METHOD",
     "AcpMcpServer",
     "AcpPeer",
     "AcpPeerCallbacks",
     "AcpRequestHandle",
     "AcpProtocolError",
+    "BoundedMessageDispatcher",
     "BoundedMessageQueue",
     "Agent",
     "AgentCapabilities",
