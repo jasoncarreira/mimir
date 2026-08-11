@@ -4,8 +4,9 @@ import asyncio
 
 import pytest
 
+from mimir.acp.agent import MimirAcpAgent
 from mimir.acp.sdk import RequestError
-from mimir.acp.updates import UpdateDispatcher
+from mimir.acp.updates import MAX_UPDATE_BYTES, MAX_UPDATE_ITEMS, UpdateDispatcher, _event_bytes
 
 
 class Publisher:
@@ -94,7 +95,7 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
     publisher = Publisher()
     publisher.block = True
     dispatcher = UpdateDispatcher(publisher)
-    for index in range(300):
+    for index in range(MAX_UPDATE_ITEMS):
         dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": str(index), "tool_name": "search", "args": {"index": index}})
     await publisher.entered.wait()
     drain = asyncio.create_task(dispatcher.drain())
@@ -103,7 +104,7 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
     publisher.release.set()
     await drain
     progress = [item.raw_input["index"] for item in publisher.updates if item.status == "in_progress"]
-    assert progress == list(range(300))
+    assert progress == list(range(MAX_UPDATE_ITEMS))
     await finish(dispatcher)
 
 
@@ -224,3 +225,112 @@ async def test_is_error_discriminator_overrides_nominal_success() -> None:
         ("failed", "tool"),
     ]
     await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_update_item_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
+    for _ in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue(event)
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue(event)
+    assert dispatcher.queue.qsize() == MAX_UPDATE_ITEMS
+    assert dispatcher.failure is not None
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_update_byte_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    base = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search", "args": {"value": ""}}
+    overhead = _event_bytes(base)
+    event = {**base, "args": {"value": "a" * (MAX_UPDATE_BYTES - overhead)}}
+    assert _event_bytes(event) == MAX_UPDATE_BYTES
+    dispatcher.enqueue(event)
+    assert dispatcher.queued_bytes == MAX_UPDATE_BYTES
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue({"type": "tool_call"})
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+    assert dispatcher.queued_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_overflow_cancels_owner_quarantines_follow_on_events() -> None:
+    blocked_publisher = Publisher()
+    blocked_publisher.block = True
+    source: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    dispatcher_ready: asyncio.Future[UpdateDispatcher] = (
+        asyncio.get_running_loop().create_future()
+    )
+    owner_cancelled = asyncio.Event()
+    follow_ons_enqueued = asyncio.Event()
+    source_drained = asyncio.Event()
+
+    async def own_connection() -> None:
+        dispatcher = UpdateDispatcher(blocked_publisher)
+        dispatcher_ready.set_result(dispatcher)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            owner_cancelled.set()
+            await follow_ons_enqueued.wait()
+            await source.join()
+            source_drained.set()
+            await blocked_publisher.release.wait()
+            with pytest.raises(RequestError, match="Internal error"):
+                await dispatcher.drain()
+            await dispatcher.close()
+            raise
+
+    owner = asyncio.create_task(own_connection())
+    dispatcher = await dispatcher_ready
+    forwarder = asyncio.create_task(MimirAcpAgent._forward_updates(source, dispatcher))
+    event = {
+        "type": "tool_call",
+        "phase": "start",
+        "id": "blocked",
+        "tool_name": "search",
+    }
+    await source.put(event)
+    await blocked_publisher.entered.wait()
+    for index in range(MAX_UPDATE_ITEMS):
+        await source.put({**event, "id": str(index)})
+    await source.put({**event, "id": "limit-plus-one"})
+    await owner_cancelled.wait()
+    assert dispatcher.queue.qsize() == MAX_UPDATE_ITEMS
+
+    for index in range(5):
+        await source.put({**event, "id": f"quarantined-{index}"})
+    follow_ons_enqueued.set()
+    await source_drained.wait()
+    assert source.empty()
+    assert forwarder.done() is False
+
+    independent_publisher = Publisher()
+    independent = UpdateDispatcher(independent_publisher)
+    await independent.submit(
+        {"type": "tool_call", "phase": "start", "id": "live", "tool_name": "search"}
+    )
+    await independent.drain()
+    assert [(item.tool_call_id, item.status) for item in independent_publisher.updates] == [
+        ("live", "pending")
+    ]
+
+    blocked_publisher.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    forwarder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder
+    await independent.close()

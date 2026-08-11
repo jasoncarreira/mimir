@@ -131,7 +131,9 @@ def test_pinned_distribution_protocol_and_schema_boundary() -> None:
         "AGENT_METHODS", "AUTH_METHOD_ID", "CLIENT_METHODS", "MCP_CONNECT_METHOD",
         "MCP_DISCONNECT_METHOD", "MCP_INBOUND_NOTIFICATIONS", "MCP_MESSAGE_METHOD",
         "MCP_NOTIFICATION_METHODS", "MCP_REQUEST_METHODS", "PERMISSION_METHOD",
-        "AcpPeer", "AcpPeerCallbacks", "AcpRequestHandle", "AcpProtocolError", "CancelledPermissionOutcome",
+        "AcpPeer", "AcpPeerCallbacks", "AcpRequestHandle", "AcpProtocolError", "BoundedMessageQueue", "CancelledPermissionOutcome",
+        "MAX_FRAME_BYTES", "MAX_PENDING_REQUESTS", "INPUT_QUEUE_MAX_ITEMS",
+        "INPUT_QUEUE_MAX_BYTES", "INPUT_QUEUE_DRAIN_TIMEOUT",
         "ConnectMcpRequest", "ConnectMcpResponse", "DisconnectMcpRequest",
         "DisconnectMcpResponse", "MessageMcpNotification", "MessageMcpRequest",
         "PermissionCompletion", "PermissionDecision", "PermissionSnapshot",
@@ -1383,3 +1385,156 @@ async def test_request_store_close_unknown_duplicate_and_abandon_contract() -> N
     abandoned_state.resolve_outgoing(7, {})
     with pytest.raises(sdk.AcpProtocolError, match="Duplicate or late"):
         abandoned_state.resolve_outgoing(7, {})
+
+
+@pytest.mark.asyncio
+async def test_ndjson_frame_limit_is_counted_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = b'{"jsonrpc":"2.0","method":"x","params":{"value":""}}'
+    payload = base[:-3] + (b"a" * (sdk.MAX_FRAME_BYTES - len(base))) + base[-3:]
+    assert len(payload) == sdk.MAX_FRAME_BYTES
+    reader = asyncio.StreamReader()
+    reader.feed_data(payload + b"\n")
+    reader.feed_eof()
+    transport = sdk.StrictNdjsonTransport(reader, SimpleNamespace())
+    message = await transport.receive()
+    assert message is not None
+    assert transport.take_frame_bytes() == sdk.MAX_FRAME_BYTES
+
+    decoded = False
+    original_loads = sdk.json.loads
+
+    def loads(value: Any) -> Any:
+        nonlocal decoded
+        decoded = True
+        return original_loads(value)
+
+    monkeypatch.setattr(sdk.json, "loads", loads)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"x" * (sdk.MAX_FRAME_BYTES + 1))
+    reader.feed_eof()
+    transport = sdk.StrictNdjsonTransport(reader, SimpleNamespace())
+    with pytest.raises(sdk.AcpProtocolError, match="size limit"):
+        await transport.receive()
+    assert decoded is False
+    assert len(transport._buffer) == sdk.MAX_FRAME_BYTES + 1
+
+
+@pytest.mark.asyncio
+async def test_pending_request_limit_admits_exact_boundary() -> None:
+    store = sdk.StrictMessageStateStore()
+    for request_id in range(sdk.MAX_PENDING_REQUESTS):
+        store.register_outgoing(request_id, "method")
+    with pytest.raises(sdk.AcpProtocolError, match="Too many pending"):
+        store.register_outgoing(sdk.MAX_PENDING_REQUESTS, "method")
+    for request_id in range(sdk.MAX_PENDING_REQUESTS):
+        store.abandon_outgoing(request_id)
+
+
+@pytest.mark.asyncio
+async def test_input_queue_item_limit_times_out_only_after_exact_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", 0.01)
+    queue = sdk.BoundedMessageQueue()
+    tasks = [SimpleNamespace(message={"jsonrpc": "2.0", "method": "x", "params": {"n": index}}) for index in range(sdk.INPUT_QUEUE_MAX_ITEMS)]
+    for task in tasks:
+        await queue.publish(task)
+    with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
+        await queue.publish(SimpleNamespace(message={"jsonrpc": "2.0", "method": "x"}))
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+    while not queue._queue.empty():
+        await queue._queue.get()
+        queue.task_done()
+
+
+@pytest.mark.asyncio
+async def test_input_queue_byte_limit_admits_exact_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", 0.01)
+    queue = sdk.BoundedMessageQueue()
+    base = {"value": ""}
+    overhead = len(sdk.json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode())
+    task = SimpleNamespace(message={"value": "a" * (sdk.INPUT_QUEUE_MAX_BYTES - overhead)})
+    await queue.publish(task)
+    assert queue.pending_bytes == sdk.INPUT_QUEUE_MAX_BYTES
+    with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
+        await queue.publish(SimpleNamespace(message={"x": 1}))
+    await queue._queue.get()
+    queue.task_done()
+    assert queue.pending_bytes == 0
+
+
+class ControlledWaitFor:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.decision = asyncio.Event()
+        self.expire = False
+        self.calls = 0
+
+    async def __call__(self, awaitable, timeout):
+        self.calls += 1
+        if self.calls > 1:
+            return await awaitable
+        task = asyncio.ensure_future(awaitable)
+        self.started.set()
+        await self.decision.wait()
+        if self.expire:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise asyncio.TimeoutError
+        return await task
+
+
+@pytest.mark.asyncio
+async def test_input_queue_capacity_release_wins_before_controlled_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = ControlledWaitFor()
+    queue = sdk.BoundedMessageQueue()
+    for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        await queue.publish(SimpleNamespace(message={"index": index}))
+    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
+
+    waiting = asyncio.create_task(
+        queue.publish(SimpleNamespace(message={"index": "waiting"}))
+    )
+    await timeout.started.wait()
+    assert waiting.done() is False
+    await queue._queue.get()
+    queue.task_done()
+    timeout.decision.set()
+    await waiting
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+
+    while not queue._queue.empty():
+        await queue._queue.get()
+        queue.task_done()
+
+
+@pytest.mark.asyncio
+async def test_input_queue_controlled_expiry_wins_before_capacity_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = ControlledWaitFor()
+    queue = sdk.BoundedMessageQueue()
+    for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        await queue.publish(SimpleNamespace(message={"index": index}))
+    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
+
+    waiting = asyncio.create_task(
+        queue.publish(SimpleNamespace(message={"index": "waiting"}))
+    )
+    await timeout.started.wait()
+    assert waiting.done() is False
+    timeout.expire = True
+    timeout.decision.set()
+    with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
+        await waiting
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+
+    await queue._queue.get()
+    queue.task_done()
+    while not queue._queue.empty():
+        await queue._queue.get()
+        queue.task_done()
