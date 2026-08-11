@@ -1909,17 +1909,23 @@ def build_app(config: Config) -> web.Application:
     async def _compensate_startup(app: web.Application) -> list[Exception]:
         errors: list[Exception] = []
 
-        async def attempt(operation: Any) -> None:
+        async def attempt(operation: Any) -> bool:
             try:
                 await operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+                return False
+            return True
 
         def attempt_sync(operation: Any) -> None:
             try:
                 operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+
+        acp_stopped = True
+        if startup_state.acp_daemon is not None:
+            acp_stopped = await attempt(startup_state.acp_daemon.stop)
 
         try:
             task_errors = await cancel_background_tasks(
@@ -1936,26 +1942,25 @@ def build_app(config: Config) -> web.Application:
             attempt_sync(lambda: mark_clean_shutdown(config.home))
         if startup_state.scheduler_start_attempted:
             attempt_sync(scheduler.stop)
-        if startup_state.mcp_manager is not None:
+        if acp_stopped and startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
-        if startup_state.acp_daemon is not None:
-            await attempt(startup_state.acp_daemon.stop)
-        if startup_state.bridges_connect_attempted:
+        if acp_stopped and startup_state.bridges_connect_attempted:
             await attempt(channels.disconnect_all)
-        if startup_state.bundle is not None:
+        if acp_stopped and startup_state.bundle is not None:
             await attempt(startup_state.bundle.aclose)
         if (
-            startup_state.activity_panel_start_attempted
+            acp_stopped
+            and startup_state.activity_panel_start_attempted
             and startup_state.activity_panel is not None
         ):
             await attempt(startup_state.activity_panel.stop)
-        await attempt(pairing_notifier.aclose)
-        try:
-            _clear_runtime_app_state(app, runtime_slot, startup_state)
-        except BaseException as exc:
-            errors.append(_cleanup_exception(exc))
-        finally:
-            startup_state.compensated = True
+        if acp_stopped:
+            await attempt(pairing_notifier.aclose)
+            try:
+                _clear_runtime_app_state(app, runtime_slot, startup_state)
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+        startup_state.compensated = True
         return errors
 
     async def _on_startup(app: web.Application) -> None:
@@ -1972,11 +1977,13 @@ def build_app(config: Config) -> web.Application:
     async def _on_cleanup(app: web.Application) -> None:
         errors: list[Exception] = []
 
-        async def attempt(operation: Any) -> None:
+        async def attempt(operation: Any) -> bool:
             try:
                 await operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+                return False
+            return True
 
         def attempt_sync(operation: Any) -> Any:
             try:
@@ -2044,20 +2051,22 @@ def build_app(config: Config) -> web.Application:
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
             attempt_sync(scheduler.stop)
+            acp_stopped = True
             if startup_state.acp_daemon is not None:
-                await attempt(startup_state.acp_daemon.stop)
-            if startup_state.bundle is not None:
+                acp_stopped = await attempt(startup_state.acp_daemon.stop)
+            if acp_stopped and startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
-            if startup_state.activity_panel is not None:
+            if acp_stopped and startup_state.activity_panel is not None:
                 await attempt(startup_state.activity_panel.stop)
-            await attempt(pairing_notifier.aclose)
-            await attempt(channels.disconnect_all)
-            if startup_state.mcp_manager is not None:
-                await attempt(startup_state.mcp_manager.shutdown)
-            try:
-                _clear_runtime_app_state(app, runtime_slot, startup_state)
-            except BaseException as exc:
-                errors.append(_cleanup_exception(exc))
+            if acp_stopped:
+                await attempt(pairing_notifier.aclose)
+                await attempt(channels.disconnect_all)
+                if startup_state.mcp_manager is not None:
+                    await attempt(startup_state.mcp_manager.shutdown)
+                try:
+                    _clear_runtime_app_state(app, runtime_slot, startup_state)
+                except BaseException as exc:
+                    errors.append(_cleanup_exception(exc))
 
         for error in errors:
             log.error("server cleanup failed: %s", error)

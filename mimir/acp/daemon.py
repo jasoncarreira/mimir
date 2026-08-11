@@ -18,6 +18,7 @@ from .sdk import run_stdio_agent
 ACP_AUTH_TIMEOUT = 10.0
 ACP_PEER_GRACE_TIMEOUT = 5.0
 ACP_PEER_CANCEL_TIMEOUT = 2.0
+ACP_PEER_ABORT_TIMEOUT = 1.0
 ACP_SHUTDOWN_TIMEOUT = 20.0
 ACP_MAX_PEERS = 8
 ACP_CLOSE_CONCURRENCY = 4
@@ -193,19 +194,23 @@ class AcpDaemon:
             return
         self._stopping = True
         server, self._server = self._server, None
-        if server is not None:
-            server.close()
-            await server.wait_closed()
+
+        async def shutdown() -> None:
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+            await self._stop_peers()
+
+        shutdown_task = asyncio.create_task(shutdown())
         try:
-            await asyncio.wait_for(self._stop_peers(), ACP_SHUTDOWN_TIMEOUT)
-        except TimeoutError:
-            for peer in tuple(self._peers):
-                peer.task.cancel()
-                transport = peer.writer.transport
-                transport.abort()
-            await asyncio.gather(
-                *(peer.task for peer in tuple(self._peers)), return_exceptions=True
+            done, _ = await asyncio.wait(
+                {shutdown_task}, timeout=ACP_SHUTDOWN_TIMEOUT
             )
+            if not done:
+                shutdown_task.cancel()
+                self._abort_peers(tuple(self._peers))
+                raise AcpDaemonError("ACP peer shutdown exceeded its total deadline")
+            await shutdown_task
         finally:
             self._unlink_owned_socket(self._socket_identity)
             self._socket_identity = None
@@ -241,7 +246,10 @@ class AcpDaemon:
         else:
             del reader
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, OSError):
+                writer.transport.abort()
             raise AcpDaemonError("an ACP daemon is already listening")
         current = _safe_stat(
             self.socket_path, kind="socket", mode=_SOCKET_MODE, uid=self._uid
@@ -261,7 +269,10 @@ class AcpDaemon:
             or _peer_uid(sock) != self._uid
         ):
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, OSError):
+                writer.transport.abort()
             return
         self._admitted += 1
         task = asyncio.create_task(self._run_peer(reader, writer))
@@ -280,7 +291,10 @@ class AcpDaemon:
         agent = self._agent
         if agent is None:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, OSError):
+                writer.transport.abort()
             return
         connection_agent = _ConnectionAgent(agent)
         task = asyncio.create_task(
@@ -308,9 +322,9 @@ class AcpDaemon:
             await asyncio.gather(task, return_exceptions=True)
             writer.close()
             try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+                await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, OSError):
+                writer.transport.abort()
 
     async def _stop_peers(self) -> None:
         peers = tuple(self._peers)
@@ -320,29 +334,46 @@ class AcpDaemon:
             async with semaphore:
                 peer.writer.close()
                 try:
-                    await peer.writer.wait_closed()
-                except OSError:
-                    pass
+                    await asyncio.wait_for(
+                        peer.writer.wait_closed(), ACP_PEER_GRACE_TIMEOUT
+                    )
+                except (TimeoutError, OSError):
+                    peer.writer.transport.abort()
 
         await asyncio.gather(*(close(peer) for peer in peers))
-        pending = [peer.task for peer in peers if not peer.task.done()]
+        pending = {peer.task for peer in peers if not peer.task.done()}
         if pending:
-            done, pending_set = await asyncio.wait(
+            _, pending = await asyncio.wait(
                 pending, timeout=ACP_PEER_GRACE_TIMEOUT
             )
-            del done
-            for task in pending_set:
-                task.cancel()
-            if pending_set:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending_set, return_exceptions=True),
-                        ACP_PEER_CANCEL_TIMEOUT,
-                    )
-                except TimeoutError:
-                    for peer in peers:
-                        if peer.task in pending_set:
-                            peer.writer.transport.abort()
+        for task in pending:
+            task.cancel()
+        if pending:
+            _, pending = await asyncio.wait(
+                pending, timeout=ACP_PEER_CANCEL_TIMEOUT
+            )
+        if pending:
+            pending = set(self._abort_peers(peers, tasks=pending))
+            _, pending = await asyncio.wait(
+                pending, timeout=ACP_PEER_ABORT_TIMEOUT
+            )
+        if pending:
+            raise AcpDaemonError("ACP peers did not terminate after transport abort")
+        await asyncio.gather(*(peer.task for peer in peers), return_exceptions=True)
+
+    def _abort_peers(
+        self,
+        peers: tuple[_Peer, ...],
+        *,
+        tasks: set[asyncio.Task[None]] | None = None,
+    ) -> tuple[asyncio.Task[None], ...]:
+        selected = tasks or {peer.task for peer in peers if not peer.task.done()}
+        for peer in peers:
+            if peer.task not in selected:
+                continue
+            peer.task.cancel()
+            peer.writer.transport.abort()
+        return tuple(selected)
 
     def _unlink_owned_socket(self, identity: tuple[int, int] | None) -> None:
         if identity is None:
@@ -369,6 +400,7 @@ class AcpDaemon:
 __all__ = [
     "ACP_AUTH_TIMEOUT",
     "ACP_MAX_PEERS",
+    "ACP_PEER_ABORT_TIMEOUT",
     "AcpDaemon",
     "AcpDaemonError",
     "acp_enabled_from_env",

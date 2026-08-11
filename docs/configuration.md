@@ -120,7 +120,6 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_RECENT_SOURCES` | csv-list | `slack,discord,bluesky,web,stdin,acp` | Allowlist of `Message.source` values in Recent activity. `*`/`all` = allow all; `""` = none. |
 | `MIMIR_ACP_JOURNAL_TTL_DAYS` | positive int | `7` | Days to retain replayable ACP session journals before expiry. |
 | `MIMIR_ACP_ENABLED` | bool | enabled on POSIX with verifiable peer credentials | Start the owner-only Unix ACP daemon with `mimir run`. An explicit false value (`0`, `false`, `no`, `off`, or `n`, case-insensitive) prevents all ACP daemon construction; explicit enable fails on unsupported platforms. |
-| `MIMIR_ACP_PROFILE` | profile name | `default` | Client-side ACP profile selected when `--profile` is absent. This is a profile name only and must never contain a credential or other secret. |
 | `MIMIR_RECENT_MESSAGE_CHARS` | int | `4096` | Per-message render cap (chars) in Recent activity. `0` = no cap. |
 | `MIMIR_RECENT_BOUNDARIES` | int | `3` | Recent session boundaries rendered under "Recent session summaries". `0` disables. |
 | `MIMIR_UNFINISHED_STALE_AGE_HOURS` | int | `2` | Age (h) at which an Unfinished summary gets the `[verify before quoting]` suffix. |

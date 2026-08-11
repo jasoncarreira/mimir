@@ -2316,3 +2316,63 @@ async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
     control.events.clear()
     await _run_cleanup(app)
     assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_acp_stop_failure_preserves_shared_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop:failed")
+            raise RuntimeError("peer still owns runtime work")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    await _run_startup(app)
+    control.events.clear()
+    with pytest.raises(ExceptionGroup, match="server cleanup failed"):
+        await _run_cleanup(app)
+    assert "acp:stop:failed" in control.events
+    assert "bundle:close" not in control.events
+    assert "bridges:disconnect" not in control.events
+    assert control.bundle.closed is False
+
+
+@pytest.mark.asyncio
+async def test_acp_is_stopped_before_bundle_on_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("later startup")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="later startup"):
+        await _run_startup(app)
+    assert control.events.index("acp:start") < control.events.index("indexer:start")
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
