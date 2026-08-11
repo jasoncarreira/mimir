@@ -1909,6 +1909,7 @@ async def _spawn_open_code_impl(
     )
     from ..contained_snapshot import (
         SnapshotCredentialsRefused,
+        SnapshotEmbeddedRepository,
         SnapshotSourceChanged,
         SnapshotUnsafeEntry,
     )
@@ -2110,6 +2111,13 @@ async def _spawn_open_code_impl(
             except SnapshotCredentialsRefused:
                 terminal = classify_spawn_terminal_state(
                     provisioning_reason="seed_credentials"
+                )
+            except SnapshotEmbeddedRepository:
+                # Must precede SnapshotUnsafeEntry, which it subclasses. A seed
+                # tree with a nested checkout is an ordinary layout, not a
+                # hostile path, and the two want different reasons.
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="embedded_seed_repository"
                 )
             except SnapshotUnsafeEntry:
                 terminal = classify_spawn_terminal_state(
