@@ -232,6 +232,9 @@ async def execute_contained(
         projections=checked_projections,
         identifier=identifier,
     )
+    started = getattr(directory, "_contained_started", None)
+    if started is not None:
+        started(process)
     output_overflow = False
     cancel_task: asyncio.Task[None] | None = None
 

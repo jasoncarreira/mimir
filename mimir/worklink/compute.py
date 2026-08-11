@@ -310,9 +310,19 @@ def _fd_anchored_opencode_argv(
 
 
 class _ClientBoundCapability:
-    def __init__(self, capability: object, client: object) -> None:
+    def __init__(
+        self,
+        capability: object,
+        client: object,
+        started: asyncio.Future[object],
+    ) -> None:
         self._capability = capability
         self._contained_worker_client = client
+        self._started = started
+
+    def _contained_started(self, process: object) -> None:
+        if not self._started.done():
+            self._started.set_result(process)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._capability, name)
@@ -422,11 +432,13 @@ class LocalSubprocessComputeBackend:
             raise ComputeLaunchError("worker projection is invalid") from exc
         identifier = str(uuid.uuid4())
         client = self._worker_client or WorkerClient(authorization)
-        capability = _ClientBoundCapability(authorization, client)
+        started: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        capability = _ClientBoundCapability(authorization, client, started)
         stdout_limit, stderr_limit = _worklink_output_limits()
-        try:
-            task = asyncio.create_task(
-                execute_contained(
+
+        async def collect_contained() -> CollectedExecutionResult:
+            try:
+                return await execute_contained(
                     command,
                     capability,
                     {
@@ -440,13 +452,20 @@ class LocalSubprocessComputeBackend:
                     stdout_limit=stdout_limit,
                     stderr_limit=stderr_limit,
                 )
-            )
-            await asyncio.sleep(0)
-            if task.done():
-                task.result()
+            except BaseException as exc:
+                if not started.done():
+                    started.set_exception(exc)
+                raise
+
+        task = asyncio.create_task(collect_contained())
+        try:
+            process = await started
         except (OSError, RuntimeError, ValueError) as exc:
+            try:
+                await task
+            except (OSError, RuntimeError, ValueError):
+                pass
             raise ComputeLaunchError(str(exc)) from exc
-        process = getattr(client, "processes", {}).get(identifier)
         pid = getattr(process, "pid", None)
         ticks = None
         if isinstance(pid, int):
@@ -545,10 +564,12 @@ class LocalSubprocessComputeBackend:
         """Whether the launched subprocess is still running (liveness probe for
         the feature-factory observe loop). Unknown/gone handles read as dead."""
         try:
-            proc, _spec, _command = self._job(handle)
+            job, _spec, _command = self._job(handle)
         except KeyError:
             return False
-        return getattr(proc, "returncode", 0) is None
+        if isinstance(job, asyncio.Task):
+            return not job.done()
+        return getattr(job, "returncode", 0) is None
 
     async def cancel(self, handle: LaunchHandle) -> None:
         try:
