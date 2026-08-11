@@ -29,6 +29,8 @@ MIMIR_UID = 1001
 WORKLINK_UID = 1002
 WORKLINK_GID = 1002
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
+REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
+OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 MAX_FDS = 3
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
@@ -155,6 +157,19 @@ def _identity_integer(request: dict[str, Any], field: str) -> int:
     return value
 
 
+def _issued_checkout_relative(resolved: Path) -> tuple[Path, Path]:
+    matches: list[tuple[Path, Path]] = []
+    for root in (ENABLED_CHECKOUT_ROOT, REPO_TEST_CHECKOUT_ROOT, OPENCODE_CHECKOUT_ROOT):
+        try:
+            canonical = root.resolve(strict=True)
+            matches.append((root, resolved.relative_to(canonical)))
+        except (OSError, ValueError):
+            continue
+    if len(matches) != 1:
+        raise RuntimeError("received checkout FD is not the exact issued checkout")
+    return matches[0]
+
+
 def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
@@ -166,16 +181,13 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
     if (observed.st_dev, observed.st_ino) != (device, inode):
         raise RuntimeError("received checkout FD identity does not match request")
     resolved = Path(os.readlink(f"/proc/self/fd/{fd}"))
-    canonical_root = ENABLED_CHECKOUT_ROOT.resolve(strict=True)
-    try:
-        relative = resolved.relative_to(canonical_root)
-    except ValueError as exc:
-        raise RuntimeError("received checkout FD is not the exact issued checkout") from exc
+    root, relative = _issued_checkout_relative(resolved)
     if (
         len(relative.parts) != 3
         or re.fullmatch(r"[0-9a-f]{64}", relative.parts[0]) is None
         or relative.parts[1] != f"{issue}-{attempt}"
         or relative.parts[2] != "checkout"
+        or (root == OPENCODE_CHECKOUT_ROOT and attempt != 1)
     ):
         raise RuntimeError("received checkout FD is not the exact issued checkout")
     boundary = resolved.parent.stat(follow_symlinks=False)

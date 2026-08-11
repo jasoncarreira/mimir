@@ -583,3 +583,90 @@ def test_worker_cannot_cross_attempt_boundary_and_negative_control_is_live() -> 
         assert (first / "own-write").read_text() == "owned"
     finally:
         shutil.rmtree(boundary, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("root_name", "issue", "attempt"),
+    [
+        ("checkouts", 41, 2),
+        ("repo-test-checkouts", 41, 7),
+        ("opencode-checkouts", 9, 1),
+    ],
+)
+def test_executor_accepts_only_the_three_issued_checkout_shapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_name: str,
+    issue: int,
+    attempt: int,
+) -> None:
+    roots = {
+        "checkouts": tmp_path / "checkouts",
+        "repo-test-checkouts": tmp_path / "repo-test-checkouts",
+        "opencode-checkouts": tmp_path / "opencode-checkouts",
+    }
+    for root in roots.values():
+        root.mkdir()
+    monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", roots["checkouts"])
+    monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", roots["repo-test-checkouts"])
+    monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", roots["opencode-checkouts"])
+    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
+    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    path = roots[root_name] / ("a" * 64) / f"{issue}-{attempt}" / "checkout"
+    path.mkdir(parents=True)
+    path.parent.chmod(0o700)
+    path.chmod(0o2770)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(fd)
+    real_readlink = os.readlink
+    monkeypatch.setattr(
+        worker_exec.os,
+        "readlink",
+        lambda value: str(path) if str(value).startswith("/proc/self/fd/") else real_readlink(value),
+    )
+    try:
+        worker_exec._validate_checkout(
+            fd,
+            {
+                "device": observed.st_dev,
+                "inode": observed.st_ino,
+                "issue": issue,
+                "attempt": attempt,
+            },
+        )
+    finally:
+        os.close(fd)
+
+
+def test_executor_refuses_a_fourth_checkout_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = [tmp_path / name for name in ("checkouts", "repo-test", "opencode")]
+    for root in roots:
+        root.mkdir()
+    monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", roots[0])
+    monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", roots[1])
+    monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", roots[2])
+    path = tmp_path / "fourth" / ("a" * 64) / "41-2" / "checkout"
+    path.mkdir(parents=True)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(fd)
+    real_readlink = os.readlink
+    monkeypatch.setattr(
+        worker_exec.os,
+        "readlink",
+        lambda value: str(path) if str(value).startswith("/proc/self/fd/") else real_readlink(value),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="exact issued"):
+            worker_exec._validate_checkout(
+                fd,
+                {
+                    "device": observed.st_dev,
+                    "inode": observed.st_ino,
+                    "issue": 41,
+                    "attempt": 2,
+                },
+            )
+    finally:
+        os.close(fd)

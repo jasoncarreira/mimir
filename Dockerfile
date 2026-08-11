@@ -91,6 +91,8 @@ RUN groupadd --gid 1001 mimir \
     && chmod 0700 /home/mimir \
     && install -d -o root -g root -m 0711 /var/lib/mimir-worklink \
     && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts \
+    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/repo-test-checkouts \
+    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/opencode-checkouts \
     && install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes
 USER mimir
 # Land ``docker exec -it <ctn> bash`` at a predictable home dir.
