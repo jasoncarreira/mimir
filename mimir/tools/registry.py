@@ -2044,6 +2044,54 @@ async def _spawn_open_code_impl(
             if prompt_reason is not None:
                 terminal = classify_spawn_terminal_state(prompt_reason=prompt_reason)
 
+        if terminal is None and invocation is not None and agent:
+            agent_reason = prompt_contains_sensitive_source_path(
+                agent,
+                agent_home=home,
+                source_paths=(invocation.config_path, invocation.auth_path),
+            )
+            if agent_reason is not None:
+                terminal = classify_spawn_terminal_state(prompt_reason=agent_reason)
+
+        if terminal is None and invocation is not None:
+            try:
+                spawn_arguments = shlex.split(
+                    os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", "")
+                )
+                argv = ["opencode", "run", "--dir", ".", *spawn_arguments]
+                argv += ["-m", invocation.model]
+                if agent:
+                    argv += ["--agent", agent]
+                argv += ["--", prompt]
+                selectors = {
+                    "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
+                    "OPENCODE_MODEL": invocation.model,
+                    "OPENCODE_PROVIDER": invocation.provider,
+                }
+                if agent:
+                    selectors["OPENCODE_AGENT"] = agent
+                worker_env = opencode_worker_environment(
+                    base_worker_environment(run_id), selectors
+                )
+            except ValueError:
+                terminal = classify_spawn_terminal_state(
+                    configuration_reason="config_provider_selection"
+                )
+
+        if terminal is None and invocation is not None:
+            sensitive_execution_value = any(
+                prompt_contains_sensitive_source_path(
+                    value,
+                    agent_home=home,
+                    source_paths=(invocation.config_path, invocation.auth_path),
+                ) is not None
+                for value in (*argv, *worker_env.values())
+            )
+            if sensitive_execution_value:
+                terminal = classify_spawn_terminal_state(
+                    configuration_reason="config_provider_selection"
+                )
+
         if terminal is None and invocation is not None:
             try:
                 checkout = checkout_factory(
@@ -2081,22 +2129,6 @@ async def _spawn_open_code_impl(
                 )
 
         if terminal is None and invocation is not None and checkout is not None:
-            argv = ["opencode", "run", "--dir", "."]
-            argv += shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
-            argv += ["-m", invocation.model]
-            if agent:
-                argv += ["--agent", agent]
-            argv += ["--", prompt]
-            selectors = {
-                "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
-                "OPENCODE_MODEL": invocation.model,
-                "OPENCODE_PROVIDER": invocation.provider,
-            }
-            if agent:
-                selectors["OPENCODE_AGENT"] = agent
-            worker_env = opencode_worker_environment(
-                base_worker_environment(run_id), selectors
-            )
             projections = [
                 WorkerProjection(
                     path=".config/opencode/opencode.json",
@@ -2123,7 +2155,7 @@ async def _spawn_open_code_impl(
                     )
                 stdout = execution.stdout
                 stderr = execution.stderr
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, ValueError):
                 terminal = classify_spawn_terminal_state(
                     containment_available=False
                 )
@@ -2174,9 +2206,13 @@ async def _spawn_open_code_impl(
         "schema_version": 2,
         "run_id": run_id,
         "launcher": "mimir.spawn_open_code",
-        "name": name,
-        "model": invocation.model if invocation is not None else None,
-        "agent": agent,
+        "name": scrubber.scrub_text(name) if name is not None else None,
+        "model": (
+            scrubber.scrub_text(invocation.model)
+            if invocation is not None
+            else None
+        ),
+        "agent": scrubber.scrub_text(agent) if agent is not None else None,
         "status": terminal.status,
         "reason_code": terminal.reason_code,
         "exit_code": terminal.exit_code,
