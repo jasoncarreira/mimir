@@ -1373,8 +1373,10 @@ def _repo_test_conftest_payload(canary: Path) -> bytes:
     ).encode()
 
 
-def _plant_repo_test_payload(lease: Path, canary: Path, pytest_executable: str) -> None:
-    (lease / "conftest.py").write_bytes(_repo_test_conftest_payload(canary))
+def _plant_repo_test_payload(
+    lease: Path, conftest_payload: bytes, pytest_executable: str,
+) -> None:
+    (lease / "conftest.py").write_bytes(conftest_payload)
     (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
     (lease / "run-tests.sh").write_text(
         f"#!/bin/sh\nexec {pytest_executable} -s \"$@\"\n", encoding="utf-8",
@@ -1737,8 +1739,9 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         os.chown(path, 1001, 1001, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
     monkeypatch.setenv("HOME", str(controller_home))
-    _plant_repo_test_payload(lease, canary, pytest_executable)
-    assert (lease / "conftest.py").read_bytes() == _repo_test_conftest_payload(canary)
+    planted_conftest = _repo_test_conftest_payload(canary)
+    _plant_repo_test_payload(lease, planted_conftest, pytest_executable)
+    assert (lease / "conftest.py").read_bytes() == planted_conftest
     for path in (lease / "conftest.py", lease / "test_payload.py", lease / "run-tests.sh"):
         os.chown(path, 1001, 1001)
     before = _recursive_metadata(lease)
@@ -1817,6 +1820,51 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         assert not Path(payload["home"]).exists()
         assert not any(checkout_root.rglob("checkout"))
         assert _recursive_metadata(lease) == before
+
+        assert (lease / "conftest.py").read_bytes() == planted_conftest
+        canary.write_text("protected", encoding="utf-8")
+        unsafe_observation: dict[str, object] = {}
+        unsafe_issued: list[Path] = []
+
+        async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
+            execution_env = dict(worker_env)
+            execution_env["HOME"] = str(controller_home)
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                cwd=directory.path,
+                env=execution_env,
+                capture_output=True,
+                check=False,
+            )
+            unsafe_observation.update(json.loads(
+                (directory.path / "snapshot-executed.json").read_text(encoding="utf-8")
+            ))
+            return CollectedExecutionResult(
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+                False,
+                False,
+                0,
+                0,
+            )
+
+        unsafe_result = asyncio.run(RepoProjectTests(
+            state,
+            runner=unsafe_runner,
+            checkout_factory=_snapshot_checkout_factory(
+                tmp_path / "unsafe-snapshots", unsafe_issued
+            ),
+        ).execute(("test_payload.py",)))
+        assert unsafe_result.ok
+        assert unsafe_observation["marker"] == "executed"
+        assert unsafe_observation["attacked"] is True
+        assert unsafe_observation["home"] == str(controller_home)
+        assert canary.read_text(encoding="utf-8") == "altered"
+        assert len(unsafe_issued) == 1 and not unsafe_issued[0].exists()
+        assert (lease / "conftest.py").read_bytes() == planted_conftest
+        assert _recursive_metadata(lease) == before
     finally:
         if not controller_reaped:
             try:
@@ -1846,59 +1894,6 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     assert committed.ok
 
 
-@pytest.mark.asyncio
-async def test_project_test_unsafe_runner_negative_control_alters_canary(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = repo_tools[-2]
-    lease = state.checkout_lease.path
-    controller_home = tmp_path / "agent-home"
-    controller_home.mkdir()
-    canary = controller_home / "repo-test-canary"
-    canary.write_text("protected", encoding="utf-8")
-    config_home = tmp_path / "config"
-    pytest_executable = shutil.which("pytest")
-    assert pytest_executable is not None
-    _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
-    monkeypatch.setenv("MIMIR_HOME", str(config_home))
-    monkeypatch.setenv("HOME", str(controller_home))
-    _plant_repo_test_payload(lease, canary, pytest_executable)
-    assert (lease / "conftest.py").read_bytes() == _repo_test_conftest_payload(canary)
-    issued: list[Path] = []
-    executed = False
-
-    async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
-        nonlocal executed
-        execution_env = dict(worker_env)
-        execution_env["HOME"] = str(controller_home)
-        completed = await asyncio.to_thread(
-            subprocess.run,
-            argv,
-            cwd=directory.path,
-            env=execution_env,
-            capture_output=True,
-            check=False,
-        )
-        marker = json.loads((directory.path / "snapshot-executed.json").read_text(encoding="utf-8"))
-        executed = (
-            marker["home"] == str(controller_home)
-            and marker["marker"] == "executed"
-            and marker["attacked"] is True
-        )
-        return CollectedExecutionResult(
-            completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
-        )
-
-    result = await RepoProjectTests(
-        state,
-        runner=unsafe_runner,
-        checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
-    ).execute(("test_payload.py",))
-
-    assert result.ok
-    assert executed
-    assert canary.read_text(encoding="utf-8") == "altered"
-    assert len(issued) == 1 and not issued[0].exists()
 
 
 @pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])
