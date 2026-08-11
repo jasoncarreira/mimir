@@ -1974,7 +1974,7 @@ async def _spawn_open_code_impl(
         artifact_directory = resolve_artifact_handle(artifact_base, run_id)
         artifact_directory.mkdir(mode=0o700, exist_ok=False)
         for artifact_name in (
-            "prompt.md", "stdout.txt", "stderr.txt", "manifest.json", "proposal.json"
+            "prompt.md", "stdout.txt", "stderr.txt", "manifest.json"
         ):
             artifact_path = artifact_directory / artifact_name
             artifact_path.write_bytes(b"")
@@ -2194,17 +2194,26 @@ async def _spawn_open_code_impl(
             encoding="utf-8",
         )
         proposal_path = artifact_directory / "proposal.json"
-        if terminal.proposal is None:
-            proposal_path.unlink()
-        else:
-            proposal_path.write_text(
+        if terminal.proposal is not None:
+            proposal_temporary = artifact_directory / ".proposal.json.tmp"
+            proposal_temporary.write_text(
                 json.dumps(
                     terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True
                 ) + "\n",
                 encoding="utf-8",
             )
+            proposal_temporary.chmod(0o600)
+            proposal_temporary.replace(proposal_path)
     except (OSError, RuntimeError, ValueError):
         log.warning("spawn_open_code artifact write failed")
+        for failed_proposal_path in (
+            artifact_directory / "proposal.json",
+            artifact_directory / ".proposal.json.tmp",
+        ):
+            try:
+                failed_proposal_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         terminal = classify_spawn_terminal_state(artifact_available=False)
         artifact_handle = None
     await safe_log_event(

@@ -9,6 +9,7 @@ import os
 import pwd
 import uuid
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -235,57 +236,114 @@ async def test_artifact_run_directory_failure_precedes_execution(
 async def test_generated_payload_containment_and_unsafe_negative_control(
     spawn_tree, tmp_path
 ):
-    home, seed = spawn_tree
+    from mimir.contained_execution import execute_contained
+
+    _home, seed = spawn_tree
     controller_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     canary_name = f".mimir-spawn-canary-{uuid.uuid4().hex}"
     canary = controller_home / canary_name
     worker_home = tmp_path / "worker-home"
     worker_home.mkdir()
     worker_canary = worker_home / canary_name
+    generated_input = "generate and execute the account-home probe"
 
-    def payload_runner(record, *, contained):
-        async def runner(argv, directory, worker_env, projections=(), **kwargs):
-            attack = directory.path / "generated_attack.py"
-            marker = directory.path / "payload-executed"
-            attack.write_text(
-                "import os,pwd\n"
-                "from pathlib import Path\n"
-                f"Path(pwd.getpwuid(os.getuid()).pw_dir, {canary_name!r}).write_text('breach')\n"
-                f"Path({str(marker)!r}).write_text('executed')\n"
+    def materialize(prompt: str, checkout: Path) -> Path:
+        assert prompt == generated_input
+        attack = checkout / "generated_attack.py"
+        attack.write_text(
+            "import os,pwd\n"
+            "from pathlib import Path\n"
+            f"Path(pwd.getpwuid(os.getuid()).pw_dir, {canary_name!r}).write_text('breach')\n"
+            "Path('payload-executed').write_text('executed')\n"
+        )
+        return attack
+
+    class Process:
+        def __init__(self, completed: subprocess.CompletedProcess[bytes]) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(completed.stdout)
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_data(completed.stderr)
+            self.stderr.feed_eof()
+            self.returncode = completed.returncode
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    class ContainedPayloadClient:
+        async def launch(self, **kwargs):
+            checkout = Path(kwargs["local_checkout"])
+            prompt = kwargs["argv"][-1]
+            attack = materialize(prompt, checkout)
+            wrapper = (
+                "import pwd,runpy,sys,types;"
+                f"pwd.getpwuid=lambda uid:types.SimpleNamespace(pw_dir={str(worker_home)!r});"
+                "runpy.run_path(sys.argv[1],run_name='__main__')"
             )
-            original = pwd.getpwuid
-            if contained:
-                pwd.getpwuid = lambda _uid: SimpleNamespace(pw_dir=str(worker_home))
-            try:
-                exec(compile(attack.read_bytes(), str(attack), "exec"), {"__name__": "__main__"})
-            finally:
-                pwd.getpwuid = original
-            record["marker"] = marker
-            return CollectedExecutionResult(0, b"payload ran", b"", False, False, 0, 0)
-        return runner
+            completed = subprocess.run(
+                [sys.executable, "-c", wrapper, str(attack)],
+                cwd=checkout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            return Process(completed)
+
+        async def cancel(self, identifier: str) -> None:
+            raise AssertionError(f"unexpected cancellation: {identifier}")
+
+    positive = {}
+
+    def contained_factory(*args, **kwargs):
+        checkout = factory_for(tmp_path / "positive", positive)(*args, **kwargs)
+        checkout.capability._contained_worker_client = ContainedPayloadClient()
+        return checkout
+
+    async def unsafe_runner(argv, directory, worker_env, projections=(), **kwargs):
+        attack = materialize(argv[-1], directory.path)
+        completed = subprocess.run(
+            [sys.executable, str(attack)],
+            cwd=directory.path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return CollectedExecutionResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            False,
+            False,
+            0,
+            0,
+        )
 
     try:
-        positive = {}
         result = await invoke(
-            seed, tmp_path, positive,
-            prompt="generate and execute the account-home probe",
-            runner=payload_runner(positive, contained=True),
-            factory=factory_for(tmp_path / "positive", positive),
+            seed,
+            tmp_path,
+            positive,
+            prompt=generated_input,
+            runner=execute_contained,
+            factory=contained_factory,
         )
         assert result["status"] == "succeeded"
-        assert positive["marker"].read_text() == "executed"
+        assert (positive["checkout"].path / "payload-executed").read_text() == "executed"
         assert worker_canary.read_text() == "breach"
         assert not canary.exists()
 
         negative = {}
         result = await invoke(
-            seed, tmp_path, negative,
-            prompt="generate and execute the account-home probe",
-            runner=payload_runner(negative, contained=False),
+            seed,
+            tmp_path,
+            negative,
+            prompt=generated_input,
+            runner=unsafe_runner,
             factory=factory_for(tmp_path / "negative", negative),
         )
         assert result["status"] == "succeeded"
-        assert negative["marker"].read_text() == "executed"
+        assert (negative["checkout"].path / "payload-executed").read_text() == "executed"
         assert canary.read_text() == "breach"
     finally:
         canary.unlink(missing_ok=True)
@@ -328,7 +386,7 @@ async def test_terminal_state_contract(
     from mimir.opencode_config import OpenCodeAuthError, OpenCodeConfigError
     from mimir.opencode_proposal import OpenCodeProposal, ProposalBuildResult
 
-    _home, seed = spawn_tree
+    home, seed = spawn_tree
     record = {}
     events = []
 
@@ -337,14 +395,16 @@ async def test_terminal_state_contract(
     monkeypatch.setattr(event_logger, "safe_log_event", capture)
 
     factory = factory_for(tmp_path, record)
-    runner = runner_for(record)
-    prompt = "task"
+    runner = runner_for(record, stdout=b"refresh-secret", stderr=b"refresh-secret")
+    prompt = "task refresh-secret"
     if case == "config":
+        prompt = f"task {home}"
         monkeypatch.setattr(
             opencode_config, "resolve_opencode_invocation",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
         )
     elif case == "auth":
+        prompt = f"task {home}"
         monkeypatch.setattr(
             opencode_config, "resolve_opencode_invocation",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeAuthError("auth_invalid")),
@@ -380,11 +440,21 @@ async def test_terminal_state_contract(
         }[case]
         async def runner(argv, directory, worker_env, projections=(), **kwargs):
             code, overflow, timed_out, err = values
-            return CollectedExecutionResult(code, b"", err, timed_out, overflow, 0, 0)
+            return CollectedExecutionResult(
+                code,
+                b"refresh-secret",
+                err + b" refresh-secret",
+                timed_out,
+                overflow,
+                0,
+                0,
+            )
     elif case == "no_changes":
         runner = runner_for(record, exit_code=0)
         async def runner(argv, directory, worker_env, projections=(), **kwargs):
-            return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+            return CollectedExecutionResult(
+                0, b"refresh-secret", b"refresh-secret", False, False, 0, 0
+            )
     elif case in {"path_count", "path_bytes", "patch_bytes", "sensitive", "proposal_unavailable", "proposal"}:
         proposal_reason = {
             "sensitive": "proposal_sensitive_content",
@@ -404,13 +474,129 @@ async def test_terminal_state_contract(
     assert payload["status"] == status
     assert payload["exit_code"] == exit_code
     assert (payload["proposal"] is not None) is proposal_file
-    assert events[-1][0] == event_type
-    assert events[-1][1]["reason_code"] == reason
+    assert events == [(event_type, {
+        "run_id": payload["run_id"],
+        "status": status,
+        "reason_code": reason,
+    })]
     artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
+    expected_artifacts = {"prompt.md", "stdout.txt", "stderr.txt", "manifest.json"}
+    if proposal_file:
+        expected_artifacts.add("proposal.json")
+    assert {path.name for path in artifact.iterdir()} == expected_artifacts
     manifest = json.loads((artifact / "manifest.json").read_text())
     assert manifest["status"] == status
     assert manifest["reason_code"] == reason
-    assert (artifact / "proposal.json").exists() is proposal_file
+    for artifact_path in artifact.iterdir():
+        artifact_bytes = artifact_path.read_bytes()
+        assert b"refresh-secret" not in artifact_bytes
+        assert str(home).encode() not in artifact_bytes
+    assert "<redacted>" in (artifact / "prompt.md").read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_status", "expected_reason"),
+    (
+        ("configuration_before_prompt", "configuration_refused", "config_malformed"),
+        ("prompt_before_provisioning", "prompt_refused", "agent_home_path"),
+        ("provisioning_before_containment", "seed_credentials_refused", "seed_credentials"),
+        ("timeout_before_overflow", "timeout", "timeout"),
+        ("overflow_before_nonzero", "output_overflow", "output_overflow"),
+    ),
+)
+async def test_terminal_state_first_match_precedence(
+    spawn_tree, tmp_path, monkeypatch, case, expected_status, expected_reason
+):
+    from mimir import opencode_config
+    from mimir.contained_snapshot import SnapshotCredentialsRefused
+    from mimir.opencode_config import OpenCodeConfigError
+
+    home, seed = spawn_tree
+    record = {}
+    prompt = "task"
+    factory = factory_for(tmp_path, record)
+    runner = runner_for(record)
+
+    if case == "configuration_before_prompt":
+        prompt = f"inspect {home}/secret"
+        monkeypatch.setattr(
+            opencode_config,
+            "resolve_opencode_invocation",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                OpenCodeConfigError("config_malformed")
+            ),
+        )
+
+        def factory(*args, **kwargs):
+            raise AssertionError("provisioning must not run")
+    elif case == "prompt_before_provisioning":
+        prompt = f"inspect {home}/secret"
+
+        def factory(*args, **kwargs):
+            raise AssertionError("provisioning must not run")
+    elif case == "provisioning_before_containment":
+        def factory(*args, **kwargs):
+            raise SnapshotCredentialsRefused()
+
+        async def runner(*args, **kwargs):
+            raise AssertionError("containment must not run")
+    elif case == "timeout_before_overflow":
+        async def runner(*args, **kwargs):
+            return CollectedExecutionResult(1, b"", b"401", True, True, 0, 0)
+    elif case == "overflow_before_nonzero":
+        async def runner(*args, **kwargs):
+            return CollectedExecutionResult(1, b"", b"401", False, True, 0, 0)
+
+    payload = await invoke(
+        seed,
+        tmp_path,
+        record,
+        prompt=prompt,
+        runner=runner,
+        factory=factory,
+    )
+    assert payload["status"] == expected_status
+    artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
+    manifest = json.loads((artifact / "manifest.json").read_text())
+    assert manifest["reason_code"] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_post_execution_artifact_write_failure_is_artifact_unavailable(
+    spawn_tree, tmp_path, monkeypatch
+):
+    from mimir import event_logger
+
+    _home, seed = spawn_tree
+    record = {}
+    events = []
+
+    async def capture(event, **fields):
+        events.append((event, fields))
+
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        record["argv"] = list(argv)
+        (directory.path / "generated.txt").write_text("generated\n")
+        artifact_directory = tmp_path / "home/artifacts" / kwargs["identifier"]
+        stdout_path = artifact_directory / "stdout.txt"
+        stdout_path.unlink()
+        stdout_path.mkdir()
+        return CollectedExecutionResult(0, b"done", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(event_logger, "safe_log_event", capture)
+    payload = await invoke(seed, tmp_path, record, runner=runner)
+
+    assert record["argv"][-1] == "do the thing"
+    assert payload["status"] == "artifact_unavailable"
+    assert payload["artifact_dir"] is None
+    artifact = tmp_path / "home/artifacts" / payload["run_id"]
+    assert not (artifact / "proposal.json").exists()
+    assert events == [("spawn_open_code_provisioning_refused", {
+        "run_id": payload["run_id"],
+        "status": "artifact_unavailable",
+        "reason_code": "artifact_unavailable",
+    })]
 
 
 @pytest.mark.asyncio
