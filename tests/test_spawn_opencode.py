@@ -1,377 +1,195 @@
-"""Tests for ``spawn_open_code`` (chainlink #830 / opencode spec phase 1)."""
-
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 from pathlib import Path
+import shutil
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
+from mimir.contained_execution import CollectedExecutionResult
 from mimir.tools.registry import (
     _SPAWN_DEPTH_ENV,
+    _spawn_open_code_impl,
     _spawn_reset_for_tests,
     set_spawn_config,
-    spawn_open_code,
 )
 
 
-@pytest.fixture(autouse=True)
-def _reset_guard_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _git(path: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(path), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+@pytest.fixture
+def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     _spawn_reset_for_tests()
-    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / "home"
+    seed = tmp_path / "repos" / "seed"
+    home.mkdir()
+    seed.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
-    monkeypatch.delenv("MIMIR_OPENCODE_SPAWN_ARGS", raising=False)
-    auth_path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
-    auth_path.parent.mkdir(parents=True)
-    auth_path.write_text(
-        json.dumps(
-            {
-                "openai": {"type": "oauth", "refresh": "test-refresh"},
-                "anthropic": {"type": "api", "key": "test-key"},
-            }
-        ),
-        encoding="utf-8",
-    )
+    auth = home / ".local/share/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "refresh-secret"}}))
+    _git(seed, "init")
+    _git(seed, "config", "user.name", "Test")
+    _git(seed, "config", "user.email", "test@example.invalid")
+    (seed / "README.md").write_text("seed\n")
+    _git(seed, "add", "README.md")
+    _git(seed, "commit", "-m", "seed")
+    set_spawn_config({"default_cwd": tmp_path / "repos", "artifact_root": home / "artifacts"})
+    return home, seed
 
 
-def _capture_run(record: dict):
-    def runner(argv, cwd, timeout_s, env=None):
+class FakeCheckout:
+    def __init__(self, seed: Path, destination: Path) -> None:
+        subprocess.run(["git", "clone", "--quiet", str(seed), str(destination)], check=True)
+        self.path = destination
+        self.capability = SimpleNamespace(path=destination)
+        self.base_tree = _git(destination, "rev-parse", "HEAD^{tree}")
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def factory_for(tmp_path: Path, record: dict):
+    def factory(seed, *, default_cwd, known_sensitive=()):
+        record["factory_seed"] = Path(seed)
+        record["sensitive"] = tuple(known_sensitive)
+        checkout = FakeCheckout(Path(seed), tmp_path / "issued")
+        record["checkout"] = checkout
+        return checkout
+    return factory
+
+
+def runner_for(record: dict, *, exit_code: int = 0, stdout: bytes = b"done", stderr: bytes = b""):
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
         record["argv"] = list(argv)
-        record["cwd"] = cwd
-        record["env"] = dict(env or {})
-        return record.get("returncode", 0), record.get("stdout", "all done"), record.get("stderr", "")
-
+        record["directory"] = directory
+        record["env"] = dict(worker_env)
+        record["projections"] = tuple(projections)
+        record["kwargs"] = kwargs
+        if exit_code == 0:
+            (directory.path / "generated.txt").write_text("generated\n")
+        return CollectedExecutionResult(exit_code, stdout, stderr, False, False, 0, 0)
     return runner
 
 
+async def invoke(seed: Path, tmp_path: Path, record: dict, **kwargs):
+    return json.loads(await _spawn_open_code_impl(
+        kwargs.pop("prompt", "do the thing"),
+        str(seed),
+        kwargs.pop("timeout_s", 30),
+        kwargs.pop("name", None),
+        kwargs.pop("model", None),
+        kwargs.pop("agent", None),
+        kwargs.pop("artifact_root", None),
+        contained_runner=kwargs.pop("runner", runner_for(record)),
+        checkout_factory=kwargs.pop("factory", factory_for(tmp_path, record)),
+    ))
+
+
 @pytest.mark.asyncio
-async def test_completed_run_returns_structured_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    record: dict = {"stdout": "implemented the thing"}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-
-    raw = await spawn_open_code.ainvoke({"prompt": "do the thing", "cwd": str(tmp_path), "model": "anthropic/claude", "agent": "build"})
-
-    payload = json.loads(raw)
-    assert payload["status"] == "completed"
-    assert payload["result"] == "implemented the thing"
-    assert record["argv"][:2] == ["opencode", "run"]
-    assert ["--dir", str(tmp_path)] == record["argv"][2:4]
-    assert ["-m", "anthropic/claude"] == record["argv"][4:6]
-    assert ["--agent", "build"] == record["argv"][6:8]
-    # `--` guard so a leading-dash prompt is never parsed as a flag.
+async def test_run_uses_fresh_checkout_worker_env_and_oauth_projection(spawn_tree, tmp_path):
+    home, seed = spawn_tree
+    record = {}
+    payload = await invoke(seed, tmp_path, record, model="openai/gpt-5", agent="build")
+    assert payload["status"] == "succeeded"
+    assert record["factory_seed"] == seed
+    assert record["directory"].path != seed
+    assert record["argv"][:4] == ["opencode", "run", "--dir", "."]
     assert record["argv"][-2:] == ["--", "do the thing"]
+    assert str(seed) not in record["argv"]
+    assert "HOME" not in record["env"]
+    assert record["env"][_SPAWN_DEPTH_ENV] == "1"
+    assert str(home) not in json.dumps(record["env"])
+    assert len(record["projections"]) == 2
+    assert b"refresh-secret" in record["projections"][1].document
+    assert record["checkout"].closed
 
 
 @pytest.mark.asyncio
-async def test_native_config_model_beats_agent_default_and_forwards_referenced_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = tmp_path / "opencode.jsonc"
-    config.write_text(
-        '{"model":"zai/glm-5","provider":{"zai":{"options":{"apiKey":"{env:ZAI_KEY}"}}}}',
-        encoding="utf-8",
+async def test_success_returns_lossless_proposal_and_relative_artifact(spawn_tree, tmp_path):
+    _home, seed = spawn_tree
+    record = {}
+    payload = await invoke(seed, tmp_path, record)
+    proposal = payload["proposal"]
+    assert proposal["kind"] == "git_binary_patch"
+    assert base64.b64decode(proposal["patch"], validate=True).startswith(b"diff --git")
+    assert payload["artifact_dir"].startswith("opencode-")
+    assert "/" not in payload["artifact_dir"]
+    assert (tmp_path / "home/artifacts" / payload["artifact_dir"] / "proposal.json").is_file()
+    assert not (seed / "generated.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_prompt_agent_home_path_is_refused_without_launch(spawn_tree, tmp_path):
+    home, seed = spawn_tree
+    record = {}
+    payload = await invoke(seed, tmp_path, record, prompt=f"read {home}/secret")
+    assert payload["status"] == "prompt_refused"
+    assert payload["proposal"] is None
+    assert "argv" not in record
+
+
+@pytest.mark.asyncio
+async def test_unrelated_path_in_prompt_is_verbatim(spawn_tree, tmp_path):
+    _home, seed = spawn_tree
+    record = {}
+    prompt = "compare /opt/operator/reference exactly"
+    await invoke(seed, tmp_path, record, prompt=prompt)
+    assert record["argv"][-1] == prompt
+
+
+@pytest.mark.asyncio
+async def test_containment_failure_is_fail_closed(spawn_tree, tmp_path):
+    _home, seed = spawn_tree
+    record = {}
+    async def unavailable(*args, **kwargs):
+        raise OSError("socket unavailable")
+    payload = await invoke(seed, tmp_path, record, runner=unavailable)
+    assert payload["status"] == "containment_unavailable"
+    assert payload["proposal"] is None
+    assert not (seed / "generated.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_nonzero_worker_is_classified(spawn_tree, tmp_path):
+    _home, seed = spawn_tree
+    record = {}
+    payload = await invoke(
+        seed, tmp_path, record,
+        runner=runner_for(record, exit_code=1, stderr=b"401 unauthorized"),
     )
-    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
-    auth.write_text(json.dumps({"zai": {"type": "api", "key": "stored"}}), encoding="utf-8")
-    set_spawn_config({"default_cwd": tmp_path, "opencode_config_path": config})
-    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:agent-default")
-    monkeypatch.setenv("ZAI_KEY", "native-config-secret")
-    from mimir.tools import registry
-
-    record: dict = {}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-    await spawn_open_code.ainvoke({"prompt": "task"})
-
-    model_index = record["argv"].index("-m")
-    assert record["argv"][model_index + 1] == "zai/glm-5"
-    assert record["env"]["OPENCODE_CONFIG"] == str(config)
-    assert record["env"]["ZAI_KEY"] == "native-config-secret"
+    assert payload["status"] == "authentication_required"
+    assert payload["exit_code"] == 1
 
 
 @pytest.mark.asyncio
-async def test_child_env_is_allowlisted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#494 posture: bridge/operator secrets must NOT reach the child."""
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    monkeypatch.setenv("DISCORD_BOT_TOKEN", "secret-bridge-token")
-    monkeypatch.setenv("MIMIR_API_KEY", "secret-api-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
-    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "oc-pass")
-    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    record: dict = {}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-
-    await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)})
-
-    child = record["env"]
-    assert "DISCORD_BOT_TOKEN" not in child
-    assert "MIMIR_API_KEY" not in child
-    # Stored OAuth is positively identified and the metered fallback is removed.
-    assert "OPENAI_API_KEY" not in child
-    assert child["ANTHROPIC_API_KEY"] == "sk-ant"
-    assert child["OPENCODE_SERVER_PASSWORD"] == "oc-pass"
-    # opencode is provider-agnostic — the broad provider union must reach it.
-    assert child["MINIMAX_API_KEY"] == "mm-key"
-    assert child["OPENROUTER_API_KEY"] == "or-key"
-    assert child[_SPAWN_DEPTH_ENV] == "1"
-
-
-@pytest.mark.asyncio
-async def test_auth_failure_classified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    record: dict = {"returncode": 1, "stderr": "provider error: 401 Unauthorized"}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-
-    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
-    assert payload["status"] == "auth_failed"
-    assert "401" in payload["stderr"]
-
-
-@pytest.mark.asyncio
-async def test_work_failure_classified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    record: dict = {"returncode": 2, "stderr": "could not apply patch"}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-
-    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
-    assert payload["status"] == "work_failed"
-
-
-@pytest.mark.asyncio
-async def test_spawn_failed_when_cli_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    def missing(argv, cwd, timeout_s, env=None):
-        raise FileNotFoundError("opencode")
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", missing)
-
-    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path)}))
-    assert payload["status"] == "spawn_failed"
-    assert "not on PATH" in payload["stderr"]
-    assert payload["exit_code"] is None
-
-
-@pytest.mark.asyncio
-async def test_artifacts_written_with_labels_only_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-value")
-    record: dict = {"stdout": "done"}
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture_run(record))
-
-    payload = json.loads(
-        await spawn_open_code.ainvoke(
-            {"prompt": "build it", "cwd": str(tmp_path), "name": "test-run", "artifact_root": str(tmp_path)}
-        )
+async def test_sensitive_output_is_scrubbed_everywhere(spawn_tree, tmp_path):
+    home, seed = spawn_tree
+    record = {}
+    payload = await invoke(
+        seed, tmp_path, record,
+        runner=runner_for(record, stdout=b"refresh-secret", stderr=str(home).encode()),
     )
-
-    run_dir = Path(payload["artifact_dir"])
-    assert run_dir.is_dir()
-    assert (run_dir / "prompt.md").read_text() == "build it"
-    assert (run_dir / "stdout.txt").read_text() == "done"
-    manifest = json.loads((run_dir / "manifest.json").read_text())
-    assert manifest["schema_version"] == 1
-    assert manifest["status"] == "completed"
-    assert manifest["launcher"] == "mimir.spawn_open_code"
-    # Labels only — no secret values anywhere in the manifest.
-    assert "sk-secret-value" not in (run_dir / "manifest.json").read_text()
-
-
-def test_confined_artifact_base_confines_to_home(tmp_path: Path) -> None:
-    from mimir.tools.registry import _confined_artifact_base
-
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "sub").mkdir()
-
-    # home itself and paths under it resolve; escaping paths raise.
-    assert _confined_artifact_base(str(home), home) == home.resolve()
-    assert _confined_artifact_base(str(home / "sub"), home) == (home / "sub").resolve()
-
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    with pytest.raises(ValueError):
-        _confined_artifact_base(str(outside), home)
-    with pytest.raises(ValueError):
-        _confined_artifact_base(str(home / ".." / "outside"), home)
-
-
-@pytest.mark.asyncio
-async def test_artifact_root_outside_home_refused_before_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A model-controlled artifact_root outside the home must be refused up
-    # front — before a subprocess runs and before any file is written.
-    home = tmp_path / "home"
-    home.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    set_spawn_config({"default_cwd": home})
-    from mimir.tools import registry
-
-    ran = {"spawned": False}
-
-    def runner(argv, cwd, timeout_s, env=None):
-        ran["spawned"] = True
-        return 0, "done", ""
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
-
-    raw = await spawn_open_code.ainvoke(
-        {"prompt": "leak it", "artifact_root": str(outside)}
-    )
-    assert raw.startswith("spawn_open_code refused")
-    assert ran["spawned"] is False
-    assert not (outside / ".factory").exists()
-
-
-@pytest.mark.asyncio
-async def test_artifact_root_symlink_escape_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (home / "escape").symlink_to(outside, target_is_directory=True)
-    set_spawn_config({"default_cwd": home})
-    from mimir.tools import registry
-
-    ran = {"spawned": False}
-
-    def runner(argv, cwd, timeout_s, env=None):
-        ran["spawned"] = True
-        return 0, "done", ""
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
-
-    raw = await spawn_open_code.ainvoke(
-        {"prompt": "leak it", "artifact_root": str(home / "escape")}
-    )
-    assert raw.startswith("spawn_open_code refused")
-    assert ran["spawned"] is False
-    assert not (outside / ".factory").exists()
-
-
-@pytest.mark.asyncio
-async def test_artifact_root_within_home_subdir_ok(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    sub = home / "artifacts"
-    sub.mkdir()
-    set_spawn_config({"default_cwd": home})
-    from mimir.tools import registry
-
-    monkeypatch.setattr(
-        registry, "_run_spawn_subprocess", _capture_run({"stdout": "done"})
-    )
-
-    payload = json.loads(
-        await spawn_open_code.ainvoke(
-            {"prompt": "build it", "artifact_root": str(sub)}
-        )
-    )
-    run_dir = Path(payload["artifact_dir"])
-    assert run_dir.is_dir()
-    assert sub.resolve() in run_dir.resolve().parents
-    assert (run_dir / "prompt.md").read_text() == "build it"
-
-
-@pytest.mark.asyncio
-async def test_artifact_write_refuses_symlink_planted_during_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # TOCTOU: artifact_root is validated BEFORE the spawn, but the untrusted
-    # subprocess runs before the writes and can plant a symlink at the
-    # predictable `.factory` prefix. The writes must not follow it out of home.
-    home = tmp_path / "home"
-    home.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    set_spawn_config({"default_cwd": home})
-    from mimir.tools import registry
-
-    def runner(argv, cwd, timeout_s, env=None):
-        # Simulate the spawned process planting the symlink during its run.
-        (home / ".factory").symlink_to(outside, target_is_directory=True)
-        return 0, "secret model output", ""
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", runner)
-
-    payload = json.loads(
-        await spawn_open_code.ainvoke(
-            {"prompt": "leak me", "artifact_root": str(home)}
-        )
-    )
-    # The spawn still returns a structured result...
-    assert payload["status"] == "completed"
-    # ...but nothing was written through the planted symlink to outside the home,
-    # and no artifact dir is reported (the write was refused, not silently
-    # redirected).
-    assert list(outside.rglob("*")) == []
-    assert payload["artifact_dir"] is None
-
-
-@pytest.mark.asyncio
-async def test_empty_prompt_rejected(tmp_path: Path) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    assert await spawn_open_code.ainvoke({"prompt": "  "}) == "spawn_open_code failed: prompt is required"
-
-
-def test_registration_gated_on_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    from mimir import providers
-
-    monkeypatch.setattr(providers.shutil, "which", lambda name: None)
-    assert providers.opencode_available() is False
-    monkeypatch.setattr(providers.shutil, "which", lambda name: "/usr/bin/opencode")
-    assert providers.opencode_available() is True
-
-
-@pytest.mark.asyncio
-async def test_timeout_returns_structured_envelope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import subprocess as _subprocess
-
-    set_spawn_config({"default_cwd": tmp_path})
-    from mimir.tools import registry
-
-    def hangs(argv, cwd, timeout_s, env=None):
-        raise _subprocess.TimeoutExpired(argv, timeout_s)
-
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", hangs)
-
-    payload = json.loads(
-        await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(tmp_path), "timeout_s": 7})
-    )
-    assert payload["status"] == "timeout"
-    assert "7s" in payload["stderr"]
-    assert payload["exit_code"] is None
+    encoded = json.dumps(payload)
+    assert "refresh-secret" not in encoded
+    assert str(home) not in encoded
+    artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
+    for path in artifact.iterdir():
+        assert b"refresh-secret" not in path.read_bytes()
+        assert str(home).encode() not in path.read_bytes()
