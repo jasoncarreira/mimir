@@ -211,6 +211,123 @@ async def test_prompt_agent_home_path_is_refused_without_launch(spawn_tree, tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sensitive_kind", ("home", "auth"))
+async def test_spawn_args_sensitive_path_is_configuration_refused(
+    spawn_tree, tmp_path, monkeypatch, sensitive_kind
+):
+    home, seed = spawn_tree
+    record = {}
+    sensitive = (
+        home / "secret"
+        if sensitive_kind == "home"
+        else home / ".local/share/opencode/auth.json"
+    )
+    monkeypatch.setenv("MIMIR_OPENCODE_SPAWN_ARGS", f"--label {sensitive}")
+    payload = await invoke(seed, tmp_path, record)
+    assert payload["status"] == "configuration_refused"
+    assert "argv" not in record
+    assert "factory_seed" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sensitive_kind", ("home", "auth"))
+async def test_model_sensitive_path_is_configuration_refused(
+    spawn_tree, tmp_path, sensitive_kind
+):
+    home, seed = spawn_tree
+    record = {}
+    sensitive = (
+        home / "model"
+        if sensitive_kind == "home"
+        else home / ".local/share/opencode/auth.json"
+    )
+    payload = await invoke(seed, tmp_path, record, model=f"openai/{sensitive}")
+    assert payload["status"] == "configuration_refused"
+    assert "argv" not in record
+    assert "factory_seed" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sensitive_kind", ("home", "auth"))
+async def test_agent_sensitive_path_is_prompt_refused(
+    spawn_tree, tmp_path, sensitive_kind
+):
+    home, seed = spawn_tree
+    record = {}
+    sensitive = (
+        home / "agent"
+        if sensitive_kind == "home"
+        else home / ".local/share/opencode/auth.json"
+    )
+    payload = await invoke(seed, tmp_path, record, agent=str(sensitive))
+    assert payload["status"] == "prompt_refused"
+    assert "argv" not in record
+    assert "factory_seed" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sensitive_kind", ("home", "auth"))
+async def test_worker_environment_sensitive_path_is_configuration_refused(
+    spawn_tree, tmp_path, monkeypatch, sensitive_kind
+):
+    from mimir import contained_execution
+
+    home, seed = spawn_tree
+    record = {}
+    original = contained_execution.opencode_worker_environment
+    sensitive = (
+        home / "secret"
+        if sensitive_kind == "home"
+        else home / ".local/share/opencode/auth.json"
+    )
+
+    def unsafe_environment(base, invocation):
+        environment = original(base, invocation)
+        environment["VALIDATOR_SELECTOR"] = str(sensitive)
+        return environment
+
+    monkeypatch.setattr(
+        contained_execution, "opencode_worker_environment", unsafe_environment
+    )
+    payload = await invoke(seed, tmp_path, record)
+    assert payload["status"] == "configuration_refused"
+    assert "argv" not in record
+    assert "factory_seed" not in record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ingress", ("spawn_args", "model", "agent", "environment"))
+async def test_benign_complete_argv_and_environment_values_launch(
+    spawn_tree, tmp_path, monkeypatch, ingress
+):
+    from mimir import contained_execution
+
+    _home, seed = spawn_tree
+    record = {}
+    kwargs = {}
+    if ingress == "spawn_args":
+        monkeypatch.setenv("MIMIR_OPENCODE_SPAWN_ARGS", "--label benign")
+    elif ingress == "model":
+        kwargs["model"] = "openai/gpt-5"
+    elif ingress == "agent":
+        kwargs["agent"] = "build"
+    else:
+        original = contained_execution.opencode_worker_environment
+
+        def benign_environment(base, invocation):
+            environment = original(base, invocation)
+            environment["VALIDATOR_SELECTOR"] = "/opt/operator/reference"
+            return environment
+
+        monkeypatch.setattr(
+            contained_execution, "opencode_worker_environment", benign_environment
+        )
+    payload = await invoke(seed, tmp_path, record, **kwargs)
+    assert payload["status"] == "succeeded"
+    assert "argv" in record
+
+
+@pytest.mark.asyncio
 async def test_unrelated_path_in_prompt_is_verbatim(spawn_tree, tmp_path):
     _home, seed = spawn_tree
     record = {}
@@ -229,6 +346,46 @@ async def test_containment_failure_is_fail_closed(spawn_tree, tmp_path):
     assert payload["status"] == "containment_unavailable"
     assert payload["proposal"] is None
     assert not (seed / "generated.txt").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ("capability admission rejected", "request too large"))
+async def test_contained_client_value_error_is_fail_closed(
+    spawn_tree, tmp_path, monkeypatch, message
+):
+    from mimir import event_logger
+
+    _home, seed = spawn_tree
+    record = {}
+    events = []
+
+    async def invalid_request(*args, **kwargs):
+        raise ValueError(message)
+
+    async def capture(event, **fields):
+        events.append((event, fields))
+
+    monkeypatch.setattr(event_logger, "safe_log_event", capture)
+    payload = await invoke(seed, tmp_path, record, runner=invalid_request)
+    assert payload["status"] == "containment_unavailable"
+    assert payload["proposal"] is None
+    assert events == [("spawn_open_code_containment_refused", {
+        "run_id": payload["run_id"],
+        "status": "containment_unavailable",
+        "reason_code": "containment_unavailable",
+    })]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_runner_programmer_error_is_not_swallowed(spawn_tree, tmp_path):
+    _home, seed = spawn_tree
+    record = {}
+
+    async def programmer_error(*args, **kwargs):
+        raise TypeError("programmer error")
+
+    with pytest.raises(TypeError, match="programmer error"):
+        await invoke(seed, tmp_path, record, runner=programmer_error)
 
 
 @pytest.mark.asyncio
