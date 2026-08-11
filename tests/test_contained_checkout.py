@@ -39,13 +39,14 @@ def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]
     opencode = tmp_path / "opencode-checkouts"
     repo_test.mkdir(mode=0o771)
     opencode.mkdir(mode=0o771)
+    repo_test.chmod(0o771)
+    opencode.chmod(0o771)
     monkeypatch.setattr(contained_checkout, "REPO_TEST_CHECKOUT_ROOT", repo_test)
     monkeypatch.setattr(contained_checkout, "OPENCODE_CHECKOUT_ROOT", opencode)
     monkeypatch.setattr(checkout, "_REPO_TEST_CHECKOUT_ROOT", repo_test)
     monkeypatch.setattr(checkout, "_OPENCODE_CHECKOUT_ROOT", opencode)
-    monkeypatch.setattr(contained_checkout, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(contained_checkout, "WORKLINK_GID", os.getgid())
     monkeypatch.setattr(contained_checkout.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(contained_checkout.os, "fchown", lambda *args, **kwargs: None)
     return repo_test, opencode
 
 
@@ -66,7 +67,7 @@ def test_repo_test_checkout_snapshots_without_mutating_source(
         after.st_gid,
         stat.S_IMODE(after.st_mode),
     )
-    assert issued.path.read_text if False else (issued.path / "tracked.txt").read_text() == "changed\n"
+    assert (issued.path / "tracked.txt").read_text() == "changed\n"
     assert (issued.path / "untracked.txt").read_text() == "new\n"
     relative = issued.path.relative_to(root)
     assert len(relative.parts) == 3
@@ -112,3 +113,103 @@ def test_opencode_checkout_refuses_seed_outside_default_tree(
 
     with pytest.raises(ValueError, match="outside"):
         create_opencode_checkout(source, default_cwd=default)
+
+
+@pytest.mark.parametrize("surface", ["repo_test", "opencode"])
+def test_checkout_provisioning_mutates_only_its_admitted_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    repo_test_root, opencode_root = _roots(tmp_path, monkeypatch)
+    default = tmp_path / "projects"
+    default.mkdir()
+    source = _repo(default)
+    (source / "tracked.txt").write_text("working view\n")
+    source_before = _tree_signature(source)
+    mutations: list[tuple[str, tuple[int, int], tuple[int, int] | int]] = []
+    real_chmod = os.chmod
+    real_fchmod = os.fchmod
+    real_stat = os.stat
+    real_fstat = os.fstat
+
+    def chown(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        uid: int,
+        gid: int,
+        **kwargs: object,
+    ) -> None:
+        observed = real_stat(path, **kwargs)
+        mutations.append(("chown", (observed.st_dev, observed.st_ino), (uid, gid)))
+
+    def chmod(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int,
+        **kwargs: object,
+    ) -> None:
+        observed = real_stat(path, **kwargs)
+        mutations.append(("chmod", (observed.st_dev, observed.st_ino), mode))
+        real_chmod(path, mode, **kwargs)
+
+    def fchown(fd: int, uid: int, gid: int) -> None:
+        observed = real_fstat(fd)
+        mutations.append(("fchown", (observed.st_dev, observed.st_ino), (uid, gid)))
+
+    def fchmod(fd: int, mode: int) -> None:
+        observed = real_fstat(fd)
+        mutations.append(("fchmod", (observed.st_dev, observed.st_ino), mode))
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(contained_checkout.os, "chown", chown)
+    monkeypatch.setattr(contained_checkout.os, "chmod", chmod)
+    monkeypatch.setattr(contained_checkout.os, "fchown", fchown)
+    monkeypatch.setattr(contained_checkout.os, "fchmod", fchmod)
+
+    if surface == "repo_test":
+        root = repo_test_root
+        issued = create_repo_test_checkout(source, scope_id="owner/repo", pr_number=41)
+    else:
+        root = opencode_root
+        issued = create_opencode_checkout(source, default_cwd=default)
+
+    root_identities = _tree_identities(root)
+    assert mutations
+    assert all(identity in root_identities for _operation, identity, _value in mutations)
+    assert _tree_signature(source) == source_before
+    scope = issued.path.parent.parent
+    boundary = issued.path.parent
+    assert stat.S_IMODE(root.stat().st_mode) == 0o771
+    assert stat.S_IMODE(scope.stat().st_mode) == 0o700
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+    assert stat.S_IMODE(issued.path.stat().st_mode) == 0o2770
+    scope_identity = _identity(scope)
+    boundary_identity = _identity(boundary)
+    checkout_identity = _identity(issued.path)
+    assert ("chown", scope_identity, (1001, 1001)) in mutations
+    assert ("chown", boundary_identity, (1001, 1002)) in mutations
+    assert ("fchown", checkout_identity, (1001, 1002)) in mutations
+    assert ("fchmod", checkout_identity, 0o2770) in mutations
+    issued.close()
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    observed = path.stat(follow_symlinks=False)
+    return observed.st_dev, observed.st_ino
+
+
+def _tree_identities(root: Path) -> set[tuple[int, int]]:
+    return {_identity(root), *(_identity(path) for path in root.rglob("*"))}
+
+
+def _tree_signature(root: Path) -> dict[str, tuple[int, int, int]]:
+    result: dict[str, tuple[int, int, int]] = {}
+    paths = [root]
+    paths.extend(
+        path for path in root.rglob("*") if ".git" not in path.relative_to(root).parts
+    )
+    for path in paths:
+        observed = path.stat(follow_symlinks=False)
+        result[str(path.relative_to(root))] = (
+            observed.st_uid,
+            observed.st_gid,
+            stat.S_IMODE(observed.st_mode),
+        )
+    return result
