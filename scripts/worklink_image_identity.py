@@ -189,9 +189,7 @@ import os
 from pathlib import Path
 import uuid
 
-from mimir.contained_checkout import create_opencode_checkout
-from mimir.contained_execution import execute_contained
-from mimir.tools.registry import _spawn_open_code_impl, set_spawn_config
+from mimir.tools.registry import set_spawn_config, spawn_open_code
 
 SEED = Path("/home/mimir/worklink-source")
 ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")
@@ -217,22 +215,32 @@ async def main():
     source_status = os.popen(
         "git -C /home/mimir/worklink-source status --porcelain=v1 -z"
     ).read()
-    raw = await _spawn_open_code_impl(
-        "generate and execute the containment proof payload",
-        cwd=str(SEED),
-        timeout_s=30,
-        name="shipped-image-proof",
-        model="proof/model",
-        artifact_root=str(ARTIFACTS),
-        contained_runner=execute_contained,
-        checkout_factory=create_opencode_checkout,
-        execution_identifier=str(uuid.uuid4()),
-    )
+    raw = await spawn_open_code.ainvoke({
+        "prompt": "generate and execute the containment proof payload",
+        "cwd": str(SEED),
+        "timeout_s": 30,
+        "name": "shipped-image-proof",
+        "model": "proof/model",
+        "artifact_root": str(ARTIFACTS),
+    })
     result = json.loads(raw)
     if result["status"] != "succeeded" or result["exit_code"] != 0:
         raise RuntimeError(f"live spawn failed: {result}")
+    if not result["run_id"].startswith("opencode-"):
+        raise RuntimeError("live spawn did not preserve its public run handle")
+    if result["artifact_dir"] != result["run_id"]:
+        raise RuntimeError("live spawn did not return its relative artifact handle")
     if "spawn-euid=1002" not in result["stdout"]:
         raise RuntimeError("live fake OpenCode did not report worker identity")
+    identifier_line = next(
+        (line for line in result["stdout"].splitlines() if line.startswith("spawn-identifier=")),
+        None,
+    )
+    if identifier_line is None:
+        raise RuntimeError("live fake OpenCode did not report its execution identifier")
+    identifier = uuid.UUID(identifier_line.partition("=")[2])
+    if identifier.version != 4 or str(identifier) != identifier_line.partition("=")[2]:
+        raise RuntimeError("live fake OpenCode did not receive a canonical UUIDv4 identifier")
     proposal = result.get("proposal")
     if not isinstance(proposal, dict):
         raise RuntimeError("live spawn did not produce a proposal")
@@ -440,12 +448,16 @@ import json
 import os
 from pathlib import Path
 import sys
+import uuid
 
 if os.geteuid() != 1002:
     raise SystemExit("spawn fake did not run as worklink")
 if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
     raise SystemExit(f"spawn fake did not receive the FD-anchored checkout: {sys.argv}")
 home = Path(os.environ["HOME"])
+identifier = uuid.UUID(home.name)
+if identifier.version != 4 or str(identifier) != home.name:
+    raise SystemExit("spawn fake did not receive a canonical UUIDv4 identifier")
 config = json.loads((home / ".config/opencode/opencode.json").read_text())
 auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
 expected_config = {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid"}}}
@@ -469,6 +481,7 @@ payload.write_text(
 )
 exec(compile(payload.read_bytes(), str(payload), "exec"), {"__name__": "__main__"})
 print("spawn-euid=1002")
+print(f"spawn-identifier={identifier}")
 print("oauth-access-proof oauth-refresh-proof")
 print("/home/mimir/worklink-opencode/opencode.json")
 print("/home/mimir/worklink-opencode/data/opencode/auth.json", file=sys.stderr)
