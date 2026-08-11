@@ -6,15 +6,20 @@ from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
 import re
-import selectors as io_selectors
 import shlex
 import shutil
-import signal
-import secrets
-import subprocess
-import time
-from typing import Protocol
+from collections.abc import Awaitable, Callable
+import uuid
 
+from .contained_checkout import ContainedCheckout, create_repo_test_checkout
+from .contained_execution import (
+    CollectedExecutionResult,
+    SensitiveMaterialScrubber,
+    base_worker_environment,
+    execute_contained,
+)
+from .contained_snapshot import ContainedSnapshotError, SnapshotCredentialsRefused
+from .event_logger import safe_log_event
 from .models import RepoPRAction, RepoReviewState
 from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
@@ -66,91 +71,8 @@ class ProjectTestResult:
     stderr_dropped_bytes: int = 0
 
 
-class ProjectTestRunner(Protocol):
-    def __call__(
-        self,
-        argv: tuple[str, ...],
-        *,
-        cwd: Path,
-        env: dict[str, str],
-        timeout: float,
-        output_limit: int,
-    ) -> ProjectTestProcessResult: ...
-
-
-def _bounded_project_test_runner(
-    argv: tuple[str, ...],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    timeout: float,
-    output_limit: int,
-) -> ProjectTestProcessResult:
-    """Run one fixed argv without a shell and cap both streams while reading."""
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=cwd,
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    )
-    assert process.stdout is not None and process.stderr is not None
-    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
-    selector = io_selectors.DefaultSelector()
-    for stream in streams:
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, io_selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout
-    timed_out = False
-    dropped_bytes = {process.stdout: 0, process.stderr: 0}
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            for key, _events in selector.select(min(remaining, 0.1)):
-                stream = key.fileobj
-                chunk = os.read(stream.fileno(), 8192)
-                if not chunk:
-                    selector.unregister(stream)
-                    continue
-                target = streams[stream]
-                target.extend(chunk)
-                overflow = len(target) - output_limit
-                if overflow > 0:
-                    del target[:overflow]
-                    dropped_bytes[stream] += overflow
-        if timed_out:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        returncode = process.wait(timeout=1)
-    finally:
-        selector.close()
-        for stream in streams:
-            stream.close()
-    for stream, target in streams.items():
-        if dropped_bytes[stream]:
-            # The ring boundary may bisect a token that prefix-based redaction
-            # would then miss. Retain only complete trailing lines.
-            newline = target.find(b"\n")
-            unsafe_prefix = len(target) if newline < 0 else newline + 1
-            del target[:unsafe_prefix]
-            dropped_bytes[stream] += unsafe_prefix
-    return ProjectTestProcessResult(
-        returncode,
-        bytes(streams[process.stdout]).decode("utf-8", "replace"),
-        bytes(streams[process.stderr]).decode("utf-8", "replace"),
-        timed_out,
-        any(dropped_bytes.values()),
-        dropped_bytes[process.stdout],
-        dropped_bytes[process.stderr],
-    )
+ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
+CheckoutFactory = Callable[..., ContainedCheckout]
 
 
 def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str], str]:
@@ -228,91 +150,6 @@ def _configured_command(repo_slug: str) -> tuple[tuple[str, ...], dict[str, str]
     return (str(resolved), *words[1:]), env, source
 
 
-#: Components walked from MIMIR_HOME to the per-execution home parent. Each is
-#: opened no-follow relative to the previous descriptor, never as one pathname.
-_PROJECT_TEST_HOME_COMPONENTS: tuple[str, ...] = ("scratch", "project-test-homes")
-
-
-def _open_project_test_home_parent() -> tuple[int, Path]:
-    """Walk from MIMIR_HOME to the home parent, refusing a symlink at any depth.
-
-    Opening the parent by pathname with ``O_NOFOLLOW`` is not enough: the flag
-    applies only to the FINAL component. PR-controlled code can replace an
-    intermediate component -- ``<MIMIR_HOME>/scratch`` -- with a symlink whose
-    target contains a real ``project-test-homes`` directory, and then both
-    ``mkdir(parents=True)`` and ``os.open(parent, O_NOFOLLOW)`` succeed while
-    resolving outside the home. The descriptor and every HOME derived from it
-    would sit in attacker-chosen storage, restoring the cross-run ambient-state
-    channel this function exists to prevent.
-
-    So MIMIR_HOME is the trust anchor -- it is operator-configured and a mount
-    root, not something the tests can replace -- and every component below it is
-    opened relative to the previous descriptor with ``O_NOFOLLOW``. A symlink at
-    any depth fails with ELOOP rather than being followed.
-    """
-    home = os.environ.get("MIMIR_HOME", "").strip()
-    if not home:
-        raise ProjectTestRefusal("test_not_configured", "MIMIR_HOME is not configured")
-    root = Path(home).resolve()
-    parent = root
-    try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    except OSError as exc:
-        raise ProjectTestRefusal(
-            "test_cache_home_unavailable",
-            f"project test home root is not usable: {root}",
-        ) from exc
-    try:
-        for component in _PROJECT_TEST_HOME_COMPONENTS:
-            try:
-                os.mkdir(component, 0o700, dir_fd=fd)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                raise ProjectTestRefusal(
-                    "test_cache_home_unavailable",
-                    f"project test home component is not creatable: {parent / component}",
-                ) from exc
-            try:
-                nested = os.open(
-                    component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd,
-                )
-            except OSError as exc:
-                # ELOOP here means the component is a symlink: refuse rather than
-                # follow it out of the home tree.
-                raise ProjectTestRefusal(
-                    "test_cache_home_unavailable",
-                    f"project test home component is not a real directory: {parent / component}",
-                ) from exc
-            os.close(fd)
-            fd = nested
-            parent = parent / component
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd, parent
-
-
-def _make_project_test_home(parent_fd: int, parent: Path) -> tuple[str, Path]:
-    """Create a fresh 0o700 home relative to *parent_fd*; never reuse a path."""
-    for _ in range(8):
-        name = f"run-{secrets.token_hex(8)}"
-        try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise ProjectTestRefusal(
-                "test_cache_home_unavailable",
-                f"project test home could not be created under {parent}",
-            ) from exc
-        return name, parent / name
-    raise ProjectTestRefusal(
-        "test_cache_home_unavailable",
-        f"project test home could not be created under {parent}",
-    )
-
-
 def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, ...]:
     if not isinstance(selectors, tuple):
         raise ProjectTestRefusal("test_selector_invalid", "test selectors must be a tuple")
@@ -355,19 +192,35 @@ def _validated_selectors(root: Path, selectors: tuple[str, ...]) -> tuple[str, .
     return tuple(validated)
 
 
-def _safe_output(text: str, root: Path, limit: int, *, keep_tail: bool = False) -> str:
-    scrubbed = redact_text(text).replace(str(root), "<checkout>")
+def _remap_command(root: Path, command: tuple[str, ...]) -> tuple[str, ...]:
+    executable = Path(command[0])
+    try:
+        relative = executable.relative_to(root)
+    except ValueError:
+        return command
+    return (f"./{relative.as_posix()}", *command[1:])
+
+
+def _safe_output(
+    value: bytes,
+    scrubber: SensitiveMaterialScrubber,
+    limit: int,
+    *,
+    keep_tail: bool = False,
+) -> str:
+    scrubbed = redact_text(scrubber.scrub_text(value))
     return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
 
 
 class RepoProjectTests:
-    """Execute the fixed project test command in one authorized PR lease."""
+    """Execute the fixed project test command in a disposable contained checkout."""
 
     def __init__(
         self,
         review_state: RepoReviewState,
         *,
-        runner: ProjectTestRunner = _bounded_project_test_runner,
+        runner: ContainedRunner = execute_contained,
+        checkout_factory: CheckoutFactory = create_repo_test_checkout,
         timeout: float = _TIMEOUT_SECONDS,
         output_limit: int = _CAPTURE_BYTES,
     ) -> None:
@@ -375,10 +228,11 @@ class RepoProjectTests:
             raise ValueError("project test timeout and output limit must be positive")
         self._state = review_state
         self._runner = runner
+        self._checkout_factory = checkout_factory
         self._timeout = timeout
         self._output_limit = output_limit
 
-    def execute(self, selectors: tuple[str, ...] = ()) -> ProjectTestResult:
+    async def execute(self, selectors: tuple[str, ...] = ()) -> ProjectTestResult:
         scope = self._state.action_scope
         if RepoPRAction.TEST.value not in scope.allowed_operations:
             raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test")
@@ -386,55 +240,129 @@ class RepoProjectTests:
             root = RepoGitTools(self._state).validated_checkout_root()
         except GitRefusal as exc:
             raise ProjectTestRefusal(exc.code, str(exc)) from exc
-        command, env, command_source = _configured_command(scope.canonical_repo)
+        command, configured_env, command_source = _configured_command(scope.canonical_repo)
         selected = _validated_selectors(root, selectors)
-        # Fresh HOME per execution, removed afterwards. mkdtemp creates a new
-        # 0o700 directory and fails rather than reusing an existing path, so a
-        # planted symlink cannot capture it.
-        parent_fd, parent = _open_project_test_home_parent()
+        scrubber = SensitiveMaterialScrubber(
+            checkout=root,
+            source_paths=(os.environ.get("MIMIR_HOME", ""),),
+        )
         try:
-            run_name, run_home = _make_project_test_home(parent_fd, parent)
-        except ProjectTestRefusal:
-            os.close(parent_fd)
-            raise
-        env["HOME"] = str(run_home)
-        try:
-            result = self._runner(
-                (*command, *selected), cwd=root, env=env.copy(),
-                timeout=self._timeout, output_limit=self._output_limit,
+            checkout = self._checkout_factory(
+                root,
+                scope_id=scope.scope_id,
+                pr_number=scope.pr_number,
+                known_sensitive=(),
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise ProjectTestRefusal("test_execution_failed", "configured test runner could not start") from exc
-        finally:
-            # Delete relative to the descriptor, never by pathname: rmtree(dir_fd=)
-            # resolves run_name inside the directory we created it in, so replacing
-            # the parent mid-run cannot redirect the deletion. A leaked directory
-            # costs disk, not isolation -- the next execution mints a new name.
+        except SnapshotCredentialsRefused as exc:
+            await safe_log_event(
+                "repo_test_containment_refused",
+                reason_code="snapshot_credentials",
+                repository=scope.canonical_repo,
+                pull_request=scope.pr_number,
+            )
+            raise ProjectTestRefusal(
+                "test_snapshot_credentials_refused",
+                "project test snapshot contains credential-like material",
+            ) from exc
+        except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
+            await safe_log_event(
+                "repo_test_containment_refused",
+                reason_code="snapshot_unavailable",
+                repository=scope.canonical_repo,
+                pull_request=scope.pr_number,
+            )
+            raise ProjectTestRefusal(
+                "test_snapshot_unavailable", "project test snapshot is unavailable"
+            ) from exc
+
+        identifier = str(uuid.uuid4())
+        scrubber.add_path(checkout.path)
+        command = _remap_command(root, command)
+        environment = base_worker_environment(identifier)
+        environment.update(configured_env)
+        environment.pop("HOME", None)
+        if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
             try:
-                shutil.rmtree(run_name, dir_fd=parent_fd, ignore_errors=True)
-            finally:
-                os.close(parent_fd)
+                checkout.close()
+            except (OSError, RuntimeError, ValueError) as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="cleanup_failed",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_snapshot_cleanup_failed",
+                    "project test snapshot cleanup failed",
+                ) from exc
+            raise ProjectTestRefusal(
+                "test_config_invalid",
+                "project test command or environment contains a controller path",
+            )
+        try:
+            try:
+                result = await self._runner(
+                    (*command, *selected),
+                    checkout.capability,
+                    environment,
+                    (),
+                    identifier=identifier,
+                    timeout_s=self._timeout,
+                    stdout_limit=self._output_limit,
+                    stderr_limit=self._output_limit,
+                    scrubber=scrubber,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="containment_unavailable",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_containment_unavailable",
+                    "contained project test execution is unavailable",
+                ) from exc
+        finally:
+            try:
+                checkout.close()
+            except (OSError, RuntimeError, ValueError) as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="cleanup_failed",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_snapshot_cleanup_failed",
+                    "project test snapshot cleanup failed",
+                ) from exc
+
         if result.timed_out:
             return ProjectTestResult(
                 False, "test_timeout", None,
                 command=command, command_source=command_source,
             )
         stdout = _safe_output(
-            result.stdout, root, _RETURN_STDOUT_CHARS,
+            result.stdout,
+            scrubber,
+            _RETURN_STDOUT_CHARS,
             keep_tail=result.stdout_dropped_bytes > 0,
         )
         stderr = _safe_output(
-            result.stderr, root, _RETURN_STDERR_CHARS,
+            result.stderr,
+            scrubber,
+            _RETURN_STDERR_CHARS,
             keep_tail=result.stderr_dropped_bytes > 0,
         )
         truncation = {
-            "output_limited": result.output_limited,
+            "output_limited": result.output_overflow,
             "stdout_dropped_bytes": result.stdout_dropped_bytes,
             "stderr_dropped_bytes": result.stderr_dropped_bytes,
         }
-        if result.returncode != 0:
+        if result.exit_code != 0 or result.output_overflow:
             return ProjectTestResult(
-                False, "tests_failed", result.returncode, stdout, stderr,
+                False, "tests_failed", result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
             )
         if not selectors:

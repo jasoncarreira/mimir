@@ -149,7 +149,8 @@ def test_repo_enforcement_state_preserves_explicit_flag() -> None:
     ) is True
 
 
-def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
+@pytest.mark.asyncio
+async def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
     runtime = SimpleNamespace(context=AuthContext(
         principal=None, canonical_principal=None, roles=(), event_ingress=None,
         trigger="scheduled_tick", channel_id="scheduler:heartbeat",
@@ -162,12 +163,13 @@ def test_repo_wrapper_refuses_unconfigured_repository_without_scope() -> None:
         )
 
     with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
-        repo_test.func(
+        await repo_test.coroutine(
             repository="owner/repo", pull_request=7, runtime=runtime,
         )
 
 
-def test_repo_wrapper_refuses_unconfigured_unlisted_pull_request() -> None:
+@pytest.mark.asyncio
+async def test_repo_wrapper_refuses_unconfigured_unlisted_pull_request() -> None:
     inspect = _scope(RepoPRAction.INSPECT)
     context = _auth(inspect)
 
@@ -177,7 +179,7 @@ def test_repo_wrapper_refuses_unconfigured_unlisted_pull_request() -> None:
             runtime=SimpleNamespace(context=context),
         )
     with pytest.raises(ToolException, match="not configured in GITHUB_REPOS"):
-        repo_test.func(
+        await repo_test.coroutine(
             repository="owner/repo", pull_request=8,
             runtime=SimpleNamespace(context=context),
         )

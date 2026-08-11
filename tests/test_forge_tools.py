@@ -370,7 +370,8 @@ class _TestResult:
     status: str
 
 
-def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
+@pytest.mark.asyncio
+async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = FakeForge()
@@ -384,10 +385,11 @@ def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
             ("/server/configured/repo",), 1,
         ),
     )
-    monkeypatch.setattr(
-        "mimir.tools.repo.RepoProjectTests",
-        lambda state: type("Tests", (), {"execute": lambda self, selectors: _TestResult("ok")})(),
-    )
+    class Tests:
+        async def execute(self, selectors):
+            return _TestResult("ok")
+
+    monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
     context = AuthContext(
         principal="operator", canonical_principal="operator", roles=("admin",),
         event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
@@ -397,7 +399,7 @@ def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
         tool_call_id="operator-review", store=None,
     )
 
-    assert repo_test.func(
+    assert await repo_test.coroutine(
         repository="OWNER/REPO", pull_request=1291, runtime=runtime,
     ) == {"status": "ok"}
     state = context.server_discovered_pr_states.resolve("owner/repo", 1291)

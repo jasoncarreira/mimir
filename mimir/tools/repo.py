@@ -235,7 +235,7 @@ def repo_status(
 
 
 @tool
-def repo_test(
+async def repo_test(
     repository: str,
     pull_request: int,
     selectors: tuple[str, ...] = (),
@@ -244,7 +244,7 @@ def repo_test(
     """Run the deployment-configured tests in the active bound PR checkout."""
     try:
         return asdict(
-            RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors)
+            await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors)
         )
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "project_test_failed")
@@ -374,11 +374,12 @@ def repo_push(
 
 
 def _bind_injected_runtime(repo_tool: StructuredTool) -> StructuredTool:
-    if repo_tool.func is None:
-        raise RuntimeError(f"repository tool {repo_tool.name!r} has no sync callable")
-    repo_tool.func.__annotations__["runtime"] = ToolRuntime
+    callable_ = repo_tool.func or repo_tool.coroutine
+    if callable_ is None:
+        raise RuntimeError(f"repository tool {repo_tool.name!r} has no callable")
+    callable_.__annotations__["runtime"] = ToolRuntime
     repo_tool.args_schema = create_schema_from_function(
-        repo_tool.name, repo_tool.func, filter_args=(), include_injected=True,
+        repo_tool.name, callable_, filter_args=(), include_injected=True,
     )
     repo_tool.__dict__.pop("_injected_args_keys", None)
     return repo_tool

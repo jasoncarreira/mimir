@@ -317,7 +317,7 @@ def is_memory_read_path(path: Path) -> bool:
 
 
 def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
-    """Allow memory reads except beneath a different session's channel directory."""
+    """Apply channel scope to memory reads, except for job-bound scheduled ticks."""
     home = _resolved_mimir_home()
     channel_id = getattr(auth_context, "channel_id", None)
     authority = getattr(auth_context, "service_authority", None)
@@ -326,8 +326,6 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
         and getattr(authority, "trigger", None) == "scheduled_tick"
         and bool(getattr(authority, "channel_memory_directory", None))
     )
-    if is_job_bound_tick:
-        channel_id = authority.channel_memory_directory
     if home is None:
         return False
     memory = home / "memory"
@@ -346,15 +344,11 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     except ValueError:
         return False
     for relative in relatives:
-        if is_job_bound_tick:
-            # Core blocks are already rendered into the system prompt, so denying
-            # an explicit re-read removes no exposure.
-            if (
-                relative.parts[:1] == ("channels",)
-                and relative.parts[:2] != ("channels", channel_id)
-            ):
-                return False
-        if relative.parts[:1] == ("channels",) and len(relative.parts) > 1:
+        if (
+            not is_job_bound_tick
+            and relative.parts[:1] == ("channels",)
+            and len(relative.parts) > 1
+        ):
             if relative.parts[1] != channel_id:
                 return False
     return True

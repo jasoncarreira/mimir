@@ -2594,7 +2594,7 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
         if request.tool_call["id"] == "repo-refused":
-            repo_test.func(
+            await repo_test.coroutine(
                 repository="owner/repo",
                 pull_request=17,
                 runtime=Runtime(context=auth),

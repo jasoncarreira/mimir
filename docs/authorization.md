@@ -452,16 +452,52 @@ added to a trusted-service profile.
 
 Remediation turns use the narrower `repo_test` capability. Its command comes
 from the same deployment's `worklink.yaml` `defaults.test_command`; the model
-supplies no command, flags, environment, or working directory. The server
-executes the resolved command without a shell in the active checkout lease for
-the named authorized PR. Optional selectors must name existing non-symlink
-paths inside that checkout after canonical resolution. Test output is captured
-under hard byte limits, credential-shaped values and the lease path are
-redacted, and nonzero suites return `tests_failed` rather than a shell error.
-Granting `repo_test` therefore grants execution of the operator-configured test
-command, not arbitrary shell access. See the
+supplies no command, flags, environment, or working directory. Optional
+selectors must name existing non-symlink paths inside the named authorized PR
+after canonical resolution. Test output is captured under hard byte limits,
+credential-shaped values and controller paths are redacted, and nonzero suites
+return `tests_failed` rather than a shell error. Granting `repo_test` therefore
+grants execution of the operator-configured test command, not arbitrary shell
+access. See the
 [`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
 default, supported command syntax, and non-Python examples.
+
+### Contained repository-code execution
+
+`repo_test` runs its configured command in a disposable snapshot of the active
+PR lease. Only that snapshot is admitted and normalized for the contained
+worker; the active lease remains controller-owned and available for later
+staging, commit, and push.
+
+`spawn_open_code` seeds a fresh server-issued checkout from an admitted Git
+worktree and runs OpenCode only in that checkout. The supplied `cwd` selects the
+seed and is never the worker's working directory. Credential-like tracked,
+untracked, or ignored seed entries cause provisioning to be refused rather than
+copied.
+
+Both surfaces use a server-issued worker HOME. Provider configuration and OAuth
+or API authentication cross the boundary only as projection bytes into fixed
+worker-local files; controller credential paths and values are not worker
+environment variables. If worker containment cannot be established, both
+surfaces fail closed: `repo_test` reports `test_containment_unavailable` and
+emits `repo_test_containment_refused`, while `spawn_open_code` reports
+`containment_unavailable` and emits `spawn_open_code_containment_refused`.
+
+OpenCode output may include a bounded binary patch proposal. It returns a
+relative artifact handle. The worker changes only its disposable checkout.
+Applying the proposal to an operator tree is a separate trusted action and is
+never performed by the contained identity.
+
+These guarantees are limited to the two named execution paths, their issued
+checkouts, worker identity, credential projection, collected output, and
+proposal boundary. They do not make other code-execution paths contained or
+protect an admitted seed from code the operator already approved.
+
+### Surfaces that still execute as the agent user
+
+Feature-factory runs remain outside the two contained paths above and still
+execute as the agent user. Track that OS-isolation gap separately; tool-level
+authorization alone does not provide an OS boundary.
 
 ### Declared shell commands per job
 
