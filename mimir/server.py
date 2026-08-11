@@ -1960,7 +1960,7 @@ def build_app(config: Config) -> web.Application:
                 _clear_runtime_app_state(app, runtime_slot, startup_state)
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
-        startup_state.compensated = True
+        startup_state.compensated = acp_stopped
         return errors
 
     async def _on_startup(app: web.Application) -> None:

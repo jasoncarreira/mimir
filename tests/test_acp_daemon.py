@@ -276,7 +276,8 @@ async def test_preauth_timeout_cancels_connection_runner(
     monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
     monkeypatch.setattr("mimir.acp.daemon.ACP_AUTH_TIMEOUT", 0.01)
     writer = _Writer()
-    await daemon._run_peer(asyncio.StreamReader(), writer)
+    with pytest.raises(AcpDaemonError, match="authentication timed out"):
+        await daemon._run_peer(asyncio.StreamReader(), writer)
     assert cancelled.is_set()
     assert writer.closed
     shutil.rmtree(home)
@@ -510,3 +511,119 @@ def test_peer_uid_fails_closed_when_unverifiable(
     monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
     monkeypatch.setattr("mimir.acp.daemon._libc_getpeereid", lambda: None)
     assert _peer_uid(Sock()) is None
+
+
+@pytest.mark.asyncio
+async def test_preauth_cancellation_resistance_is_post_abort_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    daemon._agent = object()
+    aborted = asyncio.Event()
+    unrelated_completed = asyncio.Event()
+
+    class AbortTransport(_Transport):
+        def abort(self) -> None:
+            super().abort()
+            aborted.set()
+
+    writer = _Writer()
+    writer.transport = AbortTransport()
+
+    async def resistant(*args: object, **kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await aborted.wait()
+
+    async def unrelated_turn() -> None:
+        await asyncio.sleep(0)
+        unrelated_completed.set()
+
+    monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", resistant)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_AUTH_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_CANCEL_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_ABORT_TIMEOUT", 0.02)
+    turn = asyncio.create_task(unrelated_turn())
+    with pytest.raises(AcpDaemonError, match="authentication timed out"):
+        await asyncio.wait_for(
+            daemon._run_peer(asyncio.StreamReader(), writer), 0.1
+        )
+    await turn
+    assert aborted.is_set()
+    assert unrelated_completed.is_set()
+    assert not daemon._connection_runners
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["failed_authentication", "cancellation", "transport_death"],
+)
+async def test_connection_failure_leaves_separate_peer_and_runtime_turn_alive(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    survivor_started = asyncio.Event()
+    survivor_release = asyncio.Event()
+    runtime_completed = asyncio.Event()
+
+    class Agent:
+        def on_connect(self, peer: object) -> int:
+            return 1
+
+        async def authenticate(self, method_id: str, **kwargs: object) -> object:
+            if method_id != "good":
+                raise RuntimeError("authentication failed")
+            return object()
+
+        async def run_turn(self) -> None:
+            await asyncio.sleep(0)
+            runtime_completed.set()
+
+    async def runner(agent: object, *, response_writer: object, **kwargs: object) -> None:
+        kind = response_writer.kind
+        if kind == "survivor":
+            await agent.authenticate("good")
+            survivor_started.set()
+            await survivor_release.wait()
+        elif kind == "failed_authentication":
+            await agent.authenticate("bad")
+        elif kind == "cancellation":
+            await asyncio.Event().wait()
+
+    daemon = AcpDaemon(_bundle(home))
+    agent = Agent()
+    daemon._agent = agent
+    monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
+    survivor_writer = _Writer()
+    survivor_writer.kind = "survivor"
+    survivor = asyncio.create_task(
+        daemon._run_peer(asyncio.StreamReader(), survivor_writer)
+    )
+    await survivor_started.wait()
+    runtime_turn = asyncio.create_task(agent.run_turn())
+    failed_writer = _Writer()
+    failed_writer.kind = failure
+    failed = asyncio.create_task(
+        daemon._run_peer(asyncio.StreamReader(), failed_writer)
+    )
+    if failure == "failed_authentication":
+        with pytest.raises(RuntimeError, match="authentication failed"):
+            await failed
+    elif failure == "cancellation":
+        await asyncio.sleep(0)
+        failed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await failed
+    else:
+        await failed
+    await runtime_turn
+    assert runtime_completed.is_set()
+    assert not survivor.done()
+    survivor_release.set()
+    await survivor
+    shutil.rmtree(home)

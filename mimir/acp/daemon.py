@@ -156,6 +156,8 @@ class AcpDaemon:
         self._server: asyncio.AbstractServer | None = None
         self._socket_identity: tuple[int, int] | None = None
         self._peers: set[_Peer] = set()
+        self._connection_runners: set[asyncio.Task[None]] = set()
+        self._runner_writers: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._admitted = 0
         self._stopping = False
 
@@ -297,34 +299,61 @@ class AcpDaemon:
                 writer.transport.abort()
             return
         connection_agent = _ConnectionAgent(agent)
-        task = asyncio.create_task(
+        runner = asyncio.create_task(
             run_stdio_agent(
                 connection_agent, request_reader=reader, response_writer=writer
             )
         )
+        self._connection_runners.add(runner)
+        self._runner_writers[runner] = writer
+
+        def runner_finished(task: asyncio.Task[None]) -> None:
+            self._connection_runners.discard(task)
+            self._runner_writers.pop(task, None)
+
+        runner.add_done_callback(runner_finished)
         auth_wait = asyncio.create_task(connection_agent.authenticated.wait())
         try:
             done, _ = await asyncio.wait(
-                {task, auth_wait}, timeout=ACP_AUTH_TIMEOUT,
+                {runner, auth_wait}, timeout=ACP_AUTH_TIMEOUT,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
-                task.cancel()
-            elif auth_wait in done and connection_agent.authenticated.is_set():
-                await task
+                raise AcpDaemonError("ACP peer authentication timed out")
+            if runner in done:
+                await runner
             else:
-                await task
+                await runner
         finally:
             auth_wait.cancel()
             await asyncio.gather(auth_wait, return_exceptions=True)
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await self._finish_runner(runner, writer)
             writer.close()
             try:
                 await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
             except (TimeoutError, OSError):
                 writer.transport.abort()
+
+    async def _finish_runner(
+        self,
+        runner: asyncio.Task[None],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        if runner.done():
+            await asyncio.gather(runner, return_exceptions=True)
+            return
+        runner.cancel()
+        _, pending = await asyncio.wait(
+            {runner}, timeout=ACP_PEER_CANCEL_TIMEOUT
+        )
+        if pending:
+            writer.transport.abort()
+            _, pending = await asyncio.wait(
+                pending, timeout=ACP_PEER_ABORT_TIMEOUT
+            )
+        if pending:
+            raise AcpDaemonError("ACP connection runner resisted cancellation and abort")
+        await asyncio.gather(runner, return_exceptions=True)
 
     async def _stop_peers(self) -> None:
         peers = tuple(self._peers)
@@ -360,6 +389,11 @@ class AcpDaemon:
         if pending:
             raise AcpDaemonError("ACP peers did not terminate after transport abort")
         await asyncio.gather(*(peer.task for peer in peers), return_exceptions=True)
+        runners = set(self._connection_runners)
+        for runner in runners:
+            writer = self._runner_writers.get(runner)
+            if writer is not None:
+                await self._finish_runner(runner, writer)
 
     def _abort_peers(
         self,
@@ -373,6 +407,11 @@ class AcpDaemon:
                 continue
             peer.task.cancel()
             peer.writer.transport.abort()
+        for runner in tuple(self._connection_runners):
+            runner.cancel()
+            writer = self._runner_writers.get(runner)
+            if writer is not None:
+                writer.transport.abort()
         return tuple(selected)
 
     def _unlink_owned_socket(self, identity: tuple[int, int] | None) -> None:
