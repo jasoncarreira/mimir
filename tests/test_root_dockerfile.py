@@ -7,10 +7,16 @@ rebuild can't silently drop them.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
+ROOT = DOCKERFILE.parent
 
 
 def _text() -> str:
@@ -45,6 +51,40 @@ def test_apt_install_layer_includes_ripgrep() -> None:
     assert re.search(r"(?m)^\s*ca-certificates\b.*\bripgrep\b", block.group("body")) or re.search(
         r"(?m)^\s+ripgrep\b", block.group("body")
     ), "ripgrep is not listed in the apt install layer"
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
+def test_built_image_provides_process_tools() -> None:
+    """The shipped artifact must provide the process tools used by runbooks."""
+    image = f"mimir-process-tools-test:{os.getpid()}"
+    try:
+        subprocess.run(
+            ["docker", "build", "--tag", image, "."],
+            cwd=ROOT,
+            check=True,
+            timeout=1200,
+        )
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-ceu",
+                "command -v ps && command -v pgrep",
+            ],
+            check=True,
+            timeout=60,
+        )
+    finally:
+        subprocess.run(
+            ["docker", "image", "rm", "--force", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
 
 def test_apt_layer_keeps_cache_hygiene() -> None:

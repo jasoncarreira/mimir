@@ -214,6 +214,52 @@ async def launch_worker(
     return backend, await backend.launch(spec())
 
 
+@pytest.mark.asyncio
+async def test_enabled_launch_failure_after_suspension_is_a_launch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SuspendedFailingClient:
+        async def launch(self, **_kwargs: Any) -> WorkerProcess:
+            await asyncio.sleep(0)
+            raise OSError("executor unavailable")
+
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    backend = LocalSubprocessComputeBackend.for_authorized_checkout(
+        Authorization(), worker_client=SuspendedFailingClient()
+    )
+
+    with pytest.raises(ComputeLaunchError, match="executor unavailable"):
+        await backend.launch(spec())
+    assert backend._jobs == {}
+    assert backend._handles == {}
+
+
+@pytest.mark.asyncio
+async def test_job_alive_tracks_contained_task_and_direct_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = WorkerClient(immediate=False)
+    backend, handle = await launch_worker(monkeypatch, client)
+    assert backend.job_alive(handle) is True
+
+    client.processes[handle.identifier].release.set()
+    await backend.wait(handle, 2)
+    assert backend.job_alive(handle) is False
+    await backend.cleanup(handle)
+    assert backend.job_alive(handle) is False
+
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    direct = LocalSubprocessComputeBackend()
+    direct_handle = await direct.launch(
+        direct_spec("import time; time.sleep(30)")
+    )
+    assert direct.job_alive(direct_handle) is True
+    await direct.cancel(direct_handle)
+    await direct.wait(direct_handle, 2)
+    assert direct.job_alive(direct_handle) is False
+    await direct.cleanup(direct_handle)
+
+
 def direct_spec(source: str) -> WorkSpec:
     work = spec()
     object.__setattr__(work, "local_checkout", Path.cwd())
