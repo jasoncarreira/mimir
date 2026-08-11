@@ -305,7 +305,10 @@ def test_sensitive_provider_config_permits_empty_values(
 
     assert json.loads(documents.config_document)["provider"]["proxy"] == provider_config
     auth_document = documents.auth_document
-    assert auth_document is None
+    assert auth_document is not None
+    assert json.loads(auth_document) == {
+        "proxy": {"type": "api", "key": "ambient"}
+    }
 
 
 @pytest.mark.parametrize(

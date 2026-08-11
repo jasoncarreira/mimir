@@ -112,3 +112,42 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     assert "worker_projections" not in spec.backend_config
     assert spec.env["PROXY_TOKEN"] == "direct"
     assert spec.env["MIMIR_HOME"] == str(tmp_path)
+
+
+def test_enabled_opencode_projects_conventional_ambient_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"proxy/model"}', encoding="utf-8")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    monkeypatch.setenv("PROXY_API_KEY", "ambient-projected-secret")
+    order = WorkOrder(
+        issue_id=1433,
+        checkout=tmp_path / "checkout",
+        prompt="build",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path)},
+    )
+
+    spec = OpenCodeBackend().work_spec(
+        order,
+        attempt=1,
+        repo_url="repo",
+        base_ref="main",
+        branch="issue/1433-a1",
+        test_command="true",
+    )
+
+    projections = spec.backend_config["worker_projections"]
+    assert json.loads(projections[1].document) == {
+        "proxy": {"type": "api", "key": "ambient-projected-secret"}
+    }
+    assert "PROXY_API_KEY" not in spec.env
+    assert "ambient-projected-secret" not in spec.env.values()

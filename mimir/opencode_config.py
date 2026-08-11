@@ -204,7 +204,11 @@ def _inspect_auth(
     if entry is None:
         if provider == "openai" and ambient_present:
             raise OpenCodeAuthError("auth_missing")
-        if ambient_present or env_references:
+        if ambient_present:
+            credential = env[ambient_name].strip()
+            scrubber.add_scalar(credential)
+            return "api", (ambient_name,), {"type": "api", "key": credential}
+        if env_references:
             return None, (), None
         raise OpenCodeAuthError("auth_missing")
     if not isinstance(entry, dict):
