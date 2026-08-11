@@ -142,6 +142,65 @@ async def test_success_returns_lossless_proposal_and_relative_artifact(spawn_tre
 
 
 @pytest.mark.asyncio
+async def test_artifact_root_outside_home_is_refused_before_contained_launch(
+    spawn_tree, tmp_path
+):
+    _home, seed = spawn_tree
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    record = {}
+    payload = await invoke(seed, tmp_path, record, artifact_root=str(outside))
+    assert payload["status"] == "artifact_unavailable"
+    assert payload["artifact_dir"] is None
+    assert "argv" not in record
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_root_symlink_escape_is_refused_before_contained_launch(
+    spawn_tree, tmp_path
+):
+    home, seed = spawn_tree
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = home / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    record = {}
+    payload = await invoke(seed, tmp_path, record, artifact_root=str(escape))
+    assert payload["status"] == "artifact_unavailable"
+    assert payload["artifact_dir"] is None
+    assert "argv" not in record
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_artifact_write_refuses_run_directory_symlink_swap(
+    spawn_tree, tmp_path
+):
+    home, seed = spawn_tree
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    record = {}
+
+    async def swapping_runner(
+        argv, directory, worker_env, projections=(), **kwargs
+    ):
+        record["argv"] = list(argv)
+        run_directory = home / "artifacts" / kwargs["identifier"]
+        assert run_directory.is_dir()
+        shutil.rmtree(run_directory)
+        run_directory.symlink_to(outside, target_is_directory=True)
+        (directory.path / "generated.txt").write_text("generated\n")
+        return CollectedExecutionResult(0, b"done", b"", False, False, 0, 0)
+
+    payload = await invoke(seed, tmp_path, record, runner=swapping_runner)
+    assert record["argv"][-1] == "do the thing"
+    assert list(outside.iterdir()) == []
+    assert payload["status"] == "artifact_unavailable"
+    assert payload["artifact_dir"] is None
+
+
+@pytest.mark.asyncio
 async def test_prompt_agent_home_path_is_refused_without_launch(spawn_tree, tmp_path):
     home, seed = spawn_tree
     record = {}
@@ -199,6 +258,48 @@ async def test_sensitive_output_is_scrubbed_everywhere(spawn_tree, tmp_path):
     for path in artifact.iterdir():
         assert b"refresh-secret" not in path.read_bytes()
         assert str(home).encode() not in path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
+    spawn_tree, tmp_path, caplog
+):
+    from mimir import event_logger
+
+    home, seed = spawn_tree
+    auth_path = home / ".local/share/opencode/auth.json"
+    config_path = home / ".config/opencode/opencode.jsonc"
+    credential = b"opaque projected credential 47!"
+    auth_path.write_bytes(json.dumps({
+        "openai": {"type": "oauth", "refresh": credential.decode()}
+    }).encode())
+    event_path = tmp_path / "events.jsonl"
+    event_logger._reset_logger_for_tests()
+    event_logger.init_logger(event_path, "spawn-sensitive-test")
+    record = {}
+    emitted = b" | ".join((credential, os.fsencode(auth_path), os.fsencode(config_path)))
+    caplog.clear()
+    try:
+        payload = await invoke(
+            seed,
+            tmp_path,
+            record,
+            runner=runner_for(record, stdout=emitted, stderr=emitted),
+        )
+        event_bytes = event_path.read_bytes()
+        log_bytes = "\n".join(record.getMessage() for record in caplog.records).encode()
+        artifact = home / "artifacts" / payload["artifact_dir"]
+        observed_sinks = [
+            json.dumps(payload, sort_keys=True).encode(),
+            event_bytes,
+            log_bytes,
+            *(path.read_bytes() for path in artifact.iterdir()),
+        ]
+        assert b"spawn_open_code_completed" in event_bytes
+        for sensitive in (credential, os.fsencode(auth_path), os.fsencode(config_path)):
+            assert all(sensitive not in sink for sink in observed_sinks)
+    finally:
+        event_logger._reset_logger_for_tests()
 
 
 @pytest.mark.asyncio

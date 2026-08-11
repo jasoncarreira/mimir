@@ -8,11 +8,14 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import select
+import signal
 import stat
 import struct
 import sys
 from types import SimpleNamespace
 import subprocess
+import traceback
 import uuid
 
 import pytest
@@ -1364,7 +1367,7 @@ def _repo_test_conftest_payload(canary: Path) -> bytes:
         "    marker = Path('snapshot-executed.json')\n"
         "    details = {'uid': os.getuid(), 'home': os.environ['HOME'], 'attacked': True}\n"
         "    try:\n"
-        f"        Path({str(canary)!r}).write_text('altered')\n"
+        f"        Path(*{list(canary.parts)!r}).write_text('altered')\n"
         "    except OSError:\n"
         "        details['attacked'] = False\n"
         "    details['marker'] = 'executed'\n"
@@ -1374,12 +1377,18 @@ def _repo_test_conftest_payload(canary: Path) -> bytes:
 
 
 def _plant_repo_test_payload(
-    lease: Path, conftest_payload: bytes, pytest_executable: str,
+    lease: Path, conftest_payload: bytes, python_executable: str,
 ) -> None:
     (lease / "conftest.py").write_bytes(conftest_payload)
     (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
+    command = (
+        'namespace={}; exec(compile(open("conftest.py").read(), '
+        '"conftest.py", "exec"), namespace); '
+        'namespace["pytest_sessionstart"](None)'
+    )
     (lease / "run-tests.sh").write_text(
-        f"#!/bin/sh\nexec {pytest_executable} -s \"$@\"\n", encoding="utf-8",
+        f"#!/bin/sh\nexec {python_executable} -c {command!r} \"$@\"\n",
+        encoding="utf-8",
     )
 
 
@@ -1722,8 +1731,10 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     boundary.mkdir()
     boundary.chmod(0o755)
     checkout_root.mkdir(mode=0o771)
+    checkout_root.chmod(0o771)
     os.chown(checkout_root, 0, 1001)
     home_root.mkdir(mode=0o710)
+    home_root.chmod(0o710)
     os.chown(home_root, 0, 1002)
     controller_home.mkdir(mode=0o700)
     os.chown(controller_home, 1001, 1001)
@@ -1732,15 +1743,15 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     os.chown(canary, 1001, 1001)
     canary.chmod(0o600)
     config_home = boundary / "config"
-    pytest_executable = shutil.which("pytest")
-    assert pytest_executable is not None
+    python_executable = shutil.which("python")
+    assert python_executable is not None
     _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
     for path in (config_home, *config_home.rglob("*"), lease, *lease.rglob("*")):
         os.chown(path, 1001, 1001, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
     monkeypatch.setenv("HOME", str(controller_home))
     planted_conftest = _repo_test_conftest_payload(canary)
-    _plant_repo_test_payload(lease, planted_conftest, pytest_executable)
+    _plant_repo_test_payload(lease, planted_conftest, python_executable)
     assert (lease / "conftest.py").read_bytes() == planted_conftest
     for path in (lease / "conftest.py", lease / "test_payload.py", lease / "run-tests.sh"):
         os.chown(path, 1001, 1001)
@@ -1752,6 +1763,9 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     listener.listen(1)
     result_read, result_write = os.pipe()
     ready_read, ready_write = os.pipe()
+    unsafe_root = boundary / "unsafe-snapshots"
+    unsafe_root.mkdir()
+    os.chown(unsafe_root, 1001, 1001)
     previous_roots = (
         contained_checkout.REPO_TEST_CHECKOUT_ROOT,
         worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
@@ -1783,32 +1797,125 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
                 capability, socket_path=socket_path
             )
             result = asyncio.run(RepoProjectTests(state).execute(("test_payload.py",)))
-            os.write(result_write, json.dumps(asdict(result)).encode())
+            positive_canary = canary.read_text(encoding="utf-8")
+            canary.write_text("protected", encoding="utf-8")
+            unsafe_observation: dict[str, object] = {}
+            unsafe_issued: list[Path] = []
+
+            async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
+                execution_env = dict(worker_env)
+                execution_env["HOME"] = str(controller_home)
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    argv,
+                    cwd=directory.path,
+                    env=execution_env,
+                    capture_output=True,
+                    check=False,
+                )
+                unsafe_observation.update(json.loads(
+                    (directory.path / "snapshot-executed.json").read_text(encoding="utf-8")
+                ))
+                return CollectedExecutionResult(
+                    completed.returncode,
+                    completed.stdout,
+                    completed.stderr,
+                    False,
+                    False,
+                    0,
+                    0,
+                )
+
+            unsafe_result = asyncio.run(RepoProjectTests(
+                state,
+                runner=unsafe_runner,
+                checkout_factory=_snapshot_checkout_factory(unsafe_root, unsafe_issued),
+            ).execute(("test_payload.py",)))
+            lease_preserved = _recursive_metadata(lease) == before
+            payload_preserved = (lease / "conftest.py").read_bytes() == planted_conftest
+            for payload_path in ("conftest.py", "test_payload.py", "run-tests.sh"):
+                (lease / payload_path).unlink()
+            (lease / "tracked.txt").write_text("after test\n", encoding="utf-8")
+            later_stage = RepoGitTools(state).execute(GitStage(("tracked.txt",))).ok
+            later_commit = RepoGitTools(state).execute(
+                GitCommit(("tracked.txt",), "after contained test")
+            ).ok
+            response = {
+                "positive": asdict(result),
+                "positive_canary": positive_canary,
+                "unsafe": unsafe_observation,
+                "unsafe_ok": unsafe_result.ok,
+                "unsafe_snapshot_cleaned": (
+                    len(unsafe_issued) == 1 and not unsafe_issued[0].exists()
+                ),
+                "final_canary": canary.read_text(encoding="utf-8"),
+                "lease_preserved": lease_preserved,
+                "payload_preserved": payload_preserved,
+                "later_stage": later_stage,
+                "later_commit": later_commit,
+            }
+            os.write(result_write, json.dumps(response).encode())
             os._exit(0)
         except BaseException as exc:
-            os.write(result_write, json.dumps({"error": repr(exc)}).encode())
+            os.write(result_write, json.dumps({
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+            }).encode())
             os._exit(1)
 
     os.close(result_write)
     os.close(ready_write)
     controller_reaped = False
+
+    def controller_failure(stage: str) -> None:
+        nonlocal controller_reaped
+        readable, _, _ = select.select([result_read], [], [], 0)
+        detail = os.read(result_read, 1_048_576).decode() if readable else ""
+        reaped_pid, status = os.waitpid(controller_pid, os.WNOHANG)
+        controller_reaped = reaped_pid == controller_pid
+        pytest.fail(
+            f"controller failed before {stage}: status={status}, result={detail or '<none>'}"
+        )
+
     try:
+        readable, _, _ = select.select([ready_read, result_read], [], [], 20)
+        if result_read in readable:
+            controller_failure("readiness")
+        if ready_read not in readable:
+            controller_failure("readiness deadline")
         assert os.read(ready_read, 64) == b"controller-ready"
+
+        readable, _, _ = select.select([listener, result_read], [], [], 20)
+        if result_read in readable:
+            controller_failure("executor connection")
+        if listener not in readable:
+            controller_failure("executor connection deadline")
         connection, _ = listener.accept()
         _pid, uid, _gid = struct.unpack(
             "3i",
             connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")),
         )
         assert uid == 1001
-        worker_exec.handle_connection(connection)
-        _, status = os.waitpid(controller_pid, 0)
-        controller_reaped = True
+
+        def execution_deadline(_signum, _frame):
+            raise TimeoutError("contained repo-test proof exceeded 30 seconds")
+
+        previous_alarm_handler = signal.signal(signal.SIGALRM, execution_deadline)
+        signal.alarm(30)
+        try:
+            worker_exec.handle_connection(connection)
+            _, status = os.waitpid(controller_pid, 0)
+            controller_reaped = True
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_alarm_handler)
         observed = json.loads(os.read(result_read, 1_048_576))
-        assert os.waitstatus_to_exitcode(status) == 0, observed
-        assert observed["ok"] is True, observed
+        assert os.waitstatus_to_exitcode(status) == 0, json.dumps(observed, indent=2)
+        positive = observed["positive"]
+        assert positive["ok"] is True, json.dumps(observed, indent=2)
         payload_line = next(
             line.removeprefix("MIMIR_PAYLOAD=")
-            for line in observed["stdout"].splitlines()
+            for line in positive["stdout"].splitlines()
             if line.startswith("MIMIR_PAYLOAD=")
         )
         payload = json.loads(payload_line)
@@ -1816,55 +1923,22 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         assert Path(payload["home"]).parent == home_root
         assert payload["marker"] == "executed"
         assert payload["attacked"] is False
-        assert canary.read_text(encoding="utf-8") == "protected"
+        assert observed["positive_canary"] == "protected"
         assert not Path(payload["home"]).exists()
         assert not any(checkout_root.rglob("checkout"))
-        assert _recursive_metadata(lease) == before
 
-        assert (lease / "conftest.py").read_bytes() == planted_conftest
-        canary.write_text("protected", encoding="utf-8")
-        unsafe_observation: dict[str, object] = {}
-        unsafe_issued: list[Path] = []
-
-        async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
-            execution_env = dict(worker_env)
-            execution_env["HOME"] = str(controller_home)
-            completed = await asyncio.to_thread(
-                subprocess.run,
-                argv,
-                cwd=directory.path,
-                env=execution_env,
-                capture_output=True,
-                check=False,
-            )
-            unsafe_observation.update(json.loads(
-                (directory.path / "snapshot-executed.json").read_text(encoding="utf-8")
-            ))
-            return CollectedExecutionResult(
-                completed.returncode,
-                completed.stdout,
-                completed.stderr,
-                False,
-                False,
-                0,
-                0,
-            )
-
-        unsafe_result = asyncio.run(RepoProjectTests(
-            state,
-            runner=unsafe_runner,
-            checkout_factory=_snapshot_checkout_factory(
-                tmp_path / "unsafe-snapshots", unsafe_issued
-            ),
-        ).execute(("test_payload.py",)))
-        assert unsafe_result.ok
+        unsafe_observation = observed["unsafe"]
+        assert observed["unsafe_ok"] is True
         assert unsafe_observation["marker"] == "executed"
         assert unsafe_observation["attacked"] is True
         assert unsafe_observation["home"] == str(controller_home)
+        assert observed["final_canary"] == "altered"
+        assert observed["unsafe_snapshot_cleaned"] is True
         assert canary.read_text(encoding="utf-8") == "altered"
-        assert len(unsafe_issued) == 1 and not unsafe_issued[0].exists()
-        assert (lease / "conftest.py").read_bytes() == planted_conftest
-        assert _recursive_metadata(lease) == before
+        assert observed["lease_preserved"] is True
+        assert observed["payload_preserved"] is True
+        assert observed["later_stage"] is True
+        assert observed["later_commit"] is True
     finally:
         if not controller_reaped:
             try:
@@ -1886,12 +1960,6 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         for ancestor, mode in restored_modes.items():
             ancestor.chmod(mode)
 
-    for payload_path in ("conftest.py", "test_payload.py", "run-tests.sh"):
-        (lease / payload_path).unlink()
-    (lease / "tracked.txt").write_text("after test\n", encoding="utf-8")
-    assert RepoGitTools(state).execute(GitStage(("tracked.txt",))).ok
-    committed = RepoGitTools(state).execute(GitCommit(("tracked.txt",), "after contained test"))
-    assert committed.ok
 
 
 
