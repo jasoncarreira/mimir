@@ -164,22 +164,23 @@ class OpenCodeBackend:
             "model_source": invocation.model_source,
         }
         if _coding_enabled():
-            config_document, auth_document = opencode_worker_documents(invocation)
+            documents = opencode_worker_documents(invocation, resolution_env)
             projections = [
-                WorkerProjection(".config/opencode/opencode.json", config_document)
+                WorkerProjection(
+                    ".config/opencode/opencode.json", documents.config_document
+                )
             ]
-            if auth_document is not None:
+            if documents.auth_document is not None:
                 projections.append(
-                    WorkerProjection(".local/share/opencode/auth.json", auth_document)
+                    WorkerProjection(
+                        ".local/share/opencode/auth.json", documents.auth_document
+                    )
                 )
             env = {
-                key: resolution_env[key]
-                for key in invocation.pass_env
-                if key in resolution_env
+                "OPENCODE_PERMISSION": _permission_override(self.bash_allowlist),
             }
-            env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
             backend_config["worker_projections"] = projections
-            backend_config["pass_env"] = invocation.pass_env
+            backend_config["pass_env"] = ()
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
