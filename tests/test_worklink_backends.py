@@ -1114,6 +1114,7 @@ def test_registry_derives_only_configured_non_python_runner(
             provider="openai",
             model_source="test",
             config_path=Path("/nonexistent/opencode.jsonc"),
+            auth_path=Path("/nonexistent/auth.json"),
             auth_type=None,
         ),
     )

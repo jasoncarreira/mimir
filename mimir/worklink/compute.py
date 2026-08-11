@@ -21,6 +21,13 @@ import signal
 import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from ..contained_execution import (
+    CollectedExecutionResult,
+    base_worker_environment,
+    execute_contained,
+    opencode_worker_environment,
+)
+
 
 @dataclass(frozen=True)
 class ComputeCaps:
@@ -179,14 +186,6 @@ def _local_child_env() -> dict[str, str]:
     return env
 
 
-_ENABLED_BASE_ENV = {
-    "USER": "worklink",
-    "LOGNAME": "worklink",
-    "SHELL": "/bin/sh",
-    "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "LANG": "C.UTF-8",
-    "LC_ALL": "C.UTF-8",
-}
 _ENABLED_SYNTHESIZED_NAMES = frozenset({
     "HOME",
     "XDG_CONFIG_HOME",
@@ -261,24 +260,21 @@ def _validate_dynamic_worker_name(name: object) -> str:
 
 def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
     home = f"/var/lib/mimir-worklink/homes/{identifier}"
-    env = dict(_ENABLED_BASE_ENV)
-    env.update({
-        "HOME": home,
-        "XDG_CONFIG_HOME": f"{home}/.config",
-        "XDG_DATA_HOME": f"{home}/.local/share",
-        "XDG_CACHE_HOME": f"{home}/.cache",
-        "OPENCODE_CONFIG": f"{home}/.config/opencode/opencode.json",
-    })
+    additions: dict[str, str] = {}
     permission = spec.env.get("OPENCODE_PERMISSION")
     if permission is not None:
-        value = _validate_worker_value("OPENCODE_PERMISSION", permission)
+        additions["OPENCODE_PERMISSION"] = _validate_worker_value(
+            "OPENCODE_PERMISSION", permission
+        )
+    env = opencode_worker_environment(base_worker_environment(identifier), additions)
+    env["HOME"] = home
+    if permission is not None:
         try:
-            parsed = json.loads(value)
+            parsed = json.loads(additions["OPENCODE_PERMISSION"])
         except (TypeError, ValueError) as exc:
             raise ComputeLaunchError("invalid OPENCODE_PERMISSION") from exc
         if not isinstance(parsed, dict):
             raise ComputeLaunchError("invalid OPENCODE_PERMISSION")
-        env["OPENCODE_PERMISSION"] = value
     permitted = spec.backend_config.get("pass_env", ())
     if isinstance(permitted, (str, bytes)) or not isinstance(permitted, Sequence):
         raise ComputeLaunchError("worker pass_env must be a sequence")
@@ -311,6 +307,25 @@ def _fd_anchored_opencode_argv(
             raise ComputeLaunchError("enabled OpenCode --dir must name the issued checkout")
         return (*command[: index + 1], ".", *command[index + 2 :])
     return command
+
+
+class _ClientBoundCapability:
+    def __init__(
+        self,
+        capability: object,
+        client: object,
+        started: asyncio.Future[object],
+    ) -> None:
+        self._capability = capability
+        self._contained_worker_client = client
+        self._started = started
+
+    def _contained_started(self, process: object) -> None:
+        if not self._started.done():
+            self._started.set_result(process)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._capability, name)
 
 
 @dataclass
@@ -417,35 +432,83 @@ class LocalSubprocessComputeBackend:
             raise ComputeLaunchError("worker projection is invalid") from exc
         identifier = str(uuid.uuid4())
         client = self._worker_client or WorkerClient(authorization)
+        started: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        capability = _ClientBoundCapability(authorization, client, started)
+        stdout_limit, stderr_limit = _worklink_output_limits()
+
+        async def collect_contained() -> CollectedExecutionResult:
+            try:
+                return await execute_contained(
+                    command,
+                    capability,
+                    {
+                        key: value
+                        for key, value in _enabled_child_env(spec, identifier).items()
+                        if key != "HOME"
+                    },
+                    projections,
+                    identifier=identifier,
+                    timeout_s=spec.timeout_s,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                )
+            except BaseException as exc:
+                if not started.done():
+                    started.set_exception(exc)
+                raise
+
+        task = asyncio.create_task(collect_contained())
         try:
-            proc = await client.launch(
-                local_checkout=spec.local_checkout,
-                argv=command,
-                env={
-                    key: value
-                    for key, value in _enabled_child_env(spec, identifier).items()
-                    if key != "HOME"
-                },
-                projections=projections,
-                identifier=identifier,
-            )
+            process = await started
         except (OSError, RuntimeError, ValueError) as exc:
+            try:
+                await task
+            except (OSError, RuntimeError, ValueError):
+                pass
             raise ComputeLaunchError(str(exc)) from exc
-        from .run_state import process_start_ticks
-        ticks = process_start_ticks(proc.pid)
+        pid = getattr(process, "pid", None)
+        ticks = None
+        if isinstance(pid, int):
+            from .run_state import process_start_ticks
+
+            ticks = process_start_ticks(pid)
         handle = LaunchHandle(
             substrate=self.name,
             identifier=identifier,
             process_start_ticks=ticks,
-            shim_pid=proc.pid,
+            shim_pid=pid,
         )
-        self._jobs[identifier] = (proc, spec, command)
+        self._jobs[identifier] = (task, spec, command)
         self._handles[identifier] = handle
         self._worker_clients[identifier] = client
         return handle
 
     async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
-        proc, _spec, command = self._job(handle)
+        job, _spec, command = self._job(handle)
+        if isinstance(job, asyncio.Task):
+            timed_out = False
+            try:
+                collected = await asyncio.wait_for(
+                    asyncio.shield(job), timeout=timeout_s
+                )
+            except TimeoutError:
+                timed_out = True
+                client = self._worker_clients[handle.identifier]
+                await getattr(client, "cancel")(handle.identifier)
+                collected = await job
+            if not isinstance(collected, CollectedExecutionResult):
+                raise RuntimeError("contained execution returned an invalid result")
+            return ComputeResult(
+                exit_code=collected.exit_code if collected.exit_code is not None else -1,
+                stdout=collected.stdout.decode(errors="replace"),
+                stderr=collected.stderr.decode(errors="replace"),
+                timed_out=timed_out or collected.timed_out,
+                output_overflow=collected.output_overflow,
+                handle=handle,
+                command=command,
+            )
+
+        proc = job
         timed_out = False
         output_overflow = False
         kill_task: asyncio.Task[None] | None = None
@@ -501,10 +564,12 @@ class LocalSubprocessComputeBackend:
         """Whether the launched subprocess is still running (liveness probe for
         the feature-factory observe loop). Unknown/gone handles read as dead."""
         try:
-            proc, _spec, _command = self._job(handle)
+            job, _spec, _command = self._job(handle)
         except KeyError:
             return False
-        return getattr(proc, "returncode", 0) is None
+        if isinstance(job, asyncio.Task):
+            return not job.done()
+        return getattr(job, "returncode", 0) is None
 
     async def cancel(self, handle: LaunchHandle) -> None:
         try:

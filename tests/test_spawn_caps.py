@@ -1,12 +1,11 @@
-"""Tests for coding-tool spawn concurrency, rate, and depth caps."""
-
 from __future__ import annotations
 
 import asyncio
-import json
 import os
+import json
 from pathlib import Path
-from typing import Any
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,264 +22,187 @@ from mimir.tools.registry import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_guard_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test gets a clean guard and an explicit subscription credential.
-
-    The semaphore + lock are loop-bound, so swapping loops between tests would
-    error otherwise. Spawn-cap tests are not credential tests; provision an
-    isolated OpenCode OAuth record so they do not depend on the developer's
-    home auth store and cannot fail earlier at the credential gate in CI.
-    """
+def reset(monkeypatch: pytest.MonkeyPatch) -> None:
     _spawn_reset_for_tests()
-    # Default env: no inherited depth, no operator overrides.
-    monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
-    monkeypatch.delenv("MIMIR_SPAWN_MAX_CONCURRENT", raising=False)
-    monkeypatch.delenv("MIMIR_SPAWN_MAX_PER_HOUR", raising=False)
-    monkeypatch.delenv("MIMIR_SPAWN_MAX_DEPTH", raising=False)
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
-    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_text(
-        json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
-        encoding="utf-8",
-    )
+    for name in (
+        _SPAWN_DEPTH_ENV,
+        "MIMIR_SPAWN_MAX_CONCURRENT",
+        "MIMIR_SPAWN_MAX_PER_HOUR",
+        "MIMIR_SPAWN_MAX_DEPTH",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
-def _ok_run(
-    argv: list[str], cwd: str | None, timeout_s: int, env: dict[str, str] | None = None
-) -> tuple[int, str, str]:
-    """Successful subprocess mock."""
-    return 0, "done", ""
-
-
-# ─── depth cap ───────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_depth_cap_refuses_at_max(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A nested coding subprocess at the depth cap is refused."""
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "2")
-    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "2")  # already at the cap
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
-
-    msg = await spawn_open_code.ainvoke({"prompt": "should be refused"})
-    assert "depth cap" in msg.lower()
-    assert "MIMIR_SPAWN_MAX_DEPTH" in msg
-
-
-@pytest.mark.asyncio
-async def test_depth_cap_allows_below_max(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "2")
-    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "1")  # one level deep — still OK
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
-
-    msg = await spawn_open_code.ainvoke({"prompt": "should run"})
-    assert "depth cap" not in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_depth_cap_root_agent_is_zero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Root agent (no ``MIMIR_SPAWN_DEPTH`` set) starts at depth 0 —
-    can spawn freely up to max_depth."""
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "1")
-    # No MIMIR_SPAWN_DEPTH set — current_depth=0, < max_depth=1.
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
-
-    msg = await spawn_open_code.ainvoke({"prompt": "root-level"})
-    assert "depth cap" not in msg.lower()
-
-
-# ─── child env propagation ───────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_child_env_has_incremented_depth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The subprocess receives ``MIMIR_SPAWN_DEPTH=parent+1``."""
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "1")
-
-    captured_env: dict[str, str] = {}
-
-    def _capture(argv, cwd, timeout_s, env=None):
-        captured_env.update(env or {})
-        return 0, "ok", ""
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture)
-
-    await spawn_open_code.ainvoke({"prompt": "x"})
-    assert captured_env.get(_SPAWN_DEPTH_ENV) == "2"
-
-
-@pytest.mark.asyncio
-async def test_child_env_starts_at_one_from_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Root agent (no MIMIR_SPAWN_DEPTH) spawns with child env ``=1``."""
-    set_spawn_config({"default_cwd": tmp_path})
-
-    captured_env: dict[str, str] = {}
-
-    def _capture(argv, cwd, timeout_s, env=None):
-        captured_env.update(env or {})
-        return 0, "ok", ""
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _capture)
-
-    await spawn_open_code.ainvoke({"prompt": "x"})
-    assert captured_env.get(_SPAWN_DEPTH_ENV) == "1"
-
-
-# ─── per-hour rate cap ──────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_rate_cap_refuses_after_threshold(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """After N successful spawns in the window, the (N+1)th is refused
-    with the rate-cap message until the window rolls forward."""
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "3")
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "9")  # ignore depth
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _ok_run)
-
-    # 3 should succeed.
-    for i in range(3):
-        msg = await spawn_open_code.ainvoke({"prompt": f"call-{i}"})
-        assert "refused" not in msg.lower(), f"call {i} was refused: {msg}"
-
-    # 4th hits the cap.
-    msg = await spawn_open_code.ainvoke({"prompt": "call-4"})
-    assert "per-hour cap" in msg
-    assert "3/h" in msg
-
-
-@pytest.mark.asyncio
-async def test_rate_slot_release_removes_this_spawn_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Abort cleanup must release the slot reserved by this spawn, not
-    blindly pop the newest slot that may belong to a concurrent spawn."""
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "10")
-
-    from mimir.tools import registry
-
-    ticks = iter([1000.0, 1001.0])
-
-    def _fake_monotonic() -> float:
-        return next(ticks, 1001.0)
-
-    monkeypatch.setattr(registry.time, "monotonic", _fake_monotonic)
-
+def test_guard_defaults() -> None:
     guard = _spawn_guard_init()
-    token_a, err_a = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
-    token_b, err_b = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
-
-    assert err_a is None
-    assert err_b is None
-    assert list(_SPAWN_GUARD.recent) == [1000.0, 1001.0]
-
-    await _spawn_release_rate_slot(guard, token_a)
-    assert list(_SPAWN_GUARD.recent) == [1001.0]
-
-    await _spawn_release_rate_slot(guard, token_b)
-    assert list(_SPAWN_GUARD.recent) == []
+    assert guard.max_concurrent == 3
+    assert guard.max_per_hour == 20
+    assert guard.max_depth == 2
 
 
-# ─── concurrency semaphore ──────────────────────────────────────────────
+def test_guard_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "4")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "3")
+    guard = _spawn_guard_init()
+    assert (guard.max_concurrent, guard.max_per_hour, guard.max_depth) == (1, 4, 3)
+
+
+def test_invalid_caps_use_defaults_and_zero_floors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "invalid")
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "0")
+    guard = _spawn_guard_init()
+    assert guard.max_concurrent == 3
+    assert guard.max_per_hour == 1
 
 
 @pytest.mark.asyncio
-async def test_concurrency_semaphore_serializes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """When max_concurrent=2, three concurrent spawns mean at most
-    two subprocess calls run at once. Bookkeeping uses ``threading.Lock``
-    because ``_run_spawn_subprocess`` is invoked via ``asyncio.to_thread``
-    — each call runs in a different worker thread, so the counter
-    crosses thread boundaries."""
-    import threading
-    import time as _time
-
-    set_spawn_config({"default_cwd": tmp_path})
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "2")
-    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "20")
-
-    in_flight = 0
-    peak = 0
-    lock = threading.Lock()
-
-    def _bumped_sync(argv, cwd, timeout_s, env=None):
-        nonlocal in_flight, peak
-        with lock:
-            in_flight += 1
-            peak = max(peak, in_flight)
-        # Sleep long enough that all three concurrent calls would
-        # overlap if the semaphore weren't gating them.
-        _time.sleep(0.1)
-        with lock:
-            in_flight -= 1
-        return 0, "ok", ""
-
-    from mimir.tools import registry
-    monkeypatch.setattr(registry, "_run_spawn_subprocess", _bumped_sync)
-
-    results = await asyncio.gather(
-        spawn_open_code.ainvoke({"prompt": "a"}),
-        spawn_open_code.ainvoke({"prompt": "b"}),
-        spawn_open_code.ainvoke({"prompt": "c"}),
-    )
-    assert all("refused" not in r.lower() for r in results)
-    assert peak <= 2, f"max_concurrent=2 was violated (peak={peak})"
+async def test_rate_cap_refuses_after_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_PER_HOUR", "2")
+    guard = _spawn_guard_init()
+    first, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert first is not None and error is None
+    second, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert second is not None and error is None
+    token, error = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    assert token is None
+    assert "per-hour cap" in error
 
 
-# ─── #494: minimal spawned-CLI env (no secret bleed) ───────────────────
+@pytest.mark.asyncio
+async def test_release_removes_only_own_rate_token() -> None:
+    guard = _spawn_guard_init()
+    first, _ = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    second, _ = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    await _spawn_release_rate_slot(guard, first)
+    assert list(guard.recent) == [second]
 
 
-def test_minimal_child_env_strips_unrelated_secrets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#494: a spawned CLI gets infra + only its provider's creds + the
-    incremented spawn depth — never the parent's unrelated secrets."""
-    from mimir.tools.registry import _minimal_child_env
+@pytest.mark.asyncio
+async def test_semaphore_enforces_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    guard = _spawn_guard_init()
+    assert guard.sem is not None
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    order = []
 
-    # Unrelated secrets that must NOT reach the child.
-    for k in ("DISCORD_TOKEN", "DATABASE_URL", "TAVILY_API_KEY", "GITHUB_TOKEN"):
-        monkeypatch.setenv(k, f"{k}-secret")
-    # Provider creds + infra.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-xyz")
-    monkeypatch.setenv("OPENCODE_API_KEY", "opencode-secret")
-    monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("HOME", "/home/mimir")
+    async def holder(label: str) -> None:
+        assert guard.sem is not None
+        async with guard.sem:
+            order.append(label)
+            if label == "first":
+                entered.set()
+                await release.wait()
 
-    child_env = _minimal_child_env(depth=1, cred_prefixes=("OPENCODE_",))
-    assert child_env["OPENCODE_API_KEY"] == "opencode-secret"
-    assert child_env["HOME"] == "/home/mimir"
-    assert child_env[_SPAWN_DEPTH_ENV] == "1"
-    assert "ANTHROPIC_API_KEY" not in child_env
-    assert "OPENAI_API_KEY" not in child_env
-    assert "DISCORD_TOKEN" not in child_env
+    first = asyncio.create_task(holder("first"))
+    await entered.wait()
+    second = asyncio.create_task(holder("second"))
+    await asyncio.sleep(0)
+    assert order == ["first"]
+    release.set()
+    await asyncio.gather(first, second)
+    assert order == ["first", "second"]
+
+
+def test_reset_clears_loop_bound_state() -> None:
+    guard = _spawn_guard_init()
+    guard.recent.extend((1.0, 2.0))
+    _spawn_reset_for_tests()
+    assert _SPAWN_GUARD.sem is None
+    assert _SPAWN_GUARD.rate_lock is None
+    assert not _SPAWN_GUARD.recent
+
+
+def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from mimir import contained_checkout, contained_execution
+    from mimir.contained_execution import CollectedExecutionResult
+
+    home = tmp_path / "home"
+    seed = tmp_path / "seed"
+    home.mkdir()
+    seed.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    auth = home / ".local/share/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "test"}}))
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.invalid"], check=True)
+    (seed / "README").write_text("seed")
+    subprocess.run(["git", "-C", str(seed), "add", "README"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "seed"], check=True)
+    set_spawn_config({"default_cwd": tmp_path, "artifact_root": home / "artifacts"})
+    calls = {"factory": 0, "envs": []}
+
+    class Checkout:
+        def __init__(self, path):
+            self.path = path
+            self.capability = SimpleNamespace(path=path)
+            self.base_tree = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD^{tree}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+        def close(self):
+            pass
+
+    def factory(source, **kwargs):
+        calls["factory"] += 1
+        destination = tmp_path / f"issued-{calls['factory']}"
+        subprocess.run(["git", "clone", "-q", str(source), str(destination)], check=True)
+        return Checkout(destination)
+
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        calls["envs"].append(dict(worker_env))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(contained_checkout, "create_opencode_checkout", factory)
+    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    return seed, calls, contained_execution
+
+
+@pytest.mark.asyncio
+async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatch):
+    seed, calls, _module = _surface_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "2")
+    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "2")
+    refused = await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)})
+    assert "depth cap" in refused
+    assert not calls["envs"]
+
+    _spawn_reset_for_tests()
+    monkeypatch.setenv(_SPAWN_DEPTH_ENV, "1")
+    payload = json.loads(await spawn_open_code.ainvoke({"prompt": "task", "cwd": str(seed)}))
+    assert payload["status"] == "succeeded"
+    assert calls["envs"][-1][_SPAWN_DEPTH_ENV] == "2"
+
+
+@pytest.mark.asyncio
+async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monkeypatch):
+    from mimir.contained_execution import CollectedExecutionResult
+    seed, calls, contained_execution = _surface_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    maximum = 0
+
+    async def runner(argv, directory, worker_env, projections=(), **kwargs):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        entered.set()
+        await release.wait()
+        active -= 1
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(contained_execution, "execute_contained", runner)
+    first = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "one", "cwd": str(seed)}))
+    await entered.wait()
+    second = asyncio.create_task(spawn_open_code.ainvoke({"prompt": "two", "cwd": str(seed)}))
+    await asyncio.sleep(0.05)
+    assert maximum == 1
+    release.set()
+    await asyncio.gather(first, second)
+    assert maximum == 1

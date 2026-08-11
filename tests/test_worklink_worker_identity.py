@@ -20,6 +20,8 @@ def test_image_declares_distinct_fixed_controller_and_worker_identities() -> Non
 def test_image_provisions_protected_worklink_roots() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts" in text
+    assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/repo-test-checkouts" in text
+    assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/opencode-checkouts" in text
     assert "install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes" in text
 
 

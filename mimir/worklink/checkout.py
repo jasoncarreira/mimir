@@ -22,6 +22,8 @@ EventLogger = Callable[..., None]
 MIMIR_UID = 1001
 WORKLINK_GID = 1002
 _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
+_REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
+_OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _AUTHORIZATION_FACTORY = object()
 
@@ -290,6 +292,18 @@ def _open_issued_checkout(root: Path, relative_path: Path) -> int:
         os.close(root_fd)
 
 
+def _open_worklink_checkout(relative_path: Path) -> int:
+    return _open_issued_checkout(_ENABLED_CHECKOUT_ROOT, relative_path)
+
+
+def _open_repo_test_checkout(relative_path: Path) -> int:
+    return _open_issued_checkout(_REPO_TEST_CHECKOUT_ROOT, relative_path)
+
+
+def _open_opencode_checkout(relative_path: Path) -> int:
+    return _open_issued_checkout(_OPENCODE_CHECKOUT_ROOT, relative_path)
+
+
 def _preflight_directory_fd(directory_fd: int) -> None:
     for name in os.listdir(directory_fd):
         value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -527,7 +541,7 @@ def create_isolated_checkout(
         _assert_self_contained_checkout(path, runner=runner)
         if enabled:
             relative_path = path.relative_to(_ENABLED_CHECKOUT_ROOT)
-            checkout_fd = _open_issued_checkout(_ENABLED_CHECKOUT_ROOT, relative_path)
+            checkout_fd = _open_worklink_checkout(relative_path)
             try:
                 _normalize_checkout_fd(
                     checkout_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
