@@ -494,7 +494,7 @@ def test_service_read_scope_includes_both_home_skill_roots_without_write_scope(
     assert (home / ".mimir_builtin_skills").resolve() not in write_roots
 
 
-def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
+def test_scheduled_tick_read_scope_includes_all_channels_and_remains_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -509,14 +509,22 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
     script = home / "scripts" / "process_conditional_todos.py"
     issue_note = home / "memory" / "issues" / "scheduler-read-scope.md"
     core_note = home / "memory" / "core" / "30-reflection-policy.md"
+    protected_channel_note = (
+        home / "memory" / "channels" / "scheduler:daily-journal" / ".env"
+    )
+    secret_channel_note = (
+        home / "memory" / "channels" / "scheduler:daily-journal" / "secret.md"
+    )
     denied = (
         home / ".env",
         home / "credentials" / "service.json",
-        sibling_note,
+        protected_channel_note,
+        secret_channel_note,
     )
-    for target in (own_note, script, issue_note, core_note, *denied):
+    for target in (own_note, sibling_note, script, issue_note, core_note, *denied):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("ordinary test content\n", encoding="utf-8")
+    secret_channel_note.write_text("ghp_" + "a" * 30, encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
     base = get_service_principal("scheduled_tick")
@@ -533,7 +541,7 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
         _service_auth(service, InformationFlowLabels()),
         channel_id="configured-delivery-channel",
     )
-    for target in (own_note, script, issue_note, core_note):
+    for target in (own_note, sibling_note, script, issue_note, core_note):
         assert access_control._trigger_service_read_target_is_allowed(
             service, "read_file", {"file_path": str(target)}, auth_context=auth,
         ) is True, target
@@ -548,13 +556,13 @@ def test_scheduled_tick_read_scope_is_job_bound_and_read_only(
     assert access_control._trigger_service_read_target_is_allowed(
         other_service, "read_file", {"file_path": str(own_note)},
         auth_context=other_auth,
-    ) is False
+    ) is True
 
     for operation in ("write_file", "edit_file"):
         assert service.sink_policy_for(operation) == base.sink_policy_for(operation)
 
 
-def test_scheduled_tick_memory_scope_allows_core_and_only_its_channel(
+def test_scheduled_tick_memory_scope_allows_core_and_all_channels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.read_policy import is_memory_read_path_allowed
@@ -573,11 +581,81 @@ def test_scheduled_tick_memory_scope_allows_core_and_only_its_channel(
 
     assert is_memory_read_path_allowed(core, auth) is True
     assert is_memory_read_path_allowed(own, auth) is True
-    assert is_memory_read_path_allowed(other, auth) is False
-    # The bare channels directory is the one case the general check below
-    # cannot cover (it requires len(parts) > 1); enumerating it leaks the
-    # other jobs' channel names.
-    assert is_memory_read_path_allowed(home / "memory" / "channels", auth) is False
+    assert is_memory_read_path_allowed(other, auth) is True
+    assert is_memory_read_path_allowed(home / "memory" / "channels", auth) is True
+
+
+def test_scheduled_tick_can_execute_cross_channel_memory_hygiene_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    notes = {
+        "scheduler:memory-hygiene": "own note\n",
+        "poller:github-activity": "runbook-like cross-channel note\n",
+        "web-operator": "operator channel fact\n",
+    }
+    for channel, content in notes.items():
+        note = home / "memory" / "channels" / channel / "notes.md"
+        note.parent.mkdir(parents=True)
+        note.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = build_scheduled_tick_service_principal("memory-hygiene", home)
+    assert service is not None
+    auth = create_auth_context(AgentEvent(
+        trigger="scheduled_tick",
+        channel_id=service.channel_memory_directory,
+        service_principal=service.canonical,
+        service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    registry = ToolRegistry()
+    calls = (
+        ("glob", {"path": "memory/channels", "pattern": "**/*"}),
+        ("ls", {"path": "memory/channels"}),
+        *(("ls", {"path": f"memory/channels/{channel}"}) for channel in notes),
+        (
+            "read_file",
+            {"file_path": "memory/channels/poller:github-activity/notes.md"},
+        ),
+    )
+    for tool_name, arguments in calls:
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is True, (tool_name, arguments, decision.reason)
+
+    token = set_current_turn(SimpleNamespace(turn_id="memory-hygiene", auth_context=auth))
+    try:
+        backend = WriteGuardBackend(home, ["memory"])
+        glob_result = backend.glob("**/*", path="/memory/channels")
+        channels_result = backend.ls("/memory/channels")
+        channel_sizes = {
+            channel: sum(
+                int(entry.get("size", 0))
+                for entry in backend.ls(f"/memory/channels/{channel}").entries
+            )
+            for channel in notes
+        }
+        read_result = backend.read(
+            "/memory/channels/poller:github-activity/notes.md"
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert glob_result.error is None
+    assert {match["path"] for match in glob_result.matches} == {
+        f"/memory/channels/{channel}/notes.md" for channel in notes
+    }
+    assert channels_result.error is None
+    assert {
+        Path(entry["path"].rstrip("/")).name for entry in channels_result.entries
+    } == set(notes)
+    assert channel_sizes == {
+        channel: len(content.encode("utf-8")) for channel, content in notes.items()
+    }
+    assert read_result.error is None
+    assert read_result.file_data["content"] == notes["poller:github-activity"]
 
 
 def test_heartbeat_profile_memory_scope_is_unchanged(
