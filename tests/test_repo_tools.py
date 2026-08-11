@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
+import os
 from pathlib import Path
+import shutil
+import stat
 from types import SimpleNamespace
 import subprocess
 
@@ -11,7 +15,7 @@ import pytest
 from langchain_core.tools import ToolException
 
 from mimir.contained_execution import CollectedExecutionResult
-from mimir.contained_snapshot import SnapshotCredentialsRefused
+from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
@@ -1318,6 +1322,55 @@ def _test_checkout_factory(source: Path, **_kwargs):
     return SimpleNamespace(path=source, capability=SimpleNamespace(path=source), close=lambda: None)
 
 
+def _snapshot_checkout_factory(root: Path, issued: list[Path]):
+    def factory(source: Path, **_kwargs):
+        boundary = root / f"issued-{len(issued)}"
+        destination = boundary / "checkout"
+        create_git_snapshot(source, destination)
+        issued.append(destination)
+
+        def close() -> None:
+            shutil.rmtree(boundary)
+
+        return SimpleNamespace(
+            path=destination,
+            capability=SimpleNamespace(path=destination),
+            close=close,
+        )
+
+    return factory
+
+
+def _recursive_metadata(root: Path) -> dict[str, tuple[int, int, int]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat(follow_symlinks=False).st_uid,
+            path.stat(follow_symlinks=False).st_gid,
+            stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
+        )
+        for path in (root, *root.rglob("*"))
+    }
+
+
+def _plant_repo_test_payload(lease: Path, canary: Path, pytest_executable: str) -> None:
+    (lease / "conftest.py").write_text(
+        "from pathlib import Path\n"
+        "import json, os\n"
+        "def pytest_sessionstart(session):\n"
+        "    Path('snapshot-executed.json').write_text(json.dumps("
+        "{'uid': os.getuid(), 'home': os.environ['HOME']}))\n"
+        "    try:\n"
+        f"        Path({str(canary)!r}).write_text('altered')\n"
+        "    except OSError:\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+    (lease / "test_payload.py").write_text("def test_payload():\n    assert True\n", encoding="utf-8")
+    (lease / "run-tests.sh").write_text(
+        f"#!/bin/sh\nexec {pytest_executable} \"$@\"\n", encoding="utf-8",
+    )
+
+
 async def _local_contained_runner(argv, directory, worker_env, projections, **_kwargs):
     completed = await asyncio.to_thread(
         subprocess.run, argv, cwd=directory.path, env=dict(worker_env), capture_output=True, check=False,
@@ -1443,22 +1496,175 @@ async def test_project_test_snapshot_credentials_are_named_refusal(
 
 
 @pytest.mark.asyncio
-async def test_project_test_containment_unavailable_fails_closed(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+async def test_project_test_snapshot_credential_refusal_discloses_no_bytes_or_paths(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from mimir import project_tests as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "controller-config"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    credential_path = state.checkout_lease.path / "nested" / "credentials.json"
+    credential_path.parent.mkdir()
+    credential_bytes = b"arbitrary-credential\x00\xff\x10-not-token-shaped"
+    credential_path.write_bytes(credential_bytes)
+    issued: list[Path] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("credential refusal must happen before launch")
+            ),
+            checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+        ).execute()
+
+    assert refusal.value.code == "test_snapshot_credentials_refused"
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "snapshot_credentials",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+    outward_sinks = (
+        str(refusal.value).encode(),
+        json.dumps(events, sort_keys=True).encode(),
+        caplog.text.encode(),
+        json.dumps({"events": events, "refusal": str(refusal.value)}, sort_keys=True).encode(),
+    )
+    for sink in outward_sinks:
+        assert credential_bytes not in sink
+        assert os.fsencode(credential_path) not in sink
+    assert issued == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("socket unavailable"),
+        PermissionError("peer rejected"),
+        ValueError("checkout fd admission rejected"),
+        RuntimeError("worker launch rejected"),
+    ],
+    ids=("socket", "peer", "fd-admission", "launch"),
+)
+async def test_project_test_containment_unavailable_fails_closed(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    from mimir import project_tests as project_tests_module
+
     state = repo_tools[-2]
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    marker = tmp_path / "must-not-execute"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
 
     async def unavailable(*_args, **_kwargs):
-        raise OSError("socket unavailable")
+        assert not marker.exists()
+        raise failure
 
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
     with pytest.raises(ProjectTestRefusal) as refusal:
         await RepoProjectTests(
             state, runner=unavailable, checkout_factory=_test_checkout_factory,
         ).execute()
     assert refusal.value.code == "test_containment_unavailable"
+    assert str(failure) not in str(refusal.value)
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "containment_unavailable",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_fails", [False, True])
+async def test_project_test_snapshot_is_removed_after_execution(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_fails: bool,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    issued: list[Path] = []
+
+    async def runner(*_args, **_kwargs):
+        if runner_fails:
+            raise OSError("launch failed")
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    service = RepoProjectTests(
+        state,
+        runner=runner,
+        checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+    )
+    if runner_fails:
+        with pytest.raises(ProjectTestRefusal) as refusal:
+            await service.execute(("tracked.txt",))
+        assert refusal.value.code == "test_containment_unavailable"
+    else:
+        assert (await service.execute(("tracked.txt",))).ok
+    assert len(issued) == 1
+    assert not issued[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_project_test_snapshot_cleanup_failure_is_not_silent(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import project_tests as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    checkout = SimpleNamespace(
+        path=state.checkout_lease.path,
+        capability=SimpleNamespace(path=state.checkout_lease.path),
+        close=lambda: (_ for _ in ()).throw(OSError("cleanup path must not escape")),
+    )
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+            ),
+            checkout_factory=lambda *_args, **_kwargs: checkout,
+        ).execute(("tracked.txt",))
+
+    assert refusal.value.code == "test_snapshot_cleanup_failed"
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "cleanup_failed",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
+    assert str(state.checkout_lease.path) not in str(refusal.value)
 
 
 @pytest.mark.asyncio
@@ -1466,18 +1672,118 @@ async def test_project_test_snapshot_preserves_active_lease_for_later_stage(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = repo_tools[-2]
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
     lease = state.checkout_lease.path
-    before = lease.stat()
-    await RepoProjectTests(
-        state, runner=_local_contained_runner, checkout_factory=_test_checkout_factory,
-    ).execute(("tracked.txt",))
-    after = lease.stat()
-    assert (before.st_uid, before.st_gid, before.st_mode) == (after.st_uid, after.st_gid, after.st_mode)
+    controller_home = tmp_path / "agent-home"
+    controller_home.mkdir()
+    canary = controller_home / "repo-test-canary"
+    canary.write_text("protected", encoding="utf-8")
+    canary.chmod(0o444)
+    runtime_home = tmp_path / "executor-runtime-home"
+    runtime_home.mkdir()
+    config_home = tmp_path / "config"
+    pytest_executable = shutil.which("pytest")
+    assert pytest_executable is not None
+    _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
+    monkeypatch.setenv("MIMIR_HOME", str(config_home))
+    monkeypatch.setenv("HOME", str(controller_home))
+    _plant_repo_test_payload(lease, canary, pytest_executable)
+    before = _recursive_metadata(lease)
+    issued: list[Path] = []
+    observations: dict[str, object] = {}
+
+    async def contained_runner(argv, directory, worker_env, projections, **_kwargs):
+        observations["argv"] = argv
+        observations["env"] = dict(worker_env)
+        execution_env = dict(worker_env)
+        execution_env["HOME"] = str(runtime_home)
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            argv,
+            cwd=directory.path,
+            env=execution_env,
+            capture_output=True,
+            check=False,
+        )
+        marker = directory.path / "snapshot-executed.json"
+        observations["marker"] = json.loads(marker.read_text(encoding="utf-8"))
+        return CollectedExecutionResult(
+            completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
+        )
+
+    try:
+        result = await RepoProjectTests(
+            state,
+            runner=contained_runner,
+            checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+        ).execute(("test_payload.py",))
+    finally:
+        canary.chmod(0o644)
+
+    assert result.ok
+    assert observations["marker"] == {"uid": os.getuid(), "home": str(runtime_home)}
+    assert str(controller_home) not in json.dumps(observations["argv"])
+    assert str(controller_home) not in json.dumps(observations["env"])
+    assert "HOME" not in observations["env"]
+    assert canary.read_text(encoding="utf-8") == "protected"
+    assert len(issued) == 1 and not issued[0].exists()
+    assert _recursive_metadata(lease) == before
+
+    for payload_path in ("conftest.py", "test_payload.py", "run-tests.sh"):
+        (lease / payload_path).unlink()
     (lease / "tracked.txt").write_text("after test\n", encoding="utf-8")
     assert RepoGitTools(state).execute(GitStage(("tracked.txt",))).ok
+    committed = RepoGitTools(state).execute(GitCommit(("tracked.txt",), "after contained test"))
+    assert committed.ok
+
+
+@pytest.mark.asyncio
+async def test_project_test_unsafe_runner_negative_control_alters_canary(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    lease = state.checkout_lease.path
+    controller_home = tmp_path / "agent-home"
+    controller_home.mkdir()
+    canary = controller_home / "repo-test-canary"
+    canary.write_text("protected", encoding="utf-8")
+    config_home = tmp_path / "config"
+    pytest_executable = shutil.which("pytest")
+    assert pytest_executable is not None
+    _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
+    monkeypatch.setenv("MIMIR_HOME", str(config_home))
+    monkeypatch.setenv("HOME", str(controller_home))
+    _plant_repo_test_payload(lease, canary, pytest_executable)
+    issued: list[Path] = []
+    executed = False
+
+    async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
+        nonlocal executed
+        execution_env = dict(worker_env)
+        execution_env["HOME"] = str(controller_home)
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            argv,
+            cwd=directory.path,
+            env=execution_env,
+            capture_output=True,
+            check=False,
+        )
+        marker = json.loads((directory.path / "snapshot-executed.json").read_text(encoding="utf-8"))
+        executed = marker["home"] == str(controller_home)
+        return CollectedExecutionResult(
+            completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
+        )
+
+    result = await RepoProjectTests(
+        state,
+        runner=unsafe_runner,
+        checkout_factory=_snapshot_checkout_factory(tmp_path / "snapshots", issued),
+    ).execute(("test_payload.py",))
+
+    assert result.ok
+    assert executed
+    assert canary.read_text(encoding="utf-8") == "altered"
+    assert len(issued) == 1 and not issued[0].exists()
 
 
 @pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])

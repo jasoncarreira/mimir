@@ -242,7 +242,10 @@ class RepoProjectTests:
             raise ProjectTestRefusal(exc.code, str(exc)) from exc
         command, configured_env, command_source = _configured_command(scope.canonical_repo)
         selected = _validated_selectors(root, selectors)
-        scrubber = SensitiveMaterialScrubber(checkout=root)
+        scrubber = SensitiveMaterialScrubber(
+            checkout=root,
+            source_paths=(os.environ.get("MIMIR_HOME", ""),),
+        )
         try:
             checkout = self._checkout_factory(
                 root,
@@ -278,6 +281,24 @@ class RepoProjectTests:
         environment = base_worker_environment(identifier)
         environment.update(configured_env)
         environment.pop("HOME", None)
+        if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
+            try:
+                checkout.close()
+            except (OSError, RuntimeError, ValueError) as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="cleanup_failed",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_snapshot_cleanup_failed",
+                    "project test snapshot cleanup failed",
+                ) from exc
+            raise ProjectTestRefusal(
+                "test_config_invalid",
+                "project test command or environment contains a controller path",
+            )
         try:
             try:
                 result = await self._runner(
@@ -304,8 +325,17 @@ class RepoProjectTests:
         finally:
             try:
                 checkout.close()
-            except (OSError, RuntimeError):
-                pass
+            except (OSError, RuntimeError, ValueError) as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="cleanup_failed",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_snapshot_cleanup_failed",
+                    "project test snapshot cleanup failed",
+                ) from exc
 
         if result.timed_out:
             return ProjectTestResult(
