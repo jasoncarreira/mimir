@@ -1924,7 +1924,7 @@ async def _spawn_open_code_impl(
         classify_spawn_terminal_state,
         cleanup_failure_event,
         prompt_contains_sensitive_source_path,
-        write_spawn_artifacts,
+        resolve_artifact_handle,
     )
     from ..worklink.worker_client import WorkerProjection
 
@@ -1971,6 +1971,14 @@ async def _spawn_open_code_impl(
             str(selected_artifact_root), home
         )
         artifact_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        artifact_directory = resolve_artifact_handle(artifact_base, run_id)
+        artifact_directory.mkdir(mode=0o700, exist_ok=False)
+        for artifact_name in (
+            "prompt.md", "stdout.txt", "stderr.txt", "manifest.json", "proposal.json"
+        ):
+            artifact_path = artifact_directory / artifact_name
+            artifact_path.write_bytes(b"")
+            artifact_path.chmod(0o600)
     except (OSError, RuntimeError, ValueError):
         terminal = classify_spawn_terminal_state(artifact_available=False)
         await safe_log_event(
@@ -2151,12 +2159,6 @@ async def _spawn_open_code_impl(
                 log.warning("spawn_open_code cleanup failed")
 
     assert terminal is not None
-    await safe_log_event(
-        terminal.event_type,
-        run_id=run_id,
-        status=terminal.status,
-        reason_code=terminal.reason_code,
-    )
     manifest = {
         "schema_version": 2,
         "run_id": run_id,
@@ -2173,20 +2175,44 @@ async def _spawn_open_code_impl(
         "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
         "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
     }
-    artifact_handle = None
+    artifact_handle = run_id
     try:
-        artifact_handle = write_spawn_artifacts(
-            artifact_base,
-            run_id,
-            prompt=prompt,
-            stdout=stdout,
-            stderr=stderr,
-            manifest=manifest,
-            scrubber=scrubber,
-            proposal=terminal.proposal,
+        (artifact_directory / "prompt.md").write_text(
+            scrubber.scrub_text(prompt), encoding="utf-8"
         )
+        (artifact_directory / "stdout.txt").write_text(
+            scrubber.scrub_text(stdout), encoding="utf-8"
+        )
+        (artifact_directory / "stderr.txt").write_text(
+            scrubber.scrub_text(stderr), encoding="utf-8"
+        )
+        scrubbed_manifest = json.loads(
+            scrubber.scrub_text(json.dumps(manifest, ensure_ascii=False))
+        )
+        (artifact_directory / "manifest.json").write_text(
+            json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        proposal_path = artifact_directory / "proposal.json"
+        if terminal.proposal is None:
+            proposal_path.unlink()
+        else:
+            proposal_path.write_text(
+                json.dumps(
+                    terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True
+                ) + "\n",
+                encoding="utf-8",
+            )
     except (OSError, RuntimeError, ValueError):
         log.warning("spawn_open_code artifact write failed")
+        terminal = classify_spawn_terminal_state(artifact_available=False)
+        artifact_handle = None
+    await safe_log_event(
+        terminal.event_type,
+        run_id=run_id,
+        status=terminal.status,
+        reason_code=terminal.reason_code,
+    )
     safe_stdout = scrubber.scrub_text(stdout).strip()[:2000]
     safe_stderr = scrubber.scrub_text(stderr).strip()[:500]
     if terminal.status == "configuration_refused":

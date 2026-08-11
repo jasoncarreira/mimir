@@ -5,6 +5,9 @@ import base64
 import json
 from pathlib import Path
 import shutil
+import os
+import pwd
+import uuid
 import subprocess
 from types import SimpleNamespace
 
@@ -69,7 +72,9 @@ def factory_for(tmp_path: Path, record: dict):
     def factory(seed, *, default_cwd, known_sensitive=()):
         record["factory_seed"] = Path(seed)
         record["sensitive"] = tuple(known_sensitive)
-        checkout = FakeCheckout(Path(seed), tmp_path / "issued")
+        index = record.get("factory_calls", 0) + 1
+        record["factory_calls"] = index
+        checkout = FakeCheckout(Path(seed), tmp_path / f"issued-{index}")
         record["checkout"] = checkout
         return checkout
     return factory
@@ -193,3 +198,240 @@ async def test_sensitive_output_is_scrubbed_everywhere(spawn_tree, tmp_path):
     for path in artifact.iterdir():
         assert b"refresh-secret" not in path.read_bytes()
         assert str(home).encode() not in path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_artifact_run_directory_failure_precedes_execution(
+    spawn_tree, tmp_path, monkeypatch
+):
+    from mimir import event_logger, opencode_config
+    from mimir.opencode_config import OpenCodeConfigError
+    _home, seed = spawn_tree
+    record = {}
+    events = []
+    async def capture(event, **fields):
+        events.append((event, fields))
+    monkeypatch.setattr(event_logger, "safe_log_event", capture)
+    monkeypatch.setattr(
+        opencode_config, "resolve_opencode_invocation",
+        lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
+    )
+    artifact_file = tmp_path / "home" / "not-a-directory"
+    artifact_file.write_text("occupied")
+    payload = await invoke(
+        seed, tmp_path, record, artifact_root=str(artifact_file)
+    )
+    assert payload["status"] == "artifact_unavailable"
+    assert payload["artifact_dir"] is None
+    assert "argv" not in record
+    assert events == [("spawn_open_code_provisioning_refused", {
+        "run_id": payload["run_id"],
+        "status": "artifact_unavailable",
+        "reason_code": "artifact_unavailable",
+    })]
+
+
+@pytest.mark.asyncio
+async def test_generated_payload_containment_and_unsafe_negative_control(
+    spawn_tree, tmp_path
+):
+    home, seed = spawn_tree
+    controller_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    canary_name = f".mimir-spawn-canary-{uuid.uuid4().hex}"
+    canary = controller_home / canary_name
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir()
+    worker_canary = worker_home / canary_name
+
+    def payload_runner(record, *, contained):
+        async def runner(argv, directory, worker_env, projections=(), **kwargs):
+            attack = directory.path / "generated_attack.py"
+            marker = directory.path / "payload-executed"
+            attack.write_text(
+                "import os,pwd\n"
+                "from pathlib import Path\n"
+                f"Path(pwd.getpwuid(os.getuid()).pw_dir, {canary_name!r}).write_text('breach')\n"
+                f"Path({str(marker)!r}).write_text('executed')\n"
+            )
+            original = pwd.getpwuid
+            if contained:
+                pwd.getpwuid = lambda _uid: SimpleNamespace(pw_dir=str(worker_home))
+            try:
+                exec(compile(attack.read_bytes(), str(attack), "exec"), {"__name__": "__main__"})
+            finally:
+                pwd.getpwuid = original
+            record["marker"] = marker
+            return CollectedExecutionResult(0, b"payload ran", b"", False, False, 0, 0)
+        return runner
+
+    try:
+        positive = {}
+        result = await invoke(
+            seed, tmp_path, positive,
+            prompt="generate and execute the account-home probe",
+            runner=payload_runner(positive, contained=True),
+            factory=factory_for(tmp_path / "positive", positive),
+        )
+        assert result["status"] == "succeeded"
+        assert positive["marker"].read_text() == "executed"
+        assert worker_canary.read_text() == "breach"
+        assert not canary.exists()
+
+        negative = {}
+        result = await invoke(
+            seed, tmp_path, negative,
+            prompt="generate and execute the account-home probe",
+            runner=payload_runner(negative, contained=False),
+            factory=factory_for(tmp_path / "negative", negative),
+        )
+        assert result["status"] == "succeeded"
+        assert negative["marker"].read_text() == "executed"
+        assert canary.read_text() == "breach"
+    finally:
+        canary.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "status", "exit_code", "reason", "event_type", "proposal_file"),
+    (
+        ("config", "configuration_refused", None, "config_malformed", "spawn_open_code_configuration_refused", False),
+        ("auth", "authentication_refused", None, "auth_invalid", "spawn_open_code_authentication_refused", False),
+        ("prompt_auth", "prompt_refused", None, "config_auth_source_path", "spawn_open_code_prompt_refused", False),
+        ("credentials", "seed_credentials_refused", None, "seed_credentials", "spawn_open_code_provisioning_refused", False),
+        ("invalid_seed", "seed_refused", None, "invalid_seed", "spawn_open_code_provisioning_refused", False),
+        ("unsafe_seed", "seed_refused", None, "unsafe_seed_entry", "spawn_open_code_provisioning_refused", False),
+        ("seed_changed", "seed_refused", None, "seed_changed", "spawn_open_code_provisioning_refused", False),
+        ("provisioning", "provisioning_unavailable", None, "provisioning_unavailable", "spawn_open_code_provisioning_refused", False),
+        ("containment", "containment_unavailable", None, "containment_unavailable", "spawn_open_code_containment_refused", False),
+        ("timeout", "timeout", None, "timeout", "spawn_open_code_completed", False),
+        ("overflow", "output_overflow", 0, "output_overflow", "spawn_open_code_completed", False),
+        ("auth_worker", "authentication_required", 1, "worker_authentication_required", "spawn_open_code_completed", False),
+        ("failed", "failed", 2, "worker_nonzero", "spawn_open_code_completed", False),
+        ("no_changes", "succeeded", 0, "no_changes", "spawn_open_code_completed", False),
+        ("path_count", "proposal_overflow", 0, "path_count", "spawn_open_code_completed", False),
+        ("path_bytes", "proposal_overflow", 0, "path_bytes", "spawn_open_code_completed", False),
+        ("patch_bytes", "proposal_overflow", 0, "patch_bytes", "spawn_open_code_completed", False),
+        ("sensitive", "proposal_sensitive_content", 0, "proposal_sensitive_content", "spawn_open_code_completed", False),
+        ("proposal_unavailable", "proposal_unavailable", 0, "proposal_unavailable", "spawn_open_code_completed", False),
+        ("proposal", "succeeded", 0, "proposal_created", "spawn_open_code_completed", True),
+    ),
+)
+async def test_terminal_state_contract(
+    spawn_tree, tmp_path, monkeypatch, case, status, exit_code, reason, event_type,
+    proposal_file,
+):
+    from mimir import event_logger, opencode_config, opencode_proposal
+    from mimir.contained_snapshot import (
+        SnapshotCredentialsRefused, SnapshotSourceChanged, SnapshotUnsafeEntry,
+    )
+    from mimir.opencode_config import OpenCodeAuthError, OpenCodeConfigError
+    from mimir.opencode_proposal import OpenCodeProposal, ProposalBuildResult
+
+    _home, seed = spawn_tree
+    record = {}
+    events = []
+
+    async def capture(event, **fields):
+        events.append((event, fields))
+    monkeypatch.setattr(event_logger, "safe_log_event", capture)
+
+    factory = factory_for(tmp_path, record)
+    runner = runner_for(record)
+    prompt = "task"
+    if case == "config":
+        monkeypatch.setattr(
+            opencode_config, "resolve_opencode_invocation",
+            lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
+        )
+    elif case == "auth":
+        monkeypatch.setattr(
+            opencode_config, "resolve_opencode_invocation",
+            lambda *a, **k: (_ for _ in ()).throw(OpenCodeAuthError("auth_invalid")),
+        )
+    elif case == "prompt_auth":
+        config_source = tmp_path / "repos" / "opencode.json"
+        config_source.write_text(json.dumps({"model": "openai/test-model"}))
+        set_spawn_config({
+            "default_cwd": tmp_path / "repos",
+            "artifact_root": tmp_path / "home/artifacts",
+            "opencode_config_path": config_source,
+        })
+        prompt = str(config_source)
+    elif case in {"credentials", "invalid_seed", "unsafe_seed", "seed_changed", "provisioning"}:
+        error = {
+            "credentials": SnapshotCredentialsRefused(),
+            "invalid_seed": ValueError("bad seed"),
+            "unsafe_seed": SnapshotUnsafeEntry("unsafe"),
+            "seed_changed": SnapshotSourceChanged("changed"),
+            "provisioning": OSError("disk"),
+        }[case]
+        def factory(*args, **kwargs):
+            raise error
+    elif case == "containment":
+        async def runner(*args, **kwargs):
+            raise OSError("socket")
+    elif case in {"timeout", "overflow", "auth_worker", "failed"}:
+        values = {
+            "timeout": (None, False, True, b""),
+            "overflow": (0, True, False, b""),
+            "auth_worker": (1, False, False, b"401 unauthorized"),
+            "failed": (2, False, False, b"compile failed"),
+        }[case]
+        async def runner(argv, directory, worker_env, projections=(), **kwargs):
+            code, overflow, timed_out, err = values
+            return CollectedExecutionResult(code, b"", err, timed_out, overflow, 0, 0)
+    elif case == "no_changes":
+        runner = runner_for(record, exit_code=0)
+        async def runner(argv, directory, worker_env, projections=(), **kwargs):
+            return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+    elif case in {"path_count", "path_bytes", "patch_bytes", "sensitive", "proposal_unavailable", "proposal"}:
+        proposal_reason = {
+            "sensitive": "proposal_sensitive_content",
+            "proposal_unavailable": "proposal_unavailable",
+        }.get(case, case if case != "proposal" else "proposal_created")
+        proposal = None
+        if case == "proposal":
+            proposal = OpenCodeProposal(1, "git_binary_patch", "a" * 40, "base64", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "")
+        monkeypatch.setattr(
+            opencode_proposal, "build_opencode_proposal",
+            lambda *a, **k: ProposalBuildResult(proposal, proposal_reason),
+        )
+
+    payload = await invoke(
+        seed, tmp_path, record, prompt=prompt, runner=runner, factory=factory
+    )
+    assert payload["status"] == status
+    assert payload["exit_code"] == exit_code
+    assert (payload["proposal"] is not None) is proposal_file
+    assert events[-1][0] == event_type
+    assert events[-1][1]["reason_code"] == reason
+    artifact = tmp_path / "home/artifacts" / payload["artifact_dir"]
+    manifest = json.loads((artifact / "manifest.json").read_text())
+    assert manifest["status"] == status
+    assert manifest["reason_code"] == reason
+    assert (artifact / "proposal.json").exists() is proposal_file
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_does_not_mutate_terminal_result(
+    spawn_tree, tmp_path, monkeypatch
+):
+    from mimir import event_logger
+    _home, seed = spawn_tree
+    record = {}
+    events = []
+    async def capture(event, **fields):
+        events.append((event, fields))
+    monkeypatch.setattr(event_logger, "safe_log_event", capture)
+    factory = factory_for(tmp_path, record)
+    def failing_factory(*args, **kwargs):
+        checkout = factory(*args, **kwargs)
+        def close():
+            raise OSError("cleanup")
+        checkout.close = close
+        return checkout
+    payload = await invoke(seed, tmp_path, record, factory=failing_factory)
+    assert payload["status"] == "succeeded"
+    assert events[0][0] == "spawn_open_code_cleanup_failed"
+    assert events[-1][0] == "spawn_open_code_completed"
