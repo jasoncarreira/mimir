@@ -146,6 +146,46 @@ class SensitiveMaterialScrubber:
     ) -> str:
         return self.scrub_bytes(value).decode("utf-8", errors=errors)
 
+    def lookahead_bytes(self) -> int:
+        """Bytes to read past a cut so a material spanning it is present in full."""
+        if not self._materials:
+            return 0
+        return max(len(material) for material in self._materials) - 1
+
+    def safe_truncation_length(
+        self, value: bytes | bytearray | memoryview, limit: int
+    ) -> int:
+        """Largest cut at or below ``limit`` that no registered material spans.
+
+        ``scrub_bytes`` replaces whole values, so a buffer cut through the middle
+        of a material keeps a fragment that matches nothing and survives
+        scrubbing verbatim. Truncation is the only step that produces such a
+        fragment -- a value split across reads is reassembled before scrubbing --
+        so the cut is where the boundary has to be enforced.
+
+        ``value`` must extend ``lookahead_bytes()`` past ``limit`` wherever the
+        source has that much left, so an occurrence spanning ``limit`` is present
+        whole and can be located rather than inferred from its prefix. Inferring
+        would move the cut for any tail that merely looks like the start of a
+        material, which discards output no secret was ever in.
+        """
+        payload = self._bytes(value)
+        cut = max(0, min(limit, len(payload)))
+        while True:
+            for material in self._materials:
+                length = len(material)
+                # The bounds admit only occurrences that start before ``cut`` and
+                # end after it, so every hit genuinely spans the cut and sits
+                # strictly earlier -- which is also why this terminates.
+                found = payload.find(
+                    material, max(0, cut - length + 1), cut + length - 1
+                )
+                if found != -1:
+                    cut = found
+                    break
+            else:
+                return cut
+
     def _add(self, value: bytes | bytearray | memoryview | str) -> None:
         payload = self._bytes(value)
         if payload:
@@ -162,19 +202,33 @@ async def _drain(
     stream: asyncio.StreamReader | None,
     limit: int,
     overflow: Any,
+    scrubber: Any = None,
 ) -> tuple[bytes, int]:
     if stream is None:
         return b"", 0
+    # Hold ``lookahead`` bytes beyond the cap so a secret straddling the cut is
+    # buffered whole and can be recognised; without it the cut leaves a fragment
+    # that whole-value scrubbing does not match and emits verbatim.
+    lookahead = scrubber.lookahead_bytes() if scrubber is not None else 0
+    ceiling = limit + lookahead
     retained = bytearray()
-    dropped = 0
+    total = 0
+    overflowed = False
     while chunk := await stream.read(64 * 1024):
-        remaining = max(0, limit - len(retained))
-        retained.extend(chunk[:remaining])
-        excess = max(0, len(chunk) - remaining)
-        if excess:
-            dropped += excess
+        total += len(chunk)
+        room = max(0, ceiling - len(retained))
+        if room:
+            retained.extend(chunk[:room])
+        if total > limit and not overflowed:
+            overflowed = True
             overflow()
-    return bytes(retained), dropped
+    if total <= limit:
+        return bytes(retained), 0
+    keep = (
+        limit if scrubber is None else scrubber.safe_truncation_length(retained, limit)
+    )
+    del retained[keep:]
+    return bytes(retained), total - keep
 
 
 def _worker_classes() -> tuple[Any, Any]:
@@ -199,6 +253,7 @@ async def execute_contained(
     timeout_s: float,
     stdout_limit: int,
     stderr_limit: int,
+    scrubber: Any = None,
 ) -> CollectedExecutionResult:
     if stdout_limit <= 0 or stderr_limit <= 0:
         raise ValueError("worker output limits must be positive")
@@ -246,8 +301,12 @@ async def execute_contained(
         cancel_task = asyncio.create_task(client.cancel(identifier))
 
     async def collect() -> tuple[int | None, bytes, int, bytes, int]:
-        stdout_task = asyncio.create_task(_drain(process.stdout, stdout_limit, overflow))
-        stderr_task = asyncio.create_task(_drain(process.stderr, stderr_limit, overflow))
+        stdout_task = asyncio.create_task(
+            _drain(process.stdout, stdout_limit, overflow, scrubber)
+        )
+        stderr_task = asyncio.create_task(
+            _drain(process.stderr, stderr_limit, overflow, scrubber)
+        )
         try:
             exit_code = await process.wait()
         finally:

@@ -2152,6 +2152,7 @@ async def _spawn_open_code_impl(
                         timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
                         stderr_limit=1024 * 1024,
+                        scrubber=scrubber,
                     )
                 stdout = execution.stdout
                 stderr = execution.stderr

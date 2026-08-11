@@ -310,6 +310,7 @@ class RepoProjectTests:
                     timeout_s=self._timeout,
                     stdout_limit=self._output_limit,
                     stderr_limit=self._output_limit,
+                    scrubber=scrubber,
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 await safe_log_event(

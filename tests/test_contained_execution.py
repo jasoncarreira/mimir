@@ -218,3 +218,115 @@ def test_sensitive_material_scrubber_covers_bytes_and_path_forms(tmp_path: Path)
     assert scrubbed.count(b"<redacted>") >= 3
     assert "_materials" not in repr(scrubber)
     assert scrubber.contains_sensitive(b"proposal scalar-secret") is True
+
+
+_SECRET = b"sk-live-ABCDEFGHIJKLMNOPQRSTUV"
+_TRUNCATION_OUTPUT = b"begin " + _SECRET + b" end-of-log"
+
+
+def _secret_scrubber() -> SensitiveMaterialScrubber:
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+    scrubber.add_scalar(_SECRET)
+    return scrubber
+
+
+def _surviving_fragment(scrubber: SensitiveMaterialScrubber, emitted: bytes) -> bytes:
+    """The longest non-empty piece of the secret left after scrubbing ``emitted``."""
+    scrubbed = scrubber.scrub_bytes(emitted)
+    for length in range(len(_SECRET), 0, -1):
+        if _SECRET[:length] in scrubbed:
+            return _SECRET[:length]
+    return b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", range(1, len(_TRUNCATION_OUTPUT)))
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+async def test_truncation_never_emits_a_fragment_of_a_secret(
+    monkeypatch: pytest.MonkeyPatch, limit: int, stream: str
+) -> None:
+    """No cut point may leave a piece of a secret that whole-value scrubbing misses.
+
+    Every offset is exercised because the cut lands wherever the cap falls: a
+    single hand-picked limit passes while the neighbouring ones leak.
+    """
+    on_stdout = stream == "stdout"
+    client = Client(
+        _TRUNCATION_OUTPUT if on_stdout else b"",
+        b"" if on_stdout else _TRUNCATION_OUTPUT,
+    )
+    install_client(monkeypatch, client)
+    scrubber = _secret_scrubber()
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=1,
+        stdout_limit=limit if on_stdout else 4096,
+        stderr_limit=4096 if on_stdout else limit,
+        scrubber=scrubber,
+    )
+
+    emitted = result.stdout if on_stdout else result.stderr
+    dropped = result.stdout_dropped_bytes if on_stdout else result.stderr_dropped_bytes
+    assert _surviving_fragment(scrubber, emitted) == b""
+    assert len(emitted) <= limit
+    # Trimming past the cap stays honest: the counter accounts for every byte
+    # the caller does not receive, not just the ones the cap itself dropped.
+    assert dropped == len(_TRUNCATION_OUTPUT) - len(emitted)
+
+
+@pytest.mark.asyncio
+async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output a secret was never in is capped exactly, not trimmed defensively.
+
+    The cut is chosen from secrets actually spanning it rather than from tails
+    that merely look like the start of one, so a run of a material's leading
+    byte -- ``/`` is the first byte of every registered path -- costs nothing.
+    """
+    payload = b"/usr/lib/" + b"/" * 4000 + b"trailing"
+    client = Client(payload)
+    install_client(monkeypatch, client)
+    scrubber = _secret_scrubber()
+    scrubber.add_scalar("/mimir-home/state/liveness.json")
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=1,
+        stdout_limit=2000,
+        stderr_limit=2000,
+        scrubber=scrubber,
+    )
+
+    assert result.stdout == payload[:2000]
+    assert result.stdout_dropped_bytes == len(payload) - 2000
+
+
+def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret() -> None:
+    scrubber = _secret_scrubber()
+    payload = _TRUNCATION_OUTPUT
+    start = payload.index(_SECRET)
+
+    assert scrubber.lookahead_bytes() == len(_SECRET) - 1
+    # A cut anywhere inside the secret retreats to where it begins.
+    for limit in range(start + 1, start + len(_SECRET)):
+        assert scrubber.safe_truncation_length(payload, limit) == start
+    # Cuts clear of it are left alone, including the two boundaries.
+    for limit in (0, start, start + len(_SECRET), len(payload)):
+        assert scrubber.safe_truncation_length(payload, limit) == limit
+    # A limit past the buffer cannot invent bytes.
+    assert scrubber.safe_truncation_length(payload, len(payload) + 50) == len(payload)
+
+
+def test_safe_truncation_length_without_materials_is_the_limit() -> None:
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+
+    assert scrubber.lookahead_bytes() == 0
+    assert scrubber.safe_truncation_length(b"plain output", 5) == 5
