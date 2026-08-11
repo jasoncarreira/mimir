@@ -28,6 +28,10 @@ class UpdateDispatcher:
         self._queued_bytes = 0
         self._queued_sizes: asyncio.Queue[int] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
+        try:
+            self._producer = asyncio.current_task()
+        except RuntimeError:
+            self._producer = None
         self._failure: BaseException | None = None
         self._publication_failed = False
         self._open_tools: dict[str, str] = {}
@@ -57,19 +61,45 @@ class UpdateDispatcher:
         self._queued_bytes += size
 
     async def submit(self, event: Mapping[str, Any]) -> None:
-        self.enqueue(event)
+        try:
+            self.enqueue(event)
+        except RequestError:
+            current = asyncio.current_task()
+            if self._producer is None or self._producer is current:
+                raise
+            self._producer.cancel()
+        await asyncio.sleep(0)
 
     def permission_snapshot(self, tool_call_id: str) -> PermissionSnapshot | None:
         return self._snapshots.get(tool_call_id)
 
 
-    async def consume(self, source: asyncio.Queue[dict[str, Any]]) -> None:
-        while True:
-            event = await source.get()
-            try:
-                self.enqueue(event)
-            finally:
-                source.task_done()
+    async def consume(
+        self,
+        source: asyncio.Queue[dict[str, Any]],
+        producer: asyncio.Task[Any] | None = None,
+    ) -> None:
+        try:
+            while True:
+                event = await source.get()
+                try:
+                    self.enqueue(event)
+                finally:
+                    source.task_done()
+        except RequestError:
+            owner = producer if producer is not None else self._producer
+            if owner is not None and owner is not asyncio.current_task():
+                if not owner.done():
+                    owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+            while True:
+                try:
+                    source.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                else:
+                    source.task_done()
+            raise
 
     async def drain(self) -> None:
         self._ensure_worker()
@@ -114,6 +144,8 @@ class UpdateDispatcher:
     async def close(self) -> None:
         if self._worker is None:
             return
+        while self.queue.full():
+            await asyncio.sleep(0)
         self.queue.put_nowait(None)
         self._queued_sizes.put_nowait(0)
         await self.queue.join()

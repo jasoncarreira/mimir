@@ -1463,3 +1463,54 @@ async def test_input_queue_byte_limit_admits_exact_boundary(
     await queue._queue.get()
     queue.task_done()
     assert queue.pending_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_input_queue_capacity_released_before_deadline_admits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", 0.2)
+    queue = sdk.BoundedMessageQueue()
+    for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        await queue.publish(SimpleNamespace(message={"index": index}))
+
+    waiting = asyncio.create_task(
+        queue.publish(SimpleNamespace(message={"index": "waiting"}))
+    )
+    await asyncio.sleep(0)
+    assert waiting.done() is False
+    await queue._queue.get()
+    queue.task_done()
+    await asyncio.wait_for(waiting, 0.1)
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+
+    while not queue._queue.empty():
+        await queue._queue.get()
+        queue.task_done()
+
+
+@pytest.mark.asyncio
+async def test_input_queue_capacity_held_rejects_only_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = 0.05
+    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", timeout)
+    queue = sdk.BoundedMessageQueue()
+    for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        await queue.publish(SimpleNamespace(message={"index": index}))
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    waiting = asyncio.create_task(
+        queue.publish(SimpleNamespace(message={"index": "waiting"}))
+    )
+    await asyncio.sleep(timeout / 2)
+    assert waiting.done() is False
+    with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
+        await waiting
+    assert loop.time() - started >= timeout
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+
+    while not queue._queue.empty():
+        await queue._queue.get()
+        queue.task_done()

@@ -262,3 +262,51 @@ async def test_update_byte_limit_admits_exact_boundary_and_rejects_next() -> Non
         await dispatcher.drain()
     await dispatcher.close()
     assert dispatcher.queued_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_consume_overflow_cancels_producer_and_quarantines_follow_on_events() -> None:
+    blocked_publisher = Publisher()
+    blocked_publisher.block = True
+    dispatcher = UpdateDispatcher(blocked_publisher)
+    source: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=1)
+    producer_cancelled = asyncio.Event()
+
+    async def produce() -> None:
+        try:
+            for index in range(MAX_UPDATE_ITEMS + 20):
+                await source.put(
+                    {
+                        "type": "tool_call",
+                        "phase": "start",
+                        "id": str(index),
+                        "tool_name": "search",
+                    }
+                )
+        except asyncio.CancelledError:
+            producer_cancelled.set()
+            raise
+
+    producer = asyncio.create_task(produce())
+    consumer = asyncio.create_task(dispatcher.consume(source, producer))
+    await blocked_publisher.entered.wait()
+    with pytest.raises(RequestError, match="Internal error"):
+        await asyncio.wait_for(consumer, 1)
+    await asyncio.wait_for(source.join(), 0.1)
+    assert producer_cancelled.is_set()
+    assert producer.done()
+    assert source.empty()
+
+    independent_publisher = Publisher()
+    independent = UpdateDispatcher(independent_publisher)
+    independent.enqueue(
+        {"type": "tool_call", "phase": "start", "id": "live", "tool_name": "search"}
+    )
+    await asyncio.wait_for(independent.drain(), 0.1)
+    assert [(item.tool_call_id, item.status) for item in independent_publisher.updates] == [
+        ("live", "pending")
+    ]
+
+    blocked_publisher.release.set()
+    await asyncio.wait_for(dispatcher.close(), 1)
+    await independent.close()
