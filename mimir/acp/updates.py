@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -9,6 +10,8 @@ from mimir.acp.sdk import AgentPlanUpdate, PermissionSnapshot, PlanEntry, Reques
 
 _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"}
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
+MAX_UPDATE_ITEMS = 128
+MAX_UPDATE_BYTES = 8 * 1024 * 1024
 
 
 class UpdateDispatcher:
@@ -21,7 +24,9 @@ class UpdateDispatcher:
         self.publisher = publisher
         self.lease = lease
         self.epoch = epoch
-        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=MAX_UPDATE_ITEMS)
+        self._queued_bytes = 0
+        self._queued_sizes: asyncio.Queue[int] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
         self._publication_failed = False
@@ -34,9 +39,22 @@ class UpdateDispatcher:
     def failure(self) -> BaseException | None:
         return self._failure
 
+    @property
+    def queued_bytes(self) -> int:
+        return self._queued_bytes
+
     def enqueue(self, event: Mapping[str, Any]) -> None:
         self._ensure_worker()
-        self.queue.put_nowait(_allowed_event(event))
+        allowed = _allowed_event(event)
+        size = _event_bytes(allowed)
+        if self.queue.full() or self._queued_bytes + size > MAX_UPDATE_BYTES:
+            error = RuntimeError("ACP update queue limit exceeded")
+            if self._failure is None:
+                self._failure = error
+            raise RequestError(-32603, "Internal error") from error
+        self.queue.put_nowait(allowed)
+        self._queued_sizes.put_nowait(size)
+        self._queued_bytes += size
 
     async def submit(self, event: Mapping[str, Any]) -> None:
         self.enqueue(event)
@@ -65,7 +83,7 @@ class UpdateDispatcher:
             self._failure = error or RuntimeError("ACP turn failed")
         await self.queue.join()
         for tool_id, name in list(self._open_tools.items()):
-            self.queue.put_nowait({"type": "_terminal", "phase": "end", "id": tool_id, "tool_name": name})
+            self.enqueue({"type": "_terminal", "phase": "end", "id": tool_id, "tool_name": name})
         await self.queue.join()
         raise RequestError(-32603, "Internal error") from self._failure
 
@@ -97,6 +115,7 @@ class UpdateDispatcher:
         if self._worker is None:
             return
         self.queue.put_nowait(None)
+        self._queued_sizes.put_nowait(0)
         await self.queue.join()
         await self._worker
         self._worker = None
@@ -138,6 +157,9 @@ class UpdateDispatcher:
                                 self._publication_failed = True
                                 break
             finally:
+                size = self._queued_sizes.get_nowait()
+                self._queued_sizes.task_done()
+                self._queued_bytes -= size
                 self.queue.task_done()
 
     def _map(self, event: dict[str, Any]) -> list[Any]:
@@ -204,9 +226,13 @@ class UpdateDispatcher:
         return []
 
 
+def _event_bytes(event: Mapping[str, Any]) -> int:
+    return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def _allowed_event(event: Mapping[str, Any]) -> dict[str, Any]:
     keys = {"type", "phase", "id", "tool_name", "args", "content", "status", "is_error"}
-    return {key: event[key] for key in keys if key in event}
+    return _strict_json({key: event[key] for key in keys if key in event})
 
 
 def _strict_json(value: Any, key: str = "") -> Any:

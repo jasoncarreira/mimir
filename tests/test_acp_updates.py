@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from mimir.acp.sdk import RequestError
-from mimir.acp.updates import UpdateDispatcher
+from mimir.acp.updates import MAX_UPDATE_BYTES, MAX_UPDATE_ITEMS, UpdateDispatcher, _event_bytes
 
 
 class Publisher:
@@ -94,7 +94,7 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
     publisher = Publisher()
     publisher.block = True
     dispatcher = UpdateDispatcher(publisher)
-    for index in range(300):
+    for index in range(MAX_UPDATE_ITEMS):
         dispatcher.enqueue({"type": "tool_call", "phase": "end", "id": str(index), "tool_name": "search", "args": {"index": index}})
     await publisher.entered.wait()
     drain = asyncio.create_task(dispatcher.drain())
@@ -103,7 +103,7 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
     publisher.release.set()
     await drain
     progress = [item.raw_input["index"] for item in publisher.updates if item.status == "in_progress"]
-    assert progress == list(range(300))
+    assert progress == list(range(MAX_UPDATE_ITEMS))
     await finish(dispatcher)
 
 
@@ -224,3 +224,41 @@ async def test_is_error_discriminator_overrides_nominal_success() -> None:
         ("failed", "tool"),
     ]
     await finish(dispatcher)
+
+
+@pytest.mark.asyncio
+async def test_update_item_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
+    for _ in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue(event)
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue(event)
+    assert dispatcher.queue.qsize() == MAX_UPDATE_ITEMS
+    assert dispatcher.failure is not None
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_update_byte_limit_admits_exact_boundary_and_rejects_next() -> None:
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    base = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search", "args": {"value": ""}}
+    overhead = _event_bytes(base)
+    event = {**base, "args": {"value": "a" * (MAX_UPDATE_BYTES - overhead)}}
+    assert _event_bytes(event) == MAX_UPDATE_BYTES
+    dispatcher.enqueue(event)
+    assert dispatcher.queued_bytes == MAX_UPDATE_BYTES
+    with pytest.raises(RequestError, match="Internal error"):
+        dispatcher.enqueue({"type": "tool_call"})
+    publisher.release.set()
+    with pytest.raises(RequestError, match="Internal error"):
+        await dispatcher.drain()
+    await dispatcher.close()
+    assert dispatcher.queued_bytes == 0
