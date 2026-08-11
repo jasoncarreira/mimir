@@ -9,6 +9,7 @@ import pytest
 
 from mimir.contained_snapshot import (
     SnapshotCredentialsRefused,
+    SnapshotEmbeddedRepository,
     SnapshotSourceChanged,
     SnapshotUnsafeEntry,
     create_git_snapshot,
@@ -464,3 +465,79 @@ def test_env_example_parent_component_is_not_exempt(
     add_entry(repository, inventory, relative, b"benign content")
     with pytest.raises(SnapshotCredentialsRefused, match="^Snapshot credentials refused$"):
         create_git_snapshot(repository, tmp_path / "snapshot")
+
+
+def _embed_repository(parent: Path, name: str) -> Path:
+    """Create a nested Git repo — what a worktree or vendored checkout looks like."""
+    nested = parent / name
+    nested.mkdir()
+    git(nested, "init", "-q")
+    git(nested, "config", "user.email", "nested@example.invalid")
+    git(nested, "config", "user.name", "Nested")
+    (nested / "inner.txt").write_text("inner\n")
+    git(nested, "add", ".")
+    git(nested, "commit", "-qm", "inner")
+    return nested
+
+
+@pytest.mark.parametrize("name", ["worktree-checkout", "ignored-nested"])
+def test_embedded_repository_is_refused_as_its_own_condition(
+    repository: Path, tmp_path: Path, name: str
+) -> None:
+    """A nested repo must not read as a malformed path.
+
+    ``git ls-files --others`` will not descend into a nested repository and
+    reports it as one entry with a trailing slash. That slash splits to an empty
+    component, so before this was distinguished the refusal was identical to the
+    one raised for ``..`` and absolute paths — which sends the reader looking for
+    an attack instead of for a worktree.
+    """
+    _embed_repository(repository, name)
+
+    with pytest.raises(SnapshotEmbeddedRepository) as embedded:
+        preflight_git_snapshot(repository)
+
+    assert str(embedded.value) == "Snapshot source contains an embedded Git repository"
+    assert embedded.value.reason_code == "embedded_repository"
+
+
+def test_embedded_repository_still_caught_by_existing_handlers(
+    repository: Path,
+) -> None:
+    """Subclassing keeps every current ``except SnapshotUnsafeEntry`` working."""
+    _embed_repository(repository, "nested")
+
+    assert issubclass(SnapshotEmbeddedRepository, SnapshotUnsafeEntry)
+    with pytest.raises(SnapshotUnsafeEntry):
+        preflight_git_snapshot(repository)
+
+
+def test_embedded_repository_refusal_does_not_echo_the_path(
+    repository: Path, tmp_path: Path
+) -> None:
+    """Entry names are content a contributor chooses, so they stay out of the message.
+
+    Mirrors the guarantee already asserted for unsafe symlinks: a refusal an
+    operator or the agent reads must not carry attacker-selectable bytes.
+    """
+    _embed_repository(repository, "revealing-nested-name")
+
+    with pytest.raises(SnapshotEmbeddedRepository) as embedded:
+        create_git_snapshot(repository, tmp_path / "snapshot")
+
+    assert "revealing-nested-name" not in str(embedded.value)
+    assert str(repository) not in str(embedded.value)
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "../../outside"])
+def test_genuinely_unsafe_paths_keep_the_generic_refusal(
+    repository: Path, tmp_path: Path, target: str
+) -> None:
+    """The narrowing must not reclassify real unsafe entries."""
+    os.symlink(target, repository / "bad-link")
+
+    with pytest.raises(SnapshotUnsafeEntry) as unsafe:
+        create_git_snapshot(repository, tmp_path / "snapshot")
+
+    assert not isinstance(unsafe.value, SnapshotEmbeddedRepository)
+    assert str(unsafe.value) == "Snapshot contains an unsafe entry"

@@ -26,6 +26,29 @@ class SnapshotUnsafeEntry(ContainedSnapshotError):
     reason_code = "unsafe_snapshot_entry"
 
 
+class SnapshotEmbeddedRepository(SnapshotUnsafeEntry):
+    """The source tree contains a nested Git repository.
+
+    A file-level walk cannot capture one, so refusing is correct — but the
+    condition is ordinary (a worktree, a vendored checkout), not a malformed or
+    hostile path. It subclasses ``SnapshotUnsafeEntry`` so existing handlers keep
+    catching it; the separate type and ``reason_code`` exist so the refusal reads
+    as "your tree has a nested checkout" instead of sending the reader off to look
+    for an attack.
+
+    The offending path is deliberately NOT carried. Entry names are content — a
+    contributor's branch can choose them — and this module already refuses to echo
+    a path into a refusal an operator or the agent will read. Naming the category
+    is what makes it diagnosable; the tree can be searched with
+    ``git ls-files --others | grep '/$'``.
+    """
+
+    reason_code = "embedded_repository"
+
+    def __init__(self) -> None:
+        super().__init__("Snapshot source contains an embedded Git repository")
+
+
 class SnapshotSourceChanged(ContainedSnapshotError):
     reason_code = "snapshot_source_changed"
 
@@ -126,6 +149,15 @@ def _head_revision(source: bytes) -> bytes:
 
 
 def _validate_relative_path(relative: bytes) -> None:
+    if relative.endswith(b"/"):
+        # ``_inventory`` runs ``git ls-files --others`` WITHOUT ``--directory``, so
+        # git lists files individually -- except for a nested repository, which it
+        # refuses to descend into and reports as a single directory-shaped entry.
+        # A path component can never contain "/", so a trailing slash identifies
+        # that case unambiguously. Checked before the component scan below, which
+        # would otherwise reject the trailing empty component as a malformed path
+        # and lose the reason.
+        raise SnapshotEmbeddedRepository()
     if not relative or relative.startswith(b"/") or b"\0" in relative:
         raise SnapshotUnsafeEntry("Snapshot contains an unsafe entry")
     components = relative.split(b"/")

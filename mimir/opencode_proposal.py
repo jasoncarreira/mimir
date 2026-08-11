@@ -332,6 +332,10 @@ def classify_spawn_terminal_state(
             "seed_credentials": "seed_credentials_refused",
             "invalid_seed": "seed_refused",
             "unsafe_seed_entry": "seed_refused",
+            # Without this the unknown-reason default would report
+            # "provisioning_unavailable" — blaming the containment path for what
+            # is a property of the seed tree.
+            "embedded_seed_repository": "seed_refused",
             "seed_changed": "seed_refused",
             "provisioning_unavailable": "provisioning_unavailable",
         }
