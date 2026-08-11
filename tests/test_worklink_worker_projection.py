@@ -69,14 +69,13 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     ]
     assert json.loads(projections[0].document) == {
         "model": "proxy/model",
-        "provider": {"proxy": {"options": {"apiKey": "{env:PROXY_TOKEN}"}}},
+        "provider": {"proxy": {"options": {"apiKey": "referenced"}}},
     }
     assert json.loads(projections[1].document) == {
         "proxy": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": 7}
     }
-    assert spec.backend_config["pass_env"] == ("PROXY_TOKEN",)
+    assert spec.backend_config["pass_env"] == ()
     assert spec.env == {
-        "PROXY_TOKEN": "referenced",
         "OPENCODE_PERMISSION": spec.env["OPENCODE_PERMISSION"],
     }
 

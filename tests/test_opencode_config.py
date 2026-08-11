@@ -97,7 +97,7 @@ def test_openai_oauth_is_distinguished_and_disables_metered_fallback(
 
 
 def test_openai_ambient_key_without_stored_auth_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(OpenCodeAuthError, match="provider 'openai'.*metered fallback"):
+    with pytest.raises(OpenCodeAuthError, match="OpenCode authentication unavailable") as raised:
         resolve_opencode_invocation(
             env=_env(
                 tmp_path,
@@ -105,10 +105,11 @@ def test_openai_ambient_key_without_stored_auth_is_rejected(tmp_path: Path) -> N
                 OPENAI_API_KEY="must-not-appear",
             )
         )
+    assert raised.value.reason_code == "auth_missing"
 
 
 def test_missing_provider_credential_fails_loudly(tmp_path: Path) -> None:
-    with pytest.raises(OpenCodeConfigError, match="provider 'anthropic'.*no credential"):
+    with pytest.raises(OpenCodeAuthError, match="OpenCode authentication unavailable"):
         resolve_opencode_invocation(
             env=_env(tmp_path, MIMIR_MODEL_SPEC="claude-code:claude-sonnet-4-6")
         )
@@ -142,7 +143,7 @@ def test_unselected_provider_env_reference_does_not_hide_missing_auth(
         encoding="utf-8",
     )
 
-    with pytest.raises(OpenCodeAuthError, match="provider 'anthropic'.*no credential"):
+    with pytest.raises(OpenCodeAuthError, match="OpenCode authentication unavailable"):
         resolve_opencode_invocation(env=_env(tmp_path))
 
 
@@ -215,11 +216,13 @@ def test_worker_documents_select_only_complete_native_record(
     })
 
     invocation = resolve_opencode_invocation(env=_env(tmp_path, PROXY_TOKEN="from-env"))
-    config_document, auth_document = opencode_worker_documents(invocation)
+    documents = opencode_worker_documents(invocation, _env(tmp_path, PROXY_TOKEN="from-env"))
+    config_document = documents.config_document
+    auth_document = documents.auth_document
 
     assert json.loads(config_document) == {
         "model": "proxy/model",
-        "provider": {"proxy": {"options": {"apiKey": "{env:PROXY_TOKEN}"}}},
+        "provider": {"proxy": {"options": {"apiKey": "from-env"}}},
     }
     assert auth_document is not None
     assert json.loads(auth_document) == {"proxy": entry}
@@ -298,9 +301,10 @@ def test_sensitive_provider_config_permits_empty_values(
         env=_env(tmp_path, OPENCODE_CONFIG=str(config), PROXY_API_KEY="ambient")
     )
 
-    config_document, auth_document = opencode_worker_documents(invocation)
+    documents = opencode_worker_documents(invocation)
 
-    assert json.loads(config_document)["provider"]["proxy"] == provider_config
+    assert json.loads(documents.config_document)["provider"]["proxy"] == provider_config
+    auth_document = documents.auth_document
     assert auth_document is None
 
 
@@ -359,5 +363,81 @@ def test_selected_github_provider_is_rejected(tmp_path: Path) -> None:
     invocation = resolve_opencode_invocation(
         env=_env(tmp_path, OPENCODE_CONFIG=str(config))
     )
-    with pytest.raises(OpenCodeConfigError, match="GitHub"):
+    with pytest.raises(OpenCodeConfigError, match="OpenCode configuration unavailable"):
         opencode_worker_documents(invocation)
+
+
+def test_explicit_missing_config_has_stable_failure(tmp_path: Path) -> None:
+    missing = tmp_path / "secret-config-name.json"
+
+    with pytest.raises(OpenCodeConfigError) as raised:
+        resolve_opencode_invocation(
+            env=_env(tmp_path, OPENCODE_CONFIG=str(missing))
+        )
+
+    assert raised.value.reason_code == "config_missing"
+    assert str(raised.value) == "OpenCode configuration unavailable"
+    assert str(missing) not in str(raised.value)
+
+
+def test_auth_parse_failure_has_stable_failure(tmp_path: Path) -> None:
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text('{"openai":{"type":"oauth","refresh":"secret"},broken}', encoding="utf-8")
+
+    with pytest.raises(OpenCodeAuthError) as raised:
+        resolve_opencode_invocation(
+            env=_env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+        )
+
+    assert raised.value.reason_code == "auth_malformed"
+    assert str(raised.value) == "OpenCode authentication unavailable"
+    assert "secret" not in str(raised.value)
+    assert str(auth) not in str(raised.value)
+
+
+def test_oversize_config_is_refused_before_parsing(tmp_path: Path) -> None:
+    config = tmp_path / "opencode.json"
+    config.write_bytes(b"{" + b" " * (1024 * 1024))
+
+    with pytest.raises(OpenCodeConfigError) as raised:
+        resolve_opencode_invocation(
+            env=_env(tmp_path, OPENCODE_CONFIG=str(config))
+        )
+
+    assert raised.value.reason_code == "config_oversize"
+    assert str(raised.value) == "OpenCode configuration unavailable"
+
+
+def test_worker_documents_materialize_env_without_repr_or_scrub_leaks(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "operator" / "opencode.json"
+    config.parent.mkdir()
+    config.write_text(
+        '{"model":"proxy/model","provider":{"proxy":{"options":{"apiKey":"{env:PROXY_TOKEN}"}}}}',
+        encoding="utf-8",
+    )
+    _write_auth(tmp_path, {
+        "proxy": {"type": "oauth", "refresh": "oauth-refresh-secret"},
+        "inactive": {"type": "api", "key": "inactive-auth-secret"},
+    })
+    env = _env(
+        tmp_path,
+        OPENCODE_CONFIG=str(config),
+        PROXY_TOKEN="projected-env-secret",
+    )
+
+    invocation = resolve_opencode_invocation(env=env)
+    documents = opencode_worker_documents(invocation, env)
+
+    assert json.loads(documents.config_document)["provider"]["proxy"]["options"]["apiKey"] == "projected-env-secret"
+    assert "projected-env-secret" not in repr(documents)
+    assert str(config) not in repr(invocation)
+    text = documents.scrubber.scrub_text(
+        f"{config} projected-env-secret oauth-refresh-secret inactive-auth-secret"
+    )
+    assert str(config) not in text
+    assert "projected-env-secret" not in text
+    assert "oauth-refresh-secret" not in text
+    assert "inactive-auth-secret" not in text
