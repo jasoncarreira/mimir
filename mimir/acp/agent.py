@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -69,6 +70,8 @@ if TYPE_CHECKING:
 
 _WEB_KEY_FIELD = "mimir.webKey"
 ACP_PROMPT_CANCEL_GRACE_SECONDS = 2.0
+ACP_GENERATION_RETIRE_GRACE_SECONDS = 2.0
+ACP_GENERATION_RETIRE_CANCEL_SECONDS = 2.0
 ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
 ACP_AUDIT_EVENT_LIMIT = 256
 _LOGGER = logging.getLogger(__name__)
@@ -318,7 +321,9 @@ class MimirAcpAgent:
         self._generation = 0
         self._next_generation = 0
         self._connection: ConnectionState | None = None
-        self._candidate: ConnectionState | None = None
+        self._connection_generation: ContextVar[int | None] = ContextVar(
+            "mimir_acp_connection_generation", default=None
+        )
         self._connections: dict[int, ConnectionState] = {}
         self._retirement_tasks: set[asyncio.Task[Any]] = set()
         self._sessions: dict[str, SessionState] = {}
@@ -340,7 +345,26 @@ class MimirAcpAgent:
         self._next_generation = getattr(self, "_next_generation", self._generation) + 1
         connection = ConnectionState(self._next_generation, conn)
         self._connections[connection.generation] = connection
-        self._candidate = connection
+        generation_context = getattr(self, "_connection_generation", None)
+        if generation_context is None:
+            generation_context = ContextVar(
+                "mimir_acp_connection_generation", default=None
+            )
+            self._connection_generation = generation_context
+        generation_context.set(connection.generation)
+        protocol_connection = getattr(conn, "_connection", None)
+        handler = getattr(protocol_connection, "_handler", None)
+        if handler is not None:
+            async def bound_handler(
+                method: str, params: Any, is_notification: bool
+            ) -> Any:
+                token = generation_context.set(connection.generation)
+                try:
+                    return await handler(method, params, is_notification)
+                finally:
+                    generation_context.reset(token)
+
+            protocol_connection._handler = bound_handler
         return connection.generation
 
     async def initialize(self, protocol_version: int, client_capabilities: ClientCapabilities | None = None, client_info: Implementation | None = None, **kwargs: Any) -> InitializeResponse:
@@ -356,8 +380,7 @@ class MimirAcpAgent:
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
-        candidate = self._candidate
-        connection = candidate if candidate is not None else self._connection
+        connection = self._calling_connection()
         if connection is not None:
             connection.principal = None
             connection.auth_context = None
@@ -383,19 +406,13 @@ class MimirAcpAgent:
             self._auth_context = auth_context
             self._display_name = display_name
             return AuthenticateResponse()
-        if connection.closed:
-            raise auth_required_error()
-        if candidate is not None:
-            if self._candidate is not connection:
-                raise auth_required_error()
-        elif self._connection is not connection:
+        if connection.closed or self._connections.get(connection.generation) is not connection:
             raise auth_required_error()
         old = self._connection
         connection.principal = identity.canonical
         connection.auth_context = auth_context
         connection.display_name = display_name
         self._connection = connection
-        self._candidate = None
         self._generation = connection.generation
         self._client = connection.peer
         self._auth_context = auth_context
@@ -408,7 +425,7 @@ class MimirAcpAgent:
             for session_id, (generation, _) in tuple(self._environments.items()):
                 if generation == old.generation:
                     self._environments.pop(session_id, None)
-            task = asyncio.create_task(self._retire_generation(old.generation))
+            task = asyncio.create_task(self._retire_replaced_generation(old.generation))
             old.retirement_task = task
             self._retirement_tasks.add(task)
             task.add_done_callback(self._retirement_tasks.discard)
@@ -656,6 +673,21 @@ class MimirAcpAgent:
                 connection.closed = False
         await self._retire_generation(generation)
 
+    async def _retire_replaced_generation(self, generation: int) -> None:
+        await asyncio.sleep(ACP_GENERATION_RETIRE_GRACE_SECONDS)
+        try:
+            await asyncio.wait_for(
+                self._retire_generation(generation),
+                ACP_GENERATION_RETIRE_CANCEL_SECONDS,
+            )
+        except TimeoutError:
+            connection = self._connections.get(generation)
+            if connection is None:
+                return
+            connection.transport_dead = True
+            connection.closed = False
+            await self._retire_generation(generation)
+
     async def _retire_generation(self, generation: int) -> None:
         connection = self._connections.get(generation)
         if connection is None or connection.closed:
@@ -694,8 +726,6 @@ class MimirAcpAgent:
             if task is not asyncio.current_task():
                 task.cancel()
         self._connections.pop(generation, None)
-        if getattr(self, "_candidate", None) is connection:
-            self._candidate = None
         if self._connection is connection:
             self._connection = None
             self._client = None
@@ -797,11 +827,17 @@ class MimirAcpAgent:
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         return None
 
+    def _calling_connection(self) -> ConnectionState | None:
+        generation_context = getattr(self, "_connection_generation", None)
+        if generation_context is None:
+            return self._connection
+        generation = generation_context.get()
+        if generation is None:
+            return None
+        return self._connections.get(generation)
+
     def _begin_stateful(self) -> str:
-        candidate = self._candidate
-        if candidate is not None and not candidate.closed:
-            raise auth_required_error()
-        connection = self._connection
+        connection = self._calling_connection()
         if connection is None:
             auth_context = self._auth_context
         else:
@@ -813,6 +849,7 @@ class MimirAcpAgent:
                 connection is not None
                 and (
                     connection.closed
+                    or connection is not self._connection
                     or connection.generation != self._generation
                     or connection.principal != auth_context.canonical_principal
                 )
@@ -838,14 +875,22 @@ class MimirAcpAgent:
         return connection.display_name
 
     def _require_client(self) -> Client:
+        connection = self._calling_connection()
+        if connection is not None:
+            if connection is not self._connection or connection.closed:
+                raise internal_error()
+            return connection.peer
         if self._client is None:
             raise internal_error()
         return self._client
 
     def _require_connection(self) -> ConnectionState:
-        if self._connection is None or self._connection.closed:
+        connection = self._calling_connection()
+        if connection is None:
+            connection = self._connection
+        if connection is None or connection is not self._connection or connection.closed:
             raise internal_error()
-        return self._connection
+        return connection
 
     def _validate_declaration(self, cwd: str, mcp_servers: object | None) -> ProviderDeclaration | None:
         if mcp_servers is None or mcp_servers == []:

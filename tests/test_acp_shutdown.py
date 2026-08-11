@@ -1656,6 +1656,6 @@ async def test_candidate_connection_does_not_retire_active_generation() -> None:
     assert retired.is_set() is False
     assert agent._retirement_tasks == set()
     assert agent._connection is old
-    assert agent._candidate is successor
+    assert agent._connections[successor_generation] is successor
     assert successor.auth_context is None
     assert successor.principal is None

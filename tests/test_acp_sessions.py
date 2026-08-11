@@ -698,7 +698,7 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
 
     assert agent._generation == old_generation
     assert agent._connection is None
-    assert agent._candidate is agent._connections[successor_generation]
+    assert agent._connections[successor_generation].auth_context is None
     assert session_id not in agent._environments
 
 
@@ -1397,7 +1397,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             await agent.authenticate(
                 "mimir-web-key", **{"mimir.webKey": "viewer-secret"}
             )
-        assert agent._candidate.auth_context is None
+        assert agent._connections[peer.peer_generation].auth_context is None
 
         await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
         creating = asyncio.create_task(
