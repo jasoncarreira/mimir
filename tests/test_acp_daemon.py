@@ -154,10 +154,12 @@ async def test_stale_socket_is_revalidated_and_replaced() -> None:
     stale.bind(str(path))
     stale.close()
     path.chmod(0o600)
-    old_inode = path.lstat().st_ino
     daemon = AcpDaemon(_bundle(home))
     await daemon.start()
-    assert path.lstat().st_ino != old_inode
+    reader, writer = await asyncio.open_unix_connection(str(path))
+    del reader
+    writer.close()
+    await writer.wait_closed()
     await daemon.stop()
     shutil.rmtree(home)
 
