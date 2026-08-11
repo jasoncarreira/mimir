@@ -387,6 +387,7 @@ def _controlled_server_app(
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
     monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
     monkeypatch.setenv("MIMIR_LIVENESS_BEAT_SECONDS", "0")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "false")
     monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path / "missing-source"))
     monkeypatch.setenv("DISCORD_TOKEN", "")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "")
@@ -2282,3 +2283,137 @@ class TestHandleEvent:
         event = stub.enqueue.call_args.args[0]
         assert event.source == "api"
         assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+@pytest.mark.asyncio
+async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+            control.events.append("acp:construct")
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    control.events.clear()
+    await _run_startup(app)
+    assert control.events.count("runtime") == 1
+    assert control.events.index("runtime") < control.events.index("acp:construct")
+    assert control.events.index("acp:construct") < control.events.index("acp:start")
+
+    control.events.clear()
+    await _run_cleanup(app)
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_acp_stop_failure_preserves_shared_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop:failed")
+            raise RuntimeError("peer still owns runtime work")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    await _run_startup(app)
+    control.events.clear()
+    with pytest.raises(ExceptionGroup, match="server cleanup failed"):
+        await _run_cleanup(app)
+    assert "acp:stop:failed" in control.events
+    assert "bundle:close" not in control.events
+    assert "bridges:disconnect" not in control.events
+    assert control.bundle.closed is False
+
+
+@pytest.mark.asyncio
+async def test_acp_is_stopped_before_bundle_on_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("later startup")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="later startup"):
+        await _run_startup(app)
+    assert control.events.index("acp:start") < control.events.index("indexer:start")
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_compensation_preserves_ownership_for_cleanup_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("startup failure")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        stop_calls = 0
+
+        def __init__(self, bundle: Any) -> None:
+            self.bundle = bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            type(self).stop_calls += 1
+            if type(self).stop_calls == 1:
+                raise RuntimeError("peer cleanup incomplete")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        await _run_startup(app)
+    assert app["startup_state"].compensated is False
+    assert app["startup_state"].acp_daemon is app["acp_daemon"]
+    assert app["agent_runtime"] is control.bundle
+    assert control.bundle.closed is False
+
+    await _run_cleanup(app)
+    assert Daemon.stop_calls == 2
+    assert app["startup_state"].acp_daemon is None
+    assert app["acp_daemon"] is None
+    assert app["agent_runtime"] is None
+    assert control.bundle.closed is True

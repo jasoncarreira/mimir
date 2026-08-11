@@ -320,6 +320,8 @@ class _StartupState:
     runtime_attempted: bool = False
     bundle: Any | None = None
     runtime_published: bool = False
+    acp_daemon: Any | None = None
+    acp_start_attempted: bool = False
     activity_panel: Any | None = None
     activity_panel_start_attempted: bool = False
     indexer_start_attempted: bool = False
@@ -384,9 +386,12 @@ def _clear_runtime_app_state(
         app[field] = None
     if "activity_panel" in app:
         app["activity_panel"] = None
+    if "acp_daemon" in app:
+        app["acp_daemon"] = None
     if "mcp_manager" in app:
         app["mcp_manager"] = None
     state.bundle = None
+    state.acp_daemon = None
     state.activity_panel = None
     state.mcp_manager = None
     state.runtime_published = False
@@ -1148,6 +1153,14 @@ def build_app(config: Config) -> web.Application:
         bundle = await create_agent_runtime(config, core, runtime_adapters)
         startup_state.bundle = bundle
         _publish_runtime(app, runtime_slot, startup_state, bundle)
+        from .acp.daemon import AcpDaemon, acp_enabled_from_env
+
+        if acp_enabled_from_env():
+            acp_daemon = AcpDaemon(bundle)
+            startup_state.acp_daemon = acp_daemon
+            app["acp_daemon"] = acp_daemon
+            startup_state.acp_start_attempted = True
+            await acp_daemon.start()
         agent = bundle.agent
         indexer = bundle.indexer
         saga_client = bundle.saga_client
@@ -1896,17 +1909,23 @@ def build_app(config: Config) -> web.Application:
     async def _compensate_startup(app: web.Application) -> list[Exception]:
         errors: list[Exception] = []
 
-        async def attempt(operation: Any) -> None:
+        async def attempt(operation: Any) -> bool:
             try:
                 await operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+                return False
+            return True
 
         def attempt_sync(operation: Any) -> None:
             try:
                 operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+
+        acp_stopped = True
+        if startup_state.acp_daemon is not None:
+            acp_stopped = await attempt(startup_state.acp_daemon.stop)
 
         try:
             task_errors = await cancel_background_tasks(
@@ -1923,24 +1942,25 @@ def build_app(config: Config) -> web.Application:
             attempt_sync(lambda: mark_clean_shutdown(config.home))
         if startup_state.scheduler_start_attempted:
             attempt_sync(scheduler.stop)
-        if startup_state.mcp_manager is not None:
+        if acp_stopped and startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
-        if startup_state.bridges_connect_attempted:
+        if acp_stopped and startup_state.bridges_connect_attempted:
             await attempt(channels.disconnect_all)
-        if startup_state.bundle is not None:
+        if acp_stopped and startup_state.bundle is not None:
             await attempt(startup_state.bundle.aclose)
         if (
-            startup_state.activity_panel_start_attempted
+            acp_stopped
+            and startup_state.activity_panel_start_attempted
             and startup_state.activity_panel is not None
         ):
             await attempt(startup_state.activity_panel.stop)
-        await attempt(pairing_notifier.aclose)
-        try:
-            _clear_runtime_app_state(app, runtime_slot, startup_state)
-        except BaseException as exc:
-            errors.append(_cleanup_exception(exc))
-        finally:
-            startup_state.compensated = True
+        if acp_stopped:
+            await attempt(pairing_notifier.aclose)
+            try:
+                _clear_runtime_app_state(app, runtime_slot, startup_state)
+            except BaseException as exc:
+                errors.append(_cleanup_exception(exc))
+        startup_state.compensated = acp_stopped
         return errors
 
     async def _on_startup(app: web.Application) -> None:
@@ -1957,11 +1977,13 @@ def build_app(config: Config) -> web.Application:
     async def _on_cleanup(app: web.Application) -> None:
         errors: list[Exception] = []
 
-        async def attempt(operation: Any) -> None:
+        async def attempt(operation: Any) -> bool:
             try:
                 await operation()
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
+                return False
+            return True
 
         def attempt_sync(operation: Any) -> Any:
             try:
@@ -2029,18 +2051,22 @@ def build_app(config: Config) -> web.Application:
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
             attempt_sync(scheduler.stop)
-            if startup_state.bundle is not None:
+            acp_stopped = True
+            if startup_state.acp_daemon is not None:
+                acp_stopped = await attempt(startup_state.acp_daemon.stop)
+            if acp_stopped and startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
-            if startup_state.activity_panel is not None:
+            if acp_stopped and startup_state.activity_panel is not None:
                 await attempt(startup_state.activity_panel.stop)
-            await attempt(pairing_notifier.aclose)
-            await attempt(channels.disconnect_all)
-            if startup_state.mcp_manager is not None:
-                await attempt(startup_state.mcp_manager.shutdown)
-            try:
-                _clear_runtime_app_state(app, runtime_slot, startup_state)
-            except BaseException as exc:
-                errors.append(_cleanup_exception(exc))
+            if acp_stopped:
+                await attempt(pairing_notifier.aclose)
+                await attempt(channels.disconnect_all)
+                if startup_state.mcp_manager is not None:
+                    await attempt(startup_state.mcp_manager.shutdown)
+                try:
+                    _clear_runtime_app_state(app, runtime_slot, startup_state)
+                except BaseException as exc:
+                    errors.append(_cleanup_exception(exc))
 
         for error in errors:
             log.error("server cleanup failed: %s", error)
