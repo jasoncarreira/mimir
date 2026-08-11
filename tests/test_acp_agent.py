@@ -405,8 +405,7 @@ async def test_actual_router_uses_only_meta_key_and_emits_no_notification_respon
             "data": {"method": "_example"},
         },
     }
-    assert agent._auth_context is not None
-    assert agent._auth_context.canonical_principal == "operator"
+    assert agent._auth_context is None
 
 
 def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
@@ -432,10 +431,9 @@ def test_agent_exposes_no_out_of_scope_handlers(tmp_path: Path) -> None:
     assert all(not hasattr(agent, name) for name in forbidden)
 
 
-async def test_authentication_is_reset_and_checked_for_each_connection_generation(tmp_path: Path) -> None:
+async def test_candidate_activates_only_after_admin_authentication(tmp_path: Path) -> None:
     resolver = _resolver(tmp_path)
     agent = _agent(resolver)
-    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
     first = SimpleNamespace()
     first_generation = agent.on_connect(first)
     with pytest.raises(sdk.RequestError) as unauthenticated_first:
@@ -443,11 +441,110 @@ async def test_authentication_is_reset_and_checked_for_each_connection_generatio
     assert _error(unauthenticated_first.value) == _error(sdk.auth_required_error())
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
     assert agent._connections[first_generation].principal == "operator"
+    assert agent._connection is agent._connections[first_generation]
 
     second = SimpleNamespace()
     second_generation = agent.on_connect(second)
-    assert agent._connections[second_generation].principal is None
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._generation == first_generation
+    with pytest.raises(sdk.RequestError) as invalid_candidate:
+        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "invalid"})
+    assert _error(invalid_candidate.value) == _error(sdk.auth_required_error())
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._auth_context is not None
+    assert agent._auth_context.canonical_principal == "operator"
     assert agent._connections[second_generation].auth_context is None
-    with pytest.raises(sdk.RequestError) as unauthenticated_second:
-        await agent.new_session("/two")
-    assert _error(unauthenticated_second.value) == _error(sdk.auth_required_error())
+
+    await agent.on_transport_closed(second_generation)
+    assert agent._connection is agent._connections[first_generation]
+    assert agent._generation == first_generation
+    assert agent._auth_context is not None
+
+    replacement_generation = agent.on_connect(SimpleNamespace())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "admin-secret"})
+    assert agent._connection is agent._connections[replacement_generation]
+    assert agent._generation == replacement_generation
+
+
+async def test_overlapping_connections_keep_authentication_and_dispatch_physical(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(tmp_path, raw_key="first-secret")
+    identities_path = tmp_path / "state" / "identities.yaml"
+    identities = yaml.safe_load(identities_path.read_text(encoding="utf-8"))
+    identities["people"].append(
+        {
+            "canonical": "second-operator",
+            "display_name": "Second Operator",
+            "aliases": [hash_web_key("second-secret")],
+            "access": {"roles": ["admin"], "is_service": False},
+        }
+    )
+    identities_path.write_text(yaml.safe_dump(identities), encoding="utf-8")
+    resolver.reload()
+    agent = _agent(resolver)
+
+    async def physical_connection(
+        peer: object,
+        ready: asyncio.Future[int],
+        commands: asyncio.Queue[tuple[Any, tuple[Any, ...], dict[str, Any], asyncio.Future[Any]] | None],
+    ) -> None:
+        ready.set_result(agent.on_connect(peer))
+        while (command := await commands.get()) is not None:
+            operation, args, kwargs, result = command
+            try:
+                result.set_result(await operation(*args, **kwargs))
+            except BaseException as exc:
+                result.set_exception(exc)
+
+    loop = asyncio.get_running_loop()
+    first_ready: asyncio.Future[int] = loop.create_future()
+    second_ready: asyncio.Future[int] = loop.create_future()
+    first_commands: asyncio.Queue[Any] = asyncio.Queue()
+    second_commands: asyncio.Queue[Any] = asyncio.Queue()
+    first_task = asyncio.create_task(
+        physical_connection(SimpleNamespace(), first_ready, first_commands)
+    )
+    second_task = asyncio.create_task(
+        physical_connection(SimpleNamespace(), second_ready, second_commands)
+    )
+    first_generation, second_generation = await asyncio.gather(
+        first_ready, second_ready
+    )
+
+    async def invoke(
+        commands: asyncio.Queue[Any], operation: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = loop.create_future()
+        await commands.put((operation, args, kwargs, result))
+        return await result
+
+    try:
+        await invoke(
+            first_commands,
+            agent.authenticate,
+            "mimir-web-key",
+            **{"mimir.webKey": "first-secret"},
+        )
+        assert agent._connections[first_generation].principal == "operator"
+        assert agent._connections[second_generation].principal is None
+        assert agent._connection is agent._connections[first_generation]
+
+        created = await invoke(first_commands, agent.new_session, "/active")
+        assert created.session_id
+        with pytest.raises(sdk.RequestError):
+            await invoke(second_commands, agent.new_session, "/candidate")
+        with pytest.raises(sdk.RequestError):
+            await invoke(
+                second_commands,
+                agent.authenticate,
+                "mimir-web-key",
+                **{"mimir.webKey": "invalid"},
+            )
+        assert agent._connection is agent._connections[first_generation]
+        assert agent._connections[first_generation].principal == "operator"
+        assert agent._connections[second_generation].principal is None
+    finally:
+        await first_commands.put(None)
+        await second_commands.put(None)
+        await asyncio.gather(first_task, second_task)

@@ -290,12 +290,14 @@ async def test_connection_replacement_old_cleanup_preserves_successor_ownership(
 
     replacement = Client()
     agent.on_connect(replacement)
-    assert session_id not in agent._active_prompts
-    assert agent._environments == {}
+    assert session_id in agent._active_prompts
+    assert session_id in agent._environments
     with pytest.raises(sdk.RequestError) as unauthenticated:
         await agent.load_session("/replacement", session_id)
     assert unauthenticated.value.to_error_obj()["code"] == -32000
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    assert session_id not in agent._active_prompts
+    assert agent._environments == {}
     await agent.load_session("/replacement", session_id)
     successor = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="successor")]))
     while len(core.calls) < 2:
@@ -311,6 +313,177 @@ async def test_connection_replacement_old_cleanup_preserves_successor_ownership(
     response = await successor
     assert response.stop_reason == "end_turn"
     assert session_id not in agent._active_prompts
+
+
+async def test_replacement_retirement_waits_for_grace_then_completes_cancel_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent, _, core = await _ready(tmp_path)
+    old_generation = agent._generation
+    session_id = (await agent.new_session("/old")).session_id
+    old_release = asyncio.Event()
+    old_cancelled = asyncio.Event()
+
+    async def old_turn(event: Any, **kwargs: Any) -> None:
+        core.entered.set()
+        try:
+            await old_release.wait()
+        except asyncio.CancelledError:
+            old_cancelled.set()
+            raise
+
+    monkeypatch.setattr(core, "run_turn", old_turn)
+    running = asyncio.create_task(
+        agent.prompt(
+            session_id,
+            [sdk.TextContentBlock(type="text", text="old")],
+        )
+    )
+    await core.entered.wait()
+    active = agent._sessions[session_id].active_prompt
+    assert active is not None
+    grace_started = asyncio.Event()
+    grace_release = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def controlled_sleep(delay: float) -> None:
+        if delay == agent_module.ACP_GENERATION_RETIRE_GRACE_SECONDS:
+            grace_started.set()
+            await grace_release.wait()
+            return
+        await real_sleep(delay)
+
+    monkeypatch.setattr(agent_module.asyncio, "sleep", controlled_sleep)
+    agent.on_connect(Client())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    await grace_started.wait()
+
+    assert old_generation in agent._connections
+    assert active.cancelling is False
+    assert active.prompt_handler is running
+    assert running.done() is False
+
+    grace_release.set()
+    await old_cancelled.wait()
+    assert active.cancelling is True
+    response = await running
+    await asyncio.gather(*agent._retirement_tasks)
+
+    assert response.stop_reason == "cancelled"
+    assert old_generation not in agent._connections
+    assert active.completed.is_set()
+
+
+async def test_replacement_retirement_force_quarantines_old_and_preserves_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent, _, core = await _ready(tmp_path)
+    old_generation = agent._generation
+    old_session_id = (await agent.new_session("/old")).session_id
+    old_release = asyncio.Event()
+    old_cancelled = asyncio.Event()
+    successor_release = asyncio.Event()
+    successor_started = asyncio.Event()
+    call_count = 0
+
+    async def controlled_turn(event: Any, **kwargs: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            core.entered.set()
+            while not old_release.is_set():
+                try:
+                    await old_release.wait()
+                except asyncio.CancelledError:
+                    old_cancelled.set()
+            return
+        successor_started.set()
+        await successor_release.wait()
+
+    monkeypatch.setattr(core, "run_turn", controlled_turn)
+    old_request = asyncio.create_task(
+        agent.prompt(
+            old_session_id,
+            [sdk.TextContentBlock(type="text", text="old")],
+        )
+    )
+    await core.entered.wait()
+    old_active = agent._sessions[old_session_id].active_prompt
+    assert old_active is not None
+
+    grace_started = asyncio.Event()
+    grace_release = asyncio.Event()
+    cancel_window_expired = asyncio.Event()
+    real_sleep = asyncio.sleep
+    real_wait_for = asyncio.wait_for
+
+    async def controlled_sleep(delay: float) -> None:
+        if delay == agent_module.ACP_GENERATION_RETIRE_GRACE_SECONDS:
+            grace_started.set()
+            await grace_release.wait()
+            return
+        await real_sleep(delay)
+
+    async def controlled_wait_for(awaitable: Any, timeout: float) -> Any:
+        if timeout != agent_module.ACP_GENERATION_RETIRE_CANCEL_SECONDS:
+            return await real_wait_for(awaitable, timeout)
+        retirement = asyncio.ensure_future(awaitable)
+        expiry = asyncio.create_task(cancel_window_expired.wait())
+        done, _ = await asyncio.wait(
+            {retirement, expiry}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if retirement in done:
+            expiry.cancel()
+            await asyncio.gather(expiry, return_exceptions=True)
+            return await retirement
+        retirement.cancel()
+        await asyncio.gather(retirement, return_exceptions=True)
+        raise TimeoutError
+
+    monkeypatch.setattr(agent_module.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(agent_module.asyncio, "wait_for", controlled_wait_for)
+    monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 17.0)
+
+    successor_client = Client()
+    agent.on_connect(successor_client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    await grace_started.wait()
+    successor_generation = agent._generation
+    successor_session_id = (await agent.new_session("/successor")).session_id
+    successor_request = asyncio.create_task(
+        agent.prompt(
+            successor_session_id,
+            [sdk.TextContentBlock(type="text", text="successor")],
+        )
+    )
+    await successor_started.wait()
+
+    assert old_active.cancelling is False
+    assert old_request.done() is False
+    grace_release.set()
+    await old_cancelled.wait()
+    assert old_active.cancelling is True
+    assert old_request.done() is False
+
+    cancel_window_expired.set()
+    await asyncio.gather(*agent._retirement_tasks)
+
+    assert old_generation not in agent._connections
+    assert old_active.journal_lease.closed is True
+    assert old_request.cancelling() > 0
+    assert successor_generation in agent._connections
+    assert agent._connection is agent._connections[successor_generation]
+    assert agent._sessions[successor_session_id].active_prompt is not None
+    assert successor_request.done() is False
+    assert agent._bundle.agent is core
+
+    old_release.set()
+    successor_release.set()
+    old_response, successor_response = await asyncio.gather(
+        old_request, successor_request
+    )
+    assert old_response.stop_reason == "end_turn"
+    assert successor_response.stop_reason == "end_turn"
 
 
 async def test_normal_core_failure_terminalizes_and_redacts(tmp_path: Path) -> None:
@@ -694,8 +867,9 @@ async def test_transport_teardown_is_generation_scoped_and_requires_load(tmp_pat
 
     await agent.on_transport_closed(old_generation)
 
-    assert agent._generation == successor_generation
-    assert agent._connection.closed is False
+    assert agent._generation == old_generation
+    assert agent._connection is None
+    assert agent._connections[successor_generation].auth_context is None
     assert session_id not in agent._environments
 
 
@@ -1394,7 +1568,7 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             await agent.authenticate(
                 "mimir-web-key", **{"mimir.webKey": "viewer-secret"}
             )
-        assert agent._connection.auth_context is None
+        assert agent._connections[peer.peer_generation].auth_context is None
 
         await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
         creating = asyncio.create_task(

@@ -1628,7 +1628,7 @@ async def test_inbound_mcp_generation_identity_prevents_connection_id_collision(
     assert observed == [(1, "old"), (2, "new")]
 
 
-async def test_replaced_generation_retirement_is_not_owned_by_successor_connection() -> None:
+async def test_candidate_connection_does_not_retire_active_generation() -> None:
     agent = object.__new__(MimirAcpAgent)
     old_peer = object()
     new_peer = object()
@@ -1639,23 +1639,23 @@ async def test_replaced_generation_retirement_is_not_owned_by_successor_connecti
     agent._client = old_peer
     agent._auth_context = object()
     agent._display_name = "old"
-    agent._bridge = SimpleNamespace(_connected=False)
+    agent._bridge = SimpleNamespace(_connected=True)
     agent._active_prompts = {}
     agent._environments = {}
     agent._retirement_tasks = set()
     retired = asyncio.Event()
 
     async def retire(generation: int) -> None:
-        assert generation == 1
         retired.set()
 
     agent._retire_generation = retire
     successor_generation = agent.on_connect(new_peer)
     successor = agent._connections[successor_generation]
-    await retired.wait()
-    await asyncio.gather(*agent._retirement_tasks)
+    await asyncio.sleep(0)
 
-    assert successor.tasks == set()
-    assert agent._connection is successor
+    assert retired.is_set() is False
+    assert agent._retirement_tasks == set()
+    assert agent._connection is old
+    assert agent._connections[successor_generation] is successor
     assert successor.auth_context is None
     assert successor.principal is None

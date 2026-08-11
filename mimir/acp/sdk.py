@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextvars import ContextVar
+from collections import deque
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -12,6 +13,7 @@ from acp.agent.router import build_agent_router
 from acp.connection import Connection
 from acp.interfaces import Agent, Client
 from acp.meta import AGENT_METHODS, CLIENT_METHODS
+from acp.task import DefaultMessageDispatcher
 from acp.task.queue import InMemoryMessageQueue
 from acp.schema import (
     AcpMcpServer,
@@ -64,6 +66,12 @@ MCP_NOTIFICATION_METHODS = frozenset({"notifications/initialized", "notification
 MCP_INBOUND_NOTIFICATIONS = frozenset(
     {"notifications/tools/list_changed", "notifications/progress", "notifications/message"}
 )
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+MAX_PENDING_REQUESTS = 64
+INPUT_QUEUE_MAX_ITEMS = 64
+INPUT_QUEUE_MAX_BYTES = 8 * 1024 * 1024
+INPUT_QUEUE_DRAIN_TIMEOUT = 2.0
+MAX_ACTIVE_INBOUND_RUNNERS = 64
 
 
 class AcpProtocolError(RuntimeError):
@@ -97,6 +105,8 @@ class StrictMessageStateStore:
     def register_outgoing(self, request_id: int, method: str) -> asyncio.Future[Any]:
         if request_id in self._outgoing:
             raise AcpProtocolError("Duplicate outgoing request ID")
+        if len(self._outgoing) >= MAX_PENDING_REQUESTS:
+            raise AcpProtocolError("Too many pending requests")
         future = asyncio.get_running_loop().create_future()
         self._outgoing[request_id] = future
         registration = self._registration.get()
@@ -177,17 +187,46 @@ class StrictNdjsonTransport:
     ) -> None:
         self._reader = reader
         self._writer = writer
+        self._buffer = bytearray()
+        self._frame_bytes: int | None = None
 
     async def receive(self) -> dict[str, Any] | None:
-        line = await self._reader.readline()
-        if not line:
+        frame = await self._read_frame()
+        if frame is None:
             return None
+        self._frame_bytes = len(frame)
         try:
-            message = json.loads(line)
+            message = json.loads(frame)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AcpProtocolError("Malformed JSON-RPC frame") from exc
         validate_jsonrpc_envelope(message)
         return message
+
+    async def _read_frame(self) -> bytes | None:
+        while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                if newline > MAX_FRAME_BYTES:
+                    raise AcpProtocolError("JSON-RPC frame exceeds size limit")
+                frame = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                return frame
+            if len(self._buffer) > MAX_FRAME_BYTES:
+                raise AcpProtocolError("JSON-RPC frame exceeds size limit")
+            remaining = MAX_FRAME_BYTES + 1 - len(self._buffer)
+            chunk = await self._reader.read(min(64 * 1024, remaining))
+            if not chunk:
+                if not self._buffer:
+                    return None
+                frame = bytes(self._buffer)
+                self._buffer.clear()
+                return frame
+            self._buffer.extend(chunk)
+
+    def take_frame_bytes(self) -> int | None:
+        frame_bytes = self._frame_bytes
+        self._frame_bytes = None
+        return frame_bytes
 
     async def send(self, message: dict[str, Any]) -> None:
         validate_jsonrpc_envelope(message)
@@ -675,6 +714,144 @@ class AcpPeer:
         return None
 
 
+class BoundedMessageQueue(InMemoryMessageQueue):
+    def __init__(self, frame_bytes: Any = None) -> None:
+        super().__init__(maxsize=INPUT_QUEUE_MAX_ITEMS)
+        self._frame_bytes = frame_bytes
+        self._pending_bytes = 0
+        self._sizes: deque[int] = deque()
+        self._space_available = asyncio.Event()
+
+    @property
+    def pending_bytes(self) -> int:
+        return self._pending_bytes
+
+    async def publish(self, task: Any) -> None:
+        size = self._message_bytes(task)
+        if size > INPUT_QUEUE_MAX_BYTES:
+            raise AcpProtocolError("Input queue byte limit exceeded")
+        deadline = asyncio.get_running_loop().time() + INPUT_QUEUE_DRAIN_TIMEOUT
+        while self._pending_bytes + size > INPUT_QUEUE_MAX_BYTES:
+            self._space_available.clear()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise AcpProtocolError("Input queue drain timed out")
+            try:
+                await asyncio.wait_for(self._space_available.wait(), remaining)
+            except asyncio.TimeoutError:
+                raise AcpProtocolError("Input queue drain timed out") from None
+        self._pending_bytes += size
+        self._sizes.append(size)
+        remaining = deadline - asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(super().publish(task), max(0, remaining))
+        except asyncio.TimeoutError:
+            self._release_last(size)
+            raise AcpProtocolError("Input queue drain timed out") from None
+        except BaseException:
+            self._release_last(size)
+            raise
+
+    def close_nowait(self) -> None:
+        self._closed = True
+
+    def task_done(self) -> None:
+        if self._sizes:
+            self._pending_bytes -= self._sizes.popleft()
+            self._space_available.set()
+        super().task_done()
+
+    def _release_last(self, size: int) -> None:
+        self._sizes.pop()
+        self._pending_bytes -= size
+        self._space_available.set()
+
+    def _message_bytes(self, task: Any) -> int:
+        if self._frame_bytes is not None:
+            size = self._frame_bytes()
+            if size is not None:
+                return size
+        message = getattr(task, "message", None)
+        if message is None:
+            return 0
+        return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+class BoundedMessageDispatcher(DefaultMessageDispatcher):
+    def __init__(
+        self,
+        queue: BoundedMessageQueue,
+        supervisor: Any,
+        store: Any,
+        request_runner: Any,
+        notification_runner: Any,
+        *,
+        max_active: int = MAX_ACTIVE_INBOUND_RUNNERS,
+    ) -> None:
+        super().__init__(
+            queue=queue,
+            supervisor=supervisor,
+            store=store,
+            request_runner=request_runner,
+            notification_runner=notification_runner,
+        )
+        if max_active <= 0:
+            raise ValueError("max_active must be positive")
+        self._runner_slots = asyncio.BoundedSemaphore(max_active)
+
+    async def stop(self) -> None:
+        self._queue.close_nowait()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _dispatch_request(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+        try:
+            record = self._store.begin_incoming(
+                message.get("method", ""), message.get("params")
+            )
+        except BaseException:
+            self._runner_slots.release()
+            raise
+
+        async def runner() -> None:
+            try:
+                result = await self._request_runner(message)
+            except Exception as exc:
+                self._store.fail_incoming(record, exc)
+                raise
+            else:
+                self._store.complete_incoming(record, result)
+            finally:
+                self._runner_slots.release()
+
+        self._create_runner(runner(), "mimir.acp.Dispatcher.request")
+
+    async def _dispatch_notification(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+
+        async def runner() -> None:
+            try:
+                await self._notification_runner(message)
+            finally:
+                self._runner_slots.release()
+
+        self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
+
+    def _create_runner(self, coroutine: Any, name: str) -> None:
+        try:
+            self._supervisor.create(coroutine, name=name)
+        except BaseException:
+            coroutine.close()
+            self._runner_slots.release()
+            raise
+
+
 async def run_stdio_agent(
     agent: Agent,
     *,
@@ -695,13 +872,14 @@ async def run_stdio_agent(
 
     transport = StrictNdjsonTransport(request_reader, response_writer)
     state_store = StrictMessageStateStore()
-    message_queue = InMemoryMessageQueue()
+    message_queue = BoundedMessageQueue(transport.take_frame_bytes)
     connection = Connection(
         route,
         transport,
         listening=False,
         state_store=state_store,
         queue=message_queue,
+        dispatcher_factory=BoundedMessageDispatcher,
     )
     peer = AcpPeer(connection, agent, state_store)
     holder["peer"] = peer
@@ -718,7 +896,10 @@ async def run_stdio_agent(
         primary = exc
         traceback = exc.__traceback__
     peer.mark_transport_dead()
-    await message_queue.join()
+    try:
+        await asyncio.wait_for(message_queue.join(), INPUT_QUEUE_DRAIN_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
     await asyncio.sleep(0)
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
@@ -757,12 +938,20 @@ __all__ = [
     "MCP_MESSAGE_METHOD",
     "MCP_NOTIFICATION_METHODS",
     "MCP_REQUEST_METHODS",
+    "MAX_FRAME_BYTES",
+    "MAX_PENDING_REQUESTS",
+    "INPUT_QUEUE_MAX_ITEMS",
+    "INPUT_QUEUE_MAX_BYTES",
+    "INPUT_QUEUE_DRAIN_TIMEOUT",
+    "MAX_ACTIVE_INBOUND_RUNNERS",
     "PERMISSION_METHOD",
     "AcpMcpServer",
     "AcpPeer",
     "AcpPeerCallbacks",
     "AcpRequestHandle",
     "AcpProtocolError",
+    "BoundedMessageDispatcher",
+    "BoundedMessageQueue",
     "Agent",
     "AgentCapabilities",
     "AgentMessageChunk",
