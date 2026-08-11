@@ -596,7 +596,7 @@ class MimirAcpAgent:
 
     async def _cancel_active(self, active: ActivePrompt, *, transport: bool) -> bool:
         async with self._boundary_lock:
-            if active.cancelling:
+            if active.cancelling and not transport:
                 return False
             active.cancelling = True
             if transport:
@@ -685,12 +685,11 @@ class MimirAcpAgent:
             if connection is None:
                 return
             connection.transport_dead = True
-            connection.closed = False
-            await self._retire_generation(generation)
+            await self._retire_generation(generation, force=True)
 
-    async def _retire_generation(self, generation: int) -> None:
+    async def _retire_generation(self, generation: int, *, force: bool = False) -> None:
         connection = self._connections.get(generation)
-        if connection is None or connection.closed:
+        if connection is None or (connection.closed and not force):
             return
         connection.closed = True
         owned: dict[int, SessionState] = {}
@@ -704,7 +703,9 @@ class MimirAcpAgent:
         for state in owned.values():
             active = state.active_prompt
             if active is not None and active.generation == generation:
-                await self._cancel_active(active, transport=connection.transport_dead)
+                await self._cancel_active(
+                    active, transport=force or connection.transport_dead
+                )
                 self._dispatchers.discard(active.dispatcher)
                 if self._active_prompts.get(state.record.session_id) is active:
                     self._active_prompts.pop(state.record.session_id, None)
