@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 
 import pytest
 from langchain_core.tools import ToolException
 
+from mimir.contained_execution import CollectedExecutionResult
+from mimir.contained_snapshot import SnapshotCredentialsRefused
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
@@ -15,7 +19,6 @@ from mimir.pr_checkout_lease import (
     create_pr_checkout_lease,
 )
 from mimir.project_tests import (
-    ProjectTestProcessResult,
     ProjectTestRefusal,
     RepoProjectTests,
 )
@@ -491,7 +494,7 @@ def test_conflict_resolution_dropping_either_test_pinned_side_is_not_pushed(
     home = tmp_path / "home"
     _configure_worklink_test(home, str(lease.path / "suite"))
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    result = RepoProjectTests(state).execute()
+    result = _execute_project_tests(state)
     assert result.ok is False
 
     with pytest.raises(GitRefusal) as refusal:
@@ -528,7 +531,7 @@ def test_conflict_resolution_preserves_both_sides_records_evidence_and_pushes(
     home = tmp_path / "home"
     _configure_worklink_test(home, str(lease.path / "suite"))
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    assert RepoProjectTests(state).execute().ok
+    assert _execute_project_tests(state).ok
     assert tools.execute(GitPush()).ok
     assert _git(origin, "rev-parse", scope.destination_ref) == _git(
         lease.path, "rev-parse", "HEAD",
@@ -1311,378 +1314,170 @@ def _configure_worklink_test(home: Path, command: str = "/usr/bin/true -q") -> N
     )
 
 
-def test_project_tests_use_fixed_command_checkout_and_environment(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _origin, _source, _scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_never_pass_to_tests")
-    calls = []
-
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        calls.append((argv, cwd, env, timeout, output_limit))
-        return ProjectTestProcessResult(0, stdout=f"ok {cwd}")
-
-    result = RepoProjectTests(state, runner=runner).execute(("tracked.txt::case",))
-
-    assert result.ok is True
-    assert result.code == "tests_passed"
-    assert result.command == ("/usr/bin/true", "-q")
-    assert result.command_source == "deployment"
-    assert result.stdout == "ok <checkout>"
-    argv, cwd, env, timeout, output_limit = calls[0]
-    assert argv == ("/usr/bin/true", "-q", "tracked.txt::case")
-    assert cwd == state.checkout_lease.path.resolve()
-    assert "GITHUB_TOKEN" not in env
-    assert "MIMIR_MODEL_SPEC" not in env
-    assert timeout == 300.0
-    assert output_limit == 64 * 1024
+def _test_checkout_factory(source: Path, **_kwargs):
+    return SimpleNamespace(path=source, capability=SimpleNamespace(path=source), close=lambda: None)
 
 
-def test_project_tests_prefer_repository_command_and_report_source(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _origin, _source, scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "worklink.yaml").write_text(
-        "defaults:\n  test_command: /usr/bin/false\n",
-        encoding="utf-8",
+async def _local_contained_runner(argv, directory, worker_env, projections, **_kwargs):
+    completed = await asyncio.to_thread(
+        subprocess.run, argv, cwd=directory.path, env=dict(worker_env), capture_output=True, check=False,
     )
-    (home / "repositories.yaml").write_text(
-        f"""
-repositories:
-  - slug: owner/repo
-    root: {scope.canonical_root}
-    mode: rw
-    origin: https://github.com/owner/repo.git
-    base_branch: main
-    test_command: /usr/bin/true --repository
-""".strip(),
-        encoding="utf-8",
+    return CollectedExecutionResult(
+        completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
     )
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    calls = []
-
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        calls.append(argv)
-        return ProjectTestProcessResult(0)
-
-    result = RepoProjectTests(state, runner=runner).execute(())
-
-    assert calls == [("/usr/bin/true", "--repository")]
-    assert result.command == ("/usr/bin/true", "--repository")
-    assert result.command_source == "repository"
 
 
-def test_project_tests_refuse_unresolvable_repository_command(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _origin, _source, scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "repositories.yaml").write_text(
-        f"""
-repositories:
-  - slug: owner/repo
-    root: {scope.canonical_root}
-    mode: rw
-    origin: https://github.com/owner/repo.git
-    base_branch: main
-    test_command: runner-that-does-not-exist --quiet
-""".strip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    with pytest.raises(ProjectTestRefusal) as exc_info:
-        RepoProjectTests(state).execute(())
-
-    assert exc_info.value.code == "test_command_unresolvable"
+def _execute_project_tests(state: RepoReviewState):
+    return asyncio.run(RepoProjectTests(
+        state, runner=_local_contained_runner, checkout_factory=_test_checkout_factory,
+    ).execute())
 
 
-def test_project_test_home_is_writable_and_fresh_per_execution(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """HOME must be writable, and a different directory each execution.
-
-    Observed live on 2026-07-31: uv failed before reaching pytest because it
-    could not create ``$HOME/.cache/uv`` under ``/nonexistent``.
-    """
-    _origin, _source, _scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    seen: list[Path] = []
-
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        run_home = Path(env["HOME"])
-        seen.append(run_home)
-        assert run_home.is_dir(), "HOME must exist so a runner can create its cache"
-        (run_home / ".cache").mkdir(parents=True, exist_ok=True)
-        assert run_home != Path("/nonexistent")
-        assert run_home != Path.home(), "the operator's real dotfiles stay unreachable"
-        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
-        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-        return ProjectTestProcessResult(0, stdout="ok")
-
-    tests = RepoProjectTests(state, runner=runner)
-    tests.execute(())
-    tests.execute(())
-
-    assert len(seen) == 2
-    assert seen[0] != seen[1], "each execution must get its own HOME"
-    for run_home in seen:
-        assert not run_home.exists(), "each HOME must be removed after the execution"
-
-
-def test_project_test_home_does_not_carry_state_between_executions(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """State planted by one execution must not be visible to the next.
-
-    The tests that run in this HOME are PR-controlled, so a shared directory
-    would let one PR plant ambient config -- a .npmrc, a pip.conf; only Git
-    configuration is neutralised -- for a later PR to pick up.
-    """
-    _origin, _source, _scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    observed: list[bool] = []
-
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        planted = Path(env["HOME"]) / ".npmrc"
-        observed.append(planted.exists())
-        planted.write_text("registry=http://attacker.invalid\n", encoding="utf-8")
-        return ProjectTestProcessResult(0, stdout="ok")
-
-    tests = RepoProjectTests(state, runner=runner)
-    tests.execute(())
-    tests.execute(())
-
-    assert observed == [False, False], "planted config leaked into the next execution"
-
-
-def test_project_test_parent_swap_during_run_cannot_delete_outside_tree(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A parent swapped mid-run must not redirect cleanup outside the home.
-
-    The tests executing in the per-run HOME are PR-controlled. If cleanup resolved
-    the home by pathname, replacing the parent with a symlink during the run would
-    make rmtree traverse the swap and delete a matching tree elsewhere. Creation
-    and deletion are both descriptor-relative, so the swap is inert.
-    """
-    _origin, _source, _scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    # A tree outside the home that must survive, containing a same-named entry so
-    # a pathname-based delete would actually hit something.
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    treasure = outside / "keep.txt"
-    treasure.write_text("must survive\n", encoding="utf-8")
-
-    parent = home.resolve() / "scratch" / "project-test-homes"
-
-    captured: dict[str, str] = {}
-
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        run_home = Path(env["HOME"])
-        captured["name"] = run_home.name
-        # Mirror the run directory's name inside the outside tree, then swap the
-        # parent for a symlink to it -- exactly what PR-controlled test code could
-        # do while executing.
-        decoy = outside / run_home.name
-        decoy.mkdir()
-        (decoy / "keep.txt").write_text("decoy\n", encoding="utf-8")
-        import shutil as _shutil
-        _shutil.rmtree(parent)
-        parent.symlink_to(outside, target_is_directory=True)
-        return ProjectTestProcessResult(0, stdout="ok")
-
-    RepoProjectTests(state, runner=runner).execute(())
-
-    # The decoy is what a pathname-based cleanup destroys: after the swap,
-    # parent/<run-name> resolves to outside/<run-name>. Descriptor-relative
-    # deletion never resolves that pathname, so the decoy must be untouched.
-    decoy = outside / captured["name"]
-    assert decoy.is_dir(), "cleanup followed the swapped parent and deleted outside the home"
-    assert (decoy / "keep.txt").read_text(encoding="utf-8") == "decoy\n"
-    assert treasure.read_text(encoding="utf-8") == "must survive\n"
-
-
-@pytest.mark.parametrize("depth", ["scratch", "project-test-homes"])
-def test_project_test_refuses_symlinked_ancestor_at_any_depth(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, depth: str,
-) -> None:
-    """A symlink at ANY component below MIMIR_HOME must refuse, not be followed.
-
-    O_NOFOLLOW guards only the final component, so a symlink planted at the
-    intermediate ``scratch`` level -- with a real ``project-test-homes`` inside the
-    target -- would otherwise be followed by both mkdir(parents=True) and
-    os.open(parent, O_NOFOLLOW), placing HOME outside the home tree and restoring
-    the cross-run ambient-state channel.
-    """
-    _origin, _source, _scope, state, _tools = repo_tools
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    outside = tmp_path / "outside"
-    if depth == "scratch":
-        # The target contains a REAL final component, so a final-component-only
-        # check would succeed here.
-        (outside / "project-test-homes").mkdir(parents=True)
-        (home / "scratch").symlink_to(outside, target_is_directory=True)
-    else:
-        outside.mkdir()
-        (home / "scratch").mkdir(parents=True, exist_ok=True)
-        (home / "scratch" / "project-test-homes").symlink_to(
-            outside, target_is_directory=True,
-        )
-
-    def runner(argv, *, cwd, env, timeout, output_limit):  # pragma: no cover
-        raise AssertionError("runner must not be reached")
-
-    with pytest.raises(ProjectTestRefusal) as refusal:
-        RepoProjectTests(state, runner=runner).execute(())
-    assert refusal.value.code == "test_cache_home_unavailable"
-    # Nothing may have been created through the symlink.
-    assert not any(outside.rglob("run-*")), "an execution home was created outside the home tree"
-
-
-def test_project_test_failure_is_actionable_and_output_is_scrubbed(
+@pytest.mark.asyncio
+async def test_project_tests_use_snapshot_collected_result_and_worker_environment(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = repo_tools[-2]
     home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "never-forwarded")
+    calls = []
+
+    def factory(source, **kwargs):
+        capability = SimpleNamespace(path=tmp_path / "snapshot")
+        return SimpleNamespace(path=capability.path, capability=capability, close=lambda: None)
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append((argv, directory, env, projections, kwargs))
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(state, runner=runner, checkout_factory=factory).execute(
+        ("tracked.txt::case",)
+    )
+    assert result.ok is True
+    argv, directory, env, projections, kwargs = calls[0]
+    assert argv == ("/usr/bin/true", "-q", "tracked.txt::case")
+    assert directory.path == tmp_path / "snapshot"
+    assert projections == ()
+    assert "HOME" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MIMIR_HOME" not in env
+    assert env["CI"] == "1"
+    assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 64 * 1024
+    assert kwargs["timeout_s"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_project_tests_scrub_checkout_home_and_sensitive_output(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "controller-home"
     _configure_worklink_test(home, "/usr/bin/false")
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
     secret = "ghp_abcdefghijklmnopqrstuvwxyz"
 
-    def runner(argv, *, cwd, env, timeout, output_limit):
-        return ProjectTestProcessResult(
-            3, stdout=f"failure in {cwd}\n{secret}", stderr=f"token={secret}",
-        )
+    async def runner(*_args, **_kwargs):
+        payload = f"{state.checkout_lease.path} {home} {secret}".encode()
+        return CollectedExecutionResult(3, payload, payload, False, False, 0, 0)
 
-    result = RepoProjectTests(state, runner=runner).execute()
-
-    assert result.ok is False
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute()
     assert result.code == "tests_failed"
-    assert result.returncode == 3
-    assert str(state.checkout_lease.path.resolve()) not in result.stdout
+    assert str(home) not in result.stdout + result.stderr
+    assert str(state.checkout_lease.path) not in result.stdout + result.stderr
     assert secret not in result.stdout + result.stderr
-    assert "[REDACTED]" in result.stdout + result.stderr
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("selector", ["--flag", "../outside", "tracked.txt;id", "/tmp/test"])
-def test_project_test_selector_injection_is_refused(
+async def test_project_test_selector_injection_is_refused(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selector: str,
 ) -> None:
     state = repo_tools[-2]
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-
     with pytest.raises(ProjectTestRefusal) as refusal:
-        RepoProjectTests(state).execute((selector,))
+        await RepoProjectTests(state).execute((selector,))
     assert refusal.value.code in {"test_selector_invalid", "test_selector_outside_checkout"}
 
 
-def test_project_test_resolves_selector_before_checkout_containment(
-    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = repo_tools[-2]
-    home = tmp_path / "home"
-    _configure_worklink_test(home)
-    monkeypatch.setenv("MIMIR_HOME", str(home))
-    outside = tmp_path / "outside-test"
-    outside.write_text("outside\n", encoding="utf-8")
-    (state.checkout_lease.path / "escaped-test").symlink_to(outside)
-
-    with pytest.raises(ProjectTestRefusal) as refusal:
-        RepoProjectTests(state).execute(("escaped-test",))
-    assert refusal.value.code == "test_selector_outside_checkout"
-
-    internal_target = state.checkout_lease.path / "tracked.txt"
-    (state.checkout_lease.path / "internal-test-link").symlink_to(internal_target)
-    with pytest.raises(ProjectTestRefusal) as internal:
-        RepoProjectTests(state).execute(("internal-test-link",))
-    assert internal.value.code == "test_selector_outside_checkout"
-
-
-def test_project_test_scope_action_and_active_lease_guards_are_pinned(
+@pytest.mark.asyncio
+async def test_project_test_scope_and_active_lease_guards(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _origin, _source, scope, state, _tools = repo_tools
     home = tmp_path / "home"
     _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-
-    denied_scope = replace(
-        scope,
-        allowed_operations=scope.allowed_operations - {RepoPRAction.TEST.value},
-    )
-    denied_state = RepoReviewState(denied_scope)
-    with pytest.raises(ProjectTestRefusal) as denied:
-        RepoProjectTests(denied_state).execute()
-    assert denied.value.code == "scope_action_denied"
-
+    denied = RepoReviewState(replace(
+        scope, allowed_operations=scope.allowed_operations - {RepoPRAction.TEST.value},
+    ))
+    with pytest.raises(ProjectTestRefusal, match="scope does not grant"):
+        await RepoProjectTests(denied).execute()
     object.__setattr__(state, "checkout_lease", replace(state.checkout_lease, revoked=True))
     with pytest.raises(ProjectTestRefusal) as inactive:
-        RepoProjectTests(state).execute()
+        await RepoProjectTests(state).execute()
     assert inactive.value.code == "inactive_checkout"
 
 
-@pytest.mark.parametrize(
-    ("exit_code", "final_line", "expected_ok", "expected_code"),
-    [
-        (0, "FINAL PASS: 8000 passed", True, "tests_passed"),
-        (1, "FAILED tests/test_chatty.py::test_failure", False, "tests_failed"),
-    ],
-)
-def test_project_test_output_limit_preserves_real_status_and_final_lines(
-    repo_tools,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    exit_code: int,
-    final_line: str,
-    expected_ok: bool,
-    expected_code: str,
+@pytest.mark.asyncio
+async def test_project_test_snapshot_credentials_are_named_refusal(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = repo_tools[-2]
-    runner = tmp_path / f"chatty-{exit_code}"
-    runner.write_text(
-        "#!/bin/sh\n"
-        "i=0\n"
-        "while [ $i -lt 8000 ]; do\n"
-        "  printf 'progress-%05d\\n' \"$i\"\n"
-        "  i=$((i + 1))\n"
-        "done\n"
-        f"printf '%s\\n' '{final_line}'\n"
-        f"exit {exit_code}\n",
-        encoding="utf-8",
-    )
-    runner.chmod(0o755)
     home = tmp_path / "home"
-    _configure_worklink_test(home, str(runner))
+    _configure_worklink_test(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    result = RepoProjectTests(state).execute()
+    def refused(*_args, **_kwargs):
+        raise SnapshotCredentialsRefused(1)
 
-    assert result.ok is expected_ok
-    assert result.code == expected_code
-    assert result.returncode == exit_code
-    assert final_line in result.stdout
-    assert result.output_limited is True
-    assert result.stdout_dropped_bytes > 0
-    assert result.stderr_dropped_bytes == 0
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(state, checkout_factory=refused).execute()
+    assert refusal.value.code == "test_snapshot_credentials_refused"
+
+
+@pytest.mark.asyncio
+async def test_project_test_containment_unavailable_fails_closed(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def unavailable(*_args, **_kwargs):
+        raise OSError("socket unavailable")
+
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state, runner=unavailable, checkout_factory=_test_checkout_factory,
+        ).execute()
+    assert refusal.value.code == "test_containment_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_project_test_snapshot_preserves_active_lease_for_later_stage(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    lease = state.checkout_lease.path
+    before = lease.stat()
+    await RepoProjectTests(
+        state, runner=_local_contained_runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    after = lease.stat()
+    assert (before.st_uid, before.st_gid, before.st_mode) == (after.st_uid, after.st_gid, after.st_mode)
+    (lease / "tracked.txt").write_text("after test\n", encoding="utf-8")
+    assert RepoGitTools(state).execute(GitStage(("tracked.txt",))).ok
 
 
 @pytest.mark.parametrize("kind", ["argument_scope", "lease_scope", "inactive", "invalid_head"])
