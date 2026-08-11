@@ -387,6 +387,7 @@ def _controlled_server_app(
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
     monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
     monkeypatch.setenv("MIMIR_LIVENESS_BEAT_SECONDS", "0")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "false")
     monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path / "missing-source"))
     monkeypatch.setenv("DISCORD_TOKEN", "")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "")
@@ -2282,3 +2283,36 @@ class TestHandleEvent:
         event = stub.enqueue.call_args.args[0]
         assert event.source == "api"
         assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+@pytest.mark.asyncio
+async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+            control.events.append("acp:construct")
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    control.events.clear()
+    await _run_startup(app)
+    assert control.events.count("runtime") == 1
+    assert control.events.index("runtime") < control.events.index("acp:construct")
+    assert control.events.index("acp:construct") < control.events.index("acp:start")
+
+    control.events.clear()
+    await _run_cleanup(app)
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")

@@ -16,6 +16,7 @@ REQUIRED_MEMBERS = (
     "mimir/acp/agent.py",
     "mimir/acp/bootstrap.py",
     "mimir/acp/composition.py",
+    "mimir/acp/daemon.py",
     "mimir/acp/host.py",
     "mimir/acp/bridge.py",
     "mimir/acp/journal.py",
@@ -23,6 +24,7 @@ REQUIRED_MEMBERS = (
     "mimir/acp/updates.py",
     "mimir/acp/sdk.py",
     "mimir/acp/stdio.py",
+    "mimir/acp/transport.py",
     "mimir/bundled_docs/docs/acp.md",
 )
 REACT_DIST_PREFIX = "mimir/react_app/dist/"

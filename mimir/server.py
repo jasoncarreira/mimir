@@ -320,6 +320,8 @@ class _StartupState:
     runtime_attempted: bool = False
     bundle: Any | None = None
     runtime_published: bool = False
+    acp_daemon: Any | None = None
+    acp_start_attempted: bool = False
     activity_panel: Any | None = None
     activity_panel_start_attempted: bool = False
     indexer_start_attempted: bool = False
@@ -384,9 +386,12 @@ def _clear_runtime_app_state(
         app[field] = None
     if "activity_panel" in app:
         app["activity_panel"] = None
+    if "acp_daemon" in app:
+        app["acp_daemon"] = None
     if "mcp_manager" in app:
         app["mcp_manager"] = None
     state.bundle = None
+    state.acp_daemon = None
     state.activity_panel = None
     state.mcp_manager = None
     state.runtime_published = False
@@ -1148,6 +1153,14 @@ def build_app(config: Config) -> web.Application:
         bundle = await create_agent_runtime(config, core, runtime_adapters)
         startup_state.bundle = bundle
         _publish_runtime(app, runtime_slot, startup_state, bundle)
+        from .acp.daemon import AcpDaemon, acp_enabled_from_env
+
+        if acp_enabled_from_env():
+            acp_daemon = AcpDaemon(bundle)
+            startup_state.acp_daemon = acp_daemon
+            app["acp_daemon"] = acp_daemon
+            startup_state.acp_start_attempted = True
+            await acp_daemon.start()
         agent = bundle.agent
         indexer = bundle.indexer
         saga_client = bundle.saga_client
@@ -1925,6 +1938,8 @@ def build_app(config: Config) -> web.Application:
             attempt_sync(scheduler.stop)
         if startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
+        if startup_state.acp_daemon is not None:
+            await attempt(startup_state.acp_daemon.stop)
         if startup_state.bridges_connect_attempted:
             await attempt(channels.disconnect_all)
         if startup_state.bundle is not None:
@@ -2029,6 +2044,8 @@ def build_app(config: Config) -> web.Application:
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
             attempt_sync(scheduler.stop)
+            if startup_state.acp_daemon is not None:
+                await attempt(startup_state.acp_daemon.stop)
             if startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
             if startup_state.activity_panel is not None:
