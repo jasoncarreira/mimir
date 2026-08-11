@@ -6,6 +6,77 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-08-11
+
+A patch by version number, but the containment work below changes what an **image**
+must provide. A deployment that upgrades the package without rebuilding its image
+starts cleanly, reports healthy, and has silently lost `repo_test` and
+`spawn_open_code`.
+
+### Operator actions required
+
+1. **The image must provide the Worklink containment layer.** Contained execution
+   now backs `repo_test` and `spawn_open_code`, not only Worklink builds. The image
+   needs: a `worklink` user and group at **uid/gid 1002**; the agent user at
+   **uid 1001**, and a member of the `worklink` group; `/var/lib/mimir-worklink`
+   (`root:root 0711`) containing `checkouts`, `repo-test-checkouts` and
+   `opencode-checkouts` (`root:mimir 0771`) and `homes` (`root:worklink 0710`); a
+   root-owned executor virtualenv; and the `worklink-execd` s6 service, which
+   listens on `/run/mimir-worklink/socket/worklink-execd.sock`.
+
+   The `Dockerfile` in this repository does all of it. **A deployment that builds
+   its own image must port it** — mimirbot builds from its own `Dockerfile`, did not
+   inherit any of this, and lost both tools until it was ported.
+
+   Failure mode: `test_containment_unavailable` from `repo_test` and
+   `containment_available=false` from `spawn_open_code`. Both fail closed, which is
+   the safe direction, but neither names the missing piece, and nothing fails at
+   startup — the tools simply refuse the next time they are called.
+
+2. **The agent must run as uid 1001.** `MIMIR_UID` is a literal in
+   `mimir/worklink/worker_exec.py` and `mimir/worklink/checkout.py`. The root
+   executor refuses any peer whose uid differs, and the agent-side checkout handoff
+   chowns each checkout to `WORKLINK_GID`, which is what the group membership in (1)
+   is for — POSIX only lets a non-root process set a file's group to a group it
+   belongs to. Renumbering an existing deployment means chowning its workspace
+   volume. #1439 tracks resolving both by account name so this stops being a
+   deployment constraint.
+
+### Added
+
+- Contained execution is now a reusable entry point (`mimir/contained_execution.py`,
+  `mimir/contained_checkout.py`, `mimir/contained_snapshot.py`). `repo_test` and
+  `spawn_open_code` run through it, as the unprivileged `worklink` user inside an
+  issued checkout, instead of spawning directly. (#1438)
+- Worklink builds run as a separate `worklink` user, launched by a root
+  `worklink-execd` service rather than under the agent's own identity. (#1426)
+- `procps`, so `ps`, `pgrep`, `pkill` and `top` resolve in the image. A missing `ps`
+  reports "executable file not found", which reads as a dead process; that false
+  negative had cost three diagnoses of healthy runs. (#1434)
+
+### Changed
+
+- A job-bound scheduled tick may read all of `memory/channels/**`. The previous
+  per-job narrowing was an artifact of reusing the single-channel check rather than
+  a designed boundary, and it left `memory-hygiene` unable to perform the channel
+  scan its own prompt specifies. Scheduled ticks have no inbound message, so there
+  is no injection at the trigger. (#1435)
+- The shipped `scheduler_template.yaml` heartbeat record carries
+  `authority_profile: heartbeat`, matching the 0.8.0 operator action. (#1427)
+- github-poller coalesces repeated events for the same subject. (#1432)
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The output cap cut
+  at an arbitrary byte offset, and scrubbing replaces whole values — so a cut through
+  the middle of a secret left a prefix that matched nothing and was emitted verbatim.
+  Collection now buffers past the cap far enough to see a value spanning the cut and
+  retreats to where it begins. (#1438)
+- Declared `shell_commands` were authorized and then refused: the execution gate
+  dropped the declarations, so per-job command grants had never worked. (#1430)
+- Concurrent Worklink builds sharing the `worklink` uid could read and modify each
+  other's checkouts by traversing `../<other-issue>-<attempt>`. (#1428)
+
 ## [0.8.0] — 2026-08-09
 
 Minor rather than patch because two changes require an operator to edit
