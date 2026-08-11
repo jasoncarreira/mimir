@@ -1885,6 +1885,366 @@ def _write_run_artifacts_confined(
     return artifact_base / ".factory" / "runs" / run_id
 
 
+async def _spawn_open_code_impl(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout_s: int = 1800,
+    name: Optional[str] = None,
+    model: Optional[str] = None,
+    agent: Optional[str] = None,
+    artifact_root: Optional[str] = None,
+    *,
+    contained_runner: Any,
+    checkout_factory: Any,
+) -> str:
+    import shlex
+    import uuid
+
+    from ..contained_execution import (
+        SensitiveMaterialScrubber,
+        base_worker_environment,
+        opencode_worker_environment,
+    )
+    from ..contained_snapshot import (
+        SnapshotCredentialsRefused,
+        SnapshotSourceChanged,
+        SnapshotUnsafeEntry,
+    )
+    from ..event_logger import safe_log_event
+    from ..opencode_config import (
+        OpenCodeAuthError,
+        OpenCodeConfigError,
+        opencode_auth_path,
+        opencode_config_path,
+        opencode_worker_documents,
+        resolve_opencode_invocation,
+    )
+    from ..opencode_proposal import (
+        build_opencode_proposal,
+        classify_spawn_terminal_state,
+        cleanup_failure_event,
+        prompt_contains_sensitive_source_path,
+        resolve_artifact_handle,
+    )
+    from ..worklink.worker_client import WorkerProjection
+
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return "spawn_open_code failed: no spawn config"
+    if not prompt or not prompt.strip():
+        return "spawn_open_code failed: prompt is required"
+
+    guard = _spawn_guard_init()
+    current_depth = (
+        _env_int_floor1(_SPAWN_DEPTH_ENV, 0)
+        if os.environ.get(_SPAWN_DEPTH_ENV)
+        else 0
+    )
+    if current_depth >= guard.max_depth:
+        return (
+            "spawn_open_code refused: recursion depth cap reached "
+            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
+        )
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    if rate_err is not None:
+        return rate_err
+
+    run_id = f"opencode-{uuid.uuid4().hex[:12]}"
+    default_cwd = Path(cfg.get("default_cwd") or os.environ.get("HOME", "."))
+    seed = Path(cwd).expanduser() if cwd else default_cwd
+    home = Path(os.environ.get("HOME", str(default_cwd))).expanduser()
+    config_path = opencode_config_path(override=cfg.get("opencode_config_path"))
+    auth_path = opencode_auth_path()
+    scrubber = SensitiveMaterialScrubber(
+        home=home,
+        checkout=seed,
+        artifact_root=artifact_root,
+        source_paths=(config_path, auth_path),
+    )
+    selected_artifact_root = Path(
+        artifact_root
+        or cfg.get("artifact_root")
+        or (home / ".factory" / "runs")
+    ).expanduser()
+    try:
+        artifact_base = _confined_artifact_base(
+            str(selected_artifact_root), home
+        )
+        artifact_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        artifact_directory = resolve_artifact_handle(artifact_base, run_id)
+        artifact_directory.mkdir(mode=0o700, exist_ok=False)
+        for artifact_name in (
+            "prompt.md", "stdout.txt", "stderr.txt", "manifest.json"
+        ):
+            artifact_path = artifact_directory / artifact_name
+            artifact_path.write_bytes(b"")
+            artifact_path.chmod(0o600)
+    except (OSError, RuntimeError, ValueError):
+        terminal = classify_spawn_terminal_state(artifact_available=False)
+        await safe_log_event(
+            terminal.event_type,
+            run_id=run_id,
+            status=terminal.status,
+            reason_code=terminal.reason_code,
+        )
+        await _spawn_release_rate_slot(guard, rate_token)
+        return json.dumps({
+            "run_id": run_id,
+            "status": terminal.status,
+            "exit_code": None,
+            "stdout": "",
+            "result": "",
+            "stderr": "Artifact storage unavailable",
+            "artifact_dir": None,
+            "name": name,
+            "proposal": None,
+        }, indent=2)
+
+    stdout = b""
+    stderr = b""
+    invocation = None
+    checkout = None
+    execution = None
+    terminal = None
+    seed_tree = None
+
+    try:
+        try:
+            invocation = resolve_opencode_invocation(
+                model, config_path=cfg.get("opencode_config_path")
+            )
+            documents = opencode_worker_documents(invocation)
+            scrubber = documents.scrubber
+            scrubber.add_path(seed)
+            scrubber.add_path(artifact_base)
+        except OpenCodeAuthError as exc:
+            terminal = classify_spawn_terminal_state(
+                authentication_reason=exc.reason_code
+            )
+        except OpenCodeConfigError as exc:
+            terminal = classify_spawn_terminal_state(
+                configuration_reason=exc.reason_code
+            )
+
+        if terminal is None and invocation is not None:
+            prompt_reason = prompt_contains_sensitive_source_path(
+                prompt,
+                agent_home=home,
+                source_paths=(invocation.config_path, invocation.auth_path),
+            )
+            if prompt_reason is not None:
+                terminal = classify_spawn_terminal_state(prompt_reason=prompt_reason)
+
+        if terminal is None and invocation is not None:
+            try:
+                checkout = checkout_factory(
+                    seed,
+                    default_cwd=default_cwd,
+                    known_sensitive=tuple(
+                        document
+                        for document in (
+                            documents.config_document,
+                            documents.auth_document,
+                        )
+                        if document is not None
+                    ),
+                )
+                seed_tree = checkout.base_tree
+            except SnapshotCredentialsRefused:
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="seed_credentials"
+                )
+            except SnapshotUnsafeEntry:
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="unsafe_seed_entry"
+                )
+            except SnapshotSourceChanged:
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="seed_changed"
+                )
+            except ValueError:
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="invalid_seed"
+                )
+            except (OSError, RuntimeError):
+                terminal = classify_spawn_terminal_state(
+                    provisioning_reason="provisioning_unavailable"
+                )
+
+        if terminal is None and invocation is not None and checkout is not None:
+            argv = ["opencode", "run", "--dir", "."]
+            argv += shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
+            argv += ["-m", invocation.model]
+            if agent:
+                argv += ["--agent", agent]
+            argv += ["--", prompt]
+            selectors = {
+                "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
+                "OPENCODE_MODEL": invocation.model,
+                "OPENCODE_PROVIDER": invocation.provider,
+            }
+            if agent:
+                selectors["OPENCODE_AGENT"] = agent
+            worker_env = opencode_worker_environment(
+                base_worker_environment(run_id), selectors
+            )
+            projections = [
+                WorkerProjection(
+                    path=".config/opencode/opencode.json",
+                    document=documents.config_document,
+                )
+            ]
+            if documents.auth_document is not None:
+                projections.append(WorkerProjection(
+                    path=".local/share/opencode/auth.json",
+                    document=documents.auth_document,
+                ))
+            assert guard.sem is not None
+            try:
+                async with guard.sem:
+                    execution = await contained_runner(
+                        argv,
+                        checkout.capability,
+                        worker_env,
+                        tuple(projections),
+                        identifier=run_id,
+                        timeout_s=timeout_s,
+                        stdout_limit=1024 * 1024,
+                        stderr_limit=1024 * 1024,
+                    )
+                stdout = execution.stdout
+                stderr = execution.stderr
+            except (OSError, RuntimeError):
+                terminal = classify_spawn_terminal_state(
+                    containment_available=False
+                )
+
+        if terminal is None and execution is not None and checkout is not None:
+            proposal_result = None
+            if (
+                execution.exit_code == 0
+                and not execution.timed_out
+                and not execution.output_overflow
+            ):
+                proposal_result = build_opencode_proposal(
+                    checkout.path, scrubber=scrubber, base_tree=seed_tree
+                )
+            auth_required = False
+            if execution.exit_code not in (None, 0):
+                blob = scrubber.scrub_text(stderr + b"\n" + stdout).lower()
+                auth_required = any(marker in blob for marker in (
+                    "unauthorized", "not logged in", "credential", "auth", "401"
+                ))
+            terminal = classify_spawn_terminal_state(
+                timed_out=execution.timed_out,
+                output_overflow=execution.output_overflow,
+                exit_code=execution.exit_code,
+                worker_authentication_required=auth_required,
+                proposal_result=proposal_result,
+            )
+    except BaseException:
+        await _spawn_release_rate_slot(guard, rate_token)
+        raise
+    finally:
+        if checkout is not None:
+            try:
+                checkout.close()
+            except (OSError, RuntimeError):
+                event = cleanup_failure_event(run_id)
+                await safe_log_event(
+                    event["type"],
+                    run_id=event["run_id"],
+                    reason_code=event["reason_code"],
+                )
+                log.warning("spawn_open_code cleanup failed")
+
+    assert terminal is not None
+    manifest = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "launcher": "mimir.spawn_open_code",
+        "name": name,
+        "model": invocation.model if invocation is not None else None,
+        "agent": agent,
+        "status": terminal.status,
+        "reason_code": terminal.reason_code,
+        "exit_code": terminal.exit_code,
+        "seed_tree": seed_tree,
+        "timed_out": bool(execution and execution.timed_out),
+        "output_overflow": bool(execution and execution.output_overflow),
+        "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
+        "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
+    }
+    artifact_handle = run_id
+    try:
+        (artifact_directory / "prompt.md").write_text(
+            scrubber.scrub_text(prompt), encoding="utf-8"
+        )
+        (artifact_directory / "stdout.txt").write_text(
+            scrubber.scrub_text(stdout), encoding="utf-8"
+        )
+        (artifact_directory / "stderr.txt").write_text(
+            scrubber.scrub_text(stderr), encoding="utf-8"
+        )
+        scrubbed_manifest = json.loads(
+            scrubber.scrub_text(json.dumps(manifest, ensure_ascii=False))
+        )
+        (artifact_directory / "manifest.json").write_text(
+            json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        proposal_path = artifact_directory / "proposal.json"
+        if terminal.proposal is not None:
+            proposal_temporary = artifact_directory / ".proposal.json.tmp"
+            proposal_temporary.write_text(
+                json.dumps(
+                    terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True
+                ) + "\n",
+                encoding="utf-8",
+            )
+            proposal_temporary.chmod(0o600)
+            proposal_temporary.replace(proposal_path)
+    except (OSError, RuntimeError, ValueError):
+        log.warning("spawn_open_code artifact write failed")
+        for failed_proposal_path in (
+            artifact_directory / "proposal.json",
+            artifact_directory / ".proposal.json.tmp",
+        ):
+            try:
+                failed_proposal_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        terminal = classify_spawn_terminal_state(artifact_available=False)
+        artifact_handle = None
+    await safe_log_event(
+        terminal.event_type,
+        run_id=run_id,
+        status=terminal.status,
+        reason_code=terminal.reason_code,
+    )
+    safe_stdout = scrubber.scrub_text(stdout).strip()[:2000]
+    safe_stderr = scrubber.scrub_text(stderr).strip()[:500]
+    if terminal.status == "configuration_refused":
+        safe_stderr = "OpenCode configuration unavailable"
+    elif terminal.status == "authentication_refused":
+        safe_stderr = "OpenCode authentication unavailable"
+    elif terminal.status == "prompt_refused":
+        safe_stderr = "Prompt contains a sensitive controller path"
+    elif terminal.status == "containment_unavailable":
+        safe_stderr = "Contained execution unavailable"
+    return json.dumps({
+        "run_id": run_id,
+        "status": terminal.status,
+        "exit_code": terminal.exit_code,
+        "stdout": safe_stdout,
+        "result": safe_stdout,
+        "stderr": safe_stderr,
+        "artifact_dir": artifact_handle,
+        "name": name,
+        "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
+    }, indent=2)
+
+
 @tool
 async def spawn_open_code(
     prompt: str,
@@ -1895,209 +2255,20 @@ async def spawn_open_code(
     agent: Optional[str] = None,
     artifact_root: Optional[str] = None,
 ) -> str:
-    """Spawn an OpenCode CLI subprocess to execute a coding task.
+    """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
+    from ..contained_checkout import create_opencode_checkout
+    from ..contained_execution import execute_contained
 
-    The provider-agnostic substrate spawn (chainlink #830 / the opencode
-    software-factory spec, phase 1): runs ``opencode run --dir <cwd>``
-    once, non-interactively, and returns a structured result. OpenCode
-    routes to whichever model provider its own config selects, so this
-    provides a backend-shaped coding tool. Registered only when the
-    ``opencode`` CLI is on PATH (``providers.opencode_available``).
-
-    Uses the shared per-hour / concurrency / recursion-depth spawn budget.
-
-    Args:
-        prompt: The task to hand to the spawned OpenCode instance.
-        cwd: Working directory for the run. Defaults to home.
-        timeout_s: Subprocess timeout (default 30 min).
-        name: Optional label recorded in the spawn log/manifest.
-        model: ``provider/model`` (opencode ``-m`` format). Omit to use the
-            OpenCode config model, then the agent's current model as fallback.
-        agent: opencode agent name (``--agent``). Omit for default.
-        artifact_root: When set, persist run artifacts under
-            ``<artifact_root>/.factory/runs/<run_id>/`` — prompt.md,
-            stdout.txt, stderr.txt, and a manifest.json carrying labels
-            only (never secret values).
-    """
-    cfg = _STATE["spawn_config"]
-    if cfg is None:
-        return "spawn_open_code failed: no spawn config"
-    if not prompt or not prompt.strip():
-        return "spawn_open_code failed: prompt is required"
-
-    from ..opencode_config import (
-        OpenCodeAuthError,
-        OpenCodeConfigError,
-        resolve_opencode_invocation,
-    )
-    from ..config import model_spec_at_call_time
-
-    try:
-        spawn_home = cfg.get("default_cwd")
-        model_spec_at_call_time(Path(spawn_home) if spawn_home else None)
-        invocation = resolve_opencode_invocation(
-            model,
-            config_path=cfg.get("opencode_config_path"),
-        )
-    except (OpenCodeAuthError, OpenCodeConfigError) as exc:
-        return json.dumps({
-            "status": "auth_failed" if isinstance(exc, OpenCodeAuthError) else "config_failed",
-            "stderr": str(exc),
-        }, indent=2)
-
-    guard = _spawn_guard_init()
-    current_depth = _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(
-        _SPAWN_DEPTH_ENV
-    ) else 0
-    if current_depth >= guard.max_depth:
-        return (
-            f"spawn_open_code refused: recursion depth cap reached "
-            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
-        )
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
-    if rate_err is not None:
-        return rate_err
-
-    # Validate the (model-controlled) artifact_root BEFORE spawning so a
-    # bad/escaping path is refused up front rather than after burning a run.
-    artifact_base: Optional[Path] = None
-    if artifact_root:
-        home = cfg.get("default_cwd")
-        if not home:
-            return "spawn_open_code refused: artifact_root set but no home is configured"
-        try:
-            artifact_base = _confined_artifact_base(artifact_root, home)
-        except (ValueError, OSError, RuntimeError) as exc:
-            return f"spawn_open_code refused: {exc}"
-
-    cwd_path = Path(cwd).expanduser() if cwd else cfg.get("default_cwd")
-    import shlex
-    import uuid
-    argv = ["opencode", "run"]
-    if cwd_path:
-        argv += ["--dir", str(cwd_path)]
-    # Operator-tunable extra flags (permissions profile, --format json, ...)
-    # — the opencode CLI surface evolves, so don't hardcode beyond the
-    # subcommand. e.g. MIMIR_OPENCODE_SPAWN_ARGS="--format json".
-    argv += shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
-    argv += ["-m", invocation.model]
-    if agent:
-        argv += ["--agent", agent]
-    argv += ["--", prompt]
-
-    # Allowlisted child env (#494): infra + the provider credential families
-    # opencode may legitimately route to + its own vars + incremented spawn
-    # depth. Bridge/operator secrets are NOT inherited. (Spec tier-1; the
-    # per-run auth home is the tier-2 follow-up.)
-    # opencode is provider-agnostic — it routes to whichever provider its config
-    # selects — so it needs the broad provider-credential union, matching the
-    # worklink local_subprocess allowlist (#830). Bridge/operator secrets are
-    # still excluded by _minimal_child_env's allowlist model.
-    child_env = _minimal_child_env(
-        depth=current_depth + 1,
-        cred_prefixes=(
-            "OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_",
-            "MINIMAX_", "OPENROUTER_", "GROQ_", "GEMINI_", "GOOGLE_",
-            "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
-        ),
-    )
-    if invocation.config_path.exists() or os.environ.get("OPENCODE_CONFIG"):
-        child_env["OPENCODE_CONFIG"] = str(invocation.config_path)
-    for key in invocation.pass_env:
-        if key in os.environ:
-            child_env[key] = os.environ[key]
-    for key in invocation.remove_env:
-        child_env.pop(key, None)
-
-    run_id = f"opencode-{uuid.uuid4().hex[:12]}"
-    started = datetime.now(timezone.utc)
-    status = "completed"
-    returncode: Optional[int] = None
-    stdout = ""
-    stderr = ""
-    assert guard.sem is not None
-    try:
-        async with guard.sem:
-            try:
-                returncode, stdout, stderr = await asyncio.to_thread(
-                    _run_spawn_subprocess,
-                    argv,
-                    str(cwd_path) if cwd_path else None,
-                    timeout_s,
-                    child_env,
-                )
-            except subprocess.TimeoutExpired:
-                status = "timeout"
-            except FileNotFoundError:
-                status = "spawn_failed"
-    except BaseException:
-        await _spawn_release_rate_slot(guard, rate_token)
-        raise
-    if status == "completed" and returncode != 0:
-        # Spec §6 failure taxonomy: distinguish auth failures (fix = operator
-        # re-auth) from work failures (fix = different prompt/task).
-        blob = (stderr + "\n" + stdout).lower()
-        status = (
-            "auth_failed"
-            if any(marker in blob for marker in ("unauthorized", "not logged in", "credential", "auth", "401"))
-            else "work_failed"
-        )
-
-    artifact_dir: Optional[Path] = None
-    if artifact_base is not None:
-        manifest = json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "launcher": "mimir.spawn_open_code",
-                "name": name,
-                "cwd": str(cwd_path) if cwd_path else None,
-                "model": invocation.model,
-                "agent": agent,
-                "status": status,
-                "exit_code": returncode,
-                "started_at": started.isoformat(),
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-        try:
-            # Symlink-safe: the untrusted subprocess has already run and may have
-            # planted a symlink at the predictable .factory/runs prefix, so the
-            # writes go through openat + O_NOFOLLOW rather than Path.mkdir /
-            # write_text (which would follow it out of the home). A rejected
-            # symlink / write failure simply skips artifacts (best-effort).
-            artifact_dir = _write_run_artifacts_confined(
-                home,
-                artifact_base,
-                run_id,
-                {
-                    "prompt.md": prompt,
-                    "stdout.txt": stdout,
-                    "stderr.txt": stderr,
-                    "manifest.json": manifest,
-                },
-            )
-        except OSError:
-            artifact_dir = None  # artifacts are best-effort; structured return is primary
-
-    if status == "spawn_failed":
-        stderr = "'opencode' CLI not on PATH"
-    elif status == "timeout":
-        stderr = f"timed out after {timeout_s}s"
-    elif status == "auth_failed":
-        stderr = f"OpenCode provider {invocation.provider!r} authentication failed: {stderr}"
-    return json.dumps(
-        {
-            "run_id": run_id,
-            "status": status,
-            "exit_code": returncode,
-            "result": stdout.strip()[:2000],
-            "stderr": stderr.strip()[:500] if status != "completed" else "",
-            "artifact_dir": str(artifact_dir) if artifact_dir else None,
-            "name": name,
-        },
-        indent=2,
+    return await _spawn_open_code_impl(
+        prompt,
+        cwd,
+        timeout_s,
+        name,
+        model,
+        agent,
+        artifact_root,
+        contained_runner=execute_contained,
+        checkout_factory=create_opencode_checkout,
     )
 
 
