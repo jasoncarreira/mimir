@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -1967,6 +1968,7 @@ async def _spawn_open_code_impl(
         or cfg.get("artifact_root")
         or (home / ".factory" / "runs")
     ).expanduser()
+    artifact_directory_fd = -1
     try:
         artifact_base = _confined_artifact_base(
             str(selected_artifact_root), home
@@ -1980,7 +1982,13 @@ async def _spawn_open_code_impl(
             artifact_path = artifact_directory / artifact_name
             artifact_path.write_bytes(b"")
             artifact_path.chmod(0o600)
+        artifact_directory_fd = os.open(
+            artifact_directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
     except (OSError, RuntimeError, ValueError):
+        if artifact_directory_fd >= 0:
+            os.close(artifact_directory_fd)
         terminal = classify_spawn_terminal_state(artifact_available=False)
         await safe_log_event(
             terminal.event_type,
@@ -2144,6 +2152,8 @@ async def _spawn_open_code_impl(
                 proposal_result=proposal_result,
             )
     except BaseException:
+        os.close(artifact_directory_fd)
+        artifact_directory_fd = -1
         await _spawn_release_rate_slot(guard, rate_token)
         raise
     finally:
@@ -2178,45 +2188,83 @@ async def _spawn_open_code_impl(
     }
     artifact_handle = run_id
     try:
-        (artifact_directory / "prompt.md").write_text(
-            scrubber.scrub_text(prompt), encoding="utf-8"
+        directory_state = os.stat(artifact_directory, follow_symlinks=False)
+        anchored_state = os.fstat(artifact_directory_fd)
+        if (
+            not stat.S_ISDIR(directory_state.st_mode)
+            or not os.path.samestat(directory_state, anchored_state)
+        ):
+            raise OSError("artifact directory identity changed")
+
+        def write_existing_artifact(name: str, document: bytes) -> None:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                dir_fd=artifact_directory_fd,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("artifact is not a regular file")
+                with os.fdopen(descriptor, "wb", closefd=False) as destination:
+                    destination.write(document)
+            finally:
+                os.close(descriptor)
+
+        write_existing_artifact(
+            "prompt.md", scrubber.scrub_text(prompt).encode("utf-8")
         )
-        (artifact_directory / "stdout.txt").write_text(
-            scrubber.scrub_text(stdout), encoding="utf-8"
+        write_existing_artifact(
+            "stdout.txt", scrubber.scrub_text(stdout).encode("utf-8")
         )
-        (artifact_directory / "stderr.txt").write_text(
-            scrubber.scrub_text(stderr), encoding="utf-8"
+        write_existing_artifact(
+            "stderr.txt", scrubber.scrub_text(stderr).encode("utf-8")
         )
         scrubbed_manifest = json.loads(
             scrubber.scrub_text(json.dumps(manifest, ensure_ascii=False))
         )
-        (artifact_directory / "manifest.json").write_text(
-            json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        proposal_path = artifact_directory / "proposal.json"
+        manifest_document = (
+            json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        write_existing_artifact("manifest.json", manifest_document)
         if terminal.proposal is not None:
-            proposal_temporary = artifact_directory / ".proposal.json.tmp"
-            proposal_temporary.write_text(
+            proposal_document = (
                 json.dumps(
                     terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True
-                ) + "\n",
-                encoding="utf-8",
+                ) + "\n"
+            ).encode("utf-8")
+            proposal_descriptor = os.open(
+                ".proposal.json.tmp",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=artifact_directory_fd,
             )
-            proposal_temporary.chmod(0o600)
-            proposal_temporary.replace(proposal_path)
+            try:
+                with os.fdopen(
+                    proposal_descriptor, "wb", closefd=False
+                ) as destination:
+                    destination.write(proposal_document)
+            finally:
+                os.close(proposal_descriptor)
+            os.replace(
+                ".proposal.json.tmp",
+                "proposal.json",
+                src_dir_fd=artifact_directory_fd,
+                dst_dir_fd=artifact_directory_fd,
+            )
     except (OSError, RuntimeError, ValueError):
         log.warning("spawn_open_code artifact write failed")
-        for failed_proposal_path in (
-            artifact_directory / "proposal.json",
-            artifact_directory / ".proposal.json.tmp",
-        ):
+        for failed_proposal_name in ("proposal.json", ".proposal.json.tmp"):
             try:
-                failed_proposal_path.unlink(missing_ok=True)
+                os.unlink(failed_proposal_name, dir_fd=artifact_directory_fd)
+            except FileNotFoundError:
+                pass
             except OSError:
                 pass
         terminal = classify_spawn_terminal_state(artifact_available=False)
         artifact_handle = None
+    finally:
+        os.close(artifact_directory_fd)
+
     await safe_log_event(
         terminal.event_type,
         run_id=run_id,
