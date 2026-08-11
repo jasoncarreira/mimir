@@ -31,6 +31,7 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -1896,9 +1897,9 @@ async def _spawn_open_code_impl(
     *,
     contained_runner: Any,
     checkout_factory: Any,
+    execution_identifier: str | None = None,
 ) -> str:
     import shlex
-    import uuid
 
     from ..contained_execution import (
         SensitiveMaterialScrubber,
@@ -2107,7 +2108,7 @@ async def _spawn_open_code_impl(
                         checkout.capability,
                         worker_env,
                         tuple(projections),
-                        identifier=run_id,
+                        identifier=execution_identifier or run_id,
                         timeout_s=timeout_s,
                         stdout_limit=1024 * 1024,
                         stderr_limit=1024 * 1024,
@@ -2269,6 +2270,7 @@ async def spawn_open_code(
         artifact_root,
         contained_runner=execute_contained,
         checkout_factory=create_opencode_checkout,
+        execution_identifier=str(uuid.uuid4()),
     )
 
 

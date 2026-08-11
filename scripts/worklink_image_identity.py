@@ -179,6 +179,98 @@ test -r "$HOME/.local/share/opencode/auth.json"
 asyncio.run(main())
 """
 
+SPAWN_PROOF = r"""
+from __future__ import annotations
+import asyncio
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import uuid
+
+from mimir.contained_checkout import create_opencode_checkout
+from mimir.contained_execution import execute_contained
+from mimir.tools.registry import _spawn_open_code_impl, set_spawn_config
+
+SEED = Path("/home/mimir/worklink-source")
+ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")
+CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
+AUTH = Path("/home/mimir/worklink-opencode/data/opencode/auth.json")
+CANARY = Path("/home/mimir/worklink-canary")
+OAUTH = (b"oauth-access-proof", b"oauth-refresh-proof")
+
+async def main():
+    if os.geteuid() != 1001:
+        raise RuntimeError("spawn controller proof is not running as mimir")
+    os.environ.update({
+        "OPENCODE_CONFIG": str(CONFIG),
+        "XDG_DATA_HOME": str(AUTH.parents[1]),
+        "MIMIR_MODEL_SPEC": "proof:model",
+    })
+    set_spawn_config({
+        "default_cwd": Path("/home/mimir"),
+        "artifact_root": ARTIFACTS,
+        "opencode_config_path": CONFIG,
+    })
+    source_head = (SEED / ".git/HEAD").read_bytes()
+    source_status = os.popen(
+        "git -C /home/mimir/worklink-source status --porcelain=v1 -z"
+    ).read()
+    raw = await _spawn_open_code_impl(
+        "generate and execute the containment proof payload",
+        cwd=str(SEED),
+        timeout_s=30,
+        name="shipped-image-proof",
+        model="proof/model",
+        artifact_root=str(ARTIFACTS),
+        contained_runner=execute_contained,
+        checkout_factory=create_opencode_checkout,
+        execution_identifier=str(uuid.uuid4()),
+    )
+    result = json.loads(raw)
+    if result["status"] != "succeeded" or result["exit_code"] != 0:
+        raise RuntimeError(f"live spawn failed: {result}")
+    if "spawn-euid=1002" not in result["stdout"]:
+        raise RuntimeError("live fake OpenCode did not report worker identity")
+    proposal = result.get("proposal")
+    if not isinstance(proposal, dict):
+        raise RuntimeError("live spawn did not produce a proposal")
+    patch = base64.b64decode(proposal["patch"], validate=True)
+    if proposal.get("schema_version") != 1 or proposal.get("kind") != "git_binary_patch":
+        raise RuntimeError("live spawn proposal schema is invalid")
+    if proposal.get("byte_length") != len(patch):
+        raise RuntimeError("live spawn proposal length is invalid")
+    if proposal.get("sha256") != hashlib.sha256(patch).hexdigest():
+        raise RuntimeError("live spawn proposal digest is invalid")
+    for marker in (b"spawn-payload-executed", b"spawn-worker-uid"):
+        if marker not in patch:
+            raise RuntimeError(f"live spawn proposal omitted {marker!r}")
+    artifact = ARTIFACTS / result["artifact_dir"]
+    observed = raw.encode()
+    for path in artifact.rglob("*"):
+        if path.is_file():
+            observed += path.read_bytes()
+    forbidden = (*OAUTH, os.fsencode(CONFIG), os.fsencode(AUTH))
+    for material in forbidden:
+        if material in observed:
+            raise RuntimeError("spawn output or artifacts disclosed OAuth material or controller paths")
+    if CANARY.read_text() != "controller-reset":
+        raise RuntimeError("generated OpenCode payload changed controller canary")
+    if (SEED / ".git/HEAD").read_bytes() != source_head:
+        raise RuntimeError("spawn changed the seed repository HEAD")
+    if os.popen("git -C /home/mimir/worklink-source status --porcelain=v1 -z").read() != source_status:
+        raise RuntimeError("spawn changed the seed repository working tree")
+    for path in sorted(ARTIFACTS.rglob("*"), reverse=True):
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        else:
+            path.rmdir()
+    ARTIFACTS.rmdir()
+
+asyncio.run(main())
+"""
+
 
 def main() -> None:
     run(["docker", "info"], timeout=30)
@@ -272,12 +364,12 @@ if home.parent != Path("/var/lib/mimir-worklink/homes"):
     raise SystemExit("coding CLI received an invalid HOME")
 config = json.loads((home / ".config/opencode/opencode.json").read_text())
 auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
-if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "{env:PROOF_TOKEN}"}}}:
+if config != {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid", "apiKey": "provider-reference"}}}:
     raise SystemExit("selected provider configuration was not projected exactly")
 if auth != {"proof": {"type": "api", "key": "projected-secret"}}:
     raise SystemExit("selected provider auth was not projected exactly")
-if os.environ.get("PROOF_TOKEN") != "provider-reference":
-    raise SystemExit("selected provider environment reference was not projected")
+if "PROOF_TOKEN" in os.environ:
+    raise SystemExit("selected provider credential leaked into the worker environment")
 checkout = Path.cwd()
 checkout_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
 os.chdir(home)
@@ -332,10 +424,71 @@ PY
             "PROOF_TOKEN=provider-reference /opt/mimir-worklink/venv/bin/python /tmp/worklink-runtime-proof.py",
             user="mimir",
         )
+        spawn_setup = r"""
+            set -eu
+            cat > /home/mimir/worklink-opencode/opencode.json <<'JSON'
+{"model":"proof/model","provider":{"proof":{"endpoint":"https://proof.invalid"}}}
+JSON
+            cat > /home/mimir/worklink-opencode/data/opencode/auth.json <<'JSON'
+{"proof":{"type":"oauth","access":"oauth-access-proof","refresh":"oauth-refresh-proof","expires":4102444800000}}
+JSON
+            chown mimir:mimir /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            chmod 0600 /home/mimir/worklink-opencode/opencode.json /home/mimir/worklink-opencode/data/opencode/auth.json
+            cat > /usr/local/bin/opencode <<'PY'
+#!/opt/mimir-worklink/venv/bin/python
+import json
+import os
+from pathlib import Path
+import sys
+
+if os.geteuid() != 1002:
+    raise SystemExit("spawn fake did not run as worklink")
+if "--dir" not in sys.argv or sys.argv[sys.argv.index("--dir") + 1] != ".":
+    raise SystemExit(f"spawn fake did not receive the FD-anchored checkout: {sys.argv}")
+home = Path(os.environ["HOME"])
+config = json.loads((home / ".config/opencode/opencode.json").read_text())
+auth = json.loads((home / ".local/share/opencode/auth.json").read_text())
+expected_config = {"model": "proof/model", "provider": {"proof": {"endpoint": "https://proof.invalid"}}}
+expected_auth = {"proof": {"type": "oauth", "access": "oauth-access-proof", "refresh": "oauth-refresh-proof", "expires": 4102444800000}}
+if config != expected_config:
+    raise SystemExit("spawn fake did not read the selected provider config projection")
+if auth != expected_auth:
+    raise SystemExit("spawn fake did not read the OAuth projection")
+payload = Path("generated-containment-proof.py")
+payload.write_text(
+    "import os\n"
+    "import pwd\n"
+    "from pathlib import Path\n"
+    "controller_home = Path(pwd.getpwnam('mimir').pw_dir)\n"
+    "try:\n"
+    "    (controller_home / 'worklink-canary').write_text('attacked')\n"
+    "except OSError:\n"
+    "    pass\n"
+    "Path('spawn-payload-executed').write_text('executed')\n"
+    "Path('spawn-worker-uid').write_text(str(os.geteuid()))\n"
+)
+exec(compile(payload.read_bytes(), str(payload), "exec"), {"__name__": "__main__"})
+print("spawn-euid=1002")
+print("oauth-access-proof oauth-refresh-proof")
+print("/home/mimir/worklink-opencode/opencode.json")
+print("/home/mimir/worklink-opencode/data/opencode/auth.json", file=sys.stderr)
+PY
+            chmod 0755 /usr/local/bin/opencode
+        """
+        docker_exec("/bin/sh", "-ceu", spawn_setup)
+        docker_exec(
+            "/bin/sh", "-c", "cat > /tmp/worklink-spawn-proof.py && chmod 0644 /tmp/worklink-spawn-proof.py",
+            input_text=SPAWN_PROOF,
+        )
+        docker_exec(
+            "/opt/mimir-worklink/venv/bin/python", "/tmp/worklink-spawn-proof.py",
+            user="mimir",
+        )
         docker_exec("/bin/sh", "-ceu", """
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             test -z "$(find /var/lib/mimir-worklink/homes -mindepth 1 -maxdepth 1 -print -quit)"
             test -z "$(find /var/lib/mimir-worklink/checkouts -mindepth 2 -maxdepth 2 -print -quit)"
+            test -z "$(find /var/lib/mimir-worklink/opencode-checkouts -mindepth 2 -maxdepth 2 -print -quit)"
         """)
         print("worklink shipped-image identity proof passed")
     finally:
