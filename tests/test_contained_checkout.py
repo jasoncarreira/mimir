@@ -10,6 +10,7 @@ import pytest
 import mimir.contained_checkout as contained_checkout
 import mimir.worklink.checkout as checkout
 from mimir.contained_checkout import create_opencode_checkout, create_repo_test_checkout
+from mimir.contained_snapshot import SnapshotCredentialsRefused
 
 
 def _git(path: Path, *args: str) -> str:
@@ -78,6 +79,64 @@ def test_repo_test_checkout_snapshots_without_mutating_source(
     issued.close()
     assert not boundary.exists()
     assert list(root.iterdir()) == []
+
+
+def test_repo_test_checkout_allows_tracked_credential_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roots(tmp_path, monkeypatch)
+    source = _repo(tmp_path)
+    (source / "tracked.txt").write_text("SERVICE_TOKEN=fixture-value\n")
+    _git(source, "add", "tracked.txt")
+    _git(source, "commit", "-q", "-m", "credential-shaped fixture")
+
+    issued = create_repo_test_checkout(source, scope_id="owner/repo", pr_number=42)
+
+    assert (issued.path / "tracked.txt").read_text() == "SERVICE_TOKEN=fixture-value\n"
+    issued.close()
+
+
+@pytest.mark.parametrize("inventory", ["untracked", "ignored"])
+def test_repo_test_checkout_still_refuses_nontracked_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inventory: str
+) -> None:
+    _roots(tmp_path, monkeypatch)
+    source = _repo(tmp_path)
+    directory = source / inventory
+    directory.mkdir()
+    if inventory == "ignored":
+        (source / ".gitignore").write_text("ignored/\n")
+        _git(source, "add", ".gitignore")
+        _git(source, "commit", "-q", "-m", "ignore local files")
+    (directory / ".env.local").write_text("SERVICE_TOKEN=do-not-copy\n")
+    (directory / "credentials.json").write_text("fixture\n")
+
+    with pytest.raises(SnapshotCredentialsRefused) as error:
+        create_repo_test_checkout(source, scope_id="owner/repo", pr_number=43)
+
+    assert error.value.reason_code == "snapshot_credentials"
+    assert error.value.relative_path_count == 2
+    assert str(error.value) == "Snapshot credentials refused"
+    assert ".env.local" not in str(error.value)
+    assert "do-not-copy" not in str(error.value)
+
+
+def test_opencode_checkout_still_refuses_tracked_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roots(tmp_path, monkeypatch)
+    default = tmp_path / "projects"
+    default.mkdir()
+    source = _repo(default)
+    (source / "tracked.txt").write_text("SERVICE_TOKEN=fixture-value\n")
+    _git(source, "add", "tracked.txt")
+    _git(source, "commit", "-q", "-m", "credential-shaped fixture")
+
+    with pytest.raises(SnapshotCredentialsRefused) as error:
+        create_opencode_checkout(source, default_cwd=default)
+
+    assert error.value.reason_code == "snapshot_credentials"
+    assert error.value.relative_path_count == 1
 
 
 def test_opencode_checkout_has_fixed_seed_commit_and_cleans_up(
