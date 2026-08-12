@@ -2884,6 +2884,38 @@ def test_service_shell_binding_refusal_returns_stable_rule(
         assert secret_value not in refusal
 
 
+def test_service_shell_binding_refusal_handles_missing_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    monkeypatch.setattr(
+        budget_gate,
+        "parse_service_shell_argv_with_diagnostics",
+        lambda *_args, **_kwargs: (None, "synthetic refusal", None),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": "echo safe"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert bound.tool_call["args"]["mimir_shell_refusal"] == (
+        "shell_exec was refused before execution: synthetic refusal "
+        "binding_rule=unknown"
+    )
+
+
 def test_service_shell_final_binding_refusal_emits_hard_denial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
