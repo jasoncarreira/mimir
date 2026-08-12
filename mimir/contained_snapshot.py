@@ -262,10 +262,14 @@ def _scan_regular(
     relative: bytes,
     kind: GitInventoryClass,
     known_sensitive: tuple[bytes, ...],
+    *,
+    scan_credentials: bool,
 ) -> SnapshotEntry:
     fd, before = _open_regular(source_path)
     try:
-        sensitive = _name_is_sensitive(relative) or _content_is_sensitive(fd, known_sensitive)
+        sensitive = scan_credentials and (
+            _name_is_sensitive(relative) or _content_is_sensitive(fd, known_sensitive)
+        )
         after = os.fstat(fd)
     except OSError as exc:
         raise SnapshotSourceChanged("Snapshot source changed") from exc
@@ -308,6 +312,8 @@ def _inspect_entry(
     relative: bytes,
     kind: GitInventoryClass,
     known_sensitive: tuple[bytes, ...],
+    *,
+    scan_credentials: bool,
 ) -> SnapshotEntry:
     _validate_relative_path(relative)
     source_path = os.path.join(source, relative)
@@ -320,7 +326,13 @@ def _inspect_entry(
     except OSError as exc:
         raise SnapshotSourceChanged("Snapshot source changed") from exc
     if stat.S_ISREG(observed.st_mode):
-        return _scan_regular(source_path, relative, kind, known_sensitive)
+        return _scan_regular(
+            source_path,
+            relative,
+            kind,
+            known_sensitive,
+            scan_credentials=scan_credentials,
+        )
     if stat.S_ISLNK(observed.st_mode):
         try:
             target = os.readlink(source_path)
@@ -367,6 +379,7 @@ def preflight_git_snapshot(
     source: str | os.PathLike[str],
     *,
     known_sensitive: Iterable[bytes] = (),
+    scan_tracked_credentials: bool = True,
 ) -> tuple[SnapshotEntry, ...]:
     source_bytes = os.fsencode(os.path.abspath(os.fspath(source)))
     _refuse_special_files(source_bytes)
@@ -381,7 +394,20 @@ def preflight_git_snapshot(
                 raise SnapshotUnavailable("Snapshot unavailable")
             seen.add(relative)
             try:
-                result.append(_inspect_entry(source_bytes, relative, kind, sensitive))
+                # A repo_test checkout may exempt only content Git inventories as
+                # tracked: it is already committed and visible to the same agent.
+                # Untracked and ignored material crosses a real disclosure boundary
+                # and must always take the existing credential-scanning path.
+                scan_credentials = kind != "tracked" or scan_tracked_credentials
+                result.append(
+                    _inspect_entry(
+                        source_bytes,
+                        relative,
+                        kind,
+                        sensitive,
+                        scan_credentials=scan_credentials,
+                    )
+                )
             except SnapshotCredentialsRefused:
                 credential_count += 1
     if credential_count:
@@ -470,6 +496,7 @@ def create_git_snapshot(
     destination: str | os.PathLike[str],
     *,
     known_sensitive: Iterable[bytes] = (),
+    scan_tracked_credentials: bool = True,
 ) -> SnapshotResult:
     try:
         source_path = Path(source).resolve(strict=True)
@@ -486,7 +513,11 @@ def create_git_snapshot(
     source_bytes = os.fsencode(source_path)
     destination_bytes = os.fsencode(destination_path)
     revision = _head_revision(source_bytes)
-    entries = preflight_git_snapshot(source_path, known_sensitive=known_sensitive)
+    entries = preflight_git_snapshot(
+        source_path,
+        known_sensitive=known_sensitive,
+        scan_tracked_credentials=scan_tracked_credentials,
+    )
     try:
         completed = subprocess.run(
             [b"git", b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet", b"--", source_bytes, destination_bytes],
@@ -508,7 +539,11 @@ def create_git_snapshot(
             raise SnapshotSourceChanged("Snapshot source changed")
         for entry in entries:
             _overlay_entry(source_bytes, destination_bytes, entry)
-        verified_entries = preflight_git_snapshot(source_path, known_sensitive=known_sensitive)
+        verified_entries = preflight_git_snapshot(
+            source_path,
+            known_sensitive=known_sensitive,
+            scan_tracked_credentials=scan_tracked_credentials,
+        )
         if _head_revision(source_bytes) != revision or verified_entries != entries:
             raise SnapshotSourceChanged("Snapshot source changed")
     except ContainedSnapshotError:

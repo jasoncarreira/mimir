@@ -314,7 +314,10 @@ async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
     assert result.stdout_dropped_bytes == len(payload) - 2000
 
 
-def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret() -> None:
+def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     scrubber = _secret_scrubber()
     payload = _TRUNCATION_OUTPUT
     start = payload.index(_SECRET)
@@ -330,7 +333,10 @@ def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret() -> None:
     assert scrubber.safe_truncation_length(payload, len(payload) + 50) == len(payload)
 
 
-def test_safe_truncation_length_without_materials_is_the_limit() -> None:
+def test_safe_truncation_length_without_materials_is_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     scrubber = SensitiveMaterialScrubber(home="", checkout=None)
 
     assert scrubber.lookahead_bytes() == 0
