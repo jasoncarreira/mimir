@@ -1,49 +1,27 @@
-# ACP over stdio
+# ACP client
 
-Install the ACP extra, then let an ACP client launch `mimir acp` as its server
-process:
+Mimir's server owns the shared ACP runtime and listens on the owner-only Unix socket at `<home>/.mimir/acp/daemon.sock`. `mimir acp` is a client proxy; it never creates a standalone runtime.
 
-```sh
-pip install "mimir-agent[acp]"
-mimir acp
+Create a local profile and store its key in the native OS secure store:
+
+```console
+mimir acp profile set default --home /absolute/mimir/home
+mimir acp credential set --profile default
+mimir acp --profile default
 ```
 
-Mimir provides ACP over stdio only. It does not open a network listener, socket, or port. The ACP client owns the SSH or Docker connection.
+Profiles in `${XDG_CONFIG_HOME:-~/.config}/mimir/acp/profiles.json` contain no credentials. Selection uses `--profile`, then nonempty `MIMIR_ACP_PROFILE`, then `default`.
 
-stdin carries UTF-8 JSONL requests. stdout carries UTF-8 JSONL frames after Mimir starts. stderr carries diagnostics so logs and errors do not contaminate the protocol frames.
+For a remote daemon, configure every SSH field:
 
-## Remote launch
-
-An ACP client can launch Mimir on another host with SSH:
-
-```sh
-ssh <host> mimir acp
+```console
+mimir acp profile set remote --home /remote/home \
+  --ssh-host host.example --ssh-user mimir --ssh-port 22 \
+  --identity-file /absolute/id_ed25519 --known-hosts-file /absolute/known_hosts
+mimir acp credential set --profile remote
+mimir acp --profile remote
 ```
 
-Disable pseudo-TTY allocation for a framing-safe connection:
+The client invokes hardened public-key OpenSSH and the internal remote command `mimir-agent acp relay --home PATH`. The relay is profile-, credential-, and runtime-blind.
 
-```sh
-ssh -T <host> mimir acp
-```
-
-For an existing container, keep stdin attached without allocating a TTY:
-
-```sh
-docker exec -i <container> mimir acp
-```
-
-## Framing troubleshooting
-
-| Hazard | Symptom | Fix |
-|---|---|---|
-| SSH pseudo-TTY allocation | A TTY can alter or interleave bytes, causing malformed-frame errors. | Disable TTY allocation; use `ssh -T`. |
-| Docker `-t` | A pseudo-TTY can alter framing. | Use `docker exec -i` without `-t`. |
-| MOTD, login banners, or shell startup/rc output | These bytes can precede the first JSON frame and make the client reject the first frame. | Configure a silent noninteractive shell or wrapper, and redirect diagnostics to stderr. |
-
-Mimir reserves stdout only after startup and cannot remove bytes already emitted by a parent shell, SSH daemon, or wrapper. It does not strip banners or provide a network transport. Any shell, daemon, or wrapper that runs before Mimir must therefore keep stdout silent.
-
-## Session replay semantics
-
-Loading a session replays its prepared updates with their original sequence numbers. Replay is client-visible at-least-once delivery: an update delivered before an interruption can be delivered again when the session is loaded. Clients must therefore tolerate duplicate prepared updates.
-
-Plans produced from deepagents Todos preserve Todo content and status. Mimir synthesizes the `medium` priority required by ACP because deepagents Todos have no priority field.
+stdin and stdout carry UTF-8 JSONL ACP frames only. stdout is reserved before command imports; diagnostics go to stderr. Do not allocate a pseudo-TTY or insert banners because either alters protocol framing.

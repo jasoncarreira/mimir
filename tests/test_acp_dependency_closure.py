@@ -1,31 +1,10 @@
 from __future__ import annotations
-
-import ast
+import importlib.util
 from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def _imports(module: str) -> set[str]:
-    tree = ast.parse((ROOT / (module.replace(".", "/") + ".py")).read_text())
-    result: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            result.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            result.add(node.module)
-    return result
-
-
-def test_transport_is_dependency_neutral() -> None:
-    assert all(not name.startswith("mimir") for name in _imports("mimir.acp.transport"))
-
-
-def test_daemon_consumes_runtime_without_constructing_or_closing_it() -> None:
-    source = (ROOT / "mimir/acp/daemon.py").read_text()
-    assert "create_agent_runtime" not in source
-    assert "create_core_services" not in source
-    assert ".aclose(" not in source
-    assert "start_unix_server" in source
-    assert "start_server(" not in source
+ROOT=Path(__file__).resolve().parents[1]
+spec=importlib.util.spec_from_file_location("acp_dependency_closure",ROOT/".github"/"acp_dependency_closure.py"); assert spec and spec.loader
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+def test_proxy_relay_and_client_closures_are_finite_and_runtime_blind(): module.assert_policy(module.module_paths(ROOT/"mimir"))
+def test_entrypoint_acp_branch_has_only_the_client_dispatch():
+ source=(ROOT/"mimir"/"entrypoint.py").read_text(); branch=source.split('if sys.argv[1:2] == ["acp"]:',1)[1].split('from mimir.cli',1)[0]; assert 'mimir.acp.bootstrap' in branch and 'mimir.cli' not in branch
+def test_composition_is_globally_absent(): assert not (ROOT/"mimir"/"acp"/"composition.py").exists()
