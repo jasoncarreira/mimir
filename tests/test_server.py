@@ -361,6 +361,7 @@ class _ServerControl:
     panel: Any | None = None
     identity_resolver: Any | None = None
     real_dispatcher: bool = False
+    real_runtime: bool = False
     turns: list[Any] = field(default_factory=list)
 
     def hit(self, name: str) -> None:
@@ -676,7 +677,8 @@ def _controlled_server_app(
     monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
     monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
     monkeypatch.setattr(mimir.runtime, "create_core_services", create_core_services)
-    monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
+    if not control.real_runtime:
+        monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
     monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: control.hit("preflight"))
     monkeypatch.setattr(mimir.doc_seed, "refresh_docs", lambda home: {})
     monkeypatch.setattr(
@@ -2303,10 +2305,21 @@ class TestHandleEvent:
 async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_healthy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mimir.tools
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
     from mimir.acp.daemon import AcpDaemon
+    from mimir.agent import Agent
     from mimir.dispatcher import Dispatcher
+    from mimir.event_logger import EventLogger
     from mimir.identities import IdentityResolver, hash_web_key
     from mimir.models import AgentEvent
+    from mimir.runtime import AgentRuntimeBundle
+
+    class DeterministicModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> DeterministicModel:
+            return self
 
     raw_key = "owned-server-acp-key"
     home = Path(tempfile.mkdtemp(prefix="mimir-server-acp-", dir="/tmp"))
@@ -2330,8 +2343,20 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
     resolver = IdentityResolver(home)
     resolver.reload()
     monkeypatch.setattr("mimir.dispatcher.log_event", AsyncMock())
-    control = _ServerControl(identity_resolver=resolver, real_dispatcher=True)
+    control = _ServerControl(
+        identity_resolver=resolver,
+        real_dispatcher=True,
+        real_runtime=True,
+    )
     app, control = _controlled_server_app(home, monkeypatch, control)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "mimir.event_logger._logger",
+        EventLogger(home / "logs" / "events.jsonl", "failure-isolation"),
+    )
+    model = DeterministicModel(messages=iter([AIMessage(content="turn complete")]))
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", lambda *args, **kwargs: model)
+    monkeypatch.setenv("MIMIR_SYSTEM_PROMPT_OVERRIDE", "Owned failure-isolation test prompt")
     monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
     await _run_startup(app)
 
@@ -2340,6 +2365,8 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         bundle = app["agent_runtime"]
         dispatcher = app["dispatcher"]
         assert isinstance(daemon, AcpDaemon)
+        assert isinstance(bundle, AgentRuntimeBundle)
+        assert isinstance(bundle.agent, Agent)
         assert isinstance(dispatcher, Dispatcher)
         assert daemon._bundle is bundle
         assert app["runtime_slot"].bundle is bundle
@@ -2389,13 +2416,25 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
             author="operator",
             source="web",
         )
-        assert await dispatcher.enqueue(event) is True
-        channel_queue = dispatcher._queues[event.channel_id]
-        await asyncio.wait_for(channel_queue.join(), 1.0)
+        turn_events = bundle.turn_event_bus.subscribe(event.channel_id)
+        try:
+            assert await dispatcher.enqueue(event) is True
+            channel_queue = dispatcher._queues[event.channel_id]
+            terminal = None
+            while terminal is None:
+                observed = await asyncio.wait_for(turn_events.get(), 3.0)
+                if observed["type"] == "turn" and observed["phase"] == "end":
+                    terminal = observed
+            await asyncio.wait_for(channel_queue.join(), 3.0)
+        finally:
+            bundle.turn_event_bus.unsubscribe(event.channel_id, turn_events)
 
-        assert control.turns == [event]
-        assert bundle.closed is False
+        assert terminal["status"] == "ok"
+        assert bundle.agent._agent_model is model
+        assert bundle._close_task is None
         assert bundle.adapters.dispatcher is dispatcher
+        assert bundle.adapters.channels is app["channels"]
+        assert bundle.adapters.scheduler is app["scheduler"]
         assert dispatcher._run_turn.__self__ is bundle.agent
     finally:
         await _run_cleanup(app)
