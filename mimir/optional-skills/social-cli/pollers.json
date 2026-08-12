@@ -6,10 +6,20 @@
       "cron": "*/15 * * * *",
       "batch_size": 3,
       "authority": {
-        "profile": "research",
+        "profile": "custom",
         "tier": "scoped-with-provenance",
-        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
-        "scoped_roots": ["state"]
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "scoped_roots": ["state"],
+        "shell_commands": [
+          {
+            "exec": "bash",
+            "path": "/usr/bin/bash",
+            "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
+            "options": ["--platform", "--action", "--since", "--json", "--dry-run"]
+          },
+          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
+          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
+        ]
       },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
@@ -26,10 +36,20 @@
       "cron": "0 */2 * * *",
       "batch_size": 10,
       "authority": {
-        "profile": "research",
+        "profile": "custom",
         "tier": "scoped-with-provenance",
-        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message"],
-        "scoped_roots": ["state"]
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "scoped_roots": ["state"],
+        "shell_commands": [
+          {
+            "exec": "bash",
+            "path": "/usr/bin/bash",
+            "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
+            "options": ["--platform", "--action", "--since", "--json", "--dry-run"]
+          },
+          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
+          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
+        ]
       },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",

@@ -130,7 +130,7 @@ The poller surfaces notifications. The agent responds:
 
 3. **Dispatch:**
    ```bash
-   cd $STATE_DIR && social-cli dispatch --platform bsky
+   bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications dispatch --platform bsky
    # --platform must match the outbox-<platform>.yaml you wrote
    # omit it to dispatch every outbox-*.yaml present
    # add --dry-run to validate without posting
@@ -166,7 +166,7 @@ The poller surfaces notifications. The agent responds:
 
 4. **Check daily post count from the dispatch ledgers:**
    ```bash
-   social-cli count --platform bsky --action post --since today
+   bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications count --platform bsky --action post --since today
    ```
    This is the canonical daily-post-count check. It scans the
    `sent_ledger-*.yaml` files across the social-cli poller state
@@ -184,7 +184,7 @@ The poller surfaces notifications. The agent responds:
    The default output is just the number, suitable for cron or an
    agent guard. Add `--json` for compact machine-readable metadata:
    ```bash
-   social-cli count --platform bsky --action post --since today --json
+   bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications count --platform bsky --action post --since today --json
    ```
 
    Do not maintain a separate daily counter file for Bluesky caps.
@@ -521,7 +521,7 @@ operator-curated and trustworthy; `text` is not.
 Not emitting?
 
 1. **Binary on PATH:** `docker exec <agent> which social-cli`
-2. **Sync works:** `cd $STATE_DIR && social-cli sync -p bsky` →
+2. **Count works:** `bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications count --platform bsky --action post --since today` →
    populates `inbox-bsky.yaml` without errors
 3. **.env present:** `ls -la $STATE_DIR` shows mode-600 `.env`
 4. **Inbox vs cursor:** if `inbox-<platform>.yaml` has items but the poller

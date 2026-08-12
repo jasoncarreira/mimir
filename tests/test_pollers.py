@@ -15,6 +15,7 @@ import asyncio
 from dataclasses import replace
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -226,10 +227,18 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
     companions = {"bash_jobs_list", "bash_job_output"}
 
     for manifest_path in manifests.glob("*/pollers.json"):
-        entries = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+        installed = tmp_path / "skills" / manifest_path.parent.name
+        shutil.copytree(manifest_path.parent, installed)
+        installed_manifest = installed / "pollers.json"
+        entries = json.loads(installed_manifest.read_text(encoding="utf-8"))["pollers"]
         for entry in entries:
             if "authority" not in entry:
                 continue
+            for declaration in entry["authority"].get("shell_commands", []):
+                if "script" in declaration:
+                    declaration["script"] = str(
+                        installed / "scripts" / Path(declaration["script"]).name
+                    )
             persist_dir = tmp_path / entry["name"]
             persist_dir.mkdir()
             principal = _parse_poller_authority(
@@ -237,7 +246,7 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
                 name=entry["name"],
                 persist_dir=persist_dir,
                 state_root=tmp_path / "state" / "pollers",
-                manifest_path=manifest_path,
+                manifest_path=installed_manifest,
             )
             capabilities = set(principal.capabilities)
             if capabilities & {"shell_exec", "bash_async"}:

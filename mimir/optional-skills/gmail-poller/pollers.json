@@ -6,10 +6,20 @@
       "cron": "*/5 * * * *",
       "batch_size": 5,
       "authority": {
-        "profile": "research",
+        "profile": "custom",
         "tier": "scoped-with-provenance",
-        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "operator_alert"],
-        "scoped_roots": ["state"]
+        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "operator_alert", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "scoped_roots": ["state"],
+        "shell_commands": [
+          {
+            "exec": "bash",
+            "path": "/usr/bin/bash",
+            "script": "/mimir-home/skills/gmail-poller/scripts/run-gog.sh",
+            "options": ["--account", "--max", "--json", "--no-input"]
+          },
+          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
+          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
+        ]
       },
       "pass_env": [
         "GOG_ACCOUNT",

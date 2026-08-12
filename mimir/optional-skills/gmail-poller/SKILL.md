@@ -185,9 +185,9 @@ already gives us a better one — duplicating it would be net loss.
 
 If the poller isn't emitting:
 
-1. **Verify gog is authed**: `gog auth list` should show `GOG_ACCOUNT`.
+1. **Verify gog is authed**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh auth list` should show `GOG_ACCOUNT`.
    In container: `docker exec mimirbot gog auth list`.
-2. **Run the search manually**: `gog gmail messages search "$MIMIR_GMAIL_QUERY" --account "$GOG_ACCOUNT" --max 5 --json` — if this returns zero hits, the query is wrong.
+2. **Run the search manually**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search "$MIMIR_GMAIL_QUERY" --account "$GOG_ACCOUNT" --max 5 --json --no-input` — if this returns zero hits, the query is wrong.
 3. **Check `events.jsonl`** for `poller_stderr` entries from
    `gmail-inbox` — these surface gog's stderr (auth errors,
    rate-limit hits) verbatim.
