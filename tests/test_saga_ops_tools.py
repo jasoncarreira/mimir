@@ -310,6 +310,16 @@ async def test_mark_contributions_store_raises_surfaces_error(
 # ────────────────────────────────────────────────────────────────────
 
 
+def test_end_session_description_requires_capability_for_explicit_call() -> None:
+    description = " ".join(saga_ops.saga_end_session.description.split())
+
+    assert "has the ``saga_end_session`` capability" in description
+    assert "call explicitly when" in description
+    assert "session is wrapping" in description
+    assert "Without that capability, do not attempt the call" in description
+    assert "synthesis turn closes the session" in description
+
+
 @pytest.mark.asyncio
 async def test_end_session_no_store_returns_error(
     turn_with_session: TurnContext,

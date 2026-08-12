@@ -15,6 +15,11 @@ from mimir.contained_execution import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_explicit_opencode_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+
+
 class Capability:
     path = Path("/issued/checkout")
 
@@ -224,8 +229,7 @@ _SECRET = b"sk-live-ABCDEFGHIJKLMNOPQRSTUV"
 _TRUNCATION_OUTPUT = b"begin " + _SECRET + b" end-of-log"
 
 
-def _secret_scrubber(monkeypatch: pytest.MonkeyPatch) -> SensitiveMaterialScrubber:
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+def _secret_scrubber() -> SensitiveMaterialScrubber:
     scrubber = SensitiveMaterialScrubber(home="", checkout=None)
     scrubber.add_scalar(_SECRET)
     return scrubber
@@ -257,7 +261,7 @@ async def test_truncation_never_emits_a_fragment_of_a_secret(
         b"" if on_stdout else _TRUNCATION_OUTPUT,
     )
     install_client(monkeypatch, client)
-    scrubber = _secret_scrubber(monkeypatch)
+    scrubber = _secret_scrubber()
 
     result = await execute_contained(
         ("tool",),
@@ -292,7 +296,7 @@ async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
     payload = b"/usr/lib/" + b"/" * 4000 + b"trailing"
     client = Client(payload)
     install_client(monkeypatch, client)
-    scrubber = _secret_scrubber(monkeypatch)
+    scrubber = _secret_scrubber()
     scrubber.add_scalar("/mimir-home/state/liveness.json")
 
     result = await execute_contained(
@@ -313,7 +317,7 @@ async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
 def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scrubber = _secret_scrubber(monkeypatch)
+    scrubber = _secret_scrubber()
     payload = _TRUNCATION_OUTPUT
     start = payload.index(_SECRET)
 
