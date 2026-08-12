@@ -59,16 +59,20 @@ print(json.dumps({{'origins':origins,'entries':entries,'requires':requires}}))
     return json.loads(completed.stdout)
 
 
-def _assert_metadata(probe: dict[str, object], temporary: Path) -> Path:
+def _assert_metadata(probe: dict[str, object], python: Path, work: Path, env: dict[str, str]) -> Path:
     assert probe["entries"] == {"mimir": "mimir.entrypoint:main", "mimir-agent": "mimir.entrypoint:main"}
     requirements = probe["requires"]
     assert sum(item == "agent-client-protocol==0.12.0" for item in requirements) == 1
     assert sum(item == "keyring==25.7.0" for item in requirements) == 1
     assert not any("extra == 'acp'" in item or 'extra == "acp"' in item for item in requirements)
     origins = {name: Path(origin).resolve() for name, origin in probe["origins"].items()}
+    site_packages = Path(subprocess.run(
+        [str(python), "-c", "import site; print(site.getsitepackages()[0])"],
+        cwd=work, env=env, text=True, capture_output=True, check=True,
+    ).stdout.strip()).resolve()
     for name, origin in origins.items():
-        if temporary.resolve() not in origin.parents:
-            raise AssertionError(f"{name} resolved outside clean environment: {origin}")
+        if origin != site_packages and site_packages not in origin.parents:
+            raise AssertionError(f"{name} did not resolve from site-packages: {origin}")
         if ROOT.resolve() in origin.parents:
             raise AssertionError(f"{name} leaked from checkout: {origin}")
     return origins["mimir.acp.__init__"].parents[1]
@@ -147,6 +151,70 @@ asyncio.run(main())
         process.wait(timeout=5)
 
 
+def _remote_round_trip(python: Path, work: Path, env: dict[str, str], config: Path) -> None:
+    home = work / "remote-home"
+    socket = home / ".mimir" / "acp" / "daemon.sock"
+    socket.parent.mkdir(parents=True, mode=0o700)
+    os.chmod(socket.parent, 0o700)
+    identity = work / "identity"
+    known = work / "known-hosts"
+    identity.write_text("")
+    known.write_text("")
+    identity.chmod(0o600)
+    known.chmod(0o600)
+    server = """import asyncio,sys
+async def main():
+ async def handle(reader,writer):
+  payload=await reader.readline(); assert b'installed-secret' in payload
+  writer.write(b'{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n'); await writer.drain(); writer.close(); await writer.wait_closed()
+ service=await asyncio.start_unix_server(handle,path=sys.argv[1])
+ async with service: await service.serve_forever()
+asyncio.run(main())
+"""
+    server_process = subprocess.Popen([str(python), "-c", server, str(socket)], cwd=work, env=env)
+    relay = work / "ssh-relay"
+    relay.write_text(
+        f"#!{python}\n"
+        "import os,subprocess,sys\n"
+        "assert all('installed-secret' not in value for value in [*sys.argv,*os.environ.values()])\n"
+        f"raise SystemExit(subprocess.call([{str(python)!r},'-m','mimir.acp','relay','--home',{str(home)!r}]))\n"
+    )
+    relay.chmod(0o755)
+    try:
+        for _ in range(200):
+            if socket.exists():
+                break
+            import time
+            time.sleep(0.01)
+        setup = (
+            "from pathlib import Path\n"
+            "from mimir.acp.profiles import Profile,ProfileStore,RemoteProfile\n"
+            f"ProfileStore(Path({str(config / 'mimir' / 'acp' / 'profiles.json')!r})).set(Profile('remote',Path({str(home)!r}),RemoteProfile('example.com','agent',22,Path({str(identity)!r}),Path({str(known)!r}))))\n"
+        )
+        subprocess.run([str(python), "-c", setup], cwd=work, env=env, check=True)
+        installed = subprocess.run(
+            [str(python), "-c", (
+                "import asyncio,io\n"
+                "from mimir.acp.credentials import NativeCredentialStore\n"
+                "from mimir.acp.profiles import ProfileStore\n"
+                "from mimir.acp.ssh import run_ssh_proxy\n"
+                "p=ProfileStore().get('remote'); assert p is not None\n"
+                f"asyncio.run(run_ssh_proxy(p,NativeCredentialStore().get('remote'),getattr(__import__('sys').stdout,'buffer'),_ssh_path=__import__('pathlib').Path({str(relay)!r})))\n"
+            )],
+            cwd=work,
+            env=env,
+            input=b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n',
+            capture_output=True,
+            timeout=20,
+        )
+        assert installed.returncode == 0, installed.stderr.decode()
+        assert installed.stdout == b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+        assert b"installed-secret" not in installed.stdout + installed.stderr
+    finally:
+        server_process.terminate()
+        server_process.wait(timeout=5)
+
+
 def smoke(artifact: Path) -> None:
     artifact = artifact.resolve()
     with tempfile.TemporaryDirectory(prefix="mimir-acp-install-") as value:
@@ -159,7 +227,7 @@ def smoke(artifact: Path) -> None:
         python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         run(["uv", "pip", "install", "--python", str(python), f"{artifact}[acp]"], cwd=work, env=env)
         probe = _probe(python, work, env)
-        package = _assert_metadata(probe, temporary)
+        package = _assert_metadata(probe, python, work, env)
         closure_spec = importlib.util.spec_from_file_location("closure", ROOT / ".github" / "acp_dependency_closure.py")
         assert closure_spec and closure_spec.loader
         closure = importlib.util.module_from_spec(closure_spec)
@@ -194,22 +262,12 @@ def smoke(artifact: Path) -> None:
             _local_round_trip([str(bindir / "mimir"), "acp"], python, work, env, config)
             _local_round_trip([str(python), "-m", "mimir.acp"], python, work, env, config)
             _relay_round_trip([str(bindir / "mimir-agent"), "acp"], python, work, env)
+            _remote_round_trip(python, work, env, config)
         finally:
             import shutil
             shutil.rmtree(short, ignore_errors=True)
         work = temporary / "work"
 
-        ssh_probe = """from pathlib import Path
-from mimir.acp.profiles import Profile,RemoteProfile
-from mimir.acp.ssh import build_ssh_argv
-import tempfile
-with tempfile.TemporaryDirectory() as value:
- root=Path(value); ssh=root/'ssh'; identity=root/'id'; known=root/'known'
- for path,mode in ((ssh,0o755),(identity,0o600),(known,0o600)): path.write_text(''); path.chmod(mode)
- argv=build_ssh_argv(Profile('remote',Path('/remote'),RemoteProfile('example.com','agent',22,identity,known)),ssh)
- assert argv[-1]=='mimir-agent acp relay --home /remote'
-"""
-        run([str(python), "-c", ssh_probe], cwd=work, env=env)
 
 
 def slice_verify() -> None:

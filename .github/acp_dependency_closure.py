@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 from typing import Mapping
 
@@ -14,6 +15,9 @@ POLICY = {
     "mimir.acp.profiles": set(),
     "mimir.acp.credentials": set(),
     "mimir.acp.transport": set(),
+}
+THIRD_PARTY_POLICY = {
+    "mimir.acp.credentials": {"keyring"},
 }
 ROOTS = {
     "local": {"mimir.acp.proxy"},
@@ -73,6 +77,7 @@ class Analysis(ast.NodeVisitor):
         self.module = module
         self.known_modules = known_modules
         self.imports: set[str] = set()
+        self.external_imports: set[str] = set()
         self.aliases: dict[str, str] = {}
         self.calls: set[str] = set()
         self.attributes: set[str] = set()
@@ -92,6 +97,8 @@ class Analysis(ast.NodeVisitor):
             self.aliases[local] = item.name if item.asname else local
             if item.name == "mimir" or item.name.startswith("mimir."):
                 self.imports.add(item.name)
+            else:
+                self.external_imports.add(item.name.split(".")[0])
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         base = _resolve_from(self.module, node)
@@ -105,6 +112,8 @@ class Analysis(ast.NodeVisitor):
                 self.imports.add(target)
             elif base == "mimir" or base.startswith("mimir."):
                 self.imports.add(base)
+            elif base:
+                self.external_imports.add(base.split(".")[0])
 
     def visit_Assign(self, node: ast.Assign) -> None:
         value = self._name(node.value)
@@ -195,6 +204,10 @@ def _assert_analysis(module: str, analysis: Analysis, paths: Mapping[str, Path])
     actual = _first_party_imports(analysis, set(paths))
     if actual != POLICY[module]:
         raise AssertionError(f"{module} imports {sorted(actual)}, expected {sorted(POLICY[module])}")
+    third_party = analysis.external_imports - sys.stdlib_module_names
+    allowed = THIRD_PARTY_POLICY.get(module, set())
+    if third_party != allowed:
+        raise AssertionError(f"{module} third-party imports {sorted(third_party)}, expected {sorted(allowed)}")
     _assert_sinks(module, analysis)
 
 

@@ -32,7 +32,8 @@ def _safe_file(path: Path, *, executable_root: bool = False, strict: bool = Fals
     if executable_root and not value.st_mode & 0o111: raise SshError("unsafe SSH executable")
 
 
-def build_ssh_argv(profile: Profile, ssh_path: Path = SSH_PATH) -> tuple[str, ...]:
+def build_ssh_argv(profile: Profile, ssh_path: Path | None = None) -> tuple[str, ...]:
+    ssh_path = SSH_PATH if ssh_path is None else ssh_path
     remote = profile.remote
     if remote is None: raise SshError("remote profile required")
     _safe_file(ssh_path, executable_root=ssh_path == SSH_PATH)
@@ -80,43 +81,17 @@ async def stop_child(process: Any) -> None:
     try: await asyncio.wait_for(process.wait(), KILL_TIMEOUT)
     except TimeoutError as exc: raise SshError("SSH child did not stop") from exc
 
-class _PrefixedReader:
-    def __init__(self, prefix: bytes, reader: asyncio.StreamReader) -> None:
-        self._prefix = prefix
-        self._reader = reader
-
-    async def read(self, size: int = -1) -> bytes:
-        if self._prefix:
-            value = self._prefix if size < 0 else self._prefix[:size]
-            self._prefix = self._prefix[len(value):]
-            return value
-        return await self._reader.read(size)
-
-
-async def _establish(process: Any) -> bytes:
-    first = asyncio.create_task(process.stdout.read(1))
-    exited = asyncio.create_task(process.wait())
-    try:
-        done, _ = await asyncio.wait({first, exited}, timeout=CONNECT_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            raise SshError("SSH establishment timed out")
-        if exited in done:
-            raise SshError("SSH connection failed")
-        value = first.result()
-        if not value:
-            raise SshError("SSH connection failed")
-        return value
-    finally:
-        for task in (first, exited):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(first, exited, return_exceptions=True)
-
-
-async def run_ssh_proxy(profile: Profile, credential: str, output: BinaryIO) -> None:
+async def run_ssh_proxy(
+    profile: Profile,
+    credential: str,
+    output: BinaryIO,
+    *,
+    _ssh_path: Path | None = None,
+    _environment: Mapping[str, str] | None = None,
+) -> None:
     process = await asyncio.wait_for(asyncio.create_subprocess_exec(
-        *build_ssh_argv(profile), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, env=child_environment()), CONNECT_TIMEOUT)
+        *build_ssh_argv(profile, _ssh_path), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=child_environment(_environment)), CONNECT_TIMEOUT)
     if process.stdin is None or process.stdout is None or process.stderr is None:
         await stop_child(process)
         raise SshError("SSH pipes unavailable")
@@ -127,10 +102,8 @@ async def run_ssh_proxy(profile: Profile, credential: str, output: BinaryIO) -> 
         raise
     discard = asyncio.create_task(_discard(process.stderr))
     upstream = asyncio.create_task(pump_stream(reader, FrameWriter(process.stdin, credential)))
-    downstream: asyncio.Task[None] | None = None
+    downstream = asyncio.create_task(pump_stream(process.stdout, writer))
     try:
-        prefix = await _establish(process)
-        downstream = asyncio.create_task(pump_stream(_PrefixedReader(prefix, process.stdout), writer))
         await asyncio.gather(upstream, downstream)
         try:
             code = await asyncio.wait_for(process.wait(), WAIT_TIMEOUT)

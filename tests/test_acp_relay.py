@@ -26,6 +26,12 @@ def test_relay_output_retries_partial_writes() -> None:
     assert stream.getvalue() == b"complete"
 
 
+def test_relay_is_blind_to_protocol_profiles_credentials_and_runtime() -> None:
+    source = Path(__import__("mimir.acp.relay", fromlist=["x"]).__file__).read_text()
+    for forbidden in ("json", "authenticate", "mimir.webKey", "profiles", "credentials", "runtime", "server"):
+        assert forbidden not in source
+
+
 @pytest.mark.asyncio
 async def test_relay_round_trip_and_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = Path("/tmp") / f"mimir-relay-{os.getpid()}"

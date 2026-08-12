@@ -47,6 +47,20 @@ def test_transitive_sink_is_detected(tmp_path: Path) -> None:
         module.assert_policy(paths)
 
 
+@pytest.mark.parametrize(("member", "source"), [
+    ("mimir.acp.proxy", "import requests\nfrom . import profiles, credentials, transport\n"),
+    ("mimir.acp.relay", "from cryptography import x509\nfrom . import transport\n"),
+    ("mimir.acp.credentials", "import keyring\nimport requests\n"),
+])
+def test_per_member_third_party_allowlist_rejects_mutations(tmp_path: Path, member: str, source: str) -> None:
+    paths = dict(module.module_paths(ROOT / "mimir"))
+    path = tmp_path / f"{member.rsplit('.', 1)[-1]}.py"
+    path.write_text(source)
+    paths[member] = path
+    with pytest.raises(AssertionError, match="third-party"):
+        module.assert_policy(paths)
+
+
 def test_entrypoint_acp_branch_has_only_the_client_dispatch() -> None:
     tree = ast.parse((ROOT / "mimir" / "entrypoint.py").read_text())
     branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If))

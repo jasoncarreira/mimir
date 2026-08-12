@@ -78,6 +78,28 @@ def test_symlink_store_is_rejected_without_rewrite(tmp_path: Path) -> None:
     assert target.read_text() == '{"profiles":{},"version":1}\n'
 
 
+def test_read_opens_no_follow_and_rejects_path_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = store(tmp_path)
+    prepare(s, '{"profiles":{},"version":1}\n')
+    target = tmp_path / "target"
+    target.write_text('{"profiles":{"stolen":{"home":"/x","remote":null}},"version":1}\n')
+    real_open = os.open
+    observed: list[int] = []
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if Path(path) == s.path:
+            observed.append(flags)
+            s.path.unlink()
+            s.path.symlink_to(target)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("mimir.acp.profiles.os.open", swapping_open)
+    with pytest.raises(ProfileError, match="unsafe-profile-store"):
+        s.list()
+    assert observed and observed[0] & getattr(os, "O_NOFOLLOW", 0)
+    assert "stolen" in target.read_text()
+
+
 @pytest.mark.parametrize("payload", [
     '{"version":1,"version":1,"profiles":{}}',
     '{"version":1,"profiles":{"p":{"home":"/x","home":"/y","remote":null}}}',

@@ -136,21 +136,28 @@ class ProfileStore:
             raise
 
     def _read(self) -> dict[str, object]:
+        self._validate_parents_if_present()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            value = self.path.lstat()
+            fd = os.open(self.path, flags)
         except FileNotFoundError:
             return {}
         except OSError as exc:
             raise ProfileError("unsafe-profile-store") from exc
-        self._validate_parents()
-        if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode) or value.st_uid != os.getuid() or value.st_mode & 0o077:
-            raise ProfileError("unsafe-profile-store")
         try:
-            document = json.loads(self.path.read_text("utf-8"), object_pairs_hook=_pairs)
+            value = os.fstat(fd)
+            if not stat.S_ISREG(value.st_mode) or value.st_uid != os.getuid() or value.st_mode & 0o077:
+                raise ProfileError("unsafe-profile-store")
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                fd = -1
+                document = json.load(stream, object_pairs_hook=_pairs)
         except ProfileError:
             raise
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ProfileError("invalid-profile-store") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
         if not isinstance(document, dict):
             raise ProfileError("invalid-profile-store")
         version = document.get("version")
@@ -181,6 +188,14 @@ class ProfileStore:
                 raise ProfileError("unsafe-profile-store") from exc
             if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode) or value.st_uid != uid or value.st_mode & 0o077:
                 raise ProfileError("unsafe-profile-store")
+
+    def _validate_parents_if_present(self) -> None:
+        try:
+            self._validate_parents()
+        except ProfileError as exc:
+            if not self.path.parent.exists():
+                return
+            raise exc
 
     def _write(self, profiles: Mapping[str, object]) -> None:
         self._ensure_parents()

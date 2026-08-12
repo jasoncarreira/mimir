@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from keyring.errors import KeyringLocked, NoKeyringError
 
 from mimir.acp import credentials
 from mimir.acp.credentials import SERVICE, CredentialError, CredentialMutationUncertain, NativeCredentialStore
@@ -91,6 +92,26 @@ def test_backend_selection_and_unavailability_are_definite(monkeypatch: pytest.M
     monkeypatch.setitem(__import__("sys").modules, "keyring", SimpleNamespace(get_keyring=lambda: third_party))
     with pytest.raises(CredentialError, match="secure-store-unavailable"):
         credentials._production_backend()
+
+
+@pytest.mark.parametrize("operation", ["get", "delete"])
+@pytest.mark.parametrize("error", [KeyringLocked("locked"), NoKeyringError("missing")])
+def test_locked_or_unavailable_native_store_is_not_a_read_failure(operation: str, error: BaseException) -> None:
+    backend = Backend("key")
+    backend.read_error = error
+    store = NativeCredentialStore(_backend=backend)
+    with pytest.raises(CredentialError, match="secure-store-unavailable"):
+        getattr(store, operation)("default")
+    assert [call[0] for call in backend.calls] == ["get"]
+
+
+@pytest.mark.parametrize("operation", ["get", "delete"])
+def test_other_native_read_errors_remain_credential_read_failed(operation: str) -> None:
+    backend = Backend("key")
+    backend.read_error = RuntimeError("private")
+    store = NativeCredentialStore(_backend=backend)
+    with pytest.raises(CredentialError, match="credential-read-failed"):
+        getattr(store, operation)("default")
 
 
 def test_set_requires_tty_and_maps_input_failures_before_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

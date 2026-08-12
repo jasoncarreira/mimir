@@ -46,6 +46,14 @@ def _production_backend() -> Any:
     return backend
 
 
+def _unavailable_error(exc: BaseException) -> bool:
+    try:
+        from keyring.errors import InitError, KeyringLocked, NoKeyringError
+    except Exception:
+        return False
+    return isinstance(exc, (InitError, KeyringLocked, NoKeyringError))
+
+
 class NativeCredentialStore:
     def __init__(self, *, _backend: Any | None = None) -> None:
         self._backend = _backend
@@ -65,7 +73,8 @@ class NativeCredentialStore:
         except CredentialError:
             raise
         except BaseException as exc:
-            raise CredentialError("credential-read-failed") from exc
+            code = "secure-store-unavailable" if _unavailable_error(exc) else "credential-read-failed"
+            raise CredentialError(code) from exc
         if value is not None and not isinstance(value, str):
             raise CredentialError("credential-read-failed")
         return value
@@ -87,7 +96,8 @@ class NativeCredentialStore:
         try:
             present = backend.get_password(SERVICE, profile)
         except BaseException as exc:
-            raise CredentialError("credential-read-failed") from exc
+            code = "secure-store-unavailable" if _unavailable_error(exc) else "credential-read-failed"
+            raise CredentialError(code) from exc
         if present is None:
             return
         try:
