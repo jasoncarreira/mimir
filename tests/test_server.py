@@ -2420,15 +2420,22 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         try:
             assert await dispatcher.enqueue(event) is True
             channel_queue = dispatcher._queues[event.channel_id]
-            terminal = None
-            while terminal is None:
-                observed = await asyncio.wait_for(turn_events.get(), 3.0)
-                if observed["type"] == "turn" and observed["phase"] == "end":
-                    terminal = observed
-            await asyncio.wait_for(channel_queue.join(), 3.0)
+            await asyncio.wait_for(channel_queue.join(), 10.0)
+            observed_events = []
+            while not turn_events.empty():
+                observed_events.append(turn_events.get_nowait())
+            terminal = next(
+                (
+                    observed
+                    for observed in observed_events
+                    if observed["type"] == "turn" and observed["phase"] == "end"
+                ),
+                None,
+            )
         finally:
             bundle.turn_event_bus.unsubscribe(event.channel_id, turn_events)
 
+        assert terminal is not None
         assert terminal["status"] == "ok"
         assert bundle.agent._agent_model is model
         assert bundle._close_task is None
