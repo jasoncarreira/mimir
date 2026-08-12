@@ -2823,6 +2823,67 @@ def test_undeclared_shell_principal_keeps_shared_profile_behavior() -> None:
     assert bound.tool_call["args"]["mimir_direct_argv"] == authorization_argv
 
 
+@pytest.mark.parametrize(
+    ("command", "declarations", "expected_rule", "secret_value"),
+    [
+        (
+            "gog gmail search *",
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            "shell_control_characters",
+            None,
+        ),
+        (
+            "gog gmail search --plain sensitive-option-value",
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            "declared_command_mismatch",
+            "sensitive-option-value",
+        ),
+        (
+            "curl https://sensitive.example/private-path",
+            None,
+            "profile_allowlist",
+            "https://sensitive.example/private-path",
+        ),
+    ],
+    ids=["shell-control", "declared-command", "profile-allowlist"],
+)
+def test_service_shell_binding_refusal_returns_stable_rule(
+    command: str,
+    declarations: list[dict[str, object]] | None,
+    expected_rule: str,
+    secret_value: str | None,
+) -> None:
+    from mimir.tools import budget_gate
+
+    declared = (
+        access_control.parse_declared_shell_commands(declarations, writable_roots=())
+        if declarations is not None
+        else ()
+    )
+    service = build_trigger_service_principal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=declared,
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": command}),
+        "shell_exec",
+        auth,
+    )
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert refusal.startswith("shell_exec was refused before execution: ")
+    assert refusal.endswith(f" binding_rule={expected_rule}")
+    if secret_value is not None:
+        assert secret_value not in refusal
+
+
 def test_service_shell_final_binding_refusal_emits_hard_denial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

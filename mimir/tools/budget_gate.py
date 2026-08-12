@@ -714,7 +714,8 @@ def _request_for_authorized_execution(
         # future refactor that drops this channel still fails closed rather than
         # reaching a shell.
         args["mimir_shell_refusal"] = (
-            f"{tool_name} was refused before execution: {refusal}"
+            f"{tool_name} was refused before execution: {refusal} "
+            f"binding_rule={binding_rule.value}"
         )
         args["mimir_direct_argv"] = [
             "/usr/bin/false",
