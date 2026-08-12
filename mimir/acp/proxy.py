@@ -10,7 +10,7 @@ from typing import Any, BinaryIO
 
 from .credentials import CredentialError, NativeCredentialStore
 from .profiles import Profile, ProfileError, ProfileStore, selected_profile
-from .transport import pump_bidirectional
+from .transport import close_writer, pump_bidirectional
 
 CONNECT_TIMEOUT = 5.0
 MAX_FRAME_BYTES = 1024 * 1024
@@ -25,28 +25,46 @@ class FrameWriter:
         self._buffer = bytearray()
 
     def write(self, data: bytes) -> None:
-        self._buffer.extend(data)
-        if len(self._buffer) > MAX_FRAME_BYTES and b"\n" not in self._buffer:
+        view = memoryview(data)
+        while view:
+            remaining = MAX_FRAME_BYTES - len(self._buffer)
+            newline = view.tobytes().find(b"\n")
+            if newline < 0:
+                if len(view) > remaining:
+                    raise ProxyError("invalid frame")
+                self._buffer.extend(view)
+                return
+            if newline > remaining:
+                raise ProxyError("invalid frame")
+            self._buffer.extend(view[:newline])
+            view = view[newline + 1:]
+            self._write_frame(bytes(self._buffer))
+            self._buffer.clear()
+
+    def _write_frame(self, frame: bytes) -> None:
+        try:
+            message = json.loads(frame)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProxyError("invalid frame") from exc
+        if not isinstance(message, dict):
             raise ProxyError("invalid frame")
-        while True:
-            end = self._buffer.find(b"\n")
-            if end < 0: return
-            frame = bytes(self._buffer[:end]); del self._buffer[:end + 1]
-            if len(frame) > MAX_FRAME_BYTES: raise ProxyError("invalid frame")
-            try:
-                message = json.loads(frame)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ProxyError("invalid frame") from exc
-            if isinstance(message, dict) and message.get("method") == "authenticate":
-                params = message.get("params")
-                if isinstance(params, dict):
-                    metadata = params.get("_meta")
-                    clean = {key: value for key, value in metadata.items() if isinstance(key, str) and key != "mimir" and not key.startswith("mimir.")} if isinstance(metadata, dict) else {}
-                    clean["mimir.webKey"] = self._credential
-                    params["_meta"] = clean
-            encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
-            if len(encoded) > MAX_FRAME_BYTES: raise ProxyError("invalid frame")
-            self._writer.write(encoded)
+        if message.get("method") == "authenticate":
+            params = message.get("params")
+            if not isinstance(params, dict):
+                raise ProxyError("invalid frame")
+            metadata = params.get("_meta", {})
+            if not isinstance(metadata, dict):
+                raise ProxyError("invalid frame")
+            clean = {
+                key: value for key, value in metadata.items()
+                if key != "mimir" and not key.startswith("mimir.")
+            }
+            clean["mimir.webKey"] = self._credential
+            params["_meta"] = clean
+        encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        if len(encoded) > MAX_FRAME_BYTES:
+            raise ProxyError("invalid frame")
+        self._writer.write(encoded)
 
     async def drain(self) -> None: await self._writer.drain()
     def write_eof(self) -> None:
@@ -100,7 +118,11 @@ def socket_path(profile: Profile) -> Path:
 async def run_local_proxy(profile: Profile, credential: str, output: BinaryIO) -> None:
     path = socket_path(profile)
     upstream_reader, upstream_writer = await asyncio.wait_for(asyncio.open_unix_connection(str(path)), CONNECT_TIMEOUT)
-    stdin_reader, stdout_writer, stdin_transport = await open_stdio(output)
+    try:
+        stdin_reader, stdout_writer, stdin_transport = await open_stdio(output)
+    except BaseException:
+        await close_writer(upstream_writer)
+        raise
     try:
         await pump_bidirectional(stdin_reader, stdout_writer, upstream_reader, FrameWriter(upstream_writer, credential))
     finally:

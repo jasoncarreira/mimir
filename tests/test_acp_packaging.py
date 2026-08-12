@@ -42,6 +42,8 @@ def test_acp_and_mcp_dependency_declarations() -> None:
     assert project["dependencies"].count("keyring==25.7.0") == 1
     assert optional["dev"].count("agent-client-protocol==0.12.0") == 0
     assert dependency_groups["dev"].count("agent-client-protocol==0.12.0") == 0
+    assert optional["dev"].count("keyring==25.7.0") == 0
+    assert dependency_groups["dev"].count("keyring==25.7.0") == 0
 
     assert optional["mcp"] == ["mcp>=1.27"]
     assert optional["dev"].count("mcp>=1.27") == 1
@@ -96,6 +98,9 @@ def test_acp_docs_cover_client_contract() -> None:
     assert "mimir acp credential set" in docs
     assert "mimir-agent acp relay --home" in docs
     assert "stdout" in docs and "JSONL" in docs
+    assert "no plaintext" in docs
+    assert "credential-mutation-uncertain" in docs
+    assert "12 seconds" in docs and "5 seconds" in docs
 
 def test_wheel_guard_matches_finite_acp_source_inventory() -> None:
     members = {member for member in _required_wheel_members() if member.startswith("mimir/acp/")}

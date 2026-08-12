@@ -51,7 +51,16 @@ class _FrameDelivery:
             while True:
                 item = self._queue.get()
                 if item is _END: break
-                payload = cast(bytes, item); self._file.write(payload); self._file.flush()
+                payload = cast(bytes, item)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = self._file.write(remaining)
+                    if written is None:
+                        written = len(remaining)
+                    if written <= 0:
+                        raise BrokenPipeError
+                    remaining = remaining[written:]
+                self._file.flush()
                 with self._lock: self._reserved -= len(payload)
         except BaseException as exc:
             self._error = exc; self._accepting = False; self._loop.call_soon_threadsafe(self._callback, exc)

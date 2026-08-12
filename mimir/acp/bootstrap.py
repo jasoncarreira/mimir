@@ -47,7 +47,7 @@ def _parser(output: BinaryIO) -> argparse.ArgumentParser:
     profile_commands.add_parser("list")
     show = profile_commands.add_parser("show"); show.add_argument("name")
     setp = profile_commands.add_parser("set"); setp.add_argument("name"); setp.add_argument("--home", required=True)
-    setp.add_argument("--ssh-host"); setp.add_argument("--ssh-user"); setp.add_argument("--ssh-port", type=int, default=22)
+    setp.add_argument("--ssh-host"); setp.add_argument("--ssh-user"); setp.add_argument("--ssh-port", type=int)
     setp.add_argument("--identity-file"); setp.add_argument("--known-hosts-file")
     delete = profile_commands.add_parser("delete"); delete.add_argument("name")
     credentials = commands.add_parser("credential")
@@ -80,10 +80,11 @@ def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
             _json(output, profile_json(profile)); return 0
         if args.profile_command == "delete":
             store.delete(args.name); _status("deleted"); return 0
-        remote_values = (args.ssh_host, args.ssh_user, args.identity_file, args.known_hosts_file)
-        any_remote = any(value is not None for value in remote_values) or args.ssh_port != 22
-        if any_remote and any(value is None for value in remote_values): raise ProfileError()
-        remote = None if not any_remote else RemoteProfile(args.ssh_host, args.ssh_user, args.ssh_port, Path(args.identity_file), Path(args.known_hosts_file))
+        remote_values = (args.ssh_host, args.ssh_user, args.ssh_port, args.identity_file, args.known_hosts_file)
+        any_remote = any(value is not None for value in remote_values)
+        required_remote = (args.ssh_host, args.ssh_user, args.identity_file, args.known_hosts_file)
+        if any_remote and any(value is None for value in required_remote): raise ProfileError()
+        remote = None if not any_remote else RemoteProfile(args.ssh_host, args.ssh_user, args.ssh_port or 22, Path(args.identity_file), Path(args.known_hosts_file))
         store.set(Profile(args.name, Path(args.home), remote)); _status("updated"); return 0
     except ProfileError as exc: return _error(exc.code)
     except OSError: return _error("unsafe-profile-store")
@@ -98,6 +99,7 @@ def _credential_command(args: argparse.Namespace) -> int:
         store = NativeCredentialStore()
         if args.credential_command == "status": _status("stored" if store.get(name) is not None else "missing"); return 0
         if args.credential_command == "delete": store.delete(name); _status("deleted"); return 0
+        store.require_available()
         secret = read_secret_from_tty(); store.set(name, secret); _status("updated"); return 0
     except CredentialMutationUncertain: _status("error: credential-mutation-uncertain"); return 3
     except CredentialError as exc: return _error(exc.code)

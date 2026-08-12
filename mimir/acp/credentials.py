@@ -47,13 +47,16 @@ def _production_backend() -> Any:
 
 
 class NativeCredentialStore:
-    def __init__(self, backend: Any | None = None) -> None:
-        self._backend = backend
+    def __init__(self, *, _backend: Any | None = None) -> None:
+        self._backend = _backend
 
     def _native(self) -> Any:
         if self._backend is None:
             self._backend = _production_backend()
         return self._backend
+
+    def require_available(self) -> None:
+        self._native()
 
     def get(self, profile: str) -> str | None:
         _validate(profile)
@@ -109,7 +112,7 @@ def read_secret_from_tty(prompt: Callable[..., str] = getpass.getpass) -> str:
         with os.fdopen(fd, "r+", encoding="utf-8", closefd=False) as tty:
             try:
                 return prompt("Credential: ", stream=tty)
-            except (EOFError, KeyboardInterrupt, Exception) as exc:
+            except BaseException as exc:
                 raise CredentialError("credential-input-failed") from exc
     finally:
         os.close(fd)
