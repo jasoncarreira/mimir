@@ -15,6 +15,11 @@ from mimir.contained_execution import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_explicit_opencode_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+
+
 class Capability:
     path = Path("/issued/checkout")
 
