@@ -173,8 +173,35 @@ def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
     from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
 
     profile = TRIGGER_AUTHORITY_PROFILES["research"]
-    assert {"memory_store", "saga_feedback", "saga_mark_contributions"} <= profile
+    assert {
+        "memory_store",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_record_skill_learning",
+    } <= profile
     assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+
+
+def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "research-agent"
+    persist_dir.mkdir(parents=True)
+
+    authority = _parse_poller_authority(
+        _authority(
+            capabilities=["saga_record_skill_learning"],
+            scoped_roots=[],
+        ),
+        name="research-agent",
+        persist_dir=persist_dir,
+        state_root=tmp_path / "state" / "pollers",
+        manifest_path=tmp_path / "skills" / "research-agent" / "pollers.json",
+    )
+
+    assert authority.capabilities == ("saga_record_skill_learning",)
+    assert authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert authority.readable_domains == ("poller_payload",)
+    assert authority.sink_destinations == ("saga",)
+    assert "saga_end_session" not in authority.capabilities
 
 
 def test_github_profile_allows_only_its_bounded_fetch_capability(
