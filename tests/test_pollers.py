@@ -99,6 +99,12 @@ def _install_script(skill_dir: Path, name: str, body: str) -> Path:
     return script
 
 
+_REQUIRES_DEPLOYMENT_BASH = pytest.mark.skipif(
+    not Path("/usr/bin/bash").exists(),
+    reason="requires deployment-image executable path /usr/bin/bash",
+)
+
+
 # ─── discover_pollers ────────────────────────────────────────────────
 
 
@@ -272,6 +278,7 @@ def test_non_github_poller_cannot_claim_unbounded_fetch_capability(
         )
 
 
+@_REQUIRES_DEPLOYMENT_BASH
 def test_shipped_poller_shell_authorities_have_job_inspection_companions(
     tmp_path: Path,
 ) -> None:
