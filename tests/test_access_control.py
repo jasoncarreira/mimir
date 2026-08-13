@@ -1264,6 +1264,46 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
     assert "shell_process" not in principal.sink_destinations
 
 
+def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
+    tmp_path: Path,
+) -> None:
+    from mimir.models import SourceLabel
+
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="github-user",
+        domain="github",
+        resource_id="owner/repo#1",
+        bridge_instance="github",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="poller",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+    assert labels.has_untrusted_active_ingest is True
+    assert "rebuild_index" in principal.capabilities
+    assert access_control.TRIGGER_CAPABILITY_TIERS["rebuild_index"] is (
+        CapabilityTier.SCOPE_CONTAINED
+    )
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, InformationFlowLabels()),
+        enforce=True,
+    ).allowed is True
+    tainted_decision = registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, labels),
+        enforce=True,
+    )
+    assert tainted_decision.allowed is False
+    assert tainted_decision.argument_egress == "taint_gated"
+
+
 @pytest.mark.parametrize(
     "command",
     (

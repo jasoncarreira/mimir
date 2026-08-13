@@ -414,6 +414,7 @@ class ServicePrincipal:
 TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "write_file": CapabilityTier.SCOPE_CONTAINED,
     "edit_file": CapabilityTier.SCOPE_CONTAINED,
+    "rebuild_index": CapabilityTier.SCOPE_CONTAINED,
     "shell_exec": CapabilityTier.SCOPE_CONTAINED,
     "bash_async": CapabilityTier.SCOPE_CONTAINED,
     "bash_jobs_list": CapabilityTier.SCOPE_CONTAINED,
@@ -547,7 +548,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "bash_jobs_list", "bash_job_output",
         "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
         "agrep", "file_search", "get_turn", "mimir_get_turn",
-        "write_file", "edit_file", "pr_metadata", "pr_checks", "pr_reviews",
+        "write_file", "edit_file", "rebuild_index", "pr_metadata", "pr_checks",
+        "pr_reviews",
     }),
 }
 
@@ -4505,6 +4507,13 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
     SinkCategory.EXTERNAL_MCP: "external_mcp",
 }
 
+# Operations in this set have no caller-supplied destination: each writes only
+# fixed, derived paths, so the ordinary target adapter has nothing to validate.
+# Taint gating still applies upstream at the capability-tier gate; membership
+# here bypasses only destination checks. Keep membership narrow: a candidate
+# must accept no caller-selected target and write only fixed derived destinations.
+_FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
+
 
 _TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({"fetch_url", "web_search"})
 
@@ -5091,9 +5100,11 @@ class SinkGate:
                 service_target_allowed = _target_within_active_pr_checkout_lease(
                     target, review_state,
                 )
+            fixed_file_destination = tool_name in _FIXED_SERVICE_SINK_OPERATIONS
             synthesis_scope_denied = (
                 service.canonical == "synthesis"
                 and sink_category is SinkCategory.FILE
+                and not fixed_file_destination
                 and resolve_large_tool_results_target(target) is None
                 and not _synthesis_target_matches_session(
                     target, getattr(auth_context, "channel_id", None),
@@ -5143,9 +5154,9 @@ class SinkGate:
                             "repo_pr_target_outside_active_lease"
                         )
             if (
-                adapter is None
+                (adapter is None and not fixed_file_destination)
                 or synthesis_scope_denied
-                or not service_target_allowed
+                or (not service_target_allowed and not fixed_file_destination)
                 or github_repo_scope_refusal is not None
             ):
                 return ToolAuthorization(
@@ -8134,7 +8145,9 @@ def _capability_matrix_errors() -> list[str]:
                 SinkCategory.HTTP_WEBHOOK,
                 SinkCategory.NETWORK,
                 SinkCategory.EXTERNAL_MCP,
-            } and operation not in policies_by_operation:
+            } and operation not in policies_by_operation and (
+                operation not in _FIXED_SERVICE_SINK_OPERATIONS
+            ):
                 errors.append(
                     f"Service principal '{principal.canonical}' capability "
                     f"'{operation}' has no executable destination policy"

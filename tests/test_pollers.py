@@ -204,6 +204,28 @@ def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None
     assert "saga_end_session" not in authority.capabilities
 
 
+def test_session_boundary_poller_can_declare_rebuild_index(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "session-boundary"
+    persist_dir.mkdir(parents=True)
+
+    authority = _parse_poller_authority(
+        _authority(
+            profile="session-boundary",
+            tier="scoped-with-provenance",
+            capabilities=["rebuild_index"],
+            scoped_roots=[],
+        ),
+        name="session-boundary",
+        persist_dir=persist_dir,
+        state_root=tmp_path / "state" / "pollers",
+        manifest_path=tmp_path / "skills" / "session-boundary" / "pollers.json",
+    )
+
+    assert authority.capabilities == ("rebuild_index",)
+    assert authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert authority.sink_destinations == ("filesystem",)
+
+
 def test_github_profile_allows_only_its_bounded_fetch_capability(
     tmp_path: Path,
 ) -> None:
