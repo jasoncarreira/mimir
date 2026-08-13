@@ -317,7 +317,6 @@ async def test_truncation_keeps_the_whole_cap_when_no_secret_spans_the_cut(
 def test_safe_truncation_length_moves_the_cut_off_a_spanning_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     scrubber = _secret_scrubber()
     payload = _TRUNCATION_OUTPUT
     start = payload.index(_SECRET)
