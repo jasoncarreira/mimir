@@ -4509,12 +4509,9 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 
 # Operations in this set have no caller-supplied destination: each writes only
 # fixed, derived paths, so the ordinary target adapter has nothing to validate.
-# They are also deliberately taint-independent for every principal holding the
-# capability (currently including synthesis and github). ``rebuild_index`` only
-# regenerates INDEX.md files from data already on disk, and the post-turn hook
-# performs the same rebuild unconditionally, including after tainted turns.
-# Keep membership narrow: a candidate must accept no caller-selected target,
-# write only fixed derived destinations, and be safe under untrusted ingest.
+# Taint gating still applies upstream at the capability-tier gate; membership
+# here bypasses only destination checks. Keep membership narrow: a candidate
+# must accept no caller-selected target and write only fixed derived destinations.
 _FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
 
 

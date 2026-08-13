@@ -1264,7 +1264,7 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
     assert "shell_process" not in principal.sink_destinations
 
 
-def test_synthesis_builtin_authorizes_tainted_scope_contained_index_rebuild(
+def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
     tmp_path: Path,
 ) -> None:
     from mimir.models import SourceLabel
@@ -1289,11 +1289,19 @@ def test_synthesis_builtin_authorizes_tainted_scope_contained_index_rebuild(
     assert access_control.TRIGGER_CAPABILITY_TIERS["rebuild_index"] is (
         CapabilityTier.SCOPE_CONTAINED
     )
-    assert ToolRegistry().authorize_tool(
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, InformationFlowLabels()),
+        enforce=True,
+    ).allowed is True
+    tainted_decision = registry.authorize_tool(
         "rebuild_index",
         _service_auth(principal, labels),
         enforce=True,
-    ).allowed is True
+    )
+    assert tainted_decision.allowed is False
+    assert tainted_decision.argument_egress == "taint_gated"
 
 
 @pytest.mark.parametrize(
