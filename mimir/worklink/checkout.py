@@ -378,7 +378,7 @@ def _normalize_directory_fd(directory_fd: int, owner_uid: int, group_gid: int) -
             finally:
                 os.close(child_fd)
         elif stat.S_ISREG(value.st_mode):
-            executable = bool(value.st_mode & 0o111)
+            execute_bits = 0o110 if value.st_mode & 0o111 else 0
             if value.st_nlink > 1:
                 _copy_unlinked_file(directory_fd, name, value)
                 value = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -390,7 +390,6 @@ def _normalize_directory_fd(directory_fd: int, owner_uid: int, group_gid: int) -
                 ) != (value.st_dev, value.st_ino):
                     raise RuntimeError("checkout entry changed during normalization")
                 os.fchown(entry_fd, owner_uid, group_gid)
-                execute_bits = value.st_mode & 0o111 if executable else 0
                 os.fchmod(entry_fd, 0o660 | execute_bits)
             finally:
                 os.close(entry_fd)
