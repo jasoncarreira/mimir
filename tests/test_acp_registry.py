@@ -101,7 +101,7 @@ def test_topology_daemon_contract() -> None:
         "owner-only daemon socket",
         "One already-running `mimir run` daemon owns the brain",
         "The proxy never creates a standalone runtime.",
-        "`MIMIR_ACP_ENABLED` is unset or true",
+        "ACP is enabled when `MIMIR_ACP_ENABLED` is unset or true and disabled when it is false.",
         "`$MIMIR_HOME/.mimir/acp/daemon.sock`",
         "mode `0700`",
         "mode `0600`",
@@ -119,7 +119,8 @@ def test_timing_contract() -> None:
 def test_profile_commands_exact() -> None:
     block = fenced("sh")[0]
     assert block.splitlines() == PROFILE_COMMANDS
-    assert "MIMIR_ACP_PROFILE" in section("## Profiles and credentials", "## SSH transport")
+    profile_text = section("## Profiles and credentials", "## SSH transport")
+    assert "`MIMIR_ACP_PROFILE` may select a non-secret profile name only; it must never contain a key." in profile_text
     assert not {"--destination", "--remote-home", "--identity"} & set(re.findall(r"--[a-z-]+", block))
 
 
@@ -128,24 +129,28 @@ def test_credentials_auth_and_rotation() -> None:
     for value in [
         "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --admin",
         "without echo",
-        "service `mimir.acp`",
-        "server stores only its hash",
-        "no plaintext or third-party fallback",
-        "fails if no secure backend exists",
+        "The raw key exists only in the client's native OS credential store under service `mimir.acp`; the server stores only its hash.",
+        "There is no plaintext or third-party fallback, and enrollment fails if no secure backend exists.",
+        "The raw key must never appear as an SSH password, in `sshpass` or PAM reuse, argv, an environment variable, editor JSON, profile JSON, or registry data.",
         "`MIMIR_API_KEY` supplies transport/route authority and is not the ACP principal key",
         "only `methodId`",
         "protected upstream authenticate request",
         "non-service admin identity",
+        "Validate enrollment by launching `mimir acp --profile PROFILE` from a stock client and completing its ordinary `authenticate` exchange.",
         "There is no `credential validate` command or pre-activation validation protocol.",
-        "mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --rotate-only",
-        "immediately invalidates the old key",
-        "mimir acp credential replace PROFILE",
-        "expected outage between steps 1 and 2",
-        "no rollback to the old key",
-        "mimir identities revoke-key --home /absolute/server/mimir-home CANONICAL",
-        "mimir acp credential remove PROFILE",
     ]:
         assert value in text
+
+    ordered_rotation = [
+        "1. On the server, run `mimir identities issue-key --home /absolute/server/mimir-home CANONICAL --rotate-only`. It immediately invalidates the old key and prints the new key once.",
+        "2. On the client, run `mimir acp credential replace PROFILE` and enter the new value.",
+        "3. Reconnect with `mimir acp --profile PROFILE`.",
+        "There is an expected outage between steps 1 and 2 and no rollback to the old key.",
+        "To recover, issue another key and replace the client value again.",
+        "To retire an identity, first run `mimir identities revoke-key --home /absolute/server/mimir-home CANONICAL` on the server, then `mimir acp credential remove PROFILE` on the client.",
+    ]
+    positions = [text.index(value) for value in ordered_rotation]
+    assert positions == sorted(positions)
 
 
 def test_ssh_policy_and_trust_boundary() -> None:
@@ -158,6 +163,7 @@ def test_ssh_policy_and_trust_boundary() -> None:
         "strict host-key verification",
         "no forwarding, SSH agent, or TTY",
         "mode `0600`",
+        "the known-hosts file must be owner-controlled and not group- or world-writable",
         'restrict,command="mimir-agent acp relay --home /absolute/server/mimir-home"',
         "optional defense in depth, not required product behavior",
         "MOTD, banner, or shell rc output",
@@ -264,3 +270,34 @@ def test_examples_do_not_leak_secrets_or_invent_commands() -> None:
         assert forbidden not in examples
     assert "launches a standalone runtime" not in DOCS
     assert "proxy never creates a standalone runtime" in DOCS
+
+
+def test_docs_reject_affirmative_ide_and_arbitrary_mcp_claims() -> None:
+    prose = "\n".join(
+        re.sub(r"```.*?```", "", path.read_text(), flags=re.DOTALL)
+        for path in sorted((ROOT / "docs").rglob("*.md"))
+    )
+    claim_units = re.split(r"(?<=[.!?])\s+|[\r\n]+", prose)
+    negative_terms = re.compile(
+        r"\b(?:not|never|cannot|can't|unsupported|incompatible|disabled?|disables|rejected?|prohibited)\b"
+    )
+    relevant_claims = [
+        unit
+        for unit in claim_units
+        if (
+            "mcp" in unit.lower()
+            and any(name in unit.lower() for name in ("jetbrains", "intellij", "ide's integrated", "ide integrated"))
+        )
+        or bool(re.search(r"\barbitrary\b.{0,30}\b(?:providers?|servers?)\b", unit, re.IGNORECASE))
+    ]
+    assert relevant_claims
+    assert all(negative_terms.search(unit.lower()) for unit in relevant_claims)
+
+    affirmative_claim = re.compile(
+        r"(?:jetbrains|intellij|idea)\b[^.;\n]{0,80}\b"
+        r"(?:supports?|accepts?|admits?|allows?|enables?|is compatible with|works? with)\b"
+        r"|\barbitrary(?: mcp)? providers? (?:is|are) "
+        r"(?:supported|accepted|admitted|allowed|enabled|compatible)\b",
+        re.IGNORECASE,
+    )
+    assert not affirmative_claim.search(prose)
