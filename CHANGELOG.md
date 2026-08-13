@@ -6,6 +6,37 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-08-13
+
+A patch release carrying one change: the poller shell remediation from #1449,
+which did not make 0.8.2. No operator action is required.
+
+### Changed
+
+- `gmail-poller` and `social-cli` declare the shell commands their poller turns
+  actually run, via wrapper scripts that hold the working directory and
+  environment those turns previously had to shell-prefix by hand.
+
+  The calls were being refused for SHAPE, not authority: `cd … && social-cli`,
+  `export PYTHONPATH=… && python3 -c …`, `source …/activate && …`, and
+  `ls … 2>/dev/null` are compounds, redirects and code-from-argv, none of which
+  bind to a single argv no matter what capability is granted. Of roughly 290
+  recorded attempts across the three pollers, about 15 were bindable as written.
+
+  A wrapper moves the environment and working directory inside a pinned script,
+  leaving one bindable argv outside — the pattern `run-fetch-news.sh` already
+  established. The wrappers live under `<skill>/scripts/`, writable only on a
+  trusted-operator turn, so a poller turn cannot rewrite what it is about to run.
+
+  The `research` authority profile gains exactly three capabilities to make this
+  possible — `shell_exec`, `bash_jobs_list` and `bash_job_output` — taking it from
+  17 to 20. The two job-inspection capabilities are companions that
+  `_missing_capability_companions` requires: without them the principal fails to
+  construct rather than degrading. This is a **ceiling**, not a grant: a
+  research-profile poller gains nothing until its own manifest declares the
+  capability, and only these three manifests do.
+
+
 ## [0.8.2] — 2026-08-13
 
 A patch release. Unlike 0.8.1, **no operator action is required**: no dependency
