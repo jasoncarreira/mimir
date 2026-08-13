@@ -167,10 +167,11 @@ def test_labels_without_source_provenance_fail_closed():
 
 
 @pytest.mark.parametrize(
-    ("trigger", "service_principal", "channel_id", "source", "integrity"),
+    ("trigger", "service_principal", "channel_id", "source", "integrity", "sensitivity"),
     [
-        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None, "trusted"),
-        ("saga_session_end", "synthesis", "synthesis:session", "system", "trusted"),
+        ("scheduled_tick", "scheduler", "scheduler:heartbeat", None, "trusted", "internal"),
+        ("saga_session_end", "synthesis", "synthesis:session", "system", "trusted", "internal"),
+        ("upgrade", "system", "upgrade:defaults", "system", "trusted", "private"),
     ],
 )
 def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enforce(
@@ -179,6 +180,7 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
     channel_id: str,
     source: str | None,
     integrity: str,
+    sensitivity: str,
 ):
     event = AgentEvent(
         trigger=trigger,
@@ -195,7 +197,7 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
             domain="channel",
             resource_id=channel_id,
             bridge_instance=source or f"service:{service_principal}",
-            sensitivity="internal",
+            sensitivity=sensitivity,
             authorized_principals=frozenset({f"service:{service_principal}"}),
             source_kind="service",
             integrity=integrity,
@@ -215,7 +217,11 @@ def test_trusted_authorless_service_can_egress_to_triggering_channel_under_enfor
 
 @pytest.mark.parametrize(
     ("trigger", "service_principal"),
-    [("scheduled_tick", "scheduler"), ("saga_session_end", "synthesis")],
+    [
+        ("scheduled_tick", "scheduler"),
+        ("saga_session_end", "synthesis"),
+        ("upgrade", "system"),
+    ],
 )
 def test_service_ingress_marker_prevents_trusted_integrity(
     trigger: str,
@@ -663,9 +669,96 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     assert reply.allowed is True
     assert cross_channel.allowed is False
     assert declassification.allowed is True
-    assert incompatible_reply.allowed is False
+    assert incompatible_reply.allowed is True
     assert harness.allowed is True
     assert harness.reason == "harness_metadata_display"
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    ["user_message", "poller", "scheduled_tick", "saga_session_end", "upgrade"],
+)
+def test_untrusted_ingest_can_reach_only_server_configured_operator_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+) -> None:
+    operator_channel = "slack-operator-alerts"
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", operator_channel)
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id="slack-origin" if trigger == "user_message" else f"{trigger}:work",
+        author="user-1" if trigger == "user_message" else None,
+        source="slack" if trigger == "user_message" else "system",
+    )
+    labels = _initialize_ifc_labels(event).with_source(SourceLabel(
+        principal="https://attacker.invalid",
+        domain="web",
+        resource_id="https://attacker.invalid/instructions",
+        bridge_instance="web_search",
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        interactivity=(
+            TurnInteractivity.INTERACTIVE
+            if trigger == "user_message"
+            else TurnInteractivity.NON_INTERACTIVE
+        ),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    allowed = SinkGate.check_sink_flow(
+        "send_message", operator_channel, labels, auth, enforce=True,
+    )
+    sentinel = SinkGate.check_sink_flow(
+        "send_message", "OPERATOR_CHANNEL", labels, auth, enforce=True,
+    )
+
+    assert allowed.allowed is True
+    assert sentinel.allowed is False
+    assert labels.has_untrusted_active_ingest is True
+    if trigger == "upgrade":
+        external_content_sink = SinkGate.check_sink_flow(
+            "shell_exec", "pwd", labels, auth, enforce=True,
+        )
+        assert external_content_sink.allowed is False
+        assert external_content_sink.reason == "ifc_label_blocked:shell_process"
+
+
+@pytest.mark.parametrize("trigger", ["poller", "scheduled_tick", "saga_session_end"])
+def test_non_user_trigger_does_not_gain_originating_channel_carveout(trigger: str) -> None:
+    event = AgentEvent(
+        trigger=trigger,
+        channel_id=f"{trigger}:work",
+        source="system",
+    )
+    labels = _initialize_ifc_labels(event).with_source(SourceLabel(
+        principal="external",
+        domain="web",
+        resource_id="external-result",
+        bridge_instance="web_search",
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=labels),
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "send_message", event.channel_id, labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources():
@@ -698,7 +791,7 @@ def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources
             tool, event.channel_id, untrusted_labels, auth, enforce=True,
         )
         assert trusted.allowed is True, (tool, trusted.reason)
-        assert untrusted.allowed is False, (tool, untrusted.reason)
+        assert untrusted.allowed is (tool == "send_message"), (tool, untrusted.reason)
 
 
 def test_protected_prompt_sources_are_informational():

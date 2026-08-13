@@ -35,6 +35,7 @@ from mimir.chat_skills import (
     ChatSkillInvocation,
     ChatSkillRegistry,
 )
+from mimir.channel_registry import ChannelRegistry
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
@@ -605,6 +606,79 @@ class _PromptEgressProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _WebSearchReplyProbeAgent(_FakeAgent):
+    """Run protected searches, then reply through the live enforced middleware."""
+
+    def __init__(self, channel_id: str) -> None:
+        super().__init__([AIMessage(content="complete")])
+        self.channel_id = channel_id
+        self.search_results: list[ToolMessage] = []
+        self.reply_result: ToolMessage | None = None
+        self.reply_calls = 0
+        self.labels_after_reply: InformationFlowLabels | None = None
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+
+        gate = BudgetGateMiddleware()
+
+        async def search_handler(req: ToolCallRequest) -> ToolMessage:
+            return ToolMessage(
+                content="untrusted search result",
+                tool_call_id=req.tool_call["id"],
+            )
+
+        for index in range(3):
+            self.search_results.append(await gate.awrap_tool_call(
+                ToolCallRequest(
+                    tool_call={
+                        "name": "web_search",
+                        "args": {"query": f"query {index}"},
+                        "id": f"tc-search-{index}",
+                        "type": "tool_call",
+                    },
+                    tool=None,
+                    state=None,
+                    runtime=Runtime(context=context),
+                ),
+                search_handler,
+            ))
+
+        async def reply_handler(req: ToolCallRequest) -> ToolMessage:
+            self.reply_calls += 1
+            return ToolMessage(content="sent", tool_call_id=req.tool_call["id"])
+
+        self.reply_result = await gate.awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "send_message",
+                    "args": {"channel_id": self.channel_id, "text": "reply"},
+                    "id": "tc-reply",
+                    "type": "tool_call",
+                },
+                tool=None,
+                state=None,
+                runtime=Runtime(context=context),
+            ),
+            reply_handler,
+        )
+        turn = get_current_turn()
+        assert turn is not None
+        self.labels_after_reply = turn.auth_context.ifc_state.current()
+
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _FakeChannelSession:
     """Tiny ChannelSession stand-in. Real ChannelSession is a dataclass
     in session_manager.py; we only need the ``saga_session_id`` attribute
@@ -1126,6 +1200,46 @@ async def test_run_turn_forked_tool_uses_merged_ifc_labels_from_auth_carrier(
     assert fake_agent.result.status == "error"
     assert "ifc_label_blocked:same_channel" in str(fake_agent.result.content)
     assert fake_agent.handler_calls == 0
+
+
+async def test_user_turn_web_searches_then_replies_to_origin_under_enforcement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    channel_id = "ch-C1"
+    fake_agent = _WebSearchReplyProbeAgent(channel_id)
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    channels = ChannelRegistry()
+    channels.register(_BridgeStub())  # type: ignore[arg-type]
+    agent._channels = channels
+    agent._config.access_control_enforced = True
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        """
+        people:
+          - canonical: alice
+            aliases: [stub-U1]
+            access: {roles: [user]}
+        """,
+    )
+    agent._buffer.resolver = agent._identity_resolver
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=channel_id,
+        content="search several sources and reply",
+        author="stub-U1",
+        source="stub",
+    ))
+
+    assert record.error is None
+    assert all(result.status != "error" for result in fake_agent.search_results)
+    assert fake_agent.reply_result is not None
+    assert fake_agent.reply_result.status != "error", fake_agent.reply_result.content
+    assert fake_agent.reply_calls == 1
+    assert fake_agent.labels_after_reply is not None
+    assert fake_agent.labels_after_reply.has_untrusted_active_ingest is True
 
 
 async def test_run_turn_omits_other_users_feedback_before_enforced_egress(
