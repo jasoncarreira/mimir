@@ -4,8 +4,8 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Mapping
@@ -135,15 +135,77 @@ class ProfileStore:
                 return False
             raise
 
-    def _read(self) -> dict[str, object]:
-        self._validate_parents_if_present()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    def _open_parent(self, *, create: bool) -> int | None:
+        """Open the store directory without following any pathname symlinks.
+
+        The three store-owned directories (the configured root, ``mimir``, and
+        ``acp``) must be private.  Components before the configured root are
+        traversed without following symlinks too, but their normal system
+        permissions are not constrained.
+        """
+        path = self.path
+        if not path.is_absolute():
+            raise ProfileError("unsafe-profile-store")
+        directories = path.parent.parts[1:]
+        if (
+            len(directories) < 3
+            or path.name in {"", ".", ".."}
+            or any(component in {"", ".", ".."} for component in directories)
+        ):
+            raise ProfileError("unsafe-profile-store")
+        private_from = len(directories) - 3
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(self.path, flags)
-        except FileNotFoundError:
-            return {}
+            fd = os.open(os.sep, flags)
         except OSError as exc:
             raise ProfileError("unsafe-profile-store") from exc
+        try:
+            for index, component in enumerate(directories):
+                try:
+                    child = os.open(component, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        os.close(fd)
+                        return None
+                    # The store never creates directories outside its configured
+                    # root.  Doing so would make a typo in XDG_CONFIG_HOME
+                    # unexpectedly mutate an unrelated part of the filesystem.
+                    if index < private_from:
+                        raise ProfileError("unsafe-profile-store")
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    child = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                value = os.fstat(fd)
+                if not stat.S_ISDIR(value.st_mode):
+                    raise ProfileError("unsafe-profile-store")
+                if index >= private_from and (value.st_uid != os.getuid() or value.st_mode & 0o077):
+                    raise ProfileError("unsafe-profile-store")
+            return fd
+        except ProfileError:
+            os.close(fd)
+            raise
+        except OSError as exc:
+            os.close(fd)
+            raise ProfileError("unsafe-profile-store") from exc
+
+    def _read(self) -> dict[str, object]:
+        parent_fd = self._open_parent(create=False)
+        if parent_fd is None:
+            return {}
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            try:
+                fd = os.open(self.path.name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return {}
+            except OSError as exc:
+                raise ProfileError("unsafe-profile-store") from exc
+        finally:
+            os.close(parent_fd)
         try:
             value = os.fstat(fd)
             if not stat.S_ISREG(value.st_mode) or value.st_uid != os.getuid() or value.st_mode & 0o077:
@@ -179,66 +241,65 @@ class ProfileStore:
                 raise
         return dict(profiles)
 
-    def _validate_parents(self) -> None:
-        uid = os.getuid()
-        for directory in (self.path.parent.parent, self.path.parent):
-            try:
-                value = directory.lstat()
-            except OSError as exc:
-                raise ProfileError("unsafe-profile-store") from exc
-            if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode) or value.st_uid != uid or value.st_mode & 0o077:
-                raise ProfileError("unsafe-profile-store")
-
-    def _validate_parents_if_present(self) -> None:
-        uid = os.getuid()
-        for directory in (self.path.parent.parent, self.path.parent):
-            try:
-                value = directory.lstat()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise ProfileError("unsafe-profile-store") from exc
-            if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode) or value.st_uid != uid or value.st_mode & 0o077:
-                raise ProfileError("unsafe-profile-store")
+    @staticmethod
+    def _safe_file(fd: int) -> bool:
+        value = os.fstat(fd)
+        return stat.S_ISREG(value.st_mode) and value.st_uid == os.getuid() and not value.st_mode & 0o077
 
     def _write(self, profiles: Mapping[str, object]) -> None:
-        self._ensure_parents()
-        try:
-            existing = self.path.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid() or existing.st_mode & 0o077:
-                raise ProfileError("unsafe-profile-store")
         payload = json.dumps({"version": 1, "profiles": dict(profiles)}, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-        fd, name = tempfile.mkstemp(prefix=".profiles.", dir=self.path.parent)
-        temporary = Path(name)
+        parent_fd = self._open_parent(create=True)
+        assert parent_fd is not None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        temporary: str | None = None
+        fd = -1
         try:
+            try:
+                existing_fd = os.open(self.path.name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ProfileError("unsafe-profile-store") from exc
+            else:
+                try:
+                    if not self._safe_file(existing_fd):
+                        raise ProfileError("unsafe-profile-store")
+                finally:
+                    os.close(existing_fd)
+
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            for _ in range(100):
+                candidate = f".profiles.{secrets.token_hex(8)}"
+                try:
+                    fd = os.open(candidate, create_flags, 0o600, dir_fd=parent_fd)
+                except FileExistsError:
+                    continue
+                temporary = candidate
+                break
+            else:
+                raise ProfileError("unsafe-profile-store")
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 fd = -1
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try: os.fsync(directory_fd)
-            finally: os.close(directory_fd)
+            os.replace(temporary, self.path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            temporary = None
+            os.fsync(parent_fd)
+        except ProfileError:
+            raise
+        except OSError as exc:
+            raise ProfileError("unsafe-profile-store") from exc
         finally:
-            if fd >= 0: os.close(fd)
-            try: temporary.unlink()
-            except FileNotFoundError: pass
-
-    def _ensure_parents(self) -> None:
-        self._validate_parents_if_present()
-        missing: list[Path] = []
-        current = self.path.parent
-        while not current.exists():
-            missing.append(current); current = current.parent
-        for directory in reversed(missing):
-            directory.mkdir(mode=0o700)
-            os.chmod(directory, 0o700)
-        self._validate_parents()
+            if fd >= 0:
+                os.close(fd)
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(parent_fd)
 
     @staticmethod
     def _encode(profile: Profile) -> dict[str, object]:

@@ -46,6 +46,72 @@ def test_symlinked_ancestor_is_rejected_without_creating_through_it(tmp_path: Pa
     assert not (target / "acp").exists()
 
 
+def test_config_root_is_private_before_descendants_are_created(tmp_path: Path) -> None:
+    s = store(tmp_path)
+    os.chmod(tmp_path, 0o755)
+    try:
+        with pytest.raises(ProfileError, match="unsafe-profile-store"):
+            s.set(Profile("default", Path("/x")))
+        assert not (tmp_path / "mimir").exists()
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+
+def test_parent_traversal_component_is_rejected_without_mutation(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    s = ProfileStore(target / ".." / "escaped" / "mimir" / "acp" / "profiles.json")
+
+    with pytest.raises(ProfileError, match="unsafe-profile-store"):
+        s.set(Profile("default", Path("/x")))
+
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_symlink_before_config_root_is_rejected_without_target_mutation(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    s = ProfileStore(link / "config" / "mimir" / "acp" / "profiles.json")
+
+    with pytest.raises(ProfileError, match="unsafe-profile-store"):
+        s.set(Profile("default", Path("/x")))
+
+    assert list(target.iterdir()) == []
+
+
+def test_write_keeps_validated_ancestor_descriptor_during_swap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = store(tmp_path)
+    s.set(Profile("old", Path("/old")))
+    mimir = s.path.parent.parent
+    detached = tmp_path / "detached"
+    attacker = tmp_path / "attacker"
+    (attacker / "acp").mkdir(parents=True, mode=0o700)
+    os.chmod(attacker, 0o700)
+    os.chmod(attacker / "acp", 0o700)
+    real_open = os.open
+    acp_opens = 0
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal acp_opens
+        if path == "acp" and kwargs.get("dir_fd") is not None:
+            acp_opens += 1
+            # set() traverses once to read and again to write.  Swap only after
+            # the write traversal has already opened and validated ``mimir``.
+            if acp_opens == 2:
+                mimir.rename(detached)
+                mimir.symlink_to(attacker, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("mimir.acp.profiles.os.open", swapping_open)
+    s.set(Profile("new", Path("/new")))
+
+    assert acp_opens == 2
+    assert not (attacker / "acp" / "profiles.json").exists()
+    saved = json.loads((detached / "acp" / "profiles.json").read_text())
+    assert set(saved["profiles"]) == {"old", "new"}
+
 def test_list_is_sorted_names_only_canonical_json(tmp_path: Path) -> None:
     s = store(tmp_path)
     s.set(Profile("z", Path("/z")))
@@ -105,7 +171,7 @@ def test_read_opens_no_follow_and_rejects_path_swap(tmp_path: Path, monkeypatch:
     observed: list[int] = []
 
     def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
-        if Path(path) == s.path:
+        if path == s.path.name and kwargs.get("dir_fd") is not None:
             observed.append(flags)
             s.path.unlink()
             s.path.symlink_to(target)
