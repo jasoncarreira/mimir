@@ -357,11 +357,18 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
         assert daemon._agent is not None and daemon._agent._bundle is bundle
         assert core.calls == 2
     finally:
-        assert process.stdin
+        assert process.stdin and process.stdout
         process.stdin.close()
-        await process.stdin.wait_closed()
-        stderr = await process.stderr.read() if process.stderr else b""
-        await asyncio.wait_for(process.wait(), 10)
+        stdout_drain = asyncio.create_task(process.stdout.read())
+        try:
+            await process.stdin.wait_closed()
+            stderr = await process.stderr.read() if process.stderr else b""
+            await asyncio.wait_for(process.wait(), 10)
+            raw_stdout.extend(await stdout_drain)
+        finally:
+            if not stdout_drain.done():
+                stdout_drain.cancel()
+                await asyncio.gather(stdout_drain, return_exceptions=True)
         await daemon.stop()
     assert process.returncode == 0, stderr.decode()
     profile_bytes = (tmp_path / "config" / "mimir" / "acp" / "profiles.json").read_bytes()
@@ -376,6 +383,7 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
         caplog.text.encode(),
         repr(daemon._agent._audit_events if daemon._agent else ()).encode(),
     ])
+    assert secret.encode() not in raw_stdout
     assert secret.encode() not in exposed
     assert key_file.read_text() == secret
 
