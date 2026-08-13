@@ -6404,6 +6404,105 @@ def _github_scope_test_setup(
     return root, authority, item
 
 
+def _github_poller_auth(
+    authority: ServicePrincipal, item: dict[str, object],
+) -> AuthContext:
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    return replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def test_fresh_changes_requested_review_mints_remediation_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", state="CHANGES_REQUESTED")
+
+    auth = _github_poller_auth(authority, item)
+
+    scope = auth.repo_pr_action_scope
+    assert scope is not None
+    assert scope.event_type == "pr_review"
+    assert scope.observed_head_sha == "a" * 40
+    assert scope.observed_base_sha == "b" * 40
+    registry = ToolRegistry()
+    arguments = {"repository": "o/r", "pull_request": 42}
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is True
+        assert decision.reason is None
+
+    before = _github_poller_auth(
+        authority, {**item, "state": "COMMENTED"},
+    )
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, before, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repo_pr_scope_denied"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo", "not-a-repository"),
+        ("number", 0),
+        ("author", "someone-else"),
+        ("head_repo", "not-a-repository"),
+        ("head_repo", "fork/r"),
+        ("head_remote", "source"),
+        ("head_ref", "refs/heads/not:a-branch"),
+        ("base_ref", "refs/heads/not:a-branch"),
+        ("head_sha", "a" * 39),
+        ("base_sha", "b" * 39),
+    ],
+)
+def test_fresh_changes_requested_remediation_applies_every_write_guard(
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", state="CHANGES_REQUESTED")
+    item[field] = value
+
+    auth = _github_poller_auth(authority, item)
+
+    if field == "author":
+        scope = auth.repo_pr_action_scope
+        assert scope is not None
+        assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
+        assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+    else:
+        assert auth.repo_pr_action_scope is None
+
+
+@pytest.mark.parametrize("event_type", ["pr_opened", "pr_review_comment"])
+def test_non_review_events_remain_review_only_for_self_authored_pr(
+    event_type: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type=event_type, state="CHANGES_REQUESTED")
+
+    scope = _github_poller_auth(authority, item).repo_pr_action_scope
+
+    assert scope is not None
+    assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -6818,7 +6917,58 @@ def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
         extra={"items": [item, {**item, "head_sha": "c" * 40}]},
     )
 
-    assert create_auth_context(event, enforce=True).repo_pr_scope_registry is None
+    auth = replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+    assert auth.repo_pr_scope_registry is None
+    registry = ToolRegistry()
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 42},
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repo_pr_scope_denied"
+
+
+def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, review_item = _github_scope_test_setup(tmp_path, monkeypatch)
+    review_item.update(event_type="pr_review", state="COMMENTED")
+    remediation_item = {
+        **review_item,
+        "number": 43,
+        "head_ref": "worklink/43",
+        "head_sha": "c" * 40,
+        "state": "CHANGES_REQUESTED",
+    }
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"items": [review_item, remediation_item]},
+    )
+    auth = replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+    registry = ToolRegistry()
+
+    assert auth.repo_pr_scope_registry is not None
+    assert len(auth.repo_pr_scope_registry.review_states) == 2
+    for tool_name in ("repo_commit", "repo_push"):
+        first = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 42},
+        )
+        second = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 43},
+        )
+        assert first.allowed is False
+        assert first.reason == "repo_pr_scope_denied"
+        assert second.allowed is True
 
 
 def test_repo_pr_scope_is_frozen_deterministic_and_auditable(

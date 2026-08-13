@@ -1101,10 +1101,16 @@ def _repo_pr_scope_resolution(
     head_sha: object,
     base_ref: object,
     base_sha: object,
+    review_state: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
-    is_remediation = event_type in {
+    is_fresh_changes_requested_remediation = (
+        event_type == "pr_review"
+        and review_state == "CHANGES_REQUESTED"
+        and principal == self_login
+    )
+    is_remediation = is_fresh_changes_requested_remediation or event_type in {
         "pr_changes_requested_stale",
         "pr_mergeability_rebase",
         "pr_mergeability_conflicting",
@@ -1293,6 +1299,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             repo=item.get("repo"),
             principal=item.get("author"),
             event_type=item.get("event_type"),
+            review_state=item.get("state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),
             head_remote=item.get("head_remote"),
