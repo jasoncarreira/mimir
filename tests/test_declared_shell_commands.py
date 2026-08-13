@@ -186,18 +186,19 @@ class TestInterpreterRule:
                 writable_roots=agent_writable_roots(home),
             )
 
-    def test_script_at_skill_root_remains_refused(self, home: Path) -> None:
-        """Only ``skills/<name>/scripts/**`` escapes autonomous writability."""
+    def test_script_at_skill_root_is_declarable(self, home: Path) -> None:
+        """All skill files share the admin-operator file-tool boundary."""
         skill_root_script = home / "skills" / "ai-news" / "fetch-news.py"
         skill_root_script.parent.mkdir(parents=True)
-        skill_root_script.write_text("print('unsafe')\n", encoding="utf-8")
+        skill_root_script.write_text("print('safe')\n", encoding="utf-8")
 
-        with pytest.raises(ValueError, match="agent-writable root"):
-            parse_declared_shell_commands(
-                [{"exec": "python3", "path": sys.executable,
-                  "script": str(skill_root_script)}],
-                writable_roots=agent_writable_roots(home),
-            )
+        declared = parse_declared_shell_commands(
+            [{"exec": "python3", "path": sys.executable,
+              "script": str(skill_root_script)}],
+            writable_roots=agent_writable_roots(home),
+        )
+
+        assert declared[0].script == skill_root_script.resolve()
 
     @pytest.mark.parametrize(
         "root_name",
