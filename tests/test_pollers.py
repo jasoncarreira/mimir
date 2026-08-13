@@ -15,6 +15,7 @@ import asyncio
 from dataclasses import replace
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -98,6 +99,12 @@ def _install_script(skill_dir: Path, name: str, body: str) -> Path:
     return script
 
 
+_REQUIRES_DEPLOYMENT_BASH = pytest.mark.skipif(
+    not Path("/usr/bin/bash").exists(),
+    reason="requires deployment-image executable path /usr/bin/bash",
+)
+
+
 # ─── discover_pollers ────────────────────────────────────────────────
 
 
@@ -169,12 +176,64 @@ def _authority(**updates: object) -> dict:
     return value
 
 
-def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
+def test_research_profile_has_bounded_shell_and_append_credit_authority() -> None:
     from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
 
     profile = TRIGGER_AUTHORITY_PROFILES["research"]
-    assert {"memory_store", "saga_feedback", "saga_mark_contributions"} <= profile
-    assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+    assert {
+        "memory_store",
+        "saga_feedback",
+        "saga_mark_contributions",
+        "saga_record_skill_learning",
+        "shell_exec",
+        "bash_jobs_list",
+        "bash_job_output",
+    } <= profile
+    assert {"saga_forget", "saga_end_session", "bash_async"}.isdisjoint(profile)
+
+
+def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "research-agent"
+    persist_dir.mkdir(parents=True)
+
+    authority = _parse_poller_authority(
+        _authority(
+            capabilities=["saga_record_skill_learning"],
+            scoped_roots=[],
+        ),
+        name="research-agent",
+        persist_dir=persist_dir,
+        state_root=tmp_path / "state" / "pollers",
+        manifest_path=tmp_path / "skills" / "research-agent" / "pollers.json",
+    )
+
+    assert authority.capabilities == ("saga_record_skill_learning",)
+    assert authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert authority.readable_domains == ("poller_payload",)
+    assert authority.sink_destinations == ("saga",)
+    assert "saga_end_session" not in authority.capabilities
+
+
+def test_session_boundary_poller_can_declare_rebuild_index(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "session-boundary"
+    persist_dir.mkdir(parents=True)
+
+    authority = _parse_poller_authority(
+        _authority(
+            profile="session-boundary",
+            tier="scoped-with-provenance",
+            capabilities=["rebuild_index"],
+            scoped_roots=[],
+        ),
+        name="session-boundary",
+        persist_dir=persist_dir,
+        state_root=tmp_path / "state" / "pollers",
+        manifest_path=tmp_path / "skills" / "session-boundary" / "pollers.json",
+    )
+
+    assert authority.capabilities == ("rebuild_index",)
+    assert authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert authority.sink_destinations == ("filesystem",)
 
 
 def test_github_profile_allows_only_its_bounded_fetch_capability(
@@ -219,6 +278,7 @@ def test_non_github_poller_cannot_claim_unbounded_fetch_capability(
         )
 
 
+@_REQUIRES_DEPLOYMENT_BASH
 def test_shipped_poller_shell_authorities_have_job_inspection_companions(
     tmp_path: Path,
 ) -> None:
@@ -226,10 +286,18 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
     companions = {"bash_jobs_list", "bash_job_output"}
 
     for manifest_path in manifests.glob("*/pollers.json"):
-        entries = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+        installed = tmp_path / "skills" / manifest_path.parent.name
+        shutil.copytree(manifest_path.parent, installed)
+        installed_manifest = installed / "pollers.json"
+        entries = json.loads(installed_manifest.read_text(encoding="utf-8"))["pollers"]
         for entry in entries:
             if "authority" not in entry:
                 continue
+            for declaration in entry["authority"].get("shell_commands", []):
+                if "script" in declaration:
+                    declaration["script"] = str(
+                        installed / "scripts" / Path(declaration["script"]).name
+                    )
             persist_dir = tmp_path / entry["name"]
             persist_dir.mkdir()
             principal = _parse_poller_authority(
@@ -237,7 +305,7 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
                 name=entry["name"],
                 persist_dir=persist_dir,
                 state_root=tmp_path / "state" / "pollers",
-                manifest_path=manifest_path,
+                manifest_path=installed_manifest,
             )
             capabilities = set(principal.capabilities)
             if capabilities & {"shell_exec", "bash_async"}:

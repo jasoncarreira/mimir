@@ -6,6 +6,169 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-08-13
+
+A patch release carrying one change: the poller shell remediation from #1449,
+which did not make 0.8.2. No operator action is required.
+
+### Changed
+
+- `gmail-poller` and `social-cli` declare the shell commands their poller turns
+  actually run, via wrapper scripts that hold the working directory and
+  environment those turns previously had to shell-prefix by hand.
+
+  The calls were being refused for SHAPE, not authority: `cd … && social-cli`,
+  `export PYTHONPATH=… && python3 -c …`, `source …/activate && …`, and
+  `ls … 2>/dev/null` are compounds, redirects and code-from-argv, none of which
+  bind to a single argv no matter what capability is granted. Of roughly 290
+  recorded attempts across the three pollers, about 15 were bindable as written.
+
+  A wrapper moves the environment and working directory inside a pinned script,
+  leaving one bindable argv outside — the pattern `run-fetch-news.sh` already
+  established. The wrappers live under `<skill>/scripts/`, writable only on a
+  trusted-operator turn, so a poller turn cannot rewrite what it is about to run.
+
+  The `research` authority profile gains exactly three capabilities to make this
+  possible — `shell_exec`, `bash_jobs_list` and `bash_job_output` — taking it from
+  17 to 20. The two job-inspection capabilities are companions that
+  `_missing_capability_companions` requires: without them the principal fails to
+  construct rather than degrading. This is a **ceiling**, not a grant: a
+  research-profile poller gains nothing until its own manifest declares the
+  capability, and only these three manifests do.
+
+
+## [0.8.2] — 2026-08-13
+
+A patch release. Unlike 0.8.1, **no operator action is required**: no dependency
+changed, and the `Dockerfile` is untouched, so a deployment already carrying the
+0.8.1 containment layer needs only the package.
+
+Most of this release comes from acting on recorded `shadow_tool_decision` events —
+calls that succeed today because enforcement is off, and would stop silently the
+moment `MIMIR_ACCESS_CONTROL_ENFORCED` is set. Each grant below is sized to
+observed use rather than to convenience.
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The cap cut at
+  an arbitrary byte offset and scrubbing replaces whole values, so a cut through
+  the middle of a secret left a prefix that matched nothing. Collection now
+  buffers past the cap far enough to see a value spanning the cut. (#1442)
+- A tool call from a model that serialises arrays as `{"item": [...]}` was lost
+  entirely, and the validation error was discarded so the failure was
+  undiagnosable. Such payloads are now unwrapped for list-typed parameters only,
+  and validation failures record the parameter and error type — never argument
+  values. One deployment was losing 137 session boundaries a day to this. (#1444)
+- `repo_test` could not snapshot this repository at all: the credential preflight
+  refused 114 tracked files — `README.md`, `SPEC.md`, workflows, test fixtures —
+  because they contain credential-SHAPED text. Tracked content is already
+  committed, already in the pull request, and already on the remote, so scanning
+  it prevented nothing while disabling the tool. Untracked and ignored entries
+  are still scanned, which is where the control actually applies. (#1445)
+- A nested Git repository in a source tree was refused as a malformed path.
+  `git ls-files --others` reports an embedded repo as one entry with a trailing
+  slash, which tripped the guard written for `..` and absolute paths — so a
+  worktree refused identically to a hostile path. It now has its own error and
+  reason code. (#1442)
+
+### Changed
+
+- A shell refusal now returns the stable `binding_rule` to the caller alongside
+  the human-readable reason, so an agent can distinguish "wrong flag" from "not
+  admitted" from "you wrote a shell form, not an argv" without parsing message
+  wording. A refusal path that omits the rule degrades to `binding_rule=unknown`
+  rather than raising inside the authorization gate. (#1443)
+- The autonomous trigger authority block now states the argv contract for
+  shell-bearing capabilities — one command per call, no pipes, redirects, `&&`,
+  globs, `$(...)`, or interpreter `-c`/`-m` forms — and names any declared
+  shell commands. A principal with no authority profile now receives a block
+  saying so, where previously it received nothing at all. (#1448)
+- `saga_end_session` states that an explicit call requires the capability, and
+  that principals without it should not attempt one because the synthesis turn
+  closes the session. (#1447)
+
+### Added
+
+- The `research` authority profile grants `saga_record_skill_learning`, so a
+  poller that runs a skill can record what it learned. The tool was always aimed
+  at skill-running turns; only session-boundary principals could reach it. (#1446)
+- The `session-boundary` profile grants `rebuild_index`, with an explicit
+  `SCOPE_CONTAINED` tier entry so it is reachable by principals capped below
+  `UNBOUNDED`. Taint gating is unchanged: a turn carrying untrusted active
+  ingest is still refused. (#1450)
+
+
+## [0.8.1] — 2026-08-11
+
+A patch by version number, but the containment work below changes what an **image**
+must provide. A deployment that upgrades the package without rebuilding its image
+starts cleanly, reports healthy, and has silently lost `repo_test` and
+`spawn_open_code`.
+
+### Operator actions required
+
+1. **The image must provide the Worklink containment layer.** Contained execution
+   now backs `repo_test` and `spawn_open_code`, not only Worklink builds. The image
+   needs: a `worklink` user and group at **uid/gid 1002**; the agent user at
+   **uid 1001**, and a member of the `worklink` group; `/var/lib/mimir-worklink`
+   (`root:root 0711`) containing `checkouts`, `repo-test-checkouts` and
+   `opencode-checkouts` (`root:mimir 0771`) and `homes` (`root:worklink 0710`); a
+   root-owned executor virtualenv; and the `worklink-execd` s6 service, which
+   listens on `/run/mimir-worklink/socket/worklink-execd.sock`.
+
+   The `Dockerfile` in this repository does all of it. **A deployment that builds
+   its own image must port it** — mimirbot builds from its own `Dockerfile`, did not
+   inherit any of this, and lost both tools until it was ported.
+
+   Failure mode: `test_containment_unavailable` from `repo_test` and
+   `containment_available=false` from `spawn_open_code`. Both fail closed, which is
+   the safe direction, but neither names the missing piece, and nothing fails at
+   startup — the tools simply refuse the next time they are called.
+
+2. **The agent must run as uid 1001.** `MIMIR_UID` is a literal in
+   `mimir/worklink/worker_exec.py` and `mimir/worklink/checkout.py`. The root
+   executor refuses any peer whose uid differs, and the agent-side checkout handoff
+   chowns each checkout to `WORKLINK_GID`, which is what the group membership in (1)
+   is for — POSIX only lets a non-root process set a file's group to a group it
+   belongs to. Renumbering an existing deployment means chowning its workspace
+   volume. #1439 tracks resolving both by account name so this stops being a
+   deployment constraint.
+
+### Added
+
+- Contained execution is now a reusable entry point (`mimir/contained_execution.py`,
+  `mimir/contained_checkout.py`, `mimir/contained_snapshot.py`). `repo_test` and
+  `spawn_open_code` run through it, as the unprivileged `worklink` user inside an
+  issued checkout, instead of spawning directly. (#1438)
+- Worklink builds run as a separate `worklink` user, launched by a root
+  `worklink-execd` service rather than under the agent's own identity. (#1426)
+- `procps`, so `ps`, `pgrep`, `pkill` and `top` resolve in the image. A missing `ps`
+  reports "executable file not found", which reads as a dead process; that false
+  negative had cost three diagnoses of healthy runs. (#1434)
+
+### Changed
+
+- A job-bound scheduled tick may read all of `memory/channels/**`. The previous
+  per-job narrowing was an artifact of reusing the single-channel check rather than
+  a designed boundary, and it left `memory-hygiene` unable to perform the channel
+  scan its own prompt specifies. Scheduled ticks have no inbound message, so there
+  is no injection at the trigger. (#1435)
+- The shipped `scheduler_template.yaml` heartbeat record carries
+  `authority_profile: heartbeat`, matching the 0.8.0 operator action. (#1427)
+- github-poller coalesces repeated events for the same subject. (#1432)
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The output cap cut
+  at an arbitrary byte offset, and scrubbing replaces whole values — so a cut through
+  the middle of a secret left a prefix that matched nothing and was emitted verbatim.
+  Collection now buffers past the cap far enough to see a value spanning the cut and
+  retreats to where it begins. (#1438)
+- Declared `shell_commands` were authorized and then refused: the execution gate
+  dropped the declarations, so per-job command grants had never worked. (#1430)
+- Concurrent Worklink builds sharing the `worklink` uid could read and modify each
+  other's checkouts by traversing `../<other-issue>-<attempt>`. (#1428)
+
 ## [0.8.0] — 2026-08-09
 
 Minor rather than patch because two changes require an operator to edit

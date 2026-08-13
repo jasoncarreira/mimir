@@ -120,6 +120,104 @@ def _event(author: str | None) -> AgentEvent:
     )
 
 
+def test_validated_arguments_unwraps_item_only_for_list_parameters() -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str] | None
+        title: str
+
+    tool = SimpleNamespace(args_schema=Arguments)
+    list_request = SimpleNamespace(
+        tool=tool,
+        tool_call={"args": {"topics": {"item": ["alpha", "beta"]}, "title": "x"}},
+    )
+    scalar_request = SimpleNamespace(
+        tool=tool,
+        tool_call={"args": {"topics": ["alpha"], "title": {"item": "x"}}},
+    )
+
+    assert _validated_arguments(list_request) == {
+        "topics": ["alpha", "beta"],
+        "title": "x",
+    }
+    assert _validated_arguments(scalar_request) is None
+
+
+@pytest.mark.parametrize(
+    "topics",
+    [
+        {"item": ["alpha"], "other": ["discarded"]},
+        {"items": ["alpha"]},
+        {"item": ["alpha", 7]},
+    ],
+)
+def test_validated_arguments_keeps_invalid_list_payloads_invalid(topics: object) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": topics}},
+    )
+
+    assert _validated_arguments(request) is None
+
+
+def test_validated_arguments_logs_redacted_failure_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    secret = "credential-adjacent-secret"
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": {"item": [secret, 7]}}},
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.tools.budget_gate"):
+        assert _validated_arguments(request) is None
+
+    assert "ValidationError" in caplog.text
+    assert "topics" in caplog.text
+    assert "string_type" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_validated_arguments_diagnostic_failure_does_not_change_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools import budget_gate
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": "not-a-list"}},
+    )
+
+    def fail_to_log(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("logging unavailable")
+
+    monkeypatch.setattr(budget_gate.log, "warning", fail_to_log)
+
+    assert budget_gate._validated_arguments(request) is None
+
+
 def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewState:
     return RepoReviewState(RepoPRActionScope(
         provenance="poller_payload",
@@ -1164,6 +1262,46 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
         assert access_control.TRIGGER_CAPABILITY_TIERS[capability] is CapabilityTier.SCOPE_CONTAINED
     assert "shell_exec" not in principal.capabilities
     assert "shell_process" not in principal.sink_destinations
+
+
+def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
+    tmp_path: Path,
+) -> None:
+    from mimir.models import SourceLabel
+
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="github-user",
+        domain="github",
+        resource_id="owner/repo#1",
+        bridge_instance="github",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="poller",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+    assert labels.has_untrusted_active_ingest is True
+    assert "rebuild_index" in principal.capabilities
+    assert access_control.TRIGGER_CAPABILITY_TIERS["rebuild_index"] is (
+        CapabilityTier.SCOPE_CONTAINED
+    )
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, InformationFlowLabels()),
+        enforce=True,
+    ).allowed is True
+    tainted_decision = registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, labels),
+        enforce=True,
+    )
+    assert tainted_decision.allowed is False
+    assert tainted_decision.argument_egress == "taint_gated"
 
 
 @pytest.mark.parametrize(
@@ -2823,6 +2961,99 @@ def test_undeclared_shell_principal_keeps_shared_profile_behavior() -> None:
     assert bound.tool_call["args"]["mimir_direct_argv"] == authorization_argv
 
 
+@pytest.mark.parametrize(
+    ("command", "declarations", "expected_rule", "secret_value"),
+    [
+        (
+            "gog gmail search *",
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            "shell_control_characters",
+            None,
+        ),
+        (
+            "gog gmail search --plain sensitive-option-value",
+            [{"exec": "gog", "path": "/bin/echo", "subcommands": [["gmail", "search"]]}],
+            "declared_command_mismatch",
+            "sensitive-option-value",
+        ),
+        (
+            "curl https://sensitive.example/private-path",
+            None,
+            "profile_allowlist",
+            "https://sensitive.example/private-path",
+        ),
+    ],
+    ids=["shell-control", "declared-command", "profile-allowlist"],
+)
+def test_service_shell_binding_refusal_returns_stable_rule(
+    command: str,
+    declarations: list[dict[str, object]] | None,
+    expected_rule: str,
+    secret_value: str | None,
+) -> None:
+    from mimir.tools import budget_gate
+
+    declared = (
+        access_control.parse_declared_shell_commands(declarations, writable_roots=())
+        if declarations is not None
+        else ()
+    )
+    service = build_trigger_service_principal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        declared_shell_commands=declared,
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": command}),
+        "shell_exec",
+        auth,
+    )
+
+    refusal = bound.tool_call["args"]["mimir_shell_refusal"]
+    assert refusal.startswith("shell_exec was refused before execution: ")
+    assert refusal.endswith(f" binding_rule={expected_rule}")
+    if secret_value is not None:
+        assert secret_value not in refusal
+
+
+def test_service_shell_binding_refusal_handles_missing_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    service = build_trigger_service_principal(
+        canonical="heartbeat",
+        trigger="scheduled_tick",
+        profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    monkeypatch.setattr(
+        budget_gate,
+        "parse_service_shell_argv_with_diagnostics",
+        lambda *_args, **_kwargs: (None, "synthetic refusal", None),
+    )
+
+    bound = budget_gate._request_for_authorized_execution(
+        _tool_request(auth, args={"command": "echo safe"}),
+        "shell_exec",
+        auth,
+    )
+
+    assert bound.tool_call["args"]["mimir_shell_refusal"] == (
+        "shell_exec was refused before execution: synthetic refusal "
+        "binding_rule=unknown"
+    )
+
+
 def test_service_shell_final_binding_refusal_emits_hard_denial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3799,7 +4030,7 @@ def _write_auth(*, admin: bool = False) -> AuthContext:
     )
 
 
-def _trusted_operator_write_auth() -> AuthContext:
+def _trusted_operator_write_auth(*, admin: bool = False) -> AuthContext:
     source = SourceLabel(
         principal="alice",
         domain="channel",
@@ -3816,7 +4047,7 @@ def _trusted_operator_write_auth() -> AuthContext:
         sources=(source,),
     )
     return replace(
-        _write_auth(),
+        _write_auth(admin=admin),
         domain="channel",
         resource_id="slack-C1",
         bridge_instance="slack",
@@ -3824,8 +4055,23 @@ def _trusted_operator_write_auth() -> AuthContext:
     )
 
 
+def _tainted_admin_operator_write_auth() -> AuthContext:
+    auth = _trusted_operator_write_auth(admin=True)
+    untrusted = SourceLabel(
+        principal="mallory",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity=Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    return replace(auth, ifc_labels=auth.ifc_labels.with_source(untrusted))
+
+
 @pytest.mark.parametrize(
-    ("case", "auth_factory"),
+    ("case", "auth_factory", "allowed"),
     [
         (
             "poller",
@@ -3834,6 +4080,7 @@ def _trusted_operator_write_auth() -> AuthContext:
                 trigger="poller",
                 interactivity=TurnInteractivity.NON_INTERACTIVE,
             ),
+            False,
         ),
         (
             "scheduled_tick",
@@ -3842,28 +4089,47 @@ def _trusted_operator_write_auth() -> AuthContext:
                 trigger="scheduled_tick",
                 interactivity=TurnInteractivity.NON_INTERACTIVE,
             ),
+            False,
         ),
         (
-            "replayed_event",
-            lambda: replace(_trusted_operator_write_auth(), event_ingress="http"),
+            "non_admin_operator",
+            _trusted_operator_write_auth,
+            False,
         ),
         (
-            "trusted_service",
+            "admin_operator",
+            lambda: _trusted_operator_write_auth(admin=True),
+            True,
+        ),
+        (
+            "tainted_admin_operator",
+            _tainted_admin_operator_write_auth,
+            False,
+        ),
+        (
+            "upgrade_service",
             lambda: _service_auth(
-                get_service_principal("scheduled_tick"), InformationFlowLabels(),
+                get_service_principal("upgrade"), InformationFlowLabels(),
             ),
+            False,
         ),
     ],
     ids=lambda value: value if isinstance(value, str) else None,
 )
-def test_skill_script_writes_require_a_trusted_operator_turn(
+@pytest.mark.parametrize(
+    "relative",
+    ["pollers.json", "SKILL.md", "scripts/fetch-news.ts"],
+)
+def test_skill_writes_require_an_untainted_admin_operator_turn(
     case: str,
     auth_factory,
+    allowed: bool,
+    relative: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target = home / "skills" / "ai-news" / relative
     target.parent.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
@@ -3873,20 +4139,22 @@ def test_skill_script_writes_require_a_trusted_operator_turn(
         "edit_file", auth, enforce=True, target_channel=str(target),
     )
 
-    assert decision.allowed is False, case
-    assert decision.reason == "skill_script_write_requires_trusted_operator", case
+    assert decision.allowed is allowed, case
+    assert decision.reason == (None if allowed else "skill_write_requires_admin_operator"), case
     assert decision.refusal_detail == (
-        "writes to skills/<skill>/scripts require a trusted operator turn"
+        None if allowed else "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=False, target_channel=str(target),
     )
-    assert compatibility_decision.allowed is False, case
-    assert compatibility_decision.reason == "skill_script_write_requires_trusted_operator"
+    assert compatibility_decision.allowed is allowed, case
+    assert compatibility_decision.reason == (
+        None if allowed else "skill_write_requires_admin_operator"
+    )
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-def test_trusted_operator_turn_may_write_skill_scripts(
+def test_admin_operator_turn_may_write_skill_scripts(
     tool_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3898,7 +4166,7 @@ def test_trusted_operator_turn_may_write_skill_scripts(
 
     decision = ToolRegistry().authorize_tool(
         tool_name,
-        _trusted_operator_write_auth(),
+        _trusted_operator_write_auth(admin=True),
         enforce=True,
         target_channel=str(target),
     )
@@ -3939,11 +4207,11 @@ def test_declaration_and_write_gate_share_skill_script_writability(
     )
 
     assert access_control._agent_writable_root_for_path(
-        script, roots, trusted_operator_turn=False,
+        script, roots, admin_operator_turn=False,
     ) is None
     assert declared[0].script == script.resolve()
     assert write.allowed is False
-    assert write.reason == "skill_script_write_requires_trusted_operator"
+    assert write.reason == "skill_write_requires_admin_operator"
 
 
 @pytest.mark.parametrize(
@@ -3954,7 +4222,7 @@ def test_declaration_and_write_gate_share_skill_script_writability(
         "skills/ai-news/.pre-update-backup/20260710T124800Z/fetch-news.ts",
     ],
 )
-def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
+def test_upgrade_turn_skill_package_writes_are_refused(
     relative: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3972,10 +4240,11 @@ def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
         "write_file", upgrade_auth, enforce=True, target_channel=relative,
     )
 
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert decision.reason == "skill_write_requires_admin_operator"
 
 
-def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
+def test_skill_write_refusal_is_self_classifying_in_audit_event(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4007,7 +4276,7 @@ def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
         fields.get("reason") or fields.get("denial_reason")
         for _kind, fields in captured
     }
-    assert reasons == {"skill_script_write_requires_trusted_operator"}
+    assert reasons == {"skill_write_requires_admin_operator"}
     assert reasons.isdisjoint({"read_scope", "write_scope"})
 
 

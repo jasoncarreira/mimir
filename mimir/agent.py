@@ -4354,6 +4354,15 @@ class Agent:
             trigger_capabilities=(
                 trigger_authority.capabilities if trigger_authority else None
             ),
+            trigger_authority_present=trigger_authority is not None,
+            trigger_shell_commands=(
+                tuple(
+                    command.executable
+                    for command in trigger_authority.declared_shell_commands
+                )
+                if trigger_authority
+                else None
+            ),
             turn_scratch_path=str(
                 self._config.home / "scratch" / "turns" / ctx.turn_id
             ),

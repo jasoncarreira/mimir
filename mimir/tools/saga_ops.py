@@ -218,8 +218,10 @@ async def saga_end_session(
     """Close a SAGA session by writing the rendered boundary fields to
     the ``sessions`` table (replaces the legacy session_boundary atom).
 
-    Auto-invoked by the synthesis turn at idle timeout (SPEC §5.6);
-    call explicitly if you know a session is wrapping ("talk later").
+    Auto-invoked by the synthesis turn at idle timeout (SPEC §5.6). If your
+    principal has the ``saga_end_session`` capability, call explicitly when
+    you know a session is wrapping ("talk later"). Without that capability,
+    do not attempt the call; the synthesis turn closes the session.
     Empty lists / None for optional fields are dropped.
 
     ``closed_since`` carries refs (PRs, chainlinks, paths) from

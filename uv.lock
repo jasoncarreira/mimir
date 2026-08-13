@@ -1457,7 +1457,7 @@ wheels = [
 
 [[package]]
 name = "mimir-agent"
-version = "0.8.0"
+version = "0.8.3"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },

@@ -39,9 +39,12 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from types import UnionType
+from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_origin
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -722,7 +725,8 @@ def _request_for_authorized_execution(
         # future refactor that drops this channel still fails closed rather than
         # reaching a shell.
         args["mimir_shell_refusal"] = (
-            f"{tool_name} was refused before execution: {refusal}"
+            f"{tool_name} was refused before execution: {refusal} "
+            f"binding_rule={binding_rule.value if binding_rule is not None else 'unknown'}"
         )
         args["mimir_direct_argv"] = [
             "/usr/bin/false",
@@ -832,6 +836,52 @@ def _request_with_resolved_spawn_paths(
     return request.override(tool_call={**request.tool_call, "args": args})
 
 
+def _is_sequence_annotation(annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _is_sequence_annotation(get_args(annotation)[0])
+    if origin in (Union, UnionType):
+        return any(_is_sequence_annotation(item) for item in get_args(annotation))
+    candidate = origin or annotation
+    return (
+        isinstance(candidate, type)
+        and issubclass(candidate, Sequence)
+        and candidate not in (str, bytes, bytearray)
+    )
+
+
+def _record_argument_validation_failure(
+    exc: Exception, parameter_names: set[str],
+) -> None:
+    """Log validation structure without rendering argument values."""
+    try:
+        details: list[str] = []
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            try:
+                entries = errors(
+                    include_url=False, include_context=False, include_input=False,
+                )
+            except TypeError:
+                entries = errors()
+            for entry in entries:
+                location = next(
+                    (
+                        part for part in entry.get("loc", ())
+                        if isinstance(part, str) and part in parameter_names
+                    ),
+                    "<arguments>",
+                )
+                error_type = str(entry.get("type", "validation_error"))
+                if re.fullmatch(r"[A-Za-z0-9_.-]+", error_type) is None:
+                    error_type = "validation_error"
+                details.append(f"{location}: {error_type}")
+        reason = "; ".join(details) or "schema validation failed"
+        log.warning("tool argument validation failed: %s: %s", type(exc).__name__, reason)
+    except Exception:  # noqa: BLE001 - diagnostics must not affect authorization
+        pass
+
+
 def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     """Validate and normalize the concrete call arguments before authz."""
     tool_call = getattr(request, "tool_call", None) or {}
@@ -842,9 +892,19 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     schema = getattr(tool, "args_schema", None)
     if schema is None:
         return dict(arguments)
+    normalized = dict(arguments)
+    for name, field in schema.model_fields.items():
+        value = normalized.get(name)
+        if (
+            _is_sequence_annotation(field.annotation)
+            and isinstance(value, Mapping)
+            and set(value) == {"item"}
+        ):
+            normalized[name] = value["item"]
     try:
-        validated = schema.model_validate(arguments)
-    except Exception:
+        validated = schema.model_validate(normalized)
+    except Exception as exc:
+        _record_argument_validation_failure(exc, set(schema.model_fields))
         return None
     return validated.model_dump(exclude_unset=False)
 

@@ -104,12 +104,18 @@ def _issue_checkout(
     attempt: int,
     open_checkout: Callable[[Path], int],
     known_sensitive: Iterable[bytes],
+    scan_tracked_credentials: bool = True,
     prepare: Callable[[Path], str | None] | None = None,
 ) -> tuple[SnapshotResult, CheckoutAuthorization, str | None]:
     boundary, destination = _prepare_boundary(root, scope, f"{issue_id}-{attempt}")
     checkout_fd = -1
     try:
-        snapshot = create_git_snapshot(source, destination, known_sensitive=known_sensitive)
+        snapshot = create_git_snapshot(
+            source,
+            destination,
+            known_sensitive=known_sensitive,
+            scan_tracked_credentials=scan_tracked_credentials,
+        )
         prepared = prepare(destination) if prepare is not None else None
         relative = destination.relative_to(root)
         checkout_fd = open_checkout(relative)
@@ -136,7 +142,11 @@ def create_repo_test_checkout(
         raise ValueError("pull request number must be positive")
     source_path = Path(source).resolve(strict=True)
     sensitive = tuple(known_sensitive)
-    preflight_git_snapshot(source_path, known_sensitive=sensitive)
+    preflight_git_snapshot(
+        source_path,
+        known_sensitive=sensitive,
+        scan_tracked_credentials=False,
+    )
     attempt = _positive_random()
     snapshot, authorization, _base_tree = _issue_checkout(
         source_path,
@@ -146,6 +156,7 @@ def create_repo_test_checkout(
         attempt=attempt,
         open_checkout=_open_repo_test_checkout,
         known_sensitive=sensitive,
+        scan_tracked_credentials=False,
     )
     return ContainedCheckout(snapshot.destination, authorization, snapshot)
 

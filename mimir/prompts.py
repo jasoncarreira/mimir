@@ -262,6 +262,8 @@ def build_turn_prompt(
     trigger_authority_profile: str | None = None,
     trigger_capability_tier: str | None = None,
     trigger_capabilities: Iterable[str] | None = None,
+    trigger_authority_present: bool = False,
+    trigger_shell_commands: Iterable[str] | None = None,
     turn_scratch_path: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
@@ -343,15 +345,28 @@ def build_turn_prompt(
             f"filler or empty status updates.",
         )
 
-    if trigger_authority_profile:
-        capabilities = tuple(sorted(set(trigger_capabilities or ())))
+    capabilities = tuple(sorted(set(trigger_capabilities or ())))
+    if trigger_authority_present or trigger_authority_profile or capabilities:
         capability_list = ", ".join(f"``{name}``" for name in capabilities) or "none"
         tier = f"; tier ``{trigger_capability_tier}``" if trigger_capability_tier else ""
+        profile = f"``{trigger_authority_profile}``" if trigger_authority_profile else "none"
         lines = [
-            f"Server-defined profile: ``{trigger_authority_profile}``{tier}.",
+            f"Server-defined profile: {profile}{tier}.",
             f"Available capabilities: {capability_list}.",
             "Only these listed capabilities are available; this guidance grants nothing.",
         ]
+        if {"shell_exec", "bash_async"} & set(capabilities):
+            lines.append(
+                "Shell call contract (shape only, not a grant): pass one command argv per "
+                "call. Shell syntax is not admitted: no pipes, redirects, ``&&`` or ``;``, "
+                "globs, ``$(...)``, or ``source``/``export`` prefixes. Interpreters may run "
+                "only a pinned script, never ``-c``, ``-e``, ``-m``, ``--command``, "
+                "``--eval``, or stdin ``-`` forms."
+            )
+            shell_commands = tuple(sorted(set(trigger_shell_commands or ())))
+            if shell_commands:
+                names = ", ".join(f"``{name}``" for name in shell_commands)
+                lines.append(f"Declared shell commands: {names}.")
         if "fetch_url" in capabilities:
             lines.append(
                 "``fetch_url`` may reach only this profile's approved exact-URL list "

@@ -18,7 +18,11 @@ from .contained_execution import (
     base_worker_environment,
     execute_contained,
 )
-from .contained_snapshot import ContainedSnapshotError, SnapshotCredentialsRefused
+from .contained_snapshot import (
+    ContainedSnapshotError,
+    SnapshotCredentialsRefused,
+    SnapshotEmbeddedRepository,
+)
 from .event_logger import safe_log_event
 from .models import RepoPRAction, RepoReviewState
 from .redaction import redact_text
@@ -263,6 +267,21 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 "test_snapshot_credentials_refused",
                 "project test snapshot contains credential-like material",
+            ) from exc
+        except SnapshotEmbeddedRepository as exc:
+            # Distinct from the generic branch below on purpose: this one is an
+            # ordinary tree layout, not a broken snapshot, and the fix is to point
+            # at a tree without a nested checkout. Folded into "unavailable" it
+            # reads as a fault in the containment path itself.
+            await safe_log_event(
+                "repo_test_containment_refused",
+                reason_code="snapshot_embedded_repository",
+                repository=scope.canonical_repo,
+                pull_request=scope.pr_number,
+            )
+            raise ProjectTestRefusal(
+                "test_snapshot_embedded_repository",
+                "project test snapshot source contains an embedded Git repository",
             ) from exc
         except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
             await safe_log_event(
