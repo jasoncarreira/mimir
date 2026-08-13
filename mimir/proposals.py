@@ -542,39 +542,64 @@ def _remote_proposal_branches(home: Path) -> list[tuple[str, str | None]]:
 
 
 def _proposal_branch_pr_state(home: Path, branch: str) -> ProposalPrState | None:
-    """Return the forge PR state for ``branch``; ``None`` when unknown."""
+    """Return the forge PR state for ``branch``; ``None`` when unknown.
+
+    Query open PRs separately so an older closed or merged PR cannot hide an
+    open PR for the same head through forge result ordering. Only after the
+    open-only query is authoritatively empty do we inspect a terminal PR.
+    """
     if shutil.which("gh") is None:
         return None
-    try:
-        res = _run(
-            [
-                "gh", "pr", "list", "--state", "all", "--head", branch,
-                "--json", "number,state", "--limit", "1",
-            ],
-            cwd=home,
-            capture=True,
-        )
-    except OSError:
-        return None
-    if res.returncode != 0:
-        return None
-    try:
-        prs = json.loads(res.stdout or "[]")
-        if not isinstance(prs, list):
+
+    def query(state: Literal["open", "all"]) -> list[dict[str, object]] | None:
+        try:
+            res = _run(
+                [
+                    "gh", "pr", "list", "--state", state, "--head", branch,
+                    "--json", "number,state", "--limit", "1",
+                ],
+                cwd=home,
+                capture=True,
+            )
+        except OSError:
             return None
-        if not prs:
-            return "no_pr"
-        if not isinstance(prs[0], dict):
+        if res.returncode != 0:
             return None
-        number = prs[0].get("number")
-        state = prs[0].get("state")
-        if isinstance(number, int) and not isinstance(number, bool) and state in {
-            "OPEN", "MERGED", "CLOSED",
-        }:
-            return state.lower()
+        try:
+            prs = json.loads(res.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            return None
+        return prs
+
+    open_prs = query("open")
+    if open_prs is None:
         return None
-    except (json.JSONDecodeError, AttributeError):
+    if open_prs:
+        pr = open_prs[0]
+        number = pr.get("number")
+        if (
+            isinstance(number, int)
+            and not isinstance(number, bool)
+            and pr.get("state") == "OPEN"
+        ):
+            return "open"
         return None
+
+    prs = query("all")
+    if prs is None:
+        return None
+    if not prs:
+        return "no_pr"
+    pr = prs[0]
+    number = pr.get("number")
+    state = pr.get("state")
+    if isinstance(number, int) and not isinstance(number, bool) and state in {
+        "OPEN", "MERGED", "CLOSED",
+    }:
+        return state.lower()
+    return None
 
 
 def _blob_oid(home: Path, ref: str, path: str) -> str | None:

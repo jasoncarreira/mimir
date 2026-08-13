@@ -441,14 +441,45 @@ def test_proposal_branch_pr_state_distinguishes_forge_states(
     import mimir.proposals as proposals
 
     monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
-    stdout = json.dumps([{"number": 1, "state": forge_state}])
-    monkeypatch.setattr(
-        proposals,
-        "_run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout, ""),
-    )
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        requested_state = args[args.index("--state") + 1]
+        prs = (
+            [{"number": 1, "state": "OPEN"}]
+            if requested_state == "open" and forge_state == "OPEN"
+            else []
+            if requested_state == "open"
+            else [{"number": 1, "state": forge_state}]
+        )
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", fake_run)
 
     assert proposals._proposal_branch_pr_state(home, "proposal/test") == expected
+
+
+def test_proposal_branch_pr_state_open_wins_over_terminal_result_order(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        requested_state = args[args.index("--state") + 1]
+        prs = (
+            [{"number": 2, "state": "OPEN"}]
+            if requested_state == "open"
+            else [
+                {"number": 1, "state": "CLOSED"},
+                {"number": 2, "state": "OPEN"},
+            ]
+        )
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", fake_run)
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") == "open"
 
 
 def test_proposal_branch_pr_state_reports_no_pr(
