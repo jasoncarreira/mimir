@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -8,10 +9,12 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = (
+    "test_assert_installed_acp.py",
     "test_acp_bootstrap.py",
     "test_acp_stdio.py",
     "test_acp_packaging.py",
@@ -92,7 +95,83 @@ def _install_native_fixture(python: Path, work: Path, env: dict[str, str], ssh: 
     )
     if ssh is not None:
         source += f"import mimir.acp.ssh\nmimir.acp.ssh.SSH_PATH=__import__('pathlib').Path({str(ssh)!r})\n"
-    Path(site, "sitecustomize.py").write_text(source)
+    module = f"_mimir_acp_ci_fixture_{uuid.uuid4().hex}"
+    Path(site, f"{module}.py").write_text(source)
+    Path(site, f"{module}.pth").write_text(f"import {module}\n")
+
+
+def _fixture_diagnostics(
+    process: subprocess.Popen[bytes], *, terminate: bool, timeout: float
+) -> tuple[str, list[BaseException]]:
+    cleanup_errors: list[BaseException] = []
+    if terminate and process.poll() is None:
+        try:
+            process.terminate()
+        except BaseException as error:
+            cleanup_errors.append(error)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException as error:
+            cleanup_errors.append(error)
+            stdout, stderr = b"", b""
+    except BaseException as error:
+        cleanup_errors.append(error)
+        stdout, stderr = b"", b""
+    diagnostics = (
+        f"fixture server return code: {process.returncode!r}\n"
+        f"fixture server stdout: {stdout!r}\n"
+        f"fixture server stderr: {stderr!r}"
+    )
+    return diagnostics, cleanup_errors
+
+
+@contextlib.contextmanager
+def _fixture_server(
+    command: list[str], *, cwd: Path, env: dict[str, str], stop_on_success: bool
+) -> Iterator[subprocess.Popen[bytes]]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        yield process
+    except BaseException as failure:
+        diagnostics, cleanup_errors = _fixture_diagnostics(
+            process, terminate=True, timeout=5
+        )
+        failure.add_note(diagnostics)
+        if isinstance(failure, subprocess.CalledProcessError):
+            failure.add_note(
+                f"client return code: {failure.returncode!r}\n"
+                f"client stdout: {failure.stdout!r}\n"
+                f"client stderr: {failure.stderr!r}"
+            )
+        elif isinstance(failure, subprocess.TimeoutExpired):
+            failure.add_note(
+                f"client stdout before timeout: {failure.output!r}\n"
+                f"client stderr before timeout: {failure.stderr!r}"
+            )
+        for cleanup_error in cleanup_errors:
+            failure.add_note(f"fixture server cleanup failed: {cleanup_error!r}")
+        raise
+    else:
+        diagnostics, cleanup_errors = _fixture_diagnostics(
+            process, terminate=stop_on_success, timeout=5 if stop_on_success else 15
+        )
+        if cleanup_errors:
+            raise RuntimeError(diagnostics) from cleanup_errors[0]
+        if not stop_on_success and process.returncode != 0:
+            raise RuntimeError(diagnostics)
 
 
 def _local_round_trip(command: list[str], python: Path, work: Path, env: dict[str, str], config: Path) -> None:
@@ -113,8 +192,12 @@ async def main():
  await done.wait(); service.close(); await service.wait_closed()
 asyncio.run(main())
 """
-    server_process = subprocess.Popen([str(python), "-c", server, str(socket)], cwd=work, env=env)
-    try:
+    with _fixture_server(
+        [str(python), "-c", server, str(socket)],
+        cwd=work,
+        env=env,
+        stop_on_success=False,
+    ):
         for _ in range(200):
             if socket.exists():
                 break
@@ -124,8 +207,6 @@ asyncio.run(main())
         completed = subprocess.run(command, cwd=work, env=env, input=payload, capture_output=True, check=True, timeout=15)
         assert completed.stdout == b'{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'
         assert b"installed-secret" not in completed.stdout + completed.stderr
-    finally:
-        server_process.wait(timeout=15)
 
 
 def _relay_round_trip(command: list[str], python: Path, work: Path, env: dict[str, str]) -> None:
@@ -141,17 +222,18 @@ async def main():
  async with service: await service.serve_forever()
 asyncio.run(main())
 """
-    process = subprocess.Popen([str(python), "-c", server, str(socket)], cwd=work, env=env)
-    try:
+    with _fixture_server(
+        [str(python), "-c", server, str(socket)],
+        cwd=work,
+        env=env,
+        stop_on_success=True,
+    ):
         for _ in range(200):
             if socket.exists(): break
             import time
             time.sleep(0.01)
         completed = subprocess.run([*command, "relay", "--home", str(home)], cwd=work, env=env, input=b"relay-bytes", capture_output=True, check=True, timeout=15)
         assert completed.stdout == b"relay-bytes" and completed.stderr == b""
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
 
 
 def _remote_round_trip(command: list[str], python: Path, work: Path, env: dict[str, str]) -> None:
@@ -174,7 +256,6 @@ async def main():
  async with service: await service.serve_forever()
 asyncio.run(main())
 """
-    server_process = subprocess.Popen([str(python), "-c", server, str(socket)], cwd=work, env=env)
     ssh = work / "ssh-fixture"
     observed = work / "ssh-observed.json"
     ssh.write_text(
@@ -187,7 +268,12 @@ asyncio.run(main())
         "os.execvp(expected[0],expected)\n"
     )
     ssh.chmod(0o755)
-    try:
+    with _fixture_server(
+        [str(python), "-c", server, str(socket)],
+        cwd=work,
+        env=env,
+        stop_on_success=True,
+    ):
         for _ in range(200):
             if socket.exists():
                 break
@@ -195,7 +281,7 @@ asyncio.run(main())
             time.sleep(0.01)
         _install_native_fixture(python, work, env, ssh)
         subprocess.run([
-            *command, "profile", "set", "remote", "--home", str(home),
+            *command, "profile", "add-ssh", "remote", "--home", str(home),
             "--ssh-host", "example.com", "--ssh-user", "agent",
             "--identity-file", str(identity), "--known-hosts-file", str(known),
         ], cwd=work, env=env, check=True)
@@ -212,9 +298,6 @@ asyncio.run(main())
         assert b"installed-secret" not in installed.stdout + installed.stderr
         captured = observed.read_bytes()
         assert b"installed-secret" not in captured
-    finally:
-        server_process.terminate()
-        server_process.wait(timeout=5)
 
 
 def smoke(artifact: Path) -> None:
@@ -237,8 +320,10 @@ def smoke(artifact: Path) -> None:
         closure.assert_policy(closure.module_paths(package))
         assert not Path(package, "acp", "composition.py").exists()
 
-        short = Path(tempfile.gettempdir()) / f"ma-{uuid.uuid4().hex[:8]}"
+        short_root = Path("/tmp") if os.name == "posix" else Path(tempfile.gettempdir())
+        short = short_root / f"ma-{uuid.uuid4().hex[:8]}"
         short.mkdir(mode=0o700)
+        short = short.resolve()
         config = short / "config"
         env["XDG_CONFIG_HOME"] = str(config)
         bindir = python.parent
@@ -260,7 +345,7 @@ def smoke(artifact: Path) -> None:
         try:
             work = short / "work"
             work.mkdir()
-            run([str(bindir / "mimir"), "acp", "profile", "set", "default", "--home", str(work / "home")], cwd=work, env=env)
+            run([str(bindir / "mimir"), "acp", "profile", "add-local", "default", "--home", str(work / "home")], cwd=work, env=env)
             _install_native_fixture(python, work, env)
             _local_round_trip([str(bindir / "mimir"), "acp"], python, work, env, config)
             _local_round_trip([str(python), "-m", "mimir.acp"], python, work, env, config)
