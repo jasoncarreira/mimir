@@ -15,8 +15,13 @@ from mimir.access_control import agent_writable_roots, parse_declared_shell_comm
 _ROOT = Path(__file__).resolve().parents[1]
 _OPTIONAL_SKILLS = _ROOT / "mimir" / "optional-skills"
 _DECLARING_SKILLS = ("social-cli", "gmail-poller")
+_REQUIRES_DEPLOYMENT_BASH = pytest.mark.skipif(
+    not Path("/usr/bin/bash").exists(),
+    reason="requires deployment-image executable path /usr/bin/bash",
+)
 
 
+@_REQUIRES_DEPLOYMENT_BASH
 @pytest.mark.parametrize("skill_name", _DECLARING_SKILLS)
 def test_shipped_shell_commands_parse_in_installed_skill(
     skill_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
