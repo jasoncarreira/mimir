@@ -95,7 +95,7 @@ def test_acp_docs_are_force_included() -> None:
 
 def test_acp_docs_cover_client_contract() -> None:
     docs = (ROOT / "docs" / "acp.md").read_text(encoding="utf-8")
-    assert "mimir acp credential set" in docs
+    assert "mimir acp credential add" in docs
     assert "mimir-agent acp relay --home" in docs
     assert "stdout" in docs and "JSONL" in docs
     assert "no plaintext" in docs

@@ -44,16 +44,20 @@ def _parser(output: BinaryIO) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command")
     profiles = commands.add_parser("profile")
     profile_commands = profiles.add_subparsers(dest="profile_command", required=True)
+    local = profile_commands.add_parser("add-local")
+    local.add_argument("name"); local.add_argument("--home", required=True)
+    ssh = profile_commands.add_parser("add-ssh")
+    ssh.add_argument("name"); ssh.add_argument("--home", required=True)
+    ssh.add_argument("--ssh-host", required=True); ssh.add_argument("--ssh-user", required=True)
+    ssh.add_argument("--ssh-port", type=int, default=22)
+    ssh.add_argument("--identity-file", required=True); ssh.add_argument("--known-hosts-file", required=True)
     profile_commands.add_parser("list")
-    show = profile_commands.add_parser("show"); show.add_argument("name")
-    setp = profile_commands.add_parser("set"); setp.add_argument("name"); setp.add_argument("--home", required=True)
-    setp.add_argument("--ssh-host"); setp.add_argument("--ssh-user"); setp.add_argument("--ssh-port", type=int)
-    setp.add_argument("--identity-file"); setp.add_argument("--known-hosts-file")
-    delete = profile_commands.add_parser("delete"); delete.add_argument("name")
+    remove = profile_commands.add_parser("remove"); remove.add_argument("name")
     credentials = commands.add_parser("credential")
     credential_commands = credentials.add_subparsers(dest="credential_command", required=True)
-    for name in ("set", "delete", "status"):
-        command = credential_commands.add_parser(name); command.add_argument("--profile")
+    for name in ("add", "replace", "remove"):
+        command = credential_commands.add_parser(name); command.add_argument("name")
+    credential_commands.add_parser("list")
     relay = commands.add_parser("relay"); relay.add_argument("--home", required=True)
     return parser
 
@@ -69,38 +73,50 @@ def _error(code: str) -> int:
 
 
 def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
-    from .profiles import Profile, ProfileError, ProfileStore, RemoteProfile, profile_json
+    from .profiles import Profile, ProfileError, ProfileStore, RemoteProfile
     store = ProfileStore()
     try:
         if args.profile_command == "list":
             _json(output, {"version": 1, "profiles": [profile.name for profile in store.list()]}); return 0
-        if args.profile_command == "show":
-            profile = store.get(args.name)
-            if profile is None: return _error("profile-not-found")
-            _json(output, profile_json(profile)); return 0
-        if args.profile_command == "delete":
-            store.delete(args.name); _status("deleted"); return 0
-        remote_values = (args.ssh_host, args.ssh_user, args.ssh_port, args.identity_file, args.known_hosts_file)
-        any_remote = any(value is not None for value in remote_values)
-        required_remote = (args.ssh_host, args.ssh_user, args.identity_file, args.known_hosts_file)
-        if any_remote and any(value is None for value in required_remote): raise ProfileError()
-        remote = None if not any_remote else RemoteProfile(args.ssh_host, args.ssh_user, args.ssh_port if args.ssh_port is not None else 22, Path(args.identity_file), Path(args.known_hosts_file))
-        store.set(Profile(args.name, Path(args.home), remote)); _status("updated"); return 0
+        if args.profile_command == "remove":
+            store.delete(args.name); _status("removed"); return 0
+        if store.get(args.name) is not None:
+            return _error("profile-already-exists")
+        remote = None
+        if args.profile_command == "add-ssh":
+            remote = RemoteProfile(
+                args.ssh_host, args.ssh_user, args.ssh_port,
+                Path(args.identity_file), Path(args.known_hosts_file),
+            )
+        store.set(Profile(args.name, Path(args.home), remote)); _status("added"); return 0
     except ProfileError as exc: return _error(exc.code)
     except OSError: return _error("unsafe-profile-store")
 
 
-def _credential_command(args: argparse.Namespace) -> int:
+def _credential_command(args: argparse.Namespace, output: BinaryIO) -> int:
     from .credentials import CredentialError, CredentialMutationUncertain, NativeCredentialStore, read_secret_from_tty
-    from .profiles import ProfileError, ProfileStore, selected_profile
+    from .profiles import ProfileError, ProfileStore
     try:
-        name = selected_profile(args.profile)
-        if ProfileStore().get(name) is None: return _error("profile-not-found")
+        profiles = ProfileStore()
+        if args.credential_command == "list":
+            store = NativeCredentialStore()
+            values = [
+                {"profile": profile.name, "stored": store.get(profile.name) is not None}
+                for profile in profiles.list()
+            ]
+            _json(output, {"version": 1, "credentials": values}); return 0
+        name = args.name
+        if profiles.get(name) is None: return _error("profile-not-found")
         store = NativeCredentialStore()
-        if args.credential_command == "status": _status("stored" if store.get(name) is not None else "missing"); return 0
-        if args.credential_command == "delete": store.delete(name); _status("deleted"); return 0
+        if args.credential_command == "remove":
+            store.delete(name); _status("removed"); return 0
         store.require_available()
-        secret = read_secret_from_tty(); store.set(name, secret); _status("updated"); return 0
+        existing = store.get(name)
+        if args.credential_command == "add" and existing is not None:
+            return _error("credential-already-exists")
+        if args.credential_command == "replace" and existing is None:
+            return _error("credential-not-found")
+        secret = read_secret_from_tty(); store.set(name, secret); _status("added" if args.credential_command == "add" else "replaced"); return 0
     except CredentialMutationUncertain: _status("error: credential-mutation-uncertain"); return 3
     except CredentialError as exc: return _error(exc.code)
     except ProfileError as exc: return _error(exc.code)
@@ -124,7 +140,7 @@ def _proxy(args: argparse.Namespace, output: BinaryIO) -> int:
 
 def _dispatch(args: argparse.Namespace, output: BinaryIO) -> int:
     if args.command == "profile": return _profile_command(args, output)
-    if args.command == "credential": return _credential_command(args)
+    if args.command == "credential": return _credential_command(args, output)
     if args.command == "relay":
         from .relay import RelayError, run_relay
         try: asyncio.run(run_relay(Path(args.home), output)); return 0

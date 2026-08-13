@@ -5,8 +5,8 @@ Mimir's server owns the shared ACP runtime and listens on the owner-only Unix so
 Create a local profile and store its key in the native OS secure store:
 
 ```console
-mimir acp profile set default --home /absolute/mimir/home
-mimir acp credential set --profile default
+mimir acp profile add-local default --home /absolute/mimir/home
+mimir acp credential add default
 mimir acp --profile default
 ```
 
@@ -15,20 +15,21 @@ Profiles in `${XDG_CONFIG_HOME:-~/.config}/mimir/acp/profiles.json` contain no c
 Credential operations are:
 
 ```console
-mimir acp credential status --profile default
-mimir acp credential set --profile default
-mimir acp credential delete --profile default
+mimir acp credential list
+mimir acp credential add default
+mimir acp credential replace default
+mimir acp credential remove default
 ```
 
-Setting a credential reads from a controlling TTY, never stdin, argv, or the environment. Deleting a missing credential succeeds. If the native store raises after a set or delete was dispatched, the command exits 3 and reports `credential-mutation-uncertain`; inspect the native store before deciding whether to repeat the operation. Validation, profile, secure-store selection, reads, and TTY failures exit 1 and do not report uncertainty.
+Adding or replacing a credential reads from a controlling TTY, never stdin, argv, or the environment. Removing a missing credential succeeds. If the native store raises after an add, replace, or remove was dispatched, the command exits 3 and reports `credential-mutation-uncertain`; inspect the native store before deciding whether to repeat the operation. Validation, profile, secure-store selection, reads, and TTY failures exit 1 and do not report uncertainty.
 
 For a remote daemon, configure every SSH field:
 
 ```console
-mimir acp profile set remote --home /remote/home \
+mimir acp profile add-ssh remote --home /remote/home \
   --ssh-host host.example --ssh-user mimir --ssh-port 22 \
   --identity-file /absolute/id_ed25519 --known-hosts-file /absolute/known_hosts
-mimir acp credential set --profile remote
+mimir acp credential add remote
 mimir acp --profile remote
 ```
 
