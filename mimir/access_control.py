@@ -506,7 +506,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "write_file", "edit_file", "read_file", "aread", "ls", "als",
         "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
         "saga_feedback", "saga_mark_contributions", "send_message",
-        "saga_record_skill_learning", "operator_alert",
+        "saga_record_skill_learning", "operator_alert", "shell_exec",
+        "bash_jobs_list", "bash_job_output",
     }),
     "github": frozenset({
         "worklink_run", "write_file", "edit_file", "shell_exec",
