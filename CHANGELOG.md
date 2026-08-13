@@ -28,6 +28,14 @@ which did not make 0.8.2. No operator action is required.
   established. The wrappers live under `<skill>/scripts/`, writable only on a
   trusted-operator turn, so a poller turn cannot rewrite what it is about to run.
 
+  The `research` authority profile gains exactly three capabilities to make this
+  possible — `shell_exec`, `bash_jobs_list` and `bash_job_output` — taking it from
+  17 to 20. The two job-inspection capabilities are companions that
+  `_missing_capability_companions` requires: without them the principal fails to
+  construct rather than degrading. This is a **ceiling**, not a grant: a
+  research-profile poller gains nothing until its own manifest declares the
+  capability, and only these three manifests do.
+
 
 ## [0.8.2] — 2026-08-13
 
