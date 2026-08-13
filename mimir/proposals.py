@@ -35,7 +35,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 # Reuse the hardened helpers rather than reimplement: ``_redact`` is the shared
 # token scrubber (git_tracking imports it too), ``_run`` the uniform 30s-timeout
@@ -63,6 +63,7 @@ CONFLICT_MARKER_RE = re.compile(r"^(?:<<<<<<<|=======$|>>>>>>>)", re.MULTILINE)
 #: ``(home, branch, base, title, body) -> pr_url | None`` — injectable so tests
 #: exercise the git mechanics without a real GitHub.
 PrOpener = Callable[[Path, str, str, str, str], "str | None"]
+ProposalPrState = Literal["open", "merged", "closed", "no_pr"]
 
 
 class ProposalPrError(RuntimeError):
@@ -540,23 +541,39 @@ def _remote_proposal_branches(home: Path) -> list[tuple[str, str | None]]:
     return out
 
 
-def _proposal_branch_has_open_pr(home: Path, branch: str) -> bool | None:
-    """Return True/False for an open PR on ``branch``; None when unknown."""
+def _proposal_branch_pr_state(home: Path, branch: str) -> ProposalPrState | None:
+    """Return the forge PR state for ``branch``; ``None`` when unknown."""
     if shutil.which("gh") is None:
         return None
-    res = _run(
-        [
-            "gh", "pr", "list", "--state", "open", "--head", branch,
-            "--json", "number", "--limit", "1",
-        ],
-        cwd=home,
-        capture=True,
-    )
+    try:
+        res = _run(
+            [
+                "gh", "pr", "list", "--state", "all", "--head", branch,
+                "--json", "number,state", "--limit", "1",
+            ],
+            cwd=home,
+            capture=True,
+        )
+    except OSError:
+        return None
     if res.returncode != 0:
         return None
     try:
-        return bool(json.loads(res.stdout or "[]"))
-    except json.JSONDecodeError:
+        prs = json.loads(res.stdout or "[]")
+        if not isinstance(prs, list):
+            return None
+        if not prs:
+            return "no_pr"
+        if not isinstance(prs[0], dict):
+            return None
+        number = prs[0].get("number")
+        state = prs[0].get("state")
+        if isinstance(number, int) and not isinstance(number, bool) and state in {
+            "OPEN", "MERGED", "CLOSED",
+        }:
+            return state.lower()
+        return None
+    except (json.JSONDecodeError, AttributeError):
         return None
 
 
@@ -644,10 +661,11 @@ def cleanup_resolved_proposal_branches(
     *,
     previous_skip_reasons: Mapping[str, str] | None = None,
 ) -> list[ProposalCleanupRecord]:
-    """Delete remote/local proposal branches whose PR is resolved and content is on main.\n\n    Safety gates:\n    - only proposal-owned prefixes (``proposal/`` and ``upgrade/``),
-    - preserve any branch with an open PR,
-    - delete only when the branch is ancestry-merged or the protected-surface
-      content matches ``origin/main`` (squash-merge/superseded path),
+    """Delete remote/local proposal branches resolved by PR state or content.\n\n    Safety gates:\n    - only proposal-owned prefixes (``proposal/`` and ``upgrade/``),
+    - preserve branches with open PRs or unknown PR state,
+    - delete forge-confirmed merged or closed PR branches,
+    - with no PR, delete only when the branch is ancestry-merged or the protected-surface
+      content matches ``origin/main`` (legacy/superseded path),
     - log every deletion with branch name + tip SHA for auditability.
     """
     home = Path(home).resolve()
@@ -663,22 +681,22 @@ def cleanup_resolved_proposal_branches(
         return []
     _git(["fetch", "--prune", "origin"], cwd=home)
     for branch, tip in _remote_proposal_branches(home):
-        has_open_pr = _proposal_branch_has_open_pr(home, branch)
-        if has_open_pr is True:
+        pr_state = _proposal_branch_pr_state(home, branch)
+        if pr_state == "open":
             record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr")
             _log_proposal_cleanup(
                 record, previous_skip_reasons=previous_skip_reasons
             )
             records.append(record)
             continue
-        if has_open_pr is None:
+        if pr_state is None:
             record = ProposalCleanupRecord(branch, tip, "skipped", "open_pr_unknown")
             _log_proposal_cleanup(
                 record, previous_skip_reasons=previous_skip_reasons
             )
             records.append(record)
             continue
-        if not _proposal_branch_content_is_on_main(home, branch):
+        if pr_state == "no_pr" and not _proposal_branch_content_is_on_main(home, branch):
             record = ProposalCleanupRecord(branch, tip, "skipped", "content_not_on_main")
             _log_proposal_cleanup(
                 record, previous_skip_reasons=previous_skip_reasons
@@ -699,7 +717,12 @@ def cleanup_resolved_proposal_branches(
             records.append(record)
             continue
         _remove_worktree_for_branch(home, branch)
-        record = ProposalCleanupRecord(branch, tip, "deleted", "resolved_content_on_main")
+        reason = (
+            "resolved_content_on_main"
+            if pr_state == "no_pr"
+            else f"resolved_pr_{pr_state}"
+        )
+        record = ProposalCleanupRecord(branch, tip, "deleted", reason)
         _log_proposal_cleanup(record)
         records.append(record)
     return records
