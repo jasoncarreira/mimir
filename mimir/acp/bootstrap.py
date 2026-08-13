@@ -84,7 +84,7 @@ def _profile_command(args: argparse.Namespace, output: BinaryIO) -> int:
         any_remote = any(value is not None for value in remote_values)
         required_remote = (args.ssh_host, args.ssh_user, args.identity_file, args.known_hosts_file)
         if any_remote and any(value is None for value in required_remote): raise ProfileError()
-        remote = None if not any_remote else RemoteProfile(args.ssh_host, args.ssh_user, args.ssh_port or 22, Path(args.identity_file), Path(args.known_hosts_file))
+        remote = None if not any_remote else RemoteProfile(args.ssh_host, args.ssh_user, args.ssh_port if args.ssh_port is not None else 22, Path(args.identity_file), Path(args.known_hosts_file))
         store.set(Profile(args.name, Path(args.home), remote)); _status("updated"); return 0
     except ProfileError as exc: return _error(exc.code)
     except OSError: return _error("unsafe-profile-store")

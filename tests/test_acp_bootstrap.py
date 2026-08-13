@@ -38,6 +38,18 @@ def test_remote_option_presence_and_default_port(tmp_path: Path, monkeypatch: py
     assert (tmp_path / "mimir" / "acp" / "profiles.json").read_bytes() == before
 
 
+@pytest.mark.parametrize(("port", "valid"), [(0, False), (1, True), (65535, True), (65536, False)])
+def test_remote_port_boundaries(tmp_path: Path, port: int, valid: bool, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]) -> None:
+    args = ["profile", "set", "remote", "--home", "/remote", "--ssh-host", "example.com", "--ssh-user", "agent", "--ssh-port", str(port), "--identity-file", "/id", "--known-hosts-file", "/known"]
+    expected = (0, "", "updated\n") if valid else (1, "", "error: invalid-profile\n")
+    assert invoke(tmp_path, args, monkeypatch, capfd) == expected
+    path = tmp_path / "mimir" / "acp" / "profiles.json"
+    if valid:
+        assert json.loads(path.read_text())["profiles"]["remote"]["remote"]["port"] == port
+    else:
+        assert not path.exists()
+
+
 @pytest.mark.parametrize("args", [
     ["profile"],
     ["profile", "show"],
