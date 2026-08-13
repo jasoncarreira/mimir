@@ -270,15 +270,18 @@ async def _send(process: asyncio.subprocess.Process, message: dict[str, Any]) ->
     await process.stdin.drain()
 
 
-async def _receive(process: asyncio.subprocess.Process) -> dict[str, Any]:
+async def _receive(process: asyncio.subprocess.Process, stdout: bytearray | None = None) -> dict[str, Any]:
     assert process.stdout
-    return json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
+    raw = await asyncio.wait_for(process.stdout.readline(), 5)
+    if stdout is not None:
+        stdout.extend(raw)
+    return json.loads(raw)
 
 
-async def _request(process: asyncio.subprocess.Process, request_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+async def _request(process: asyncio.subprocess.Process, request_id: int, method: str, params: dict[str, Any], stdout: bytearray | None = None) -> dict[str, Any]:
     await _send(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
     while True:
-        message = await _receive(process)
+        message = await _receive(process, stdout)
         if message.get("id") == request_id:
             return message
         await _answer_client_request(process, message)
@@ -316,25 +319,26 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
     daemon = AcpDaemon(bundle)
     await daemon.start()
     process, environment, key_file, command = await _proxy_process(tmp_path, home, secret)
+    raw_stdout = bytearray()
     try:
-        initialized = await _request(process, 1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        initialized = await _request(process, 1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}, raw_stdout)
         assert initialized["result"]["authMethods"][0]["id"] == "mimir-web-key"
-        assert (await _request(process, 2, "authenticate", {"methodId": "mimir-web-key", "_meta": {"mimir.fake": "forged"}}))["result"] == {}
+        assert (await _request(process, 2, "authenticate", {"methodId": "mimir-web-key", "_meta": {"mimir.fake": "forged"}}, raw_stdout))["result"] == {}
         created = await _request(process, 3, "session/new", {
             "cwd": "/workspace",
             "mcpServers": [{"type": "acp", "name": "mimir-hands", "serverId": "hands"}],
-        })
+        }, raw_stdout)
         session_id = created["result"]["sessionId"]
         prompted = await _request(process, 4, "session/prompt", {
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": "edit"}],
-        })
+        }, raw_stdout)
         assert prompted["result"]["stopReason"] == "end_turn"
         loaded = await _request(process, 5, "session/load", {
             "cwd": "/workspace",
             "sessionId": session_id,
             "mcpServers": [],
-        })
+        }, raw_stdout)
         assert loaded["result"] == {}
         core.block = True
         core.entered.clear()
@@ -345,7 +349,7 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
         await asyncio.wait_for(core.entered.wait(), 5)
         await _send(process, {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})
         while True:
-            response = await _receive(process)
+            response = await _receive(process, raw_stdout)
             if response.get("id") == 6:
                 break
             await _answer_client_request(process, response)
@@ -366,7 +370,7 @@ async def test_real_command_path_flow_and_secret_negative_surfaces(tmp_path: Pat
         profile_bytes,
         persisted,
         stderr,
-        json.dumps([initialized, created, prompted, loaded, response]).encode(),
+        bytes(raw_stdout),
         " ".join(environment.values()).encode(),
         " ".join(command).encode(),
         caplog.text.encode(),

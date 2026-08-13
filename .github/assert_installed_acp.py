@@ -78,9 +78,9 @@ def _assert_metadata(probe: dict[str, object], python: Path, work: Path, env: di
     return origins["mimir.acp.__init__"].parents[1]
 
 
-def _install_native_fixture(python: Path, work: Path, env: dict[str, str]) -> None:
+def _install_native_fixture(python: Path, work: Path, env: dict[str, str], ssh: Path | None = None) -> None:
     site = subprocess.run([str(python), "-c", "import site; print(site.getsitepackages()[0])"], cwd=work, env=env, text=True, capture_output=True, check=True).stdout.strip()
-    Path(site, "sitecustomize.py").write_text(
+    source = (
         "import keyring\n"
         "class Keyring:\n"
         "    __module__='keyring.backends.SecretService'\n"
@@ -90,6 +90,9 @@ def _install_native_fixture(python: Path, work: Path, env: dict[str, str]) -> No
         "    def delete_password(self,service,user): pass\n"
         "keyring.get_keyring=lambda:Keyring()\n"
     )
+    if ssh is not None:
+        source += f"import mimir.acp.ssh\nmimir.acp.ssh.SSH_PATH=__import__('pathlib').Path({str(ssh)!r})\n"
+    Path(site, "sitecustomize.py").write_text(source)
 
 
 def _local_round_trip(command: list[str], python: Path, work: Path, env: dict[str, str], config: Path) -> None:
@@ -151,7 +154,7 @@ asyncio.run(main())
         process.wait(timeout=5)
 
 
-def _remote_round_trip(python: Path, work: Path, env: dict[str, str], config: Path) -> None:
+def _remote_round_trip(command: list[str], python: Path, work: Path, env: dict[str, str]) -> None:
     home = work / "remote-home"
     socket = home / ".mimir" / "acp" / "daemon.sock"
     socket.parent.mkdir(parents=True, mode=0o700)
@@ -172,35 +175,32 @@ async def main():
 asyncio.run(main())
 """
     server_process = subprocess.Popen([str(python), "-c", server, str(socket)], cwd=work, env=env)
-    relay = work / "ssh-relay"
-    relay.write_text(
+    ssh = work / "ssh-fixture"
+    observed = work / "ssh-observed.json"
+    ssh.write_text(
         f"#!{python}\n"
-        "import os,subprocess,sys\n"
+        "import json,os,shlex,sys\n"
         "assert all('installed-secret' not in value for value in [*sys.argv,*os.environ.values()])\n"
-        f"raise SystemExit(subprocess.call([{str(python)!r},'-m','mimir.acp','relay','--home',{str(home)!r}]))\n"
+        f"expected=['mimir-agent','acp','relay','--home',{str(home)!r}]\n"
+        "assert shlex.split(sys.argv[-1])==expected\n"
+        f"json.dump({{'argv':sys.argv,'env':dict(os.environ)}},open({str(observed)!r},'w'))\n"
+        "os.execvp(expected[0],expected)\n"
     )
-    relay.chmod(0o755)
+    ssh.chmod(0o755)
     try:
         for _ in range(200):
             if socket.exists():
                 break
             import time
             time.sleep(0.01)
-        setup = (
-            "from pathlib import Path\n"
-            "from mimir.acp.profiles import Profile,ProfileStore,RemoteProfile\n"
-            f"ProfileStore(Path({str(config / 'mimir' / 'acp' / 'profiles.json')!r})).set(Profile('remote',Path({str(home)!r}),RemoteProfile('example.com','agent',22,Path({str(identity)!r}),Path({str(known)!r}))))\n"
-        )
-        subprocess.run([str(python), "-c", setup], cwd=work, env=env, check=True)
+        _install_native_fixture(python, work, env, ssh)
+        subprocess.run([
+            *command, "profile", "set", "remote", "--home", str(home),
+            "--ssh-host", "example.com", "--ssh-user", "agent",
+            "--identity-file", str(identity), "--known-hosts-file", str(known),
+        ], cwd=work, env=env, check=True)
         installed = subprocess.run(
-            [str(python), "-c", (
-                "import asyncio,io\n"
-                "from mimir.acp.credentials import NativeCredentialStore\n"
-                "from mimir.acp.profiles import ProfileStore\n"
-                "from mimir.acp.ssh import run_ssh_proxy\n"
-                "p=ProfileStore().get('remote'); assert p is not None\n"
-                f"asyncio.run(run_ssh_proxy(p,NativeCredentialStore().get('remote'),getattr(__import__('sys').stdout,'buffer'),_ssh_path=__import__('pathlib').Path({str(relay)!r})))\n"
-            )],
+            [*command, "--profile", "remote"],
             cwd=work,
             env=env,
             input=b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n',
@@ -210,6 +210,8 @@ asyncio.run(main())
         assert installed.returncode == 0, installed.stderr.decode()
         assert installed.stdout == b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
         assert b"installed-secret" not in installed.stdout + installed.stderr
+        captured = observed.read_bytes()
+        assert b"installed-secret" not in captured
     finally:
         server_process.terminate()
         server_process.wait(timeout=5)
@@ -240,6 +242,7 @@ def smoke(artifact: Path) -> None:
         config = short / "config"
         env["XDG_CONFIG_HOME"] = str(config)
         bindir = python.parent
+        env["PATH"] = os.pathsep.join((str(bindir), env.get("PATH", "")))
         launches = [
             [str(bindir / "mimir"), "acp", "--help"],
             [str(bindir / "mimir"), "acp", "profile", "list"],
@@ -262,7 +265,7 @@ def smoke(artifact: Path) -> None:
             _local_round_trip([str(bindir / "mimir"), "acp"], python, work, env, config)
             _local_round_trip([str(python), "-m", "mimir.acp"], python, work, env, config)
             _relay_round_trip([str(bindir / "mimir-agent"), "acp"], python, work, env)
-            _remote_round_trip(python, work, env, config)
+            _remote_round_trip([str(bindir / "mimir"), "acp"], python, work, env)
         finally:
             import shutil
             shutil.rmtree(short, ignore_errors=True)

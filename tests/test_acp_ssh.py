@@ -170,13 +170,27 @@ async def test_actual_subprocess_failure_is_sanitized_and_reaped(monkeypatch: py
     profile, _ = remote_profile(tmp_path)
     ssh = _fake_ssh(tmp_path, "import sys; sys.stderr.write('private-sentinel'); raise SystemExit(23)\n")
     reader = asyncio.StreamReader()
-    reader.feed_eof()
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
     with pytest.raises(SshError, match="SSH connection failed") as raised:
         await run_ssh_proxy(profile, "raw-secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")})
     assert "private-sentinel" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_early_child_failure_cancels_open_client_stdin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    ssh = _fake_ssh(tmp_path, "raise SystemExit(19)\n")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    with pytest.raises(SshError, match="SSH connection failed"):
+        await asyncio.wait_for(
+            run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", "")}),
+            2,
+        )
 
 
 @pytest.mark.asyncio
@@ -201,3 +215,79 @@ for line in sys.stdin.buffer: time.sleep(10)
     with pytest.raises(asyncio.CancelledError):
         await task
     assert marker.read_text() == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_stubborn_child_is_killed_and_reaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    marker = tmp_path / "child.json"
+    ssh = _fake_ssh(tmp_path, """
+import json,os,signal,sys,time
+def ignore(*args):
+ data=json.load(open(os.environ['MARKER'])); data['terminated']=True
+ with open(os.environ['MARKER'],'w') as stream: json.dump(data,stream)
+signal.signal(signal.SIGTERM,ignore)
+with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid(),'terminated':False},stream)
+while True: time.sleep(1)
+""")
+    reader = asyncio.StreamReader()
+    output = io.BytesIO()
+    transport = type("Transport", (), {"close": lambda self: None})()
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
+    task = asyncio.create_task(run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+    ))
+    for _ in range(200):
+        if marker.exists(): break
+        await asyncio.sleep(0.01)
+    pid = json.loads(marker.read_text())["pid"]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert json.loads(marker.read_text())["terminated"] is True
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_unread_stdout_backpressure_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    marker = tmp_path / "pid"
+    ssh = _fake_ssh(tmp_path, """
+import os,sys
+open(os.environ['MARKER'],'w').write(str(os.getpid()))
+chunk=b'x' * 65536
+while True:
+ sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+""")
+    reader = asyncio.StreamReader()
+    read_fd, write_fd = os.pipe()
+    output = os.fdopen(write_fd, "wb", buffering=0)
+    input_transport = type("Transport", (), {"close": lambda self: None})()
+    async def open_stdio(target: object) -> tuple[object, object, object]:
+        loop = asyncio.get_running_loop()
+        protocol = asyncio.streams.FlowControlMixin(loop=loop)
+        transport, _ = await loop.connect_write_pipe(lambda: protocol, target)
+        return reader, asyncio.StreamWriter(transport, protocol, None, loop), input_transport
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
+    monkeypatch.setattr("mimir.acp.ssh.TERMINATE_TIMEOUT", 0.05)
+    task = asyncio.create_task(run_ssh_proxy(
+        profile, "secret", output, _ssh_path=ssh,
+        _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)},
+    ))
+    for _ in range(200):
+        if marker.exists(): break
+        await asyncio.sleep(0.01)
+    pid = int(marker.read_text())
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    os.close(read_fd)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

@@ -36,7 +36,7 @@ def build_ssh_argv(profile: Profile, ssh_path: Path | None = None) -> tuple[str,
     ssh_path = SSH_PATH if ssh_path is None else ssh_path
     remote = profile.remote
     if remote is None: raise SshError("remote profile required")
-    _safe_file(ssh_path, executable_root=ssh_path == SSH_PATH)
+    _safe_file(ssh_path, executable_root=ssh_path == Path("/usr/bin/ssh"))
     _safe_file(remote.identity_file, strict=True)
     _safe_file(remote.known_hosts_file)
     command = shlex.join(["mimir-agent", "acp", "relay", "--home", str(profile.home)])
@@ -103,19 +103,33 @@ async def run_ssh_proxy(
     discard = asyncio.create_task(_discard(process.stderr))
     upstream = asyncio.create_task(pump_stream(reader, FrameWriter(process.stdin, credential)))
     downstream = asyncio.create_task(pump_stream(process.stdout, writer))
+    child = asyncio.create_task(process.wait())
+    pumps = asyncio.gather(upstream, downstream)
     try:
-        await asyncio.gather(upstream, downstream)
-        try:
-            code = await asyncio.wait_for(process.wait(), WAIT_TIMEOUT)
-        except TimeoutError as exc:
-            raise SshError("SSH child did not exit") from exc
-        if code:
-            raise SshError("SSH connection failed")
+        done, _ = await asyncio.wait((pumps, child), return_when=asyncio.FIRST_COMPLETED)
+        if child in done:
+            code = child.result()
+            if code:
+                raise SshError("SSH connection failed")
+            if not upstream.done():
+                upstream.cancel()
+            await asyncio.gather(upstream, return_exceptions=True)
+            await downstream
+        else:
+            pumps.result()
+            try:
+                code = await asyncio.wait_for(asyncio.shield(child), WAIT_TIMEOUT)
+            except TimeoutError as exc:
+                raise SshError("SSH child did not exit") from exc
+            if code:
+                raise SshError("SSH connection failed")
     finally:
-        for task in (upstream, downstream, discard):
+        if not pumps.done():
+            pumps.cancel()
+        for task in (upstream, downstream, child, discard):
             if task is not None and not task.done():
                 task.cancel()
-        await asyncio.gather(*(task for task in (upstream, downstream, discard) if task is not None), return_exceptions=True)
+        await asyncio.gather(pumps, upstream, downstream, child, discard, return_exceptions=True)
         input_transport.close()
         closing = asyncio.gather(close_writer(writer), close_writer(process.stdin), return_exceptions=True)
         try:

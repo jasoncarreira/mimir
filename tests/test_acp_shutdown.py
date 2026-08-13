@@ -8,6 +8,8 @@ import pytest
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
+from mimir.acp.proxy import _OutputWriter
+from mimir.acp.transport import close_writer, pump_stream
 
 
 @pytest.mark.asyncio
@@ -89,6 +91,66 @@ async def test_protocol_writer_uses_bounded_transport_close(monkeypatch: pytest.
     writer = object()
     await close_protocol_writer(writer)
     assert calls == [writer]
+
+
+@pytest.mark.asyncio
+async def test_eof_stage_preserves_descriptor_ownership() -> None:
+    class Writer:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.closed = False
+        def write_eof(self) -> None: self.events.append("eof")
+        async def drain(self) -> None: self.events.append("drain")
+        def close(self) -> None: self.closed = True
+
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    writer = Writer()
+    await pump_stream(reader, writer)
+    assert writer.events == ["eof", "drain"]
+    assert not writer.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["write", "flush"])
+async def test_peer_disconnect_write_and_flush_are_reported(stage: str) -> None:
+    class Sink(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            if stage == "write": raise BrokenPipeError
+            return super().write(data)
+        def flush(self) -> None:
+            if stage == "flush": raise ConnectionResetError
+            super().flush()
+
+    writer = _OutputWriter(Sink())
+    with pytest.raises((BrokenPipeError, ConnectionResetError)):
+        writer.write(b"frame\n")
+    assert not writer.closed
+
+
+@pytest.mark.asyncio
+async def test_writer_close_uses_exact_finite_drain_close_and_abort_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[float] = []
+    stages: list[str] = []
+
+    async def wait_for(awaitable: object, timeout: float) -> object:
+        timeouts.append(timeout)
+        awaitable.close()
+        raise TimeoutError
+
+    class Transport:
+        def abort(self) -> None: stages.append("abort")
+
+    class Writer:
+        transport = Transport()
+        async def drain(self) -> None: await asyncio.Future()
+        def close(self) -> None: stages.append("close")
+        async def wait_closed(self) -> None: await asyncio.Future()
+
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
+    await close_writer(Writer())
+    assert timeouts == [2.0, 1.0, 1.0]
+    assert stages == ["close", "abort"]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import stat
@@ -97,11 +98,19 @@ class _OutputWriter:
     def is_closing(self) -> bool: return self.closed
     async def wait_closed(self) -> None: return None
 
-async def open_stdio(output: BinaryIO) -> tuple[asyncio.StreamReader, _OutputWriter, asyncio.BaseTransport]:
+async def open_stdio(output: BinaryIO) -> tuple[asyncio.StreamReader, Any, asyncio.BaseTransport]:
     loop = asyncio.get_running_loop(); reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     transport, _ = await loop.connect_read_pipe(lambda: protocol, sys.stdin.buffer)
-    return reader, _OutputWriter(output), transport
+    try:
+        output.fileno()
+    except (AttributeError, io.UnsupportedOperation):
+        writer: Any = _OutputWriter(output)
+    else:
+        output_protocol = asyncio.streams.FlowControlMixin(loop=loop)
+        output_transport, _ = await loop.connect_write_pipe(lambda: output_protocol, output)
+        writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+    return reader, writer, transport
 
 
 def socket_path(profile: Profile) -> Path:
