@@ -621,6 +621,57 @@ def test_turn_prompt_renders_exact_autonomous_trigger_authority():
     assert "``worklink_run`` is usable only before any untrusted active ingest" in prompt
 
 
+def test_turn_prompt_renders_shell_contract_and_declared_commands_only_for_shell_capability():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    event = AgentEvent(trigger="poller", channel_id="poller:feed", content="tick")
+    shell_prompt = build_turn_prompt(
+        event,
+        trigger_authority_profile="feed",
+        trigger_capabilities=("read_file", "shell_exec"),
+        trigger_shell_commands=("social-cli", "stat"),
+    )
+
+    assert "Shell call contract (shape only, not a grant)" in shell_prompt
+    for refused_shape in (
+        "no pipes",
+        "redirects",
+        "``&&`` or ``;``",
+        "globs",
+        "``$(...)``",
+        "``source``/``export`` prefixes",
+        "never ``-c``, ``-e``, ``-m``, ``--command``, ``--eval``, or stdin ``-`` forms",
+    ):
+        assert refused_shape in shell_prompt
+    assert "Declared shell commands: ``social-cli``, ``stat``" in shell_prompt
+
+    non_shell_prompt = build_turn_prompt(
+        event,
+        trigger_authority_profile="reader",
+        trigger_capabilities=("read_file",),
+        trigger_shell_commands=("social-cli",),
+    )
+    assert "Shell call contract" not in non_shell_prompt
+    assert "Declared shell commands" not in non_shell_prompt
+
+
+def test_turn_prompt_renders_profileless_autonomous_authority():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="poller:unprofiled", content="tick"),
+        trigger_authority_present=True,
+    )
+
+    assert "## Autonomous trigger authority" in prompt
+    assert "Server-defined profile: none." in prompt
+    assert "Available capabilities: none." in prompt
+    assert "Only these listed capabilities are available; this guidance grants nothing." in prompt
+    assert "Shell call contract" not in prompt
+
+
 def test_github_trigger_prompt_rejects_self_declassification_and_spawn():
     from mimir.models import AgentEvent
     from mimir.prompts import build_turn_prompt

@@ -120,6 +120,104 @@ def _event(author: str | None) -> AgentEvent:
     )
 
 
+def test_validated_arguments_unwraps_item_only_for_list_parameters() -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str] | None
+        title: str
+
+    tool = SimpleNamespace(args_schema=Arguments)
+    list_request = SimpleNamespace(
+        tool=tool,
+        tool_call={"args": {"topics": {"item": ["alpha", "beta"]}, "title": "x"}},
+    )
+    scalar_request = SimpleNamespace(
+        tool=tool,
+        tool_call={"args": {"topics": ["alpha"], "title": {"item": "x"}}},
+    )
+
+    assert _validated_arguments(list_request) == {
+        "topics": ["alpha", "beta"],
+        "title": "x",
+    }
+    assert _validated_arguments(scalar_request) is None
+
+
+@pytest.mark.parametrize(
+    "topics",
+    [
+        {"item": ["alpha"], "other": ["discarded"]},
+        {"items": ["alpha"]},
+        {"item": ["alpha", 7]},
+    ],
+)
+def test_validated_arguments_keeps_invalid_list_payloads_invalid(topics: object) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": topics}},
+    )
+
+    assert _validated_arguments(request) is None
+
+
+def test_validated_arguments_logs_redacted_failure_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools.budget_gate import _validated_arguments
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    secret = "credential-adjacent-secret"
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": {"item": [secret, 7]}}},
+    )
+
+    with caplog.at_level("WARNING", logger="mimir.tools.budget_gate"):
+        assert _validated_arguments(request) is None
+
+    assert "ValidationError" in caplog.text
+    assert "topics" in caplog.text
+    assert "string_type" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_validated_arguments_diagnostic_failure_does_not_change_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import BaseModel
+
+    from mimir.tools import budget_gate
+
+    class Arguments(BaseModel):
+        topics: list[str]
+
+    request = SimpleNamespace(
+        tool=SimpleNamespace(args_schema=Arguments),
+        tool_call={"args": {"topics": "not-a-list"}},
+    )
+
+    def fail_to_log(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("logging unavailable")
+
+    monkeypatch.setattr(budget_gate.log, "warning", fail_to_log)
+
+    assert budget_gate._validated_arguments(request) is None
+
+
 def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewState:
     return RepoReviewState(RepoPRActionScope(
         provenance="poller_payload",
@@ -1164,6 +1262,46 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
         assert access_control.TRIGGER_CAPABILITY_TIERS[capability] is CapabilityTier.SCOPE_CONTAINED
     assert "shell_exec" not in principal.capabilities
     assert "shell_process" not in principal.sink_destinations
+
+
+def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
+    tmp_path: Path,
+) -> None:
+    from mimir.models import SourceLabel
+
+    principal = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="github-user",
+        domain="github",
+        resource_id="owner/repo#1",
+        bridge_instance="github",
+        sensitivity="internal",
+        authorized_principals=frozenset({"service:synthesis"}),
+        source_kind="poller",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+    assert labels.has_untrusted_active_ingest is True
+    assert "rebuild_index" in principal.capabilities
+    assert access_control.TRIGGER_CAPABILITY_TIERS["rebuild_index"] is (
+        CapabilityTier.SCOPE_CONTAINED
+    )
+    registry = ToolRegistry()
+    assert registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, InformationFlowLabels()),
+        enforce=True,
+    ).allowed is True
+    tainted_decision = registry.authorize_tool(
+        "rebuild_index",
+        _service_auth(principal, labels),
+        enforce=True,
+    )
+    assert tainted_decision.allowed is False
+    assert tainted_decision.argument_egress == "taint_gated"
 
 
 @pytest.mark.parametrize(

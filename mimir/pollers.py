@@ -1814,18 +1814,9 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
-                # Descendants can inherit the shell's pipe descriptors. Wait
-                # for their EOF after SIGKILL so timeout completion means the
-                # whole process group, not only its leader, has terminated.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending, return_exceptions=True),
-                        timeout=POLLER_EXIT_GRACE_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
                 raise asyncio.TimeoutError
             stdout_bytes = stdout_task.result()
             stderr_bytes = stderr_task.result()
