@@ -6,6 +6,67 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-08-13
+
+A patch release. Unlike 0.8.1, **no operator action is required**: no dependency
+changed, and the `Dockerfile` is untouched, so a deployment already carrying the
+0.8.1 containment layer needs only the package.
+
+Most of this release comes from acting on recorded `shadow_tool_decision` events —
+calls that succeed today because enforcement is off, and would stop silently the
+moment `MIMIR_ACCESS_CONTROL_ENFORCED` is set. Each grant below is sized to
+observed use rather than to convenience.
+
+### Fixed
+
+- Output truncation could emit a fragment of a registered secret. The cap cut at
+  an arbitrary byte offset and scrubbing replaces whole values, so a cut through
+  the middle of a secret left a prefix that matched nothing. Collection now
+  buffers past the cap far enough to see a value spanning the cut. (#1442)
+- A tool call from a model that serialises arrays as `{"item": [...]}` was lost
+  entirely, and the validation error was discarded so the failure was
+  undiagnosable. Such payloads are now unwrapped for list-typed parameters only,
+  and validation failures record the parameter and error type — never argument
+  values. One deployment was losing 137 session boundaries a day to this. (#1444)
+- `repo_test` could not snapshot this repository at all: the credential preflight
+  refused 114 tracked files — `README.md`, `SPEC.md`, workflows, test fixtures —
+  because they contain credential-SHAPED text. Tracked content is already
+  committed, already in the pull request, and already on the remote, so scanning
+  it prevented nothing while disabling the tool. Untracked and ignored entries
+  are still scanned, which is where the control actually applies. (#1445)
+- A nested Git repository in a source tree was refused as a malformed path.
+  `git ls-files --others` reports an embedded repo as one entry with a trailing
+  slash, which tripped the guard written for `..` and absolute paths — so a
+  worktree refused identically to a hostile path. It now has its own error and
+  reason code. (#1442)
+
+### Changed
+
+- A shell refusal now returns the stable `binding_rule` to the caller alongside
+  the human-readable reason, so an agent can distinguish "wrong flag" from "not
+  admitted" from "you wrote a shell form, not an argv" without parsing message
+  wording. A refusal path that omits the rule degrades to `binding_rule=unknown`
+  rather than raising inside the authorization gate. (#1443)
+- The autonomous trigger authority block now states the argv contract for
+  shell-bearing capabilities — one command per call, no pipes, redirects, `&&`,
+  globs, `$(...)`, or interpreter `-c`/`-m` forms — and names any declared
+  shell commands. A principal with no authority profile now receives a block
+  saying so, where previously it received nothing at all. (#1448)
+- `saga_end_session` states that an explicit call requires the capability, and
+  that principals without it should not attempt one because the synthesis turn
+  closes the session. (#1447)
+
+### Added
+
+- The `research` authority profile grants `saga_record_skill_learning`, so a
+  poller that runs a skill can record what it learned. The tool was always aimed
+  at skill-running turns; only session-boundary principals could reach it. (#1446)
+- The `session-boundary` profile grants `rebuild_index`, with an explicit
+  `SCOPE_CONTAINED` tier entry so it is reachable by principals capped below
+  `UNBOUNDED`. Taint gating is unchanged: a turn carrying untrusted active
+  ingest is still refused. (#1450)
+
+
 ## [0.8.1] — 2026-08-11
 
 A patch by version number, but the containment work below changes what an **image**
