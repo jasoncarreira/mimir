@@ -15,6 +15,7 @@ import asyncio
 from dataclasses import replace
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -169,7 +170,7 @@ def _authority(**updates: object) -> dict:
     return value
 
 
-def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
+def test_research_profile_has_bounded_shell_and_append_credit_authority() -> None:
     from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
 
     profile = TRIGGER_AUTHORITY_PROFILES["research"]
@@ -178,8 +179,11 @@ def test_research_profile_memory_authority_is_append_and_credit_only() -> None:
         "saga_feedback",
         "saga_mark_contributions",
         "saga_record_skill_learning",
+        "shell_exec",
+        "bash_jobs_list",
+        "bash_job_output",
     } <= profile
-    assert {"saga_forget", "saga_end_session"}.isdisjoint(profile)
+    assert {"saga_forget", "saga_end_session", "bash_async"}.isdisjoint(profile)
 
 
 def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None:
@@ -275,10 +279,18 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
     companions = {"bash_jobs_list", "bash_job_output"}
 
     for manifest_path in manifests.glob("*/pollers.json"):
-        entries = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+        installed = tmp_path / "skills" / manifest_path.parent.name
+        shutil.copytree(manifest_path.parent, installed)
+        installed_manifest = installed / "pollers.json"
+        entries = json.loads(installed_manifest.read_text(encoding="utf-8"))["pollers"]
         for entry in entries:
             if "authority" not in entry:
                 continue
+            for declaration in entry["authority"].get("shell_commands", []):
+                if "script" in declaration:
+                    declaration["script"] = str(
+                        installed / "scripts" / Path(declaration["script"]).name
+                    )
             persist_dir = tmp_path / entry["name"]
             persist_dir.mkdir()
             principal = _parse_poller_authority(
@@ -286,7 +298,7 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
                 name=entry["name"],
                 persist_dir=persist_dir,
                 state_root=tmp_path / "state" / "pollers",
-                manifest_path=manifest_path,
+                manifest_path=installed_manifest,
             )
             capabilities = set(principal.capabilities)
             if capabilities & {"shell_exec", "bash_async"}:
