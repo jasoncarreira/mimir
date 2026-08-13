@@ -4030,7 +4030,7 @@ def _write_auth(*, admin: bool = False) -> AuthContext:
     )
 
 
-def _trusted_operator_write_auth() -> AuthContext:
+def _trusted_operator_write_auth(*, admin: bool = False) -> AuthContext:
     source = SourceLabel(
         principal="alice",
         domain="channel",
@@ -4047,7 +4047,7 @@ def _trusted_operator_write_auth() -> AuthContext:
         sources=(source,),
     )
     return replace(
-        _write_auth(),
+        _write_auth(admin=admin),
         domain="channel",
         resource_id="slack-C1",
         bridge_instance="slack",
@@ -4055,8 +4055,23 @@ def _trusted_operator_write_auth() -> AuthContext:
     )
 
 
+def _tainted_admin_operator_write_auth() -> AuthContext:
+    auth = _trusted_operator_write_auth(admin=True)
+    untrusted = SourceLabel(
+        principal="mallory",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity=Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    return replace(auth, ifc_labels=auth.ifc_labels.with_source(untrusted))
+
+
 @pytest.mark.parametrize(
-    ("case", "auth_factory"),
+    ("case", "auth_factory", "allowed"),
     [
         (
             "poller",
@@ -4065,6 +4080,7 @@ def _trusted_operator_write_auth() -> AuthContext:
                 trigger="poller",
                 interactivity=TurnInteractivity.NON_INTERACTIVE,
             ),
+            False,
         ),
         (
             "scheduled_tick",
@@ -4073,28 +4089,47 @@ def _trusted_operator_write_auth() -> AuthContext:
                 trigger="scheduled_tick",
                 interactivity=TurnInteractivity.NON_INTERACTIVE,
             ),
+            False,
         ),
         (
-            "replayed_event",
-            lambda: replace(_trusted_operator_write_auth(), event_ingress="http"),
+            "non_admin_operator",
+            _trusted_operator_write_auth,
+            False,
         ),
         (
-            "trusted_service",
+            "admin_operator",
+            lambda: _trusted_operator_write_auth(admin=True),
+            True,
+        ),
+        (
+            "tainted_admin_operator",
+            _tainted_admin_operator_write_auth,
+            False,
+        ),
+        (
+            "upgrade_service",
             lambda: _service_auth(
-                get_service_principal("scheduled_tick"), InformationFlowLabels(),
+                get_service_principal("upgrade"), InformationFlowLabels(),
             ),
+            False,
         ),
     ],
     ids=lambda value: value if isinstance(value, str) else None,
 )
-def test_skill_script_writes_require_a_trusted_operator_turn(
+@pytest.mark.parametrize(
+    "relative",
+    ["pollers.json", "SKILL.md", "scripts/fetch-news.ts"],
+)
+def test_skill_writes_require_an_untainted_admin_operator_turn(
     case: str,
     auth_factory,
+    allowed: bool,
+    relative: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    target = home / "skills" / "ai-news" / "scripts" / "fetch-news.ts"
+    target = home / "skills" / "ai-news" / relative
     target.parent.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
@@ -4104,20 +4139,22 @@ def test_skill_script_writes_require_a_trusted_operator_turn(
         "edit_file", auth, enforce=True, target_channel=str(target),
     )
 
-    assert decision.allowed is False, case
-    assert decision.reason == "skill_script_write_requires_trusted_operator", case
+    assert decision.allowed is allowed, case
+    assert decision.reason == (None if allowed else "skill_write_requires_admin_operator"), case
     assert decision.refusal_detail == (
-        "writes to skills/<skill>/scripts require a trusted operator turn"
+        None if allowed else "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=False, target_channel=str(target),
     )
-    assert compatibility_decision.allowed is False, case
-    assert compatibility_decision.reason == "skill_script_write_requires_trusted_operator"
+    assert compatibility_decision.allowed is allowed, case
+    assert compatibility_decision.reason == (
+        None if allowed else "skill_write_requires_admin_operator"
+    )
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-def test_trusted_operator_turn_may_write_skill_scripts(
+def test_admin_operator_turn_may_write_skill_scripts(
     tool_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4129,7 +4166,7 @@ def test_trusted_operator_turn_may_write_skill_scripts(
 
     decision = ToolRegistry().authorize_tool(
         tool_name,
-        _trusted_operator_write_auth(),
+        _trusted_operator_write_auth(admin=True),
         enforce=True,
         target_channel=str(target),
     )
@@ -4170,11 +4207,11 @@ def test_declaration_and_write_gate_share_skill_script_writability(
     )
 
     assert access_control._agent_writable_root_for_path(
-        script, roots, trusted_operator_turn=False,
+        script, roots, admin_operator_turn=False,
     ) is None
     assert declared[0].script == script.resolve()
     assert write.allowed is False
-    assert write.reason == "skill_script_write_requires_trusted_operator"
+    assert write.reason == "skill_write_requires_admin_operator"
 
 
 @pytest.mark.parametrize(
@@ -4185,7 +4222,7 @@ def test_declaration_and_write_gate_share_skill_script_writability(
         "skills/ai-news/.pre-update-backup/20260710T124800Z/fetch-news.ts",
     ],
 )
-def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
+def test_upgrade_turn_skill_package_writes_are_refused(
     relative: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4203,10 +4240,11 @@ def test_upgrade_turn_skill_package_writes_outside_scripts_remain_admitted(
         "write_file", upgrade_auth, enforce=True, target_channel=relative,
     )
 
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert decision.reason == "skill_write_requires_admin_operator"
 
 
-def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
+def test_skill_write_refusal_is_self_classifying_in_audit_event(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4238,7 +4276,7 @@ def test_skill_script_write_refusal_is_self_classifying_in_audit_event(
         fields.get("reason") or fields.get("denial_reason")
         for _kind, fields in captured
     }
-    assert reasons == {"skill_script_write_requires_trusted_operator"}
+    assert reasons == {"skill_write_requires_admin_operator"}
     assert reasons.isdisjoint({"read_scope", "write_scope"})
 
 

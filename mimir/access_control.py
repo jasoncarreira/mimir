@@ -1809,13 +1809,13 @@ def _agent_writable_root_for_path(
     path: Path | str,
     writable_roots: tuple[Path, ...],
     *,
-    trusted_operator_turn: bool,
+    admin_operator_turn: bool,
 ) -> Path | None:
     """Return the root through which this turn may rewrite *path*, if any.
 
-    Skill prose and package data remain autonomously writable. Executable skill
-    code is different: only the existing trusted-operator ingress predicate may
-    make ``skills/<skill>/scripts/**`` writable.
+    Only an untainted, trusted admin operator turn may make anything under
+    ``skills/`` writable. This is a file-tool boundary, not a filesystem
+    sandbox: admitted shell commands and subprocesses can still write there.
     """
     try:
         candidate = Path(path).resolve()
@@ -1833,12 +1833,7 @@ def _agent_writable_root_for_path(
             continue
     if not matching:
         return None
-    if any(
-        root.name == "skills"
-        and len(relative.parts) >= 2
-        and relative.parts[1] == "scripts"
-        for root, relative in matching
-    ) and not trusted_operator_turn:
+    if any(root.name == "skills" for root, _relative in matching) and not admin_operator_turn:
         return None
     return max((root for root, _relative in matching), key=lambda root: len(root.parts))
 
@@ -1892,7 +1887,7 @@ def parse_declared_shell_commands(
         if not os.access(path, os.X_OK):
             raise _declaration_error(name, f"path is not executable: {raw_path}")
         writable_root = _agent_writable_root_for_path(
-            path, resolved_writable, trusted_operator_turn=False,
+            path, resolved_writable, admin_operator_turn=False,
         )
         if writable_root is not None:
             raise _declaration_error(
@@ -1943,7 +1938,7 @@ def parse_declared_shell_commands(
             if not resolved.exists():
                 raise _declaration_error(name, f"script does not exist: {raw_script}")
             writable_root = _agent_writable_root_for_path(
-                resolved, resolved_writable, trusted_operator_turn=False,
+                resolved, resolved_writable, admin_operator_turn=False,
             )
             if writable_root is not None:
                 raise _declaration_error(
@@ -4806,6 +4801,23 @@ class SinkGate:
         )
 
     @classmethod
+    def _is_admin_operator_turn(cls, ifc_labels: Any, auth_context: Any) -> bool:
+        """Recognize an untainted, bridge-authenticated admin operator turn."""
+        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
+        state = getattr(auth_context, "ifc_state", None)
+        has_untrusted_active_ingest = (
+            live_taint
+            if state is not None
+            and callable(getattr(state, "has_untrusted_active_ingest", None))
+            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        )
+        return (
+            cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            and has_untrusted_active_ingest is False
+            and "admin" in (getattr(auth_context, "roles", ()) or ())
+        )
+
+    @classmethod
     def check_sink_flow(
         cls,
         tool_name: str,
@@ -5344,9 +5356,7 @@ class SinkGate:
         )
         sources = getattr(ifc_labels, "sources", None)
         if (
-            trusted_operator_turn
-            and has_untrusted_active_ingest is False
-            and "admin" in (getattr(auth_context, "roles", ()) or ())
+            cls._is_admin_operator_turn(ifc_labels, auth_context)
             and is_cross_channel_operation
             and target is not None
             and isinstance(sources, tuple)
@@ -5835,7 +5845,7 @@ class WriteResourceAdapter:
         return not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
-    def authorize_skill_script_write(
+    def authorize_skill_write(
         cls,
         tool_name: str,
         target: str | None,
@@ -5844,7 +5854,7 @@ class WriteResourceAdapter:
         *,
         enforce: bool,
     ) -> ToolAuthorization | None:
-        """Apply the trusted-operator boundary to executable skill code."""
+        """Apply the admin-operator boundary to all file-tool skill writes."""
         if tool_name not in cls._WRITE_OPERATIONS or not isinstance(target, str):
             return None
         home = os.environ.get("MIMIR_HOME", "").strip()
@@ -5854,33 +5864,33 @@ class WriteResourceAdapter:
         candidate = Path(target)
         if not candidate.is_absolute():
             candidate = Path(home).resolve() / candidate
-        writable_for_operator = _agent_writable_root_for_path(
-            candidate, roots, trusted_operator_turn=True,
+        writable_for_admin_operator = _agent_writable_root_for_path(
+            candidate, roots, admin_operator_turn=True,
         )
         autonomously_writable = _agent_writable_root_for_path(
-            candidate, roots, trusted_operator_turn=False,
+            candidate, roots, admin_operator_turn=False,
         )
-        if writable_for_operator is None or autonomously_writable is not None:
+        if writable_for_admin_operator is None or autonomously_writable is not None:
             return None
 
-        trusted_operator_turn = SinkGate._is_trusted_operator_turn(
+        admin_operator_turn = SinkGate._is_admin_operator_turn(
             ifc_labels, auth_context,
         )
-        reason = None if trusted_operator_turn else "skill_script_write_requires_trusted_operator"
+        reason = None if admin_operator_turn else "skill_write_requires_admin_operator"
         return ToolAuthorization(
             tool_name=tool_name,
             decision=OperationDecision.RESOURCE_SCOPED,
-            allowed=trusted_operator_turn,
+            allowed=admin_operator_turn,
             reason=reason,
-            required_tier=AccessTier.USER if trusted_operator_turn else AccessTier.ADMIN,
+            required_tier=AccessTier.USER if admin_operator_turn else AccessTier.ADMIN,
             enforcement_enabled=enforce,
             is_shadow_decision=False,
-            would_block=not trusted_operator_turn,
+            would_block=not admin_operator_turn,
             resolved_sink_target=normalize_sink_destination(SinkCategory.FILE, target),
             refusal_detail=(
                 None
-                if trusted_operator_turn
-                else "writes to skills/<skill>/scripts require a trusted operator turn"
+                if admin_operator_turn
+                else "writes under skills/ require an untainted admin operator turn"
             ),
         )
 
@@ -6886,16 +6896,16 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
-        skill_script_write = WriteResourceAdapter.authorize_skill_script_write(
+        skill_write = WriteResourceAdapter.authorize_skill_write(
             tool_name,
             target_channel,
             auth_context,
             ifc_labels,
             enforce=enforce,
         )
-        if skill_script_write is not None:
-            skill_script_write.flow_direction = flow_direction
-            return skill_script_write
+        if skill_write is not None:
+            skill_write.flow_direction = flow_direction
+            return skill_write
         catalog = get_operation_catalog()
         preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (

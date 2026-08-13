@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir import access_control
 from mimir.skill_install import (
     DEFAULT_OPTIONAL_SKILLS_ROOT,
     OptionalSkill,
@@ -1079,6 +1080,34 @@ def test_apply_overwrites_changed_file(
     # File should now match the source.
     src_text = (fake_optional_root / "fake-skill" / "SKILL.md").read_text()
     assert installed_md.read_text() == src_text
+
+
+def test_apply_skill_update_does_not_pass_through_file_tool_gate(
+    fake_optional_root: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    installed_md = fake_home / "skills" / "fake-skill" / "SKILL.md"
+    installed_md.write_text("stale\n")
+    result = next(
+        item
+        for item in detect_skill_drift(fake_home, fake_optional_root)
+        if item.name == "fake-skill"
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("skill refresh must not invoke the file-tool gate")
+
+    monkeypatch.setattr(access_control, "_agent_writable_root_for_path", fail_if_called)
+
+    updated, failed, _ = apply_skill_update(result)
+
+    assert updated == ["SKILL.md"]
+    assert failed == []
+    assert installed_md.read_text() == (
+        fake_optional_root / "fake-skill" / "SKILL.md"
+    ).read_text()
 
 
 def test_apply_differs_file_creates_backup(
