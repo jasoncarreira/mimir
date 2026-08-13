@@ -5013,6 +5013,25 @@ def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
     assert decision.service_principal is service
 
 
+def test_web_search_allows_sourceless_sensitivity_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://search.example.invalid/api"
+    monkeypatch.setenv("TAVILY_SEARCH_URL", target)
+    labels = InformationFlowLabels(labels=frozenset({"private"}))
+
+    decision = SinkGate.check_sink_flow(
+        "web_search",
+        target,
+        labels,
+        replace(_write_auth(), ifc_labels=labels),
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.would_block is False
+
+
 @pytest.mark.parametrize(
     ("trigger", "canonical"),
     [("scheduled_tick", "scheduler")],

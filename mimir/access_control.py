@@ -4903,7 +4903,12 @@ class SinkGate:
         resolved_target = resolve_sink_target(
             tool_name, sink_category, target, service,
         )
-        if is_application_egress and ifc_labels.labels and not ifc_labels.sources:
+        if (
+            is_application_egress
+            and tool_name not in _TAINT_INDEPENDENT_EGRESS_TOOLS
+            and ifc_labels.labels
+            and not ifc_labels.sources
+        ):
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
