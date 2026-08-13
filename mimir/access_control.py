@@ -4507,6 +4507,14 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
     SinkCategory.EXTERNAL_MCP: "external_mcp",
 }
 
+# Operations in this set have no caller-supplied destination: each writes only
+# fixed, derived paths, so the ordinary target adapter has nothing to validate.
+# They are also deliberately taint-independent for every principal holding the
+# capability (currently including synthesis and github). ``rebuild_index`` only
+# regenerates INDEX.md files from data already on disk, and the post-turn hook
+# performs the same rebuild unconditionally, including after tainted turns.
+# Keep membership narrow: a candidate must accept no caller-selected target,
+# write only fixed derived destinations, and be safe under untrusted ingest.
 _FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
 
 
