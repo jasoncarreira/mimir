@@ -9,6 +9,7 @@ so the home's per-turn ``git add -A`` never grabs it as an embedded repo, and
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -383,7 +384,7 @@ def test_cleanup_resolved_squash_merged_branch_removes_remote_local_worktree_and
 
     monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log, raising=False)
     monkeypatch.setattr(
-        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: "no_pr"
     )
 
     from mimir.proposals import cleanup_resolved_proposal_branches
@@ -415,7 +416,7 @@ def test_cleanup_preserves_open_pr_branch(
     assert res.ok
 
     monkeypatch.setattr(
-        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: True
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: "open"
     )
     from mimir.proposals import cleanup_resolved_proposal_branches
 
@@ -425,6 +426,202 @@ def test_cleanup_preserves_open_pr_branch(
     assert "refs/heads/proposal/open-pr" in _git(
         "ls-remote", "--heads", "origin", "proposal/open-pr", cwd=home
     ).stdout
+
+
+@pytest.mark.parametrize(
+    ("forge_state", "expected"),
+    [("OPEN", "open"), ("MERGED", "merged"), ("CLOSED", "closed")],
+)
+def test_proposal_branch_pr_state_distinguishes_forge_states(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forge_state: str,
+    expected: str,
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        requested_state = args[args.index("--state") + 1]
+        prs = (
+            [{"number": 1, "state": "OPEN"}]
+            if requested_state == "open" and forge_state == "OPEN"
+            else []
+            if requested_state == "open"
+            else [{"number": 1, "state": forge_state}]
+        )
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", fake_run)
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") == expected
+
+
+def test_proposal_branch_pr_state_open_wins_over_terminal_result_order(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def fake_run(args, **kwargs):  # type: ignore[no-untyped-def]
+        requested_state = args[args.index("--state") + 1]
+        prs = (
+            [{"number": 2, "state": "OPEN"}]
+            if requested_state == "open"
+            else [
+                {"number": 1, "state": "CLOSED"},
+                {"number": 2, "state": "OPEN"},
+            ]
+        )
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", fake_run)
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") == "open"
+
+
+def test_proposal_branch_pr_state_reports_no_pr(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(
+        proposals,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "[]", ""),
+    )
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") == "no_pr"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode"),
+    [
+        ("[]", 1),
+        ("not json", 0),
+        ('{"state":"MERGED"}', 0),
+        ('[{"state":"MERGED"}]', 0),
+        ('[{"number":1,"state":"OTHER"}]', 0),
+    ],
+)
+def test_proposal_branch_pr_state_fails_closed_on_command_or_output_errors(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(
+        proposals,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], returncode, stdout, "failure"
+        ),
+    )
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") is None
+
+
+def test_proposal_branch_pr_state_fails_closed_when_gh_is_missing(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        proposals, "_run", lambda *args, **kwargs: pytest.fail("gh must not run")
+    )
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") is None
+
+
+def test_proposal_branch_pr_state_fails_closed_on_network_error(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.proposals as proposals
+
+    def raise_network_error(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("network")
+
+    monkeypatch.setattr(proposals.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(proposals, "_run", raise_network_error)
+
+    assert proposals._proposal_branch_pr_state(home, "proposal/test") is None
+
+
+@pytest.mark.parametrize("pr_state", ["closed", "merged"])
+def test_cleanup_sweeps_terminal_pr_without_consulting_content(
+    home: Path, monkeypatch: pytest.MonkeyPatch, pr_state: str
+) -> None:
+    branch = f"proposal/{pr_state}-pr"
+    r = open_proposal(home, branch=branch)
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        f"# reflect\n\n{pr_state}\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title=pr_state, rationale="r", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: pr_state
+    )
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_content_is_on_main",
+        lambda *args, **kwargs: pytest.fail("terminal PR state must bypass content"),
+    )
+
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    deleted = [record for record in records if record.branch == branch]
+    assert deleted and deleted[0].action == "deleted"
+    assert deleted[0].reason == f"resolved_pr_{pr_state}"
+    assert deleted[0].tip
+    assert branch not in _git("ls-remote", "--heads", "origin", branch, cwd=home).stdout
+
+
+def test_cleanup_sweeps_merged_pr_after_main_changes_proposal_blob(
+    home: Path, upstream: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    branch = "upgrade/merged-then-changed"
+    r = open_proposal(home, branch=branch, lane="upgrade")
+    assert r.ok
+    (r.worktree / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nmerged version\n", encoding="utf-8"
+    )
+    res = finalize_proposal(
+        home, title="merged", rationale="r", lane="upgrade", open_pr=lambda *a: "url"
+    )
+    assert res.ok
+
+    remote_work = home.parent / "merged-then-changed-work"
+    _git("clone", "-q", str(upstream), str(remote_work), cwd=home)
+    _git("config", "user.email", "remote@example.com", cwd=remote_work)
+    _git("config", "user.name", "remote", cwd=remote_work)
+    (remote_work / "prompts" / "reflect.md").write_text(
+        "# reflect\n\nlater main version\n", encoding="utf-8"
+    )
+    _git("add", "prompts/reflect.md", cwd=remote_work)
+    _git("commit", "-q", "-m", "change merged proposal content later", cwd=remote_work)
+    _git("push", "-q", "origin", "main", cwd=remote_work)
+
+    monkeypatch.setattr(
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: "merged"
+    )
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    records = cleanup_resolved_proposal_branches(home)
+    deleted = [record for record in records if record.branch == branch]
+    assert deleted and deleted[0].action == "deleted"
+    assert deleted[0].reason == "resolved_pr_merged"
+    assert branch not in _git("ls-remote", "--heads", "origin", branch, cwd=home).stdout
 
 
 def test_cleanup_skips_fetch_when_no_local_proposal_refs(
@@ -447,8 +644,31 @@ def test_cleanup_skips_fetch_when_no_local_proposal_refs(
     assert ["fetch", "--prune", "origin"] not in calls
 
 
-def test_cleanup_skips_branch_when_open_pr_status_unknown_and_logs(
-    home: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("pr_state", ["open", "merged", "closed", "no_pr", None])
+def test_cleanup_never_considers_branch_outside_proposal_prefixes(
+    home: Path, monkeypatch: pytest.MonkeyPatch, pr_state: str | None
+) -> None:
+    _git("branch", "unrelated", cwd=home)
+    _git("push", "-q", "origin", "unrelated", cwd=home)
+    calls: list[str] = []
+
+    def pr_lookup(home: Path, branch: str) -> str | None:
+        calls.append(branch)
+        return pr_state
+
+    monkeypatch.setattr("mimir.proposals._proposal_branch_pr_state", pr_lookup)
+    from mimir.proposals import cleanup_resolved_proposal_branches
+
+    assert cleanup_resolved_proposal_branches(home) == []
+    assert calls == []
+    assert "refs/heads/unrelated" in _git(
+        "ls-remote", "--heads", "origin", "unrelated", cwd=home
+    ).stdout
+
+
+@pytest.mark.parametrize("failure", ["missing", "nonzero", "malformed", "network"])
+def test_cleanup_skips_branch_when_pr_status_unknown_and_logs(
+    home: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     r = open_proposal(home, branch="proposal/open-pr-unknown")
     assert r.ok
@@ -466,7 +686,26 @@ def test_cleanup_skips_branch_when_open_pr_status_unknown_and_logs(
         events.append({"type": event_type, **payload})
 
     monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log, raising=False)
-    monkeypatch.setattr("mimir.proposals.shutil.which", lambda name: None)
+    if failure == "missing":
+        monkeypatch.setattr("mimir.proposals.shutil.which", lambda name: None)
+    else:
+        import mimir.proposals as proposals
+
+        real_run = proposals._run
+        monkeypatch.setattr(
+            "mimir.proposals.shutil.which", lambda name: "/usr/bin/gh"
+        )
+
+        def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+            if args[0][0] != "gh":
+                return real_run(*args, **kwargs)
+            if failure == "network":
+                raise OSError("network")
+            if failure == "nonzero":
+                return subprocess.CompletedProcess(args[0], 1, "", "failure")
+            return subprocess.CompletedProcess(args[0], 0, "not json", "")
+
+        monkeypatch.setattr("mimir.proposals._run", fake_run)
 
     from mimir.proposals import cleanup_resolved_proposal_branches
 
@@ -492,7 +731,7 @@ def test_cleanup_skips_unmerged_novel_branch(home: Path, monkeypatch: pytest.Mon
     assert res.ok
 
     monkeypatch.setattr(
-        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: "no_pr"
     )
     from mimir.proposals import cleanup_resolved_proposal_branches
 
@@ -519,15 +758,15 @@ def test_cleanup_skip_events_are_edge_triggered_until_eventual_cleanup(
     assert res.ok
 
     events: list[dict] = []
-    pr_open = True
+    pr_state = "open"
 
     def fake_log(event_type: str, **payload) -> None:  # type: ignore[no-untyped-def]
         events.append({"type": event_type, **payload})
 
     monkeypatch.setattr("mimir.proposals.log_event_sync", fake_log)
     monkeypatch.setattr(
-        "mimir.proposals._proposal_branch_has_open_pr",
-        lambda home, branch: pr_open,
+        "mimir.proposals._proposal_branch_pr_state",
+        lambda home, branch: pr_state,
     )
     from mimir.proposals import cleanup_resolved_proposal_branches
 
@@ -544,7 +783,7 @@ def test_cleanup_skip_events_are_edge_triggered_until_eventual_cleanup(
     )
     assert len(events) == 1
 
-    pr_open = False
+    pr_state = "no_pr"
     records = cleanup_resolved_proposal_branches(
         home, previous_skip_reasons=previous
     )
@@ -597,7 +836,7 @@ def test_cleanup_skips_non_surface_changes_even_if_open_pr_closed(
     _git("branch", "-D", "proposal/non-surface", cwd=home)
 
     monkeypatch.setattr(
-        "mimir.proposals._proposal_branch_has_open_pr", lambda home, branch: False
+        "mimir.proposals._proposal_branch_pr_state", lambda home, branch: "no_pr"
     )
     from mimir.proposals import cleanup_resolved_proposal_branches
 
