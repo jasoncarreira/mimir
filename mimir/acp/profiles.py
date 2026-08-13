@@ -190,12 +190,16 @@ class ProfileStore:
                 raise ProfileError("unsafe-profile-store")
 
     def _validate_parents_if_present(self) -> None:
-        try:
-            self._validate_parents()
-        except ProfileError as exc:
-            if not self.path.parent.exists():
-                return
-            raise exc
+        uid = os.getuid()
+        for directory in (self.path.parent.parent, self.path.parent):
+            try:
+                value = directory.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ProfileError("unsafe-profile-store") from exc
+            if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode) or value.st_uid != uid or value.st_mode & 0o077:
+                raise ProfileError("unsafe-profile-store")
 
     def _write(self, profiles: Mapping[str, object]) -> None:
         self._ensure_parents()
@@ -226,6 +230,7 @@ class ProfileStore:
             except FileNotFoundError: pass
 
     def _ensure_parents(self) -> None:
+        self._validate_parents_if_present()
         missing: list[Path] = []
         current = self.path.parent
         while not current.exists():

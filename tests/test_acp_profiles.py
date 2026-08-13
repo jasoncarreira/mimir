@@ -28,6 +28,24 @@ def test_list_absent_store_is_empty_without_creating_it(tmp_path: Path) -> None:
     assert not s.path.exists()
 
 
+def test_missing_leaf_does_not_hide_unsafe_ancestor_or_create_it(tmp_path: Path) -> None:
+    s = store(tmp_path)
+    s.path.parent.parent.mkdir(mode=0o755)
+    with pytest.raises(ProfileError, match="unsafe-profile-store"):
+        s.set(Profile("default", Path("/x")))
+    assert not s.path.parent.exists()
+
+
+def test_symlinked_ancestor_is_rejected_without_creating_through_it(tmp_path: Path) -> None:
+    s = store(tmp_path)
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    s.path.parent.parent.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ProfileError, match="unsafe-profile-store"):
+        s.set(Profile("default", Path("/x")))
+    assert not (target / "acp").exists()
+
+
 def test_list_is_sorted_names_only_canonical_json(tmp_path: Path) -> None:
     s = store(tmp_path)
     s.set(Profile("z", Path("/z")))
