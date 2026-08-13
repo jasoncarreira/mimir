@@ -5052,6 +5052,34 @@ def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
 
 
 @pytest.mark.parametrize(
+    ("tool_name", "target", "env_name"),
+    [
+        ("web_search", "https://search.example.invalid/api", "TAVILY_SEARCH_URL"),
+        ("fetch_url", "https://fetch.example.invalid/data", "MIMIR_EGRESS_APPROVED_URLS"),
+    ],
+)
+def test_taint_independent_egress_allows_sourceless_sensitivity_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    target: str,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, target)
+    labels = InformationFlowLabels(labels=frozenset({"private"}))
+
+    decision = SinkGate.check_sink_flow(
+        tool_name,
+        target,
+        labels,
+        replace(_write_auth(), ifc_labels=labels),
+        enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.would_block is False
+
+
+@pytest.mark.parametrize(
     ("trigger", "canonical"),
     [("scheduled_tick", "scheduler")],
 )
