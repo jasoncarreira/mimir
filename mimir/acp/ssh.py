@@ -41,9 +41,11 @@ def build_ssh_argv(profile: Profile, ssh_path: Path | None = None) -> tuple[str,
     _safe_file(remote.known_hosts_file)
     command = shlex.join(["mimir-agent", "acp", "relay", "--home", str(profile.home)])
     argv = (
-        str(ssh_path), "-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+        str(ssh_path), "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
         "-o", "KbdInteractiveAuthentication=no", "-o", "ChallengeResponseAuthentication=no",
-        "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
+        "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+        "-o", "ForwardX11Trusted=no", "-o", "PermitLocalCommand=no",
+        "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "-o", "LogLevel=ERROR",
         "-o", f"UserKnownHostsFile={remote.known_hosts_file}", "-i", str(remote.identity_file),
@@ -57,7 +59,7 @@ def build_ssh_argv(profile: Profile, ssh_path: Path | None = None) -> tuple[str,
 
 def child_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     values = os.environ if environ is None else environ
-    return {key: value for key, value in values.items() if key not in {"PYTHONPATH", "PYTHONHOME"} and not key.startswith("MIMIR_")}
+    return {key: value for key, value in values.items() if key not in {"PYTHONPATH", "PYTHONHOME", "SSH_AUTH_SOCK"} and not key.startswith("MIMIR_")}
 
 async def _discard(reader: asyncio.StreamReader) -> None:
     while await reader.read(65536): pass

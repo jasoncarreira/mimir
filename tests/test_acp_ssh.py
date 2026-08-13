@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,15 +32,33 @@ def test_exact_argv_is_injection_safe_and_secret_free(tmp_path: Path) -> None:
     profile, ssh = remote_profile(tmp_path)
     argv = build_ssh_argv(profile, ssh)
     assert argv == (
-        str(ssh), "-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+        str(ssh), "-F", "/dev/null", "-T", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
         "-o", "KbdInteractiveAuthentication=no", "-o", "ChallengeResponseAuthentication=no",
-        "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
+        "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
+        "-o", "ForwardX11Trusted=no", "-o", "PermitLocalCommand=no",
+        "-o", "ClearAllForwardings=yes", "-o", "ExitOnForwardFailure=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=1", "-o", "LogLevel=ERROR",
         "-o", f"UserKnownHostsFile={profile.remote.known_hosts_file}", "-i", str(profile.remote.identity_file),
         "-p", "2222", "--", "user@example.com", "mimir-agent acp relay --home '/remote path'",
     )
     assert "SECRET" not in str(argv)
+
+
+def test_effective_ssh_configuration_disables_forwarding_and_local_commands(tmp_path: Path) -> None:
+    profile, _ = remote_profile(tmp_path)
+    argv = build_ssh_argv(profile)
+    result = subprocess.run(
+        (argv[0], "-G", *argv[1:]),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    effective = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
+    assert effective["forwardagent"] == "no"
+    assert effective["forwardx11"] == "no"
+    assert effective["forwardx11trusted"] == "no"
+    assert effective["permitlocalcommand"] == "no"
 
 
 def test_ssh_file_allowlist_and_argument_bounds(tmp_path: Path) -> None:
@@ -56,7 +75,7 @@ def test_ssh_file_allowlist_and_argument_bounds(tmp_path: Path) -> None:
 
 
 def test_child_environment_is_secret_and_profile_free() -> None:
-    assert child_environment({"PATH": "/bin", "SECRET": "public", "PYTHONPATH": "x", "PYTHONHOME": "y", "MIMIR_ACP_PROFILE": "x", "MIMIR_KEY": "raw"}) == {"PATH": "/bin", "SECRET": "public"}
+    assert child_environment({"PATH": "/bin", "SECRET": "public", "PYTHONPATH": "x", "PYTHONHOME": "y", "SSH_AUTH_SOCK": "/agent", "MIMIR_ACP_PROFILE": "x", "MIMIR_KEY": "raw"}) == {"PATH": "/bin", "SECRET": "public"}
 
 
 class Reader:
