@@ -39,6 +39,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.tools import ToolException
 
+from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
 from .identities import AccessMetadata
 from .models import (
     NormalizedPullRequestSnapshot,
@@ -4307,7 +4308,9 @@ def _trigger_service_read_target_is_allowed(
 
 def _target_matches_operator_alert(target: str, destination: str) -> bool:
     """Bind notify-only authority to one operator-selected destination."""
-    configured = os.environ.get(destination, "").strip()
+    configured = resolve_deliver_channel(
+        OPERATOR_CHANNEL_SENTINEL, os.environ.get(destination, ""),
+    )
     return bool(configured) and target == configured
 
 
@@ -5434,6 +5437,42 @@ class SinkGate:
         resolved_triggering = ChannelResourceAdapter._resolve_channel(triggering_channel)
         if not resolved_triggering:
             return frozenset()
+
+        if tool_name == "send_message" and target is not None:
+            if _target_matches_operator_alert(
+                resolved_target_channel or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
+            ):
+                return frozenset({resolved_target_channel})
+            from .models import TurnInteractivity
+
+            resolved_resource = ChannelResourceAdapter._resolve_channel(
+                getattr(auth_context, "resource_id", None),
+            )
+            canonical_principal = getattr(auth_context, "canonical_principal", None)
+            domain = getattr(auth_context, "domain", None)
+            bridge_instance = getattr(auth_context, "bridge_instance", None)
+            sources = getattr(ifc_labels, "sources", ())
+            has_authenticated_ingress = any(
+                source.source_kind == "channel"
+                and source.principal == canonical_principal
+                and source.domain == domain
+                and ChannelResourceAdapter._resolve_channel(source.resource_id)
+                == resolved_resource
+                and source.bridge_instance == bridge_instance
+                and canonical_principal in source.authorized_principals
+                and source.integrity == "trusted"
+                and source.integrity_effect == "active_ingest"
+                for source in sources
+            )
+            if (
+                getattr(auth_context, "trigger", None) == "user_message"
+                and getattr(auth_context, "interactivity", None)
+                is TurnInteractivity.INTERACTIVE
+                and getattr(auth_context, "event_ingress", None) is None
+                and has_authenticated_ingress
+                and resolved_resource == resolved_triggering == resolved_target_channel
+            ):
+                return frozenset({resolved_target_channel})
 
         canonical_principal = getattr(auth_context, "canonical_principal", None)
         service = get_trusted_service_from_auth_context(auth_context)

@@ -4807,7 +4807,7 @@ async def test_admin_required_shadow_denial_marks_targetless_request_explicitly(
     [
         ("shell_exec", "printf test", "ifc_label_blocked:shell_process"),
         ("write_file", "/tmp/result.txt", "ifc_label_blocked:file"),
-        ("send_message", "slack-C1", "ifc_label_blocked:same_channel"),
+        ("send_message", "slack-C2", "ifc_label_blocked:same_channel"),
         ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn"),
     ],
 )
@@ -4909,7 +4909,7 @@ async def test_same_channel_event_selects_incompatible_source_not_first_source()
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         registry.authorize_tool(
-            "send_message", auth, enforce=False, target_channel="slack-C1",
+            "send_message", auth, enforce=False, target_channel="slack-C2",
             ifc_labels=labels,
         )
         await asyncio.sleep(0)
@@ -5015,17 +5015,17 @@ async def test_ifc_source_recording_failure_cannot_change_live_decision(
     monkeypatch.setattr("mimir.event_logger.log_event", capture)
 
     shadow = registry.authorize_tool(
-        "send_message", auth, enforce=False, target_channel="slack-C1",
+        "send_message", auth, enforce=False, target_channel="slack-C2",
         ifc_labels=labels,
     )
     enforced = registry.authorize_tool(
-        "send_message", auth, enforce=True, target_channel="slack-C1",
+        "send_message", auth, enforce=True, target_channel="slack-C2",
         ifc_labels=labels,
     )
     await asyncio.sleep(0)
 
     assert shadow.allowed is True
-    assert shadow.reason == "same_scope_channel"
+    assert shadow.reason == "cross_channel_scope"
     assert captured[0]["reason"] == enforced.reason == "ifc_label_blocked:same_channel"
     assert captured[0]["ifc_source_scope"] == "classification_failed"
     assert "ifc_source" not in captured[0]
