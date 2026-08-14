@@ -429,12 +429,17 @@ def approve_declassification(
 
 
 @tool
-async def request_operator_approval(tool_name: str, target: str, reason: str) -> str:
-    """Ask the authenticated operator to approve one exact tool and target.
+async def request_operator_approval(
+    tool_name: str,
+    target: str,
+    reason: str,
+    sink_category: str | None = None,
+) -> str:
+    """Ask the authenticated operator to approve an exact request.
 
-    This creates an unprivileged pending request only. Consent is recorded by
-    the server from a later authenticated inbound operator message; this tool
-    cannot create a grant.
+    A validated ``sink_category`` requests a turn-local category capability.
+    Consent is recorded only from a later authenticated inbound operator
+    message; this tool cannot create a grant.
     """
     from .._context import get_current_turn
     from ..operator_approval import cancel_request, create_request
@@ -467,18 +472,87 @@ async def request_operator_approval(tool_name: str, target: str, reason: str) ->
     normalized_reason = " ".join((reason or "").split())[:500]
     if not normalized_tool or not normalized_target:
         return "request_operator_approval refused: tool_name and target are required"
+
+    category = None
+    request_carrier = None
+    request_ordinal = None
+    if sink_category is not None:
+        from ..access_control import SinkCategory
+
+        eligible = frozenset({
+            SinkCategory.SAME_CHANNEL,
+            SinkCategory.CROSS_CHANNEL,
+            SinkCategory.PUBLIC,
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.SPAWN,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.FILE,
+            SinkCategory.DIRECT_MESSAGE,
+            SinkCategory.SAGA,
+            SinkCategory.SCHEDULER,
+            SinkCategory.PROPOSAL,
+            SinkCategory.FORGE,
+        })
+        ineligible = frozenset({
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+            SinkCategory.UNKNOWN,
+            SinkCategory.HARNESS_DISPLAY,
+        })
+        assert eligible | ineligible == frozenset(SinkCategory)
+        try:
+            parsed_category = SinkCategory(sink_category)
+        except ValueError:
+            return "request_operator_approval refused: invalid sink_category"
+        if parsed_category not in eligible:
+            return "request_operator_approval refused: ineligible sink_category"
+        category = parsed_category.value
+        request_carrier, request_ordinal = auth.ifc_state.source_snapshot(auth.ifc_labels)
+        if request_carrier is None:
+            return "request_operator_approval refused: no live information-flow state"
+
+    requesting_principal = auth.canonical_principal or auth.principal
     request, status = create_request(
         channel_id=channel_id,
         tool_name=normalized_tool,
         target=normalized_target,
-        requesting_principal=auth.canonical_principal or auth.principal,
+        requesting_principal=requesting_principal,
+        turn_id=ctx.turn_id if category is not None else None,
+        sink_category=category,
+        request_carrier=request_carrier,
+        ifc_state=auth.ifc_state if category is not None else None,
+        request_source_arrival_ordinal=request_ordinal,
     )
     if request is None:
         return f"request_operator_approval refused: {status}"
+    if category is None:
+        request_details = (
+            f"Tool: {normalized_tool}\n"
+            f"Target: {normalized_target}\n"
+        )
+    else:
+        rendered_sources = "\n".join(
+            "- "
+            f"principal={source.principal or '(unknown)'}; "
+            f"domain={source.domain or '(unknown)'}; "
+            f"resource_id={source.resource_id or '(unknown)'}; "
+            f"bridge_instance={source.bridge_instance or '(unknown)'}; "
+            f"sensitivity={source.sensitivity}; "
+            f"authorized_principals={','.join(sorted(source.authorized_principals)) or '(none)'}; "
+            f"source_kind={source.source_kind}; integrity={source.integrity}; "
+            f"integrity_effect={source.integrity_effect}"
+            for source in request_carrier.sources
+        ) or "- (none)"
+        request_details = (
+            f"Sink category: {category}\n"
+            f"Turn: {ctx.turn_id}\n"
+            f"Requesting principal: {requesting_principal}\n"
+            f"Sources:\n{rendered_sources}\n"
+        )
     alert = (
         "Operator approval requested\n"
-        f"Tool: {normalized_tool}\n"
-        f"Target: {normalized_target}\n"
+        f"{request_details}"
         f"Reason: {normalized_reason or '(none provided)'}\n"
         "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
     )
@@ -490,6 +564,8 @@ async def request_operator_approval(tool_name: str, target: str, reason: str) ->
     if not getattr(result, "sent", True):
         cancel_request(request.request_id)
         return "request_operator_approval refused: operator is unreachable"
+    if category is not None:
+        return "Operator approval is pending for the sink category."
     return "Operator approval is pending for the exact tool and target."
 
 

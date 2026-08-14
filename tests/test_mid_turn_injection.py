@@ -23,6 +23,7 @@ from mimir.identities import IdentityResolver
 from mimir.models import (
     AgentEvent,
     AuthContext,
+    InformationFlowLabels,
     TurnContext,
     TurnInteractivity,
 )
@@ -735,4 +736,160 @@ async def test_midturn_disabled_refuses_before_creating_request(tmp_path, monkey
         reset_current_turn(token)
 
     assert "mid-turn injection is disabled" in result
+    assert approval.pending_request("slack-C1") is None
+
+
+@pytest.mark.asyncio
+async def test_category_request_renders_snapshot_and_installs_after_authenticated_fold(
+    tmp_path, monkeypatch,
+):
+    from mimir.agent import _initialize_ifc_labels
+
+    sent = []
+
+    class _Channels:
+        def find(self, channel_id):
+            return object() if channel_id == "slack-C1" else None
+
+        async def send(self, channel_id, text, *, final=True):
+            from mimir.bridges.base import SendResult
+
+            sent.append(text)
+            return SendResult(sent=True, message_id="alert-1")
+
+    async def _no_log(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("mimir.dispatcher.log_event", _no_log)
+    resolver = _resolver(tmp_path)
+    cfg = replace(
+        Config.from_env(),
+        home=tmp_path,
+        operator_alert_channel="slack-C1",
+        midturn_injection_channels=("slack-",),
+    )
+    dispatcher = Dispatcher(cfg, resolver=resolver)
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", dispatcher)
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", _Channels())
+    initial = _initialize_ifc_labels(
+        _approval_event("request", author="slack-U2"), resolver=resolver,
+    )
+    auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="user",
+        roles=("user",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=initial,
+    )
+    auth.ifc_state.merge(initial)
+    ctx = TurnContext(
+        turn_id="turn-category",
+        session_id="slack-C1",
+        trigger="user_message",
+        channel_id="slack-C1",
+        started_at=time.monotonic(),
+        auth_context=auth,
+        ifc_labels=initial,
+        identity_resolver=resolver,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    dispatcher._in_flight.add("slack-C1")
+    mti.register_inflight("slack-C1")
+    token = set_current_turn(ctx)
+    try:
+        result = await tool_registry.request_operator_approval.ainvoke({
+            "tool_name": "shell_exec",
+            "target": "ignored by category authority",
+            "reason": "run reviewed commands",
+            "sink_category": "shell_process",
+        })
+        accepted = await dispatcher.enqueue(_approval_event("APPROVE"))
+        drained = mti._drain("slack-C1")
+    finally:
+        reset_current_turn(token)
+
+    assert "pending for the sink category" in result
+    assert accepted is True
+    assert [event.content for event in drained] == ["APPROVE"]
+    assert "Sink category: shell_process" in sent[0]
+    assert "Turn: turn-category" in sent[0]
+    assert "Requesting principal: user" in sent[0]
+    assert "principal=user" in sent[0]
+    assert "resource_id=slack-C1" in sent[0]
+    assert approval.recorded_grant(
+        "slack-C1", "shell_exec", "ignored by category authority",
+    ) is None
+    current = auth.ifc_state.current()
+    assert current is not None
+    assert current.sources[-1].principal == "operator"
+    assert auth.ifc_state.consume_sink_approval(
+        current=current,
+        sink_category="shell_process",
+        destination="first",
+        canonical_principal="user",
+        turn_id="turn-category",
+    )
+    assert auth.ifc_state.consume_sink_approval(
+        current=current,
+        sink_category="shell_process",
+        destination="second",
+        canonical_principal="user",
+        turn_id="turn-category",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sink_category",
+    ["network", "http_webhook", "external_mcp", "unknown", "harness_display", "bogus"],
+)
+async def test_category_request_rejects_ineligible_and_unknown_categories(
+    sink_category, tmp_path, monkeypatch,
+):
+    class _Channels:
+        def find(self, channel_id):
+            return object()
+
+    cfg = replace(
+        Config.from_env(),
+        home=tmp_path,
+        operator_alert_channel="slack-C1",
+        midturn_injection_channels=("slack-",),
+    )
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", Dispatcher(cfg))
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", _Channels())
+    auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="user",
+        roles=("user",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=InformationFlowLabels(),
+    )
+    ctx = TurnContext(
+        turn_id="turn-category-refusal",
+        session_id="slack-C1",
+        trigger="user_message",
+        channel_id="slack-C1",
+        started_at=time.monotonic(),
+        auth_context=auth,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    token = set_current_turn(ctx)
+    try:
+        result = await tool_registry.request_operator_approval.ainvoke({
+            "tool_name": "shell_exec",
+            "target": "x",
+            "reason": "x",
+            "sink_category": sink_category,
+        })
+    finally:
+        reset_current_turn(token)
+
+    assert "refused:" in result
     assert approval.pending_request("slack-C1") is None
