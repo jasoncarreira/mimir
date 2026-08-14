@@ -191,6 +191,7 @@ def _identity_can_access(path: Path, uid: int, gid: int, permissions: int) -> bo
     return ((stat.S_IMODE(observed.st_mode) >> shift) & permissions) == permissions
 
 
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
