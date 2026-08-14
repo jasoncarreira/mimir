@@ -82,6 +82,9 @@ def register_inflight(channel_id: str | None, *, emitter: Any | None = None) -> 
     """
     if not channel_id:
         return
+    from .operator_approval import clear_channel
+
+    clear_channel(channel_id)
     with _LOCK:
         _REGISTRY[channel_id] = _Inflight(emitter=emitter)
 
@@ -105,12 +108,17 @@ def deactivate(
     """
     if not channel_id:
         return [], [], []
+    from .operator_approval import clear_channel
+
     with _LOCK:
         inflight = _REGISTRY.pop(channel_id, None)
         if inflight is None:
+            clear_channel(channel_id)
             return [], [], []
         inflight.active = False
-        return _snapshot_inflight(inflight)
+        snapshot = _snapshot_inflight(inflight)
+    clear_channel(channel_id)
+    return snapshot
 
 
 def _snapshot_inflight(
@@ -165,6 +173,23 @@ def inject_message(channel_id: str, event: "AgentEvent") -> str:
         inflight = _REGISTRY.get(channel_id)
         if inflight is None or not inflight.active:
             return "no_active_turn"
+        inflight.queue.append(event)
+        return "injected"
+
+
+def inject_authenticated_message(
+    channel_id: str,
+    event: "AgentEvent",
+    resolver: Any,
+) -> str:
+    """Inject an ingress-authorized event, recording operator consent first."""
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return "no_active_turn"
+        from .operator_approval import record_authenticated_response
+
+        record_authenticated_response(event, resolver)
         inflight.queue.append(event)
         return "injected"
 
