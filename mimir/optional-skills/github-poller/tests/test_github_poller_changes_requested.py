@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import poller
+from mimir import poller_recovery
+from mimir.models import AgentEvent
 
 
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
@@ -608,6 +610,94 @@ def test_hard_refusal_is_uncharged_and_retries_only_at_daily_backstop(
     assert cursor["638"]["attempts"] == 0
     assert captured_emits[0]["attempt"] == 1
     assert captured_emits[0]["prior_refusal_reasons"] == ["service_scope_denied"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_refused_turns_never_exhaust_remediation_budget(
+    monkeypatch, captured_emits, tmp_path,
+):
+    """Framework outcomes, not a synthesized cursor, reproduce the #1459 path."""
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    events_path = tmp_path / "events.jsonl"
+    item = {
+        "event_type": "pr_changes_requested_stale",
+        "repo": "o/r",
+        "number": 638,
+        "head_sha": "aaa111",
+    }
+    for attempt in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1):
+        source_id = f"refused-{attempt}"
+        poller_recovery.stash_enqueued_event(tmp_path, AgentEvent(
+            trigger="poller",
+            channel_id="poller:github-activity",
+            content="fix PR",
+            source_id=source_id,
+            extra={"poller_name": "github-activity", "items": [item]},
+        ))
+        with events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "turn_completed",
+                "timestamp": (NOW + timedelta(minutes=attempt)).isoformat(),
+                "channel_id": "poller:github-activity",
+                "source_id": source_id,
+                "attempt_disposition": "exempt_hard_refusal",
+                "attempt_reason": "unsupported_operation",
+                "hard_refusals": [{
+                    "tool": "unsupported_operation",
+                    "boundary": "typed_action_set",
+                    "reason": "unsupported_operation",
+                }],
+                "remediation_effects": [],
+            }) + "\n")
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity",
+        channel_id="poller:github-activity",
+        persist_dir=tmp_path,
+        events_path=events_path,
+        enqueue=lambda event: None,
+        recover_failed_turns=False,
+    )
+    recovery = poller_recovery._load_state(tmp_path)["inflight"]
+    assert len(recovery) == poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1
+    assert all(entry["attempts"] == 0 for entry in recovery.values())
+    assert all(
+        entry["attempt_reasons"] == ["unsupported_operation"]
+        for entry in recovery.values()
+    )
+
+    prior = {"638": _entry("aaa111", attempts=0)}
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior,
+        now=NOW + timedelta(hours=2),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+    assert not any(
+        event.get("signal") == "pr_changes_requested_gave_up"
+        for event in captured_emits
+    )
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor,
+        now=NOW + timedelta(days=1, minutes=poller.REVIEW_REQUEST_MAX_ATTEMPTS),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    assert captured_emits[-1]["event_type"] == "pr_changes_requested_stale"
+    assert captured_emits[-1]["prior_refusal_reasons"] == ["unsupported_operation"]
+    assert not any(
+        event.get("signal") == "pr_changes_requested_gave_up"
+        for event in captured_emits
+    )
 
 
 def test_model_failure_charges_attempt_and_advances_retry(

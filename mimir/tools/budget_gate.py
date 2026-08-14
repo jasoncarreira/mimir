@@ -87,6 +87,10 @@ _PULL_REQUEST_TOOLS = _STANDING_REVIEW_TOOLS | frozenset({
     "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
     "repo_revert_abort", "repo_push",
 })
+_REMEDIATION_EFFECT_TOOLS = frozenset({
+    "repo_commit", "repo_push", "pr_comment", "pr_inline_review_comment",
+    "pr_rerequest_review",
+})
 
 
 def _resolve_standing_review(
@@ -271,6 +275,30 @@ def _emit_hard_boundary_denied(
         "hard_boundary_denied",
         **payload,
     )
+
+
+def _record_tool_outcome(tool_name: str, *, refused_reason: str = "") -> None:
+    """Attach server-observed remediation evidence to the active turn."""
+    if refused_reason:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="tool_policy",
+            reason=refused_reason[:240],
+        )
+        return
+    if tool_name == "unsupported_operation":
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="typed_action_set",
+            reason="unsupported_operation",
+        )
+        return
+    if tool_name not in _REMEDIATION_EFFECT_TOOLS:
+        return
+    active_turn = _get_current_turn_context()
+    effects = getattr(active_turn, "remediation_effects", None)
+    if isinstance(effects, list):
+        effects.append(tool_name)
 
 
 def _budget_denied_message(tool_name: str, count: int, budget: int) -> str:
@@ -1311,6 +1339,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             tool_name, auth_context, validated_arguments,
         )
         if review_denial is not None:
+            _record_tool_outcome(tool_name, refused_reason=review_denial)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=review_denial, denied=True,
                 arguments=validated_arguments,
@@ -1429,6 +1458,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
+            _record_tool_outcome(tool_name, refused_reason=service_shell_refusal)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
                 arguments=validated_arguments,
@@ -1447,6 +1477,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 _current_ifc_labels(auth_context),
             ):
                 refusal = "file write refused: integrity metadata could not be persisted"
+                _record_tool_outcome(tool_name, refused_reason=refusal)
                 _emit_tool_call_sync(
                     tool_name, ok=False, error=refusal, denied=True,
                     arguments=validated_arguments,
@@ -1491,7 +1522,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = handler(execution_request)
         except ToolException as exc:
             provenance = end_protected_result_capture(capture_token)
-            if not isinstance(exc, ToolPolicyRefusal):
+            if isinstance(exc, ToolPolicyRefusal):
+                _record_tool_outcome(tool_name, refused_reason=str(exc))
+            else:
                 result_labels = _result_labels_for_call(
                     tool_name,
                     request,
@@ -1536,6 +1569,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
+        if not is_error:
+            _record_tool_outcome(tool_name)
         _record_repo_review_checkout(
             execution_request, auth_context, failed=is_error,
         )
@@ -1574,6 +1609,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             _resolve_standing_review, tool_name, auth_context, validated_arguments,
         )
         if review_denial is not None:
+            _record_tool_outcome(tool_name, refused_reason=review_denial)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=review_denial, denied=True,
                 arguments=validated_arguments,
@@ -1692,6 +1728,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
+            _record_tool_outcome(tool_name, refused_reason=service_shell_refusal)
             _emit_tool_call_sync(
                 tool_name, ok=False, error=service_shell_refusal, denied=True,
                 arguments=validated_arguments,
@@ -1712,6 +1749,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             if not recorded:
                 refusal = "file write refused: integrity metadata could not be persisted"
+                _record_tool_outcome(tool_name, refused_reason=refusal)
                 _emit_tool_call_sync(
                     tool_name, ok=False, error=refusal, denied=True,
                     arguments=validated_arguments,
@@ -1760,7 +1798,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = await handler(execution_request)
         except ToolException as exc:
             provenance = end_protected_result_capture(capture_token)
-            if not isinstance(exc, ToolPolicyRefusal):
+            if isinstance(exc, ToolPolicyRefusal):
+                _record_tool_outcome(tool_name, refused_reason=str(exc))
+            else:
                 result_labels = _result_labels_for_call(
                     tool_name,
                     request,
@@ -1805,6 +1845,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 end_authorized_fetch(fetch_token)
         provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
+        if not is_error:
+            _record_tool_outcome(tool_name)
         _record_repo_review_checkout(
             execution_request, auth_context, failed=is_error,
         )

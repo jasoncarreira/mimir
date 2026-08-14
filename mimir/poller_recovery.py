@@ -488,6 +488,7 @@ async def reconcile_failed_turns(
                     entry["outcome_reason"] = (
                         reason if isinstance(reason, str) else "hard_boundary_refusal"
                     )
+                    entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns:
                         del inflight[source_id]
@@ -516,6 +517,7 @@ async def reconcile_failed_turns(
                     entry["outcome_reason"] = (
                         reason if isinstance(reason, str) else "hard_boundary_refusal"
                     )
+                    entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns:
                         del inflight[source_id]

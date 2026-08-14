@@ -2331,6 +2331,45 @@ async def test_framework_marks_hard_boundary_refusal_unchargeable(tmp_path: Path
     }]
 
 
+async def test_framework_charges_refusal_after_remediation_effect(tmp_path: Path):
+    class _PartiallyRemediatingAgent(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            from mimir._context import get_current_turn
+            from mimir.tools.budget_gate import _emit_hard_boundary_denied
+
+            get_current_turn().remediation_effects.append("repo_push")
+            _emit_hard_boundary_denied(
+                tool="pr_rerequest_review",
+                boundary="service_scope",
+                reason="service_scope_denied",
+            )
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_PartiallyRemediatingAgent([AIMessage(content="Push completed")]),
+        fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    await agent.run_turn(AgentEvent(
+        trigger="poller",
+        channel_id="poller:github-activity",
+        content="fix PR",
+        source_id="changes-requested:partial",
+    ))
+
+    [outcome] = [
+        event for event in _read_events(tmp_path)
+        if event.get("type") in {"turn_failed", "turn_completed"}
+    ]
+    assert outcome["attempt_disposition"] == "charge"
+    assert outcome["attempt_reason"] == "success"
+    assert outcome["remediation_effects"] == ["repo_push"]
+
+
 async def test_context_window_exceeded_emits_failed_poller_outcome(tmp_path: Path):
     fake_agent = _FakeAgent(response_messages=[AIMessage(
         content="",

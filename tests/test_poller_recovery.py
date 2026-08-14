@@ -235,6 +235,7 @@ async def test_reconcile_records_hard_refusal_without_charging_attempt(tmp_path:
     assert entry["attempts"] == 0
     assert entry["outcome_disposition"] == "exempt_hard_refusal"
     assert entry["outcome_reason"] == "service_scope_denied"
+    assert entry["attempt_reasons"] == ["service_scope_denied"]
 
 
 async def test_reconcile_completed_hard_refusal_without_charging_attempt(
@@ -266,6 +267,7 @@ async def test_reconcile_completed_hard_refusal_without_charging_attempt(
     assert entry["attempts"] == 0
     assert entry["outcome_disposition"] == "exempt_hard_refusal"
     assert entry["outcome_reason"] == "service_scope_denied"
+    assert entry["attempt_reasons"] == ["service_scope_denied"]
     assert entry["hard_refusals"] == [
         {"boundary": "service_scope", "reason": "service_scope_denied"}
     ]
