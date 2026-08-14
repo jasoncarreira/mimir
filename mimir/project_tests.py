@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import stat
 from collections.abc import Awaitable, Callable
 import uuid
 
@@ -29,6 +30,7 @@ from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
 from .repository_config import RepositoryInventory
 from .worklink.backends.registry import WorklinkConfig
+from .worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
 
 
 _TIMEOUT_SECONDS = 300.0
@@ -39,6 +41,11 @@ _MAX_SELECTORS = 32
 _MAX_SELECTOR_LENGTH = 256
 _MAX_SELECTOR_BYTES = 4_096
 _SELECTOR_PATTERN = re.compile(r"[A-Za-z0-9._/,:+=-]+", re.ASCII)
+_PERMISSION_PATH_PATTERN = re.compile(
+    rb"(?:failed to open file |failed to access )?[`'](?P<path>/[^`'\r\n]+)[`']"
+    rb"[^\r\n]*(?:Permission denied|os error 13|EACCES)",
+    re.IGNORECASE,
+)
 _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
@@ -216,6 +223,58 @@ def _safe_output(
     return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
 
 
+def _worker_can_search(metadata: os.stat_result) -> bool:
+    mode = metadata.st_mode
+    if metadata.st_uid == WORKLINK_UID:
+        return bool(mode & stat.S_IXUSR)
+    if metadata.st_gid == WORKLINK_GID:
+        return bool(mode & stat.S_IXGRP)
+    return bool(mode & stat.S_IXOTH)
+
+
+def _permission_diagnostic(path: Path) -> dict[str, object] | None:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    diagnostic: dict[str, object] | None = None
+    for part in absolute.parts[1:-1]:
+        current /= part
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError:
+            return diagnostic
+        if stat.S_ISDIR(metadata.st_mode) and not _worker_can_search(metadata):
+            diagnostic = {
+                "path": redact_text(str(absolute)),
+                "path_mode": f"0o{stat.S_IMODE(metadata.st_mode):03o}",
+                "path_uid": metadata.st_uid,
+                "path_gid": metadata.st_gid,
+                "runner_effective_uid": WORKLINK_UID,
+                "runner_effective_gid": WORKLINK_GID,
+                "traversal_failed": redact_text(str(current)),
+            }
+    return diagnostic
+
+
+def _permission_diagnostic_from_error(
+    error: BaseException | bytes,
+) -> dict[str, object] | None:
+    path: str | None = None
+    if isinstance(error, OSError) and error.errno == 13 and error.filename is not None:
+        path = os.fsdecode(error.filename)
+    elif isinstance(error, bytes):
+        match = _PERMISSION_PATH_PATTERN.search(error)
+        if match is not None:
+            path = os.fsdecode(match.group("path"))
+    if path is None or not os.path.isabs(path):
+        return None
+    return _permission_diagnostic(Path(path))
+
+
+def _permission_refusal_message(diagnostic: dict[str, object]) -> str:
+    fields = " ".join(f"{key}={value}" for key, value in diagnostic.items())
+    return f"contained project test path permission denied: {fields}"
+
+
 class RepoProjectTests:
     """Execute the fixed project test command in a disposable contained checkout."""
 
@@ -300,6 +359,11 @@ class RepoProjectTests:
         environment = base_worker_environment(identifier)
         environment.update(configured_env)
         environment.pop("HOME", None)
+        if Path(command[0]).name == "uv":
+            # uv otherwise searches above the fd-entered checkout for uv.toml.
+            # The snapshot's 0700 isolation boundary deliberately cannot be
+            # traversed by the worker, so ambient config discovery must be off.
+            environment["UV_NO_CONFIG"] = "1"
         if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
             try:
                 checkout.close()
@@ -332,6 +396,19 @@ class RepoProjectTests:
                     scrubber=scrubber,
                 )
             except (OSError, RuntimeError, ValueError) as exc:
+                diagnostic = _permission_diagnostic_from_error(exc)
+                if diagnostic is not None:
+                    await safe_log_event(
+                        "repo_test_containment_refused",
+                        reason_code="path_permission_denied",
+                        repository=scope.canonical_repo,
+                        pull_request=scope.pr_number,
+                        **diagnostic,
+                    )
+                    raise ProjectTestRefusal(
+                        "test_path_permission_denied",
+                        _permission_refusal_message(diagnostic),
+                    ) from exc
                 await safe_log_event(
                     "repo_test_containment_refused",
                     reason_code="containment_unavailable",
@@ -342,6 +419,20 @@ class RepoProjectTests:
                     "test_containment_unavailable",
                     "contained project test execution is unavailable",
                 ) from exc
+            if result.exit_code not in {None, 0}:
+                diagnostic = _permission_diagnostic_from_error(result.stderr)
+                if diagnostic is not None:
+                    await safe_log_event(
+                        "repo_test_containment_refused",
+                        reason_code="path_permission_denied",
+                        repository=scope.canonical_repo,
+                        pull_request=scope.pr_number,
+                        **diagnostic,
+                    )
+                    raise ProjectTestRefusal(
+                        "test_path_permission_denied",
+                        _permission_refusal_message(diagnostic),
+                    )
         finally:
             try:
                 checkout.close()
