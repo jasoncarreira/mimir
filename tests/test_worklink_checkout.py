@@ -914,20 +914,32 @@ def test_enabled_clone_uses_no_hardlinks() -> None:
     ]]
 
 
-def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "hardlinked_executable", [False, True], ids=["single-link", "hardlinked"]
+)
+def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(
+    tmp_path: Path, hardlinked_executable: bool
+) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     source = tmp_path / "source"
     source.write_text("shared", encoding="utf-8")
     linked = checkout / "linked"
     linked.hardlink_to(source)
+    executable_source = (
+        tmp_path / "run-source" if hardlinked_executable else checkout / "run"
+    )
+    executable_source.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable_source.chmod(0o700)
     executable = checkout / "run"
-    executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    executable.chmod(0o700)
+    if hardlinked_executable:
+        executable.hardlink_to(executable_source)
     external = tmp_path / "external"
     external.write_text("external", encoding="utf-8")
     (checkout / "link").symlink_to(external)
     original_inode = source.stat().st_ino
+    executable_inode = executable.stat().st_ino
+    assert executable.stat().st_nlink == (2 if hardlinked_executable else 1)
     checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
 
     try:
@@ -938,9 +950,14 @@ def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(tmp_path: Path)
         os.close(checkout_fd)
 
     assert linked.stat().st_ino != original_inode
+    assert (executable.stat().st_ino != executable_inode) is hardlinked_executable
     assert stat.S_IMODE(checkout.stat().st_mode) == 0o2770
     assert stat.S_IMODE(linked.stat().st_mode) == 0o660
-    assert stat.S_IMODE(executable.stat().st_mode) == 0o760
+    assert stat.S_IMODE(executable.stat().st_mode) == 0o770
+    assert all(
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) & 0o007 == 0
+        for path in (checkout, linked, executable)
+    )
     assert external.read_text(encoding="utf-8") == "external"
 
 
