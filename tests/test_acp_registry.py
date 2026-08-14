@@ -65,6 +65,39 @@ def test_schema_digest_then_validation() -> None:
     validator_class(schema, format_checker=FormatChecker()).validate(EXPECTED_MANIFEST)
 
 
+def test_schema_provenance_is_recorded_and_matches_the_vendored_bytes() -> None:
+    """The vendored schema records where its bytes came from, not just what they are.
+
+    Upstream serves this schema only from a moving ``latest`` CDN path -- versioned
+    paths 404, and ``agent.schema.json`` is absent from the ``agent-client-protocol``
+    repository at every tag (its ``schema-v*`` tags version the wire protocol schema,
+    not the registry entry schema). So no upstream revision identifies these bytes,
+    and ``immutable_revision`` is recorded as null on purpose rather than omitted.
+    """
+    provenance = json.loads((ROOT / "registry/schema/PROVENANCE.json").read_bytes())
+    schema_bytes = (ROOT / "registry/schema/agent.schema.json").read_bytes()
+
+    assert provenance["sha256"] == hashlib.sha256(schema_bytes).hexdigest()
+    assert provenance["source_url"] == json.loads(schema_bytes)["$id"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", provenance["retrieved_utc"])
+    assert provenance["registry_format_version"] == "1.0.0"
+
+    # Recorded as an explicit null with a stated reason, so a later reader cannot
+    # mistake a missing revision for an oversight.
+    assert "immutable_revision" in provenance
+    assert provenance["immutable_revision"] is None
+    assert provenance["immutable_revision_note"].strip()
+
+
+def test_docs_state_the_candidate_is_not_registry_eligible() -> None:
+    """The manifest omits authMethods, so the docs must say submission is blocked."""
+    assert "not registry-eligible" in DOCS
+    assert "authMethods" in DOCS
+    # Publication and smoke testing must not read as sufficient on their own.
+    assert "do not unlock submission" in DOCS
+    assert "registry/schema/PROVENANCE.json" in DOCS
+
+
 def test_icon_exact() -> None:
     data = (ROOT / "registry/mimir/icon.svg").read_bytes()
     assert data == EXPECTED_ICON

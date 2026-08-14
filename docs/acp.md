@@ -104,6 +104,16 @@ As the accepted premise measured 2026-08-09, Microsoft's native VS Code agent sy
 
 The registry candidate renders the launch shape `uvx mimir-agent==0.9.0 acp`. It is an offline review candidate and does not claim that unpublished version 0.9.0 is already installable. PyPI publication and registry submission remain separately authorized and release-gated after publication and manual smoke testing.
 
+### Registry eligibility
+
+**This candidate is not registry-eligible.** The curated ACP registry requires an agent to advertise at least one authentication method — Agent Auth or Terminal Auth — and this candidate deliberately carries no `authMethods`. Publication to PyPI and manual smoke testing do not unlock submission on their own: an authentication method must be designed, built, and advertised in the manifest before the candidate can be submitted at all. Until then `registry/mimir/agent.json` is a schema-valid rehearsal of the entry, not a submittable one.
+
+### Schema provenance
+
+`registry/schema/agent.schema.json` is vendored from the ACP registry CDN. Its provenance is recorded in `registry/schema/PROVENANCE.json` and pinned by `tests/test_acp_registry.py`, which asserts the vendored bytes hash to the digest recorded there.
+
+Upstream publishes this schema **only** from a moving `latest` path. Versioned CDN paths return 404, and `agent.schema.json` is not committed to the `agent-client-protocol` repository at any tag — that repository's `schema-v*` tags version the wire protocol schema, not the registry entry schema. There is therefore no upstream commit or revision that identifies these bytes, and the recorded digest plus retrieval date is the complete provenance available. Detect upstream drift by re-fetching `source_url` and comparing the digest; a mismatch means the vendored copy and `PROVENANCE.json` must be refreshed together.
+
 ## Connections, sessions, and replay
 
 There is one active ACP connection per `MIMIR_HOME`. Only a newly authenticated connection can supersede the prior generation; failed or partial authentication cannot evict the active client. Reconnection creates a new authentication and generation boundary. Session IDs are owner-bound UUIDv4 values, and reconnection resumes them through `session/load`; provider, permission, and MCP request identities are fresh.
