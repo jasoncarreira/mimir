@@ -1000,6 +1000,9 @@ class TurnContext:
     # or tool boundary. The model only receives rendered ToolMessages and cannot
     # populate this classification itself.
     hard_boundary_denials: list[dict[str, str]] = field(default_factory=list)
+    # Successful server-observed actions that prove a remediation turn started.
+    # A later refusal cannot make one of these partially executed turns free.
+    remediation_effects: list[str] = field(default_factory=list)
     # CR2 (agent runtime) fix: soft-warning idempotency. Without this
     # flag, the previous ``count == soft_threshold`` trigger could miss
     # a warning if any code path skipped an increment, AND could fire

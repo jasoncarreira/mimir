@@ -2512,7 +2512,17 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
             handler,
         )
         adapted = await middleware.awrap_tool_call(
-            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+            _make_request(
+                "repo_push", "adapted", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
+            handler,
+        )
+        unsupported = await middleware.awrap_tool_call(
+            _make_request(
+                "unsupported_operation", "unsupported", auth,
+                {"repository": "owner/repo", "pull_request": 17},
+            ),
             handler,
         )
     finally:
@@ -2522,9 +2532,23 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run() -> None:
     assert refusal.status == "error"
     assert "repo.inspect not granted" in str(refusal.content)
     assert adapted.content == "adapted"
-    assert calls == ["refused", "adapted"]
+    assert unsupported.content == "adapted"
+    assert calls == ["refused", "adapted", "unsupported"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
-    assert ctx.tool_call_count == 2
+    assert ctx.tool_call_count == 3
+    assert ctx.hard_boundary_denials == [
+        {
+            "tool": "pr_metadata",
+            "boundary": "tool_policy",
+            "reason": "pull-request operation rejected: repo.inspect not granted",
+        },
+        {
+            "tool": "unsupported_operation",
+            "boundary": "typed_action_set",
+            "reason": "unsupported_operation",
+        },
+    ]
+    assert ctx.remediation_effects == ["repo_push"]
 
 
 @pytest.mark.asyncio
