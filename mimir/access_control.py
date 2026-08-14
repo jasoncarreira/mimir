@@ -126,6 +126,30 @@ class SinkCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+_SINK_CATEGORY_CAPABILITY_ELIGIBLE = frozenset({
+    SinkCategory.SAME_CHANNEL,
+    SinkCategory.CROSS_CHANNEL,
+    SinkCategory.PUBLIC,
+    SinkCategory.SHELL_PROCESS,
+    SinkCategory.SPAWN,
+    SinkCategory.NOTIFICATION,
+    SinkCategory.FILE,
+    SinkCategory.DIRECT_MESSAGE,
+    SinkCategory.SAGA,
+    SinkCategory.SCHEDULER,
+    SinkCategory.PROPOSAL,
+    SinkCategory.FORGE,
+})
+
+assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
+    SinkCategory.NETWORK,
+    SinkCategory.HTTP_WEBHOOK,
+    SinkCategory.EXTERNAL_MCP,
+    SinkCategory.HARNESS_DISPLAY,
+    SinkCategory.UNKNOWN,
+}
+
+
 class CapabilityTier(StrEnum):
     """Blast-radius ceiling for authority declared by autonomous triggers."""
 
@@ -4698,6 +4722,21 @@ def _forge_repository_scope_mismatch(
     return None
 
 
+def _sink_category_capability_turn_id(auth_context: Any) -> str | None:
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    if (
+        turn is None
+        or getattr(turn, "auth_context", None) is None
+        or getattr(turn.auth_context, "ifc_state", None)
+        is not getattr(auth_context, "ifc_state", None)
+    ):
+        return None
+    turn_id = getattr(turn, "turn_id", None)
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -5279,6 +5318,11 @@ class SinkGate:
                     sink_category=sink_category.value,
                     destination=normalized_target,
                     canonical_principal=canonical_principal,
+                    turn_id=(
+                        _sink_category_capability_turn_id(auth_context)
+                        if sink_category in _SINK_CATEGORY_CAPABILITY_ELIGIBLE
+                        else None
+                    ),
                 )
             ):
                 return ToolAuthorization(

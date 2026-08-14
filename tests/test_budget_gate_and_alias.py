@@ -712,7 +712,7 @@ async def test_mcp_argument_posture_controls_queries_after_active_ingest(
 
 
 @pytest.mark.asyncio
-async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
+async def test_shell_category_capability_does_not_admit_external_mcp() -> None:
     from dataclasses import replace
 
     from mimir.access_control import OperationDecision, ToolFlowDirection, ToolRegistry
@@ -756,6 +756,7 @@ async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
         channel_id="private-channel",
         interactivity=None,
         enforcement_enabled=True,
+        ifc_labels=_ifc_labels("private-channel"),
     )
     arguments = {"destination": "public-destination"}
 
@@ -813,18 +814,13 @@ async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
 
     turn = _make_ctx()
     turn.auth_context = context
-    turn.ifc_labels = InformationFlowLabels(
-        labels=frozenset({"private"}),
-        source_channels=frozenset({"private-channel"}),
+    turn.ifc_labels = _install_sink_category_capability(
+        context, turn_id=turn.turn_id,
     )
     token = set_current_turn(turn)
     try:
         denied = await BudgetGateMiddleware().awrap_tool_call(
             request("tainted"), handler,
-        )
-        turn.ifc_labels = InformationFlowLabels()
-        allowed = await BudgetGateMiddleware().awrap_tool_call(
-            request("untainted"), handler,
         )
     finally:
         reset_current_turn(token)
@@ -832,8 +828,7 @@ async def test_admin_mcp_sink_cannot_bypass_external_sink_ifc() -> None:
 
     assert denied.status == "error"
     assert "ifc_label_blocked:external_mcp" in str(denied.content)
-    assert allowed.content == "ok"
-    assert handler_calls == 1
+    assert handler_calls == 0
 
 
 def _ifc_labels(
@@ -893,6 +888,213 @@ def _ifc_turn(auth: AuthContext) -> TurnContext:
     ctx.auth_context = auth
     ctx.ifc_labels = auth.ifc_labels
     return ctx
+
+
+def _install_sink_category_capability(
+    auth: AuthContext,
+    *,
+    turn_id: str,
+    sink_category: str = "shell_process",
+) -> InformationFlowLabels:
+    request_carrier = auth.ifc_state.merge(auth.ifc_labels or InformationFlowLabels())
+    request_carrier, ordinal = auth.ifc_state.source_snapshot()
+    assert isinstance(request_carrier, InformationFlowLabels)
+    event = object()
+    reply_source = SourceLabel(
+        principal="operator-admin",
+        domain="channel",
+        resource_id="ops",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"operator-admin"}),
+    )
+    post_carrier, receipt = auth.ifc_state.merge_with_receipt(
+        InformationFlowLabels(sources=(reply_source,)),
+        event_identity=event,
+    )
+    assert auth.ifc_state.install_sink_category_capability(
+        sink_category=sink_category,
+        turn_id=turn_id,
+        canonical_principal=auth.canonical_principal or "",
+        request_carrier=request_carrier,
+        request_source_arrival_ordinal=ordinal,
+        approval_event=event,
+        reply_source=reply_source,
+        fold_receipt=receipt,
+    )
+    return post_carrier
+
+
+def test_sink_category_capability_runs_repeated_sync_handlers(tmp_path: Path) -> None:
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(
+        auth, turn_id=turn.turn_id, sink_category="file",
+    )
+    calls: list[str] = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        first = BudgetGateMiddleware().wrap_tool_call(
+            _make_request("write_file", "file-1", auth, {"file_path": str(tmp_path / "first")}),
+            handler,
+        )
+        second = BudgetGateMiddleware().wrap_tool_call(
+            _make_request("write_file", "file-2", auth, {"file_path": str(tmp_path / "second")}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert first.status != "error"
+    assert second.status != "error"
+    assert calls == ["file-1", "file-2"]
+
+
+@pytest.mark.asyncio
+async def test_sink_category_capability_runs_repeated_async_handlers(tmp_path: Path) -> None:
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(
+        auth, turn_id=turn.turn_id, sink_category="file",
+    )
+    calls: list[str] = []
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        first = await BudgetGateMiddleware().awrap_tool_call(
+            _make_request("write_file", "async-file-1", auth, {"file_path": str(tmp_path / "first")}),
+            handler,
+        )
+        second = await BudgetGateMiddleware().awrap_tool_call(
+            _make_request("write_file", "async-file-2", auth, {"file_path": str(tmp_path / "second")}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert first.status != "error"
+    assert second.status != "error"
+    assert calls == ["async-file-1", "async-file-2"]
+
+
+@pytest.mark.parametrize("tool_name", ["fetch_url", "http_request"])
+def test_shell_category_capability_does_not_admit_application_egress(
+    tool_name: str,
+) -> None:
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="sent", tool_call_id=request.tool_call["id"])
+
+    argument = "url"
+    token = set_current_turn(turn)
+    try:
+        result = BudgetGateMiddleware().wrap_tool_call(
+            _make_request(
+                tool_name,
+                f"{tool_name}-1",
+                auth,
+                {argument: "https://outside.example/data"},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+
+
+def test_new_source_invalidates_category_capability_before_handler() -> None:
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    turn.ifc_labels = auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="later-source",
+        domain="file",
+        resource_id="/tmp/new.txt",
+        bridge_instance="filesystem",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="file",
+    ),)))
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        result = BudgetGateMiddleware().wrap_tool_call(
+            _make_request("shell_exec", "after-ingest", auth, {"command": "printf no"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert handler_calls == 0
+
+
+@pytest.mark.parametrize("isolation", ["turn", "principal", "session"])
+def test_category_capability_isolated_from_other_contexts(isolation: str) -> None:
+    from dataclasses import replace
+
+    auth = _ifc_auth()
+    original = _ifc_turn(auth)
+    original.ifc_labels = _install_sink_category_capability(auth, turn_id=original.turn_id)
+    if isolation == "turn":
+        isolated_auth = auth
+        isolated = _ifc_turn(isolated_auth)
+        isolated.turn_id = "later-turn"
+        isolated.ifc_labels = original.ifc_labels
+    elif isolation == "principal":
+        isolated_auth = replace(
+            auth,
+            principal="slack-U2",
+            canonical_principal="user-2",
+        )
+        isolated = _ifc_turn(isolated_auth)
+        isolated.ifc_labels = original.ifc_labels
+    else:
+        isolated_auth = _ifc_auth()
+        isolated = _ifc_turn(isolated_auth)
+        isolated.session_id = "later-session"
+        isolated.ifc_labels = isolated_auth.ifc_state.merge(isolated_auth.ifc_labels)
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(isolated)
+    try:
+        result = BudgetGateMiddleware().wrap_tool_call(
+            _make_request("shell_exec", isolation, isolated_auth, {"command": "printf no"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status == "error"
+    assert handler_calls == 0
 
 
 def _attach_auth(ctx: TurnContext, resolver: IdentityResolver | None = None) -> None:
