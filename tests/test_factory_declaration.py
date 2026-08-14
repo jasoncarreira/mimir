@@ -84,7 +84,16 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # declaration outright or act on something nobody reviewed. `bootstrap` joined the set when
     # this repository opted in to feature-factory #248, so a sandbox installs its dependencies
     # before any gate instead of discovering they are absent.
-    assert set(data) == {"resolve", "verify", "publish", "publishing_identity", "bootstrap", "pr_draft"}
+    assert set(data) == {
+        "resolve", "verify", "verify_timeout_ms", "publish", "publishing_identity",
+        "bootstrap", "pr_draft",
+    }
+    # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
+    # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
+    # factory sent SIGTERM, and that surfaces as a numeric test failure rather than a
+    # timeout -- which then blocks relaunching the run on the same SHA. The suite takes
+    # 8.5-15 min here, so 30 min is headroom rather than a guess at the current runtime.
+    assert data["verify_timeout_ms"] == 1800000
     # The value, not merely the key. Asserting presence alone would pass with `pr_draft: true`, or
     # with `--draft` restored in `publish`, either of which silently reinstates the draft-PR problem
     # this declaration exists to remove: `gh pr merge` refuses a draft, and a draft is invisible to a
