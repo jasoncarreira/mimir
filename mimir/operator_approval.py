@@ -157,29 +157,37 @@ def consume_grant(
 ) -> ApprovalGrant | None:
     """Take one grant, spending category grants even when a binding mismatches."""
     with _LOCK:
-        for grant_id, grant in tuple(_GRANTS.items()):
-            if (
-                grant.channel_id != channel_id
-                or grant.tool_name != tool_name
-                or grant.target != target
-            ):
-                continue
-            taken = _GRANTS.pop(grant_id)
-            if taken.sink_category is None:
-                return taken
-            matches = (
-                request_id == taken.request_id
-                and turn_id == taken.turn_id
-                and requesting_principal == taken.requesting_principal
-                and sink_category == taken.sink_category
-                and request_carrier == taken.request_carrier
-                and ifc_state is taken.ifc_state
-                and request_source_arrival_ordinal == taken.request_source_arrival_ordinal
-                and approval_event is taken.approval_event
-                and reply_source == taken.reply_source
-            )
-            return taken if matches else None
-    return None
+        grant_id = next((
+            candidate_id
+            for candidate_id, grant in _GRANTS.items()
+            if grant.channel_id == channel_id
+            and grant.tool_name == tool_name
+            and grant.target == target
+        ), None)
+        if grant_id is None and request_id is not None:
+            candidate = _GRANTS.get(request_id)
+            if candidate is not None and candidate.sink_category is not None:
+                grant_id = request_id
+        if grant_id is None:
+            return None
+        taken = _GRANTS.pop(grant_id)
+        if taken.sink_category is None:
+            return taken
+        matches = (
+            channel_id == taken.channel_id
+            and tool_name == taken.tool_name
+            and target == taken.target
+            and request_id == taken.request_id
+            and turn_id == taken.turn_id
+            and requesting_principal == taken.requesting_principal
+            and sink_category == taken.sink_category
+            and request_carrier == taken.request_carrier
+            and ifc_state is taken.ifc_state
+            and request_source_arrival_ordinal == taken.request_source_arrival_ordinal
+            and approval_event is taken.approval_event
+            and reply_source == taken.reply_source
+        )
+        return taken if matches else None
 
 
 def record_authenticated_response(

@@ -411,7 +411,9 @@ class InformationFlowState:
             live = self.labels
             expected_post = request_carrier.with_source(reply_source)
             if (
-                fold_receipt._state_identity is not self._receipt_identity
+                approval_event is None
+                or fold_receipt.event_identity is None
+                or fold_receipt._state_identity is not self._receipt_identity
                 or fold_receipt.event_identity is not approval_event
                 or fold_receipt.pre_carrier != request_carrier
                 or fold_receipt.pre_source_arrival_ordinal != request_source_arrival_ordinal

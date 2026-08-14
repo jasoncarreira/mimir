@@ -3593,6 +3593,65 @@ def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
     )
 
 
+def test_reusable_category_capability_has_no_legacy_exact_expiry(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr("mimir.models.time.monotonic", lambda: now)
+    state, current, _, _ = _install_category_capability()
+    assert current is not None
+    assert state.approve_sink_once(
+        fallback=None,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+        lifetime_seconds=60,
+        durable_audit=lambda *_: True,
+    )
+
+    now = 161.0
+    assert not state.consume_sink_approval(
+        current=current,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+    )
+    for destination in ("exact-command", "later-command", "latest-command"):
+        assert state.consume_sink_approval(
+            current=current,
+            sink_category="SHELL_PROCESS",
+            destination=destination,
+            canonical_principal="user-1",
+            turn_id="turn-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("approval_event", "receipt_event"),
+    ((None, None), (None, object()), (object(), None)),
+    ids=("both-absent", "approval-absent", "receipt-absent"),
+)
+def test_category_install_rejects_absent_event_identity(
+    approval_event: object | None, receipt_event: object | None,
+):
+    request_carrier = _labels()
+    state = InformationFlowState(labels=request_carrier)
+    reply_source = _approval_reply_source()
+    _, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source),
+        event_identity=receipt_event,
+    )
+
+    assert not state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS",
+        turn_id="turn-1",
+        canonical_principal="user-1",
+        request_carrier=request_carrier,
+        request_source_arrival_ordinal=0,
+        approval_event=approval_event,
+        reply_source=reply_source,
+        fold_receipt=receipt,
+    )
+
+
 def test_category_install_requires_exact_next_reply_fold_and_live_snapshot():
     request_carrier = _labels()
     reply_source = _approval_reply_source()
@@ -3670,7 +3729,26 @@ def test_category_capability_survives_duplicate_merge_but_not_new_source():
     )
 
 
-def test_category_grant_binds_every_dimension_and_mismatch_spends_it():
+@pytest.mark.parametrize(
+    "mismatched_binding",
+    (
+        "request_id",
+        "channel_id",
+        "tool_name",
+        "target",
+        "turn_id",
+        "requesting_principal",
+        "sink_category",
+        "request_carrier",
+        "ifc_state",
+        "request_source_arrival_ordinal",
+        "approval_event",
+        "reply_source",
+    ),
+)
+def test_category_grant_binds_every_dimension_and_mismatch_spends_it(
+    mismatched_binding: str,
+):
     class Resolver:
         def resolve(self, principal):
             return "admin-1" if principal == "slack-admin" else None
@@ -3678,7 +3756,7 @@ def test_category_grant_binds_every_dimension_and_mismatch_spends_it():
         def access_metadata(self, principal):
             return SimpleNamespace(is_admin=True, is_service=False)
 
-    channel = "slack-category-record"
+    channel = f"slack-category-record-{mismatched_binding}"
     request_carrier = _labels(channel)
     state = InformationFlowState(labels=request_carrier)
     reply_source = _approval_reply_source()
@@ -3696,20 +3774,49 @@ def test_category_grant_binds_every_dimension_and_mismatch_spends_it():
     assert operator_approval.record_authenticated_response(
         event, Resolver(), approval_event=event, reply_source=reply_source,
     ) == "granted"
-    assert operator_approval.consume_grant(
-        channel, "request_operator_approval", "shell",
-        request_id=request.request_id, turn_id="turn-1",
-        requesting_principal="user-1", sink_category="SHELL_PROCESS",
-        request_carrier=request_carrier, ifc_state=state,
-        request_source_arrival_ordinal=0, approval_event=object(),
-        reply_source=reply_source,
-    ) is None
-    assert operator_approval.consume_grant(
-        channel, "request_operator_approval", "shell",
-        request_id=request.request_id, turn_id="turn-1",
-        requesting_principal="user-1", sink_category="SHELL_PROCESS",
-        request_carrier=request_carrier, ifc_state=state,
-        request_source_arrival_ordinal=0, approval_event=event,
-        reply_source=reply_source,
-    ) is None
-    operator_approval.clear_channel(channel)
+    valid = {
+        "channel_id": channel,
+        "tool_name": "request_operator_approval",
+        "target": "shell",
+        "request_id": request.request_id,
+        "turn_id": "turn-1",
+        "requesting_principal": "user-1",
+        "sink_category": "SHELL_PROCESS",
+        "request_carrier": request_carrier,
+        "ifc_state": state,
+        "request_source_arrival_ordinal": 0,
+        "approval_event": event,
+        "reply_source": reply_source,
+    }
+    mismatches = {
+        "request_id": "different-request",
+        "channel_id": f"{channel}-different",
+        "tool_name": "different-tool",
+        "target": "different-target",
+        "turn_id": "turn-2",
+        "requesting_principal": "user-2",
+        "sink_category": "NETWORK_FETCH",
+        "request_carrier": _labels(channel, principal="user-2"),
+        "ifc_state": InformationFlowState(labels=request_carrier),
+        "request_source_arrival_ordinal": 1,
+        "approval_event": replace(event),
+        "reply_source": replace(reply_source, principal="admin-2"),
+    }
+    mismatched = {**valid, mismatched_binding: mismatches[mismatched_binding]}
+
+    try:
+        assert operator_approval.consume_grant(
+            mismatched.pop("channel_id"),
+            mismatched.pop("tool_name"),
+            mismatched.pop("target"),
+            **mismatched,
+        ) is None
+        retry = valid.copy()
+        assert operator_approval.consume_grant(
+            retry.pop("channel_id"),
+            retry.pop("tool_name"),
+            retry.pop("target"),
+            **retry,
+        ) is None
+    finally:
+        operator_approval.clear_channel(channel)
