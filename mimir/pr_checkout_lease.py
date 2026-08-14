@@ -13,7 +13,12 @@ import subprocess
 from typing import Callable, Sequence
 import uuid
 
-from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
+from .models import (
+    NormalizedPullRequestSnapshot,
+    RepoPRAction,
+    RepoPRActionScope,
+    RepoReviewState,
+)
 from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_checkout
 
 
@@ -92,6 +97,46 @@ class PRCheckoutLease:
 
     def revoke(self) -> None:
         object.__setattr__(self, "revoked", True)
+
+
+def _observe_current_pr_head(scope: RepoPRActionScope) -> str:
+    """Read the current head from the server-configured forge adapter."""
+    from .tools.forge import _client_for_repository
+
+    snapshot = _client_for_repository(scope.canonical_repo).get_pull_request_snapshot(
+        scope.canonical_repo.lower(), scope.pr_number,
+    )
+    if (
+        not isinstance(snapshot, NormalizedPullRequestSnapshot)
+        or snapshot.number != scope.pr_number
+        or snapshot.state != "open"
+        or snapshot.head_ref != scope.head_ref
+        or len(snapshot.head_sha) != 40
+        or any(character not in "0123456789abcdef" for character in snapshot.head_sha.lower())
+    ):
+        raise RuntimeError("forge returned ambiguous pull-request head metadata")
+    return snapshot.head_sha.lower()
+
+
+def _report_superseded_lease(
+    scope: RepoPRActionScope,
+    lease: PRCheckoutLease,
+    observed_head: str,
+) -> None:
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "pr_checkout_lease_superseded",
+            repository=scope.canonical_repo,
+            pull_request=scope.pr_number,
+            scope_id=lease.scope_id,
+            superseded_head=lease.head_sha,
+            observed_head=observed_head,
+            path=str(lease.path),
+        )
+    except Exception:  # noqa: BLE001 - evidence failure must not change lease safety
+        pass
 
 
 @dataclass(frozen=True)
@@ -727,7 +772,7 @@ def acquire_pr_checkout_lease(
         fcntl.flock(directory_fd, fcntl.LOCK_EX)
         prefix = f"{scope.scope_id[:16]}-"
         paths: list[Path] = []
-        foreign_candidates: list[tuple[Path, str]] = []
+        foreign_leases: list[PRCheckoutLease] = []
         for path in sorted(root.iterdir()):
             if path.name.startswith(".") or not path.is_dir() or path.is_symlink():
                 continue
@@ -748,18 +793,17 @@ def acquire_pr_checkout_lease(
                 raise RuntimeError(f"PR checkout lease recovery scope mismatch at {path}")
             same_pr = (
                 raw.get("canonical_repo") == scope.canonical_repo
-                and raw.get("destination_ref") == scope.destination_ref
-                and raw.get("head_sha") == scope.observed_head_sha
                 and raw.get("owner") == owner
-                and ("pr_number" not in raw or raw.get("pr_number") == scope.pr_number)
+                and (
+                    raw.get("pr_number") == scope.pr_number
+                    or (
+                        "pr_number" not in raw
+                        and raw.get("destination_ref") == scope.destination_ref
+                    )
+                )
             )
             if same_pr:
-                head = _run(
-                    runner, ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
-                    "retained PR checkout has no HEAD",
-                ).lower()
-                if head != scope.observed_head_sha.lower():
-                    foreign_candidates.append((path, head))
+                foreign_leases.append(_lease_from_recorded_metadata(path, root))
         candidates = [
             (path, _retained_candidate_head(
                 path, scope, root=root, owner=owner, runner=runner,
@@ -770,6 +814,53 @@ def acquire_pr_checkout_lease(
             (path, head) for path, head in candidates
             if head != scope.observed_head_sha.lower()
         ]
+        foreign_candidates: list[tuple[Path, str]] = []
+        if foreign_leases:
+            try:
+                observed_head = _observe_current_pr_head(scope)
+            except Exception:  # noqa: BLE001 - observation failures must fail closed
+                observed_head = None
+
+            stale = [
+                lease for lease in foreign_leases
+                if observed_head is not None and lease.head_sha.lower() != observed_head
+            ]
+            retained: list[tuple[Path, str]] = []
+            for lease in stale:
+                head = _run(
+                    runner,
+                    ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+                    "retained PR checkout has no HEAD",
+                ).lower()
+                status = _run(
+                    runner,
+                    ["git", "-C", str(lease.path), "status", "--porcelain=v1",
+                     "--untracked-files=all"],
+                    "retained PR checkout status inspection failed",
+                )
+                if head != lease.head_sha.lower() or status:
+                    retained.append((lease.path, head))
+
+            if retained:
+                _report_retained_candidates("pr_checkout_lease_retained", scope, retained)
+                named = ", ".join(f"{head} ({path})" for path, head in retained)
+                raise RuntimeError(
+                    "superseded PR checkout lease has retained work; refusing release: "
+                    f"{named}"
+                )
+
+            for lease in stale:
+                cleanup_pr_checkout_lease(lease, runner=runner)
+                _report_superseded_lease(scope, lease, observed_head)
+            foreign_leases = [lease for lease in foreign_leases if lease not in stale]
+            for lease in foreign_leases:
+                head = _run(
+                    runner,
+                    ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+                    "retained PR checkout has no HEAD",
+                ).lower()
+                foreign_candidates.append((lease.path, head))
+
         if foreign_candidates:
             _report_retained_candidates(
                 "pr_checkout_lease_scope_conflict",
