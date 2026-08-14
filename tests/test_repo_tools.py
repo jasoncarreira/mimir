@@ -1631,6 +1631,158 @@ async def test_project_test_containment_unavailable_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_project_test_permission_refusal_names_path_metadata_and_identity(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import project_tests as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "unreadable"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    failed_path = checkout_path / "uv.toml"
+    failed_path.write_text("file-content-must-not-be-logged", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", failed_path)
+
+    def close() -> None:
+        boundary.chmod(0o700)
+
+    boundary.chmod(0)
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=denied,
+            checkout_factory=lambda *_args, **_kwargs: checkout,
+        ).execute()
+
+    assert refusal.value.code == "test_path_permission_denied"
+    message = str(refusal.value)
+    assert f"path={failed_path}" in message
+    assert "path_mode=0o000" in message
+    assert f"path_uid={os.geteuid()}" in message
+    assert f"path_gid={os.getegid()}" in message
+    assert "runner_effective_uid=1002" in message
+    assert "runner_effective_gid=1002" in message
+    assert f"traversal_failed={boundary}" in message
+    assert "file-content-must-not-be-logged" not in message
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "path_permission_denied",
+        "repository": "owner/repo",
+        "pull_request": 7,
+        "path": str(failed_path),
+        "path_mode": "0o000",
+        "path_uid": os.geteuid(),
+        "path_gid": os.getegid(),
+        "runner_effective_uid": 1002,
+        "runner_effective_gid": 1002,
+        "traversal_failed": str(boundary),
+    })]
+    assert "file-content-must-not-be-logged" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_uv_config_search_is_bounded_at_unsearchable_snapshot_boundary(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink.worker_exec import _execution_checkout_fd
+
+    state = repo_tools[-2]
+    uv = shutil.which("uv")
+    assert uv is not None
+    home = tmp_path / "home"
+    _configure_worklink_test(
+        home, f"{uv} run --offline --no-cache --no-project --no-sync /usr/bin/true",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "snapshot-boundary"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir()
+    checkout_fd = os.open(checkout_path, os.O_RDONLY | os.O_DIRECTORY)
+    boundary.chmod(0)
+
+    def invoke(env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                uv, "run", "--offline", "--no-cache", "--no-project", "--no-sync",
+                "/usr/bin/true",
+            ],
+            env=env,
+            preexec_fn=lambda: os.fchdir(checkout_fd),
+            capture_output=True,
+            check=False,
+        )
+
+    observed = invoke({"PATH": os.environ["PATH"]})
+    expected_path = checkout_path / "uv.toml"
+    assert observed.returncode == 2
+    assert observed.stderr == (
+        f"error: failed to open file `{expected_path}`: "
+        "Permission denied (os error 13)\n"
+    ).encode()
+
+    async def runner(argv, _directory, env, _projections, **_kwargs):
+        execution_fd = _execution_checkout_fd(list(argv), checkout_fd, worker_home)
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                env=env,
+                pass_fds=(execution_fd,),
+                preexec_fn=lambda: os.fchdir(execution_fd),
+                capture_output=True,
+                check=False,
+            )
+        finally:
+            os.close(execution_fd)
+        return CollectedExecutionResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            False,
+            False,
+            0,
+            0,
+        )
+
+    def close() -> None:
+        boundary.chmod(0o700)
+        os.close(checkout_fd)
+
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    result = await RepoProjectTests(
+        state,
+        runner=runner,
+        checkout_factory=lambda *_args, **_kwargs: checkout,
+    ).execute(("tracked.txt",))
+    assert result.ok is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("runner_fails", [False, True])
 async def test_project_test_snapshot_is_removed_after_execution(
     repo_tools,
