@@ -30,6 +30,7 @@ from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
 from .repository_config import RepositoryInventory
 from .worklink.backends.registry import WorklinkConfig
+from .worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
 
 
 _TIMEOUT_SECONDS = 300.0
@@ -46,8 +47,6 @@ _PERMISSION_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-_WORKLINK_UID = 1002
-_WORKLINK_GID = 1002
 
 
 class ProjectTestRefusal(RuntimeError):
@@ -226,9 +225,9 @@ def _safe_output(
 
 def _worker_can_search(metadata: os.stat_result) -> bool:
     mode = metadata.st_mode
-    if metadata.st_uid == _WORKLINK_UID:
+    if metadata.st_uid == WORKLINK_UID:
         return bool(mode & stat.S_IXUSR)
-    if metadata.st_gid == _WORKLINK_GID:
+    if metadata.st_gid == WORKLINK_GID:
         return bool(mode & stat.S_IXGRP)
     return bool(mode & stat.S_IXOTH)
 
@@ -249,8 +248,8 @@ def _permission_diagnostic(path: Path) -> dict[str, object] | None:
                 "path_mode": f"0o{stat.S_IMODE(metadata.st_mode):03o}",
                 "path_uid": metadata.st_uid,
                 "path_gid": metadata.st_gid,
-                "runner_effective_uid": _WORKLINK_UID,
-                "runner_effective_gid": _WORKLINK_GID,
+                "runner_effective_uid": WORKLINK_UID,
+                "runner_effective_gid": WORKLINK_GID,
                 "traversal_failed": redact_text(str(current)),
             }
     return diagnostic
