@@ -896,6 +896,145 @@ async def test_category_request_rejects_ineligible_and_unknown_categories(
     assert approval.pending_request("slack-C1") is None
 
 
+@pytest.mark.asyncio
+async def test_category_request_without_live_ifc_refuses_before_pending_authority(
+    tmp_path, monkeypatch,
+):
+    class _Channels:
+        def __init__(self):
+            self.alerts = []
+
+        def find(self, channel_id):
+            return object() if channel_id == "slack-C1" else None
+
+        async def send(self, channel_id, text, *, final=True):
+            from mimir.bridges.base import SendResult
+
+            self.alerts.append(text)
+            return SendResult(sent=True, message_id="alert-1")
+
+    channels = _Channels()
+    cfg = replace(
+        Config.from_env(),
+        home=tmp_path,
+        operator_alert_channel="slack-C1",
+        midturn_injection_channels=("slack-",),
+    )
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", Dispatcher(cfg))
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", channels)
+    auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="user",
+        roles=("user",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    ctx = TurnContext(
+        turn_id="turn-no-live-ifc",
+        session_id="slack-C1",
+        trigger="user_message",
+        channel_id="slack-C1",
+        started_at=time.monotonic(),
+        auth_context=auth,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    token = set_current_turn(ctx)
+    try:
+        refused = await _request_shell_category()
+
+        assert refused == (
+            "request_operator_approval refused: no live information-flow state"
+        )
+        assert approval.pending_request("slack-C1") is None
+        assert approval.recorded_grant(
+            "slack-C1", "shell_exec", "category target has no authority",
+        ) is None
+        assert channels.alerts == []
+
+        # Positive control: the same genuine registry path reaches the request
+        # channel once the server-owned turn state has a live source carrier.
+        auth.ifc_state.merge(InformationFlowLabels(sources=(
+            _source("user", "slack-C1"),
+        )))
+        authorized = await _request_shell_category()
+    finally:
+        reset_current_turn(token)
+
+    assert "pending for the sink category" in authorized
+    assert approval.pending_request("slack-C1") is not None
+    assert len(channels.alerts) == 1
+
+
+def test_category_request_rejects_invalid_binding_without_authority():
+    auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="user",
+        roles=("user",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    live = InformationFlowLabels(sources=(_source("user", "slack-C1"),))
+    auth.ifc_state.merge(live)
+
+    request, status = approval.create_request(
+        channel_id="slack-C1",
+        tool_name="shell_exec",
+        target="category target has no authority",
+        requesting_principal="user",
+        turn_id="turn-invalid-binding",
+        sink_category="shell_process",
+        # Deliberately omit the request carrier that binds category authority.
+        ifc_state=auth.ifc_state,
+        request_source_arrival_ordinal=auth.ifc_state.source_arrival_ordinal(),
+    )
+
+    assert request is None
+    assert status == "invalid_category_binding"
+    assert approval.pending_request("slack-C1") is None
+    assert approval.recorded_grant(
+        "slack-C1", "shell_exec", "category target has no authority",
+    ) is None
+    assert not auth.ifc_state.consume_sink_approval(
+        current=live,
+        sink_category="shell_process",
+        destination="any command",
+        canonical_principal="user",
+        turn_id="turn-invalid-binding",
+    )
+
+    # Positive control: supplying every server-owned binding creates only the
+    # expected pending request; it still does not grant sink authority itself.
+    carrier, ordinal = auth.ifc_state.source_snapshot()
+    valid, valid_status = approval.create_request(
+        channel_id="slack-C1",
+        tool_name="shell_exec",
+        target="category target has no authority",
+        requesting_principal="user",
+        turn_id="turn-invalid-binding",
+        sink_category="shell_process",
+        request_carrier=carrier,
+        ifc_state=auth.ifc_state,
+        request_source_arrival_ordinal=ordinal,
+    )
+    assert valid is not None
+    assert valid_status == "pending"
+    assert approval.pending_request("slack-C1") is valid
+    assert approval.recorded_grant(
+        "slack-C1", "shell_exec", "category target has no authority",
+    ) is None
+    assert not auth.ifc_state.consume_sink_approval(
+        current=live,
+        sink_category="shell_process",
+        destination="any command",
+        canonical_principal="user",
+        turn_id="turn-invalid-binding",
+    )
+
+
 class _CategoryChannels:
     def __init__(self, *, reachable: bool = True, sent: bool = True):
         self.reachable = reachable
