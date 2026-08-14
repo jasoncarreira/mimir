@@ -568,7 +568,9 @@ _BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
         "root_parts": ("state", "triggers", "heartbeat"),
         "channel_memory_directory": "scheduler:heartbeat",
         "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
-        "saga_full_corpus_read": False,
+        # Heartbeat is an autonomous agent turn that recalls accumulated memory.
+        # This broadens SAGA reads only; its capabilities and sinks stay profile-bound.
+        "saga_full_corpus_read": True,
     },
     "session-boundary": {
         "canonical": "synthesis",

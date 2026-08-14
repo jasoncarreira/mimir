@@ -735,14 +735,15 @@ POLLER_OVERRIDE_KEYS = frozenset(
 
 POLLER_AUTHORITY_FIELDS = frozenset({
     "authority", "capabilities", "tier", "profile", "principal_id",
-    "scoped_roots", "operator_alert", "operator_alert_destination",
+    "scoped_roots", "saga_full_corpus_read", "operator_alert",
+    "operator_alert_destination",
 })
 
 _AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
 #: Additive, and optional so every manifest written before it existed still
 #: registers. The required-key check above is deliberately "missing" rather than
 #: an exact-set comparison for that reason.
-_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands"})
+_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read"})
 _TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -817,6 +818,10 @@ def _parse_poller_authority(
     ):
         raise ValueError("skill pollers cannot declare unbounded authority")
 
+    saga_full_corpus_read = raw.get("saga_full_corpus_read", False)
+    if not isinstance(saga_full_corpus_read, bool):
+        raise ValueError("authority saga_full_corpus_read must be a boolean")
+
     roots_raw = raw["scoped_roots"]
     if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
         raise ValueError("authority scoped_roots must be a list of names")
@@ -863,6 +868,7 @@ def _parse_poller_authority(
         roots=tuple(roots),
         owned_skill_directory=manifest_path.parent,
         channel_memory_directory=canonical,
+        saga_full_corpus_read=saga_full_corpus_read,
         declared_shell_commands=declared_shell_commands,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )

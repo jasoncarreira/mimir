@@ -8,6 +8,7 @@
       "authority": {
         "profile": "research",
         "tier": "scoped-with-provenance",
+        "saga_full_corpus_read": true,
         "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "operator_alert", "shell_exec", "bash_jobs_list", "bash_job_output"],
         "scoped_roots": ["state"],
         "shell_commands": [

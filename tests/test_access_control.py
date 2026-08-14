@@ -1249,6 +1249,60 @@ def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> No
     )
 
 
+def test_full_corpus_read_grants_are_enumerated_across_static_and_builtin_principals(
+    tmp_path: Path,
+) -> None:
+    static = access_control.get_capability_matrix_report()
+    configured = {
+        report["canonical"]
+        for report in static.values()
+        if report["saga_full_corpus_read"]
+    }
+    for profile in ("heartbeat", "session-boundary"):
+        principal = access_control.builtin_trigger_service_principal(profile, tmp_path)
+        if principal.saga_full_corpus_read:
+            configured.add(principal.canonical)
+
+    assert configured == {"heartbeat", "scheduler", "synthesis"}
+
+
+def test_full_corpus_flag_changes_only_saga_read_authority(tmp_path: Path) -> None:
+    arguments = {
+        "canonical": "poller:reviewed-memory-reader",
+        "trigger": "poller",
+        "profile": "research",
+        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
+        "capabilities": ("memory_store", "write_file", "send_message"),
+        "roots": (tmp_path,),
+        "creation_path": "test",
+    }
+    narrow = build_trigger_service_principal(**arguments)
+    broad = build_trigger_service_principal(
+        **arguments, saga_full_corpus_read=True,
+    )
+
+    assert narrow.saga_full_corpus_read is False
+    assert replace(broad, saga_full_corpus_read=False) == narrow
+    assert broad.capability_tier is narrow.capability_tier
+    assert broad.capabilities == narrow.capabilities
+    assert broad.readable_domains == narrow.readable_domains
+    assert broad.sink_destinations == narrow.sink_destinations
+    assert broad.sink_policies == narrow.sink_policies
+    assert broad.filesystem_read_roots == narrow.filesystem_read_roots
+
+    narrow_auth = _service_auth(narrow, InformationFlowLabels())
+    broad_auth = _service_auth(broad, InformationFlowLabels())
+    assert narrow_auth.roles == broad_auth.roles == ("service",)
+    registry = ToolRegistry()
+    for operation in ("add_schedule", "saga_forget", "shell_exec"):
+        narrow_decision = registry.authorize_tool(operation, narrow_auth, enforce=True)
+        broad_decision = registry.authorize_tool(operation, broad_auth, enforce=True)
+        assert (broad_decision.allowed, broad_decision.reason) == (
+            narrow_decision.allowed, narrow_decision.reason,
+        )
+        assert broad_decision.allowed is False
+
+
 def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> None:
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
