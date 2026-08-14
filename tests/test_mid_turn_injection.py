@@ -1063,6 +1063,107 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "later_source",
+    [
+        pytest.param(
+            _source(
+                "service:web_fetch",
+                "https://example.com/private",
+                domain="web",
+                bridge_instance="web-fetch",
+                source_kind="protected_tool",
+            ),
+            id="fetch",
+        ),
+        pytest.param(
+            _source(
+                "service:web_search",
+                "query:private-results",
+                domain="search",
+                bridge_instance="web-search",
+                source_kind="protected_tool",
+            ),
+            id="search",
+        ),
+        pytest.param(
+            _source(
+                "filesystem",
+                "/tmp/later-secret",
+                domain="filesystem",
+                bridge_instance="local",
+                source_kind="file",
+            ),
+            id="file-read",
+        ),
+    ],
+)
+async def test_later_tool_source_class_invalidates_authenticated_category_capability(
+    later_source, tmp_path, monkeypatch,
+):
+    ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        assert await dispatcher.enqueue(_approval_event("APPROVE"))
+        mti.MidTurnInjectionMiddleware().before_model({}, None)
+        assert _category_admitted(auth, ctx)
+        auth.ifc_state.merge(InformationFlowLabels().with_source(later_source))
+    finally:
+        reset_current_turn(token)
+
+    assert not _category_admitted(auth, ctx)
+
+
+@pytest.mark.asyncio
+async def test_later_ingested_message_invalidates_authenticated_category_capability(
+    tmp_path, monkeypatch,
+):
+    ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        assert await dispatcher.enqueue(_approval_event("APPROVE"))
+        mti.MidTurnInjectionMiddleware().before_model({}, None)
+        assert _category_admitted(auth, ctx)
+        assert await dispatcher.enqueue(
+            _approval_event("new source after approval", author="slack-U2")
+        )
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
+    finally:
+        reset_current_turn(token)
+
+    assert "new source after approval" in folded["messages"][0].content
+    assert not _category_admitted(auth, ctx)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_and_no_change_merges_preserve_authenticated_category_capability(
+    tmp_path, monkeypatch,
+):
+    ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        assert await dispatcher.enqueue(_approval_event("APPROVE"))
+        mti.MidTurnInjectionMiddleware().before_model({}, None)
+        installed = auth.ifc_state.current()
+        assert installed is not None
+        ordinal = auth.ifc_state.source_arrival_ordinal()
+        auth.ifc_state.merge(installed)
+        auth.ifc_state.merge(
+            InformationFlowLabels().with_source(installed.sources[-1])
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert auth.ifc_state.current() == installed
+    assert auth.ifc_state.source_arrival_ordinal() == ordinal
+    assert _category_admitted(auth, ctx)
+    assert _category_admitted(auth, ctx)
+
+
+@pytest.mark.asyncio
 async def test_intervening_source_before_authenticated_reply_spends_category_grant(
     tmp_path, monkeypatch,
 ):
@@ -1209,6 +1310,51 @@ async def test_hostile_reply_shaped_content_cannot_install_category_capability(
 
     assert content in model_fold["messages"][0].content
     assert approval.pending_request("slack-C1") is not None
+    assert not _category_admitted(auth, ctx)
+
+
+@pytest.mark.asyncio
+async def test_absent_category_reply_leaves_no_category_capability(
+    tmp_path, monkeypatch,
+):
+    ctx, auth, _, _, _ = _category_runtime(tmp_path, monkeypatch)
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
+    finally:
+        reset_current_turn(token)
+
+    assert folded is None
+    assert approval.pending_request("slack-C1") is not None
+    assert not _category_admitted(auth, ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "author",
+    [
+        pytest.param("slack-U2", id="non-admin-requester"),
+        pytest.param("slack-U3", id="service-admin"),
+    ],
+)
+async def test_category_dispatcher_refuses_unauthorized_approving_responder(
+    author, tmp_path, monkeypatch,
+):
+    ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        assert await dispatcher.enqueue(_approval_event("APPROVE", author=author))
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
+    finally:
+        reset_current_turn(token)
+
+    assert "APPROVE" in folded["messages"][0].content
+    assert approval.pending_request("slack-C1") is not None
+    assert approval.recorded_grant(
+        "slack-C1", "shell_exec", "category target has no authority",
+    ) is None
     assert not _category_admitted(auth, ctx)
 
 
