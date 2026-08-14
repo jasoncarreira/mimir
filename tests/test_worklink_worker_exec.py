@@ -185,6 +185,84 @@ def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path,
     assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
 
 
+def _identity_can_access(path: Path, uid: int, gid: int, permissions: int) -> bool:
+    observed = path.stat(follow_symlinks=False)
+    shift = 6 if observed.st_uid == uid else 3 if observed.st_gid == gid else 0
+    return ((stat.S_IMODE(observed.st_mode) >> shift) & permissions) == permissions
+
+
+def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "boundary" / "checkout"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    readable = nested / "readable.txt"
+    readable.write_text("runner input", encoding="utf-8")
+    executable = source / "run"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.write_text("outside", encoding="utf-8")
+    link = source / "link"
+    link.symlink_to(external)
+    source.chmod(0o700)
+    nested.chmod(0o700)
+    readable.chmod(0o600)
+    executable.chmod(0o700)
+    external.chmod(0o600)
+
+    runner_uid = os.getuid() + 1
+    runner_gid = os.getgid()
+    source_before = {
+        path.relative_to(source): stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+        for path in (source, *source.rglob("*"))
+    }
+    # This is the measured pre-fix copy: copytree preserves the 0700 boundary mode,
+    # so an identity represented only by its group cannot traverse it.
+    unnormalized = tmp_path / "unnormalized"
+    shutil.copytree(source, unnormalized, symlinks=True)
+    assert not _identity_can_access(unnormalized, runner_uid, runner_gid, 0o5)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
+    monkeypatch.setattr(worker_exec, "WORKLINK_GID", runner_gid)
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        execution_fd = worker_exec._execution_checkout_fd(["uv", "run"], source_fd, home)
+    finally:
+        os.close(source_fd)
+    os.close(execution_fd)
+
+    project = home / "project"
+    copied_readable = project / "nested" / "readable.txt"
+    copied_executable = project / "run"
+    copied_link = project / "link"
+    assert _identity_can_access(project, runner_uid, runner_gid, 0o5)
+    assert _identity_can_access(project / "nested", runner_uid, runner_gid, 0o5)
+    assert _identity_can_access(copied_readable, runner_uid, runner_gid, 0o4)
+    assert copied_readable.read_text(encoding="utf-8") == "runner input"
+    assert stat.S_IMODE(copied_readable.stat().st_mode) == 0o660
+    assert stat.S_IMODE(copied_executable.stat().st_mode) == 0o770
+    assert all(
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) & 0o007 == 0
+        for path in (project, project / "nested", copied_readable, copied_executable)
+    )
+    assert copied_link.is_symlink()
+    assert copied_link.readlink() == external
+    assert external.read_text(encoding="utf-8") == "outside"
+    assert stat.S_IMODE(external.stat().st_mode) == 0o600
+    assert {
+        path.relative_to(source): stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+        for path in (source, *source.rglob("*"))
+    } == source_before
+    assert stat.S_IMODE(source.stat().st_mode) == 0o700
+    assert not _identity_can_access(source, runner_uid, runner_gid, 0o5)
+
+    worker_exec._cleanup_home(home)
+    assert not home.exists()
+
+
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
     identifier = str(uuid.uuid4())
     payload = json.dumps({"version": 1, "op": "launch", "id": identifier, "uid": 0}).encode()

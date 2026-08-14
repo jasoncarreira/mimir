@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any
 
+from .checkout import _normalize_checkout_fd
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -220,20 +221,18 @@ def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> 
         return os.dup(checkout_fd)
     project = home / "project"
     shutil.copytree(f"/proc/self/fd/{checkout_fd}", project, symlinks=True)
-    if os.geteuid() == 0:
-        for root, directories, files in os.walk(project):
-            os.chown(root, MIMIR_UID, WORKLINK_GID, follow_symlinks=False)
-            for name in (*directories, *files):
-                os.chown(
-                    Path(root) / name,
-                    MIMIR_UID,
-                    WORKLINK_GID,
-                    follow_symlinks=False,
-                )
-    return os.open(
+    project_fd = os.open(
         project,
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
     )
+    try:
+        _normalize_checkout_fd(
+            project_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+        )
+    except Exception:
+        os.close(project_fd)
+        raise
+    return project_fd
 
 
 def _validate_environment(value: object) -> dict[str, str]:
