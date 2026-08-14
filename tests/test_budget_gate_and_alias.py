@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -1221,6 +1222,7 @@ def test_new_source_invalidates_category_capability_before_handler() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("producer_path", ["sync", "async"])
+@pytest.mark.parametrize("producer_outcome", ["success", "tool-exception", "generic-exception"])
 @pytest.mark.parametrize(
     ("tool_name", "args", "domain"),
     [
@@ -1237,6 +1239,7 @@ def test_new_source_invalidates_category_capability_before_handler() -> None:
 )
 async def test_real_producer_invalidates_category_before_refused_sink(
     producer_path: str,
+    producer_outcome: str,
     tool_name: str,
     args: dict[str, Any],
     domain: str,
@@ -1250,7 +1253,7 @@ async def test_real_producer_invalidates_category_before_refused_sink(
     producer_calls = 0
     sink_calls = 0
 
-    def publish() -> None:
+    def produce(request: ToolCallRequest) -> ToolMessage:
         nonlocal producer_calls
         producer_calls += 1
         publish_protected_result((protected_result_source(
@@ -1260,14 +1263,17 @@ async def test_real_producer_invalidates_category_before_refused_sink(
             resource_id=f"{domain}:later",
             bridge_instance="test-producer",
         ),))
+        if producer_outcome == "tool-exception":
+            raise ToolException("producer tool failure")
+        if producer_outcome == "generic-exception":
+            raise RuntimeError("producer runtime failure")
+        return ToolMessage(content="later source", tool_call_id=request.tool_call["id"])
 
     def sync_producer(request: ToolCallRequest) -> ToolMessage:
-        publish()
-        return ToolMessage(content="later source", tool_call_id=request.tool_call["id"])
+        return produce(request)
 
     async def async_producer(request: ToolCallRequest) -> ToolMessage:
-        publish()
-        return ToolMessage(content="later source", tool_call_id=request.tool_call["id"])
+        return produce(request)
 
     def sync_sink(request: ToolCallRequest) -> ToolMessage:
         nonlocal sink_calls
@@ -1296,20 +1302,35 @@ async def test_real_producer_invalidates_category_before_refused_sink(
                 lambda _request: pytest.fail("approval handler must not run"),
             )
             assert approval.status == "success"
+        produced = None
         if producer_path == "sync":
-            produced = middleware.wrap_tool_call(
-                _make_request(tool_name, f"{tool_name}-producer", auth, args),
-                sync_producer,
-            )
+            if producer_outcome == "generic-exception":
+                with pytest.raises(RuntimeError, match="producer runtime failure"):
+                    middleware.wrap_tool_call(
+                        _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                        sync_producer,
+                    )
+            else:
+                produced = middleware.wrap_tool_call(
+                    _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                    sync_producer,
+                )
             refused = middleware.wrap_tool_call(
                 _make_request("shell_exec", "sink-after-producer", auth, {"command": "pwd"}),
                 sync_sink,
             )
         else:
-            produced = await middleware.awrap_tool_call(
-                _make_request(tool_name, f"{tool_name}-producer", auth, args),
-                async_producer,
-            )
+            if producer_outcome == "generic-exception":
+                with pytest.raises(RuntimeError, match="producer runtime failure"):
+                    await middleware.awrap_tool_call(
+                        _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                        async_producer,
+                    )
+            else:
+                produced = await middleware.awrap_tool_call(
+                    _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                    async_producer,
+                )
             refused = await middleware.awrap_tool_call(
                 _make_request("shell_exec", "sink-after-producer", auth, {"command": "pwd"}),
                 async_sink,
@@ -1317,9 +1338,14 @@ async def test_real_producer_invalidates_category_before_refused_sink(
     finally:
         reset_current_turn(token)
 
-    assert produced.status != "error"
+    if producer_outcome == "success":
+        assert produced is not None and produced.status != "error"
+        assert any(source.resource_id == f"{domain}:later" for source in turn.ifc_labels.sources)
+    elif producer_outcome == "tool-exception":
+        assert produced is not None and produced.status == "error"
+    else:
+        assert produced is None
     assert producer_calls == 1
-    assert any(source.resource_id == f"{domain}:later" for source in turn.ifc_labels.sources)
     assert refused.status == "error"
     assert "ifc_label_blocked:shell_process" in str(refused.content)
     assert sink_calls == 0
