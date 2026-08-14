@@ -7098,6 +7098,47 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     })
 
 
+def test_server_discovered_changes_requested_review_mints_remediation_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
+    pr = NormalizedPullRequestSnapshot(
+        state="open", number=42, author="mimir-bot",
+        head_repo="o/r", head_remote="origin", head_ref="worklink/42",
+        head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+    )
+
+    scope = access_control.create_server_discovered_review_scope(
+        "o/r", pr, review_state="CHANGES_REQUESTED",
+    )
+    resolution = access_control.resolve_server_discovered_review_scope(
+        "o/r", pr, review_state="CHANGES_REQUESTED",
+    )
+
+    assert scope is not None
+    assert resolution.scope == scope
+    assert scope.provenance == "server_discovered"
+    assert access_control.RepoPRAction.COMMIT.value in scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value in scope.allowed_operations
+    ordinary = access_control.resolve_server_discovered_review_scope(
+        "o/r", pr, review_state="APPROVED",
+    ).scope
+    assert ordinary is not None
+    assert access_control.RepoPRAction.COMMIT.value not in ordinary.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value not in ordinary.allowed_operations
+    for change in (
+        {"author": "someone-else"},
+        {"head_repo": "fork/r"},
+        {"head_remote": "source"},
+    ):
+        guarded = access_control.resolve_server_discovered_review_scope(
+            "o/r", replace(pr, **change), review_state="CHANGES_REQUESTED",
+        ).scope
+        if guarded is not None:
+            assert access_control.RepoPRAction.COMMIT.value not in guarded.allowed_operations
+            assert access_control.RepoPRAction.PUSH.value not in guarded.allowed_operations
+
+
 def test_heartbeat_scope_rejects_raw_provider_payload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

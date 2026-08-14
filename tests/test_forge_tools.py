@@ -108,6 +108,10 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
 class FakeForge:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.snapshot_author = "untrusted-author"
+        self.reviews = (
+            ReviewProjection("1", "reviewer", "approve", "LGTM", "now", "a" * 40),
+        )
 
     def get_pull_request(self, scope):
         self.calls.append(("metadata", scope))
@@ -119,8 +123,11 @@ class FakeForge:
     def get_pull_request_snapshot(self, repository, number):
         self.calls.append(("snapshot", repository, number))
         return NormalizedPullRequestSnapshot(
-            state="open", number=number, author="untrusted-author",
-            head_repo="contributor/repo", head_remote="source",
+            state="open", number=number, author=self.snapshot_author,
+            head_repo=(
+                repository if self.snapshot_author == "reviewer" else "contributor/repo"
+            ),
+            head_remote="origin" if self.snapshot_author == "reviewer" else "source",
             head_ref="server-head", head_sha="c" * 40,
             base_ref="server-base", base_sha="d" * 40,
         )
@@ -139,7 +146,7 @@ class FakeForge:
 
     def list_reviews(self, scope):
         self.calls.append(("reviews", scope))
-        return (ReviewProjection("1", "reviewer", "approve", "LGTM", "now", "a" * 40),)
+        return self.reviews
 
     def list_comments(self, scope):
         self.calls.append(("comments", scope))
@@ -414,6 +421,52 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     assert scope.observed_base_sha == "d" * 40
     assert scope.checkout_ref == "refs/pull/1291/head"
     assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+def test_server_discovered_changes_requested_review_reaches_repo_write_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_author = "reviewer"
+    client.reviews = (
+        ReviewProjection(
+            "1", "jasoncarreira", "CHANGES_REQUESTED", "fix", "now", "c" * 40,
+        ),
+    )
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            ("/server/configured/repo", "git@github.com:owner/repo.git"),
+            ("/server/configured/repo",), 1,
+        ),
+    )
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+        enforcement_enabled=True, ifc_labels=InformationFlowLabels(),
+    )
+
+    from mimir.tools.forge import resolve_review_state_for_context
+
+    state = resolve_review_state_for_context(context, "owner/repo", 1291)
+
+    assert state.action_scope.provenance == "server_discovered"
+    assert state.action_scope.event_type == "pr_review"
+    for tool_name, action in (
+        ("repo_commit", RepoPRAction.COMMIT),
+        ("repo_push", RepoPRAction.PUSH),
+    ):
+        assert action.value in state.action_scope.allowed_operations
+        decision = access_control.ToolRegistry().authorize_tool(
+            tool_name, context, enforce=True,
+            arguments={"repository": "owner/repo", "pull_request": 1291},
+        )
+        assert decision.allowed is True
+        assert decision.reason is None
+    assert [call[0] for call in client.calls] == ["snapshot", "reviews"]
 
 
 def test_standing_review_refuses_unconfigured_repo_before_live_fetch(
