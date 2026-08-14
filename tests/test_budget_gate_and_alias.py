@@ -820,7 +820,18 @@ async def test_shell_category_capability_does_not_admit_external_mcp() -> None:
     token = set_current_turn(turn)
     try:
         denied = await BudgetGateMiddleware().awrap_tool_call(
-            request("tainted"), handler,
+            request("category"), handler,
+        )
+        assert context.ifc_state.approve_sink_once(
+            fallback=turn.ifc_labels,
+            sink_category="external_mcp",
+            destination="public-destination",
+            canonical_principal=context.canonical_principal or "",
+            lifetime_seconds=30,
+            durable_audit=lambda *_: True,
+        )
+        exact = await BudgetGateMiddleware().awrap_tool_call(
+            request("exact"), handler,
         )
     finally:
         reset_current_turn(token)
@@ -828,7 +839,8 @@ async def test_shell_category_capability_does_not_admit_external_mcp() -> None:
 
     assert denied.status == "error"
     assert "ifc_label_blocked:external_mcp" in str(denied.content)
-    assert handler_calls == 0
+    assert exact.status != "error"
+    assert handler_calls == 1
 
 
 def _ifc_labels(
@@ -925,12 +937,127 @@ def _install_sink_category_capability(
     return post_carrier
 
 
-def test_sink_category_capability_runs_repeated_sync_handlers(tmp_path: Path) -> None:
-    auth = _ifc_auth()
-    turn = _ifc_turn(auth)
-    turn.ifc_labels = _install_sink_category_capability(
-        auth, turn_id=turn.turn_id, sink_category="file",
+async def _authenticated_shell_category_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TurnContext, AuthContext, dict[str, Any]]:
+    from dataclasses import replace
+
+    from mimir import mid_turn_injection as mti
+    from mimir import operator_approval
+    from mimir.agent import _initialize_ifc_labels
+    from mimir.bridges.base import SendResult
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+    from mimir.models import AgentEvent, TurnInteractivity
+    from mimir.tools import registry as tool_registry
+
+    operator_approval._PENDING.clear()
+    operator_approval._GRANTS.clear()
+    mti._REGISTRY.clear()
+    resolver = _resolver(tmp_path, """people:
+  - canonical: operator
+    aliases: [slack-U1]
+    access: {roles: [admin]}
+  - canonical: requester
+    aliases: [slack-U2]
+    access: {roles: [admin]}
+""")
+
+    class Channels:
+        def find(self, channel_id: str) -> object | None:
+            return object() if channel_id == "slack-C1" else None
+
+        async def send(self, channel_id: str, text: str, *, final: bool = True) -> SendResult:
+            return SendResult(sent=True, message_id="approval-request")
+
+    async def no_log(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    cfg = replace(
+        Config.from_env(),
+        home=tmp_path,
+        operator_alert_channel="slack-C1",
+        midturn_injection_channels=("slack-",),
     )
+    dispatcher = Dispatcher(cfg, resolver=resolver)
+    dispatcher._in_flight.add("slack-C1")
+    monkeypatch.setattr("mimir.dispatcher.log_event", no_log)
+    monkeypatch.setattr(
+        mti,
+        "get_config",
+        lambda: {"configurable": {"channel_id": "slack-C1"}},
+    )
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", dispatcher)
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", Channels())
+    request_event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        content="request",
+        author="slack-U2",
+        source="slack",
+    )
+    initial = _initialize_ifc_labels(request_event, resolver=resolver)
+    auth = AuthContext(
+        principal="slack-U2",
+        canonical_principal="requester",
+        roles=("admin",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        ifc_labels=initial,
+    )
+    auth.ifc_state.merge(initial)
+    turn = TurnContext(
+        turn_id="authenticated-category-turn",
+        session_id="slack-C1",
+        trigger="user_message",
+        channel_id="slack-C1",
+        started_at=time.monotonic(),
+        auth_context=auth,
+        ifc_labels=initial,
+        identity_resolver=resolver,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    mti.register_inflight("slack-C1")
+    token = set_current_turn(turn)
+    try:
+        request_result = await tool_registry.request_operator_approval.ainvoke({
+            "tool_name": "write_file",
+            "target": "two reviewed files",
+            "reason": "write reviewed files",
+            "sink_category": "file",
+        })
+        approval_event = AgentEvent(
+            trigger="user_message",
+            channel_id="slack-C1",
+            content="APPROVE",
+            author="slack-U1",
+            source="slack",
+        )
+        accepted = await dispatcher.enqueue(approval_event)
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
+    finally:
+        reset_current_turn(token)
+    assert "pending for the sink category" in request_result
+    assert accepted is True
+    assert folded is not None
+    assert "APPROVE" in folded["messages"][0].content
+    current = auth.ifc_state.current()
+    assert current is not None
+    assert current.sources[-1].principal == "operator"
+    assert auth.canonical_principal == "requester"
+    return turn, auth, folded
+
+
+@pytest.mark.asyncio
+async def test_authenticated_category_grant_runs_repeated_sync_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turn, auth, _ = await _authenticated_shell_category_runtime(tmp_path, monkeypatch)
     calls: list[str] = []
 
     def handler(request: ToolCallRequest) -> ToolMessage:
@@ -956,12 +1083,11 @@ def test_sink_category_capability_runs_repeated_sync_handlers(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_sink_category_capability_runs_repeated_async_handlers(tmp_path: Path) -> None:
-    auth = _ifc_auth()
-    turn = _ifc_turn(auth)
-    turn.ifc_labels = _install_sink_category_capability(
-        auth, turn_id=turn.turn_id, sink_category="file",
-    )
+async def test_authenticated_category_grant_runs_repeated_async_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turn, auth, _ = await _authenticated_shell_category_runtime(tmp_path, monkeypatch)
     calls: list[str] = []
 
     async def handler(request: ToolCallRequest) -> ToolMessage:
@@ -986,13 +1112,28 @@ async def test_sink_category_capability_runs_repeated_async_handlers(tmp_path: P
     assert calls == ["async-file-1", "async-file-2"]
 
 
-@pytest.mark.parametrize("tool_name", ["fetch_url", "http_request"])
+@pytest.mark.parametrize("tool_name", ["fetch_url", "webhook"])
 def test_shell_category_capability_does_not_admit_application_egress(
     tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = _ifc_auth()
     turn = _ifc_turn(auth)
     turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    if tool_name == "webhook":
+        from mimir.access_control import OperationDecision, get_operation_catalog
+
+        catalog = get_operation_catalog()
+        original_get_decision = catalog.get_decision
+        monkeypatch.setattr(
+            catalog,
+            "get_decision",
+            lambda name, context=None: (
+                OperationDecision.OPEN
+                if name == "webhook"
+                else original_get_decision(name, context)
+            ),
+        )
     handler_calls = 0
 
     def handler(request: ToolCallRequest) -> ToolMessage:
@@ -1001,14 +1142,39 @@ def test_shell_category_capability_does_not_admit_application_egress(
         return ToolMessage(content="sent", tool_call_id=request.tool_call["id"])
 
     argument = "url"
+    destination = "https://outside.example/data"
     token = set_current_turn(turn)
     try:
         result = BudgetGateMiddleware().wrap_tool_call(
             _make_request(
                 tool_name,
-                f"{tool_name}-1",
+                f"{tool_name}-category",
                 auth,
-                {argument: "https://outside.example/data"},
+                {argument: destination},
+            ),
+            handler,
+        )
+        exact_category = "network" if tool_name == "fetch_url" else "http_webhook"
+        approval = BudgetGateMiddleware().wrap_tool_call(
+            _make_request(
+                "approve_declassification",
+                f"{tool_name}-approval",
+                auth,
+                {
+                    "sink_category": exact_category,
+                    "destination": destination,
+                    "reason": "paired exact-destination control",
+                },
+            ),
+            lambda _request: pytest.fail("approval handler must not run"),
+        )
+        assert approval.status == "success"
+        exact = BudgetGateMiddleware().wrap_tool_call(
+            _make_request(
+                tool_name,
+                f"{tool_name}-exact",
+                auth,
+                {argument: destination},
             ),
             handler,
         )
@@ -1016,7 +1182,8 @@ def test_shell_category_capability_does_not_admit_application_egress(
         reset_current_turn(token)
 
     assert result.status == "error"
-    assert handler_calls == 0
+    assert exact.status != "error"
+    assert handler_calls == 1
 
 
 def test_new_source_invalidates_category_capability_before_handler() -> None:
@@ -1050,6 +1217,153 @@ def test_new_source_invalidates_category_capability_before_handler() -> None:
 
     assert result.status == "error"
     assert handler_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer_path", ["sync", "async"])
+@pytest.mark.parametrize(
+    ("tool_name", "args", "domain"),
+    [
+        pytest.param("memory_query", {"query": "later"}, "saga", id="protected"),
+        pytest.param("read_file", {"path": "/private/later.txt"}, "filesystem", id="file"),
+        pytest.param("file_search", {"query": "later"}, "filesystem", id="search"),
+        pytest.param(
+            "fetch_url",
+            {"url": "https://outside.example/later"},
+            "web",
+            id="fetch",
+        ),
+    ],
+)
+async def test_real_producer_invalidates_category_before_refused_sink(
+    producer_path: str,
+    tool_name: str,
+    args: dict[str, Any],
+    domain: str,
+) -> None:
+    from mimir.access_control import protected_result_source, publish_protected_result
+
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    middleware = BudgetGateMiddleware()
+    producer_calls = 0
+    sink_calls = 0
+
+    def publish() -> None:
+        nonlocal producer_calls
+        producer_calls += 1
+        publish_protected_result((protected_result_source(
+            auth,
+            principal=f"producer:{domain}",
+            domain=domain,
+            resource_id=f"{domain}:later",
+            bridge_instance="test-producer",
+        ),))
+
+    def sync_producer(request: ToolCallRequest) -> ToolMessage:
+        publish()
+        return ToolMessage(content="later source", tool_call_id=request.tool_call["id"])
+
+    async def async_producer(request: ToolCallRequest) -> ToolMessage:
+        publish()
+        return ToolMessage(content="later source", tool_call_id=request.tool_call["id"])
+
+    def sync_sink(request: ToolCallRequest) -> ToolMessage:
+        nonlocal sink_calls
+        sink_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    async def async_sink(request: ToolCallRequest) -> ToolMessage:
+        nonlocal sink_calls
+        sink_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        if tool_name == "fetch_url":
+            approval = middleware.wrap_tool_call(
+                _make_request(
+                    "approve_declassification",
+                    "fetch-approval",
+                    auth,
+                    {
+                        "sink_category": "network",
+                        "destination": args["url"],
+                        "reason": "exercise the protected fetch producer",
+                    },
+                ),
+                lambda _request: pytest.fail("approval handler must not run"),
+            )
+            assert approval.status == "success"
+        if producer_path == "sync":
+            produced = middleware.wrap_tool_call(
+                _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                sync_producer,
+            )
+            refused = middleware.wrap_tool_call(
+                _make_request("shell_exec", "sink-after-producer", auth, {"command": "pwd"}),
+                sync_sink,
+            )
+        else:
+            produced = await middleware.awrap_tool_call(
+                _make_request(tool_name, f"{tool_name}-producer", auth, args),
+                async_producer,
+            )
+            refused = await middleware.awrap_tool_call(
+                _make_request("shell_exec", "sink-after-producer", auth, {"command": "pwd"}),
+                async_sink,
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert produced.status != "error"
+    assert producer_calls == 1
+    assert any(source.resource_id == f"{domain}:later" for source in turn.ifc_labels.sources)
+    assert refused.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(refused.content)
+    assert sink_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["duplicate", "no-change"])
+async def test_real_producer_unchanged_result_preserves_category_capability(
+    control: str,
+) -> None:
+    from mimir.access_control import publish_protected_result
+
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    middleware = BudgetGateMiddleware()
+    source = turn.ifc_labels.sources[-1]
+    sink_calls = 0
+
+    async def producer(request: ToolCallRequest) -> ToolMessage:
+        publish_protected_result((source,) if control == "duplicate" else ())
+        return ToolMessage(content="unchanged", tool_call_id=request.tool_call["id"])
+
+    async def sink(request: ToolCallRequest) -> ToolMessage:
+        nonlocal sink_calls
+        sink_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        produced = await middleware.awrap_tool_call(
+            _make_request("memory_query", "unchanged-producer", auth, {"query": "same"}),
+            producer,
+        )
+        admitted = await middleware.awrap_tool_call(
+            _make_request("shell_exec", "sink-after-unchanged", auth, {"command": "pwd"}),
+            sink,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert produced.status != "error"
+    assert admitted.status != "error"
+    assert sink_calls == 1
 
 
 @pytest.mark.parametrize("isolation", ["turn", "principal", "session"])
