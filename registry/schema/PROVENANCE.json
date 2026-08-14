@@ -1,0 +1,11 @@
+{
+  "source_url": "https://cdn.agentclientprotocol.com/registry/v1/latest/agent.schema.json",
+  "retrieved_utc": "2026-08-14",
+  "sha256": "2489443bf21d8211bcd046edeff5931eecca1ee219ffae4efde09e367c5b1236",
+  "registry_format_version": "1.0.0",
+  "registry_format_version_source": "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+  "upstream_repository": "https://github.com/agentclientprotocol/agent-client-protocol",
+  "immutable_revision": null,
+  "immutable_revision_note": "Upstream publishes the registry schema only from the moving 'latest' CDN path. Versioned CDN paths (for example .../registry/v1/v1.20.0/agent.schema.json and .../registry/v1/schema-v1.20.0/agent.schema.json) return 404, and agent.schema.json is not committed to the agent-client-protocol repository at any tag -- the repository's schema-v* tags version the wire protocol schema, not the registry entry schema. There is therefore no upstream commit or revision that identifies these bytes. The recorded sha256 plus the retrieval date is the complete provenance available, and re-fetching source_url and comparing the digest is how upstream drift is detected.",
+  "verified_by": "tests/test_acp_registry.py::test_schema_provenance_is_recorded_and_matches_the_vendored_bytes"
+}
