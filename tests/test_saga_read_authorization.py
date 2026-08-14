@@ -19,10 +19,12 @@ from mimir.models import AgentEvent, AuthContext
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import (
     AuthorizationScope,
+    Ownership,
     SagaReadAuthorization,
     Visibility,
     authorization_predicate,
     get_authorization_scope,
+    intersect_acl,
 )
 from mimir.saga.recall import recall
 from mimir.saga.store import store
@@ -562,13 +564,18 @@ def test_trusted_platform_auth_context_can_read_legacy_admin_memory(
         (
             AgentEvent(
                 trigger="scheduled_tick",
-                channel_id="scheduler:heartbeat",
-                service_principal="heartbeat",
-                service_authority=builtin_trigger_service_principal(
-                    "heartbeat", Path("."),
+                channel_id="scheduler:new-job",
+                service_principal="scheduler:new-job",
+                service_authority=build_trigger_service_principal(
+                    canonical="scheduler:new-job",
+                    trigger="scheduled_tick",
+                    profile="custom",
+                    tier=CapabilityTier.SCOPE_CONTAINED,
+                    capabilities=(),
+                    creation_path="test",
                 ),
             ),
-            "heartbeat",
+            "scheduler:new-job",
         ),
         (
             AgentEvent(
@@ -651,6 +658,102 @@ def test_full_corpus_scope_follows_declared_principal_not_poller_trigger() -> No
 
     assert scope.is_service is True
     assert scope.is_platform_service is True
+
+
+def test_affected_autonomous_principals_read_reported_fixture_corpus(
+    conn: sqlite3.Connection,
+) -> None:
+    composition = (
+        (1654, "legacy_admin", "legacy_admin"),
+        (311, "service:synthesis", "service"),
+        (85, "service:poller:github-activity", "service"),
+        (24, "service:poller", "service"),
+        (8, "jason", "private"),
+        (1, "service:heartbeat", "service"),
+    )
+    rows = []
+    index = 0
+    for count, owner, visibility in composition:
+        for _ in range(count):
+            atom_id = f"corpus-{index}"
+            rows.append((
+                atom_id, atom_id, f"hash-{index}", "2026-08-14",
+                owner, visibility,
+            ))
+            index += 1
+    conn.executemany(
+        "INSERT INTO atoms "
+        "(id, content, content_hash, created_at, owner_principal, visibility) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    affected = (
+        "heartbeat",
+        "poller:dependency-advisory-watch",
+        "poller:github-activity",
+        "poller:github-ci-watch",
+        "poller:gmail-inbox",
+        "poller:social-cli-feed",
+        "poller:social-cli-notifications",
+        "poller:worklink-ready-queue",
+        "poller:worklink-tool-pins",
+    )
+
+    for canonical in affected:
+        authority = build_trigger_service_principal(
+            canonical=canonical,
+            trigger="scheduled_tick" if canonical == "heartbeat" else "poller",
+            profile="heartbeat" if canonical == "heartbeat" else "custom",
+            tier=CapabilityTier.SCOPE_CONTAINED,
+            capabilities=(),
+            saga_full_corpus_read=True,
+            creation_path="test-fixture-measurement",
+        )
+        event = AgentEvent(
+            trigger=authority.trigger,
+            channel_id=canonical,
+            service_principal=canonical,
+            service_authority=authority,
+        )
+        scope = get_authorization_scope(create_auth_context(event, enforce=True))
+        where, params = authorization_predicate(scope, table="a")
+        readable = conn.execute(
+            f"SELECT COUNT(*) FROM atoms a WHERE {where}", params,
+        ).fetchone()[0]
+
+        assert readable == 2083, canonical
+
+
+def test_full_corpus_heartbeat_still_fails_closed_for_cross_tenant_output(
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    authority = builtin_trigger_service_principal("heartbeat", tmp_path)
+    event = AgentEvent(
+        trigger=authority.trigger,
+        channel_id="scheduler:heartbeat",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    scope = get_authorization_scope(create_auth_context(event, enforce=True))
+    where, params = authorization_predicate(scope, table="a")
+    assert (where, params) == ("1=1", [])
+
+    tenant_a = Ownership(
+        owner_principal="alice",
+        origin_domain="tenant:a",
+        visibility="private",
+        provenance={"atom": "a"},
+    )
+    tenant_b = Ownership(
+        owner_principal="bob",
+        origin_domain="tenant:b",
+        visibility="private",
+        provenance={"atom": "b"},
+    )
+
+    assert intersect_acl([tenant_a]) == tenant_a
+    assert intersect_acl([tenant_a, tenant_b]) == Ownership()
 
 
 def test_forged_platform_trigger_does_not_widen_read_scope(
