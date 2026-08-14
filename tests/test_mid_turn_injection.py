@@ -62,6 +62,9 @@ def _resolver(tmp_path) -> IdentityResolver:
   - canonical: user
     aliases: [slack-U2]
     access: {roles: [user]}
+  - canonical: service-admin
+    aliases: [slack-U3]
+    access: {roles: [admin], is_service: true}
 """,
         encoding="utf-8",
     )
@@ -532,6 +535,29 @@ async def test_dispatcher_records_exact_grant_only_from_authenticated_admin_inje
     assert grant.operator_principal == "operator"
     assert approval.recorded_grant("slack-C1", "post_message", "slack-C3") is None
     assert [event.content for event in mti._drain("slack-C1")] == ["APPROVE"]
+
+
+@pytest.mark.parametrize(
+    "author",
+    ["slack-U2", "slack-U3"],
+    ids=["non-admin", "service-identity"],
+)
+def test_resolved_nonoperator_responder_is_refused(tmp_path, author):
+    resolver = _resolver(tmp_path)
+    approval.create_request(
+        channel_id="slack-C1",
+        tool_name="post_message",
+        target="slack-C2",
+        requesting_principal="user",
+    )
+
+    result = approval.record_authenticated_response(
+        _approval_event("APPROVE", author=author), resolver,
+    )
+
+    assert result == "unauthenticated_operator"
+    assert approval.pending_request("slack-C1") is not None
+    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
 
 
 @pytest.mark.parametrize(
