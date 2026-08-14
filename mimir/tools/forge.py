@@ -172,6 +172,7 @@ def resolve_review_state_for_context(
             "must be a positive integer; for example, repository='owner/repo', pull_request=17"
         )
     from ..access_control import (
+        create_server_discovered_review_scope,
         is_configured_github_repo,
         resolve_server_discovered_review_scope,
     )
@@ -188,7 +189,26 @@ def resolve_review_state_for_context(
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
-    resolution = resolve_server_discovered_review_scope(repository, snapshot)
+    review_state = None
+    if snapshot.state == "open" and snapshot.author == os.environ.get(
+        "MIMIR_GITHUB_SELF_LOGIN", ""
+    ).strip():
+        discovery_scope = create_server_discovered_review_scope(repository, snapshot)
+        if discovery_scope is not None:
+            try:
+                reviews = client.list_reviews(discovery_scope)
+            except ForgeError as exc:
+                raise ToolException(f"pull-request operation rejected: {exc}") from exc
+            latest: dict[str, str] = {}
+            for review in reviews:
+                state = review.state.upper()
+                if state in {"APPROVED", "CHANGES_REQUESTED"}:
+                    latest[review.author] = state
+            if "CHANGES_REQUESTED" in latest.values():
+                review_state = "CHANGES_REQUESTED"
+    resolution = resolve_server_discovered_review_scope(
+        repository, snapshot, review_state=review_state,
+    )
     scope = resolution.scope
     if scope is None or scope.pr_number != pull_request:
         raise ToolPolicyRefusal(resolution.refusal_reason or (
