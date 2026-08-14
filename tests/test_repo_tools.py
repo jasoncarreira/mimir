@@ -4,6 +4,7 @@ import asyncio
 import base64
 from dataclasses import asdict, replace
 import json
+import functools
 import os
 from pathlib import Path
 import shutil
@@ -1704,53 +1705,65 @@ async def test_uv_config_search_is_bounded_at_unsearchable_snapshot_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink.worker_exec import _execution_checkout_fd
-
+    # Pins the production property that RepoProjectTests sets UV_NO_CONFIG=1 for
+    # uv commands, so uv cannot search above an fd-entered checkout for ambient
+    # config. Deliberately independent of three things this previously depended
+    # on by accident: the real uv's release behaviour, ``/proc`` (absent on
+    # macOS), and running as non-root -- root bypasses the directory mode, which
+    # silently voided the premise when the suite ran as root in a container.
     state = repo_tools[-2]
-    uv = shutil.which("uv")
-    assert uv is not None
     home = tmp_path / "home"
-    _configure_worklink_test(
-        home, f"{uv} run --offline --no-cache --no-project --no-sync /usr/bin/true",
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_uv = bin_dir / "uv"  # must be named `uv`: production keys on command[0].
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        'if [ "$UV_NO_CONFIG" = "1" ]; then exit 0; fi\n'
+        'echo "ambient uv config discovery was not disabled" >&2\n'
+        "exit 2\n",
+        encoding="utf-8",
     )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run --offline /usr/bin/true")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     boundary = tmp_path / "snapshot-boundary"
     checkout_path = boundary / "checkout"
     checkout_path.mkdir(parents=True)
-    worker_home = tmp_path / "worker-home"
-    worker_home.mkdir()
     checkout_fd = os.open(checkout_path, os.O_RDONLY | os.O_DIRECTORY)
     boundary.chmod(0)
 
-    def invoke(env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.run(
-            [
-                uv, "run", "--offline", "--no-cache", "--no-project", "--no-sync",
-                "/usr/bin/true",
-            ],
-            env=env,
-            preexec_fn=lambda: os.fchdir(checkout_fd),
-            capture_output=True,
-            check=False,
-        )
+    # Negative control: without the production environment, the command fails.
+    observed = subprocess.run(
+        [str(fake_uv), "run", "--offline", "/usr/bin/true"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+    )
+    assert observed.returncode == 2
+    assert b"ambient uv config discovery was not disabled" in observed.stderr
 
-    observed = invoke({"PATH": os.environ["PATH"]})
-    assert observed.returncode != 0
+    # The boundary is unsearchable by pathname, which is why production enters
+    # the checkout by fd. Root ignores the mode, so only assert where the OS
+    # enforces it; the fd path below is what production relies on either way.
+    if os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            os.listdir(checkout_path)
+
+    observed_env: dict[str, str] = {}
 
     async def runner(argv, _directory, env, _projections, **_kwargs):
-        execution_fd = _execution_checkout_fd(list(argv), checkout_fd, worker_home)
-        try:
-            completed = await asyncio.to_thread(
+        observed_env.update(env)
+        completed = await asyncio.to_thread(
+            functools.partial(
                 subprocess.run,
-                argv,
+                list(argv),
                 env=env,
-                pass_fds=(execution_fd,),
-                preexec_fn=lambda: os.fchdir(execution_fd),
+                preexec_fn=lambda: os.fchdir(checkout_fd),
                 capture_output=True,
                 check=False,
-            )
-        finally:
-            os.close(execution_fd)
+            ),
+        )
         return CollectedExecutionResult(
             completed.returncode,
             completed.stdout,
@@ -1775,7 +1788,13 @@ async def test_uv_config_search_is_bounded_at_unsearchable_snapshot_boundary(
         runner=runner,
         checkout_factory=lambda *_args, **_kwargs: checkout,
     ).execute(("tracked.txt",))
+
+    # Deleting the production ``environment["UV_NO_CONFIG"] = "1"`` line makes
+    # the fake uv exit 2, which fails both assertions below.
     assert result.ok is True
+    assert observed_env.get("UV_NO_CONFIG") == "1"
+    # Cleanup restored the boundary before the fd was closed.
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio
