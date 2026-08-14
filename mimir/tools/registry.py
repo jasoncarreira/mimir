@@ -429,6 +429,71 @@ def approve_declassification(
 
 
 @tool
+async def request_operator_approval(tool_name: str, target: str, reason: str) -> str:
+    """Ask the authenticated operator to approve one exact tool and target.
+
+    This creates an unprivileged pending request only. Consent is recorded by
+    the server from a later authenticated inbound operator message; this tool
+    cannot create a grant.
+    """
+    from .._context import get_current_turn
+    from ..operator_approval import cancel_request, create_request
+
+    ctx = get_current_turn()
+    auth = getattr(ctx, "auth_context", None) if ctx is not None else None
+    dispatcher = _STATE["dispatcher"]
+    channels = _STATE["channel_registry"]
+    if (
+        ctx is None
+        or auth is None
+        or auth.trigger != "user_message"
+        or auth.interactivity != TurnInteractivity.INTERACTIVE
+        or auth.is_service
+    ):
+        return "request_operator_approval refused: no interactive operator turn"
+    channel_id = (auth.channel_id or "").strip()
+    operator_channel = (
+        getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or ""
+    ).strip()
+    if not channel_id or channel_id != operator_channel:
+        return "request_operator_approval refused: operator alert channel is not the active turn"
+    if dispatcher is None or not dispatcher._injection_enabled(channel_id):
+        return "request_operator_approval refused: mid-turn injection is disabled"
+    if channels is None or channels.find(channel_id) is None:
+        return "request_operator_approval refused: operator is unreachable"
+
+    normalized_tool = " ".join((tool_name or "").split())[:128]
+    normalized_target = " ".join((target or "").split())[:1024]
+    normalized_reason = " ".join((reason or "").split())[:500]
+    if not normalized_tool or not normalized_target:
+        return "request_operator_approval refused: tool_name and target are required"
+    request, status = create_request(
+        channel_id=channel_id,
+        tool_name=normalized_tool,
+        target=normalized_target,
+        requesting_principal=auth.canonical_principal or auth.principal,
+    )
+    if request is None:
+        return f"request_operator_approval refused: {status}"
+    alert = (
+        "Operator approval requested\n"
+        f"Tool: {normalized_tool}\n"
+        f"Target: {normalized_target}\n"
+        f"Reason: {normalized_reason or '(none provided)'}\n"
+        "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
+    )
+    try:
+        result = await channels.send(channel_id, alert, final=False)
+    except Exception:
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    if not getattr(result, "sent", True):
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    return "Operator approval is pending for the exact tool and target."
+
+
+@tool
 async def send_message(
     text: str,
     channel_id: Optional[str] = None,
@@ -2610,6 +2675,7 @@ def all_mimir_tools(
     )
     tools = [
         approve_declassification,
+        request_operator_approval,
         # Memory (read + write)
         memory_query, memory_get, memory_store,
         # Change proposals for protected files (PR-gated; never writes live).

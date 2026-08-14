@@ -226,6 +226,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Declassification mutates the live authorization carrier but does not itself
     # read protected data or emit it; the subsequent exact sink remains gated.
     "approve_declassification": ToolFlowDirection.NEITHER,
+    "request_operator_approval": ToolFlowDirection.NEITHER,
     "memory_query": ToolFlowDirection.SOURCE,
     "memory_get": ToolFlowDirection.SOURCE,
     "memory_store": ToolFlowDirection.SINK,
@@ -6006,6 +6007,7 @@ class OperationCatalog:
         "fetch_url",
         "write_todos",
         "defer_injected_message",
+        "request_operator_approval",
         "commitment_complete",
         "commitment_snooze",
         "commitment_dismiss",
