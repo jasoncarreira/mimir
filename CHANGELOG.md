@@ -6,6 +6,100 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-08-15
+
+A patch release. **No operator action is required** — no dependency changed and
+the `Dockerfile` is untouched, so a deployment already carrying the 0.8.1
+containment layer needs only the package.
+
+Most of this release comes from acting on recorded `shadow_tool_decision` events
+and from three defects that were costing the agent its own local test evidence.
+Every grant below is sized to observed use rather than to convenience, and
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+- Autonomous turns could not reply to the operator. A turn that ingested anything
+  untrusted lost `send_message` for the rest of the turn, including to the
+  channel it came from. Measured on muninn: 109 of 192 sends would have been
+  refused with `ifc_label_blocked:same_channel`, 26 of them on interactive
+  operator turns. The operator alert channel is now always reachable, and a
+  `user_message` turn can always answer the channel it arrived on; cross-channel,
+  shell, file and webhook sinks are unchanged. `upgrade` is also trusted at
+  ingress like `scheduled_tick`, so the framework's own upgrade carrier no longer
+  taints its turn. (#1196)
+- Resolved proposal branches were never swept. A rejected proposal's content is
+  never on `main`, so the content check could only ever refuse, and a merged
+  branch stopped qualifying once `main` moved on. Cleanup now uses the forge's
+  terminal PR state, falling back to the content check only when no PR exists.
+  17 branches had accumulated across two agent homes. (#1197)
+- The scoped test command died before collection on an `EACCES` it did not name.
+  `uv` canonicalises the physical cwd, so an fd-entered checkout beneath a `0700`
+  isolation boundary failed before pytest started. Permission failures now report
+  the absolute path, mode, uid/gid and the ancestor whose traversal failed. This
+  had silently degraded three PR reviews to CI-only evidence and withheld one
+  validated push. (#1201)
+- A superseded PR checkout lease blocked the next checkout for the remainder of
+  its two-hour TTL, though it could no longer authorise anything — the push path
+  already refuses a stale head. Such a lease is now released when the server
+  observes the head has moved, and refused rather than released when it holds
+  retained work. (#1202)
+- A refused remediation turn was charged as a successful attempt, so a blocked
+  pull request burned its whole retry budget and reported `gave_up`. Tool and
+  authorization refusals are now recorded as such and exempt; content failures,
+  and any turn that actually committed, pushed, commented or re-requested, stay
+  charged. (#1205)
+- The execution copy made for the worklink runner was chowned but never chmodded,
+  so a `0700` source directory left the runner locked out of the directory
+  created for it. The copy now reuses the same normalisation the sibling checkout
+  path already applied; the `0700` source boundary is unchanged. (#1206)
+- `web_search` and `fetch_url` are declared taint-independent, but only one of the
+  two egress gates honoured the exemption. (#1195)
+- Only *belated* remediation was authorised: a fresh changes-requested review
+  minted a review-only scope, so every prompt fix pushed outside its scope and
+  would have been refused under enforcement. A changes-requested review on the
+  agent's own pull request now mints remediation authority, derived server-side
+  from the forge's own review list. (#1199)
+
+### Added
+
+- Operator approval that the model cannot forge. The model may *request* approval
+  for one tool and target; the grant is recorded only from an inbound operator
+  message the server authenticated at ingress, from an admin, non-service
+  identity. Timeout, decline, autonomous triggers and unreachable operators all
+  fail closed, and the grant is inert until consumed. (#1203)
+- The operator can vouch for a turn's already-ingested sources once per sink
+  category rather than per action. Per-action approval measured a median of 35
+  prompts on an affected turn and 295 at worst, which is a blanket exemption with
+  extra steps; per category it is roughly 3. The grant is pinned to the turn's
+  exact label state and dies the instant any new source is ingested, is bound to
+  one principal and one turn, and never applies to `NETWORK`, `HTTP_WEBHOOK` or
+  `EXTERNAL_MCP`. Supersedes #1059. (#1467)
+
+### Changed
+
+- Autonomous turns can recall the agent's own memory. The `saga_full_corpus_read`
+  flag existed for exactly this but had never been set on the pollers or
+  heartbeat, so a poller could read 85 of 2,083 atoms — 4% — with the rest of the
+  corpus, including the entire `legacy_admin` history, invisible to it. The flag
+  is granted per principal with the reasoning recorded; the builder default stays
+  `False`, so a future poller gains nothing by existing. Read authority only:
+  tenant isolation on outputs is unchanged. (#1204)
+- Writes to `skills/` and poller manifests now require an admin operator turn.
+  A poller could previously rewrite the manifest that grants its own authority.
+  Skill upgrades are unaffected — they do not pass through the file-tool gate.
+  (#1193)
+
+### Internal
+
+- The test suite passes on macOS again. A regression pinned `uv`'s exit code and
+  `/proc`, and its unsearchable-boundary premise silently did not hold when the
+  suite ran as root — root ignores the directory mode, so the case under test
+  never occurred. The factory declaration also now sets `verify_timeout_ms`,
+  since the default was shorter than this suite and surfaced as a numeric test
+  failure rather than a timeout. (#1194, #1469)
+
+
 ## [0.8.3] — 2026-08-13
 
 A patch release carrying one change: the poller shell remediation from #1449,
