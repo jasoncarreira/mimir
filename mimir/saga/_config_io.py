@@ -267,6 +267,7 @@ _DEFAULTS = {
         "model": "mistralai/mistral-large-3-675b-instruct-2512",
         "api_key_env": "NVIDIA_NIM_API_KEY",
         "timeout_seconds": 30,
+        "reasoning_effort": "none",
     },
     "annotation": {
         # Per-subsystem overrides; if absent, [llm] is used.
@@ -620,10 +621,11 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         # [llm] when these are absent). Used by HyDE / contextual rewrite
         # to point at a faster/cheaper model than the bench's main LLM.
         "llm_url", "llm_model", "api_key_env", "timeout_seconds",
+        "reasoning_effort",
     },
     "consolidation": {
         "enabled", "enable_llm", "llm_url", "llm_model",
-        "timeout_seconds", "api_key_env",
+        "timeout_seconds", "api_key_env", "reasoning_effort",
     },
     "embedding": {
         "max_chars", "dimensions",
@@ -635,16 +637,17 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     },
     "triples": {
         "enable_extraction", "llm_url", "llm_model", "api_key_env",
-        "timeout_seconds",
+        "timeout_seconds", "reasoning_effort",
     },
     "annotation": {
-        "use_llm", "llm_url", "llm_model", "api_key_env",
+        "use_llm", "llm_url", "llm_model", "api_key_env", "reasoning_effort",
     },
     "llm": {
         # All keys are in _DEFAULTS, but listed here for clarity.
     },
     "compression": {
         "api_key_env", "llm_url", "llm_model", "timeout_seconds",
+        "reasoning_effort",
     },
     "decay": {
         "enabled",
@@ -835,7 +838,8 @@ def resolve_llm_config(subsystem: str) -> dict:
             ``triples``, ``retrieval_v2``, ``compression``.
 
     Returns:
-        ``{"url": str, "model": str, "api_key": str, "timeout": int}``
+        Resolved endpoint, model, authentication, timeout, provider, and
+        reasoning-effort values.
     """
     cfg = get_config()
 
@@ -897,12 +901,19 @@ def resolve_llm_config(subsystem: str) -> dict:
     if provider == 'anthropic' and not api_key:
         api_key = os.environ.get('ANTHROPIC_API_KEY', '') or api_key
 
+    reasoning_effort = (
+        cfg(subsystem, 'reasoning_effort', None)
+        or cfg('llm', 'reasoning_effort', None)
+        or 'none'
+    )
+
     return {
         "url": url,
         "model": model,
         "api_key": api_key,
         "timeout": int(timeout),
         "provider": str(provider),
+        "reasoning_effort": str(reasoning_effort),
     }
 
 

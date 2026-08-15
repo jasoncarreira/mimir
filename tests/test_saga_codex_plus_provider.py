@@ -76,6 +76,18 @@ def _install_fake_codex(monkeypatch, *, content: Any = "fake-reply", raise_exc=N
     return captured
 
 
+def _load_llm_config(monkeypatch, tmp_path, toml: str) -> dict[str, Any]:
+    from mimir.saga import _config_io
+
+    config_path = tmp_path / "saga.toml"
+    config_path.write_text(toml)
+    monkeypatch.setenv("SAGA_CONFIG", str(config_path))
+    monkeypatch.setattr(_config_io, "_config", None)
+    monkeypatch.setattr(_config_io, "_config_loaded", False)
+    monkeypatch.setattr(_config_io, "_explicit_keys", {})
+    return _config_io.resolve_llm_config("consolidation")
+
+
 # ── _call_codex_plus_async ──────────────────────────────────────────
 
 
@@ -94,6 +106,68 @@ async def test_codex_plus_builds_with_model_and_reasoning_none(monkeypatch):
     assert captured["timeout_seconds"] == 45.0
     # Both system + user messages are passed through.
     assert len(captured["messages"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("toml", "expected"),
+    [
+        ("[llm]\nprovider = 'codex_plus'\n", "none"),
+        (
+            "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'medium'\n",
+            "medium",
+        ),
+        (
+            "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'medium'\n"
+            "[consolidation]\nreasoning_effort = 'high'\n",
+            "high",
+        ),
+    ],
+    ids=["built-in-default", "llm-fallback", "subsystem-override"],
+)
+async def test_codex_plus_resolves_reasoning_effort_precedence(
+    monkeypatch, tmp_path, toml, expected, caplog
+):
+    from mimir.saga import _llm
+
+    captured = _install_fake_codex(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="saga.config"):
+        llm = _load_llm_config(monkeypatch, tmp_path, toml)
+    await _llm._call_codex_plus_async(
+        llm, prompt="extract", max_tokens=64, temperature=0.0, system=None,
+    )
+
+    assert llm["reasoning_effort"] == expected
+    assert captured["reasoning_effort"] == expected
+    assert not any(
+        "reasoning_effort" in record.getMessage() for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_plus_rejects_invalid_resolved_reasoning_effort(
+    monkeypatch, tmp_path
+):
+    from mimir.saga import _llm
+
+    captured = _install_fake_codex(monkeypatch)
+    llm = _load_llm_config(
+        monkeypatch,
+        tmp_path,
+        "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'bogus'\n",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        await _llm._call_codex_plus_async(
+            llm, prompt="extract", max_tokens=64, temperature=0.0, system=None,
+        )
+
+    message = str(exc_info.value)
+    assert "codex-plus" in message
+    assert "bogus" in message
+    for level in ("none", "low", "medium", "high", "xhigh"):
+        assert level in message
+    assert captured == {}
 
 
 @pytest.mark.asyncio
