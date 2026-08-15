@@ -31,14 +31,18 @@ log = logging.getLogger(__name__)
 _CHUNK_BYTES = 8192
 
 
-def tail_jsonl_records(path: Path) -> Iterator[dict]:
+def tail_jsonl_records(path: Path, *, max_records: int | None = None) -> Iterator[dict]:
     """Yield JSON-decoded records from ``path`` newest-first.
 
     Streams chunks from the end of the file rather than reading the
     whole file into memory. Skips lines that fail to JSON-decode (the
     firehose may have torn lines from a crash). Yields nothing when the
-    file is missing or unreadable.
+    file is missing or unreadable. When ``max_records`` is set, stops
+    after yielding that many decoded records.
     """
+    if max_records is not None and max_records <= 0:
+        return
+    yielded = 0
     try:
         for line in _tail_lines(path):
             line = line.strip()
@@ -46,6 +50,9 @@ def tail_jsonl_records(path: Path) -> Iterator[dict]:
                 continue
             try:
                 yield json.loads(line)
+                yielded += 1
+                if max_records is not None and yielded >= max_records:
+                    break
             except json.JSONDecodeError:
                 continue
     except OSError:

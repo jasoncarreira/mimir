@@ -775,9 +775,9 @@ async def test_api_turns_limit_stops_tail_reading_after_page(monkeypatch, app, p
     calls = 0
     real_tail = web_ui.tail_jsonl_records
 
-    def counting_tail(path_arg):
+    def counting_tail(path_arg, **kwargs):
         nonlocal calls
-        for record in real_tail(path_arg):
+        for record in real_tail(path_arg, **kwargs):
             calls += 1
             yield record
 
@@ -792,6 +792,83 @@ async def test_api_turns_limit_stops_tail_reading_after_page(monkeypatch, app, p
     assert calls == 2
 
 
+def test_turn_cursor_helpers_bound_decoded_records(monkeypatch, tmp_path: Path):
+    turns_log = tmp_path / "turns.jsonl"
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_SCAN_RECORDS + 100)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg, **kwargs):
+        nonlocal calls
+        for record in real_tail(path_arg, **kwargs):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    assert web_ui._turns_after_page(turns_log, after="absent") == ([], False)
+    assert calls == web_ui._TURNS_MAX_SCAN_RECORDS
+
+    calls = 0
+    assert web_ui._turns_before_page(turns_log, before="absent", limit=200) == (
+        [],
+        False,
+        False,
+    )
+    assert calls == web_ui._TURNS_MAX_SCAN_RECORDS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/api/turns", "/api/v1/turns"])
+@pytest.mark.parametrize("cursor_param", ["after", "before"])
+async def test_api_turns_reports_cursor_outside_scan_window(
+    app, endpoint, cursor_param
+):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_SCAN_RECORDS + 1)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get(f"{endpoint}?{cursor_param}=absent&limit=200")
+        body = await resp.json()
+
+    error = body["error"]
+    assert resp.status == 409
+    assert error["code"] == "cursor_not_found"
+    details = error.get("details", error)
+    assert details["cursor"] == "absent"
+    assert details["scan_limit"] == web_ui._TURNS_MAX_SCAN_RECORDS
+
+
+@pytest.mark.asyncio
+async def test_api_turns_clamps_huge_limit_and_bounds_decoding(monkeypatch, app):
+    a, turns_log, _ = app
+    rows = [{"turn_id": f"t{i}"} for i in range(web_ui._TURNS_MAX_PAGE_RECORDS + 100)]
+    turns_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    calls = 0
+    real_tail = web_ui.tail_jsonl_records
+
+    def counting_tail(path_arg, **kwargs):
+        nonlocal calls
+        for record in real_tail(path_arg, **kwargs):
+            calls += 1
+            yield record
+
+    monkeypatch.setattr(web_ui, "tail_jsonl_records", counting_tail)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/turns?limit=99999999")
+        body = await resp.json()
+
+    assert resp.status == 200
+    assert len(body["data"]["turns"]) == web_ui._TURNS_MAX_PAGE_RECORDS
+    assert body["meta"]["limit"] == web_ui._TURNS_MAX_PAGE_RECORDS
+    assert calls == web_ui._TURNS_MAX_PAGE_RECORDS
+
+
 @pytest.mark.asyncio
 async def test_api_turns_before_returns_older_page(app):
     """Progressive loading: ?before=<id>&limit=N returns up to N turns
@@ -803,11 +880,13 @@ async def test_api_turns_before_returns_older_page(app):
         # Two turns older than t4 -> t2, t3.
         resp = await client.get("/api/turns?before=t4&limit=2")
         body = await resp.json()
-        # Unknown cursor -> empty (treated as "no older page").
+        # Unknown cursor is distinguishable from a valid empty older page.
         resp2 = await client.get("/api/turns?before=nope&limit=2")
         body2 = await resp2.json()
     assert [t["turn_id"] for t in body["turns"]] == ["t2", "t3"]
+    assert resp2.status == 409
     assert body2["turns"] == []
+    assert body2["error"]["code"] == "cursor_not_found"
 
 
 @pytest.mark.asyncio
