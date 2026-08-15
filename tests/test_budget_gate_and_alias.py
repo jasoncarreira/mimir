@@ -1050,7 +1050,7 @@ async def _authenticated_shell_category_runtime(
     assert current is not None
     assert current.sources[-1].principal == "operator"
     assert auth.canonical_principal == "requester"
-    return turn, auth, folded
+    return turn, auth, {"dispatcher": dispatcher, "folded": folded}
 
 
 @pytest.mark.asyncio
@@ -1111,6 +1111,56 @@ async def test_authenticated_category_grant_runs_repeated_async_handlers(
     assert first.status != "error"
     assert second.status != "error"
     assert calls == ["async-file-1", "async-file-2"]
+
+
+@pytest.mark.asyncio
+async def test_same_provenance_server_message_invalidates_category_before_real_sink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import mid_turn_injection as mti
+    from mimir.agent import _initialize_ifc_labels
+    from mimir.models import AgentEvent
+
+    turn, auth, runtime = await _authenticated_shell_category_runtime(tmp_path, monkeypatch)
+    current = auth.ifc_state.current()
+    assert current is not None
+    later = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-C1",
+        content="another operator message",
+        author="slack-U1",
+        source="slack",
+    )
+    later_labels = _initialize_ifc_labels(later, resolver=turn.identity_resolver)
+    assert later_labels.sources[-1] in current.sources
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="wrote", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        assert await runtime["dispatcher"].enqueue(later)
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
+        refused = BudgetGateMiddleware().wrap_tool_call(
+            _make_request(
+                "write_file",
+                "same-provenance-file",
+                auth,
+                {"file_path": str(tmp_path / "refused")},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert "another operator message" in folded["messages"][0].content
+    assert refused.status == "error"
+    assert "ifc_label_blocked:file" in str(refused.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.parametrize("tool_name", ["fetch_url", "webhook"])
