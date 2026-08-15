@@ -17,11 +17,12 @@ flow:
      reload-semantics gotcha — ``restart`` doesn't reload env_file).
   6. Wait for the container to come back up (poll ``docker compose ps
      --format json`` until state==running).
-  7. ``docker exec <service> mimir verify-cred <cred>`` — the
-     verification probe runs INSIDE the new container with the new
-     env value. Exit 0 = live; anything else = stale.
-  8. On verify success → emit ``credential_rotation_completed`` and
-     return 0.
+  7. If the registry marks the probe ``not_implemented``, report that
+     verification was skipped. Otherwise, ``docker exec <service>
+     mimir verify-cred <cred>`` runs the probe INSIDE the new container
+     with the new env value. Exit 0 = live; anything else = stale.
+  8. On verify success or explicit skip → emit
+     ``credential_rotation_completed`` and return 0.
   9. On any failure (write, recreate, verify): restore ``compose.env``
      from the backup, recreate again to revert, emit
      ``credential_rotation_failed``, return 1.
@@ -69,6 +70,7 @@ class RotationContext:
     service_name: str
     cred_name: str | None = None  # name of the credential the env var belongs to
     cred_type: str | None = None
+    probe_kind: str | None = None
     backup_path: Path | None = None
     started_at: float = field(default_factory=time.monotonic)
 
@@ -355,9 +357,9 @@ def _verify_in_container(compose_file: Path, service: str,
 # ── orchestration ────────────────────────────────────────────────────
 
 
-def _find_cred_for_env(env_name: str) -> tuple[str, str] | None:
+def _find_cred_for_env(env_name: str) -> tuple[str, str, str] | None:
     """Look up which credential owns ``env_name`` and what its type
-    is. Returns ``(cred_name, cred_type)`` or None if no credential
+    is. Returns ``(cred_name, cred_type, probe_kind)`` or None if no credential
     in the registry lists this env var.
 
     Walks the registry built from credentials.yaml manifests — so a
@@ -366,7 +368,7 @@ def _find_cred_for_env(env_name: str) -> tuple[str, str] | None:
     probes = get_probes()
     for name, probe in probes.items():
         if env_name in probe.env_vars:
-            return (name, probe.cred_type)
+            return (name, probe.cred_type, probe.kind)
     return None
 
 
@@ -416,8 +418,9 @@ def run_rotate(
     cred_info = _find_cred_for_env(env_name)
     cred_name: str | None = None
     cred_type: str | None = None
+    probe_kind: str | None = None
     if cred_info is not None:
-        cred_name, cred_type = cred_info
+        cred_name, cred_type, probe_kind = cred_info
     else:
         print(
             f"warn: env var {env_name!r} is not listed by any credentials.yaml manifest. "
@@ -440,6 +443,7 @@ def run_rotate(
         service_name=service_name,
         cred_name=cred_name,
         cred_type=cred_type,
+        probe_kind=probe_kind,
     )
 
     return _execute(ctx, skip_recreate=skip_recreate)
@@ -502,7 +506,11 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
         print(f"rolled back to {backup_path.name}", file=sys.stderr)
         return 1
 
-    if ctx.cred_name is not None:
+    if ctx.probe_kind == "not_implemented":
+        verify_summary = (
+            f"verification skipped (no probe implemented for {ctx.cred_name})"
+        )
+    elif ctx.cred_name is not None:
         verify_ok, verify_detail = _verify_in_container(
             ctx.compose_file_path, ctx.service_name, ctx.cred_name,
         )
