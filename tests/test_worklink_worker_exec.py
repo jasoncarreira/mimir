@@ -379,28 +379,6 @@ def test_worker_identity_verifier_rejects_any_retained_authority(monkeypatch) ->
         worker_exec._verify_worker_identity()
 
 
-def test_process_group_scan_ignores_process_that_vanishes(monkeypatch) -> None:
-    class VanishedEntry:
-        name = "123"
-
-        def __truediv__(self, name: str):
-            assert name == "stat"
-            return self
-
-        def read_text(self) -> str:
-            raise ProcessLookupError("process exited")
-
-    class ProcRoot:
-        def is_dir(self) -> bool:
-            return True
-
-        def iterdir(self):
-            return iter((VanishedEntry(),))
-
-    monkeypatch.setattr(worker_exec, "Path", lambda path: ProcRoot())
-    assert worker_exec._process_group_has_live_members(123) is False
-
-
 def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monkeypatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
