@@ -665,8 +665,6 @@ def _request_for_authorized_execution(
     A trusted service receives only the direct argv admitted by its operation-
     specific sink policy; the handler never sees the original command string.
     """
-    if tool_name not in {"shell_exec", "bash_async"}:
-        return request
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     # Never trust a model-supplied internal execution override. Ordinary calls
     # discard it; trusted-service calls below replace it with server-parsed argv
@@ -679,6 +677,8 @@ def _request_for_authorized_execution(
         if had_model_override
         else request
     )
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return sanitized_request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
     if policy is None or policy.adapter != "shell_profile":
@@ -1500,7 +1500,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = _duplicate_review_result(request, review_claim)
             _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
             return result
-        if isinstance(direct_argv, list):
+        if (
+            tool_name in {"shell_exec", "bash_async"}
+            and isinstance(direct_argv, list)
+        ):
             from ._shell_env import bind_direct_exec_argv
 
             direct_argv_token = bind_direct_exec_argv(direct_argv)
@@ -1781,7 +1784,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = _duplicate_review_result(request, review_claim)
             _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
             return result
-        if isinstance(direct_argv, list):
+        if (
+            tool_name in {"shell_exec", "bash_async"}
+            and isinstance(direct_argv, list)
+        ):
             from ._shell_env import bind_direct_exec_argv
 
             direct_argv_token = bind_direct_exec_argv(direct_argv)
