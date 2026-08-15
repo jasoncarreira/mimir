@@ -9101,15 +9101,16 @@ def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> Non
         ).allowed is True
 
 
-def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
-    """``--jq`` is a credential-read primitive, not an output formatter.
+def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neither gh's jq support nor bare jq can expose inherited credentials.
 
     ``gh`` evaluates the filter in-process and jq's ``env`` / ``$ENV`` builtins
-    return the process environment, which ``direct_exec_env`` copies wholesale
-    from the parent. So ``gh pr list --json number --jq env`` was an ADMITTED
-    command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY, MIMIR_API_KEY and
-    the provider keys into the tool result, and from there into the model's
-    context and the turn transcript.
+    return the process environment. So ``gh pr list --json number --jq env`` was
+    an ADMITTED command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
+    MIMIR_API_KEY and the provider keys into the tool result, and from there into
+    the model's context and the turn transcript.
 
     Two properties made it reachable and are worth stating, because each looks
     harmless alone. ``env`` contains no shell metacharacter, so it passes the
@@ -9117,9 +9118,10 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
     are all in ``_SHELL_CONTROL_CHARACTERS``). And enforcement is irrelevant:
     the command was allowed outright, so the flag never entered into it.
 
-    Removing the option costs nothing, since only degenerate filters were ever
-    admitted anyway. Do not reintroduce it with ``env`` blocklisted — that is a
-    denylist over an expression language.
+    Removing the gh option costs nothing, since only degenerate filters were ever
+    admitted anyway. Bare jq remains useful with arbitrary filters, so its child
+    environment is scrubbed instead. Do not replace that control with an ``env``
+    blocklist: that would be a denylist over an expression language.
     """
     import shlex
 
@@ -9133,13 +9135,33 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
         # A trivial filter is refused too: the option is gone, not filtered.
         "gh pr view 1 --repo o/r --json reviews --jq .reviews",
     )
+    profiles = (
+        "scheduler_read_only", "repo_review", "maintenance", "upgrade_workspace",
+    )
     for command in exfiltration:
-        for profile in ("repo_review", "maintenance", "scheduler_read_only"):
+        for profile in profiles:
             argv = parse_service_shell_argv(command, profile)
             assert argv is None, (
                 f"[{profile}] admitted {command!r}; --jq lets a caller read the "
                 "process environment through gh"
             )
+
+    from mimir.tools._shell_env import direct_exec_env
+
+    sentinel_name = "JQ_ENV_SENTINEL"
+    monkeypatch.setenv(sentinel_name, "super-secret-value")
+    bare_jq_commands = (
+        "jq --null-input env",
+        "jq env sample.json",
+        "jq '$ENV.GITHUB_TOKEN' sample.json",
+        "jq -r '$ENV|tostring' sample.json",
+    )
+    for command in bare_jq_commands:
+        for profile in profiles:
+            argv = parse_service_shell_argv(command, profile)
+            assert argv is not None, (profile, command)
+            assert Path(argv[0]).name == "jq", (profile, command, argv)
+            assert sentinel_name not in direct_exec_env(argv), (profile, command)
 
     # Guard the guard: no profile's option allowlist may contain --jq at all, so
     # a new subcommand cannot quietly reintroduce it on a path the cases above
@@ -9150,8 +9172,8 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter() -> None:
     body = source.split("_SERVICE_SHELL_DISPLAY_OPTIONS", 1)[0]
     assert '"--jq"' not in body, (
         "an authorization option allowlist reintroduced --jq; it is a "
-        "credential-read primitive (jq env/$ENV over direct_exec_env's copy of "
-        "the parent environment), not an output formatter"
+        "credential-read primitive (jq env/$ENV over gh's environment), not an "
+        "output formatter"
     )
 
     # ...while the display vocabulary keeps it, so a refusal can still name the
