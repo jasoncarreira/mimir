@@ -377,11 +377,17 @@ class InformationFlowState:
                 and isinstance(current, InformationFlowLabels)
                 and merged.sources != current.sources
             ) or (changed and not isinstance(current, InformationFlowLabels) and bool(merged.sources))
+            source_arrived = source_changed or (
+                event_identity is not None
+                and isinstance(added, InformationFlowLabels)
+                and bool(added.sources)
+            )
             pre_ordinal = self._source_arrival_ordinal
-            if source_changed:
+            if source_arrived:
                 self._source_arrival_ordinal += 1
             if changed and current is not None:
                 self._declassification = None
+            if (changed and current is not None) or source_arrived:
                 self._sink_category_capabilities.clear()
             self.labels = merged
             receipt = SourceFoldReceipt(
@@ -391,6 +397,7 @@ class InformationFlowState:
                 post_source_arrival_ordinal=self._source_arrival_ordinal,
                 event_identity=event_identity,
                 source_changed=source_changed,
+                source_arrived=source_arrived,
                 _state_identity=self._receipt_identity,
             )
             return merged, receipt
@@ -418,7 +425,7 @@ class InformationFlowState:
                 or fold_receipt.pre_carrier != request_carrier
                 or fold_receipt.pre_source_arrival_ordinal != request_source_arrival_ordinal
                 or fold_receipt.post_source_arrival_ordinal != request_source_arrival_ordinal + 1
-                or not fold_receipt.source_changed
+                or not fold_receipt.source_arrived
                 or fold_receipt.post_carrier != expected_post
                 or live != fold_receipt.post_carrier
             ):
@@ -514,6 +521,7 @@ class SourceFoldReceipt:
     post_source_arrival_ordinal: int
     event_identity: Any
     source_changed: bool
+    source_arrived: bool
     _state_identity: Any = field(repr=False, compare=False)
 
 

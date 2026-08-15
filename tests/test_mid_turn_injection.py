@@ -1330,6 +1330,40 @@ async def test_intervening_source_before_authenticated_reply_spends_category_gra
 
 
 @pytest.mark.asyncio
+async def test_same_provenance_source_before_authenticated_reply_spends_category_grant(
+    tmp_path, monkeypatch,
+):
+    from mimir.agent import _initialize_ifc_labels
+
+    labels_home = tmp_path / "labels"
+    labels_home.mkdir()
+    resolver = _resolver(labels_home)
+    initial = _initialize_ifc_labels(
+        _approval_event("request", author="slack-U2"), resolver=resolver,
+    )
+    ctx, auth, dispatcher, _, _ = _category_runtime(
+        tmp_path, monkeypatch, initial=initial,
+    )
+    intervening = _approval_event("another requester message", author="slack-U2")
+    intervening_labels = _initialize_ifc_labels(intervening, resolver=ctx.identity_resolver)
+    assert intervening_labels.sources == initial.sources
+
+    token = set_current_turn(ctx)
+    try:
+        await _request_shell_category()
+        assert await dispatcher.enqueue(intervening)
+        assert await dispatcher.enqueue(_approval_event("APPROVE"))
+        mti.MidTurnInjectionMiddleware().before_model({}, None)
+    finally:
+        reset_current_turn(token)
+
+    assert not _category_admitted(auth, ctx)
+    assert approval.recorded_grant(
+        "slack-C1", "shell_exec", "category target has no authority",
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_wrong_fold_event_identity_spends_category_grant(tmp_path, monkeypatch):
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
