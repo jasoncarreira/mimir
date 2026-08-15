@@ -1249,6 +1249,60 @@ def test_heartbeat_builtin_tier_covers_unbounded_fetch_url(tmp_path: Path) -> No
     )
 
 
+def test_full_corpus_read_grants_are_enumerated_across_static_and_builtin_principals(
+    tmp_path: Path,
+) -> None:
+    static = access_control.get_capability_matrix_report()
+    configured = {
+        report["canonical"]
+        for report in static.values()
+        if report["saga_full_corpus_read"]
+    }
+    for profile in ("heartbeat", "session-boundary"):
+        principal = access_control.builtin_trigger_service_principal(profile, tmp_path)
+        if principal.saga_full_corpus_read:
+            configured.add(principal.canonical)
+
+    assert configured == {"heartbeat", "scheduler", "synthesis"}
+
+
+def test_full_corpus_flag_changes_only_saga_read_authority(tmp_path: Path) -> None:
+    arguments = {
+        "canonical": "poller:reviewed-memory-reader",
+        "trigger": "poller",
+        "profile": "research",
+        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
+        "capabilities": ("memory_store", "write_file", "send_message"),
+        "roots": (tmp_path,),
+        "creation_path": "test",
+    }
+    narrow = build_trigger_service_principal(**arguments)
+    broad = build_trigger_service_principal(
+        **arguments, saga_full_corpus_read=True,
+    )
+
+    assert narrow.saga_full_corpus_read is False
+    assert replace(broad, saga_full_corpus_read=False) == narrow
+    assert broad.capability_tier is narrow.capability_tier
+    assert broad.capabilities == narrow.capabilities
+    assert broad.readable_domains == narrow.readable_domains
+    assert broad.sink_destinations == narrow.sink_destinations
+    assert broad.sink_policies == narrow.sink_policies
+    assert broad.filesystem_read_roots == narrow.filesystem_read_roots
+
+    narrow_auth = _service_auth(narrow, InformationFlowLabels())
+    broad_auth = _service_auth(broad, InformationFlowLabels())
+    assert narrow_auth.roles == broad_auth.roles == ("service",)
+    registry = ToolRegistry()
+    for operation in ("add_schedule", "saga_forget", "shell_exec"):
+        narrow_decision = registry.authorize_tool(operation, narrow_auth, enforce=True)
+        broad_decision = registry.authorize_tool(operation, broad_auth, enforce=True)
+        assert (broad_decision.allowed, broad_decision.reason) == (
+            narrow_decision.allowed, narrow_decision.reason,
+        )
+        assert broad_decision.allowed is False
+
+
 def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> None:
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
@@ -6404,6 +6458,105 @@ def _github_scope_test_setup(
     return root, authority, item
 
 
+def _github_poller_auth(
+    authority: ServicePrincipal, item: dict[str, object],
+) -> AuthContext:
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    return replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def test_fresh_changes_requested_review_mints_remediation_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", state="CHANGES_REQUESTED")
+
+    auth = _github_poller_auth(authority, item)
+
+    scope = auth.repo_pr_action_scope
+    assert scope is not None
+    assert scope.event_type == "pr_review"
+    assert scope.observed_head_sha == "a" * 40
+    assert scope.observed_base_sha == "b" * 40
+    registry = ToolRegistry()
+    arguments = {"repository": "o/r", "pull_request": 42}
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is True
+        assert decision.reason is None
+
+    before = _github_poller_auth(
+        authority, {**item, "state": "COMMENTED"},
+    )
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, before, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repo_pr_scope_denied"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo", "not-a-repository"),
+        ("number", 0),
+        ("author", "someone-else"),
+        ("head_repo", "not-a-repository"),
+        ("head_repo", "fork/r"),
+        ("head_remote", "source"),
+        ("head_ref", "refs/heads/not:a-branch"),
+        ("base_ref", "refs/heads/not:a-branch"),
+        ("head_sha", "a" * 39),
+        ("base_sha", "b" * 39),
+    ],
+)
+def test_fresh_changes_requested_remediation_applies_every_write_guard(
+    field: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", state="CHANGES_REQUESTED")
+    item[field] = value
+
+    auth = _github_poller_auth(authority, item)
+
+    if field == "author":
+        scope = auth.repo_pr_action_scope
+        assert scope is not None
+        assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
+        assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+    else:
+        assert auth.repo_pr_action_scope is None
+
+
+@pytest.mark.parametrize("event_type", ["pr_opened", "pr_review_comment"])
+def test_non_review_events_remain_review_only_for_self_authored_pr(
+    event_type: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type=event_type, state="CHANGES_REQUESTED")
+
+    scope = _github_poller_auth(authority, item).repo_pr_action_scope
+
+    assert scope is not None
+    assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -6818,7 +6971,58 @@ def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
         extra={"items": [item, {**item, "head_sha": "c" * 40}]},
     )
 
-    assert create_auth_context(event, enforce=True).repo_pr_scope_registry is None
+    auth = replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+    assert auth.repo_pr_scope_registry is None
+    registry = ToolRegistry()
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 42},
+        )
+        assert decision.allowed is False
+        assert decision.reason == "repo_pr_scope_denied"
+
+
+def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, review_item = _github_scope_test_setup(tmp_path, monkeypatch)
+    review_item.update(event_type="pr_review", state="COMMENTED")
+    remediation_item = {
+        **review_item,
+        "number": 43,
+        "head_ref": "worklink/43",
+        "head_sha": "c" * 40,
+        "state": "CHANGES_REQUESTED",
+    }
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"items": [review_item, remediation_item]},
+    )
+    auth = replace(
+        create_auth_context(event, enforce=True),
+        ifc_labels=InformationFlowLabels(),
+    )
+    registry = ToolRegistry()
+
+    assert auth.repo_pr_scope_registry is not None
+    assert len(auth.repo_pr_scope_registry.review_states) == 2
+    for tool_name in ("repo_commit", "repo_push"):
+        first = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 42},
+        )
+        second = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 43},
+        )
+        assert first.allowed is False
+        assert first.reason == "repo_pr_scope_denied"
+        assert second.allowed is True
 
 
 def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
@@ -6946,6 +7150,47 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
         access_control.RepoPRAction.PR_REVIEW.value,
         access_control.RepoPRAction.PR_COMMENT.value,
     })
+
+
+def test_server_discovered_changes_requested_review_mints_remediation_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
+    pr = NormalizedPullRequestSnapshot(
+        state="open", number=42, author="mimir-bot",
+        head_repo="o/r", head_remote="origin", head_ref="worklink/42",
+        head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+    )
+
+    scope = access_control.create_server_discovered_review_scope(
+        "o/r", pr, review_state="CHANGES_REQUESTED",
+    )
+    resolution = access_control.resolve_server_discovered_review_scope(
+        "o/r", pr, review_state="CHANGES_REQUESTED",
+    )
+
+    assert scope is not None
+    assert resolution.scope == scope
+    assert scope.provenance == "server_discovered"
+    assert access_control.RepoPRAction.COMMIT.value in scope.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value in scope.allowed_operations
+    ordinary = access_control.resolve_server_discovered_review_scope(
+        "o/r", pr, review_state="APPROVED",
+    ).scope
+    assert ordinary is not None
+    assert access_control.RepoPRAction.COMMIT.value not in ordinary.allowed_operations
+    assert access_control.RepoPRAction.PUSH.value not in ordinary.allowed_operations
+    for change in (
+        {"author": "someone-else"},
+        {"head_repo": "fork/r"},
+        {"head_remote": "source"},
+    ):
+        guarded = access_control.resolve_server_discovered_review_scope(
+            "o/r", replace(pr, **change), review_state="CHANGES_REQUESTED",
+        ).scope
+        if guarded is not None:
+            assert access_control.RepoPRAction.COMMIT.value not in guarded.allowed_operations
+            assert access_control.RepoPRAction.PUSH.value not in guarded.allowed_operations
 
 
 def test_heartbeat_scope_rejects_raw_provider_payload(

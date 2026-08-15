@@ -428,6 +428,158 @@ def approve_declassification(
     return "approve_declassification failed: missing live authorization middleware"
 
 
+def _render_approval_metadata(value: object) -> str:
+    """Render one approval-prompt value without allowing line injection."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+@tool
+async def request_operator_approval(
+    tool_name: str,
+    target: str,
+    reason: str,
+    sink_category: str | None = None,
+) -> str:
+    """Ask the authenticated operator to approve an exact request.
+
+    A validated ``sink_category`` requests a turn-local category capability.
+    Consent is recorded only from a later authenticated inbound operator
+    message; this tool cannot create a grant.
+    """
+    from .._context import get_current_turn
+    from ..operator_approval import cancel_request, create_request
+
+    ctx = get_current_turn()
+    auth = getattr(ctx, "auth_context", None) if ctx is not None else None
+    dispatcher = _STATE["dispatcher"]
+    channels = _STATE["channel_registry"]
+    if (
+        ctx is None
+        or auth is None
+        or auth.trigger != "user_message"
+        or auth.interactivity != TurnInteractivity.INTERACTIVE
+        or auth.is_service
+    ):
+        return "request_operator_approval refused: no interactive operator turn"
+    channel_id = (auth.channel_id or "").strip()
+    operator_channel = (
+        getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or ""
+    ).strip()
+    if not channel_id or channel_id != operator_channel:
+        return "request_operator_approval refused: operator alert channel is not the active turn"
+    if dispatcher is None or not dispatcher._injection_enabled(channel_id):
+        return "request_operator_approval refused: mid-turn injection is disabled"
+    if channels is None or channels.find(channel_id) is None:
+        return "request_operator_approval refused: operator is unreachable"
+
+    normalized_tool = " ".join((tool_name or "").split())[:128]
+    normalized_target = " ".join((target or "").split())[:1024]
+    normalized_reason = " ".join((reason or "").split())[:500]
+    if not normalized_tool or not normalized_target:
+        return "request_operator_approval refused: tool_name and target are required"
+
+    category = None
+    request_carrier = None
+    request_ordinal = None
+    if sink_category is not None:
+        from ..access_control import SinkCategory
+
+        eligible = frozenset({
+            SinkCategory.SAME_CHANNEL,
+            SinkCategory.CROSS_CHANNEL,
+            SinkCategory.PUBLIC,
+            SinkCategory.SHELL_PROCESS,
+            SinkCategory.SPAWN,
+            SinkCategory.NOTIFICATION,
+            SinkCategory.FILE,
+            SinkCategory.DIRECT_MESSAGE,
+            SinkCategory.SAGA,
+            SinkCategory.SCHEDULER,
+            SinkCategory.PROPOSAL,
+            SinkCategory.FORGE,
+        })
+        ineligible = frozenset({
+            SinkCategory.NETWORK,
+            SinkCategory.HTTP_WEBHOOK,
+            SinkCategory.EXTERNAL_MCP,
+            SinkCategory.UNKNOWN,
+            SinkCategory.HARNESS_DISPLAY,
+        })
+        assert eligible | ineligible == frozenset(SinkCategory)
+        try:
+            parsed_category = SinkCategory(sink_category)
+        except ValueError:
+            return "request_operator_approval refused: invalid sink_category"
+        if parsed_category not in eligible:
+            return "request_operator_approval refused: ineligible sink_category"
+        category = parsed_category.value
+        request_carrier, request_ordinal = auth.ifc_state.source_snapshot(auth.ifc_labels)
+        if request_carrier is None:
+            return "request_operator_approval refused: no live information-flow state"
+
+    requesting_principal = auth.canonical_principal or auth.principal
+    request, status = create_request(
+        channel_id=channel_id,
+        tool_name=normalized_tool,
+        target=normalized_target,
+        requesting_principal=requesting_principal,
+        turn_id=ctx.turn_id if category is not None else None,
+        sink_category=category,
+        request_carrier=request_carrier,
+        ifc_state=auth.ifc_state if category is not None else None,
+        request_source_arrival_ordinal=request_ordinal,
+    )
+    if request is None:
+        return f"request_operator_approval refused: {status}"
+    render = _render_approval_metadata
+    if category is None:
+        request_details = (
+            f"Tool: {render(normalized_tool)}\n"
+            f"Target: {render(normalized_target)}\n"
+        )
+    else:
+        rendered_sources = "\n".join(
+            "- "
+            f"principal={render(source.principal or '(unknown)')}; "
+            f"domain={render(source.domain or '(unknown)')}; "
+            f"resource_id={render(source.resource_id or '(unknown)')}; "
+            f"bridge_instance={render(source.bridge_instance or '(unknown)')}; "
+            f"sensitivity={render(source.sensitivity)}; "
+            f"authorized_principals={render(sorted(source.authorized_principals))}; "
+            f"source_kind={render(source.source_kind)}; "
+            f"integrity={render(source.integrity)}; "
+            f"integrity_effect={render(source.integrity_effect)}"
+            for source in request_carrier.sources
+        ) or "- (none)"
+        request_details = (
+            f"Sink category: {render(category)}\n"
+            f"Turn: {render(ctx.turn_id)}\n"
+            f"Requesting principal: {render(requesting_principal)}\n"
+            "Approval scope: approving authorizes every tool and every destination "
+            "in this sink category for the remainder of this turn.\n"
+            f"Requested tool (non-binding context only): {render(normalized_tool)}\n"
+            f"Requested target (non-binding context only): {render(normalized_target)}\n"
+            f"Sources:\n{rendered_sources}\n"
+        )
+    alert = (
+        "Operator approval requested\n"
+        f"{request_details}"
+        f"Reason: {render(normalized_reason or '(none provided)')}\n"
+        "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
+    )
+    try:
+        result = await channels.send(channel_id, alert, final=False)
+    except Exception:
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    if not getattr(result, "sent", True):
+        cancel_request(request.request_id)
+        return "request_operator_approval refused: operator is unreachable"
+    if category is not None:
+        return "Operator approval is pending for the sink category."
+    return "Operator approval is pending for the exact tool and target."
+
+
 @tool
 async def send_message(
     text: str,
@@ -2611,6 +2763,7 @@ def all_mimir_tools(
     )
     tools = [
         approve_declassification,
+        request_operator_approval,
         # Memory (read + write)
         memory_query, memory_get, memory_store,
         # Change proposals for protected files (PR-gated; never writes live).

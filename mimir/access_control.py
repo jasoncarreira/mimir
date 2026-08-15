@@ -126,6 +126,30 @@ class SinkCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+_SINK_CATEGORY_CAPABILITY_ELIGIBLE = frozenset({
+    SinkCategory.SAME_CHANNEL,
+    SinkCategory.CROSS_CHANNEL,
+    SinkCategory.PUBLIC,
+    SinkCategory.SHELL_PROCESS,
+    SinkCategory.SPAWN,
+    SinkCategory.NOTIFICATION,
+    SinkCategory.FILE,
+    SinkCategory.DIRECT_MESSAGE,
+    SinkCategory.SAGA,
+    SinkCategory.SCHEDULER,
+    SinkCategory.PROPOSAL,
+    SinkCategory.FORGE,
+})
+
+assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
+    SinkCategory.NETWORK,
+    SinkCategory.HTTP_WEBHOOK,
+    SinkCategory.EXTERNAL_MCP,
+    SinkCategory.HARNESS_DISPLAY,
+    SinkCategory.UNKNOWN,
+}
+
+
 class CapabilityTier(StrEnum):
     """Blast-radius ceiling for authority declared by autonomous triggers."""
 
@@ -228,6 +252,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Declassification mutates the live authorization carrier but does not itself
     # read protected data or emit it; the subsequent exact sink remains gated.
     "approve_declassification": ToolFlowDirection.NEITHER,
+    "request_operator_approval": ToolFlowDirection.NEITHER,
     "memory_query": ToolFlowDirection.SOURCE,
     "memory_get": ToolFlowDirection.SOURCE,
     "memory_store": ToolFlowDirection.SINK,
@@ -642,7 +667,9 @@ _BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
         "root_parts": ("state", "triggers", "heartbeat"),
         "channel_memory_directory": "scheduler:heartbeat",
         "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
-        "saga_full_corpus_read": False,
+        # Heartbeat is an autonomous agent turn that recalls accumulated memory.
+        # This broadens SAGA reads only; its capabilities and sinks stay profile-bound.
+        "saga_full_corpus_read": True,
     },
     "session-boundary": {
         "canonical": "synthesis",
@@ -1175,10 +1202,16 @@ def _repo_pr_scope_resolution(
     head_sha: object,
     base_ref: object,
     base_sha: object,
+    review_state: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
-    is_remediation = event_type in {
+    is_fresh_changes_requested_remediation = (
+        event_type == "pr_review"
+        and review_state == "CHANGES_REQUESTED"
+        and principal == self_login
+    )
+    is_remediation = is_fresh_changes_requested_remediation or event_type in {
         "pr_changes_requested_stale",
         "pr_mergeability_rebase",
         "pr_mergeability_conflicting",
@@ -1295,8 +1328,10 @@ def create_server_discovered_heartbeat_scope(
 def create_server_discovered_review_scope(
     repo: str,
     pull_request: NormalizedPullRequestSnapshot,
+    *,
+    review_state: object = None,
 ) -> Any:
-    """Issue standing review authority from a provider-normalized live PR."""
+    """Issue standing review or fresh-remediation authority from a live PR."""
     if (
         not isinstance(pull_request, NormalizedPullRequestSnapshot)
         or pull_request.state != "open"
@@ -1307,6 +1342,7 @@ def create_server_discovered_review_scope(
         repo=repo,
         principal=pull_request.author,
         event_type="pr_review",
+        review_state=review_state,
         number=pull_request.number,
         head_repo=pull_request.head_repo,
         head_remote=pull_request.head_remote,
@@ -1320,8 +1356,10 @@ def create_server_discovered_review_scope(
 def resolve_server_discovered_review_scope(
     repo: str,
     pull_request: NormalizedPullRequestSnapshot,
+    *,
+    review_state: object = None,
 ) -> RepoPRScopeResolution:
-    """Resolve standing review authority with an operator-actionable refusal."""
+    """Resolve standing review or fresh-remediation authority with a refusal."""
     if (
         not isinstance(pull_request, NormalizedPullRequestSnapshot)
         or pull_request.state != "open"
@@ -1334,6 +1372,7 @@ def resolve_server_discovered_review_scope(
         repo=repo,
         principal=pull_request.author,
         event_type="pr_review",
+        review_state=review_state,
         number=pull_request.number,
         head_repo=pull_request.head_repo,
         head_remote=pull_request.head_remote,
@@ -1367,6 +1406,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             repo=item.get("repo"),
             principal=item.get("author"),
             event_type=item.get("event_type"),
+            review_state=item.get("state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),
             head_remote=item.get("head_remote"),
@@ -4769,6 +4809,33 @@ def _forge_repository_scope_mismatch(
     return None
 
 
+def _sink_category_capability_turn_id(auth_context: Any) -> str | None:
+    """Resolve reusable authority from the durable AuthContext IFC carrier."""
+    from ._context import get_current_turn
+
+    state = getattr(auth_context, "ifc_state", None)
+    get_bound_turn_id = getattr(state, "sink_category_turn_id", None)
+    if not callable(get_bound_turn_id):
+        return None
+    turn_id = get_bound_turn_id()
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+
+    # Forked SDK/MCP tasks can legitimately lose the ContextVar. The immutable
+    # request binding on the genuine IFC state remains authoritative there. If
+    # ambient turn context is present, retain the stronger cross-check so a
+    # carrier attached to another TurnContext still fails closed.
+    turn = get_current_turn()
+    if turn is None:
+        return turn_id
+    if (
+        getattr(turn, "turn_id", None) != turn_id
+        or getattr(getattr(turn, "auth_context", None), "ifc_state", None) is not state
+    ):
+        return None
+    return turn_id
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -5350,6 +5417,11 @@ class SinkGate:
                     sink_category=sink_category.value,
                     destination=normalized_target,
                     canonical_principal=canonical_principal,
+                    turn_id=(
+                        _sink_category_capability_turn_id(auth_context)
+                        if sink_category in _SINK_CATEGORY_CAPABILITY_ELIGIBLE
+                        else None
+                    ),
                 )
             ):
                 return ToolAuthorization(
@@ -6080,6 +6152,7 @@ class OperationCatalog:
         "fetch_url",
         "write_todos",
         "defer_injected_message",
+        "request_operator_approval",
         "commitment_complete",
         "commitment_snooze",
         "commitment_dismiss",

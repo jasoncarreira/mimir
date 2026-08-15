@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any
 
+from .checkout import _normalize_checkout_fd
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -215,6 +216,25 @@ def _validate_command(request: dict[str, Any]) -> list[str]:
     return argv
 
 
+def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> int:
+    if Path(command[0]).name != "uv":
+        return os.dup(checkout_fd)
+    project = home / "project"
+    shutil.copytree(f"/proc/self/fd/{checkout_fd}", project, symlinks=True)
+    project_fd = os.open(
+        project,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        _normalize_checkout_fd(
+            project_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+        )
+    except Exception:
+        os.close(project_fd)
+        raise
+    return project_fd
+
+
 def _validate_environment(value: object) -> dict[str, str]:
     if not isinstance(value, dict):
         raise RuntimeError("worker environment must be string pairs")
@@ -389,6 +409,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.chown(home, WORKLINK_UID, WORKLINK_GID)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
+        execution_fd = _execution_checkout_fd(command, anchored_fd, home)
+        os.close(anchored_fd)
+        anchored_fd = execution_fd
+        fds[0] = anchored_fd
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

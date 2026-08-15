@@ -7,6 +7,7 @@
       "authority": {
         "profile": "github",
         "tier": "code-execution",
+        "saga_full_corpus_read": true,
         "capabilities": ["worklink_run", "write_file", "edit_file", "shell_exec", "bash_jobs_list", "bash_job_output", "send_message", "operator_alert", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"],
         "scoped_roots": ["state"]
       },

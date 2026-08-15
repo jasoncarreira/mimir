@@ -218,8 +218,10 @@ class Dispatcher:
         ):
             existing = self._queues.get(channel_id)
             if existing is None or existing.qsize() == 0:
-                from .mid_turn_injection import inject_message
-                if inject_message(channel_id, event) == "injected":
+                from .mid_turn_injection import inject_authenticated_message
+                if inject_authenticated_message(
+                    channel_id, event, self._identity_resolver,
+                ) == "injected":
                     await log_event("mid_turn_injected", channel_id=channel_id)
                     # PR 4: record the message in chat history NOW (true arrival
                     # time), so it threads ahead of the running turn's later

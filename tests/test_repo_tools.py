@@ -4,6 +4,7 @@ import asyncio
 import base64
 from dataclasses import asdict, replace
 import json
+import functools
 import os
 from pathlib import Path
 import shutil
@@ -54,6 +55,7 @@ from mimir.repo_tools import (
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
+from mimir.worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -1628,6 +1630,171 @@ async def test_project_test_containment_unavailable_fails_closed(
         "pull_request": 7,
     })]
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_project_test_permission_refusal_names_path_metadata_and_identity(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import project_tests as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "unreadable"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    failed_path = checkout_path / "uv.toml"
+    failed_path.write_text("file-content-must-not-be-logged", encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", failed_path)
+
+    def close() -> None:
+        boundary.chmod(0o700)
+
+    boundary.chmod(0)
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state,
+            runner=denied,
+            checkout_factory=lambda *_args, **_kwargs: checkout,
+        ).execute()
+
+    assert refusal.value.code == "test_path_permission_denied"
+    message = str(refusal.value)
+    assert f"path={failed_path}" in message
+    assert "path_mode=0o000" in message
+    assert f"path_uid={os.geteuid()}" in message
+    assert f"path_gid={os.getegid()}" in message
+    assert f"runner_effective_uid={WORKLINK_UID}" in message
+    assert f"runner_effective_gid={WORKLINK_GID}" in message
+    assert f"traversal_failed={boundary}" in message
+    assert "file-content-must-not-be-logged" not in message
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "path_permission_denied",
+        "repository": "owner/repo",
+        "pull_request": 7,
+        "path": str(failed_path),
+        "path_mode": "0o000",
+        "path_uid": os.geteuid(),
+        "path_gid": os.getegid(),
+        "runner_effective_uid": WORKLINK_UID,
+        "runner_effective_gid": WORKLINK_GID,
+        "traversal_failed": str(boundary),
+    })]
+    assert "file-content-must-not-be-logged" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_uv_config_search_is_bounded_at_unsearchable_snapshot_boundary(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pins the production property that RepoProjectTests sets UV_NO_CONFIG=1 for
+    # uv commands, so uv cannot search above an fd-entered checkout for ambient
+    # config. Deliberately independent of three things this previously depended
+    # on by accident: the real uv's release behaviour, ``/proc`` (absent on
+    # macOS), and running as non-root -- root bypasses the directory mode, which
+    # silently voided the premise when the suite ran as root in a container.
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_uv = bin_dir / "uv"  # must be named `uv`: production keys on command[0].
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        'if [ "$UV_NO_CONFIG" = "1" ]; then exit 0; fi\n'
+        'echo "ambient uv config discovery was not disabled" >&2\n'
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run --offline /usr/bin/true")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    boundary = tmp_path / "snapshot-boundary"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    checkout_fd = os.open(checkout_path, os.O_RDONLY | os.O_DIRECTORY)
+    boundary.chmod(0)
+
+    # Negative control: without the production environment, the command fails.
+    observed = subprocess.run(
+        [str(fake_uv), "run", "--offline", "/usr/bin/true"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+    )
+    assert observed.returncode == 2
+    assert b"ambient uv config discovery was not disabled" in observed.stderr
+
+    # The boundary is unsearchable by pathname, which is why production enters
+    # the checkout by fd. Root ignores the mode, so only assert where the OS
+    # enforces it; the fd path below is what production relies on either way.
+    if os.geteuid() != 0:
+        with pytest.raises(PermissionError):
+            os.listdir(checkout_path)
+
+    observed_env: dict[str, str] = {}
+
+    async def runner(argv, _directory, env, _projections, **_kwargs):
+        observed_env.update(env)
+        completed = await asyncio.to_thread(
+            functools.partial(
+                subprocess.run,
+                list(argv),
+                env=env,
+                preexec_fn=lambda: os.fchdir(checkout_fd),
+                capture_output=True,
+                check=False,
+            ),
+        )
+        return CollectedExecutionResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            False,
+            False,
+            0,
+            0,
+        )
+
+    def close() -> None:
+        boundary.chmod(0o700)
+        os.close(checkout_fd)
+
+    checkout = SimpleNamespace(
+        path=checkout_path,
+        capability=SimpleNamespace(path=checkout_path),
+        close=close,
+    )
+    result = await RepoProjectTests(
+        state,
+        runner=runner,
+        checkout_factory=lambda *_args, **_kwargs: checkout,
+    ).execute(("tracked.txt",))
+
+    # Deleting the production ``environment["UV_NO_CONFIG"] = "1"`` line makes
+    # the fake uv exit 2, which fails both assertions below.
+    assert result.ok is True
+    assert observed_env.get("UV_NO_CONFIG") == "1"
+    # Cleanup restored the boundary before the fd was closed.
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio

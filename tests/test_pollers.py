@@ -214,6 +214,57 @@ def test_research_poller_builds_with_skill_learning_only(tmp_path: Path) -> None
     assert "saga_end_session" not in authority.capabilities
 
 
+def test_poller_full_corpus_read_requires_explicit_boolean_configuration(
+    tmp_path: Path,
+) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "research-agent"
+    persist_dir.mkdir(parents=True)
+    arguments = {
+        "name": "research-agent",
+        "persist_dir": persist_dir,
+        "state_root": tmp_path / "state" / "pollers",
+        "manifest_path": tmp_path / "skills" / "research-agent" / "pollers.json",
+    }
+
+    narrow = _parse_poller_authority(_authority(), **arguments)
+    broad = _parse_poller_authority(
+        _authority(saga_full_corpus_read=True), **arguments,
+    )
+
+    assert narrow.saga_full_corpus_read is False
+    assert broad.saga_full_corpus_read is True
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _parse_poller_authority(
+            _authority(saga_full_corpus_read="true"), **arguments,
+        )
+
+
+def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None:
+    manifests = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    expected = {
+        "dependency-advisory-watch",
+        "github-activity",
+        "github-ci-watch",
+        "gmail-inbox",
+        "social-cli-feed",
+        "social-cli-notifications",
+        "worklink-ready-queue",
+        "worklink-tool-pins",
+    }
+    entries = [
+        entry
+        for manifest_path in manifests.glob("*/pollers.json")
+        for entry in json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+    ]
+
+    assert {entry["name"] for entry in entries} == expected
+    assert {
+        entry["name"]
+        for entry in entries
+        if entry["authority"].get("saga_full_corpus_read") is True
+    } == expected
+
+
 def test_session_boundary_poller_can_declare_rebuild_index(tmp_path: Path) -> None:
     persist_dir = tmp_path / "state" / "pollers" / "session-boundary"
     persist_dir.mkdir(parents=True)

@@ -2881,6 +2881,8 @@ class Agent:
         # them before finalization and reuse the exact classification.
         result_fields = derive_result_fields(messages, context=ctx)
         hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
+        remediation_effects = list(getattr(ctx, "remediation_effects", []) or [])
+        refusal_is_exempt = bool(hard_refusals and not remediation_effects)
         outcome_is_error = bool(error or result_fields["result_is_error"])
         outcome_fields = {
             "result_subtype": result_fields["result_subtype"],
@@ -2890,7 +2892,7 @@ class Agent:
             # This is framework-authored from boundary middleware state, never
             # inferred from model text or a tool error message.
             "attempt_disposition": (
-                "exempt_hard_refusal" if hard_refusals else "charge"
+                "exempt_hard_refusal" if refusal_is_exempt else "charge"
             ),
             "attempt_reason": (
                 ", ".join(
@@ -2900,10 +2902,11 @@ class Agent:
                         if isinstance(item, dict)
                     })
                 )
-                if hard_refusals
+                if refusal_is_exempt
                 else (error[:240] if error else result_fields["result_subtype"])
             ),
             "hard_refusals": hard_refusals,
+            "remediation_effects": remediation_effects,
         }
 
         # Algedonic: surface EVERY turn failure as an event so a dropped

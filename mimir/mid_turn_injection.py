@@ -64,6 +64,7 @@ class _Inflight:
     folded: list[tuple["AgentEvent", float]] = field(default_factory=list)
     deferred: dict[str, str] = field(default_factory=dict)
     emitter: Any | None = None
+    authenticated_grants: dict[int, Any] = field(default_factory=dict)
     active: bool = True
 
 
@@ -82,6 +83,9 @@ def register_inflight(channel_id: str | None, *, emitter: Any | None = None) -> 
     """
     if not channel_id:
         return
+    from .operator_approval import clear_channel
+
+    clear_channel(channel_id)
     with _LOCK:
         _REGISTRY[channel_id] = _Inflight(emitter=emitter)
 
@@ -105,12 +109,17 @@ def deactivate(
     """
     if not channel_id:
         return [], [], []
+    from .operator_approval import clear_channel
+
     with _LOCK:
         inflight = _REGISTRY.pop(channel_id, None)
         if inflight is None:
+            clear_channel(channel_id)
             return [], [], []
         inflight.active = False
-        return _snapshot_inflight(inflight)
+        snapshot = _snapshot_inflight(inflight)
+    clear_channel(channel_id)
+    return snapshot
 
 
 def _snapshot_inflight(
@@ -169,6 +178,34 @@ def inject_message(channel_id: str, event: "AgentEvent") -> str:
         return "injected"
 
 
+def inject_authenticated_message(
+    channel_id: str,
+    event: "AgentEvent",
+    resolver: Any,
+) -> str:
+    """Inject an ingress-authorized event, recording operator consent first."""
+    with _LOCK:
+        inflight = _REGISTRY.get(channel_id)
+        if inflight is None or not inflight.active:
+            return "no_active_turn"
+        from .agent import _initialize_ifc_labels
+        from .operator_approval import pending_request, record_authenticated_response
+
+        request = pending_request(channel_id)
+        event_labels = _initialize_ifc_labels(event, resolver=resolver)
+        reply_source = event_labels.sources[-1] if event_labels.sources else None
+        status = record_authenticated_response(
+            event,
+            resolver,
+            approval_event=event,
+            reply_source=reply_source,
+        )
+        if status == "granted" and request is not None and request.sink_category is not None:
+            inflight.authenticated_grants[id(event)] = request
+        inflight.queue.append(event)
+        return "injected"
+
+
 def _drain(channel_id: str | None) -> list["AgentEvent"]:
     """Pop all queued events for ``channel_id`` (FIFO); ``[]`` when none.
 
@@ -184,30 +221,71 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             return []
         drained = inflight.queue[:]
         inflight.queue.clear()
+        authenticated_grants = {
+            id(event): inflight.authenticated_grants.pop(id(event))
+            for event in drained
+            if id(event) in inflight.authenticated_grants
+        }
         now = time.monotonic()
         inflight.folded.extend((e, now) for e in drained)
         emitter = inflight.emitter
+    from dataclasses import replace
+
+    from ._context import get_current_turn
+    from .agent import _initialize_ifc_labels, _merge_ifc_labels
+    from .operator_approval import consume_grant
+
+    ctx = get_current_turn()
+    if ctx is not None:
+        for event in drained:
+            event_labels = _initialize_ifc_labels(
+                event, resolver=getattr(ctx, "identity_resolver", None),
+            )
+            ctx.ifc_labels = _merge_ifc_labels(
+                ctx.ifc_labels,
+                event_labels,
+                source_channel=getattr(ctx, "channel_id", None),
+            )
+            if ctx.auth_context is None:
+                continue
+            ctx.ifc_labels, receipt = ctx.auth_context.ifc_state.merge_with_receipt(
+                ctx.ifc_labels,
+                event_identity=event,
+            )
+            ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
+            request = authenticated_grants.get(id(event))
+            if request is None:
+                continue
+            reply_source = event_labels.sources[-1] if event_labels.sources else None
+            grant = consume_grant(
+                request.channel_id,
+                request.tool_name,
+                request.target,
+                request_id=request.request_id,
+                turn_id=request.turn_id,
+                requesting_principal=request.requesting_principal,
+                sink_category=request.sink_category,
+                request_carrier=request.request_carrier,
+                ifc_state=request.ifc_state,
+                request_source_arrival_ordinal=request.request_source_arrival_ordinal,
+                approval_event=event,
+                reply_source=reply_source,
+            )
+            if grant is None or reply_source is None:
+                continue
+            grant.ifc_state.install_sink_category_capability(
+                sink_category=grant.sink_category,
+                turn_id=grant.turn_id,
+                canonical_principal=grant.requesting_principal,
+                request_carrier=grant.request_carrier,
+                request_source_arrival_ordinal=grant.request_source_arrival_ordinal,
+                approval_event=grant.approval_event,
+                reply_source=grant.reply_source,
+                fold_receipt=receipt,
+            )
     if emitter is not None:
         try:
-            from ._context import get_current_turn
-            from .agent import _merge_ifc_labels, _initialize_ifc_labels
-
-            ctx = get_current_turn()
             if ctx is not None:
-                folded_labels = _merge_ifc_labels(
-                    *(
-                        _initialize_ifc_labels(
-                            event, resolver=getattr(ctx, "identity_resolver", None),
-                        )
-                        for event in drained
-                    ),
-                    source_channel=getattr(ctx, "channel_id", None),
-                )
-                ctx.ifc_labels = _merge_ifc_labels(ctx.ifc_labels, folded_labels)
-                if ctx.auth_context is not None:
-                    from dataclasses import replace
-                    ctx.ifc_labels = ctx.auth_context.ifc_state.merge(ctx.ifc_labels)
-                    ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
                 emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             emitter.injected_input(drained)
         except Exception:  # noqa: BLE001 — panel telemetry is best-effort
