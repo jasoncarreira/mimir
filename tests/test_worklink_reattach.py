@@ -26,9 +26,9 @@ from mimir.worklink.run_state import (
 def cp(
     args: Sequence[str] | str,
     returncode: int = 0,
-    stdout: str = "",
-    stderr: str = "",
-) -> subprocess.CompletedProcess[str]:
+    stdout: str | bytes = "",
+    stderr: str | bytes = "",
+) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
@@ -163,7 +163,12 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
 
     checkout = repo.parent / ".worklink" / repo.name / f"{issue_id}-1"
 
-    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         calls.append(args)
         if isinstance(args, str):
             return cp(args)
@@ -194,6 +199,10 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
                 # exit 1 = "yes there are staged changes" (matches the contract
                 # WorklinkRunner's _commit_checkout_changes expects).
                 return cp(args, returncode=1)
+            if "diff" in args and "--cached" in args and "-z" in args:
+                return cp(args, stdout=b"changed.txt\0")
+            if "cat-file" in args and "blob" in args:
+                return cp(args, stdout=b"clean content\n")
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
             if "diff" in args and "--stat" in args:
@@ -621,7 +630,7 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
             (order.checkout / "changed.txt").write_text("hi\n", encoding="utf-8")
             return RawResult(0, order.transcript_root / "fake.json", "success", None)
 
-    def local_runner(args, *, cwd=None):
+    def local_runner(args, *, cwd=None, text=True):
         calls.append(args)
         if isinstance(args, str):
             return cp(args, stdout="ok\n")
@@ -647,12 +656,16 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+            if "diff" in args and "--cached" in args and "-z" in args:
+                return cp(args, stdout=b"changed.txt\0")
             if "diff" in args and "--name-only" in args:
                 return cp(args, stdout="changed.txt\n")
             if "diff" in args and "--stat" in args:
                 return cp(args, stdout=" changed.txt | 1 +\n")
             if "diff" in args and "--cached" in args and "--quiet" in args:
                 return cp(args, returncode=1)
+            if "cat-file" in args and "blob" in args:
+                return cp(args, stdout=b"clean content\n")
             return cp(args)
         if args[:3] == ["gh", "pr", "create"]:
             return cp(args, stdout="https://github.com/x/y/pull/1\n")

@@ -163,6 +163,12 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
             return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[3:] == [
+            "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
+        ]:
+            return cp(args, stdout=b"changed.txt\0")
+        if isinstance(args, list) and args[3:5] == ["cat-file", "blob"]:
+            return cp(args, stdout=b"clean content\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "diff"]:
             if "--cached" in args and "--quiet" in args:
                 return cp(args, returncode=1)
@@ -236,9 +242,9 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
 def cp(
     args: Sequence[str] | str,
     returncode: int = 0,
-    stdout: str = "",
-    stderr: str = "",
-) -> subprocess.CompletedProcess[str]:
+    stdout: str | bytes = "",
+    stderr: str | bytes = "",
+) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
 
 
@@ -441,7 +447,12 @@ def _orchestrator_runner(
     calls: list[Sequence[str] | str] = []
     commit_seen = False
 
-    def runner(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def runner(
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         nonlocal commit_seen
         calls.append(args)
         checkout_result = _isolated_checkout_result(args, repo, worktree)
@@ -463,6 +474,13 @@ def _orchestrator_runner(
             return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if isinstance(args, list) and args[3:] == [
+            "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
+        ]:
+            paths = files_stdout.rstrip("\n").encode() + (b"\0" if files_stdout else b"")
+            return cp(args, stdout=paths)
+        if isinstance(args, list) and args[3:5] == ["cat-file", "blob"]:
+            return cp(args, stdout=b"clean content\n")
         if (
             isinstance(args, list)
             and args[:4] == ["git", "-C", str(worktree), "diff"]
@@ -483,12 +501,9 @@ def _orchestrator_runner(
             return cp(args, stdout="ok\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "add"]:
             return cp(args)
-        # `--quiet` uses the exit code to signal staged changes; `-U0` (the
-        # secret scan) returns 0 with the diff on stdout — no secret here.
+        # `--quiet` uses the exit code to signal staged changes.
         if isinstance(args, list) and args[:6] == ["git", "-C", str(worktree), "diff", "--cached", "--quiet"]:
             return cp(args, returncode=1 if files_stdout else 0)
-        if isinstance(args, list) and args[:6] == ["git", "-C", str(worktree), "diff", "--cached", "-U0"]:
-            return cp(args, returncode=0, stdout="")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "commit"]:
             commit_seen = True
             return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
@@ -834,8 +849,11 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
     claim_calls = 0
 
     def runner(
-        args: Sequence[str] | str, *, cwd: Path | None = None
-    ) -> subprocess.CompletedProcess[str]:
+        args: Sequence[str] | str,
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         nonlocal claim_calls
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             claim_calls += 1
@@ -848,7 +866,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
                         "-locks-cache/index.lock': File exists."
                     ),
                 )
-        return base_runner(args, cwd=cwd)
+        return base_runner(args, cwd=cwd, text=text)
 
     backend = FakeBackend()
     registry = BackendRegistry(WorklinkConfig())
@@ -1796,18 +1814,38 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
 
 
 def _commit_runner(
-    diff_stdout: str, committed: dict, *, diff_returncode: int = 0
+    staged_files: dict[str, bytes],
+    committed: dict,
+    *,
+    list_returncode: int = 0,
+    unreadable_path: str | None = None,
+    text_blob_path: str | None = None,
 ) -> object:
-    """Fake runner for _commit_checkout_changes: staged changes present, with a
-    controllable `git diff --cached -U0` body/exit; records whether commit ran."""
-    def runner(args: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Fake runner for the commit path with controllable staged index blobs."""
+    def runner(
+        args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         tail = list(args)[3:]
         if tail[:2] == ["add", "-A"]:
             return cp(args)
         if tail == ["diff", "--cached", "--quiet"]:
             return cp(args, returncode=1)  # something is staged
-        if tail == ["diff", "--cached", "-U0"]:
-            return cp(args, returncode=diff_returncode, stdout=diff_stdout)
+        if tail == [
+            "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
+        ]:
+            paths = b"\0".join(os.fsencode(path) for path in staged_files) + b"\0"
+            return cp(args, returncode=list_returncode, stdout=paths)
+        if tail[:2] == ["cat-file", "blob"]:
+            path = tail[2][1:]
+            if path == unreadable_path:
+                return cp(args, returncode=128, stdout=b"", stderr=b"missing blob")
+            blob = staged_files[path]
+            if path == text_blob_path:
+                return cp(args, stdout=blob.decode("ascii"))
+            return cp(args, stdout=blob)
         if tail[:1] == ["commit"]:
             committed["ran"] = True
             return cp(args, stdout="[issue/441-a1 abc123] worklink\n")
@@ -1815,20 +1853,45 @@ def _commit_runner(
     return runner
 
 
-def test_commit_checkout_changes_refuses_staged_secret() -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+def _real_git_runner(
+    args: Sequence[str], *, text: bool = True
+) -> subprocess.CompletedProcess:
+    return subprocess.run(list(args), capture_output=True, text=text, check=False)
 
-    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
-    secret = "ghp_" + "B" * 36
-    committed = {"ran": False}
-    runner = _commit_runner(
-        f'+++ b/config.py\n+API_TOKEN = "{secret}"\n', committed
+
+def _init_commit_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True
     )
 
-    with pytest.raises(WorklinkError, match="secret-shaped"):
-        _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
-    # Fail closed BEFORE the commit — nothing reaches a branch/PR.
-    assert committed["ran"] is False
+
+@pytest.mark.parametrize("case", ["plain", "nul", "attributes"])
+def test_commit_checkout_changes_refuses_secret_in_staged_blob(
+    tmp_path: Path, case: str
+) -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
+    secret = b"ghp_" + b"B" * 36
+    path = repo / f"{case}.txt"
+    content = b'API_TOKEN = "' + secret + b'"\n'
+    if case == "nul":
+        content = b"\x00" + content
+    if case == "attributes":
+        (repo / ".gitattributes").write_text(f"{path.name} -diff\n")
+    path.write_bytes(content)
+
+    with pytest.raises(WorklinkError, match=rf"{case}\.txt.*secret-shaped"):
+        _commit_checkout_changes(repo, issue, runner=_real_git_runner)
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        check=False,
+    ).returncode != 0
 
 
 def test_commit_checkout_changes_fails_closed_when_scan_command_fails() -> None:
@@ -1839,7 +1902,7 @@ def test_commit_checkout_changes_fails_closed_when_scan_command_fails() -> None:
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
-    runner = _commit_runner("", committed, diff_returncode=128)
+    runner = _commit_runner({}, committed, list_returncode=128)
 
     with pytest.raises(WorklinkError, match="cannot scan"):
         _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
@@ -1855,7 +1918,7 @@ def test_commit_checkout_changes_allows_benign_low_signal_token() -> None:
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
     runner = _commit_runner(
-        "+++ b/docs/example.md\n+Set the header: token=YOUR_TOKEN_HERE\n", committed
+        {"docs/example.md": b"Set the header: token=YOUR_TOKEN_HERE\n"}, committed
     )
 
     _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
@@ -1867,12 +1930,66 @@ def test_commit_checkout_changes_commits_clean_diff() -> None:
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
-    runner = _commit_runner(
-        "+++ b/app.py\n+def hello():\n+    return 42\n", committed
-    )
+    runner = _commit_runner({"app.py": b"def hello():\n    return 42\n"}, committed)
 
     _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
     assert committed["ran"] is True
+
+
+def test_commit_checkout_changes_names_unreadable_staged_path() -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+
+    committed = {"ran": False}
+    runner = _commit_runner(
+        {"unreadable.dat": b"content"}, committed, unreadable_path="unreadable.dat"
+    )
+
+    with pytest.raises(WorklinkError, match="unreadable\\.dat"):
+        _commit_checkout_changes(
+            Path("/tmp/wt"),
+            IssueContext(441, "worklink slice", "do it", {"worklink"}),
+            runner=runner,
+        )
+    assert committed["ran"] is False
+
+
+def test_commit_checkout_changes_names_staged_path_with_invalid_blob_output() -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+
+    committed = {"ran": False}
+    runner = _commit_runner(
+        {"undecodable.dat": b"content"}, committed, text_blob_path="undecodable.dat"
+    )
+
+    with pytest.raises(WorklinkError, match="undecodable\\.dat"):
+        _commit_checkout_changes(
+            Path("/tmp/wt"),
+            IssueContext(441, "worklink slice", "do it", {"worklink"}),
+            runner=runner,
+        )
+    assert committed["ran"] is False
+
+
+def test_commit_checkout_changes_commits_clean_binary_blob(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _commit_checkout_changes
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    # PNG signature plus invalid UTF-8 demonstrates that scanning is byte-safe.
+    (repo / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\xffclean binary\x00")
+
+    _commit_checkout_changes(
+        repo,
+        IssueContext(441, "worklink slice", "do it", {"worklink"}),
+        runner=_real_git_runner,
+    )
+
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show", "--format=", "--name-only", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == "image.png"
 
 
 def test_authorized_startup_snapshot_uses_publication_only(tmp_path: Path) -> None:
@@ -1909,10 +2026,16 @@ def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path
     calls = []
 
     class Publication:
-        def run(self, *args):
+        def run(self, *args, **kwargs):
             calls.append(args)
             if args == ("diff", "--cached", "--quiet"):
                 return cp(args, returncode=1)
+            if args == (
+                "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
+            ):
+                return cp(args, stdout=b"changed.txt\0")
+            if args[:2] == ("cat-file", "blob"):
+                return cp(args, stdout=b"clean content\n")
             if args == ("rev-parse", "HEAD"):
                 return cp(args, stdout="a" * 40 + "\n")
             return cp(args)
@@ -2140,11 +2263,17 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             self.calls = []
             self.commit_seen = False
 
-        def run(self, *args, check=False):
+        def run(self, *args, check=False, text=True):
             assert self.closed == 0
             self.calls.append(args)
             if scenario == "publication_exception" and args[:2] == ("diff", "--name-only"):
                 raise RuntimeError("publication failed")
+            if args == (
+                "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
+            ):
+                return cp(args, stdout=b"changed.txt\0")
+            if args[:2] == ("cat-file", "blob"):
+                return cp(args, stdout=b"clean content\n")
             if args[:2] == ("diff", "--name-only"):
                 return cp(args, stdout="changed.txt\n")
             if args[:2] == ("diff", "--stat"):
@@ -2153,8 +2282,6 @@ def test_authorized_runner_closes_real_attempt_capabilities(
                 return cp(args, stdout="" if self.commit_seen else "?? changed.txt\n")
             if args == ("diff", "--cached", "--quiet"):
                 return cp(args, returncode=1)
-            if args == ("diff", "--cached", "-U0"):
-                return cp(args)
             if args[0] == "commit":
                 if scenario == "commit_exception":
                     return cp(args, returncode=1, stderr="commit failed")
