@@ -428,6 +428,11 @@ def approve_declassification(
     return "approve_declassification failed: missing live authorization middleware"
 
 
+def _render_approval_metadata(value: object) -> str:
+    """Render one approval-prompt value without allowing line injection."""
+    return json.dumps(value, ensure_ascii=True)
+
+
 @tool
 async def request_operator_approval(
     tool_name: str,
@@ -526,34 +531,40 @@ async def request_operator_approval(
     )
     if request is None:
         return f"request_operator_approval refused: {status}"
+    render = _render_approval_metadata
     if category is None:
         request_details = (
-            f"Tool: {normalized_tool}\n"
-            f"Target: {normalized_target}\n"
+            f"Tool: {render(normalized_tool)}\n"
+            f"Target: {render(normalized_target)}\n"
         )
     else:
         rendered_sources = "\n".join(
             "- "
-            f"principal={source.principal or '(unknown)'}; "
-            f"domain={source.domain or '(unknown)'}; "
-            f"resource_id={source.resource_id or '(unknown)'}; "
-            f"bridge_instance={source.bridge_instance or '(unknown)'}; "
-            f"sensitivity={source.sensitivity}; "
-            f"authorized_principals={','.join(sorted(source.authorized_principals)) or '(none)'}; "
-            f"source_kind={source.source_kind}; integrity={source.integrity}; "
-            f"integrity_effect={source.integrity_effect}"
+            f"principal={render(source.principal or '(unknown)')}; "
+            f"domain={render(source.domain or '(unknown)')}; "
+            f"resource_id={render(source.resource_id or '(unknown)')}; "
+            f"bridge_instance={render(source.bridge_instance or '(unknown)')}; "
+            f"sensitivity={render(source.sensitivity)}; "
+            f"authorized_principals={render(sorted(source.authorized_principals))}; "
+            f"source_kind={render(source.source_kind)}; "
+            f"integrity={render(source.integrity)}; "
+            f"integrity_effect={render(source.integrity_effect)}"
             for source in request_carrier.sources
         ) or "- (none)"
         request_details = (
-            f"Sink category: {category}\n"
-            f"Turn: {ctx.turn_id}\n"
-            f"Requesting principal: {requesting_principal}\n"
+            f"Sink category: {render(category)}\n"
+            f"Turn: {render(ctx.turn_id)}\n"
+            f"Requesting principal: {render(requesting_principal)}\n"
+            "Approval scope: approving authorizes every tool and every destination "
+            "in this sink category for the remainder of this turn.\n"
+            f"Requested tool (non-binding context only): {render(normalized_tool)}\n"
+            f"Requested target (non-binding context only): {render(normalized_target)}\n"
             f"Sources:\n{rendered_sources}\n"
         )
     alert = (
         "Operator approval requested\n"
         f"{request_details}"
-        f"Reason: {normalized_reason or '(none provided)'}\n"
+        f"Reason: {render(normalized_reason or '(none provided)')}\n"
         "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
     )
     try:
