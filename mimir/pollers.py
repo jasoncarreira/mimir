@@ -1497,6 +1497,29 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+def _process_group_has_live_members(process_group: int) -> bool:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return False
+    for stat_path in proc_root.glob("[0-9]*/stat"):
+        try:
+            fields = stat_path.read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) == process_group and fields[0] not in {"Z", "X"}:
+                return True
+        except (OSError, IndexError, ValueError):
+            continue
+    return False
+
+
+async def _wait_process_group_exit(process_group: int) -> None:
+    """Let SIGKILL reach descendants before reporting timeout cleanup done."""
+    deadline = time.monotonic() + 1.0
+    while _process_group_has_live_members(process_group):
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(0.01)
+
+
 async def _drain_capped(
     stream: "asyncio.StreamReader | None",
     limit: int,
@@ -1820,6 +1843,7 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
+                await _wait_process_group_exit(proc.pid)
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -1841,6 +1865,7 @@ async def run_poller(
             except asyncio.TimeoutError:
                 _kill_process_group(proc)
                 await proc.wait()
+                await _wait_process_group_exit(proc.pid)
                 raise
             if _overflow["hit"]:
                 await log_event(
@@ -1900,6 +1925,7 @@ async def run_poller(
             _kill_process_group(proc)
             try:
                 await proc.wait()
+                await _wait_process_group_exit(proc.pid)
             except (ProcessLookupError, asyncio.CancelledError):
                 pass
 

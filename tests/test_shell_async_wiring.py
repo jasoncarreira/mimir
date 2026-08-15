@@ -68,14 +68,18 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ShellJobRe
         command: str, *, argv: list[str], channel_id: str | None,
         on_complete=None, auth_context=None, env_overlay=None, cwd=None,
     ) -> _FakeJob:
+        job = _FakeJob(command=command, channel_id=channel_id)
+        job.auth_context = auth_context
         spawned.append({
             "command": command,
             "argv": argv,
             "channel_id": channel_id,
+            "auth_context": auth_context,
             "env_overlay": env_overlay,
             "cwd": cwd,
+            "job": job,
         })
-        return _FakeJob(command=command, channel_id=channel_id)
+        return job
 
     monkeypatch.setattr(reg, "spawn", _fake_spawn)
     monkeypatch.setattr(reg, "_spawned_log", spawned, raising=False)
@@ -135,6 +139,116 @@ async def test_bash_async_no_registry_returns_error(monkeypatch: pytest.MonkeyPa
     shell_async.set_shell_job_registry(None, on_complete=None)
     out = await shell_async.bash_async.ainvoke({"command": "echo hi"})
     assert "no shell-job registry" in out
+
+
+def _turn_auth(channel_id: str, principal: str):
+    from mimir.models import (
+        AuthContext,
+        InformationFlowLabels,
+        InformationFlowState,
+        SourceLabel,
+        TurnInteractivity,
+    )
+
+    source = SourceLabel(
+        principal=principal,
+        domain="channel:private",
+        resource_id=channel_id,
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({principal}),
+    )
+    labels = InformationFlowLabels().with_source(source)
+    return AuthContext(
+        principal=principal,
+        canonical_principal=principal,
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+
+def _active_turn(turn_id: str, session_id: str, auth):
+    from mimir.models import TurnContext
+
+    return TurnContext(
+        turn_id=turn_id,
+        session_id=auth.channel_id,
+        trigger="user_message",
+        channel_id=auth.channel_id,
+        started_at=0.0,
+        saga_session_id=session_id,
+        auth_context=auth,
+        ifc_labels=auth.ifc_labels,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bash_async_refuses_foreign_session_before_spawn(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+
+    auth_a = _turn_auth("channel-a", "alice")
+    auth_b = _turn_auth("channel-b", "bob")
+    ctx_a = _active_turn("turn-a", "saga-a", auth_a)
+    ctx_b = _active_turn("turn-b", "saga-b", auth_b)
+    token_a = set_current_turn(ctx_a)
+    token_b = set_current_turn(ctx_b)
+    try:
+        out = await shell_async.bash_async.coroutine(  # type: ignore[misc]
+            command="echo secret",
+            session_id="saga-b",
+            runtime=SimpleNamespace(context=auth_a),
+        )
+    finally:
+        reset_current_turn(token_b)
+        reset_current_turn(token_a)
+
+    assert out == (
+        "bash_async refused: session_id belongs to a different channel; "
+        "use the current turn's session_id"
+    )
+    assert fake_registry._spawned_log == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_bash_async_own_session_keeps_caller_routing_auth_and_labels(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+
+    auth_a = _turn_auth("channel-a", "alice")
+    auth_b = _turn_auth("channel-b", "bob")
+    ctx_a = _active_turn("turn-a", "saga-a", auth_a)
+    ctx_b = _active_turn("turn-b", "saga-b", auth_b)
+    # A same-intent job on B must not block A: the duplicate guard is scoped to
+    # the independently established caller channel, not the supplied session.
+    fake_registry._jobs["running-b"] = _FakeJob(
+        job_id="running-b", command="echo caller", channel_id="channel-b",
+    )
+    token_a = set_current_turn(ctx_a)
+    token_b = set_current_turn(ctx_b)
+    try:
+        out = await shell_async.bash_async.coroutine(  # type: ignore[misc]
+            command="echo caller",
+            session_id="saga-a",
+            runtime=SimpleNamespace(context=auth_a),
+        )
+    finally:
+        reset_current_turn(token_b)
+        reset_current_turn(token_a)
+
+    assert "Spawned job" in out
+    spawned = fake_registry._spawned_log[0]  # type: ignore[attr-defined]
+    assert spawned["channel_id"] == "channel-a"
+    assert spawned["auth_context"] is auth_a
+    assert spawned["job"].ifc_labels == auth_a.ifc_labels
 
 
 def test_shell_registry_none_clears_registry_and_callback(tmp_path: Path) -> None:
