@@ -381,6 +381,43 @@ async def test_recent_for_channel_source_allowlist_excludes_api(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_acp_source_survives_default_recent_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+    monkeypatch.delenv("MIMIR_RECENT_SOURCES", raising=False)
+    from mimir.config import Config
+
+    allow = Config.from_env().recent_sources
+    assert isinstance(allow, frozenset)
+    buf = _make_buffer(tmp_path)
+    await buf.append(
+        buf.make_message(
+            channel_id="acp:session",
+            kind="user_message",
+            content="acp prompt",
+            author="alice",
+            source="acp",
+        )
+    )
+    await buf.append(
+        buf.make_message(
+            channel_id="acp:session",
+            kind="user_message",
+            content="api seed",
+            author="benchmark",
+            source="api",
+        )
+    )
+
+    out = buf.recent_for_channel(
+        "acp:session", limit=10, source_allowlist=allow
+    )
+    assert [message.content for message in out] == ["acp prompt"]
+
+
+@pytest.mark.asyncio
 async def test_cross_author_pull_respects_source_allowlist(tmp_path: Path):
     buf = _make_buffer(tmp_path)
     # Same author across 2 channels — but bench-tagged on one of them.

@@ -21,8 +21,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import logging
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -356,6 +359,10 @@ class _ServerControl:
     web_chat: Any | None = None
     mcp_manager: Any | None = None
     panel: Any | None = None
+    identity_resolver: Any | None = None
+    real_dispatcher: bool = False
+    real_runtime: bool = False
+    turns: list[Any] = field(default_factory=list)
 
     def hit(self, name: str) -> None:
         self.events.append(name)
@@ -387,6 +394,7 @@ def _controlled_server_app(
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
     monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
     monkeypatch.setenv("MIMIR_LIVENESS_BEAT_SECONDS", "0")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "false")
     monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path / "missing-source"))
     monkeypatch.setenv("DISCORD_TOKEN", "")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "")
@@ -399,7 +407,7 @@ def _controlled_server_app(
         def has_web_keys(self) -> bool:
             return False
 
-    resolver = Resolver()
+    resolver = control.identity_resolver or Resolver()
     chat_skills = object()
     core = SimpleNamespace(
         identity_resolver=resolver,
@@ -546,10 +554,12 @@ def _controlled_server_app(
             self._rate_limits = object()
 
         async def run_turn(self, event: Any) -> None:
-            return None
+            control.turns.append(event)
 
     class Bundle:
         def __init__(self, adapters: Any) -> None:
+            self.config = config
+            self.core = core
             self.agent = Agent()
             self.turn_logger = object()
             self.message_buffer = object()
@@ -650,7 +660,12 @@ def _controlled_server_app(
     monkeypatch.setattr("mimir.server.seed_prompts", lambda home: None)
     monkeypatch.setattr("mimir.server.seed_scheduler", lambda home: None)
     monkeypatch.setattr("mimir.server.ensure_chainlink_initialized", lambda home: None)
-    monkeypatch.setattr("mimir.server.Dispatcher", Dispatcher)
+    if control.real_dispatcher:
+        from mimir.dispatcher import Dispatcher as ProductionDispatcher
+
+        monkeypatch.setattr("mimir.server.Dispatcher", ProductionDispatcher)
+    else:
+        monkeypatch.setattr("mimir.server.Dispatcher", Dispatcher)
     monkeypatch.setattr("mimir.server.Scheduler", Scheduler)
     monkeypatch.setattr("mimir.server.ChannelRegistry", Channels)
     monkeypatch.setattr("mimir.server.BenchBridge", BenchBridge)
@@ -662,7 +677,8 @@ def _controlled_server_app(
     monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
     monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
     monkeypatch.setattr(mimir.runtime, "create_core_services", create_core_services)
-    monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
+    if not control.real_runtime:
+        monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
     monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: control.hit("preflight"))
     monkeypatch.setattr(mimir.doc_seed, "refresh_docs", lambda home: {})
     monkeypatch.setattr(
@@ -724,6 +740,7 @@ def _controlled_server_app(
     set_global_buffer(None)
     app = build_app(config)
     control.app = app
+    control.dispatcher = app["dispatcher"]
     pairing_notifier = app["pairing_notifier"]
     original_pairing_close = pairing_notifier.aclose
 
@@ -2282,3 +2299,284 @@ class TestHandleEvent:
         event = stub.enqueue.call_args.args[0]
         assert event.source == "api"
         assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+@pytest.mark.asyncio
+async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.tools
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
+    from mimir.acp.daemon import AcpDaemon
+    from mimir.agent import Agent
+    from mimir.dispatcher import Dispatcher
+    from mimir.event_logger import EventLogger
+    from mimir.identities import IdentityResolver, hash_web_key
+    from mimir.models import AgentEvent
+    from mimir.runtime import AgentRuntimeBundle
+
+    class DeterministicModel(GenericFakeChatModel):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> DeterministicModel:
+            return self
+
+    raw_key = "owned-server-acp-key"
+    home = Path(tempfile.mkdtemp(prefix="mimir-server-acp-", dir="/tmp"))
+    state = home / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        json.dumps(
+            {
+                "people": [
+                    {
+                        "canonical": "operator",
+                        "display_name": "Operator",
+                        "aliases": [hash_web_key(raw_key)],
+                        "access": {"roles": ["admin"], "is_service": False},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolver = IdentityResolver(home)
+    resolver.reload()
+    monkeypatch.setattr("mimir.dispatcher.log_event", AsyncMock())
+    control = _ServerControl(
+        identity_resolver=resolver,
+        real_dispatcher=True,
+        real_runtime=True,
+    )
+    app, control = _controlled_server_app(home, monkeypatch, control)
+    monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: [])
+    monkeypatch.setattr(
+        "mimir.event_logger._logger",
+        EventLogger(home / "logs" / "events.jsonl", "failure-isolation"),
+    )
+    model = DeterministicModel(messages=iter([AIMessage(content="turn complete")]))
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", lambda *args, **kwargs: model)
+    monkeypatch.setenv("MIMIR_SYSTEM_PROMPT_OVERRIDE", "Owned failure-isolation test prompt")
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+    await _run_startup(app)
+
+    try:
+        daemon = app["acp_daemon"]
+        bundle = app["agent_runtime"]
+        dispatcher = app["dispatcher"]
+        assert isinstance(daemon, AcpDaemon)
+        assert isinstance(bundle, AgentRuntimeBundle)
+        assert isinstance(bundle.agent, Agent)
+        assert isinstance(dispatcher, Dispatcher)
+        assert daemon._bundle is bundle
+        assert app["runtime_slot"].bundle is bundle
+        assert bundle.adapters is app["runtime_adapters"]
+        assert bundle.adapters.channels is app["channels"]
+        assert dispatcher._run_turn.__self__ is bundle.agent
+
+        reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path))
+        for request in (
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": 1},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "authenticate",
+                "params": {
+                    "methodId": "mimir-web-key",
+                    "_meta": {"mimir.webKey": raw_key},
+                },
+            },
+        ):
+            writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+        await writer.drain()
+        responses = [
+            json.loads(await asyncio.wait_for(reader.readline(), 1.0))
+            for _ in range(2)
+        ]
+        assert [response["id"] for response in responses] == [1, 2]
+        assert all("error" not in response for response in responses)
+
+        writer.transport.abort()
+        for _ in range(100):
+            if not daemon._peers and not daemon._connection_runners:
+                break
+            await asyncio.sleep(0.01)
+        assert not daemon._peers
+        assert not daemon._connection_runners
+
+        event = AgentEvent(
+            trigger="user_message",
+            channel_id="web:unrelated-after-acp-failure",
+            content="unrelated channel turn",
+            author="operator",
+            source="web",
+        )
+        turn_events = bundle.turn_event_bus.subscribe(event.channel_id)
+        try:
+            assert await dispatcher.enqueue(event) is True
+            channel_queue = dispatcher._queues[event.channel_id]
+            await asyncio.wait_for(channel_queue.join(), 10.0)
+            observed_events = []
+            while not turn_events.empty():
+                observed_events.append(turn_events.get_nowait())
+            terminal = next(
+                (
+                    observed
+                    for observed in observed_events
+                    if observed["type"] == "turn" and observed["phase"] == "end"
+                ),
+                None,
+            )
+        finally:
+            bundle.turn_event_bus.unsubscribe(event.channel_id, turn_events)
+
+        assert terminal is not None
+        assert terminal["status"] == "ok"
+        assert bundle.agent._agent_model is model
+        assert bundle._close_task is None
+        assert bundle.adapters.dispatcher is dispatcher
+        assert bundle.adapters.channels is app["channels"]
+        assert bundle.adapters.scheduler is app["scheduler"]
+        assert dispatcher._run_turn.__self__ is bundle.agent
+    finally:
+        await _run_cleanup(app)
+        shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_acp_daemon_uses_published_bundle_and_stops_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+            control.events.append("acp:construct")
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    control.events.clear()
+    await _run_startup(app)
+    assert control.events.count("runtime") == 1
+    assert control.events.index("runtime") < control.events.index("acp:construct")
+    assert control.events.index("acp:construct") < control.events.index("acp:start")
+
+    control.events.clear()
+    await _run_cleanup(app)
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_acp_stop_failure_preserves_shared_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop:failed")
+            raise RuntimeError("peer still owns runtime work")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    await _run_startup(app)
+    control.events.clear()
+    with pytest.raises(ExceptionGroup, match="server cleanup failed"):
+        await _run_cleanup(app)
+    assert "acp:stop:failed" in control.events
+    assert "bundle:close" not in control.events
+    assert "bridges:disconnect" not in control.events
+    assert control.bundle.closed is False
+
+
+@pytest.mark.asyncio
+async def test_acp_is_stopped_before_bundle_on_startup_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("later startup")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        def __init__(self, bundle: Any) -> None:
+            assert bundle is control.bundle
+
+        async def start(self) -> None:
+            control.events.append("acp:start")
+
+        async def stop(self) -> None:
+            control.events.append("acp:stop")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="later startup"):
+        await _run_startup(app)
+    assert control.events.index("acp:start") < control.events.index("indexer:start")
+    assert control.events.index("acp:stop") < control.events.index("bundle:close")
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_compensation_preserves_ownership_for_cleanup_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.acp.daemon
+
+    control = _ServerControl(failures={"indexer:start": RuntimeError("startup failure")})
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    monkeypatch.setenv("MIMIR_ACP_ENABLED", "true")
+
+    class Daemon:
+        stop_calls = 0
+
+        def __init__(self, bundle: Any) -> None:
+            self.bundle = bundle
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            type(self).stop_calls += 1
+            if type(self).stop_calls == 1:
+                raise RuntimeError("peer cleanup incomplete")
+
+    monkeypatch.setattr(mimir.acp.daemon, "AcpDaemon", Daemon)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        await _run_startup(app)
+    assert app["startup_state"].compensated is False
+    assert app["startup_state"].acp_daemon is app["acp_daemon"]
+    assert app["agent_runtime"] is control.bundle
+    assert control.bundle.closed is False
+
+    await _run_cleanup(app)
+    assert Daemon.stop_calls == 2
+    assert app["startup_state"].acp_daemon is None
+    assert app["acp_daemon"] is None
+    assert app["agent_runtime"] is None
+    assert control.bundle.closed is True

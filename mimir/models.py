@@ -609,7 +609,7 @@ class AgentEvent:
     """
 
     trigger: str                      # "user_message" | "scheduled_tick" | "saga_session_end" | ...
-    channel_id: str
+    channel_id: str | None
     content: str = ""
     author: str | None = None
     author_display: str | None = None

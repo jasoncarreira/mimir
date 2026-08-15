@@ -1708,9 +1708,17 @@ class Agent:
             self._cached_coding_enabled = coding_enabled
             return self._agent
 
-    async def run_turn(self, event: AgentEvent) -> TurnRecord:
+    async def run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+    ) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
-        turn_id = make_turn_id()
+        turn_id = turn_id or make_turn_id()
+        explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
@@ -1720,13 +1728,24 @@ class Agent:
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
         )
-        initial_auth_context = _create_turn_auth_context(
-            event,
-            getattr(self, "_identity_resolver", None),
-            policy_version=getattr(self._config, "policy_version", None),
-            enforce=self._config.access_control_enforced,
-            ifc_labels=initial_ifc_labels,
-        )
+        if explicit_session_binding:
+            bound_auth_context = _require_auth_context(event.continuation_auth_context)
+            if not bound_auth_context.enforcement_enabled:
+                raise ValueError("bound turns require enforced authorization")
+            initial_auth_context = replace(
+                bound_auth_context,
+                ifc_labels=initial_ifc_labels,
+                ifc_state=InformationFlowState(labels=initial_ifc_labels),
+                saga_session_id=saga_session_id,
+            )
+        else:
+            initial_auth_context = _create_turn_auth_context(
+                event,
+                getattr(self, "_identity_resolver", None),
+                policy_version=getattr(self._config, "policy_version", None),
+                enforce=self._config.access_control_enforced,
+                ifc_labels=initial_ifc_labels,
+            )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,
@@ -1778,12 +1797,14 @@ class Agent:
                     pass
 
             # Session attach — same as the SDK path.
-            session_id = event.channel_id or "default"
-            saga_session_id: str | None = None
+            session_id = (
+                session_id if explicit_session_binding else event.channel_id or "default"
+            )
+            saga_session_id = saga_session_id if explicit_session_binding else None
             session_egress_state = initial_auth_context.egress_state
-            if event.trigger == "saga_session_end":
+            if not explicit_session_binding and event.trigger == "saga_session_end":
                 saga_session_id = (event.extra or {}).get("saga_session_id")
-            elif self._sessions is not None:
+            elif not explicit_session_binding and self._sessions is not None:
                 channel_visibility = (
                     event.extra.get("channel_visibility", "private")
                     if isinstance(event.extra, Mapping)
@@ -1962,6 +1983,9 @@ class Agent:
                 t_total_start, emitter, initial_auth_context,
             )
             return _turn_record
+        except asyncio.CancelledError as exc:
+            _turn_exc = exc
+            raise
         except Exception as exc:
             _turn_exc = exc
             # chainlink #306 (+ #415): _run_turn_body's model-loop try/except emits
