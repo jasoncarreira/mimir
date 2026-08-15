@@ -39,6 +39,7 @@ from mimir.access_control import ToolRegistry, builtin_trigger_service_principal
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     RepoPRAction,
     RepoPRActionScope,
     RepoPRScopeRegistry,
@@ -1054,7 +1055,7 @@ async def _authenticated_shell_category_runtime(
 
 
 @pytest.mark.asyncio
-async def test_authenticated_category_grant_runs_repeated_sync_handlers(
+async def test_authenticated_category_grant_survives_lost_turn_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1065,22 +1066,54 @@ async def test_authenticated_category_grant_runs_repeated_sync_handlers(
         calls.append(request.tool_call["id"])
         return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
 
+    # Model the SDK/MCP execution fork: the genuine frozen AuthContext and its
+    # IFC state survive, while the ambient task-local TurnContext does not.
     token = set_current_turn(turn)
-    try:
-        first = BudgetGateMiddleware().wrap_tool_call(
-            _make_request("write_file", "file-1", auth, {"file_path": str(tmp_path / "first")}),
-            handler,
-        )
-        second = BudgetGateMiddleware().wrap_tool_call(
-            _make_request("write_file", "file-2", auth, {"file_path": str(tmp_path / "second")}),
-            handler,
-        )
-    finally:
-        reset_current_turn(token)
+    reset_current_turn(token)
+    assert get_current_turn() is None
+    first = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("write_file", "file-1", auth, {"file_path": str(tmp_path / "first")}),
+        handler,
+    )
+    second = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("write_file", "file-2", auth, {"file_path": str(tmp_path / "second")}),
+        handler,
+    )
 
     assert first.status != "error"
     assert second.status != "error"
     assert calls == ["file-1", "file-2"]
+
+
+def test_category_grant_without_turn_context_rejects_different_turn() -> None:
+    from dataclasses import replace
+
+    auth = _ifc_auth()
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    different_auth = replace(
+        auth,
+        ifc_labels=turn.ifc_labels,
+        ifc_state=InformationFlowState(labels=turn.ifc_labels),
+    )
+    handler_calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(_ifc_turn(different_auth))
+    reset_current_turn(token)
+    assert get_current_turn() is None
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("shell_exec", "different-turn", different_auth, {"command": "pwd"}),
+        handler,
+    )
+
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
 
 
 @pytest.mark.asyncio

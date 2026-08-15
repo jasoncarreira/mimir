@@ -317,6 +317,10 @@ class InformationFlowState:
     )
     _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
     _receipt_identity: Any = field(default_factory=object, repr=False, compare=False)
+    # Bound once from the server-issued approval request. This lives on the
+    # durable IFC cell carried by AuthContext so forked SDK/MCP tasks do not
+    # depend on the ambient _current_turn ContextVar to retain turn authority.
+    _sink_category_turn_id: str | None = field(default=None, repr=False, compare=False)
     _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
@@ -402,6 +406,11 @@ class InformationFlowState:
             )
             return merged, receipt
 
+    def sink_category_turn_id(self) -> str | None:
+        """Return the immutable turn binding for reusable sink authority."""
+        with self._lock:
+            return self._sink_category_turn_id
+
     def install_sink_category_capability(
         self,
         *,
@@ -428,8 +437,15 @@ class InformationFlowState:
                 or not fold_receipt.source_arrived
                 or fold_receipt.post_carrier != expected_post
                 or live != fold_receipt.post_carrier
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or self._sink_category_turn_id not in (None, turn_id)
             ):
                 return False
+            # The request's turn id was server-issued and all request/state/fold
+            # bindings above have been authenticated. Bind it once to the same
+            # durable IFC cell that AuthContext carries through execution forks.
+            self._sink_category_turn_id = turn_id
             self._sink_category_capabilities[sink_category] = SinkCategoryCapability(
                 sink_category=sink_category,
                 turn_id=turn_id,
