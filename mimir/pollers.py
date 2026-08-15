@@ -1820,9 +1820,16 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
+                # Reaping the shell does not prove its SIGKILLed children have
+                # exited yet. Give inherited pipes a bounded chance to reach EOF
+                # before returning from timeout cleanup.
+                drain_tasks = set(pending)
+                _, pending = await asyncio.wait(
+                    drain_tasks, timeout=POLLER_EXIT_GRACE_SECONDS,
+                )
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.gather(*drain_tasks, return_exceptions=True)
                 raise asyncio.TimeoutError
             stdout_bytes = stdout_task.result()
             stderr_bytes = stderr_task.result()
