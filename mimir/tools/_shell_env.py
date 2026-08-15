@@ -27,6 +27,7 @@ _GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
 Path(_GH_CONFIG_DIR).chmod(0o500)
 _ALTERNATE_GITHUB_ENV = ("GH_TOKEN", "GH_HOST")
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
+_JQ_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
 _DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
     "mimir_direct_exec_argv", default=None,
 )
@@ -77,6 +78,10 @@ def _is_gh_argv(argv: list[str] | None) -> bool:
     return bool(argv) and Path(argv[0]).name == "gh"
 
 
+def _is_jq_argv(argv: list[str] | None) -> bool:
+    return bool(argv) and Path(argv[0]).name == "jq"
+
+
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
@@ -85,6 +90,17 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     workspace virtualenv. The project test executable and fixed arguments come
     from operator configuration rather than language-specific inference here.
     """
+    if _is_jq_argv(argv):
+        # A jq filter is a program and can read every inherited variable through
+        # env/$ENV. Keep only process settings jq legitimately needs.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _JQ_ENV_NAMES or key.startswith("LC_")
+        }
+        env["PATH"] = _TRUSTED_PATH
+        return env
+
     env = os.environ.copy()
     scrub_model_selection_env(env)
     for key in _ALTERNATE_GITHUB_ENV:
@@ -121,6 +137,13 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     ``ShellJobRegistry`` overlays values onto its own inherited environment.
     """
     overlay: dict[str, str | None] = direct_exec_env(argv)
+    if _is_jq_argv(argv):
+        # ShellJobRegistry starts from its own inherited environment and adds
+        # PYTHONUNBUFFERED before applying this overlay.
+        for key in (*os.environ, "PYTHONUNBUFFERED"):
+            if key not in overlay:
+                overlay[key] = None
+        return overlay
     for key in (*_ALTERNATE_GITHUB_ENV, "GH_CONFIG_DIR", _MODEL_SELECTION_ENV):
         if key in os.environ and key not in overlay:
             overlay[key] = None

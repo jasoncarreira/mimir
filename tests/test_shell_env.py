@@ -186,6 +186,73 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
     assert all(overlay[key] is None for key in scrubbed)
 
 
+def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JQ_ENV_SENTINEL", "super-secret-value")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("HOME", "/safe/home")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("LC_TIME", "C")
+    monkeypatch.setenv("TZ", "UTC")
+
+    argv = ["/usr/bin/jq", "--null-input", "env"]
+    env = direct_exec_env(argv)
+    overlay = direct_exec_env_overlay(argv)
+
+    assert all(
+        key in {"PATH", "HOME", "LANG", "TZ"} or key.startswith("LC_")
+        for key in env
+    )
+    assert env["PATH"] == _shell_env._TRUSTED_PATH
+    assert env["HOME"] == "/safe/home"
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["LC_TIME"] == "C"
+    assert env["TZ"] == "UTC"
+    assert "JQ_ENV_SENTINEL" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert overlay["JQ_ENV_SENTINEL"] is None
+    assert overlay["GITHUB_TOKEN"] is None
+    assert overlay["PYTHONUNBUFFERED"] is None
+
+
+def test_real_jq_cannot_read_parent_credentials_and_still_filters_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jq = shutil.which("jq")
+    if jq is None:
+        pytest.skip("jq is not installed")
+
+    sample = tmp_path / "sample.json"
+    sample.write_text('{"name": "Ada"}\n', encoding="utf-8")
+    sentinel = "super-secret-value-12345"
+    monkeypatch.setenv("JQ_ENV_SENTINEL", sentinel)
+    monkeypatch.setenv("GITHUB_TOKEN", sentinel)
+    commands = (
+        [jq, "--null-input", "env"],
+        [jq, "env", str(sample)],
+        [jq, "$ENV.GITHUB_TOKEN", str(sample)],
+        [jq, "-r", "$ENV|tostring", str(sample)],
+    )
+
+    for argv in commands:
+        completed = subprocess.run(
+            argv, capture_output=True, check=True, env=direct_exec_env(argv), text=True,
+        )
+        assert sentinel not in completed.stdout, argv
+
+    legitimate = [jq, "-r", ".name", str(sample)]
+    completed = subprocess.run(
+        legitimate,
+        capture_output=True,
+        check=True,
+        env=direct_exec_env(legitimate),
+        text=True,
+    )
+    assert completed.stdout == "Ada\n"
+
+
 @pytest.mark.parametrize("arguments", [
     ["api", "user"],
     ["pr", "view", "17"],

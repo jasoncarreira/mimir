@@ -2333,8 +2333,7 @@ def _assert_staged_diff_has_no_secret(
     runner: Runner,
     publication: ControllerGitPublication | None = None,
 ) -> None:
-    """Refuse (raise ``WorklinkError``) if the staged diff adds a secret-shaped
-    token — OR if the scan itself cannot run.
+    """Refuse if a staged blob contains a secret-shaped token or cannot be scanned.
 
     The Worklink factory runs an untrusted backend and then commits, pushes,
     and opens a PR autonomously — so a token the backend emitted into a file
@@ -2342,35 +2341,50 @@ def _assert_staged_diff_has_no_secret(
     factory writes to the target repo, which does NOT carry the /mimir-home
     pre-commit secret hook, so this scan is the guard for that path.
 
-    Two things a security gate must get right:
-
-    * **Fail closed when it can't verify.** ``git diff --cached -U0`` returns 0
-      with the diff on stdout; a non-zero exit is a real failure (bad index,
-      config, permissions), so treat it as "cannot scan" and refuse — never
-      accept empty stdout from a failed command as "clean".
-    * **Match the commit-time policy, not the log redactor.** Use the shared
-      high-signal patterns (``secret_scan.contains_secret``) that mirror the
-      pre-commit hook — NOT ``redaction.redact_text``, whose contract permits
-      false positives and would block benign generated content (a placeholder
-      ``token=`` value in a doc/test).
+    Read index blobs directly: rendered diffs omit content for paths Git treats
+    as binary, including paths marked ``-diff`` by an untrusted attributes file.
+    Byte output also makes arbitrary binary content scannable without relying on
+    subprocess' strict text decoding. Use the shared high-signal patterns
+    (``secret_scan.contains_secret``), not the broader log redactor.
     """
-    diff = (
-        publication.run("diff", "--cached", "-U0")
-        if publication is not None
-        else runner(["git", "-C", str(checkout), "diff", "--cached", "-U0"])
+
+    def run_git_bytes(*args: str) -> subprocess.CompletedProcess:
+        if publication is not None:
+            return publication.run(*args, text=False)
+        return runner(["git", "-C", str(checkout), *args], text=False)
+
+    staged = run_git_bytes(
+        "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
     )
-    if diff.returncode != 0:
+    if staged.returncode != 0:
         raise WorklinkError(
             "cannot scan staged Worklink changes for secrets "
-            f"(git diff --cached exited {diff.returncode}); refusing to commit/push"
+            f"(listing staged paths exited {staged.returncode}); refusing to commit/push"
         )
-    for line in (diff.stdout or "").splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
+    if not isinstance(staged.stdout, bytes):
+        raise WorklinkError(
+            "cannot scan staged Worklink changes for secrets "
+            "(staged path list was not byte output); refusing to commit/push"
+        )
+
+    for raw_path in staged.stdout.split(b"\0"):
+        if not raw_path:
             continue
-        if contains_secret(line):
+        path = os.fsdecode(raw_path)
+        blob = run_git_bytes("cat-file", "blob", f":{path}")
+        if blob.returncode != 0 or not isinstance(blob.stdout, bytes):
+            raise WorklinkError(
+                "cannot scan staged Worklink path "
+                f"{path!r} for secrets; refusing to commit/push"
+            )
+        # surrogateescape preserves every byte while leaving ASCII secret shapes
+        # unchanged, so legitimate binary blobs remain scannable rather than
+        # being blanket-refused or silently skipped.
+        text = blob.stdout.decode("utf-8", errors="surrogateescape")
+        if contains_secret(text):
             # Do not echo the offending line — it holds the secret.
             raise WorklinkError(
-                "staged Worklink changes contain a secret-shaped token; refusing "
+                f"staged Worklink path {path!r} contains a secret-shaped token; refusing "
                 "to commit/push — remove the credential from the changes"
             )
 
@@ -2795,21 +2809,37 @@ def _list_runner(runner: Runner) -> Callable[[Sequence[str]], subprocess.Complet
 
 
 def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
-    def run(args: Sequence[str] | str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def run(
+        args: Sequence[str] | str,
+        cwd: Path | None = None,
+        *,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         if isinstance(args, str):
-            return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
+            return subprocess.run(
+                args, shell=True, cwd=cwd, capture_output=True, text=text, check=False
+            )
         # Chainlink discovers its repository from cwd. Its configured home is
         # authoritative even when a caller also supplies a backend checkout.
         command_cwd = home if args and args[0] == chainlink_bin else cwd
-        return subprocess.run(list(args), cwd=command_cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            list(args), cwd=command_cwd, capture_output=True, text=text, check=False
+        )
 
     return run
 
 
-def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    args: Sequence[str] | str,
+    *,
+    cwd: Path | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
     if isinstance(args, str):
-        return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, check=False)
-    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            args, shell=True, cwd=cwd, capture_output=True, text=text, check=False
+        )
+    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=text, check=False)
 
 
 def _log_event(event_type: str, **payload: Any) -> None:

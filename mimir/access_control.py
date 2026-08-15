@@ -2230,6 +2230,10 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
             option_prefixes=("--exclude=", "--include=", "--exclude-dir="),
         )
     if command == "jq":
+        # Filters are intentionally unconstrained: jq is useful precisely as a
+        # JSON expression language. direct_exec_env() must therefore give the
+        # pinned jq child only a minimal non-secret environment; never replace
+        # that control with a filter-text denylist for env/$ENV.
         return _arguments_match_allowlist(
             arguments,
             exact_options=frozenset({

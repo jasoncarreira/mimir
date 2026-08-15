@@ -56,6 +56,17 @@ def _agent(resolver: IdentityResolver) -> MimirAcpAgent:
     return MimirAcpAgent(bundle)
 
 
+async def _agent_with_session(tmp_path: Path) -> tuple[MimirAcpAgent, str, int]:
+    agent = _agent(_resolver(tmp_path))
+    generation = agent.on_connect(SimpleNamespace())
+    await agent.authenticate(
+        "mimir-web-key",
+        **{"mimir.webKey": "admin-secret"},
+    )
+    session_id = (await agent.new_session("/workspace")).session_id
+    return agent, session_id, generation
+
+
 def _dump(response: Any) -> dict[str, Any]:
     return response.model_dump(
         mode="json",
@@ -325,15 +336,138 @@ async def test_stateful_methods_require_authentication_and_connection(
     assert _error(post_auth.value) == _error(sdk.internal_error())
 
 
-async def test_cancel_is_always_a_no_op(tmp_path: Path) -> None:
-    agent = _agent(_resolver(tmp_path))
+async def test_cancel_from_unauthenticated_peer_leaves_existing_session_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent, session_id, _ = await _agent_with_session(tmp_path)
+    state = agent._sessions[session_id]
+    active = SimpleNamespace(cancelling=False)
+    state.active_prompt = active
+    calls: list[Any] = []
 
-    assert await agent.cancel("missing-session", asserted="authority") is None
+    async def cancel_active(candidate: Any, *, transport: bool) -> bool:
+        calls.append((candidate, transport))
+        return True
+
+    monkeypatch.setattr(agent, "_cancel_active", cancel_active)
+    agent.on_connect(SimpleNamespace())
+
+    with caplog.at_level("INFO", logger="mimir.acp.agent"):
+        assert await agent.cancel(session_id) is None
+
+    assert calls == []
+    assert agent._sessions[session_id] is state
+    assert state.active_prompt is active
+    assert active.cancelling is False
+    assert caplog.records[-1].acp_audit == {
+        "event": "acp_cancel_noop",
+        "session_id": session_id,
+        "reason": "unauthenticated",
+    }
+
+
+async def test_cancel_from_demoted_connection_leaves_successor_prompt_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent, session_id, first_generation = await _agent_with_session(tmp_path)
+    agent.on_connect(SimpleNamespace())
     await agent.authenticate(
         "mimir-web-key",
         **{"mimir.webKey": "admin-secret"},
     )
-    assert await agent.cancel("missing-session") is None
+    await agent.load_session("/successor", session_id)
+    state = agent._sessions[session_id]
+    running_prompt = asyncio.create_task(asyncio.Event().wait())
+    active = SimpleNamespace(cancelling=False, model_task=running_prompt)
+    state.active_prompt = active
+    calls: list[Any] = []
+
+    async def cancel_active(candidate: Any, *, transport: bool) -> bool:
+        calls.append((candidate, transport))
+        return True
+
+    monkeypatch.setattr(agent, "_cancel_active", cancel_active)
+    token = agent._connection_generation.set(first_generation)
+    try:
+        with caplog.at_level("INFO", logger="mimir.acp.agent"):
+            assert await agent.cancel(session_id) is None
+    finally:
+        agent._connection_generation.reset(token)
+        for task in agent._retirement_tasks:
+            task.cancel()
+        await asyncio.gather(*agent._retirement_tasks, return_exceptions=True)
+
+    assert calls == []
+    assert agent._sessions[session_id] is state
+    assert state.active_prompt is active
+    assert active.cancelling is False
+    assert running_prompt.done() is False
+    assert caplog.records[-1].acp_audit == {
+        "event": "acp_cancel_noop",
+        "session_id": session_id,
+        "reason": "not_current_connection",
+    }
+    running_prompt.cancel()
+    await asyncio.gather(running_prompt, return_exceptions=True)
+
+
+async def test_cancel_rejects_session_from_another_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent, session_id, generation = await _agent_with_session(tmp_path)
+    state = agent._sessions[session_id]
+    state.generation = generation + 1
+    active = SimpleNamespace(cancelling=False)
+    state.active_prompt = active
+    calls: list[Any] = []
+
+    async def cancel_active(candidate: Any, *, transport: bool) -> bool:
+        calls.append((candidate, transport))
+        return True
+
+    monkeypatch.setattr(agent, "_cancel_active", cancel_active)
+    with caplog.at_level("INFO", logger="mimir.acp.agent"):
+        assert await agent.cancel(session_id) is None
+
+    assert calls == []
+    assert state.active_prompt is active
+    assert active.cancelling is False
+    assert caplog.records[-1].acp_audit["reason"] == "session_generation_mismatch"
+
+
+async def test_cancel_rejects_session_owned_by_another_principal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent, session_id, _ = await _agent_with_session(tmp_path)
+    state = agent._sessions[session_id]
+    state.record = SimpleNamespace(
+        session_id=session_id,
+        owner_principal="another-operator",
+    )
+    active = SimpleNamespace(cancelling=False)
+    state.active_prompt = active
+    calls: list[Any] = []
+
+    async def cancel_active(candidate: Any, *, transport: bool) -> bool:
+        calls.append((candidate, transport))
+        return True
+
+    monkeypatch.setattr(agent, "_cancel_active", cancel_active)
+    with caplog.at_level("INFO", logger="mimir.acp.agent"):
+        assert await agent.cancel(session_id) is None
+
+    assert calls == []
+    assert state.active_prompt is active
+    assert active.cancelling is False
+    assert caplog.records[-1].acp_audit["reason"] == "session_owner_mismatch"
 
 
 async def test_unknown_extension_request_and_notification_behavior(

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from mimir.acp.profiles import Profile, RemoteProfile
-from mimir.acp.ssh import SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
+from mimir.acp.ssh import SSH_PATH, SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
 
 
 def remote_profile(tmp_path: Path) -> tuple[Profile, Path]:
@@ -46,6 +46,8 @@ def test_exact_argv_is_injection_safe_and_secret_free(tmp_path: Path) -> None:
 
 
 def test_effective_ssh_configuration_disables_forwarding_and_local_commands(tmp_path: Path) -> None:
+    if not SSH_PATH.is_file():
+        pytest.skip("system SSH executable is not installed")
     profile, _ = remote_profile(tmp_path)
     argv = build_ssh_argv(profile)
     result = subprocess.run(

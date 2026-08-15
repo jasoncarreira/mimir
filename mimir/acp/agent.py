@@ -586,12 +586,36 @@ class MimirAcpAgent:
         return response
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        state = self._sessions.get(session_id)
-        active = state.active_prompt if state is not None else None
-        if active is None or not await self._cancel_active(active, transport=False):
-            event = {"event": "acp_cancel_noop", "session_id": session_id}
-            self._audit_events.append(event)
-            _LOGGER.info("acp_cancel_noop", extra={"acp_audit": event})
+        refusal_reason: str | None = None
+        try:
+            owner = self._begin_stateful()
+        except RequestError:
+            connection = self._calling_connection()
+            if connection is None or connection.auth_context is None:
+                refusal_reason = "unauthenticated"
+            elif connection is not self._connection:
+                refusal_reason = "not_current_connection"
+            elif connection.generation != self._generation:
+                refusal_reason = "connection_generation_mismatch"
+            elif connection.closed:
+                refusal_reason = "closed_connection"
+            else:
+                refusal_reason = "authentication_mismatch"
+        else:
+            state = self._sessions.get(session_id)
+            if state is not None and state.generation != self._generation:
+                refusal_reason = "session_generation_mismatch"
+            elif state is not None and state.record.owner_principal != owner:
+                refusal_reason = "session_owner_mismatch"
+            else:
+                active = state.active_prompt if state is not None else None
+                if active is not None and await self._cancel_active(active, transport=False):
+                    return None
+        event = {"event": "acp_cancel_noop", "session_id": session_id}
+        if refusal_reason is not None:
+            event["reason"] = refusal_reason
+        self._audit_events.append(event)
+        _LOGGER.info("acp_cancel_noop", extra={"acp_audit": event})
         return None
 
     async def _cancel_active(self, active: ActivePrompt, *, transport: bool) -> bool:
