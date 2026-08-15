@@ -312,6 +312,15 @@ class InformationFlowState:
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,
     )
+    _sink_category_capabilities: dict[str, "SinkCategoryCapability"] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+    _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
+    _receipt_identity: Any = field(default_factory=object, repr=False, compare=False)
+    # Bound once from the server-issued approval request. This lives on the
+    # durable IFC cell carried by AuthContext so forked SDK/MCP tasks do not
+    # depend on the ambient _current_turn ContextVar to retain turn authority.
+    _sink_category_turn_id: str | None = field(default=None, repr=False, compare=False)
     _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
@@ -329,28 +338,123 @@ class InformationFlowState:
                 and current.has_untrusted_active_ingest
             )
 
+    def source_arrival_ordinal(self) -> int:
+        with self._lock:
+            return self._source_arrival_ordinal
+
+    def source_snapshot(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> tuple[InformationFlowLabels | None, int]:
+        with self._lock:
+            current = self.labels if self.labels is not None else fallback
+            return current, self._source_arrival_ordinal
+
     def merge(
         self,
         added: InformationFlowLabels,
         fallback: InformationFlowLabels | None = None,
     ) -> InformationFlowLabels:
         """Atomically union labels so concurrent tool results cannot attenuate state."""
+        merged, _ = self.merge_with_receipt(added, fallback=fallback)
+        return merged
+
+    def merge_with_receipt(
+        self,
+        added: InformationFlowLabels,
+        fallback: InformationFlowLabels | None = None,
+        *,
+        event_identity: Any = None,
+    ) -> tuple[InformationFlowLabels, "SourceFoldReceipt"]:
         with self._lock:
             current = self.labels if self.labels is not None else fallback
-            merged = InformationFlowLabels()
-            for carrier in (current, added):
-                if not isinstance(carrier, InformationFlowLabels):
-                    continue
-                for label in carrier.labels:
+            merged = current if isinstance(current, InformationFlowLabels) else InformationFlowLabels()
+            if isinstance(added, InformationFlowLabels):
+                for label in added.labels:
                     merged = merged.with_label(label)
-                for channel in carrier.source_channels:
+                for channel in added.source_channels:
                     merged = merged.with_channel(channel)
-                for source in carrier.sources:
+                for source in added.sources:
                     merged = merged.with_source(source)
-            if current is not None and merged != current:
+            changed = not isinstance(current, InformationFlowLabels) or merged != current
+            source_changed = (
+                changed
+                and isinstance(current, InformationFlowLabels)
+                and merged.sources != current.sources
+            ) or (changed and not isinstance(current, InformationFlowLabels) and bool(merged.sources))
+            source_arrived = source_changed or (
+                event_identity is not None
+                and isinstance(added, InformationFlowLabels)
+                and bool(added.sources)
+            )
+            pre_ordinal = self._source_arrival_ordinal
+            if source_arrived:
+                self._source_arrival_ordinal += 1
+            if changed and current is not None:
                 self._declassification = None
+            if (changed and current is not None) or source_arrived:
+                self._sink_category_capabilities.clear()
             self.labels = merged
-            return merged
+            receipt = SourceFoldReceipt(
+                pre_carrier=current if isinstance(current, InformationFlowLabels) else None,
+                post_carrier=merged,
+                pre_source_arrival_ordinal=pre_ordinal,
+                post_source_arrival_ordinal=self._source_arrival_ordinal,
+                event_identity=event_identity,
+                source_changed=source_changed,
+                source_arrived=source_arrived,
+                _state_identity=self._receipt_identity,
+            )
+            return merged, receipt
+
+    def sink_category_turn_id(self) -> str | None:
+        """Return the immutable turn binding for reusable sink authority."""
+        with self._lock:
+            return self._sink_category_turn_id
+
+    def install_sink_category_capability(
+        self,
+        *,
+        sink_category: str,
+        turn_id: str,
+        canonical_principal: str,
+        request_carrier: InformationFlowLabels,
+        request_source_arrival_ordinal: int,
+        approval_event: Any,
+        reply_source: SourceLabel,
+        fold_receipt: "SourceFoldReceipt",
+    ) -> bool:
+        with self._lock:
+            live = self.labels
+            expected_post = request_carrier.with_source(reply_source)
+            if (
+                approval_event is None
+                or fold_receipt.event_identity is None
+                or fold_receipt._state_identity is not self._receipt_identity
+                or fold_receipt.event_identity is not approval_event
+                or fold_receipt.pre_carrier != request_carrier
+                or fold_receipt.pre_source_arrival_ordinal != request_source_arrival_ordinal
+                or fold_receipt.post_source_arrival_ordinal != request_source_arrival_ordinal + 1
+                or not fold_receipt.source_arrived
+                or fold_receipt.post_carrier != expected_post
+                or live != fold_receipt.post_carrier
+                or not isinstance(turn_id, str)
+                or not turn_id
+                or self._sink_category_turn_id not in (None, turn_id)
+            ):
+                return False
+            # The request's turn id was server-issued and all request/state/fold
+            # bindings above have been authenticated. Bind it once to the same
+            # durable IFC cell that AuthContext carries through execution forks.
+            self._sink_category_turn_id = turn_id
+            self._sink_category_capabilities[sink_category] = SinkCategoryCapability(
+                sink_category=sink_category,
+                turn_id=turn_id,
+                canonical_principal=canonical_principal,
+                labels=live.labels,
+                source_channels=live.source_channels,
+                sources=live.sources,
+            )
+            return True
 
     def approve_sink_once(
         self,
@@ -390,29 +494,64 @@ class InformationFlowState:
         sink_category: str,
         destination: str,
         canonical_principal: str,
+        turn_id: str | None = None,
     ) -> bool:
-        """Atomically consume a matching, unexpired, one-use sink capability."""
+        """Admit an exact one-shot or matching reusable category capability."""
         with self._lock:
-            capability = self._declassification
-            if capability is None:
-                return False
-            if time.monotonic() > capability.expires_at:
-                self._declassification = None
-                return False
             live = self.labels if self.labels is not None else current
-            matches = (
-                capability.sink_category == sink_category
-                and capability.destination == destination
-                and capability.canonical_principal == canonical_principal
+            capability = self._declassification
+            if capability is not None:
+                if time.monotonic() > capability.expires_at:
+                    self._declassification = None
+                else:
+                    matches = (
+                        capability.sink_category == sink_category
+                        and capability.destination == destination
+                        and capability.canonical_principal == canonical_principal
+                        and isinstance(live, InformationFlowLabels)
+                        and capability.labels == live.labels == current.labels
+                        and capability.source_channels == live.source_channels == current.source_channels
+                        and capability.sources == live.sources == current.sources
+                    )
+                    if matches:
+                        self._declassification = None
+                        return True
+            category_capability = self._sink_category_capabilities.get(sink_category)
+            return bool(
+                turn_id is not None
+                and category_capability is not None
+                and category_capability.turn_id == turn_id
+                and category_capability.canonical_principal == canonical_principal
                 and isinstance(live, InformationFlowLabels)
-                and capability.labels == live.labels == current.labels
-                and capability.source_channels == live.source_channels == current.source_channels
-                and capability.sources == live.sources == current.sources
+                and category_capability.labels == live.labels == current.labels
+                and category_capability.source_channels == live.source_channels == current.source_channels
+                and category_capability.sources == live.sources == current.sources
             )
-            if not matches:
-                return False
-            self._declassification = None
-            return True
+
+
+@dataclass(frozen=True)
+class SourceFoldReceipt:
+    pre_carrier: InformationFlowLabels | None
+    post_carrier: InformationFlowLabels
+    pre_source_arrival_ordinal: int
+    post_source_arrival_ordinal: int
+    event_identity: Any
+    source_changed: bool
+    source_arrived: bool
+    _state_identity: Any = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class SinkCategoryCapability:
+    sink_category: str
+    turn_id: str
+    canonical_principal: str
+    labels: frozenset[str]
+    source_channels: frozenset[str]
+    sources: tuple[SourceLabel, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sources", _dedup_source_labels(self.sources))
 
 
 @dataclass(frozen=True)

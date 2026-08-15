@@ -1544,9 +1544,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            end_protected_result_capture(capture_token)
+            provenance = end_protected_result_capture(capture_token)
             result_labels = _result_labels_for_call(
-                tool_name, request, auth_context, authorization, failed=True,
+                tool_name,
+                request,
+                auth_context,
+                authorization,
+                provenance=provenance,
+                failed=True,
             )
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(
@@ -1820,9 +1825,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            end_protected_result_capture(capture_token)
+            provenance = end_protected_result_capture(capture_token)
             result_labels = _result_labels_for_call(
-                tool_name, request, auth_context, authorization, failed=True,
+                tool_name,
+                request,
+                auth_context,
+                authorization,
+                provenance=provenance,
+                failed=True,
             )
             _merge_result_labels(auth_context, result_labels)
             _emit_tool_call_sync(

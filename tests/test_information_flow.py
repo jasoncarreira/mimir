@@ -51,6 +51,7 @@ from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
 from mimir.harness_egress import harness_sink_allowed
+from mimir import operator_approval
 from mimir.models import (
     AgentEvent,
     AuthContext,
@@ -3513,3 +3514,309 @@ def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> N
         target_channel=event.channel_id, ifc_labels=labels,
     )
     assert reply.allowed is True
+
+
+def _approval_reply_source() -> SourceLabel:
+    return SourceLabel(
+        principal="admin-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"admin-1"}),
+    )
+
+
+def _install_category_capability() -> tuple[
+    InformationFlowState, InformationFlowLabels, SourceLabel, object
+]:
+    request_carrier = _labels()
+    state = InformationFlowState(labels=request_carrier)
+    event = object()
+    reply_source = _approval_reply_source()
+    _, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source), event_identity=event,
+    )
+    assert state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS",
+        turn_id="turn-1",
+        canonical_principal="user-1",
+        request_carrier=request_carrier,
+        request_source_arrival_ordinal=0,
+        approval_event=event,
+        reply_source=reply_source,
+        fold_receipt=receipt,
+    )
+    return state, state.current(), reply_source, event
+
+
+def test_category_capability_is_reusable_and_coexists_with_exact_one_shot():
+    state, current, _, _ = _install_category_capability()
+    assert current is not None
+    assert state.approve_sink_once(
+        fallback=None,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+        lifetime_seconds=60,
+        durable_audit=lambda *_: True,
+    )
+
+    assert state.consume_sink_approval(
+        current=current,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+        turn_id="turn-1",
+    )
+    for destination in ("first", "second"):
+        assert state.consume_sink_approval(
+            current=current,
+            sink_category="SHELL_PROCESS",
+            destination=destination,
+            canonical_principal="user-1",
+            turn_id="turn-1",
+        )
+    assert not state.consume_sink_approval(
+        current=current,
+        sink_category="SHELL_PROCESS",
+        destination="third",
+        canonical_principal="other-user",
+        turn_id="turn-1",
+    )
+    assert not state.consume_sink_approval(
+        current=current,
+        sink_category="SHELL_PROCESS",
+        destination="third",
+        canonical_principal="user-1",
+        turn_id="turn-2",
+    )
+
+
+def test_reusable_category_capability_has_no_legacy_exact_expiry(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr("mimir.models.time.monotonic", lambda: now)
+    state, current, _, _ = _install_category_capability()
+    assert current is not None
+    assert state.approve_sink_once(
+        fallback=None,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+        lifetime_seconds=60,
+        durable_audit=lambda *_: True,
+    )
+
+    now = 161.0
+    assert not state.consume_sink_approval(
+        current=current,
+        sink_category="SHELL_PROCESS",
+        destination="exact-command",
+        canonical_principal="user-1",
+    )
+    for destination in ("exact-command", "later-command", "latest-command"):
+        assert state.consume_sink_approval(
+            current=current,
+            sink_category="SHELL_PROCESS",
+            destination=destination,
+            canonical_principal="user-1",
+            turn_id="turn-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("approval_event", "receipt_event"),
+    ((None, None), (None, object()), (object(), None)),
+    ids=("both-absent", "approval-absent", "receipt-absent"),
+)
+def test_category_install_rejects_absent_event_identity(
+    approval_event: object | None, receipt_event: object | None,
+):
+    request_carrier = _labels()
+    state = InformationFlowState(labels=request_carrier)
+    reply_source = _approval_reply_source()
+    _, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source),
+        event_identity=receipt_event,
+    )
+
+    assert not state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS",
+        turn_id="turn-1",
+        canonical_principal="user-1",
+        request_carrier=request_carrier,
+        request_source_arrival_ordinal=0,
+        approval_event=approval_event,
+        reply_source=reply_source,
+        fold_receipt=receipt,
+    )
+
+
+def test_category_install_requires_exact_next_reply_fold_and_live_snapshot():
+    request_carrier = _labels()
+    reply_source = _approval_reply_source()
+    state = InformationFlowState(labels=request_carrier)
+    expected_event = object()
+    _, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source), event_identity=object(),
+    )
+    assert not state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS", turn_id="turn-1",
+        canonical_principal="user-1", request_carrier=request_carrier,
+        request_source_arrival_ordinal=0, approval_event=expected_event,
+        reply_source=reply_source, fold_receipt=receipt,
+    )
+
+    state = InformationFlowState(labels=request_carrier)
+    intervening = SourceLabel(
+        principal="user-2", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-2"}),
+    )
+    state.merge(InformationFlowLabels().with_source(intervening))
+    _, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source), event_identity=expected_event,
+    )
+    assert not state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS", turn_id="turn-1",
+        canonical_principal="user-1", request_carrier=request_carrier,
+        request_source_arrival_ordinal=0, approval_event=expected_event,
+        reply_source=reply_source, fold_receipt=receipt,
+    )
+
+
+def test_category_install_rejects_post_fold_race_and_includes_reply_source():
+    request_carrier = _labels()
+    state = InformationFlowState(labels=request_carrier)
+    event = object()
+    reply_source = _approval_reply_source()
+    post, receipt = state.merge_with_receipt(
+        InformationFlowLabels().with_source(reply_source), event_identity=event,
+    )
+    later = SourceLabel(
+        principal="user-3", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-3"}),
+    )
+    state.merge(InformationFlowLabels().with_source(later))
+    assert reply_source in post.sources
+    assert not state.install_sink_category_capability(
+        sink_category="SHELL_PROCESS", turn_id="turn-1",
+        canonical_principal="user-1", request_carrier=request_carrier,
+        request_source_arrival_ordinal=0, approval_event=event,
+        reply_source=reply_source, fold_receipt=receipt,
+    )
+
+
+def test_category_capability_survives_duplicate_merge_but_not_new_source():
+    state, current, _, _ = _install_category_capability()
+    assert current is not None
+    state.merge(current)
+    assert state.consume_sink_approval(
+        current=current, sink_category="SHELL_PROCESS", destination="one",
+        canonical_principal="user-1", turn_id="turn-1",
+    )
+    state.merge(InformationFlowLabels().with_source(SourceLabel(
+        principal="user-4", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-4"}),
+    )))
+    live = state.current()
+    assert live is not None
+    assert not state.consume_sink_approval(
+        current=live, sink_category="SHELL_PROCESS", destination="two",
+        canonical_principal="user-1", turn_id="turn-1",
+    )
+
+
+@pytest.mark.parametrize(
+    "mismatched_binding",
+    (
+        "request_id",
+        "channel_id",
+        "tool_name",
+        "target",
+        "turn_id",
+        "requesting_principal",
+        "sink_category",
+        "request_carrier",
+        "ifc_state",
+        "request_source_arrival_ordinal",
+        "approval_event",
+        "reply_source",
+    ),
+)
+def test_category_grant_binds_every_dimension_and_mismatch_spends_it(
+    mismatched_binding: str,
+):
+    class Resolver:
+        def resolve(self, principal):
+            return "admin-1" if principal == "slack-admin" else None
+
+        def access_metadata(self, principal):
+            return SimpleNamespace(is_admin=True, is_service=False)
+
+    channel = f"slack-category-record-{mismatched_binding}"
+    request_carrier = _labels(channel)
+    state = InformationFlowState(labels=request_carrier)
+    reply_source = _approval_reply_source()
+    event = AgentEvent(
+        trigger="user_message", channel_id=channel, content="APPROVE",
+        author="slack-admin", source="slack",
+    )
+    request, status = operator_approval.create_request(
+        channel_id=channel, tool_name="request_operator_approval", target="shell",
+        requesting_principal="user-1", turn_id="turn-1",
+        sink_category="SHELL_PROCESS", request_carrier=request_carrier,
+        ifc_state=state, request_source_arrival_ordinal=0,
+    )
+    assert status == "pending" and request is not None
+    assert operator_approval.record_authenticated_response(
+        event, Resolver(), approval_event=event, reply_source=reply_source,
+    ) == "granted"
+    valid = {
+        "channel_id": channel,
+        "tool_name": "request_operator_approval",
+        "target": "shell",
+        "request_id": request.request_id,
+        "turn_id": "turn-1",
+        "requesting_principal": "user-1",
+        "sink_category": "SHELL_PROCESS",
+        "request_carrier": request_carrier,
+        "ifc_state": state,
+        "request_source_arrival_ordinal": 0,
+        "approval_event": event,
+        "reply_source": reply_source,
+    }
+    mismatches = {
+        "request_id": "different-request",
+        "channel_id": f"{channel}-different",
+        "tool_name": "different-tool",
+        "target": "different-target",
+        "turn_id": "turn-2",
+        "requesting_principal": "user-2",
+        "sink_category": "NETWORK_FETCH",
+        "request_carrier": _labels(channel, principal="user-2"),
+        "ifc_state": InformationFlowState(labels=request_carrier),
+        "request_source_arrival_ordinal": 1,
+        "approval_event": replace(event),
+        "reply_source": replace(reply_source, principal="admin-2"),
+    }
+    mismatched = {**valid, mismatched_binding: mismatches[mismatched_binding]}
+
+    try:
+        assert operator_approval.consume_grant(
+            mismatched.pop("channel_id"),
+            mismatched.pop("tool_name"),
+            mismatched.pop("target"),
+            **mismatched,
+        ) is None
+        retry = valid.copy()
+        assert operator_approval.consume_grant(
+            retry.pop("channel_id"),
+            retry.pop("tool_name"),
+            retry.pop("target"),
+            **retry,
+        ) is None
+    finally:
+        operator_approval.clear_channel(channel)

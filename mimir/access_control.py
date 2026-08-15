@@ -126,6 +126,30 @@ class SinkCategory(StrEnum):
     UNKNOWN = "unknown"
 
 
+_SINK_CATEGORY_CAPABILITY_ELIGIBLE = frozenset({
+    SinkCategory.SAME_CHANNEL,
+    SinkCategory.CROSS_CHANNEL,
+    SinkCategory.PUBLIC,
+    SinkCategory.SHELL_PROCESS,
+    SinkCategory.SPAWN,
+    SinkCategory.NOTIFICATION,
+    SinkCategory.FILE,
+    SinkCategory.DIRECT_MESSAGE,
+    SinkCategory.SAGA,
+    SinkCategory.SCHEDULER,
+    SinkCategory.PROPOSAL,
+    SinkCategory.FORGE,
+})
+
+assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
+    SinkCategory.NETWORK,
+    SinkCategory.HTTP_WEBHOOK,
+    SinkCategory.EXTERNAL_MCP,
+    SinkCategory.HARNESS_DISPLAY,
+    SinkCategory.UNKNOWN,
+}
+
+
 class CapabilityTier(StrEnum):
     """Blast-radius ceiling for authority declared by autonomous triggers."""
 
@@ -4711,6 +4735,33 @@ def _forge_repository_scope_mismatch(
     return None
 
 
+def _sink_category_capability_turn_id(auth_context: Any) -> str | None:
+    """Resolve reusable authority from the durable AuthContext IFC carrier."""
+    from ._context import get_current_turn
+
+    state = getattr(auth_context, "ifc_state", None)
+    get_bound_turn_id = getattr(state, "sink_category_turn_id", None)
+    if not callable(get_bound_turn_id):
+        return None
+    turn_id = get_bound_turn_id()
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+
+    # Forked SDK/MCP tasks can legitimately lose the ContextVar. The immutable
+    # request binding on the genuine IFC state remains authoritative there. If
+    # ambient turn context is present, retain the stronger cross-check so a
+    # carrier attached to another TurnContext still fails closed.
+    turn = get_current_turn()
+    if turn is None:
+        return turn_id
+    if (
+        getattr(turn, "turn_id", None) != turn_id
+        or getattr(getattr(turn, "auth_context", None), "ifc_state", None) is not state
+    ):
+        return None
+    return turn_id
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -5292,6 +5343,11 @@ class SinkGate:
                     sink_category=sink_category.value,
                     destination=normalized_target,
                     canonical_principal=canonical_principal,
+                    turn_id=(
+                        _sink_category_capability_turn_id(auth_context)
+                        if sink_category in _SINK_CATEGORY_CAPABILITY_ELIGIBLE
+                        else None
+                    ),
                 )
             ):
                 return ToolAuthorization(
