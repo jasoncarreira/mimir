@@ -54,6 +54,7 @@ import logging
 from typing import Any
 
 from mimir._llm_retry import _retry_async, _retry_sync
+from mimir._reasoning_effort import validate_effort
 
 log = logging.getLogger(__name__)
 
@@ -334,8 +335,8 @@ async def _call_codex_plus_async(
 
     ``max_tokens``/``temperature`` are accepted but unused: the Codex
     responses API (as surfaced by ChatCodexPlus) doesn't expose them.
-    ``reasoning_effort="none"`` keeps inference cheap and matches mimir's
-    main-agent codex-plus construction (agent.py).
+    Reasoning effort defaults to ``"none"`` to keep inference cheap, and can
+    be overridden through saga's LLM configuration.
 
     A fresh ChatCodexPlus is built per call so its async HTTP client
     binds to the *calling* loop — saga runs on different loops across
@@ -368,10 +369,13 @@ async def _call_codex_plus_async(
     if system:
         messages.append(SystemMessage(content=system))
     messages.append(HumanMessage(content=prompt))
+    reasoning_effort = validate_effort(
+        "codex-plus", str(llm.get("reasoning_effort") or "none")
+    )
     try:
         chat = ChatCodexPlus(
             model=llm.get("model") or "gpt-5.4",
-            reasoning_effort="none",
+            reasoning_effort=reasoning_effort,
             timeout_seconds=float(llm.get("timeout", 120)),
         )
         result = await chat.ainvoke(messages)

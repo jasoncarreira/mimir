@@ -71,6 +71,8 @@ from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
 from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
+from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
+from ._reasoning_effort import validate_effort as _validate_effort
 from .jsonl_snapshot import JsonlSnapshot
 from .models import (
     AgentEvent,
@@ -639,33 +641,6 @@ def _supports_responses_api() -> bool:
         return True
     parsed_host = (_urlparse(base_url).hostname or "").lower()
     return parsed_host == "api.openai.com"
-
-
-# Reasoning-effort levels each provider accepts, for fail-fast validation.
-# Mirrors what the provider packages enforce internally (codex's
-# VALID_REASONING_EFFORTS frozenset, langchain-anthropic / claude-agent-sdk
-# Literals, OpenAI's gpt-5 levels) so a bad MIMIR_MODEL_REASONING_EFFORT is
-# caught here at model construction — with the valid set named — rather than
-# erroring deep in a provider call on the first turn. NOTE "none" is
-# Codex-only (the others have no "no-reasoning" level).
-_EFFORT_LEVELS: dict[str, frozenset[str]] = {
-    "codex-plus": frozenset({"none", "low", "medium", "high", "xhigh"}),
-    "openai": frozenset({"minimal", "low", "medium", "high"}),
-    "anthropic": frozenset({"low", "medium", "high", "xhigh", "max"}),
-    "claude-code": frozenset({"low", "medium", "high", "max"}),
-}
-
-
-def _validate_effort(provider: str, effort: str) -> str:
-    """Return ``effort`` unchanged if valid for ``provider``, else raise
-    ValueError naming the accepted set. Unknown providers pass through."""
-    valid = _EFFORT_LEVELS.get(provider)
-    if valid is not None and effort not in valid:
-        raise ValueError(
-            f"MIMIR_MODEL_REASONING_EFFORT={effort!r} is not a valid reasoning "
-            f"effort for provider {provider!r}; choose one of {sorted(valid)}"
-        )
-    return effort
 
 
 def resolve_model_from_config(
