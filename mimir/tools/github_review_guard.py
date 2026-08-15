@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .refusals import ToolPolicyRefusal
+
 
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
@@ -51,6 +53,20 @@ def _option_value(argv: list[str], names: set[str]) -> str | None:
     return None
 
 
+def _review_segment(argv: list[str]) -> list[str] | None:
+    start = 0
+    for index in range(len(argv) + 1):
+        if index < len(argv):
+            token = argv[index]
+            if not token or not all(character in "();|&\n" for character in token):
+                continue
+        segment = argv[start:index]
+        if len(segment) >= 3 and Path(segment[0]).name == "gh" and segment[1:3] == ["pr", "review"]:
+            return segment
+        start = index + 1
+    return None
+
+
 def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
     if str((request.tool_call or {}).get("name") or "") not in {
         "shell_exec", "bash_async", "Bash", "bash",
@@ -64,23 +80,26 @@ def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
     command = args.get("command")
     if not isinstance(command, str):
         return None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="();|&\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    argv: list[str] = []
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="();|&")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        argv = list(lexer)
-    except ValueError:
+        while (token := lexer.get_token()) is not None:
+            argv.append(token)
+    except ValueError as exc:
+        if _review_segment(argv) is not None:
+            raise ToolPolicyRefusal(
+                f"GitHub review submission refused: shell command could not be parsed ({exc})",
+            ) from exc
         return None
-    controls = {"&&", "||", ";", "|", "&", "(", ")"}
-    start = 0
-    for index in range(len(argv) + 1):
-        if index < len(argv) and argv[index] not in controls:
-            continue
-        segment = argv[start:index]
-        if len(segment) >= 3 and Path(segment[0]).name == "gh" and segment[1:3] == ["pr", "review"]:
-            return segment, cwd
-        start = index + 1
-    return None
+    segment = _review_segment(argv)
+    return (segment, cwd) if segment is not None else None
+
+
+def _review_refusal(reason: str) -> ToolPolicyRefusal:
+    return ToolPolicyRefusal(f"GitHub review submission refused: {reason}")
 
 
 def review_submission_from_request(request: Any) -> ReviewSubmission | None:
@@ -88,38 +107,51 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
     if parsed is None:
         return None
     argv, cwd = parsed
-    if len(argv) < 4 or Path(argv[0]).name != "gh" or argv[1:3] != ["pr", "review"]:
+    if len(argv) < 3 or Path(argv[0]).name != "gh" or argv[1:3] != ["pr", "review"]:
         return None
+    if len(argv) < 4:
+        raise _review_refusal("an approval, change request, or comment flag is required")
 
     state_flags = {
         "--approve": "APPROVED",
+        "-a": "APPROVED",
         "--request-changes": "CHANGES_REQUESTED",
+        "-r": "CHANGES_REQUESTED",
         "--comment": "COMMENTED",
+        "-c": "COMMENTED",
     }
-    states = {state for flag, state in state_flags.items() if flag in argv[3:]}
-    if len(states) != 1:
-        return None
-
-    value_options = {"--repo", "-R", "--body", "--body-file"}
+    value_options = {"--repo", "-R", "--body", "-b", "--body-file", "-F"}
+    states: set[str] = set()
     number: int | None = None
     index = 3
     while index < len(argv):
         value = argv[index]
+        if value in state_flags:
+            states.add(state_flags[value])
+            index += 1
+            continue
         if value in value_options:
+            if index + 1 >= len(argv):
+                raise _review_refusal(f"option {value} requires a value")
             index += 2
             continue
         if any(value.startswith(f"{option}=") for option in value_options):
             index += 1
             continue
-        if not value.startswith("-"):
-            try:
-                number = int(value)
-            except ValueError:
-                return None
-            break
+        if value.startswith("-"):
+            raise _review_refusal(f"unrecognised option {value}")
+        try:
+            parsed_number = int(value)
+        except ValueError:
+            raise _review_refusal(f"pull request number is not an integer: {value}") from None
+        if number is not None:
+            raise _review_refusal("more than one pull request number was provided")
+        number = parsed_number
         index += 1
+    if len(states) != 1:
+        raise _review_refusal("exactly one review state flag is required")
     if number is not None and number <= 0:
-        return None
+        raise _review_refusal("pull request number must be positive")
     repo = _option_value(argv[3:], {"--repo", "-R"})
     return ReviewSubmission(argv[0], repo, number, states.pop(), cwd)
 
