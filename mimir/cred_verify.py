@@ -53,6 +53,10 @@ log = logging.getLogger(__name__)
 
 
 CredType = Literal["A", "B", "C", "D"]
+ProbeKind = Literal[
+    "subprocess", "format", "all_env_set", "not_implemented", "python",
+]
+ProbeStatus = Literal["passed", "failed", "skipped"]
 
 
 @dataclass
@@ -61,11 +65,19 @@ class ProbeResult:
 
     name: str
     cred_type: CredType
-    ok: bool
+    status: ProbeStatus
     detail: str
 
+    @property
+    def ok(self) -> bool:
+        return self.status == "passed"
+
+    @property
+    def skipped(self) -> bool:
+        return self.status == "skipped"
+
     def render(self) -> str:
-        status = "OK" if self.ok else "FAIL"
+        status = "SKIP" if self.skipped else "OK" if self.ok else "FAIL"
         return f"[{self.cred_type}] {status}  {self.name}: {self.detail}"
 
 
@@ -77,6 +89,7 @@ class Probe:
     cred_type: CredType
     env_vars: tuple[str, ...]
     description: str
+    kind: ProbeKind
     fn: Callable[[], tuple[bool, str]]
     source: str   # where the manifest lived (for debugging duplicates)
 
@@ -318,7 +331,7 @@ def _build_probe_from_spec(
 
     return Probe(
         name=name, cred_type=cred_type, env_vars=env_vars,
-        description=description, fn=fn, source=str(manifest_path),
+        description=description, kind=kind, fn=fn, source=str(manifest_path),
     )
 
 
@@ -417,7 +430,7 @@ def reset_probes_cache() -> None:
 
 def verify(name: str, home: Path | None = None) -> ProbeResult:
     """Run a single probe by registry name. Returns a
-    ``ProbeResult(ok=False, detail='unknown credential: ...')`` if
+    failed ``ProbeResult`` with ``detail='unknown credential: ...'`` if
     the name isn't registered — Phase 3 (rotation) calls this inline
     and doesn't want a bare ``KeyError`` on a typo."""
     probes = get_probes(home)
@@ -428,12 +441,17 @@ def verify(name: str, home: Path | None = None) -> ProbeResult:
         # cred_type for error handling should check ``ok`` first.
         # If/when CredType gains a "?" or "unknown" value, swap this.
         return ProbeResult(
-            name=name, cred_type="A", ok=False,
+            name=name, cred_type="A", status="failed",
             detail=f"unknown credential: {name!r}",
         )
     ok, detail = probe.fn()
+    status: ProbeStatus
+    if probe.kind == "not_implemented":
+        status = "skipped"
+    else:
+        status = "passed" if ok else "failed"
     return ProbeResult(
-        name=probe.name, cred_type=probe.cred_type, ok=ok, detail=detail,
+        name=probe.name, cred_type=probe.cred_type, status=status, detail=detail,
     )
 
 
@@ -454,7 +472,7 @@ def run_verify_cred_cmd(name: str, home: Path | None = None) -> int:
         return 2
     result = verify(name, home=home)
     print(result.render())
-    return 0 if result.ok else 1
+    return 0 if result.ok or result.skipped else 1
 
 
 def run_verify_creds_cmd(only_type: str | None = None, home: Path | None = None) -> int:
@@ -468,10 +486,17 @@ def run_verify_creds_cmd(only_type: str | None = None, home: Path | None = None)
             print("no probes registered (no credentials.yaml manifests discovered)")
         return 1
     failures = 0
+    skipped = 0
     for r in results:
         print(r.render())
-        if not r.ok:
+        if r.skipped:
+            skipped += 1
+        elif not r.ok:
             failures += 1
     print()
-    print(f"{len(results) - failures}/{len(results)} probes ok")
+    passed = len(results) - failures - skipped
+    summary = f"{passed}/{len(results)} probes ok"
+    if skipped:
+        summary += f", {skipped} skipped"
+    print(summary)
     return 0 if failures == 0 else 1
