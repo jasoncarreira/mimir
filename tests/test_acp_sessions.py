@@ -230,6 +230,42 @@ async def test_nonreplayable_load_has_no_replay_prefix(tmp_path: Path) -> None:
     assert client.updates == []
 
 
+async def test_prompt_auth_context_is_scoped_to_the_session_channel(
+    tmp_path: Path,
+) -> None:
+    """The turn's auth context targets the session channel, not the connection.
+
+    ``authenticate`` builds one context per connection against ``acp:stdio``,
+    but each prompt runs on ``acp:<session-id>``. The same-channel sink check
+    resolves the triggering channel from ``auth_context.channel_id``, so a
+    connection-scoped context made a reply to the turn's own channel
+    unsatisfiable — every ACP turn was refused with
+    ``ifc_label_blocked:same_channel``. Authority fields must carry through
+    unchanged; only the channel narrows.
+    """
+    agent, _client, core = await _ready(tmp_path)
+    created = await agent.new_session("/workspace")
+    session_id = created.session_id
+    connection_context = agent._connections[agent._generation].auth_context
+
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+
+    [(event, _kwargs)] = core.calls
+    context = event.continuation_auth_context
+    assert context is not None
+    assert event.channel_id == f"acp:{session_id}"
+    assert context.channel_id == f"acp:{session_id}"
+    assert context.resource_id == f"acp:{session_id}"
+    # Narrowed, not widened: the connection context was a different channel,
+    # and every authority field is carried through untouched.
+    assert connection_context.channel_id != f"acp:{session_id}"
+    assert context.principal == connection_context.principal
+    assert context.canonical_principal == connection_context.canonical_principal
+    assert context.roles == connection_context.roles
+    assert context.is_service == connection_context.is_service
+    assert context.enforcement_enabled == connection_context.enforcement_enabled
+
+
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id
@@ -534,6 +570,39 @@ async def test_write_todos_emits_complete_replacement_plan(tmp_path: Path) -> No
     assert [(entry.content, entry.status, entry.priority) for entry in plans[0].entries] == [("ship", "pending", "medium")]
 
 
+async def test_transport_death_releases_prompt_blocked_on_update_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("mimir.acp.updates.UPDATE_CLOSE_TIMEOUT", 0.01)
+    agent, client, _ = await _ready(tmp_path)
+    session_id = (await agent.new_session("/one")).session_id
+    generation = agent._generation
+    original = client.session_update
+    blocked = asyncio.Event()
+
+    async def stop_after_user_message(session: str, update: Any) -> None:
+        if update.session_update != "user_message_chunk":
+            blocked.set()
+            await asyncio.Event().wait()
+        await original(session, update)
+
+    client.session_update = stop_after_user_message
+    prompting = asyncio.create_task(
+        agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+    )
+    await blocked.wait()
+    active = agent._active_prompts[session_id]
+
+    await agent.on_transport_closed(generation)
+    with pytest.raises(sdk.RequestError, match="Internal error"):
+        await asyncio.wait_for(prompting, 0.1)
+
+    assert active.completed.is_set()
+    assert active.dispatcher._worker is None
+    assert session_id not in agent._active_prompts
+    assert agent._bundle.turn_event_bus._exact_turn_subscribers == {}
+
+
 @pytest.mark.parametrize("reason", ["expired", "deleted", "io_failed"])
 async def test_unavailable_load_reasons_have_no_prefix(tmp_path: Path, reason: str) -> None:
     agent, client, _ = await _ready(tmp_path)
@@ -549,13 +618,19 @@ async def test_unavailable_load_reasons_have_no_prefix(tmp_path: Path, reason: s
     assert client.updates == []
 
 
-async def test_sweep_runs_at_start_of_each_authenticated_stateful_handler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_sweep_runs_off_loop_once_per_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     agent, _, _ = await _ready(tmp_path)
-    calls: list[int] = []
+    calls: list[tuple[int, bool]] = []
     original = agent._store.sweep
 
     def sweep(days: int) -> None:
-        calls.append(days)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            off_loop = True
+        else:
+            off_loop = False
+        calls.append((days, off_loop))
         original(days)
 
     monkeypatch.setattr(agent._store, "sweep", sweep)
@@ -563,7 +638,10 @@ async def test_sweep_runs_at_start_of_each_authenticated_stateful_handler(tmp_pa
     await agent.load_session("/two", session_id)
     await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
 
-    assert calls == [7, 7, 7]
+    assert calls == [(7, True)]
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
+    await agent.load_session("/three", session_id)
+    assert calls == [(7, True), (7, True)]
 
 
 async def test_malformed_provider_declaration_creates_no_state(tmp_path: Path) -> None:
@@ -669,6 +747,7 @@ async def test_overflowed_session_accepts_later_live_prompts(tmp_path: Path, mon
     session_id = (await agent.new_session("/one")).session_id
 
     first = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")])
+    agent._last_sweep -= agent_module.ACP_SESSION_SWEEP_INTERVAL_SECONDS
     second = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
 
     assert first.stop_reason == second.stop_reason == "end_turn"

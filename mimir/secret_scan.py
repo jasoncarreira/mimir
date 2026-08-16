@@ -24,14 +24,16 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{20,}"),           # OpenAI classic (base62, no hyphens)
     re.compile(r"ghp_[A-Za-z0-9]{30,}"),          # GitHub PAT (classic)
     re.compile(r"gho_[A-Za-z0-9]{30,}"),          # GitHub OAuth
+    re.compile(r"gh[usr]_[A-Za-z0-9]{30,}"),      # GitHub user/server/app tokens
     re.compile(r"github_pat_[A-Za-z0-9_]{60,}"),  # GitHub fine-grained PAT
     re.compile(r"AKIA[0-9A-Z]{16}"),              # AWS access key
     re.compile(r"ASIA[0-9A-Z]{16}"),              # AWS STS temp key
+    re.compile(r"AWS_SECRET_ACCESS_KEY\s*=\s*[A-Za-z0-9/+=]{20,}"),
     re.compile(r'"refresh_token"\s*:\s*"[^"]{20,}"'),
     re.compile(r'"access_token"\s*:\s*"[^"]{20,}"'),
     re.compile(r'"client_secret"\s*:\s*"[^"]{20,}"'),
-    re.compile(r"xoxb-[0-9A-Za-z-]{20,}"),        # Slack bot token
-    re.compile(r"xoxp-[0-9A-Za-z-]{20,}"),        # Slack user token
+    re.compile(r"xox[bpasr]-[0-9A-Za-z-]{20,}"),  # Slack credential tokens
+    re.compile(r"\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b"),
 )
 
 

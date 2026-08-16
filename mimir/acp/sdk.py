@@ -71,6 +71,9 @@ MAX_PENDING_REQUESTS = 64
 INPUT_QUEUE_MAX_ITEMS = 64
 INPUT_QUEUE_MAX_BYTES = 8 * 1024 * 1024
 INPUT_QUEUE_DRAIN_TIMEOUT = 2.0
+OUTPUT_DRAIN_TIMEOUT = 30.0
+DISPATCHER_STOP_TIMEOUT = 30.0
+DISPATCHER_CANCEL_TIMEOUT = 2.0
 MAX_ACTIVE_INBOUND_RUNNERS = 64
 
 
@@ -105,7 +108,7 @@ class StrictMessageStateStore:
     def register_outgoing(self, request_id: int, method: str) -> asyncio.Future[Any]:
         if request_id in self._outgoing:
             raise AcpProtocolError("Duplicate outgoing request ID")
-        if len(self._outgoing) >= MAX_PENDING_REQUESTS:
+        if len(self._outgoing) + len(self._abandoned) >= MAX_PENDING_REQUESTS:
             raise AcpProtocolError("Too many pending requests")
         future = asyncio.get_running_loop().create_future()
         self._outgoing[request_id] = future
@@ -232,7 +235,7 @@ class StrictNdjsonTransport:
         validate_jsonrpc_envelope(message)
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         self._writer.write((payload + "\n").encode("utf-8"))
-        await self._writer.drain()
+        await asyncio.wait_for(self._writer.drain(), OUTPUT_DRAIN_TIMEOUT)
 
     async def close(self) -> None:
         return None
@@ -450,6 +453,11 @@ def validate_acp_mcp_server(value: Any) -> AcpMcpServer:
         raise AcpProtocolError("Malformed ACP MCP server declaration") from exc
 
 
+def _observe_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 def validate_permission_response(value: Any) -> PermissionDecision:
     try:
         response = RequestPermissionResponse.model_validate(value)
@@ -468,6 +476,7 @@ class AcpRequestHandle:
     outer_id: int
     task: asyncio.Task[Any]
     _store: StrictMessageStateStore
+    _owned_tasks: tuple[asyncio.Task[Any], ...] = ()
     _abandoned: bool = False
 
     def abandon(self) -> None:
@@ -476,6 +485,9 @@ class AcpRequestHandle:
         self._abandoned = True
         self._store.abandon_outgoing(self.outer_id)
         self.task.cancel()
+        for task in self._owned_tasks:
+            task.cancel()
+            task.add_done_callback(_observe_task_exception)
 
     cancel = abandon
 
@@ -540,6 +552,7 @@ class AcpPeer:
                 self._state_store.abandon_outgoing(outer_id)
             task.cancel()
             started.cancel()
+            await asyncio.gather(task, started, return_exceptions=True)
             raise
         finally:
             self._state_store.cancel_start(registration, token)
@@ -561,7 +574,10 @@ class AcpPeer:
                 return PermissionCompletion("reject_once", exc)
 
         return AcpRequestHandle(
-            handle.outer_id, asyncio.create_task(completion()), handle._store
+            handle.outer_id,
+            asyncio.create_task(completion()),
+            handle._store,
+            _owned_tasks=(handle.task,),
         )
 
     async def start_mcp_request(
@@ -630,7 +646,11 @@ class AcpPeer:
         try:
             if self._state_store is not None:
                 handle = await self.start_tool_permission(session_id, snapshot)
-                return await handle.task
+                try:
+                    return await handle.task
+                except asyncio.CancelledError:
+                    handle.abandon()
+                    raise
             result = await self._connection.send_request(
                 PERMISSION_METHOD, permission_request_params(session_id, snapshot)
             )
@@ -668,7 +688,11 @@ class AcpPeer:
             raise method_not_found_error(method)
         if self._state_store is not None:
             handle = await self.start_mcp_request(connection_id, method, params)
-            return await handle.task
+            try:
+                return await handle.task
+            except asyncio.CancelledError:
+                handle.abandon()
+                raise
         request = MessageMcpRequest(
             connectionId=connection_id, method=method, params=params
         )
@@ -735,6 +759,11 @@ class BoundedMessageQueue(InMemoryMessageQueue):
         self._pending_bytes = 0
         self._sizes: deque[int] = deque()
         self._space_available = asyncio.Event()
+        self._sentinel_enqueued = False
+        # Reserve one item slot for the sentinel so close() never waits behind a
+        # blocked publisher. Byte reservations are producer-serialized as well.
+        self._publish_slots = asyncio.Semaphore(INPUT_QUEUE_MAX_ITEMS)
+        self._publish_lock = asyncio.Lock()
 
     @property
     def pending_bytes(self) -> int:
@@ -745,40 +774,49 @@ class BoundedMessageQueue(InMemoryMessageQueue):
         if size > INPUT_QUEUE_MAX_BYTES:
             raise AcpProtocolError("Input queue byte limit exceeded")
         deadline = asyncio.get_running_loop().time() + INPUT_QUEUE_DRAIN_TIMEOUT
-        while self._pending_bytes + size > INPUT_QUEUE_MAX_BYTES:
-            self._space_available.clear()
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise AcpProtocolError("Input queue drain timed out")
-            try:
-                await asyncio.wait_for(self._space_available.wait(), remaining)
-            except asyncio.TimeoutError:
-                raise AcpProtocolError("Input queue drain timed out") from None
-        self._pending_bytes += size
-        self._sizes.append(size)
-        remaining = deadline - asyncio.get_running_loop().time()
+        acquired = False
         try:
-            await asyncio.wait_for(super().publish(task), max(0, remaining))
-        except asyncio.TimeoutError:
-            self._release_last(size)
+            async with asyncio.timeout_at(deadline):
+                await self._publish_slots.acquire()
+                acquired = True
+                async with self._publish_lock:
+                    while self._pending_bytes + size > INPUT_QUEUE_MAX_BYTES:
+                        if self._closed:
+                            raise RuntimeError("message queue already closed")
+                        self._space_available.clear()
+                        await self._space_available.wait()
+                    if self._closed:
+                        raise RuntimeError("message queue already closed")
+                    # Queue capacity and byte accounting commit together under the
+                    # producer lock; put_nowait cannot be cancelled after commit.
+                    self._queue.put_nowait(task)
+                    self._pending_bytes += size
+                    self._sizes.append(size)
+                    acquired = False
+        except (TimeoutError, asyncio.QueueFull):
             raise AcpProtocolError("Input queue drain timed out") from None
-        except BaseException:
-            self._release_last(size)
-            raise
+        finally:
+            if acquired:
+                self._publish_slots.release()
+
+    async def close(self) -> None:
+        self._closed = True
+        self._space_available.set()
+        async with self._publish_lock:
+            if not self._sentinel_enqueued:
+                await self._queue.put(None)
+                self._sentinel_enqueued = True
 
     def close_nowait(self) -> None:
         self._closed = True
+        self._space_available.set()
 
     def task_done(self) -> None:
         if self._sizes:
             self._pending_bytes -= self._sizes.popleft()
+            self._publish_slots.release()
             self._space_available.set()
         super().task_done()
-
-    def _release_last(self, size: int) -> None:
-        self._sizes.pop()
-        self._pending_bytes -= size
-        self._space_available.set()
 
     def _message_bytes(self, task: Any) -> int:
         if self._frame_bytes is not None:
@@ -812,23 +850,19 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         if max_active <= 0:
             raise ValueError("max_active must be positive")
         self._runner_slots = asyncio.BoundedSemaphore(max_active)
-
-    async def stop(self) -> None:
-        self._queue.close_nowait()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
+        self._runner_tasks: set[asyncio.Task[Any]] = set()
 
     async def _dispatch_request(self, message: dict[str, Any]) -> None:
+        method = message.get("method", "")
+        if method == "authenticate" and self._runner_tasks:
+            # The dispatcher loop is ordered: waiting here drains all earlier
+            # handlers while preventing later work from being admitted. The
+            # authentication runner itself is then awaited below, making
+            # authentication an exclusive fence without consuming waiter slots.
+            await asyncio.wait(tuple(self._runner_tasks))
         await self._runner_slots.acquire()
         try:
-            record = self._store.begin_incoming(
-                message.get("method", ""), message.get("params")
-            )
+            record = self._store.begin_incoming(method, message.get("params"))
         except BaseException:
             self._runner_slots.release()
             raise
@@ -844,7 +878,9 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
             finally:
                 self._runner_slots.release()
 
-        self._create_runner(runner(), "mimir.acp.Dispatcher.request")
+        task = self._create_runner(runner(), "mimir.acp.Dispatcher.request")
+        if method == "authenticate":
+            await asyncio.wait((task,))
 
     async def _dispatch_notification(self, message: dict[str, Any]) -> None:
         await self._runner_slots.acquire()
@@ -857,13 +893,78 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
 
         self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
 
-    def _create_runner(self, coroutine: Any, name: str) -> None:
+    async def stop(self) -> None:
+        task = self._task
+        if task is None:
+            self._queue.close_nowait()
+            return
+        shutdown = asyncio.create_task(self._shutdown(task))
+        cancelled = False
+        while not shutdown.done():
+            try:
+                await asyncio.shield(shutdown)
+            except asyncio.CancelledError:
+                # Repeated caller cancellation must not cancel cleanup itself.
+                cancelled = True
+                continue
         try:
-            self._supervisor.create(coroutine, name=name)
+            shutdown.result()
+        finally:
+            self._task = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown(self, task: asyncio.Task[Any]) -> None:
+        drain = asyncio.create_task(self._drain(task))
+        done, _ = await asyncio.wait((drain,), timeout=DISPATCHER_STOP_TIMEOUT)
+        if done:
+            drain.result()
+            return
+        drain.cancel()
+        drain.add_done_callback(_observe_task_exception)
+        task.cancel()
+        runners = tuple(self._runner_tasks)
+        for runner in runners:
+            runner.cancel()
+        done, pending = await asyncio.wait(
+            (task, *runners), timeout=DISPATCHER_CANCEL_TIMEOUT
+        )
+        for completed in done:
+            if not completed.cancelled():
+                completed.exception()
+        self._runner_tasks.difference_update(done)
+        # A cancellation-resistant handler cannot be awaited again by the ACP
+        # supervisor without restoring the same unbounded shutdown. Detach only
+        # after both bounded grace periods; the connection is already retiring.
+        for pending_task in pending:
+            pending_task.add_done_callback(_observe_task_exception)
+        supervisor_tasks = getattr(self._supervisor, "_tasks", None)
+        if isinstance(supervisor_tasks, set):
+            supervisor_tasks.difference_update(pending)
+        self._runner_tasks.difference_update(pending)
+
+    async def _drain(self, task: asyncio.Task[Any]) -> None:
+        await self._queue.close()
+        await task
+        while self._runner_tasks:
+            runners = tuple(self._runner_tasks)
+            # Wait for completion without retrieving runner exceptions here. The
+            # ACP supervisor owns exception observation/reporting; gathering these
+            # tasks during close would make expected JSON-RPC errors escape from
+            # connection.close() on Python 3.12.
+            await asyncio.wait(runners)
+            self._runner_tasks.difference_update(runners)
+
+    def _create_runner(self, coroutine: Any, name: str) -> asyncio.Task[Any]:
+        try:
+            task = self._supervisor.create(coroutine, name=name)
         except BaseException:
             coroutine.close()
             self._runner_slots.release()
             raise
+        self._runner_tasks.add(task)
+        task.add_done_callback(self._runner_tasks.discard)
+        return task
 
 
 async def run_stdio_agent(
@@ -909,12 +1010,17 @@ async def run_stdio_agent(
     except BaseException as exc:
         primary = exc
         traceback = exc.__traceback__
-    peer.mark_transport_dead()
+    close_failure: BaseException | None = None
     try:
-        await asyncio.wait_for(message_queue.join(), INPUT_QUEUE_DRAIN_TIMEOUT)
-    except asyncio.TimeoutError:
-        pass
-    await asyncio.sleep(0)
+        close_task = asyncio.create_task(connection.close())
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await close_task
+            raise
+    except BaseException as exc:
+        close_failure = exc
+    peer.mark_transport_dead()
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
         if on_closed is not None:
@@ -925,19 +1031,12 @@ async def run_stdio_agent(
             traceback = exc.__traceback__
         else:
             primary.add_note(f"on_transport_closed also failed: {exc!r}")
-    try:
-        close_task = asyncio.create_task(connection.close())
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            await close_task
-            raise
-    except BaseException as exc:
+    if close_failure is not None:
         if primary is None:
-            primary = exc
-            traceback = exc.__traceback__
+            primary = close_failure
+            traceback = close_failure.__traceback__
         else:
-            primary.add_note(f"connection.close also failed: {exc!r}")
+            primary.add_note(f"connection.close also failed: {close_failure!r}")
     if primary is not None:
         raise primary.with_traceback(traceback)
 

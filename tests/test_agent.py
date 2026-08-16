@@ -1698,7 +1698,9 @@ async def test_run_turn_defers_folded_message(tmp_path: Path):
 async def test_run_turn_no_saga_skips_query_and_feedback(tmp_path: Path):
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
     record = await agent.run_turn(event)
     assert record.output == "ok"
     # No SAGA → no memory block injected
@@ -2721,7 +2723,9 @@ async def test_run_turn_successful_send_suppresses_no_reply_signal(
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
     agent._channels = registry  # type: ignore[attr-defined]
 
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
     await agent.run_turn(event)
 
     events_log = tmp_path / "home" / "logs" / "events.jsonl"
@@ -4141,6 +4145,190 @@ async def test_run_turn_cross_channel_only_delivery_still_flags(tmp_path: Path):
     [sig] = [e for e in evs if e.get("type") == "interactive_turn_no_send_message"]
     assert sig["channel_id"] == "ch-1"
     assert sig["delivered_elsewhere"] == ["ops-channel"]
+
+
+def _acp_turn(monkeypatch, *, acp: bool = True) -> None:
+    """Make the capability context report an ACP-delivery turn (or not)."""
+    from types import SimpleNamespace
+
+    from mimir.tools import client_provider
+
+    monkeypatch.setattr(
+        client_provider,
+        "get_turn_capability_context",
+        lambda: SimpleNamespace(acp_delivery=acp),
+    )
+
+
+async def test_acp_turn_auto_delivers_final_text_without_opt_in(tmp_path, monkeypatch):
+    """An ACP turn delivers its reply even though no channel opted in.
+
+    ``send_message`` is stripped from the ACP tool surface
+    (``_request_for_acp_model``) and refused if called
+    (``_acp_send_message_refusal``), so auto-delivery is not optional recovery
+    there — it is the only path a reply can take. Gating it on
+    ``auto_deliver_final_text_channels`` dropped every ACP answer.
+    """
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="the answer is Paris")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    # Deliberately NOT opted in — that is the point of the test.
+    agent._config.auto_deliver_final_text_channels = ()  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
+    await agent.run_turn(event)
+
+    assert [send[1] for send in bridge.sends] == ["the answer is Paris"]
+
+
+async def test_acp_delivers_replies_below_the_substantiveness_floor(
+    tmp_path, monkeypatch,
+):
+    """A one-word ACP answer is still delivered.
+
+    ``_substantive_final_text`` requires >= 20 characters and >= 3 words before
+    auto-shipping, which is the right bar for *recovery* on a channel where the
+    model could have called send_message. ACP has no such alternative, so the
+    floor would drop the single-word answers clients most often ask for.
+    """
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="Paris")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ()  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="capital?",
+        author="test-user", source="test",
+    )
+    await agent.run_turn(event)
+
+    assert [send[1] for send in bridge.sends] == ["Paris"]
+
+
+async def test_non_acp_turn_keeps_the_substantiveness_floor(tmp_path, monkeypatch):
+    """The floor still applies off ACP, even on an opted-in channel."""
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch, acp=False)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="Paris")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ("ch-",)  # type: ignore[attr-defined]
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="capital?",
+        author="test-user", source="test",
+    )
+    await agent.run_turn(event)
+
+    assert bridge.sends == []
+
+
+async def test_acp_delivery_is_not_truncated_at_the_turn_record_cap(
+    tmp_path, monkeypatch,
+):
+    """A long ACP reply is delivered in full.
+
+    ``TurnRecord.output`` is capped at 2,048 characters for persistence, so any
+    delivery sourced from the record silently truncates. Auto-delivery is fed
+    the untruncated turn output instead; this pins that difference.
+    """
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch)
+    long_reply = "x" * 5000
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content=long_reply)])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ()  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
+    record = await agent.run_turn(event)
+
+    [(_cid, delivered, _final)] = bridge.sends
+    assert len(delivered) == 5000, "ACP reply was truncated in delivery"
+    assert delivered == long_reply
+    # The persisted record stays capped — the cap is correct there, and this
+    # asserts the two values genuinely differ so the test cannot pass by both
+    # being untruncated.
+    assert len(record.output) == 2048
+
+
+async def test_acp_turn_logs_no_forgot_to_send_signal(tmp_path, monkeypatch):
+    """Delivering marks the channel, so the no-send signal stays quiet."""
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="the answer is Paris")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ()  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    assert [e for e in evs if e.get("type") == "interactive_turn_no_send_message"] == []
+
+
+async def test_non_acp_turn_keeps_the_auto_deliver_opt_in(tmp_path, monkeypatch):
+    """The bypass must not widen into "always auto-deliver everywhere".
+
+    On a normal bridge turn send_message IS available, so an un-opted-in
+    channel must still deliver nothing and still report the missed reply.
+    """
+    import json
+    from mimir.channel_registry import ChannelRegistry
+
+    _acp_turn(monkeypatch, acp=False)
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="never delivered")])
+    bridge = _BridgeStub()
+    registry = ChannelRegistry()
+    registry.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._channels = registry  # type: ignore[attr-defined]
+    agent._config.auto_deliver_final_text_channels = ()  # type: ignore[attr-defined]
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="test-user", source="test",
+    )
+    await agent.run_turn(event)
+
+    assert bridge.sends == []
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
+    [sig] = [e for e in evs if e.get("type") == "interactive_turn_no_send_message"]
+    assert sig["channel_id"] == "ch-1"
 
 
 def test_resolve_model_claude_code_fails_closed_without_adapter(monkeypatch):

@@ -8,7 +8,7 @@ import uuid
 from collections import deque
 from collections.abc import Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -70,11 +70,22 @@ if TYPE_CHECKING:
     from mimir.runtime import AgentRuntimeBundle
 
 _WEB_KEY_FIELD = "mimir.webKey"
+#: Bridge instance recorded on every ACP-originated AgentEvent.
+#:
+#: IFC labels its sources with this value, and the same-channel sink check
+#: (``_source_is_triggering_channel_compatible``) compares a source's
+#: bridge_instance against the one resolved for the sink. When an event omits
+#: it, ``access_control`` falls back to ``event.source`` ("acp") — so an
+#: authenticate event labelled "acp-stdio" and a prompt event falling back to
+#: "acp" never match, and every reply to the originating ACP channel is refused
+#: with ``ifc_label_blocked:same_channel``. Both sites must use this constant.
+_ACP_BRIDGE_INSTANCE = "acp-stdio"
 ACP_PROMPT_CANCEL_GRACE_SECONDS = 2.0
 ACP_GENERATION_RETIRE_GRACE_SECONDS = 2.0
 ACP_GENERATION_RETIRE_CANCEL_SECONDS = 2.0
 ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
 ACP_AUDIT_EVENT_LIMIT = 256
+ACP_SESSION_SWEEP_INTERVAL_SECONDS = 60 * 60
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -141,6 +152,7 @@ class ActivePrompt:
     mcp_handles: list[AcpRequestHandle] = field(default_factory=list)
     mcp_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     cancelling: bool = False
+    transport_dead: bool = False
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     progress_tokens: dict[str, ProgressTokenOwnership] = field(default_factory=dict)
@@ -319,6 +331,8 @@ class MimirAcpAgent:
             home = Path(self._identity_resolver._yaml_path).parents[1]
         self._ttl_days = getattr(config, "acp_journal_ttl_days", 7)
         self._store = SessionStore(home)
+        self._last_sweep: float | None = None
+        self._sweep_lock = asyncio.Lock()
         self._journals = JournalCache(self._store)
         self._client: Client | None = None
         self._generation = 0
@@ -398,7 +412,7 @@ class MimirAcpAgent:
             identity = self._identity_resolver.resolve_web_key(raw_key)
             if identity is None or not identity.access.is_admin or identity.access.is_service:
                 raise ValueError
-            event = AgentEvent(trigger="acp_authenticate", channel_id="acp:stdio", content="", author=identity.canonical, author_display=identity.display_name or identity.canonical, author_id=None, source_id=None, source="acp", extra={"channel_visibility": "private", "bridge_instance": "acp-stdio"})
+            event = AgentEvent(trigger="acp_authenticate", channel_id="acp:stdio", content="", author=identity.canonical, author_display=identity.display_name or identity.canonical, author_id=None, source_id=None, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE})
             auth_context = create_auth_context(event, self._identity_resolver, enforce=True, event_ingress="acp")
             if auth_context.principal != identity.canonical or auth_context.canonical_principal != identity.canonical or "admin" not in auth_context.roles or auth_context.is_service or not auth_context.enforcement_enabled:
                 raise ValueError
@@ -442,7 +456,7 @@ class MimirAcpAgent:
         return AuthenticateResponse()
 
     async def new_session(self, cwd: str, additional_directories: list[str] | None = None, mcp_servers: object | None = None, **kwargs: Any) -> NewSessionResponse:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         self._validate_directories(additional_directories)
         client = self._require_client()
         declaration = self._validate_declaration(cwd, mcp_servers)
@@ -472,7 +486,7 @@ class MimirAcpAgent:
         return NewSessionResponse(sessionId=record.session_id)
 
     async def load_session(self, cwd: str, session_id: str, mcp_servers: object | None = None, additional_directories: list[str] | None = None, **kwargs: Any) -> LoadSessionResponse | None:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         self._validate_directories(additional_directories)
         client = self._require_client()
         declaration = self._validate_declaration(cwd, mcp_servers)
@@ -505,7 +519,7 @@ class MimirAcpAgent:
         return LoadSessionResponse()
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         blocks = self._validate_prompt(prompt)
         client = self._require_client()
         state = self._sessions.get(session_id)
@@ -545,7 +559,7 @@ class MimirAcpAgent:
         try:
             for block in blocks:
                 await journal.publish_live(UserMessageChunk(sessionUpdate="user_message_chunk", content=block), client, turn_id=turn_id, lease=lease)
-            event = AgentEvent(trigger="user_message", channel_id=record.thread_id, content=self._normalize_prompt(blocks), author=owner, author_display=self._display_name_for(state) or owner, author_id=owner, source_id=turn_id, source="acp", extra={"channel_visibility": "private"}, continuation_auth_context=self._auth_context_for(state))
+            event = AgentEvent(trigger="user_message", channel_id=record.thread_id, content=self._normalize_prompt(blocks), author=owner, author_display=self._display_name_for(state) or owner, author_id=owner, source_id=turn_id, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE}, continuation_auth_context=self._auth_context_for(state))
             async with self._boundary_lock:
                 if not active._is_current():
                     raise asyncio.CancelledError
@@ -562,6 +576,8 @@ class MimirAcpAgent:
                     await dispatcher.terminalize_failure(exc)
                 except BaseException:
                     pass
+            elif active.transport_dead:
+                failed = exc
             else:
                 await self._finish_cancel(active)
                 response = PromptResponse(stopReason="cancelled")
@@ -599,7 +615,7 @@ class MimirAcpAgent:
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         refusal_reason: str | None = None
         try:
-            owner = self._begin_stateful()
+            owner = await self._begin_stateful()
         except RequestError:
             connection = self._calling_connection()
             if connection is None or connection.auth_context is None:
@@ -635,6 +651,7 @@ class MimirAcpAgent:
                 return False
             active.cancelling = True
             if transport:
+                active.transport_dead = True
                 active.journal_lease.close()
             else:
                 await active.journal_lease.close_boundary(active.dispatcher.publisher._journal.lock)
@@ -875,7 +892,7 @@ class MimirAcpAgent:
             return None
         return self._connections.get(generation)
 
-    def _begin_stateful(self) -> str:
+    async def _begin_stateful(self) -> str:
         generation_context = getattr(self, "_connection_generation", None)
         generation = generation_context.get() if generation_context is not None else None
         if generation in getattr(self, "_replaced_generations", ()):
@@ -899,17 +916,64 @@ class MimirAcpAgent:
             )
         ):
             raise auth_required_error()
-        try:
-            self._store.sweep(self._ttl_days)
-        except BaseException:
-            raise internal_error() from None
+        now = asyncio.get_running_loop().time()
+        if (
+            self._last_sweep is None
+            or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
+        ):
+            async with self._sweep_lock:
+                now = asyncio.get_running_loop().time()
+                if (
+                    self._last_sweep is None
+                    or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
+                ):
+                    try:
+                        await asyncio.to_thread(self._store.sweep, self._ttl_days)
+                    except BaseException:
+                        raise internal_error() from None
+                    self._last_sweep = now
+        if connection is None:
+            if self._auth_context is not auth_context:
+                raise auth_required_error()
+        elif (
+            connection.closed
+            or connection is not self._connection
+            or connection.generation != self._generation
+            or connection.auth_context is not auth_context
+            or connection.principal != auth_context.canonical_principal
+        ):
+            raise auth_required_error()
         return auth_context.canonical_principal
 
     def _auth_context_for(self, state: SessionState) -> AuthContext | None:
+        """The connection's auth context, re-scoped to *this session's* channel.
+
+        ``authenticate`` builds one context per CONNECTION, against the
+        connection channel ``acp:stdio``. Every prompt turn, though, runs on
+        ``acp:<session-id>``. The same-channel sink check resolves the
+        triggering channel from ``auth_context.channel_id`` and compares it to
+        each source's channel, so the connection-scoped context made a reply to
+        the turn's OWN channel unsatisfiable — measured as
+        ``ifc_label_blocked:same_channel`` on every ACP turn.
+
+        This narrows the context to the channel the turn actually runs on; it
+        grants nothing new. ``principal``, ``roles`` and every other authority
+        field are carried through untouched, the caller above has already
+        checked the connection principal owns this session, and
+        ``thread_id`` is server-generated (``acp:{uuid4}``) and revalidated on
+        load — never client-supplied, so a client cannot steer the context at
+        another channel.
+        """
         connection = self._connections.get(state.generation)
         if connection is None or connection.principal != state.record.owner_principal:
             return None
-        return connection.auth_context
+        context = connection.auth_context
+        if context is None:
+            return None
+        thread_id = state.record.thread_id
+        if getattr(context, "channel_id", None) == thread_id:
+            return context
+        return replace(context, channel_id=thread_id, resource_id=thread_id)
 
     def _display_name_for(self, state: SessionState) -> str | None:
         connection = self._connections.get(state.generation)

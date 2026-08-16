@@ -2910,6 +2910,166 @@ async def test_admin_gate_missing_context_allows_sensitive_tool_when_not_enforce
     assert handler_calls == 1
 
 
+def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.tools import extra
+    from mimir.tools._shell_env import login_shell_command
+
+    middleware = BudgetGateMiddleware()
+    ctx = _make_ctx()
+    auth = ctx.auth_context
+    executed: list[list[str]] = []
+    outer_args: dict[str, Any] = {}
+
+    def run(argv: list[str], **_kwargs: Any) -> SimpleNamespace:
+        executed.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def run_shell(request: ToolCallRequest) -> ToolMessage:
+        result = extra.shell_exec.invoke(request.tool_call["args"])
+        return ToolMessage(content=result, tool_call_id=request.tool_call["id"])
+
+    def run_task(request: ToolCallRequest) -> ToolMessage:
+        outer_args.update(request.tool_call["args"])
+        return middleware.wrap_tool_call(
+            _make_request(
+                "shell_exec", "nested-shell", auth,
+                {"command": "git status --short"},
+            ),
+            run_shell,
+        )
+
+    monkeypatch.setattr(extra.subprocess, "run", run)
+    token = set_current_turn(ctx)
+    try:
+        middleware.wrap_tool_call(
+            _make_request(
+                "task", "outer-task", auth,
+                {
+                    "description": "nested shell",
+                    "subagent_type": "general-purpose",
+                    "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
+                    "mimir_shell_refusal": "model-authored refusal",
+                },
+            ),
+            run_task,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert "mimir_direct_argv" not in outer_args
+    assert "mimir_shell_refusal" not in outer_args
+    assert executed == [["bash", "-lc", login_shell_command("git status --short")]]
+
+
+@pytest.mark.asyncio
+async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.tools import shell_async
+    from mimir.tools._shell_env import login_shell_command
+
+    middleware = BudgetGateMiddleware()
+    ctx = _make_ctx()
+    auth = ctx.auth_context
+    spawned: list[list[str]] = []
+    outer_args: dict[str, Any] = {}
+
+    class Registry:
+        def running_jobs(self) -> list[Any]:
+            return []
+
+        def spawn(self, _command: str, *, argv: list[str], **_kwargs: Any) -> Any:
+            spawned.append(list(argv))
+            return SimpleNamespace(job_id="nested-job", pid=123, ifc_labels=None)
+
+    async def run_shell(request: ToolCallRequest) -> ToolMessage:
+        result = await shell_async.bash_async.ainvoke(request.tool_call["args"])
+        return ToolMessage(content=result, tool_call_id=request.tool_call["id"])
+
+    async def run_task(request: ToolCallRequest) -> ToolMessage:
+        outer_args.update(request.tool_call["args"])
+        return await middleware.awrap_tool_call(
+            _make_request(
+                "bash_async", "nested-bash", auth,
+                {"command": "git status --short"},
+            ),
+            run_shell,
+        )
+
+    shell_async.set_shell_job_registry(Registry(), on_complete=None)  # type: ignore[arg-type]
+    token = set_current_turn(ctx)
+    try:
+        await middleware.awrap_tool_call(
+            _make_request(
+                "task", "outer-task", auth,
+                {
+                    "description": "nested shell",
+                    "subagent_type": "general-purpose",
+                    "mimir_direct_argv": ["/bin/sh", "-c", "planted"],
+                    "mimir_shell_refusal": "model-authored refusal",
+                },
+            ),
+            run_task,
+        )
+    finally:
+        reset_current_turn(token)
+        shell_async.set_shell_job_registry(None, on_complete=None)
+
+    assert "mimir_direct_argv" not in outer_args
+    assert "mimir_shell_refusal" not in outer_args
+    assert spawned == [["bash", "-lc", login_shell_command("git status --short")]]
+
+
+@pytest.mark.asyncio
+async def test_non_shell_execution_never_binds_direct_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep both middleware bind sites safe if sanitization ever drifts."""
+    from mimir.tools import budget_gate
+    from mimir.tools._shell_env import bound_direct_exec_argv
+
+    planted = ["/bin/sh", "-c", "planted"]
+    middleware = BudgetGateMiddleware()
+    ctx = _make_ctx()
+    auth = ctx.auth_context
+    observed: list[list[str] | None] = []
+
+    monkeypatch.setattr(
+        budget_gate,
+        "_request_for_authorized_execution",
+        lambda request, _tool_name, _auth_context: request,
+    )
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        observed.append(bound_direct_exec_argv())
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        observed.append(bound_direct_exec_argv())
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(ctx)
+    try:
+        middleware.wrap_tool_call(
+            _make_request("task", "sync-task", auth, {"mimir_direct_argv": planted}),
+            sync_handler,
+        )
+        await middleware.awrap_tool_call(
+            _make_request("task", "async-task", auth, {"mimir_direct_argv": planted}),
+            async_handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert observed == [None, None]
+
+
 # ─── get_turn alias (unchanged from prior file) ───────────────────
 
 

@@ -109,6 +109,34 @@ async def test_fifo_pressure_and_drain_wait_for_every_update() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.updates.UPDATE_CLOSE_TIMEOUT", 0.02)
+    publisher = Publisher()
+    publisher.block = True
+    dispatcher = UpdateDispatcher(publisher)
+    event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
+    for _ in range(MAX_UPDATE_ITEMS):
+        dispatcher.enqueue(event)
+    await publisher.entered.wait()
+    ticks = 0
+
+    async def witness() -> None:
+        nonlocal ticks
+        while dispatcher._worker is not None:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    witnessing = asyncio.create_task(witness())
+    await asyncio.wait_for(dispatcher.close(), 0.1)
+    await witnessing
+    assert ticks < 50
+    assert dispatcher._worker is None
+    assert dispatcher.queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_first_delivery_failure_is_retained_and_remaining_queue_is_acked() -> None:
     publisher = Publisher()
     publisher.fail_at = 2
