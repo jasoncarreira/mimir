@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 from pathlib import Path, PurePosixPath
+import math
 import re
 import shutil
 import signal
@@ -33,6 +34,7 @@ HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 MAX_FDS = 3
+_CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
 _PR_CAP_AMBIENT = 47
@@ -44,7 +46,7 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections",
+    "argv", "env", "projections", "timeout_s",
 })
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
 _jobs_lock = threading.Lock()
@@ -347,18 +349,22 @@ def _wait_process_group(process_group: int, deadline: float | None) -> None:
         time.sleep(0.01)
 
 
-def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    _wait_process_group(proc.pid, time.monotonic() + timeout_s)
-    if _process_group_has_live_members(proc.pid):
+    _wait_process_group(process_group, time.monotonic() + timeout_s)
+    if _process_group_has_live_members(process_group):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _wait_process_group(proc.pid, None)
+        _wait_process_group(process_group, None)
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+    _terminate_process_group_pid(proc.pid, timeout_s)
     proc.wait()
 
 
@@ -395,6 +401,14 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     _validate_checkout(fds[0], request)
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
+    timeout_s = request["timeout_s"]
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+    ):
+        raise RuntimeError("worker timeout must be a positive finite number")
     anchored_fd = os.open(
         ".",
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
@@ -433,13 +447,24 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.close(fds[2])
         fds[2] = -1
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        exit_code = proc.wait()
-        _terminate_process_group(proc, 0)
+        timed_out = False
+        try:
+            exit_code = proc.wait(timeout=timeout_s + _CONTROLLER_CANCELLATION_GRACE_S)
+            _terminate_process_group(proc, 0)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_group(proc)
+            exit_code = proc.returncode
         with _jobs_lock:
             _jobs.pop(identifier, None)
         _cleanup_home(home)
         home = Path()
-        _send(connection, {"id": identifier, "status": "terminal", "exit_code": exit_code})
+        _send(connection, {
+            "id": identifier,
+            "status": "terminal",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+        })
     finally:
         with _jobs_lock:
             active = _jobs.pop(identifier, None)

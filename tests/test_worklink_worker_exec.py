@@ -10,6 +10,7 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import uuid
 
@@ -63,12 +64,12 @@ def test_client_rejects_non_uuid_home_and_invalid_commands(tmp_path: Path) -> No
     with _authorization(path) as checkout:
         client = WorkerClient(checkout)
         with pytest.raises(ValueError, match="UUIDv4"):
-            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={}, identifier="job"))
+            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={}, identifier="job", timeout_s=1))
         identifier = str(uuid.uuid4())
         with pytest.raises(ValueError, match="HOME"):
-            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={"HOME": "/tmp"}, identifier=identifier))
+            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={"HOME": "/tmp"}, identifier=identifier, timeout_s=1))
         with pytest.raises(ValueError, match="non-empty"):
-            asyncio.run(client.launch(local_checkout=path, argv=[], env={}, identifier=identifier))
+            asyncio.run(client.launch(local_checkout=path, argv=[], env={}, identifier=identifier, timeout_s=1))
 
 
 @pytest.mark.asyncio
@@ -98,6 +99,7 @@ async def test_client_authenticates_root_before_sending_fds(tmp_path: Path, monk
                 argv=["true"],
                 env={},
                 identifier=str(uuid.uuid4()),
+                timeout_s=1,
             )
     assert sent == []
 
@@ -436,6 +438,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         ],
         "env": {"PATH": "/usr/bin:/bin"},
         "projections": [],
+        "timeout_s": 5,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
@@ -444,6 +447,86 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         assert responses[-1]["exit_code"] == 0
         assert not (tmp_path / "homes" / identifier).exists()
         assert os.read(stderr_read, 4096) == b""
+    finally:
+        for fd in (*fds, stdout_read, stderr_read):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    identifier = str(uuid.uuid4())
+    responses: list[dict[str, object]] = []
+    waits: list[float | None] = []
+
+    class Connection:
+        def send(self, payload: bytes) -> None:
+            responses.append(json.loads(payload))
+
+    class Process:
+        pid = 4321
+        returncode: int | None = None
+
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["worker"], timeout)
+            assert self.returncode is not None
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
+    worker_exec.HOME_ROOT.mkdir()
+    monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
+    monkeypatch.setattr(worker_exec, "_project_home", lambda *args: None)
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_exec.os, "chmod", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        worker_exec,
+        "_execution_checkout_fd",
+        lambda _command, anchored_fd, _home: os.dup(anchored_fd),
+    )
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    def terminate(observed: Process, timeout_s: float = 5.0) -> None:
+        assert observed is process
+        process.returncode = -signal.SIGKILL
+        process.wait()
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    request = {
+        "version": 1,
+        "op": "launch",
+        "id": identifier,
+        "issue": 41,
+        "attempt": 2,
+        "device": 0,
+        "inode": 0,
+        "argv": ["worker"],
+        "env": {},
+        "projections": [],
+        "timeout_s": 0.25,
+    }
+    fds = [checkout_fd, stdout_write, stderr_write]
+    try:
+        worker_exec._handle_launch(Connection(), request, fds)
+        assert waits[0] == 0.25 + worker_exec._CONTROLLER_CANCELLATION_GRACE_S
+        assert responses[-1] == {
+            "id": identifier,
+            "status": "terminal",
+            "exit_code": -signal.SIGKILL,
+            "timed_out": True,
+        }
     finally:
         for fd in (*fds, stdout_read, stderr_read):
             if fd >= 0:
@@ -502,6 +585,7 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
                 )],
                 env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
                 identifier=str(uuid.uuid4()),
+                timeout_s=5,
             )
             stdout, stderr = await asyncio.gather(process.stdout.read(), process.stderr.read())
             returncode = await process.wait()
