@@ -312,7 +312,9 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     handle = await backend.launch(direct_spec(source))
 
     result = await asyncio.wait_for(
-        backend.wait(handle, 0.05 if trigger == "timeout" else 2), timeout=3
+        # Let the source pass its 100ms startup delay so the grandchild owns
+        # the SIGTERM-ignore state this assertion is intended to exercise.
+        backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
     )
     await backend.cleanup(handle)
 
