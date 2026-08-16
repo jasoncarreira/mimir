@@ -175,7 +175,7 @@ async def test_auto_loaded_skill_learning_contributes_atom_provenance(
 
     try:
         prompt, _ = await agent._build_turn_prompt(
-            ctx, event, saga_block=None, subagent_block=None,
+            ctx, event, saga_block=None,
         )
     finally:
         conn.close()
