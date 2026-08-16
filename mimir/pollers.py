@@ -1820,11 +1820,6 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
-                # EOF from inherited pipes confirms process-group members have
-                # observed the kill; reaping the shell alone does not.
-                _, pending = await asyncio.wait(
-                    pending, timeout=POLLER_EXIT_GRACE_SECONDS,
-                )
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
