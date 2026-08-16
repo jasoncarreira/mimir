@@ -9,6 +9,7 @@ import pytest
 
 import mimir.contained_checkout as contained_checkout
 import mimir.worklink.checkout as checkout
+from mimir.worklink.identities import get_identities
 from mimir.contained_checkout import create_opencode_checkout, create_repo_test_checkout
 from mimir.contained_snapshot import SnapshotCredentialsRefused
 
@@ -114,12 +115,13 @@ def test_prepare_boundary_remains_controller_owned_0700(
         root, "scope", "1259-1"
     )
 
+    identities = get_identities()
     assert checkout_path == boundary / "checkout"
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert ownership[-1] == (
         boundary,
-        checkout.MIMIR_UID,
-        checkout.WORKLINK_GID,
+        identities.mimir_uid,
+        identities.worklink_gid,
     )
 
 
@@ -315,15 +317,18 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     assert stat.S_IMODE(scope.stat().st_mode) == 0o700
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert stat.S_IMODE(issued.path.stat().st_mode) == 0o2770
+    identities = get_identities()
     scope_identity = _identity(scope)
     boundary_identity = _identity(boundary)
     checkout_identity = _identity(issued.path)
-    assert ("chown", scope_identity, (checkout.MIMIR_UID, checkout.MIMIR_UID)) in mutations
     assert (
-        "chown", boundary_identity, (checkout.MIMIR_UID, checkout.WORKLINK_GID)
+        "chown", scope_identity, (identities.mimir_uid, identities.mimir_uid)
     ) in mutations
     assert (
-        "fchown", checkout_identity, (checkout.MIMIR_UID, checkout.WORKLINK_GID)
+        "chown", boundary_identity, (identities.mimir_uid, identities.worklink_gid)
+    ) in mutations
+    assert (
+        "fchown", checkout_identity, (identities.mimir_uid, identities.worklink_gid)
     ) in mutations
     assert ("fchmod", checkout_identity, 0o2770) in mutations
     issued.close()

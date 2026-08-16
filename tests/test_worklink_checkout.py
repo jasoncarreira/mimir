@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
@@ -984,8 +985,11 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
     calls: list[list[str]] = []
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
-    monkeypatch.setattr(checkout_module, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(checkout_module, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        checkout_module,
+        "get_identities",
+        lambda: SimpleNamespace(mimir_uid=os.getuid(), worklink_gid=os.getgid()),
+    )
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))

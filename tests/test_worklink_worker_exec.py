@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 import signal
 import socket
 import stat
@@ -244,8 +245,13 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
     root = tmp_path / "checkouts"
     issued = _issued(tmp_path)
     monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", root)
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
     issued.chmod(0o2770)
     issued.parent.chmod(0o700)
 
@@ -348,8 +354,13 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
 
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", runner_gid)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=runner_uid, worklink_gid=runner_gid
+        ),
+    )
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
     try:
         execution_fd = worker_exec._execution_checkout_fd(["uv", "run"], source_fd, home)
@@ -432,8 +443,13 @@ def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
     runner.chmod(0o770)
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
 
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -556,7 +572,11 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
 
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Listener())
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", 1001)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(mimir_uid=1001, worklink_uid=1002, worklink_gid=1002),
+    )
     monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
     monkeypatch.setattr(worker_exec.os, "chmod", lambda *args: None)
@@ -1049,8 +1069,13 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
     monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", roots["checkouts"])
     monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", roots["repo-test-checkouts"])
     monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", roots["opencode-checkouts"])
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
     path = roots[root_name] / ("a" * 64) / f"{issue}-{attempt}" / "checkout"
     path.mkdir(parents=True)
     path.parent.chmod(0o700)
