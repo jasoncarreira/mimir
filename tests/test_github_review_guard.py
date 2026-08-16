@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,11 +12,19 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
+from mimir.tools import extra
 from tests.auth_helpers import middleware_auth_context
 
 
-def _request(command: str, *, direct_argv: list[str] | None = None) -> SimpleNamespace:
+def _request(
+    command: str,
+    *,
+    cwd: str | None = None,
+    direct_argv: list[str] | None = None,
+) -> SimpleNamespace:
     args: dict[str, object] = {"command": command}
+    if cwd is not None:
+        args["cwd"] = cwd
     if direct_argv is not None:
         args["mimir_direct_argv"] = direct_argv
     return SimpleNamespace(tool_call={"name": "shell_exec", "args": args})
@@ -28,11 +37,19 @@ class FakeGitHub:
         self.reviews: list[dict[str, object]] = []
         self.review_side_effects = 0
         self.current_number = 152
+        self.repositories_by_cwd: dict[Path, str] = {}
+        self.probe_cwds: list[Path] = []
         self.lock = threading.Lock()
 
     def run(self, spec: guard.ReviewSubmission, arguments: list[str]):
+        cwd = Path(spec.cwd).resolve() if spec.cwd is not None else Path.cwd()
+        self.probe_cwds.append(cwd)
         if arguments[:2] == ["api", "user"]:
             output = self.reviewer
+        elif arguments[:2] == ["repo", "view"]:
+            if cwd not in self.repositories_by_cwd:
+                return SimpleNamespace(returncode=1, stdout="")
+            output = self.repositories_by_cwd[cwd]
         elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}"]:
             output = self.head
         elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}/reviews"]:
@@ -129,6 +146,108 @@ def test_current_pull_request_is_inferred_when_number_is_omitted(
     assert claim is not None
     assert claim.number == github.current_number
     claim.release()
+
+
+def test_omitted_cwd_uses_same_mimir_home_as_shell_exec(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process_repo = tmp_path / "process-repo"
+    shell_repo = tmp_path / "shell-repo"
+    process_repo.mkdir()
+    shell_repo.mkdir()
+    monkeypatch.chdir(process_repo)
+    monkeypatch.setenv("MIMIR_HOME", str(shell_repo))
+    github.repositories_by_cwd[shell_repo] = "o/r"
+    shell_cwds: list[Path | None] = []
+
+    def shell_run(*_args: object, **kwargs: object) -> SimpleNamespace:
+        shell_cwds.append(kwargs.get("cwd"))  # type: ignore[arg-type]
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(extra.subprocess, "run", shell_run)
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+
+    claim = guard.claim_review_submission(spec)
+    extra.shell_exec.invoke({"command": "true"})
+
+    assert claim is not None
+    assert claim.repo == "o/r"
+    assert github.probe_cwds and set(github.probe_cwds) == {shell_repo}
+    assert shell_cwds == [shell_repo]
+    claim.release()
+
+
+def test_explicit_cwd_remains_authoritative(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    explicit_repo = tmp_path / "explicit-repo"
+    explicit_repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "other-repo"))
+    github.repositories_by_cwd[explicit_repo] = "o/r"
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve", cwd=str(explicit_repo)),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert claim is not None
+    assert set(github.probe_cwds) == {explicit_repo}
+    claim.release()
+
+
+def test_compound_cd_resolves_review_repository(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = home / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    github.repositories_by_cwd[repo] = "o/r"
+
+    spec = guard.review_submission_from_request(
+        _request("cd repo && gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert claim is not None
+    assert set(github.probe_cwds) == {repo}
+    claim.release()
+
+
+def test_unknown_effective_repository_cannot_produce_duplicate(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    monkeypatch.setitem(extra._SHELL_STATE, "cwd", None)
+    github.repositories_by_cwd[tmp_path] = "o/r"
+    github.reviews.append({
+        "user": {"login": github.reviewer},
+        "commit_id": github.head,
+        "state": "APPROVED",
+    })
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve --body ok"),
+    )
+
+    assert spec is not None
+    assert spec.cwd is None
+    assert guard.claim_review_submission(spec) is None
+    assert github.probe_cwds == []
 
 
 def test_same_head_same_reviewer_same_state_is_suppressed(github: FakeGitHub) -> None:

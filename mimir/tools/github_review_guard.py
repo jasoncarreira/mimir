@@ -11,6 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .extra import _effective_shell_cwd
+
 
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
@@ -57,10 +59,11 @@ def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
     }:
         return None
     args = (request.tool_call or {}).get("args") or {}
-    cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
+    raw_cwd = args.get("cwd")
+    cwd = _effective_shell_cwd(raw_cwd if isinstance(raw_cwd, str) else None)
     direct = args.get("mimir_direct_argv")
     if isinstance(direct, list) and all(isinstance(value, str) for value in direct):
-        return list(direct), cwd
+        return list(direct), str(cwd) if cwd is not None else None
     command = args.get("command")
     if not isinstance(command, str):
         return None
@@ -73,12 +76,27 @@ def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
         return None
     controls = {"&&", "||", ";", "|", "&", "(", ")"}
     start = 0
+    previous_segment: list[str] = []
+    previous_control: str | None = None
     for index in range(len(argv) + 1):
         if index < len(argv) and argv[index] not in controls:
             continue
         segment = argv[start:index]
         if len(segment) >= 3 and Path(segment[0]).name == "gh" and segment[1:3] == ["pr", "review"]:
-            return segment, cwd
+            if (
+                previous_control in {"&&", ";"}
+                and len(previous_segment) == 2
+                and previous_segment[0] == "cd"
+            ):
+                target = Path(previous_segment[1]).expanduser()
+                if not target.is_absolute():
+                    if cwd is None:
+                        return segment, None
+                    target = cwd / target
+                cwd = target.resolve()
+            return segment, str(cwd) if cwd is not None else None
+        previous_segment = segment
+        previous_control = argv[index] if index < len(argv) else None
         start = index + 1
     return None
 
@@ -154,6 +172,8 @@ def _text(spec: ReviewSubmission, arguments: list[str]) -> str | None:
 def _repo(spec: ReviewSubmission) -> str | None:
     if spec.repo:
         return spec.repo.strip() or None
+    if spec.cwd is None:
+        return None
     return _text(spec, ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
 
 
@@ -213,8 +233,10 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
     review. A non-duplicate claim holds its lock through the outbound command.
     """
     repo = _repo(spec)
+    if not repo:
+        return None
     reviewer = _reviewer(spec)
-    if not repo or not reviewer:
+    if not reviewer:
         return None
     number = _number(spec, repo)
     if number is None:
