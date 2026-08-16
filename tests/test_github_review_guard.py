@@ -11,6 +11,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
+from mimir.tools.refusals import ToolPolicyRefusal
 from tests.auth_helpers import middleware_auth_context
 
 
@@ -85,17 +86,165 @@ def _tool_request(
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("command", "expected"),
     [
-        "cd repo && gh pr review 152 --repo o/r --approve --body ok",
-        "printf ready | gh pr review 152 --repo o/r --approve --body ok",
-        "true; gh pr review 152 --repo o/r --approve --body ok",
+        (
+            "cd repo && gh pr review 152 --repo o/r --approve --body ok",
+            guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+        ),
+        (
+            "printf ready | gh pr review 152 --repo o/r --approve --body ok",
+            guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+        ),
+        (
+            "true; gh pr review 152 --repo o/r --approve --body ok",
+            guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+        ),
+        (
+            "cd repo\ngh pr review 152 --repo o/r --approve --body ok",
+            guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+        ),
+        (
+            "gh pr review 152 -a -b LGTM",
+            guard.ReviewSubmission("gh", None, 152, "APPROVED", None),
+        ),
+        (
+            "gh pr review 152 -r --body nope",
+            guard.ReviewSubmission("gh", None, 152, "CHANGES_REQUESTED", None),
+        ),
+        (
+            "gh pr review --repo o/r --approve -b LGTM",
+            guard.ReviewSubmission("gh", "o/r", None, "APPROVED", None),
+        ),
+        (
+            "gh pr review 152 -c -F review.md",
+            guard.ReviewSubmission("gh", None, 152, "COMMENTED", None),
+        ),
     ],
 )
-def test_review_submission_is_found_in_compound_command(command: str) -> None:
+def test_review_submission_is_found_in_compound_command(
+    command: str,
+    expected: guard.ReviewSubmission,
+) -> None:
     spec = guard.review_submission_from_request(_request(command))
 
-    assert spec == guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None)
+    assert spec == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd repo\ngh pr review 152 --repo o/r --approve --body ok",
+        "gh pr review 152 -a -b LGTM",
+        "gh pr review 152 -r -F review.md",
+        "gh pr review 152 -c",
+    ],
+)
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_new_review_shapes_are_claimed_by_sync_and_async_middleware(
+    command: str,
+    is_async: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    claimed: list[guard.ReviewSubmission] = []
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        budget_gate, "_request_for_authorized_execution", lambda request, *_: request,
+    )
+    monkeypatch.setattr(
+        guard,
+        "claim_review_submission",
+        lambda spec: claimed.append(spec) or None,
+    )
+    request = _tool_request(command, tool_call_id="new-shape")
+    middleware = budget_gate.BudgetGateMiddleware()
+
+    if is_async:
+        async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+            return ToolMessage(content="submitted", tool_call_id="new-shape")
+
+        await middleware.awrap_tool_call(request, async_handler)
+    else:
+        middleware.wrap_tool_call(
+            request,
+            lambda _request: ToolMessage(content="submitted", tool_call_id="new-shape"),
+        )
+
+    assert len(claimed) == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_unparseable_review_is_refused_by_sync_and_async_middleware(
+    is_async: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        budget_gate, "_request_for_authorized_execution", lambda request, *_: request,
+    )
+    request = _tool_request(
+        "gh pr review 152 --approve --unknown value",
+        tool_call_id="unparseable",
+    )
+
+    with pytest.raises(ToolPolicyRefusal, match="unrecognised option --unknown"):
+        if is_async:
+            async def async_handler(_request: ToolCallRequest) -> ToolMessage:
+                pytest.fail("refused handler was executed")
+
+            await budget_gate.BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+        else:
+            budget_gate.BudgetGateMiddleware().wrap_tool_call(
+                request,
+                lambda _request: pytest.fail("refused handler was executed"),
+            )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf 'gh pr review 152 --approve'",
+        "echo gh pr review 152 --approve",
+        "printf 'gh pr review",
+    ],
+)
+def test_non_review_commands_are_not_refused(command: str) -> None:
+    assert guard.review_submission_from_request(_request(command)) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        (
+            "gh pr review 152 --approve --unknown value",
+            "unrecognised option --unknown",
+        ),
+        ("gh pr review nope --approve", "pull request number is not an integer"),
+        ("gh pr review 152 --approve --body", "option --body requires a value"),
+        ("gh pr review 152 --body ok", "exactly one review state flag is required"),
+        (
+            "gh pr review 152 --approve --body 'unterminated",
+            "shell command could not be parsed",
+        ),
+    ],
+)
+def test_unparseable_review_reports_reason(command: str, reason: str) -> None:
+    with pytest.raises(ToolPolicyRefusal, match=reason):
+        guard.review_submission_from_request(_request(command))
+
+
+def test_body_value_is_not_parsed_as_a_state_flag() -> None:
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --comment --body --approve"),
+    )
+
+    assert spec == guard.ReviewSubmission("gh", None, 152, "COMMENTED", None)
 
 
 def test_direct_argv_remains_authoritative_for_compound_command() -> None:
@@ -114,6 +263,17 @@ def test_direct_argv_remains_authoritative_for_compound_command() -> None:
     assert spec == guard.ReviewSubmission(
         "/usr/bin/gh", "o/r", 152, "APPROVED", None,
     )
+
+
+def test_non_review_direct_argv_is_not_refused() -> None:
+    spec = guard.review_submission_from_request(
+        _request(
+            "gh pr review 152 --approve",
+            direct_argv=["gh", "pr", "list", "--state", "open"],
+        ),
+    )
+
+    assert spec is None
 
 
 def test_current_pull_request_is_inferred_when_number_is_omitted(
