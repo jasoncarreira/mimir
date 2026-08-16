@@ -845,11 +845,7 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
     async def stop(self) -> None:
         self._queue.close_nowait()
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            await self._task
             self._task = None
 
     def _create_runner(self, coroutine: Any, name: str) -> asyncio.Task[Any]:

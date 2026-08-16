@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from acp.task import RpcTask, RpcTaskKind
 from pydantic import ValidationError
 
 from mimir.acp import sdk
@@ -770,6 +771,55 @@ async def test_live_connection_bounds_active_inbound_runners() -> None:
     assert connection._recv_task is not None
     await asyncio.wait_for(connection._recv_task, 1)
     await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stop_drains_buffered_requests_before_shutdown() -> None:
+    transport = MemoryTransport()
+    gate = asyncio.Event()
+    started: list[int] = []
+
+    async def route(method: str, params: Any, is_notification: bool) -> Any:
+        del method, params, is_notification
+        started.append(len(started) + 1)
+        if len(started) == 1:
+            await gate.wait()
+        return {"sequence": len(started)}
+
+    queue = sdk.BoundedMessageQueue()
+    connection = sdk.Connection(
+        route,
+        transport,
+        listening=False,
+        queue=queue,
+        dispatcher_factory=lambda *args: sdk.BoundedMessageDispatcher(
+            *args, max_active=1
+        ),
+    )
+    for request_id in range(3):
+        await queue.publish(
+            RpcTask(
+                RpcTaskKind.REQUEST,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": f"request/{request_id}",
+                    "params": {},
+                },
+            )
+        )
+
+    while started != [1]:
+        await asyncio.sleep(0)
+    closing = asyncio.create_task(connection.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    gate.set()
+    await asyncio.wait_for(closing, 1)
+    responses = [await transport.outgoing.get() for _ in range(3)]
+    assert sorted(response["id"] for response in responses) == [0, 1, 2]
+    assert queue._queue.empty()
 
 
 @pytest.mark.asyncio
