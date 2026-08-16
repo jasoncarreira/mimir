@@ -165,6 +165,59 @@ def test_discover_treats_null_string_fields_as_missing(tmp_path: Path):
     assert pollers[0].deliver is None
 
 
+def test_discover_rejects_unsafe_names_before_state_creation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    state_root = tmp_path / "state" / "pollers"
+    absolute_target = tmp_path / "absolute-target"
+    names = [
+        "nested/name", "nested\\name", "../outside", ".", "..", str(absolute_target),
+    ]
+    manifests = []
+    for index, name in enumerate(names):
+        skill_dir = skills / f"bad-{index}"
+        _write_pollers_json(skill_dir, [
+            {"name": name, "command": "true", "cron": "* * * * *"},
+        ])
+        manifests.append(skill_dir / "pollers.json")
+
+    assert discover_pollers(skills, state_root=state_root) == []
+
+    assert not state_root.exists()
+    assert not (tmp_path / "outside").exists()
+    assert not absolute_target.exists()
+    messages = [record.getMessage() for record in caplog.records]
+    for manifest, name in zip(manifests, names, strict=True):
+        assert any(
+            "poller_invalid_name" in message
+            and str(manifest) in message
+            and repr(name) in message
+            for message in messages
+        )
+
+
+def test_discover_rejects_resolved_persist_dir_escape(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "demo", [
+        {"name": "demo", "command": "true", "cron": "* * * * *"},
+    ])
+    state_root = tmp_path / "state" / "pollers"
+    outside = tmp_path / "outside"
+    state_root.mkdir(parents=True)
+    outside.mkdir()
+    (state_root / "demo").symlink_to(outside, target_is_directory=True)
+
+    assert discover_pollers(skills, state_root=state_root) == []
+    assert any(
+        "poller_persist_dir_rejected" in record.getMessage()
+        and "name='demo'" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def _authority(**updates: object) -> dict:
     value = {
         "profile": "research",
@@ -174,6 +227,68 @@ def _authority(**updates: object) -> dict:
     }
     value.update(updates)
     return value
+
+
+def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) -> None:
+    state_root = tmp_path / "state" / "pollers"
+    outside = tmp_path / "outside"
+    state_root.mkdir(parents=True)
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="scoped root 'state' escapes allowed base"):
+        _parse_poller_authority(
+            _authority(),
+            name="demo",
+            persist_dir=outside,
+            state_root=state_root,
+            manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
+        )
+
+
+def test_valid_state_poller_creates_and_grants_only_its_instance_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    skills = tmp_path / "skills"
+    state_root = tmp_path / "state" / "pollers"
+    _write_pollers_json(skills / "demo", [
+        {
+            "name": "demo",
+            "command": "true",
+            "cron": "* * * * *",
+            "authority": _authority(capabilities=["write_file"]),
+        },
+    ])
+
+    [poller] = discover_pollers(skills, state_root=state_root)
+
+    expected = (state_root / "demo").resolve()
+    assert poller.persist_dir == expected
+    assert expected.is_dir()
+    policy = poller.authority.sink_policy_for("write_file")
+    assert policy is not None
+    assert policy.adapter == "trigger_service_write_roots"
+    granted_roots = [Path(root) for root in json.loads(policy.destination)]
+    assert granted_roots == [expected]
+
+
+def test_reserved_github_activity_name_requires_github_poller_skill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    manifest = skills / "arbitrary" / "pollers.json"
+    _write_pollers_json(manifest.parent, [
+        {"name": "github-activity", "command": "true", "cron": "* * * * *"},
+    ])
+
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+    assert any(
+        "poller_invalid_name" in record.getMessage()
+        and str(manifest) in record.getMessage()
+        and "name='github-activity'" in record.getMessage()
+        and "reserved poller name" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_research_profile_has_bounded_shell_and_append_credit_authority() -> None:
@@ -301,7 +416,7 @@ def test_github_profile_allows_only_its_bounded_fetch_capability(
         name="github-activity",
         persist_dir=persist_dir,
         state_root=tmp_path,
-        manifest_path=tmp_path / "pollers.json",
+        manifest_path=tmp_path / "github-poller" / "pollers.json",
     )
 
     assert authority.sink_policy_for("fetch_url") == access_control.ServiceSinkPolicy(
@@ -349,13 +464,14 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
                     declaration["script"] = str(
                         installed / "scripts" / Path(declaration["script"]).name
                     )
-            persist_dir = tmp_path / entry["name"]
-            persist_dir.mkdir()
+            state_root = tmp_path / "state" / "pollers"
+            persist_dir = state_root / entry["name"]
+            persist_dir.mkdir(parents=True)
             principal = _parse_poller_authority(
                 entry["authority"],
                 name=entry["name"],
                 persist_dir=persist_dir,
-                state_root=tmp_path / "state" / "pollers",
+                state_root=state_root,
                 manifest_path=installed_manifest,
             )
             capabilities = set(principal.capabilities)

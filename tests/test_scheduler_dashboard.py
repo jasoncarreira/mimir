@@ -13,8 +13,14 @@ from mimir.scheduler import Scheduler
 from mimir.scheduler_dashboard import build_scheduler_dashboard_payload
 
 
-def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "*/5 * * * *") -> Path:
-    skill = skills_dir / name
+def _drop_pollers_skill(
+    skills_dir: Path,
+    name: str,
+    cron: str = "*/5 * * * *",
+    *,
+    skill_name: str | None = None,
+) -> Path:
+    skill = skills_dir / (skill_name or name)
     skill.mkdir(parents=True, exist_ok=True)
     (skill / "pollers.json").write_text(json.dumps({
         "pollers": [{"name": name, "command": "true", "cron": cron}],
@@ -64,7 +70,7 @@ async def test_scheduler_dashboard_surfaces_poller_usage(tmp_path: Path):
         home=tmp_path,
     )
     skills = tmp_path / "skills"
-    _drop_pollers_skill(skills, "github-activity")
+    _drop_pollers_skill(skills, "github-activity", skill_name="github-poller")
     sched.add_poller_jobs(skills)
 
     payload = build_scheduler_dashboard_payload(
@@ -100,7 +106,7 @@ async def test_scheduler_dashboard_surfaces_missing_poller_cost_as_null(tmp_path
         home=tmp_path,
     )
     skills = tmp_path / "skills"
-    _drop_pollers_skill(skills, "github-activity")
+    _drop_pollers_skill(skills, "github-activity", skill_name="github-poller")
     sched.add_poller_jobs(skills)
 
     payload = build_scheduler_dashboard_payload(

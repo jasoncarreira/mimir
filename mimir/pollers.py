@@ -752,6 +752,37 @@ _TIER_RANK = {
 }
 
 
+def _validate_path_component(value: str, *, label: str) -> None:
+    """Reject values that are not one non-special filesystem component."""
+    path = Path(value)
+    if (
+        not value
+        or "/" in value
+        or "\\" in value
+        or path.is_absolute()
+        or path.name != value
+        or value in {".", ".."}
+    ):
+        raise ValueError(f"invalid {label}: {value!r}")
+
+
+def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
+    """Resolve and require ``candidate`` to remain an immediate child of ``base``."""
+    resolved = candidate.resolve()
+    if resolved.parent != base.resolve():
+        raise ValueError(f"{label} escapes allowed base: {candidate}")
+    return resolved
+
+
+def _validate_poller_identity(name: str, manifest_path: Path) -> None:
+    """Bind names with special server-side authority to their shipped skill identity."""
+    if name == "github-activity" and manifest_path.parent.name != "github-poller":
+        raise ValueError(
+            "reserved poller name 'github-activity' may only be declared by "
+            "the 'github-poller' skill"
+        )
+
+
 def _parse_poller_authority(
     raw: object,
     *,
@@ -761,6 +792,7 @@ def _parse_poller_authority(
     manifest_path: Path,
 ) -> ServicePrincipal:
     """Strictly resolve one manifest authority declaration or raise ValueError."""
+    _validate_poller_identity(name, manifest_path)
     if not isinstance(raw, dict):
         raise ValueError("authority must be an object")
     unknown = set(raw) - _AUTHORITY_KEYS - _OPTIONAL_AUTHORITY_KEYS
@@ -830,15 +862,26 @@ def _parse_poller_authority(
     home = state_root.parent.parent.resolve() if state_root is not None else None
     for root_name in roots_raw:
         if root_name == "state":
-            candidate = expected_state
+            if state_root is None:
+                candidate = expected_state
+            else:
+                candidate = _resolve_direct_child(
+                    expected_state,
+                    state_root,
+                    label="scoped root 'state'",
+                )
         elif root_name.startswith("wiki:") and home is not None:
             slug = root_name.removeprefix("wiki:")
-            if not slug or Path(slug).name != slug or slug in {".", ".."}:
-                raise ValueError(f"invalid scoped root: {root_name!r}")
-            candidate = (home / "state" / "wiki" / slug).resolve()
+            try:
+                _validate_path_component(slug, label="scoped root")
+            except ValueError as exc:
+                raise ValueError(f"invalid scoped root: {root_name!r}") from exc
             wiki_base = (home / "state" / "wiki").resolve()
-            if candidate.parent != wiki_base:
-                raise ValueError(f"scoped root escapes allowed base: {root_name!r}")
+            candidate = _resolve_direct_child(
+                wiki_base / slug,
+                wiki_base,
+                label=f"scoped root {root_name!r}",
+            )
         else:
             raise ValueError(f"unknown scoped root: {root_name!r}")
         if not candidate.exists() or not candidate.is_dir():
@@ -1237,6 +1280,15 @@ def discover_pollers(
                     pollers_file, entry,
                 )
                 continue
+            try:
+                _validate_path_component(name, label="poller name")
+                _validate_poller_identity(name, pollers_file)
+            except ValueError as exc:
+                log.warning(
+                    "poller_invalid_name: %s name=%r — %s; poller not registered",
+                    pollers_file, name, exc,
+                )
+                continue
             misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
             if misplaced_authority:
                 log.warning(
@@ -1320,9 +1372,21 @@ def discover_pollers(
                         pollers_file, name, ", ".join(_missing_req),
                     )
                     continue
-            persist_dir = (
-                state_root / name if state_root is not None else None
-            )
+            persist_dir: Path | None = None
+            if state_root is not None:
+                try:
+                    persist_dir = _resolve_direct_child(
+                        state_root / name,
+                        state_root,
+                        label=f"poller persist_dir for {name!r}",
+                    )
+                except (OSError, ValueError) as exc:
+                    log.warning(
+                        "poller_persist_dir_rejected: %s name=%r — %s; "
+                        "poller not registered",
+                        pollers_file, name, exc,
+                    )
+                    continue
             # Create the per-poller STATE_DIR at discovery time so
             # operators can drop credentials (`.env`) and cursor seed
             # files into a known location BEFORE the first cron tick
