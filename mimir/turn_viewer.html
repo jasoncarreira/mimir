@@ -236,6 +236,7 @@ function lsSet(key, value) {
 
 var authedFetch = window.MimirAuth.authedFetch;
 var getApiKey = window.MimirAuth.getApiKey;
+var promptApiKey = window.MimirAuth.promptApiKey;
 window.__mimir_resetApiKey = function() {
   window.MimirAuth.reset('manual rotation');
   if (typeof loadInitial === 'function') loadInitial();
