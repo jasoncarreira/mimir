@@ -2974,6 +2974,10 @@ def test_declared_shell_authorization_and_execution_gates_agree(
             service,
             review_state=review_state,
         )
+        gate_admitted = SinkGate.check_sink_flow(
+            "shell_exec", command, auth.ifc_labels, auth, enforce=True,
+            repo_review_state=review_state,
+        ).allowed
         bound = budget_gate._request_for_authorized_execution(
             _tool_request(auth, args={"command": command}),
             "shell_exec",
@@ -2987,7 +2991,24 @@ def test_declared_shell_authorization_and_execution_gates_agree(
 
         assert execution_argv == authorization_argv
         assert authorization_admitted is (authorization_argv is not None)
+        assert gate_admitted is authorization_admitted
         assert authorization_admitted is expected_admitted
+
+
+@pytest.mark.parametrize("subcommand", ["diff", "log", "show"])
+def test_read_only_git_safety_options_must_precede_pathspec_separator(
+    subcommand: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    misplaced = f"git {subcommand} -- --no-ext-diff --no-textconv"
+    effective = f"git {subcommand} --no-ext-diff --no-textconv -- README.md"
+
+    assert parse_service_shell_argv(misplaced, "scheduler_read_only") is None
+    argv = parse_service_shell_argv(effective, "scheduler_read_only")
+    assert argv == [
+        str(maintenance_pinned_executables["git"]), subcommand,
+        "--no-ext-diff", "--no-textconv", "--", "README.md",
+    ]
 
 
 def test_undeclared_shell_principal_keeps_shared_profile_behavior() -> None:
@@ -5103,6 +5124,29 @@ def test_ifc_label_blocked_sink_denial_carries_service_principal() -> None:
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:http_webhook"
     assert decision.service_principal is service
+
+
+def test_application_egress_fails_closed_when_live_taint_predicate_raises() -> None:
+    labels = InformationFlowLabels()
+
+    def predicate_raises(_fallback: object) -> bool:
+        raise RuntimeError("live IFC state unavailable")
+
+    indeterminate_auth = replace(
+        _write_auth(),
+        ifc_labels=labels,
+        ifc_state=SimpleNamespace(
+            has_untrusted_active_ingest=predicate_raises,
+            consume_sink_approval=lambda **_kwargs: False,
+        ),
+    )
+    blocked = SinkGate.check_sink_flow(
+        "http_request", "https://example.invalid/hook", labels,
+        indeterminate_auth, enforce=True,
+    )
+
+    assert blocked.allowed is False
+    assert blocked.reason == "ifc_label_blocked:http_webhook"
 
 
 @pytest.mark.parametrize(
