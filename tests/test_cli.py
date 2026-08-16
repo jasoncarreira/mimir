@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -380,6 +381,28 @@ def test_regenerate_api_key_cli_errors_when_no_env(
     assert "no .env" in capsys.readouterr().err
 
 
+def test_regenerate_api_key_refuses_process_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home)
+    env_path = home / ".env"
+    before = env_path.read_text()
+    monkeypatch.setenv("MIMIR_API_KEY", "compose-key-still-in-force")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["regenerate-api-key", "--home", str(home)])
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "process environment" in output.err
+    assert "mimir rotate --env MIMIR_API_KEY" in output.err
+    assert env_path.read_text() == before
+
+
 def test_run_refuses_without_explicit_home(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
 ):
@@ -462,6 +485,53 @@ def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixtur
     out = capsys.readouterr().out
     assert "mimir home ready at" in out
     assert str(home.resolve()) in out
+
+
+def test_bare_setup_refuses_unrelated_git_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    repo = tmp_path / "source-checkout"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Operator Name")
+    git("config", "user.email", "operator@example.com")
+    (repo / "README.md").write_text("source repository\n")
+    git("add", "README.md")
+    git("commit", "-m", "initial")
+    git("checkout", "-b", "feature/keep-me")
+    git("remote", "add", "origin", "https://example.invalid/original.git")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\n# operator hook\n")
+    hook.chmod(0o755)
+    before_hook = hook.read_bytes()
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MIMIR_STATE_REPO", "https://example.invalid/replacement.git")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-be-used")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["setup"])
+
+    assert exc_info.value.code == 1
+    assert "unrelated git repository" in capsys.readouterr().err
+    assert git("branch", "--show-current") == "feature/keep-me"
+    assert git("config", "user.name") == "Operator Name"
+    assert git("config", "user.email") == "operator@example.com"
+    assert git("remote", "get-url", "origin") == "https://example.invalid/original.git"
+    assert hook.read_bytes() == before_hook
+    assert not (repo / ".mimir").exists()
 
 
 def test_main_run_subcommand_exports_home_env(tmp_path: Path):
