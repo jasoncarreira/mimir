@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
@@ -24,7 +24,7 @@ const { SkinProvider, useSkin, skinIdFromPrefs } =
 const { useUiState } = await import("../uiState");
 
 function Probe() {
-  const { skin, availableSkins, cssVariables } = useSkin();
+  const { skin, availableSkins, cssVariables, setUserSkin } = useSkin();
   return (
     <>
       <div data-testid="skin-id">{skin.id}</div>
@@ -33,6 +33,7 @@ function Probe() {
       <div data-testid="unknown-token">
         {cssVariables["--mimir-background-image"]}
       </div>
+      <button onClick={() => setUserSkin("neon-terminal")} type="button">Choose Neon Terminal</button>
     </>
   );
 }
@@ -70,6 +71,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   useUiState.setState({ apiKeyPresent: false });
+  window.history.replaceState({}, "", "/");
 });
 
 describe("SkinProvider per-user skin preferences (#562)", () => {
@@ -102,6 +104,43 @@ describe("SkinProvider per-user skin preferences (#562)", () => {
 
   it("ignores unknown skin ids in prefs", () => {
     expect(skinIdFromPrefs({ skin: "unknown" })).toBeNull();
+  });
+
+  it("uses a query skin as a preview until the user explicitly chooses a skin", async () => {
+    window.history.replaceState({}, "", "/app/chat?skin=cosmic-nebula");
+    useUiState.setState({ apiKeyPresent: true });
+    bootstrapApi.apiFetchEnvelope.mockResolvedValue({ ok: true, version: "v1", data: bootstrap });
+    whoamiApi.getWhoami.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        canonical: "alice",
+        display_name: "Alice",
+        roles: ["user"],
+        is_admin: false,
+        is_master: false,
+        prefs: { skin: "default-retro" },
+      },
+    });
+    whoamiApi.updateUserPrefs.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        canonical: "alice",
+        display_name: "Alice",
+        roles: ["user"],
+        is_admin: false,
+        is_master: false,
+        prefs: { skin: "neon-terminal" },
+      },
+    });
+
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("cosmic-nebula"));
+    fireEvent.click(screen.getByRole("button", { name: "Choose Neon Terminal" }));
+
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("neon-terminal"));
+    expect(whoamiApi.updateUserPrefs).toHaveBeenCalledWith({ skin: "neon-terminal" });
   });
 
   it("merges operator skins from bootstrap into runtime resolution", async () => {

@@ -257,10 +257,10 @@ interface SkinProviderProps extends PropsWithChildren {
 }
 
 export function SkinProvider({ children, skinId }: SkinProviderProps) {
-  // Precedence: explicit prop (tests/embeds) > ?skin= override > the agent's
-  // configured skin (bootstrap.ui.skin) > default. Bootstrap loads async, so the
-  // configured skin applies once it arrives (default until then).
+  // Precedence: explicit prop (tests/embeds) > an in-page picker choice > the
+  // initial ?skin= preview > user preference > configured skin > default.
   const queryClient = useQueryClient();
+  const [userSelection, setUserSelection] = React.useState<SkinId | null>(null);
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
   const { data: bootstrap } = useBootstrap();
   const signedIn = Boolean(
@@ -281,7 +281,7 @@ export function SkinProvider({ children, skinId }: SkinProviderProps) {
     ? configured
     : DEFAULT_SKIN_ID;
   const selectedSkinId =
-    skinId ?? resolveSkinId(userSkin ?? fallback, registry);
+    skinId ?? userSelection ?? resolveSkinId(userSkin ?? fallback, registry);
   const skin = loadSkin(selectedSkinId, registry);
   useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
@@ -292,7 +292,10 @@ export function SkinProvider({ children, skinId }: SkinProviderProps) {
     },
   });
   const setUserSkin = useMemo(
-    () => (nextSkinId: SkinId) => skinMutation.mutate(nextSkinId),
+    () => (nextSkinId: SkinId) => {
+      setUserSelection(nextSkinId);
+      skinMutation.mutate(nextSkinId);
+    },
     [skinMutation.mutate],
   );
   const availableSkins = useMemo(() => Object.values(registry), [registry]);
