@@ -15,6 +15,80 @@ import pytest
 from mimir.saga import migrations as m
 
 
+def _create_unstamped_v4_db(
+    db_path: Path,
+    *,
+    include_observations_metadata: bool = True,
+    include_triples: bool = True,
+) -> None:
+    """Create the structural v4 shape used by real-open migration tests."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE atoms (
+            id TEXT PRIMARY KEY, content TEXT NOT NULL,
+            content_hash TEXT NOT NULL, source_type TEXT DEFAULT 'conversation',
+            metadata TEXT DEFAULT '{}', tombstoned INTEGER DEFAULT 0,
+            agent_id TEXT DEFAULT 'default', session_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, channel_id TEXT, started_at TEXT NOT NULL,
+            ended_at TEXT, summary TEXT, reflected_at TEXT,
+            topics_discussed TEXT NOT NULL DEFAULT '[]',
+            decisions_made TEXT NOT NULL DEFAULT '[]',
+            unfinished TEXT NOT NULL DEFAULT '[]', emotional_state TEXT,
+            closed_since TEXT NOT NULL DEFAULT '[]', embedding BLOB,
+            embedding_dim INTEGER
+        );
+        CREATE TABLE access_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, atom_id TEXT NOT NULL,
+            ts TEXT NOT NULL, source TEXT NOT NULL, weight REAL DEFAULT 1.0,
+            session_id TEXT, metadata TEXT DEFAULT '{}'
+        );
+        CREATE TABLE atom_access_summary (
+            atom_id TEXT PRIMARY KEY, recent_ts_json TEXT DEFAULT '[]',
+            recent_weights_json TEXT DEFAULT '[]', old_count INTEGER DEFAULT 0,
+            old_weight_sum REAL DEFAULT 0.0, old_oldest_ts TEXT,
+            last_updated_ts TEXT
+        );
+        CREATE TABLE embeddings (
+            atom_id TEXT PRIMARY KEY, provider TEXT NOT NULL,
+            model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL,
+            embedded_at TEXT NOT NULL
+        );
+        CREATE TABLE atom_topics (
+            atom_id TEXT NOT NULL, topic TEXT NOT NULL,
+            PRIMARY KEY (atom_id, topic)
+        );
+        CREATE TABLE atom_relations (
+            source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL, confidence REAL DEFAULT 1.0,
+            created_at TEXT NOT NULL, metadata TEXT DEFAULT '{}',
+            PRIMARY KEY (source_id, target_id, relation_type)
+        );
+        """
+    )
+    if include_observations_metadata:
+        conn.execute(
+            "CREATE TABLE observations_metadata ("
+            "atom_id TEXT PRIMARY KEY, evidence_count INTEGER DEFAULT 0, "
+            "trend TEXT, last_evidence_at TEXT, consolidated_at TEXT NOT NULL, "
+            "consolidation_session TEXT)"
+        )
+    if include_triples:
+        conn.execute(
+            "CREATE TABLE triples ("
+            "id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, "
+            "object TEXT NOT NULL, source_atom_id TEXT, confidence REAL DEFAULT 1.0, "
+            "valid_from TEXT, valid_until TEXT, embedding BLOB, "
+            "embedding_dim INTEGER, tombstoned INTEGER DEFAULT 0, "
+            "created_at TEXT NOT NULL, metadata TEXT DEFAULT '{}')"
+        )
+    conn.commit()
+    conn.close()
+
+
 class TestModuleSurface:
     def test_current_schema_version_is_int(self) -> None:
         assert isinstance(m.CURRENT_SCHEMA_VERSION, int)
@@ -85,6 +159,56 @@ class TestDetectSchemaVersion:
             "origin_trigger TEXT, origin_ref TEXT)"
         )
         assert m.detect_schema_version(conn) == 10
+
+    def test_missing_session_backfill_forces_v2_replay_through_real_open(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "missing-session-backfill.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, metadata, session_id, created_at) "
+            "VALUES (?, ?, ?, 'session_boundary', ?, ?, ?)",
+            (
+                "b1",
+                "Decided to migrate ACP to feature/acp; Jason approved",
+                "boundary-hash",
+                '{"topics_discussed":["ACP"],"decisions_made":["migrate"]}',
+                "sess-1",
+                "2026-08-15T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO embeddings "
+            "(atom_id, provider, model, dim, vec, embedded_at) "
+            "VALUES ('b1', 'stub', 'stub-1d', 1, x'01020304', "
+            "'2026-08-15T00:00:00+00:00')"
+        )
+        conn.commit()
+
+        assert m.detect_schema_version(conn) == 1
+        conn.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM atoms WHERE source_type = 'session_boundary'"
+        ).fetchone() == (0,)
+        assert migrated.execute(
+            "SELECT summary, topics_discussed, decisions_made, embedding, "
+            "embedding_dim FROM sessions WHERE id = 'sess-1'"
+        ).fetchone() == (
+            "Decided to migrate ACP to feature/acp; Jason approved",
+            '["ACP"]',
+            '["migrate"]',
+            b"\x01\x02\x03\x04",
+            1,
+        )
+        assert {
+            row[0] for row in migrated.execute("SELECT version FROM schema_version")
+        } == set(range(1, m.CURRENT_SCHEMA_VERSION + 1))
 
 
 class TestApplyPendingMigrations:
@@ -331,6 +455,101 @@ class TestApplyPendingMigrations:
                     7: "ALTER TABLE triples ADD COLUMN visibility TEXT;"
                 },
             )
+
+
+class TestSagaStoreInitialization:
+    def test_zero_byte_file_gets_full_greenfield_schema(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "empty.db"
+        db_path.touch()
+
+        conn = SagaStore(db_path=db_path)._ensure_conn()
+
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"atoms", "sessions", "schema_version"} <= tables
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone() == (m.CURRENT_SCHEMA_VERSION,)
+
+    def test_partial_schema_does_not_commit_inferred_version_rows(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "partial.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, started_at TEXT NOT NULL, "
+            "topics_discussed TEXT NOT NULL DEFAULT '[]', "
+            "embedding BLOB, embedding_dim INTEGER)"
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.OperationalError):
+            SagaStore(db_path=db_path)._ensure_conn()
+
+        check = sqlite3.connect(db_path)
+        version_table = check.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_version'"
+        ).fetchone()
+        if version_table is not None:
+            assert check.execute("SELECT version FROM schema_version").fetchall() == []
+        check.close()
+
+
+class TestV5BoundaryCleanup:
+    def test_v5_refuses_if_backfill_postcondition_changes_after_detection(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "v5-guard.db"
+        _create_unstamped_v4_db(db_path)
+        setup = sqlite3.connect(db_path)
+        setup.execute(
+            "INSERT INTO sessions (id, started_at) VALUES "
+            "('sess-1', '2026-08-15T00:00:00+00:00')"
+        )
+        setup.execute(
+            "INSERT INTO atoms "
+            "(id, content, content_hash, source_type, session_id, created_at) "
+            "VALUES ('b1', 'boundary', 'hash', 'session_boundary', 'sess-1', "
+            "'2026-08-15T00:00:00+00:00')"
+        )
+        setup.commit()
+        setup.close()
+
+        store = SagaStore(db_path=db_path)
+
+        def detect_then_invalidate(conn: sqlite3.Connection) -> int:
+            detected = m.detect_schema_version(conn)
+            assert detected == 4
+            conn.execute("DELETE FROM sessions WHERE id = 'sess-1'")
+            conn.commit()
+            return detected
+
+        store._detect_schema_version = detect_then_invalidate  # type: ignore[method-assign]
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="session_boundary atom has no matching sessions row",
+        ):
+            store._ensure_conn()
+
+        check = sqlite3.connect(db_path)
+        assert check.execute("SELECT id FROM atoms WHERE id = 'b1'").fetchone() == (
+            "b1",
+        )
+        assert check.execute("SELECT version FROM schema_version").fetchall() == []
+        check.close()
 
 
 class TestV6RebuildDataPreservation:
@@ -690,28 +909,14 @@ class TestV7OwnershipMigration:
         assert "idx_triples_visibility" in indexes
         assert "idx_triples_owner" in indexes
 
-    def test_v6_without_observations_metadata_migrates_to_v7(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.executescript(
-            """
-            CREATE TABLE atoms (id TEXT PRIMARY KEY);
-            CREATE TABLE sessions (id TEXT PRIMARY KEY, channel_id TEXT);
-            CREATE TABLE triples (id TEXT PRIMARY KEY);
-            CREATE TABLE schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            );
-            INSERT INTO schema_version VALUES
-                (6, '2000-01-01T00:00:00+00:00');
-            """
-        )
+    def test_v6_without_observations_metadata_migrates_to_v7(
+        self, tmp_path: Path
+    ) -> None:
+        from mimir.saga.client import SagaStore
 
-        m.apply_pending_migrations(
-            conn,
-            fresh=False,
-            target_version=7,
-            migrations={7: m.MIGRATIONS[7]},
-        )
+        db_path = tmp_path / "without-observations-metadata.db"
+        _create_unstamped_v4_db(db_path, include_observations_metadata=False)
+        conn = SagaStore(db_path=db_path)._ensure_conn()
 
         columns = {
             row[1]
@@ -730,6 +935,32 @@ class TestV7OwnershipMigration:
             "visibility",
             "provenance",
         } <= columns
+        assert 6 in {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
+
+    def test_v6_without_triples_migrates_to_v7(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "without-triples.db"
+        _create_unstamped_v4_db(db_path, include_triples=False)
+        conn = SagaStore(db_path=db_path)._ensure_conn()
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
+        assert {
+            "id",
+            "source_atom_id",
+            "owner_principal",
+            "visibility",
+            "provenance",
+        } <= columns
+        assert any(
+            row[2] == "atoms" and row[6] == "SET NULL"
+            for row in conn.execute("PRAGMA foreign_key_list(triples)")
+        )
+        assert 6 in {
+            row[0] for row in conn.execute("SELECT version FROM schema_version")
+        }
 
     def test_v7_preserves_existing_data(self) -> None:
         conn = sqlite3.connect(":memory:")
