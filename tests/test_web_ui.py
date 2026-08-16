@@ -589,6 +589,14 @@ def test_dashboard_extension_route_path_allows_app_prefix_words_only():
             label="App Child",
         ).validate()
 
+    for unsafe_path in ("//status", "/../status", "/status/../secret", "/\\status"):
+        with pytest.raises(ValueError, match="route_path"):
+            DashboardExtensionManifest(
+                id="unsafe",
+                route_path=unsafe_path,
+                label="Unsafe",
+            ).validate()
+
 
 @pytest.mark.asyncio
 async def test_turns_page_serves_html(app):
