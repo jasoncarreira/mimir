@@ -363,7 +363,8 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
         if scope.observed_head_sha != live_head:
             raise RuntimeError(
                 f"PR head advanced: scoped head {scope.observed_head_sha} is stale; "
-                f"fetched head is {live_head}"
+                f"fetched head is {live_head}; fatal: unable to access "
+                "'https://x-access-token:synthetic-secret@github.com/o/r/': rate limited"
             )
         lease = SimpleNamespace(
             path=tmp_path / "fresh", scope_id=scope.scope_id,
@@ -380,7 +381,8 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
 
     assert str(raised.value) == (
         f"repository checkout rejected: PR head advanced: scoped head {second_head} "
-        f"is stale; fetched head is {third_head}"
+        f"is stale; fetched head is {third_head}; fatal: unable to access "
+        "'https://[REDACTED]@github.com/o/r/': rate limited"
     )
     assert client.snapshot_calls == 2
     assert reminted_heads == [second_head]
@@ -406,7 +408,8 @@ def test_failed_remint_preserves_existing_stale_head_refusal(
         assert scope is old_scope
         raise RuntimeError(
             f"PR head advanced: scoped head {scope.observed_head_sha} is stale; "
-            f"fetched head is {fresh_head}"
+            f"fetched head is {fresh_head}; fatal: unable to access "
+            "'https://x-access-token:synthetic-secret@github.com/o/r/': rate limited"
         )
 
     monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", stale_checkout)
@@ -416,7 +419,41 @@ def test_failed_remint_preserves_existing_stale_head_refusal(
 
     assert str(raised.value) == (
         f"repository checkout rejected: PR head advanced: scoped head "
-        f"{old_scope.observed_head_sha} is stale; fetched head is {fresh_head}"
+        f"{old_scope.observed_head_sha} is stale; fetched head is {fresh_head}; "
+        "fatal: unable to access 'https://[REDACTED]@github.com/o/r/': rate limited"
+    )
+
+
+def test_repo_cleanup_redacts_git_url_userinfo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _auth(_scope(RepoPRAction.CHECKOUT))
+    state = auth.repo_review_state
+    assert state is not None
+    state.attach_checkout_lease(SimpleNamespace(
+        is_active=True,
+        scope_id=state.action_scope.scope_id,
+        owner=state.action_scope.principal,
+        path="/tmp/synthetic-checkout",
+    ))
+    monkeypatch.setattr(
+        "mimir.tools.repo.cleanup_pr_checkout_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(
+            "fatal: unable to access "
+            "'https://x-access-token:synthetic-secret@github.com/o/r/': authentication failed"
+        )),
+    )
+
+    with pytest.raises(ToolException) as raised:
+        repo_cleanup.func(
+            repository="owner/repo",
+            pull_request=7,
+            runtime=SimpleNamespace(context=auth),
+        )
+
+    assert str(raised.value) == (
+        "repository cleanup rejected: fatal: unable to access "
+        "'https://[REDACTED]@github.com/o/r/': authentication failed"
     )
 
 

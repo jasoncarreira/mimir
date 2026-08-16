@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -87,6 +88,7 @@ def github(monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
     monkeypatch.setattr(guard, "_run", fake.run)
     monkeypatch.setitem(extra._SHELL_STATE, "cwd", None)
     guard._locks.clear()
+    guard._lock_users.clear()
     return fake
 
 
@@ -472,6 +474,43 @@ def test_new_head_different_state_and_different_reviewer_are_allowed(
     claim.release()
 
 
+def test_review_claim_release_prunes_unused_lock(github: FakeGitHub) -> None:
+    claim = guard.claim_review_submission(
+        guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+    )
+
+    assert claim is not None
+    assert len(guard._locks) == 1
+    claim.release()
+
+    assert guard._locks == {}
+    assert guard._lock_users == {}
+
+
+def test_review_claim_lock_timeout_refuses_instead_of_proceeding(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("o/r", 152, github.head, github.reviewer.casefold(), "APPROVED")
+    held_lock = threading.Lock()
+    held_lock.acquire()
+    guard._locks[key] = held_lock
+    guard._lock_users[key] = 1
+    monkeypatch.setattr(guard, "_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="timed out waiting"):
+            guard.claim_review_submission(
+                guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+            )
+        assert guard._lock_users[key] == 1
+    finally:
+        held_lock.release()
+        guard._release_lock_user(key, held_lock)
+
+    assert key not in guard._locks
+
+
 def test_wrap_tool_call_recovered_poller_and_manual_race_has_one_side_effect(
     github: FakeGitHub,
     monkeypatch: pytest.MonkeyPatch,
@@ -544,6 +583,83 @@ def test_wrap_tool_call_releases_review_claim_when_handler_raises(
         )
 
     assert len(releases) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_wrap_releases_review_claim_when_cancelled_in_prologue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from mimir.tools import budget_gate
+
+    releases: list[None] = []
+    claim = guard.ReviewClaim(
+        "o/r", 152, "head-1", "mimir-carreira", "APPROVED", False,
+    )
+    claim.release = lambda: releases.append(None)  # type: ignore[method-assign]
+    monkeypatch.setattr(guard, "claim_review_submission", lambda spec: claim)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        access_control,
+        "begin_protected_result_capture",
+        lambda: (_ for _ in ()).throw(asyncio.CancelledError()),
+    )
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        pytest.fail("cancelled prologue reached handler")
+
+    with pytest.raises(asyncio.CancelledError):
+        await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                "gh pr review 152 --repo o/r --approve", tool_call_id="cancelled",
+            ),
+            handler,
+        )
+
+    assert len(releases) == 1
+
+
+def test_multi_target_result_labels_use_operative_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    cwd_authorization = SimpleNamespace(name="cwd")
+    artifact_authorization = SimpleNamespace(name="artifact")
+    authorizations = iter((cwd_authorization, artifact_authorization))
+    consumed: list[object] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_authorize_tool_call",
+        lambda *_args, **_kwargs: (next(authorizations), None),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_result_labels_for_call",
+        lambda _name, _request, _auth, authorization, **_kwargs: (
+            consumed.append(authorization) or None
+        ),
+    )
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    request = ToolCallRequest(
+        tool_call={
+            "name": "spawn_open_code",
+            "args": {"prompt": "task", "cwd": "/work", "artifact_root": "/artifacts"},
+            "id": "multi-target",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=middleware_auth_context()),
+    )
+
+    result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(content="spawned", tool_call_id="multi-target"),
+    )
+
+    assert result.status == "success"
+    assert consumed == [cwd_authorization, cwd_authorization]
 
 
 def test_wrap_tool_call_duplicate_release_remains_idempotent(
