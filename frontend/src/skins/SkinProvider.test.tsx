@@ -135,12 +135,30 @@ describe("SkinProvider per-user skin preferences (#562)", () => {
       },
     });
 
-    renderProvider(<Probe />);
+    const { unmount } = renderProvider(<Probe />);
     await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("cosmic-nebula"));
     fireEvent.click(screen.getByRole("button", { name: "Choose Neon Terminal" }));
 
     await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("neon-terminal"));
     expect(whoamiApi.updateUserPrefs).toHaveBeenCalledWith({ skin: "neon-terminal" });
+    expect(window.location.search).toBe("");
+
+    whoamiApi.getWhoami.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        canonical: "alice",
+        display_name: "Alice",
+        roles: ["user"],
+        is_admin: false,
+        is_master: false,
+        prefs: { skin: "neon-terminal" },
+      },
+    });
+    unmount();
+    renderProvider(<Probe />);
+
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("neon-terminal"));
   });
 
   it("merges operator skins from bootstrap into runtime resolution", async () => {
