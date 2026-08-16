@@ -11,11 +11,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .extra import _effective_shell_cwd
 from .refusals import ToolPolicyRefusal
 
 
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
+_lock_users: dict[tuple[str, int, str, str, str], int] = {}
+_LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,7 @@ class ReviewSubmission:
     number: int | None
     state: str
     cwd: str | None
+    repository_context_known: bool = True
 
 
 @dataclass
@@ -36,11 +40,30 @@ class ReviewClaim:
     state: str
     duplicate: bool
     _lock: threading.Lock | None = None
+    _key: tuple[str, int, str, str, str] | None = None
 
     def release(self) -> None:
         if self._lock is not None:
-            self._lock.release()
+            lock = self._lock
+            key = self._key
             self._lock = None
+            self._key = None
+            lock.release()
+            if key is not None:
+                _release_lock_user(key, lock)
+
+
+def _release_lock_user(
+    key: tuple[str, int, str, str, str], lock: threading.Lock,
+) -> None:
+    with _locks_guard:
+        users = _lock_users[key] - 1
+        if users:
+            _lock_users[key] = users
+        else:
+            _lock_users.pop(key, None)
+            if _locks.get(key) is lock:
+                _locks.pop(key, None)
 
 
 def _option_value(argv: list[str], names: set[str]) -> str | None:
@@ -53,7 +76,7 @@ def _option_value(argv: list[str], names: set[str]) -> str | None:
     return None
 
 
-def _review_segment(argv: list[str]) -> list[str] | None:
+def _review_segment(argv: list[str]) -> tuple[list[str], int] | None:
     start = 0
     for index in range(len(argv) + 1):
         if index < len(argv):
@@ -62,21 +85,23 @@ def _review_segment(argv: list[str]) -> list[str] | None:
                 continue
         segment = argv[start:index]
         if len(segment) >= 3 and Path(segment[0]).name == "gh" and segment[1:3] == ["pr", "review"]:
-            return segment
+            return segment, start
         start = index + 1
     return None
 
 
-def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
+def _review_argv(request: Any) -> tuple[list[str], str | None, bool] | None:
     if str((request.tool_call or {}).get("name") or "") not in {
         "shell_exec", "bash_async", "Bash", "bash",
     }:
         return None
     args = (request.tool_call or {}).get("args") or {}
-    cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
+    raw_cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
+    effective_cwd = _effective_shell_cwd(raw_cwd)
+    cwd = str(effective_cwd) if effective_cwd is not None else None
     direct = args.get("mimir_direct_argv")
     if isinstance(direct, list) and all(isinstance(value, str) for value in direct):
-        return list(direct), cwd
+        return list(direct), cwd, True
     command = args.get("command")
     if not isinstance(command, str):
         return None
@@ -95,7 +120,27 @@ def _review_argv(request: Any) -> tuple[list[str], str | None] | None:
             ) from exc
         return None
     segment = _review_segment(argv)
-    return (segment, cwd) if segment is not None else None
+    if segment is None:
+        return None
+    review_argv, start = segment
+    repository_context_known = True
+    prefix = argv[:start]
+    if "cd" in prefix:
+        repository_context_known = False
+        if (
+            len(prefix) == 3
+            and prefix[0] == "cd"
+            and prefix[2] == "&&"
+            and not any(character in prefix[1] for character in "$`*?[]{}")
+        ):
+            target = Path(prefix[1]).expanduser()
+            if not target.is_absolute():
+                target = (effective_cwd or Path.cwd()) / target
+            cwd = str(target.resolve())
+            repository_context_known = True
+    if _option_value(review_argv[3:], {"--repo", "-R"}):
+        repository_context_known = True
+    return review_argv, cwd, repository_context_known
 
 
 def _review_refusal(reason: str) -> ToolPolicyRefusal:
@@ -106,7 +151,7 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
     parsed = _review_argv(request)
     if parsed is None:
         return None
-    argv, cwd = parsed
+    argv, cwd, repository_context_known = parsed
     if len(argv) < 3 or Path(argv[0]).name != "gh" or argv[1:3] != ["pr", "review"]:
         return None
     if len(argv) < 4:
@@ -153,7 +198,9 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
     if number is not None and number <= 0:
         raise _review_refusal("pull request number must be positive")
     repo = _option_value(argv[3:], {"--repo", "-R"})
-    return ReviewSubmission(argv[0], repo, number, states.pop(), cwd)
+    return ReviewSubmission(
+        argv[0], repo, number, states.pop(), cwd, repository_context_known,
+    )
 
 
 def _gh_env() -> dict[str, str] | None:
@@ -244,6 +291,8 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
     fails open in that case so an outage cannot silently discard a legitimate
     review. A non-duplicate claim holds its lock through the outbound command.
     """
+    if not spec.repo and not spec.repository_context_known:
+        return None
     repo = _repo(spec)
     reviewer = _reviewer(spec)
     if not repo or not reviewer:
@@ -259,19 +308,26 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
         key = (repo.casefold(), number, head, reviewer.casefold(), spec.state)
         with _locks_guard:
             lock = _locks.setdefault(key, threading.Lock())
-        lock.acquire()
+            _lock_users[key] = _lock_users.get(key, 0) + 1
+        if not lock.acquire(timeout=_LOCK_ACQUIRE_TIMEOUT_SECONDS):
+            _release_lock_user(key, lock)
+            raise _review_refusal(
+                "timed out waiting for another matching review submission"
+            )
         # If the PR moved while this caller waited, claim the new-head key
         # instead. This keeps the key aligned with the head checked immediately
         # before submission.
         current_head = _head(spec, repo)
         if current_head != head:
             lock.release()
+            _release_lock_user(key, lock)
             if not current_head:
                 return None
             continue
         exists = _matching_review_exists(spec, repo, head, reviewer)
         if exists is None:
             lock.release()
+            _release_lock_user(key, lock)
             return None
         return ReviewClaim(
             repo=repo,
@@ -281,4 +337,5 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
             state=spec.state,
             duplicate=exists,
             _lock=lock,
+            _key=key,
         )

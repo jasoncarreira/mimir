@@ -26,6 +26,7 @@ from ..proposals import (
     abandon_proposal as _abandon_proposal,
     finalize_proposal as _finalize_proposal,
     list_open_proposals,
+    normalize_lane,
     open_proposal as _open_proposal,
 )
 from ..event_logger import log_event
@@ -66,6 +67,10 @@ async def open_proposal(lane: str = "agent") -> str:
 
     Returns the path to edit, or an explanation if a proposal can't be opened.
     """
+    try:
+        lane = normalize_lane(lane)
+    except ValueError as exc:
+        return f"open_proposal failed ({exc})"
     home = _home()
     if home is None:
         return "open_proposal failed: MIMIR_HOME not set — surface to the operator."
@@ -111,6 +116,10 @@ async def submit_proposal(title: str, rationale: str, lane: str = "agent") -> st
             commit message; this is what the operator reviews against.
         lane: Proposal lane to submit. Defaults to ``agent``.
     """
+    try:
+        lane = normalize_lane(lane)
+    except ValueError as exc:
+        return f"submit_proposal failed ({exc})"
     home = _home()
     if home is None:
         raise ProposalSubmissionError(
@@ -175,6 +184,10 @@ async def abandon_proposal(lane: str = "agent") -> str:
     Args:
         lane: Proposal lane to abandon. Defaults to ``agent``.
     """
+    try:
+        lane = normalize_lane(lane)
+    except ValueError as exc:
+        return f"abandon_proposal failed ({exc})"
     home = _home()
     if home is None:
         return "abandon_proposal failed: MIMIR_HOME not set — surface to the operator."

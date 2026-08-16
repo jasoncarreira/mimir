@@ -1039,7 +1039,7 @@ textarea {
 
 .saga-validation {
   align-self: center;
-  color: var(--mimir-color-danger, #9f1d1d);
+  color: var(--mimir-color-status-danger, #8b3a3a);
   font-weight: var(--mimir-font-weight-strong, 700);
 }
 
@@ -1592,12 +1592,12 @@ textarea {
 }
 
 .live-activity__span[data-state="active"] .live-activity__span-marker {
-  background: #7fb6ff;
+  background: var(--mimir-color-status-info, #315f7d);
   animation: live-activity-pulse 1.1s ease-in-out infinite;
 }
 
 .live-activity__span[data-state="error"] .live-activity__span-marker {
-  background: #ff8d8d;
+  background: var(--mimir-color-status-danger, #8b3a3a);
 }
 
 @keyframes live-activity-pulse {
@@ -1621,14 +1621,14 @@ textarea {
   font-weight: var(--mimir-font-weight-strong, 700);
 }
 
-.live-activity__span[data-type="tool_result"] { border-left-color: rgb(47 224 160 / 60%); }
-.live-activity__span[data-type="tool_result"] .live-activity__span-title { color: #5be8c0; }
-.live-activity__span[data-type="tool_call"] { border-left-color: rgb(90 150 255 / 60%); }
-.live-activity__span[data-type="tool_call"] .live-activity__span-title { color: #7fb6ff; }
-.live-activity__span[data-type="reasoning"] { border-left-color: rgb(224 178 74 / 60%); }
-.live-activity__span[data-type="reasoning"] .live-activity__span-title { color: #e7b357; }
-.live-activity__span[data-type="text"] { border-left-color: rgb(160 90 255 / 60%); }
-.live-activity__span[data-type="text"] .live-activity__span-title { color: #c9a3ff; }
+.live-activity__span[data-type="tool_result"] { border-left-color: var(--mimir-color-timeline-tool-result, #326b48); }
+.live-activity__span[data-type="tool_result"] .live-activity__span-title { color: var(--mimir-color-timeline-tool-result, #326b48); }
+.live-activity__span[data-type="tool_call"] { border-left-color: var(--mimir-color-timeline-tool-call, #7a5b1d); }
+.live-activity__span[data-type="tool_call"] .live-activity__span-title { color: var(--mimir-color-timeline-tool-call, #7a5b1d); }
+.live-activity__span[data-type="reasoning"] { border-left-color: var(--mimir-color-timeline-reasoning, #315f7d); }
+.live-activity__span[data-type="reasoning"] .live-activity__span-title { color: var(--mimir-color-timeline-reasoning, #315f7d); }
+.live-activity__span[data-type="text"] { border-left-color: var(--mimir-color-chrome-accent, #60786a); }
+.live-activity__span[data-type="text"] .live-activity__span-title { color: var(--mimir-color-chrome-accent, #60786a); }
 
 .live-activity__span-time {
   color: var(--mimir-color-text-muted, #58685f);
@@ -2268,7 +2268,7 @@ textarea {
   padding: 2px 6px;
   border: var(--mimir-border-width-hairline, 1px) solid var(--mimir-color-panel-border, #d6ded9);
   border-radius: var(--mimir-radius-control, 6px);
-  background: var(--mimir-color-page-background, #f7faf7);
+  background: var(--mimir-color-panel-background-muted, #f1f5f2);
   color: var(--mimir-color-text-muted, #58685f);
   font-size: var(--mimir-font-size-xs, 0.75rem);
 }
@@ -2649,18 +2649,18 @@ textarea {
 }
 
 .saga-atom-row__kind[data-kind="atom"] {
-  color: #5be88f;
-  border-color: rgb(47 224 112 / 36%);
+  color: var(--mimir-color-timeline-tool-result, #326b48);
+  border-color: var(--mimir-color-timeline-tool-result, #326b48);
 }
 
 .saga-atom-row__kind[data-kind="observation"] {
-  color: #7fb6ff;
-  border-color: rgb(90 150 255 / 38%);
+  color: var(--mimir-color-timeline-reasoning, #315f7d);
+  border-color: var(--mimir-color-timeline-reasoning, #315f7d);
 }
 
 .saga-atom-row__kind[data-kind="triple"] {
-  color: #c9a3ff;
-  border-color: rgb(160 90 255 / 38%);
+  color: var(--mimir-color-chrome-accent, #60786a);
+  border-color: var(--mimir-color-chrome-accent, #60786a);
 }
 
 .saga-atom-row__meta,
@@ -2694,52 +2694,50 @@ textarea {
 }
 
 .turn-trigger[data-trigger="saga_session_end"] {
-  color: #c9a3ff;
-  background: rgb(160 90 255 / 16%);
-  border-color: rgb(160 90 255 / 38%);
+  --turn-trigger-color: var(--mimir-color-trigger-saga-session-end, #68428e);
 }
 
 .turn-trigger[data-trigger="scheduled_tick"] {
-  color: #e7b357;
-  background: rgb(224 178 74 / 15%);
-  border-color: rgb(224 178 74 / 38%);
+  --turn-trigger-color: var(--mimir-color-trigger-scheduled-tick, #7a5b1d);
 }
 
 .turn-trigger[data-trigger="poller"] {
-  color: #5be8c0;
-  background: rgb(47 224 160 / 14%);
-  border-color: rgb(47 224 160 / 36%);
+  --turn-trigger-color: var(--mimir-color-trigger-poller, #326b48);
 }
 
 .turn-trigger[data-trigger="user_message"],
 .turn-trigger[data-trigger="user"] {
-  color: #7fb6ff;
-  background: rgb(90 150 255 / 16%);
-  border-color: rgb(90 150 255 / 38%);
+  --turn-trigger-color: var(--mimir-color-trigger-user-message, #315f7d);
 }
 
 .turn-trigger[data-trigger="synthesis"] {
-  color: #5be88f;
-  background: rgb(47 224 112 / 14%);
-  border-color: rgb(47 224 112 / 36%);
+  --turn-trigger-color: var(--mimir-color-trigger-synthesis, #3f6330);
 }
 
 .turn-trigger[data-trigger="heartbeat"] {
-  color: #ff8fb0;
-  background: rgb(255 90 130 / 14%);
-  border-color: rgb(255 90 130 / 36%);
+  --turn-trigger-color: var(--mimir-color-trigger-heartbeat, #8b3a3a);
 }
 
-.turn-trigger[data-trigger="spawn"] {
-  color: #a6a6ff;
-  background: rgb(130 130 255 / 16%);
-  border-color: rgb(130 130 255 / 38%);
+.turn-trigger[data-trigger="claude_code_spawn"] {
+  --turn-trigger-color: var(--mimir-color-trigger-claude-code-spawn, #4f4f92);
 }
 
-.turn-trigger[data-trigger="job"] {
-  color: #8fd6e6;
-  background: rgb(90 190 215 / 14%);
-  border-color: rgb(90 190 215 / 36%);
+.turn-trigger[data-trigger="shell_job_complete"] {
+  --turn-trigger-color: var(--mimir-color-trigger-shell-job-complete, #216674);
+}
+
+.turn-trigger[data-trigger="saga_session_end"],
+.turn-trigger[data-trigger="scheduled_tick"],
+.turn-trigger[data-trigger="poller"],
+.turn-trigger[data-trigger="user_message"],
+.turn-trigger[data-trigger="user"],
+.turn-trigger[data-trigger="synthesis"],
+.turn-trigger[data-trigger="heartbeat"],
+.turn-trigger[data-trigger="claude_code_spawn"],
+.turn-trigger[data-trigger="shell_job_complete"] {
+  color: var(--turn-trigger-color);
+  background: color-mix(in srgb, var(--turn-trigger-color) 14%, var(--mimir-color-panel-background-muted, #f1f5f2));
+  border-color: var(--turn-trigger-color);
 }
 
 /* Neon Terminal uppercases interactive labels, but turn/session rows are
@@ -3334,7 +3332,7 @@ textarea {
 .wiki-reader__header h2 {
   overflow-wrap: anywhere;
   margin: 0;
-  font-size: var(--mimir-font-size-2xl, 1.5rem);
+  font-size: var(--mimir-font-size-lg, 1.125rem);
 }
 
 .wiki-reader__header p:not(.ui-eyebrow) {

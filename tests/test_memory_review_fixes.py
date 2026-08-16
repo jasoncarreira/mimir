@@ -225,6 +225,28 @@ async def test_most_retrieved_filters_by_channel_id(client, monkeypatch):
     assert aid not in [x["id"] for x in b]
 
 
+@pytest.mark.asyncio
+async def test_most_retrieved_includes_shared_atoms(client, monkeypatch):
+    _patch_provider(monkeypatch)
+    stored = await client.store("shared ranked atom")
+    atom_id = stored["atom_id"]
+    conn = client._ensure_conn()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    conn.execute("UPDATE atoms SET agent_id = 'shared' WHERE id = ?", (atom_id,))
+    conn.execute(
+        "INSERT INTO access_events (atom_id, ts, source, weight) "
+        "VALUES (?, ?, 'retrieval', 1.0)",
+        (atom_id, recent_ts),
+    )
+    conn.commit()
+
+    ranked = await client.most_retrieved_atoms(
+        days=7, count=5, auth_context=ADMIN_SCOPE,
+    )
+
+    assert atom_id in [item["id"] for item in ranked]
+
+
 # ─── #7: outcome("negative") writes a feedback_negative event ────────
 
 

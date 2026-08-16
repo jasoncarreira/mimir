@@ -1024,6 +1024,40 @@ async def test_poll_once_expired_token_triggers_refresh(
 
 
 @pytest.mark.asyncio
+async def test_poll_once_emits_event_when_rotated_refresh_token_cannot_persist(
+    cfg: PollerConfig, rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch, credentials_path: Path,
+) -> None:
+    oauth = read_credentials(credentials_path)
+    oauth["expiresAt"] = int((time.time() - 60) * 1000)
+    write_credentials(credentials_path, oauth)
+    events: list[tuple[str, dict]] = []
+
+    async def _capture(event_type: str, **fields):
+        events.append((event_type, fields))
+
+    async def _refresh(session, oauth_in, cfg_in):
+        refreshed = dict(oauth_in)
+        refreshed["accessToken"] = "fake-new-access"
+        refreshed["refreshToken"] = "fake-rotated-refresh"
+        return refreshed
+
+    monkeypatch.setattr(op, "log_event", _capture)
+    monkeypatch.setattr(op, "refresh_access_token", _refresh)
+    monkeypatch.setattr(
+        op, "write_credentials",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only filesystem")),
+    )
+
+    result = await poll_once(cfg, rate_store, session=_MockSession())
+
+    assert result == {"ok": False, "stage": "proactive_refresh_persist"}
+    [failure] = [event for event in events if event[0] == "oauth_refresh_persist_failed"]
+    assert failure[1]["stage"] == "proactive_refresh"
+    assert "read-only filesystem" in failure[1]["error"]
+
+
+@pytest.mark.asyncio
 async def test_poll_once_refresh_fails_logged_out(
     cfg: PollerConfig, rate_store: RateLimitStore,
     monkeypatch: pytest.MonkeyPatch, credentials_path: Path,
@@ -1177,6 +1211,40 @@ async def test_poll_once_401_then_refresh_then_retry(
     # Both refresh and usage_ok logged.
     assert "oauth_refresh_ok" in types
     assert "oauth_usage_ok" in types
+
+
+@pytest.mark.asyncio
+async def test_poll_once_emits_event_when_reactive_refresh_cannot_persist(
+    cfg: PollerConfig, rate_store: RateLimitStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    async def _capture(event_type: str, **fields):
+        events.append((event_type, fields))
+
+    async def _fetch(session, token, cfg_in):
+        raise UsageFetchError("usage 401", unauthorized=True, status=401)
+
+    async def _refresh(session, oauth_in, cfg_in):
+        refreshed = dict(oauth_in)
+        refreshed["refreshToken"] = "fake-rotated-refresh"
+        return refreshed
+
+    monkeypatch.setattr(op, "log_event", _capture)
+    monkeypatch.setattr(op, "fetch_usage", _fetch)
+    monkeypatch.setattr(op, "refresh_access_token", _refresh)
+    monkeypatch.setattr(
+        op, "write_credentials",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    result = await poll_once(cfg, rate_store, session=_MockSession())
+
+    assert result == {"ok": False, "stage": "reactive_refresh_persist"}
+    [failure] = [event for event in events if event[0] == "oauth_refresh_persist_failed"]
+    assert failure[1]["stage"] == "reactive_refresh"
+    assert "disk full" in failure[1]["error"]
 
 
 # ── chainlink #17 (CR#22 layer b): derive_5h_from_cost ───────────────

@@ -335,7 +335,7 @@ function _expandDir(label) {
 // Expand the tree to a target dir path and scroll it into view.
 function expandAndScrollToDir(targetPath) {
   const parts = targetPath.split("/").filter(Boolean);
-  for (let i = 1; i < parts.length; i++) {
+  for (let i = 1; i <= parts.length; i++) {
     const anc = parts.slice(0, i).join("/");
     const el = _pathToEl.get(anc);
     if (el) _expandDir(el);
@@ -429,6 +429,10 @@ async function loadSearch(q) {
   searchResults.innerHTML = '<div class="tree-loading">Searching...</div>';
   try {
     const data = await authedFetch("/api/memory?view=search&q=" + encodeURIComponent(q));
+    if (data.error) {
+      searchResults.innerHTML = '<div class="error-msg">Error: ' + esc(data.error) + "</div>";
+      return;
+    }
     searchResults.innerHTML = "";
 
     const header = document.createElement("div");

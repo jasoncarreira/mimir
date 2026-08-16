@@ -1493,7 +1493,15 @@ async def poll_once(
         if is_access_token_expired(oauth):
             try:
                 oauth = await refresh_access_token(session, oauth, cfg)
-                write_credentials(cfg.credentials_path, oauth)
+                try:
+                    write_credentials(cfg.credentials_path, oauth)
+                except OSError as exc:
+                    await log_event(
+                        "oauth_refresh_persist_failed",
+                        stage="proactive_refresh",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return {"ok": False, "stage": "proactive_refresh_persist"}
                 await log_event(
                     "oauth_refresh_ok",
                     expires_at_ms=oauth.get("expiresAt"),
@@ -1533,7 +1541,15 @@ async def poll_once(
             if exc.unauthorized:
                 try:
                     oauth = await refresh_access_token(session, oauth, cfg)
-                    write_credentials(cfg.credentials_path, oauth)
+                    try:
+                        write_credentials(cfg.credentials_path, oauth)
+                    except OSError as write_exc:
+                        await log_event(
+                            "oauth_refresh_persist_failed",
+                            stage="reactive_refresh",
+                            error=f"{type(write_exc).__name__}: {write_exc}",
+                        )
+                        return {"ok": False, "stage": "reactive_refresh_persist"}
                     await log_event(
                         "oauth_refresh_ok",
                         expires_at_ms=oauth.get("expiresAt"),

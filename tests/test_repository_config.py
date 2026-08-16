@@ -90,6 +90,30 @@ def test_repository_record_drives_binding_roots_and_legacy_projections(
     assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
 
 
+@pytest.mark.parametrize(
+    "empty_name",
+    ["GITHUB_REPOS", "MIMIR_FILE_TOOL_ROOTS", "WORKLINK_REPO"],
+)
+def test_empty_legacy_repository_value_uses_declarative_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_name: str,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv(empty_name, "")
+
+    config = Config.from_env()
+
+    assert os.environ["GITHUB_REPOS"] == "owner/repo"
+    assert dict(config.file_tool_roots)[str(checkout.resolve())] == "rw"
+    assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
+
+
 def test_worklink_target_must_name_declared_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -174,6 +198,43 @@ def test_legacy_root_disagreement_fails_closed_with_both_values(
     assert "MIMIR_FILE_TOOL_ROOTS disagrees" in message
     assert str(other) in message
     assert str(allowed) in message
+
+
+@pytest.mark.parametrize(
+    ("name", "legacy_value", "declared_value"),
+    [
+        ("GITHUB_REPOS", "other/repo", "owner/repo"),
+        ("WORKLINK_REPO", "{other}", "{checkout}"),
+    ],
+)
+def test_nonempty_legacy_disagreement_fails_closed_with_both_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    legacy_value: str,
+    declared_value: str,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    other = tmp_path / "other"
+    allowed.mkdir()
+    other.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    legacy_value = legacy_value.format(other=other, checkout=checkout)
+    declared_value = declared_value.format(other=other, checkout=checkout)
+    monkeypatch.setenv(name, legacy_value)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        Config.from_env()
+
+    message = str(exc_info.value)
+    assert name in message
+    assert legacy_value in message
+    assert declared_value in message
 
 
 def test_worklink_config_names_one_neutral_repository(tmp_path: Path) -> None:

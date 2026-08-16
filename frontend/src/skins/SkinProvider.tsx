@@ -3,6 +3,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useState,
   type PropsWithChildren,
 } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -56,6 +57,14 @@ const tokenCssVariableNames = {
   colorTimelineToolResult: "--mimir-color-timeline-tool-result",
   colorTimelineToolResultBackground:
     "--mimir-color-timeline-tool-result-background",
+  colorTriggerSagaSessionEnd: "--mimir-color-trigger-saga-session-end",
+  colorTriggerScheduledTick: "--mimir-color-trigger-scheduled-tick",
+  colorTriggerPoller: "--mimir-color-trigger-poller",
+  colorTriggerUserMessage: "--mimir-color-trigger-user-message",
+  colorTriggerSynthesis: "--mimir-color-trigger-synthesis",
+  colorTriggerHeartbeat: "--mimir-color-trigger-heartbeat",
+  colorTriggerClaudeCodeSpawn: "--mimir-color-trigger-claude-code-spawn",
+  colorTriggerShellJobComplete: "--mimir-color-trigger-shell-job-complete",
   colorCodeBackground: "--mimir-color-code-background",
   colorCodeText: "--mimir-color-code-text",
   colorFocusRing: "--mimir-color-focus-ring",
@@ -249,10 +258,10 @@ interface SkinProviderProps extends PropsWithChildren {
 }
 
 export function SkinProvider({ children, skinId }: SkinProviderProps) {
-  // Precedence: explicit prop (tests/embeds) > ?skin= override > the agent's
-  // configured skin (bootstrap.ui.skin) > default. Bootstrap loads async, so the
-  // configured skin applies once it arrives (default until then).
+  // Precedence: explicit prop (tests/embeds) > an in-page picker choice > the
+  // initial ?skin= preview > user preference > configured skin > default.
   const queryClient = useQueryClient();
+  const [userSelection, setUserSelection] = useState<SkinId | null>(null);
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
   const { data: bootstrap } = useBootstrap();
   const signedIn = Boolean(
@@ -273,7 +282,7 @@ export function SkinProvider({ children, skinId }: SkinProviderProps) {
     ? configured
     : DEFAULT_SKIN_ID;
   const selectedSkinId =
-    skinId ?? resolveSkinId(userSkin ?? fallback, registry);
+    skinId ?? userSelection ?? resolveSkinId(userSkin ?? fallback, registry);
   const skin = loadSkin(selectedSkinId, registry);
   useSkinFonts(skin);
   const cssVariables = useMemo(() => skinTokensToCssVariables(skin), [skin]);
@@ -284,7 +293,19 @@ export function SkinProvider({ children, skinId }: SkinProviderProps) {
     },
   });
   const setUserSkin = useMemo(
-    () => (nextSkinId: SkinId) => skinMutation.mutate(nextSkinId),
+    () => (nextSkinId: SkinId) => {
+      setUserSelection(nextSkinId);
+      if (typeof window !== "undefined") {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("skin");
+        window.history.replaceState(
+          window.history.state,
+          "",
+          `${url.pathname}${url.search}${url.hash}`,
+        );
+      }
+      skinMutation.mutate(nextSkinId);
+    },
     [skinMutation.mutate],
   );
   const availableSkins = useMemo(() => Object.values(registry), [registry]);

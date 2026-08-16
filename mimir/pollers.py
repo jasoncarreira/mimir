@@ -1054,8 +1054,10 @@ def _apply_poller_overrides(
     if "cron" in overrides:
         cron = str(overrides["cron"]).strip()
         try:
-            from apscheduler.triggers.cron import CronTrigger
-            CronTrigger.from_crontab(cron)
+            # Import lazily to avoid the scheduler -> pollers module cycle.
+            # Validation must use the exact parser that installs the trigger.
+            from .scheduler import _cron_trigger_from_standard_crontab
+            _cron_trigger_from_standard_crontab(cron)
             updates["cron"] = cron
         except Exception as exc:  # noqa: BLE001 — keep manifest cron on any parse failure
             log.warning(

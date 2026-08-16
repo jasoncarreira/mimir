@@ -1,21 +1,13 @@
-"""Subagent inbox + .md definitions (SPEC §4.3, §4.4)."""
+"""Subagent .md definitions (SPEC §4.3)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from mimir.subagent_defs import (
     list_subagents,
     parse_vsm_config,
     seed_subagent_defs,
-)
-from mimir.subagent_inbox import (
-    SubagentInbox,
-    SubagentResult,
-    read_output_file,
-    render_subagent_updates,
 )
 
 
@@ -44,78 +36,6 @@ def test_climber_marked_background(tmp_path: Path):
     seed_subagent_defs(tmp_path)
     body = (tmp_path / ".claude" / "agents" / "climber.md").read_text()
     assert "background: true" in body
-
-
-@pytest.mark.asyncio
-async def test_inbox_push_and_drain():
-    inbox = SubagentInbox()
-    r = SubagentResult(
-        task_id="t1",
-        status="completed",
-        summary="done",
-        output_file="/tmp/x.md",
-    )
-    await inbox.push("c1", r)
-    assert inbox.peek("c1")[0].task_id == "t1"
-
-    drained = await inbox.drain("c1")
-    assert len(drained) == 1
-    assert inbox.peek("c1") == []
-
-
-@pytest.mark.asyncio
-async def test_inbox_isolates_channels():
-    inbox = SubagentInbox()
-    await inbox.push("c1", SubagentResult(task_id="t1", status="completed", summary="", output_file=None))
-    await inbox.push("c2", SubagentResult(task_id="t2", status="completed", summary="", output_file=None))
-    assert len(await inbox.drain("c1")) == 1
-    assert len(await inbox.drain("c1")) == 0  # already drained
-    assert len(await inbox.drain("c2")) == 1
-
-
-@pytest.mark.asyncio
-async def test_inbox_idle_eviction_preserves_pending_notifications():
-    inbox = SubagentInbox()
-    result = SubagentResult(
-        task_id="t1", status="completed", summary="", output_file=None
-    )
-    await inbox.push("c1", result)
-    inbox.by_channel["empty"] = []
-
-    assert inbox.evict_channel("c1") is False
-    assert inbox.evict_channel("empty") is True
-    assert inbox.evict_channel("missing") is False
-    assert inbox.peek("c1") == [result]
-
-
-def test_render_subagent_updates_includes_status_and_summary():
-    rendered = render_subagent_updates([
-        SubagentResult(
-            task_id="t1",
-            status="completed",
-            summary="climbed to 0.92",
-            output_file="/tmp/result.md",
-            description="optimize the boids reward",
-        )
-    ])
-    assert "[completed]" in rendered
-    assert "climbed to 0.92" in rendered
-    assert "/tmp/result.md" in rendered
-    assert "optimize the boids reward" in rendered
-
-
-def test_read_output_file_truncates(tmp_path: Path):
-    p = tmp_path / "big.md"
-    p.write_text("x" * 50_000)
-    body = read_output_file(str(p), max_bytes=200)
-    assert body is not None
-    assert "[truncated]" in body
-    assert len(body) < 50_000
-
-
-def test_read_output_file_returns_none_for_missing():
-    assert read_output_file("/tmp/does-not-exist-zzz.md") is None
-    assert read_output_file(None) is None
 
 
 # ─── §12.5: VSM frontmatter parsing ────────────────────────────────────
@@ -189,24 +109,3 @@ def test_parse_vsm_config_user_override_wins_over_bundled(tmp_path: Path):
     )
     vsm = parse_vsm_config(tmp_path, "critic")
     assert vsm == {"s3_tool_budget": 999, "s4_foresight": True}
-
-
-@pytest.mark.asyncio
-async def test_inbox_push_caps_summary_at_store_time():
-    """Stored results linger until the channel's next turn (possibly
-    forever) — cap the summary at push, not just at render."""
-    from mimir.subagent_inbox import MAX_SUMMARY_BYTES
-
-    inbox = SubagentInbox()
-    await inbox.push(
-        "ch",
-        SubagentResult(
-            task_id="t",
-            status="completed",
-            summary="x" * (MAX_SUMMARY_BYTES * 3),
-            output_file=None,
-        ),
-    )
-    (stored,) = inbox.peek("ch")
-    assert stored.summary.endswith("…[truncated]")
-    assert len(stored.summary) == MAX_SUMMARY_BYTES + len("…[truncated]")

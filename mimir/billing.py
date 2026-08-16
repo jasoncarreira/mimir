@@ -413,18 +413,17 @@ def record_codex_plus_rate_limits(
 
     recorded: dict[str, dict[str, Any]] = {}
     updates: dict[str, RateLimitSnapshot] = {}
-    for window, positional_key, positional_short in (
-        (getattr(rl, "primary", None), "openai_five_hour", "five_hour"),
-        (getattr(rl, "secondary", None), "openai_seven_day", "seven_day"),
-    ):
+    for window in (getattr(rl, "primary", None), getattr(rl, "secondary", None)):
         if window is None or getattr(window, "used_percent", None) is None:
             continue
         minutes = getattr(window, "window_minutes", None)
         if minutes == 0:
             continue
         if minutes is None:
-            store_key, short = positional_key, positional_short
-        elif minutes >= 1440:
+            # Position is plan-dependent (Pro may report 7d as primary).
+            # Reject the whole reading so existing known-good state survives.
+            return False
+        if minutes >= 1440:
             store_key, short = "openai_seven_day", "seven_day"
         else:
             store_key, short = "openai_five_hour", "five_hour"

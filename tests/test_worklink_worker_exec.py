@@ -10,6 +10,7 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import uuid
 
@@ -63,12 +64,12 @@ def test_client_rejects_non_uuid_home_and_invalid_commands(tmp_path: Path) -> No
     with _authorization(path) as checkout:
         client = WorkerClient(checkout)
         with pytest.raises(ValueError, match="UUIDv4"):
-            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={}, identifier="job"))
+            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={}, identifier="job", timeout_s=1))
         identifier = str(uuid.uuid4())
         with pytest.raises(ValueError, match="HOME"):
-            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={"HOME": "/tmp"}, identifier=identifier))
+            asyncio.run(client.launch(local_checkout=path, argv=["true"], env={"HOME": "/tmp"}, identifier=identifier, timeout_s=1))
         with pytest.raises(ValueError, match="non-empty"):
-            asyncio.run(client.launch(local_checkout=path, argv=[], env={}, identifier=identifier))
+            asyncio.run(client.launch(local_checkout=path, argv=[], env={}, identifier=identifier, timeout_s=1))
 
 
 @pytest.mark.asyncio
@@ -98,6 +99,7 @@ async def test_client_authenticates_root_before_sending_fds(tmp_path: Path, monk
                 argv=["true"],
                 env={},
                 identifier=str(uuid.uuid4()),
+                timeout_s=1,
             )
     assert sent == []
 
@@ -264,6 +266,91 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     assert not home.exists()
 
 
+def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied: list[tuple[str, Path, bool]] = []
+    normalized: list[int] = []
+    monkeypatch.setattr(
+        worker_exec.shutil,
+        "copytree",
+        lambda source, destination, *, symlinks: copied.append(
+            (source, destination, symlinks)
+        ),
+    )
+    monkeypatch.setattr(worker_exec.os, "open", lambda *_args, **_kwargs: 29)
+    monkeypatch.setattr(
+        worker_exec,
+        "_normalize_checkout_fd",
+        lambda fd, **_kwargs: normalized.append(fd),
+    )
+
+    result = worker_exec._execution_checkout_fd(
+        ["./.venv/bin/pytest", "-q"],
+        17,
+        tmp_path / "home",
+        checkout_root=worker_exec.REPO_TEST_CHECKOUT_ROOT,
+    )
+
+    assert result == 29
+    assert copied == [("/proc/self/fd/17", tmp_path / "home" / "project", True)]
+    assert normalized == [29]
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "boundary" / "checkout"
+    venv = source / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    runner = venv / "pytest"
+    runner.write_text("#!/bin/sh\necho fd-anchored\n", encoding="utf-8")
+    source.chmod(0o2770)
+    (source / ".venv").chmod(0o2770)
+    venv.chmod(0o2770)
+    runner.chmod(0o770)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
+    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        execution_fd = worker_exec._execution_checkout_fd(
+            ["./.venv/bin/pytest", "-q"],
+            source_fd,
+            home,
+            checkout_root=worker_exec.REPO_TEST_CHECKOUT_ROOT,
+        )
+    finally:
+        os.close(source_fd)
+    try:
+        assert os.path.samefile(f"/proc/self/fd/{execution_fd}", home / "project")
+        assert not os.path.samefile(f"/proc/self/fd/{execution_fd}", source)
+        completed = subprocess.run(
+            ["./.venv/bin/pytest", "-q"],
+            preexec_fn=lambda: os.fchdir(execution_fd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (completed.returncode, completed.stdout, completed.stderr) == (
+            0,
+            "fd-anchored\n",
+            "",
+        )
+    finally:
+        os.close(execution_fd)
+
+    copied_venv = home / "project" / ".venv"
+    copied_runner = copied_venv / "bin" / "pytest"
+    assert stat.S_IMODE(copied_venv.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(copied_runner.stat().st_mode) == 0o770
+    assert stat.S_IMODE(copied_venv.stat().st_mode) & 0o007 == 0
+    assert stat.S_IMODE(copied_runner.stat().st_mode) & 0o007 == 0
+
+
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
     identifier = str(uuid.uuid4())
     payload = json.dumps({"version": 1, "op": "launch", "id": identifier, "uid": 0}).encode()
@@ -379,6 +466,46 @@ def test_worker_identity_verifier_rejects_any_retained_authority(monkeypatch) ->
         worker_exec._verify_worker_identity()
 
 
+def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identifier = str(uuid.uuid4())
+
+    class Incumbent:
+        pass
+
+    incumbent = Incumbent()
+    request = {
+        "version": 1,
+        "op": "launch",
+        "id": identifier,
+        "issue": 41,
+        "attempt": 2,
+        "device": 0,
+        "inode": 0,
+        "argv": ["worker"],
+        "env": {},
+        "projections": [],
+        "timeout_s": 1,
+    }
+    monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
+    monkeypatch.setattr(
+        worker_exec.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("duplicate launch reached Popen"),
+    )
+    with worker_exec._jobs_lock:
+        worker_exec._jobs[identifier] = incumbent  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            worker_exec._handle_launch(object(), request, [0, 1, 2])  # type: ignore[arg-type]
+        with worker_exec._jobs_lock:
+            assert worker_exec._jobs[identifier] is incumbent
+    finally:
+        with worker_exec._jobs_lock:
+            worker_exec._jobs.pop(identifier, None)
+
+
 def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monkeypatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -436,6 +563,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         ],
         "env": {"PATH": "/usr/bin:/bin"},
         "projections": [],
+        "timeout_s": 5,
     }
     fds = [checkout_fd, stdout_write, stderr_write]
     try:
@@ -444,6 +572,86 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
         assert responses[-1]["exit_code"] == 0
         assert not (tmp_path / "homes" / identifier).exists()
         assert os.read(stderr_read, 4096) == b""
+    finally:
+        for fd in (*fds, stdout_read, stderr_read):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    checkout_fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    identifier = str(uuid.uuid4())
+    responses: list[dict[str, object]] = []
+    waits: list[float | None] = []
+
+    class Connection:
+        def send(self, payload: bytes) -> None:
+            responses.append(json.loads(payload))
+
+    class Process:
+        pid = 4321
+        returncode: int | None = None
+
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append(timeout)
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["worker"], timeout)
+            assert self.returncode is not None
+            return self.returncode
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
+    worker_exec.HOME_ROOT.mkdir()
+    monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
+    monkeypatch.setattr(worker_exec, "_project_home", lambda *args: None)
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_exec.os, "chmod", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        worker_exec,
+        "_execution_checkout_fd",
+        lambda _command, anchored_fd, _home, **_kwargs: os.dup(anchored_fd),
+    )
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    def terminate(observed: Process, timeout_s: float = 5.0) -> None:
+        assert observed is process
+        process.returncode = -signal.SIGKILL
+        process.wait()
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group", terminate)
+    request = {
+        "version": 1,
+        "op": "launch",
+        "id": identifier,
+        "issue": 41,
+        "attempt": 2,
+        "device": 0,
+        "inode": 0,
+        "argv": ["worker"],
+        "env": {},
+        "projections": [],
+        "timeout_s": 0.25,
+    }
+    fds = [checkout_fd, stdout_write, stderr_write]
+    try:
+        worker_exec._handle_launch(Connection(), request, fds)
+        assert waits[0] == 0.25 + worker_exec._CONTROLLER_CANCELLATION_GRACE_S
+        assert responses[-1] == {
+            "id": identifier,
+            "status": "terminal",
+            "exit_code": -signal.SIGKILL,
+            "timed_out": True,
+        }
     finally:
         for fd in (*fds, stdout_read, stderr_read):
             if fd >= 0:
@@ -502,6 +710,7 @@ def test_worker_payload_cannot_reach_controller_canary_and_detector_is_live() ->
                 )],
                 env={"PATH": "/usr/bin:/bin", "CANARY": str(canary)},
                 identifier=str(uuid.uuid4()),
+                timeout_s=5,
             )
             stdout, stderr = await asyncio.gather(process.stdout.read(), process.stderr.read())
             returncode = await process.wait()
@@ -704,7 +913,7 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
         lambda value: str(path) if str(value).startswith("/proc/self/fd/") else real_readlink(value),
     )
     try:
-        worker_exec._validate_checkout(
+        accepted_root = worker_exec._validate_checkout(
             fd,
             {
                 "device": observed.st_dev,
@@ -713,6 +922,7 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
                 "attempt": attempt,
             },
         )
+        assert accepted_root == roots[root_name]
     finally:
         os.close(fd)
 

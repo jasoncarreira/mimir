@@ -77,11 +77,11 @@ describe("OpsRoute", () => {
     expect(screen.getByText(/Positive \(last 24h\):/)).toBeTruthy();
   });
 
-  it("links JSON to the admin-gated v1 ops endpoint", async () => {
+  it("does not offer a JSON link that cannot send the API key", async () => {
     renderOpsRoute("/ops?days=14");
 
-    const link = await screen.findByRole("link", { name: "JSON" });
-    expect(link.getAttribute("href")).toBe("/api/v1/ops?days=14");
+    expect(await screen.findByRole("heading", { name: "Ops Dashboard" })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "JSON" })).toBeNull();
   });
 
   it("renders open PR links from the ops payload safely", async () => {

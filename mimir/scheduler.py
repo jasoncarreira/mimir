@@ -46,6 +46,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
     agent_writable_roots,
@@ -847,11 +848,7 @@ class Scheduler:
         return value.  This helper retains the task in ``_background_tasks``
         until it finishes, matching the cpython-documented strong-ref pattern.
         """
-        loop = asyncio.get_running_loop()
-        task: asyncio.Task[Any] = loop.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+        return spawn_background(self._background_tasks, coro, name=name)
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -1141,19 +1138,23 @@ class Scheduler:
         self.arm_quota_pause_recheck()
 
     def arm_quota_pause_recheck(self) -> None:
-        """Register/replace the interval probe that early-clears an
+        """Register the interval probe that early-clears an
         authoritative 429 pause when fresh quota evidence shows the
         provider recovered before the recorded reset. Idempotent;
         disarms itself once the pause is gone. Best-effort like the
         one-shot wake."""
         try:
+            # Keep the first probe's countdown. Repeated 429s should not defer
+            # recovery indefinitely by replacing it with a fresh interval.
+            if self._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is not None:
+                return
             self._scheduler.add_job(
                 self._recheck_quota_pause,
                 trigger=IntervalTrigger(seconds=_quota_recheck_seconds()),
                 id=_QUOTA_RECHECK_JOB_ID,
-                replace_existing=True,
                 coalesce=True,
                 max_instances=1,
+                misfire_grace_time=300,
             )
         except Exception:  # noqa: BLE001 — recovery degrades to the one-shot wake
             log.exception("failed to arm quota-pause recheck")
@@ -3272,7 +3273,7 @@ class Scheduler:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             self._loop_lag_task = None
@@ -3285,6 +3286,12 @@ class Scheduler:
         if self._started or self._scheduler.running:
             self._scheduler.shutdown(wait=False)
             self._started = False
+        errors = await cancel_background_tasks(
+            self._background_tasks,
+            label="scheduler",
+        )
+        if errors:
+            raise BaseExceptionGroup("scheduler shutdown failed", errors)
 
 
 def _summarize_consolidate(payload: Any) -> dict:

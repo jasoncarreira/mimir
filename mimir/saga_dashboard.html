@@ -418,6 +418,16 @@ function esc(s) {
   return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function escAttr(s) {
+  return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function bindAtomRows(container) {
+  container.querySelectorAll(".atom-row[data-atom-id]").forEach(row => {
+    row.addEventListener("click", () => loadAtom(row.dataset.atomId, row));
+  });
+}
+
 // ── Stats ─────────────────────────────────────────────────────────
 async function loadStats() {
   try {
@@ -477,7 +487,7 @@ async function loadRecent() {
       const stream = esc(a.stream || "semantic");
       const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">📌</span>' : '';
       const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
-      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+      return '<div class="atom-row" data-atom-id="' + escAttr(a.id) + '">'
         + '<span class="atom-preview">' + preview + "</span>"
         + typeBadge
         + '<span class="meta">' + stream + "</span>"
@@ -487,6 +497,7 @@ async function loadRecent() {
     }).join("");
 
     list.innerHTML = totalLine + header + rows;
+    bindAtomRows(list);
   } catch (e) {
     list.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
   }
@@ -531,16 +542,16 @@ async function loadAtom(atomId, rowEl) {
       ["Pinned", d.is_pinned ? "yes" : "no"],
       ["Created", fmtTs(d.created_at)],
       ["Access count", d.access_count != null ? d.access_count : "—"],
-      ["Last access", d.last_access_ts ? fmtTs(d.last_access_ts) + " (" + esc(d.last_access_source) + ")" : "—"],
+      ["Last access", d.last_access_ts ? fmtTs(d.last_access_ts) + " (" + (d.last_access_source || "") + ")" : "—"],
       ["Embedding", d.embedding ? d.embedding.provider + "/" + d.embedding.model + " dim=" + d.embedding.dim : "none"],
-      ["Tombstoned", d.tombstoned ? "yes (" + esc(d.tombstoned_reason || "?") + ")" : "no"],
+      ["Tombstoned", d.tombstoned ? "yes (" + (d.tombstoned_reason || "?") + ")" : "no"],
       ["Topics", Array.isArray(d.topics) ? d.topics.join(", ") || "—" : "—"],
     ].map(([k, v]) => kv(k, v)).join("");
 
     const relHtml = (d.relations_out && d.relations_out.length)
       ? d.relations_out.map(r =>
           '<div class="relation-row"><b>' + esc(r.relation_type) + '</b> → '
-          + esc(r.target_id) + ' (conf ' + (r.confidence || 1).toFixed(2) + ')'
+          + esc(r.target_id) + ' (conf ' + (r.confidence ?? 1).toFixed(2) + ')'
           + (r.target_preview ? ' — <span style="color:var(--muted)">' + esc(r.target_preview) + "…</span>" : "")
           + "</div>"
         ).join("")
@@ -597,7 +608,7 @@ async function runSearch() {
       const stream = esc(a.stream || "semantic");
       const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">\u{1F4CC}</span>' : '';
       const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
-      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+      return '<div class="atom-row" data-atom-id="' + escAttr(a.id) + '">'
         + '<span class="atom-preview">' + preview + "</span>"
         + typeBadge
         + '<span class="meta">' + stream + "</span>"
@@ -607,6 +618,7 @@ async function runSearch() {
     }).join("");
 
     container.innerHTML = '<div class="atom-list">' + meta + header + rows + "</div>";
+    bindAtomRows(container);
   } catch (e) {
     container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
   }

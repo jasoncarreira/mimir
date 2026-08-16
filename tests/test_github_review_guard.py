@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,14 +14,22 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
+from mimir.tools import extra
 from mimir.tools.refusals import ToolPolicyRefusal
 from tests.auth_helpers import middleware_auth_context
 
 
-def _request(command: str, *, direct_argv: list[str] | None = None) -> SimpleNamespace:
+def _request(
+    command: str,
+    *,
+    direct_argv: list[str] | None = None,
+    cwd: str | None = None,
+) -> SimpleNamespace:
     args: dict[str, object] = {"command": command}
     if direct_argv is not None:
         args["mimir_direct_argv"] = direct_argv
+    if cwd is not None:
+        args["cwd"] = cwd
     return SimpleNamespace(tool_call={"name": "shell_exec", "args": args})
 
 
@@ -30,20 +41,36 @@ class FakeGitHub:
         self.review_side_effects = 0
         self.current_number = 152
         self.lock = threading.Lock()
+        self.repos_by_cwd: dict[str, str] = {}
+        self.calls: list[tuple[list[str], str | None]] = []
 
     def run(self, spec: guard.ReviewSubmission, arguments: list[str]):
+        self.calls.append((arguments, spec.cwd))
+        returncode = 0
         if arguments[:2] == ["api", "user"]:
             output = self.reviewer
-        elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}"]:
-            output = self.head
-        elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}/reviews"]:
+        elif arguments[:2] == ["repo", "view"]:
+            cwd = str(Path(spec.cwd or Path.cwd()).resolve())
+            output = self.repos_by_cwd.get(cwd, "")
+            returncode = 0 if output else 1
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
+            and arguments[1].endswith(f"/pulls/{spec.number}/reviews")
+        ):
             with self.lock:
                 output = json.dumps(self.reviews)
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
+            and arguments[1].endswith(f"/pulls/{spec.number}")
+        ):
+            output = self.head
         elif arguments[:2] == ["pr", "view"]:
             output = str(self.current_number)
         else:  # pragma: no cover - catches an unexpected API shape clearly
             raise AssertionError(arguments)
-        return SimpleNamespace(returncode=0, stdout=output)
+        return SimpleNamespace(returncode=returncode, stdout=output)
 
     def submit(self, spec: guard.ReviewSubmission) -> None:
         with self.lock:
@@ -59,7 +86,9 @@ class FakeGitHub:
 def github(monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
     fake = FakeGitHub()
     monkeypatch.setattr(guard, "_run", fake.run)
+    monkeypatch.setitem(extra._SHELL_STATE, "cwd", None)
     guard._locks.clear()
+    guard._lock_users.clear()
     return fake
 
 
@@ -128,7 +157,7 @@ def test_review_submission_is_found_in_compound_command(
 ) -> None:
     spec = guard.review_submission_from_request(_request(command))
 
-    assert spec == expected
+    assert replace(spec, cwd=None) == expected
 
 
 @pytest.mark.parametrize(
@@ -291,6 +320,107 @@ def test_current_pull_request_is_inferred_when_number_is_omitted(
     claim.release()
 
 
+def test_omitted_cwd_uses_shell_exec_home_not_process_cwd(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    process_repo = tmp_path / "workspace-mimir"
+    shell_home.mkdir()
+    process_repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    monkeypatch.chdir(process_repo)
+    github.repos_by_cwd = {
+        str(shell_home.resolve()): "o/shell-home",
+        str(process_repo.resolve()): "o/process-repo",
+    }
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(extra._effective_shell_cwd()) == str(shell_home.resolve())
+    assert claim is not None
+    assert claim.repo == "o/shell-home"
+    assert {cwd for _, cwd in github.calls} == {str(shell_home.resolve())}
+    claim.release()
+
+
+def test_explicit_cwd_still_overrides_shell_home(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    explicit = tmp_path / "explicit"
+    shell_home.mkdir()
+    explicit.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(explicit.resolve())] = "o/explicit"
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve", cwd=str(explicit)),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(explicit)
+    assert claim is not None
+    assert claim.repo == "o/explicit"
+    claim.release()
+
+
+def test_compound_cd_resolves_repository_from_command_directory(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    repo = shell_home / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(repo.resolve())] = "o/compound"
+
+    spec = guard.review_submission_from_request(
+        _request("cd repo && gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(repo.resolve())
+    assert claim is not None
+    assert claim.repo == "o/compound"
+    claim.release()
+
+
+def test_ambiguous_shell_cwd_cannot_return_duplicate(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    shell_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(shell_home.resolve())] = "o/wrong-repo"
+    github.reviews.append({
+        "user": {"login": github.reviewer},
+        "commit_id": github.head,
+        "state": "APPROVED",
+    })
+
+    spec = guard.review_submission_from_request(
+        _request('cd "$REVIEW_REPO" && gh pr review 152 --approve'),
+    )
+    assert spec is not None
+
+    assert spec.repository_context_known is False
+    assert guard.claim_review_submission(spec) is None
+    assert github.calls == []
+
+
 def test_same_head_same_reviewer_same_state_is_suppressed(github: FakeGitHub) -> None:
     github.reviews.append({
         "user": {"login": github.reviewer},
@@ -342,6 +472,43 @@ def test_new_head_different_state_and_different_reviewer_are_allowed(
     assert claim is not None
     assert claim.duplicate is False
     claim.release()
+
+
+def test_review_claim_release_prunes_unused_lock(github: FakeGitHub) -> None:
+    claim = guard.claim_review_submission(
+        guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+    )
+
+    assert claim is not None
+    assert len(guard._locks) == 1
+    claim.release()
+
+    assert guard._locks == {}
+    assert guard._lock_users == {}
+
+
+def test_review_claim_lock_timeout_refuses_instead_of_proceeding(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ("o/r", 152, github.head, github.reviewer.casefold(), "APPROVED")
+    held_lock = threading.Lock()
+    held_lock.acquire()
+    guard._locks[key] = held_lock
+    guard._lock_users[key] = 1
+    monkeypatch.setattr(guard, "_LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="timed out waiting"):
+            guard.claim_review_submission(
+                guard.ReviewSubmission("gh", "o/r", 152, "APPROVED", None),
+            )
+        assert guard._lock_users[key] == 1
+    finally:
+        held_lock.release()
+        guard._release_lock_user(key, held_lock)
+
+    assert key not in guard._locks
 
 
 def test_wrap_tool_call_recovered_poller_and_manual_race_has_one_side_effect(
@@ -416,6 +583,83 @@ def test_wrap_tool_call_releases_review_claim_when_handler_raises(
         )
 
     assert len(releases) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_wrap_releases_review_claim_when_cancelled_in_prologue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from mimir.tools import budget_gate
+
+    releases: list[None] = []
+    claim = guard.ReviewClaim(
+        "o/r", 152, "head-1", "mimir-carreira", "APPROVED", False,
+    )
+    claim.release = lambda: releases.append(None)  # type: ignore[method-assign]
+    monkeypatch.setattr(guard, "claim_review_submission", lambda spec: claim)
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        access_control,
+        "begin_protected_result_capture",
+        lambda: (_ for _ in ()).throw(asyncio.CancelledError()),
+    )
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        pytest.fail("cancelled prologue reached handler")
+
+    with pytest.raises(asyncio.CancelledError):
+        await budget_gate.BudgetGateMiddleware().awrap_tool_call(
+            _tool_request(
+                "gh pr review 152 --repo o/r --approve", tool_call_id="cancelled",
+            ),
+            handler,
+        )
+
+    assert len(releases) == 1
+
+
+def test_multi_target_result_labels_use_operative_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    cwd_authorization = SimpleNamespace(name="cwd")
+    artifact_authorization = SimpleNamespace(name="artifact")
+    authorizations = iter((cwd_authorization, artifact_authorization))
+    consumed: list[object] = []
+    monkeypatch.setattr(
+        budget_gate,
+        "_authorize_tool_call",
+        lambda *_args, **_kwargs: (next(authorizations), None),
+    )
+    monkeypatch.setattr(
+        budget_gate,
+        "_result_labels_for_call",
+        lambda _name, _request, _auth, authorization, **_kwargs: (
+            consumed.append(authorization) or None
+        ),
+    )
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    request = ToolCallRequest(
+        tool_call={
+            "name": "spawn_open_code",
+            "args": {"prompt": "task", "cwd": "/work", "artifact_root": "/artifacts"},
+            "id": "multi-target",
+            "type": "tool_call",
+        },
+        tool=None,
+        state=None,
+        runtime=Runtime(context=middleware_auth_context()),
+    )
+
+    result = budget_gate.BudgetGateMiddleware().wrap_tool_call(
+        request,
+        lambda _request: ToolMessage(content="spawned", tool_call_id="multi-target"),
+    )
+
+    assert result.status == "success"
+    assert consumed == [cwd_authorization, cwd_authorization]
 
 
 def test_wrap_tool_call_duplicate_release_remains_idempotent(

@@ -2651,6 +2651,64 @@ async def test_dispatch_poller_reload_events_task_is_held_in_background_tasks(
 
 
 @pytest.mark.asyncio
+async def test_scheduler_stop_drains_background_tasks(tmp_path: Path):
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocking_task():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    task = sched._spawn(blocking_task(), name="scheduler-test-blocking")
+    await started.wait()
+
+    await sched.stop()
+
+    assert task.cancelled()
+    assert cancelled.is_set()
+    assert sched._background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_spawn_reports_background_task_failure(
+    tmp_path: Path, monkeypatch,
+):
+    recorded: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "mimir.background_tasks.log_event_sync",
+        lambda event_type, **fields: recorded.append((event_type, fields)),
+    )
+
+    async def noop(_event):
+        return True
+
+    async def fail():
+        raise RuntimeError("scheduler task failed")
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
+    task = sched._spawn(fail(), name="scheduler-test-failure")
+    while not task.done() or sched._background_tasks:
+        await asyncio.sleep(0)
+
+    assert recorded == [
+        (
+            "background_task_failed",
+            {
+                "name": "scheduler-test-failure",
+                "error": "RuntimeError: scheduler task failed",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, monkeypatch):
     logged: list[tuple[str, dict]] = []
     ticks = iter([0.0, 0.11, 0.34])
@@ -3059,7 +3117,8 @@ async def test_scheduler_loop_lag_monitor_flags_sub_cpu_block_just_over_threshol
     assert payload["blocking_stacks"][0]["stall_s"] == 0.6
 
 
-def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):
+@pytest.mark.asyncio
+async def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("MIMIR_LOOP_STALL_ALERT_SECONDS", raising=False)
     monkeypatch.delenv("MIMIR_LOOP_STALL_SELF_TERMINATE", raising=False)
     async def noop(event: AgentEvent) -> bool:
@@ -3098,7 +3157,7 @@ def test_scheduler_start_and_stop_manage_loop_lag_monitor(tmp_path: Path, monkey
     assert sched._loop_watchdog._alert_threshold == 300.0
     assert sched._loop_watchdog._terminate_on_stall is False
 
-    sched.stop()
+    await sched.stop()
 
     assert task.cancelled is True
     assert sched._loop_lag_task is None
@@ -3127,7 +3186,8 @@ def test_agent_wires_arbiter_through_scheduler_setter():
     assert "scheduler._arbiter = self._arbiter" not in source
 
 
-def test_stop_handles_underlying_partial_start(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_stop_handles_underlying_partial_start(tmp_path: Path):
     async def noop(event: AgentEvent) -> bool:
         return True
 
@@ -3145,7 +3205,7 @@ def test_stop_handles_underlying_partial_start(tmp_path: Path):
     partial = PartialScheduler()
     sched._scheduler = partial
 
-    sched.stop()
+    await sched.stop()
 
     assert partial.shutdown_calls == [False]
     assert sched._started is False
@@ -3269,10 +3329,12 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
     # Regression guard: without a registered callable, _install_callable is
     # never reached and this test cannot detect its historical second read.
     sched.register_callable("maintenance", callable_noop, "0 9 * * *")
+    sched._scheduler.add_job(lambda: None, "date", id="scheduler:stale")
 
     loop_thread = threading.get_ident()
     io_threads: list[int] = []
-    mutate_threads: list[int] = []
+    add_threads: list[int] = []
+    removals: list[tuple[str, int]] = []
 
     real_load = sched_mod.load_jobs
 
@@ -3284,17 +3346,26 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
     real_add = sched._scheduler.add_job
 
     def spy_add(*a, **k):
-        mutate_threads.append(threading.get_ident())
+        add_threads.append(threading.get_ident())
         return real_add(*a, **k)
     monkeypatch.setattr(sched._scheduler, "add_job", spy_add)
+
+    real_remove = sched._scheduler.remove_job
+
+    def spy_remove(*a, **k):
+        job_id = a[0] if a else k["job_id"]
+        removals.append((job_id, threading.get_ident()))
+        return real_remove(*a, **k)
+    monkeypatch.setattr(sched._scheduler, "remove_job", spy_remove)
 
     await sched._reload_async()
 
     assert len(io_threads) == 1, "reload must parse scheduler.yaml exactly once"
     assert all(t != loop_thread for t in io_threads), \
         "yaml read ran on the loop thread (should be in to_thread)"
-    assert mutate_threads, "no APScheduler mutation happened"
-    assert all(t == loop_thread for t in mutate_threads), \
+    assert add_threads, "no APScheduler addition happened"
+    assert "scheduler:stale" in {job_id for job_id, _ in removals}
+    assert all(t == loop_thread for t in add_threads + [t for _, t in removals]), \
         "APScheduler mutation ran off the loop thread"
 
 
@@ -3551,7 +3622,7 @@ async def test_arm_quota_recovery_wake_registers_one_shot(tmp_path: Path):
         recovery_jobs = [j for j in sched._scheduler.get_jobs() if j.id == _QUOTA_RECOVERY_JOB_ID]
         assert len(recovery_jobs) == 1
     finally:
-        sched.stop()
+        await sched.stop()
 
 
 @pytest.mark.asyncio
@@ -3575,7 +3646,7 @@ async def test_rearm_quota_recovery_on_start_from_pause_file(tmp_path: Path):
     try:
         assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is not None
     finally:
-        sched.stop()
+        await sched.stop()
 
 
 def test_minimax_poll_job_default_model_matches_poller_default():
@@ -4372,7 +4443,37 @@ async def test_arm_quota_recovery_wake_also_arms_recheck(tmp_path: Path):
     sched.arm_quota_recovery_wake(
         datetime.now(tz=timezone.utc) + timedelta(hours=1),
     )
-    assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is not None
+    job = sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID)
+    assert job is not None
+    assert job.misfire_grace_time == 300
+
+
+@pytest.mark.asyncio
+async def test_rearming_quota_recheck_preserves_existing_countdown(tmp_path: Path):
+    from mimir.scheduler import _QUOTA_RECHECK_JOB_ID
+
+    enqueued: list = []
+    sched, home, store = _paused_scheduler(tmp_path, enqueued)
+
+    sched.arm_quota_pause_recheck()
+    first_job = sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID)
+    assert first_job is not None
+
+    calls: list[str | None] = []
+    real_add_job = sched._scheduler.add_job
+
+    def _counting_add_job(*args, **kwargs):
+        calls.append(kwargs.get("id"))
+        return real_add_job(*args, **kwargs)
+
+    sched._scheduler.add_job = _counting_add_job
+    try:
+        sched.arm_quota_pause_recheck()
+    finally:
+        sched._scheduler.add_job = real_add_job
+
+    assert calls == [], f"re-arm must not re-add the job; got {calls}"
+    assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is first_job
 
 
 @pytest.mark.asyncio
