@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import json
 import logging
 import os
 import socket
@@ -13,14 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from .agent import MimirAcpAgent
-from .sdk import run_stdio_agent
+from .sdk import connection_busy_error, run_stdio_agent
 
 ACP_AUTH_TIMEOUT = 10.0
 ACP_PEER_GRACE_TIMEOUT = 5.0
 ACP_PEER_CANCEL_TIMEOUT = 2.0
 ACP_PEER_ABORT_TIMEOUT = 1.0
 ACP_SHUTDOWN_TIMEOUT = 20.0
-ACP_MAX_PEERS = 8
+ACP_MAX_PEERS = 1
 ACP_CLOSE_CONCURRENCY = 4
 _SOCKET_MODE = 0o600
 _DIRECTORY_MODE = 0o700
@@ -266,10 +267,28 @@ class AcpDaemon:
         sock = writer.get_extra_info("socket")
         if (
             self._stopping
-            or self._admitted >= ACP_MAX_PEERS
             or sock is None
             or _peer_uid(sock) != self._uid
         ):
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, OSError):
+                writer.transport.abort()
+            return
+        if self._admitted >= ACP_MAX_PEERS:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": connection_busy_error().to_error_obj(),
+            }
+            writer.write(
+                (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+            )
+            try:
+                await asyncio.wait_for(writer.drain(), ACP_PEER_ABORT_TIMEOUT)
+            except (TimeoutError, ConnectionError, OSError):
+                pass
             writer.close()
             try:
                 await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)

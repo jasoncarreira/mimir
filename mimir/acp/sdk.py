@@ -360,6 +360,20 @@ def auth_required_error() -> RequestError:
     return RequestError.auth_required({"methodId": AUTH_METHOD_ID})
 
 
+def connection_busy_error() -> RequestError:
+    return RequestError(
+        -32001,
+        "An ACP client is already connected; close it before opening another editor",
+    )
+
+
+def connection_replaced_error() -> RequestError:
+    return RequestError(
+        -32002,
+        "This ACP connection was replaced by another client; reconnect to continue",
+    )
+
+
 def method_not_found_error(method: str) -> RequestError:
     return RequestError.method_not_found(method)
 
