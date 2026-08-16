@@ -63,6 +63,35 @@ def _report_retained_candidates(
         pass
 
 
+def _report_lease_acquired(
+    lease: PRCheckoutLease,
+    *,
+    acquisition: str,
+    runner: Runner,
+) -> None:
+    """Best-effort evidence of the checkout head bound by an established lease."""
+    try:
+        from .event_logger import log_event_sync
+
+        head_sha = _run(
+            runner,
+            ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD"],
+            "acquired PR checkout lease has no HEAD",
+        ).lower()
+        log_event_sync(
+            "pr_checkout_lease_acquired",
+            repository=lease.canonical_repo,
+            pull_request=lease.pr_number,
+            scope_id=lease.scope_id,
+            head_sha=head_sha,
+            path=str(lease.path),
+            owner=lease.owner,
+            acquisition=acquisition,
+        )
+    except Exception:  # noqa: BLE001 - evidence failure must not change lease safety
+        pass
+
+
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
@@ -901,6 +930,7 @@ def acquire_pr_checkout_lease(
                 _report_retained_candidates(
                     "pr_checkout_lease_resumed", scope, unpublished,
                 )
+            _report_lease_acquired(lease, acquisition="resume", runner=runner)
             return lease, tuple(distinct)
         lease = create_pr_checkout_lease(
             scope,
@@ -910,6 +940,7 @@ def acquire_pr_checkout_lease(
             review_state=review_state,
             runner=runner,
         )
+        _report_lease_acquired(lease, acquisition="fresh", runner=runner)
         return lease, ()
     finally:
         fcntl.flock(directory_fd, fcntl.LOCK_UN)
