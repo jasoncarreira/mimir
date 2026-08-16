@@ -282,7 +282,16 @@ review give-up signals when expected activity is missing.
 
 CI remediation requires `MIMIR_GITHUB_SELF_LOGIN` to identify owned PRs and the
 same writable repository binding and coding surface used by other remediation
-events. Delivery receipts are stored beside the cursor under
-`.delivery-receipts/`; enqueue rejection leaves no receipt, so the failure is
-retried rather than silently consumed. Before checkout, Mimir re-fetches the PR
-and current checks and terminates closed, superseded-head, or already-green work.
+events. Its scope keeps `pr_comment` so an unsuccessful repair can leave an
+operator-visible trace, while excluding `pr_edit` and `pr_rerequest`. Delivery
+receipts are stored beside the cursor under `.delivery-receipts/`; enqueue
+rejection leaves no receipt, so the failure is retried rather than silently
+consumed. Before checkout, Mimir re-fetches the PR and current checks and
+terminates closed, superseded-head, or already-green work.
+
+The first observation after rollout deliberately baselines failures that already
+predate its collection window: an untouched red head stays quiet until its head
+or failure set changes. Open-PR discovery is also intentionally bounded to the
+100 most recently updated PRs. Newly completed checks normally refresh the
+relevant PR into that window; this is a bounded approximation, not complete
+enumeration of repositories with more than 100 open pull requests.

@@ -400,8 +400,10 @@ def test_ci_remediation_scope_requires_checkout_before_every_mutation(
 
     assert scope.allowed_operations == frozenset({
         "repo.inspect", "repo.checkout", "repo.test", "repo.write",
-        "repo.commit", "repo.push",
+        "repo.commit", "repo.push", "pr.comment",
     })
+    assert "pr.edit" not in scope.allowed_operations
+    assert "pr.rerequest" not in scope.allowed_operations
 
 
 @dataclass(frozen=True)

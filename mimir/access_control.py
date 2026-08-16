@@ -970,7 +970,6 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.PR_REREQUEST.value,
 })
 _REPO_PR_CI_REMEDIATION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS - frozenset({
-    RepoPRAction.PR_COMMENT.value,
     RepoPRAction.PR_EDIT.value,
     RepoPRAction.PR_REREQUEST.value,
 })

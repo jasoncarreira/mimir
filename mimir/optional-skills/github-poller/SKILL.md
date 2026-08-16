@@ -136,8 +136,14 @@ For each repo in `GITHUB_REPOS`:
   the PR and checks and stops before mutation when the PR closed, the head was
   superseded, or a rerun is green. Failures on external contributors' PRs emit a
   `pr_ci_failure_external` notification signal only and never receive repository
-  mutation authority. Stable delivery keys and framework receipts dedupe
-  overlapping polls while allowing a rejected handoff to retry safely.
+  mutation authority. CI remediation retains `pr_comment` authority so blocked
+  or failed repairs can leave an operator-visible trace, but excludes `pr_edit`
+  and `pr_rerequest`. Stable delivery keys and framework receipts dedupe
+  overlapping polls while allowing a rejected handoff to retry safely. On
+  rollout, a head whose failures predate the first observation is deliberately
+  baselined and remains quiet until its head or failure set changes. Open-PR
+  discovery is intentionally bounded to the 100 most recently updated PRs; a
+  newly completed check normally refreshes the affected PR into that window.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
