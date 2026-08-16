@@ -218,6 +218,21 @@ async def test_bash_async_refuses_foreign_session_before_spawn(
 
 
 @pytest.mark.asyncio
+async def test_bash_async_unresolvable_caller_still_spawns_without_routing_or_auth(
+    fake_registry: ShellJobRegistry,
+) -> None:
+    out = await shell_async.bash_async.coroutine(  # type: ignore[misc]
+        command="echo in-process",
+        session_id="model-supplied-session",
+    )
+
+    assert "Spawned job" in out
+    spawned = fake_registry._spawned_log[0]  # type: ignore[attr-defined]
+    assert spawned["channel_id"] is None
+    assert spawned["auth_context"] is None
+
+
+@pytest.mark.asyncio
 async def test_bash_async_own_session_keeps_caller_routing_auth_and_labels(
     fake_registry: ShellJobRegistry,
 ) -> None:

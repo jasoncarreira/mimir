@@ -260,15 +260,16 @@ async def bash_async(
     if channel_id is None and current_ctx is not None:
         channel_id = getattr(current_ctx, "channel_id", None)
 
-    if session_id and channel_id is None:
-        return (
-            "bash_async refused: session_id cannot be verified because the "
-            "caller's channel is unavailable"
+    if channel_id is None:
+        # Preserve the deliberate in-process behavior: callers without a
+        # resolvable delivery channel may still spawn a job. In that case the
+        # model-provided session id selects neither routing nor authorization.
+        ctx = current_ctx
+        resolution = "contextvar" if ctx is not None else "missing"
+    else:
+        ctx, resolution = resolve_active_ctx(
+            {"session_id": session_id}, caller_channel_id=channel_id,
         )
-
-    ctx, resolution = resolve_active_ctx(
-        {"session_id": session_id}, caller_channel_id=channel_id,
-    )
     if resolution == "channel_mismatch":
         return (
             "bash_async refused: session_id belongs to a different channel; "
