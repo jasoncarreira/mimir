@@ -16,7 +16,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Sequence
 
-from .identities import MIMIR_UID, WORKLINK_GID
+from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
@@ -405,8 +405,13 @@ def _normalize_directory_fd(directory_fd: int, owner_uid: int, group_gid: int) -
 
 
 def _normalize_checkout_fd(
-    checkout_fd: int, *, owner_uid: int = MIMIR_UID, group_gid: int = WORKLINK_GID
+    checkout_fd: int, *, owner_uid: int | None = None, group_gid: int | None = None
 ) -> None:
+    identities = get_identities()
+    if owner_uid is None:
+        owner_uid = identities.mimir_uid
+    if group_gid is None:
+        group_gid = identities.worklink_gid
     root = os.fstat(checkout_fd)
     if not stat.S_ISDIR(root.st_mode):
         raise RuntimeError("authorized checkout is not a directory")
@@ -420,8 +425,8 @@ def normalize_checkout(
     authorization: Any,
     *,
     safe_git: Any,
-    owner_uid: int = MIMIR_UID,
-    group_gid: int = WORKLINK_GID,
+    owner_uid: int | None = None,
+    group_gid: int | None = None,
 ) -> None:
     authorization.verify(authorization.path)
     safe_git.run("rev-parse", "--git-dir", check=True)
@@ -459,16 +464,17 @@ def create_isolated_checkout(
     """
 
     enabled = coding_enabled() and worker_eligible
+    identities = get_identities() if enabled else None
     path = _isolated_checkout_path(
         repo, worklink_dir, issue_id, attempt, worker_authorized=enabled
     )
     branch = f"issue/{issue_id}-a{attempt}"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if enabled:
+    if identities is not None:
         repo_parent = path.parent.parent
-        os.chown(repo_parent, MIMIR_UID, WORKLINK_GID)
+        os.chown(repo_parent, identities.mimir_uid, identities.worklink_gid)
         os.chmod(repo_parent, 0o710)
-        os.chown(path.parent, MIMIR_UID, WORKLINK_GID)
+        os.chown(path.parent, identities.mimir_uid, identities.worklink_gid)
         os.chmod(path.parent, 0o700)
     if path.exists():
         raise RuntimeError(f"attempt checkout already exists: {path}")
@@ -542,8 +548,11 @@ def create_isolated_checkout(
             relative_path = path.relative_to(_ENABLED_CHECKOUT_ROOT)
             checkout_fd = _open_worklink_checkout(relative_path)
             try:
+                assert identities is not None
                 _normalize_checkout_fd(
-                    checkout_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+                    checkout_fd,
+                    owner_uid=identities.mimir_uid,
+                    group_gid=identities.worklink_gid,
                 )
                 authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
                 checkout_fd = -1

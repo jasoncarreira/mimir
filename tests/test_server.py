@@ -1676,6 +1676,33 @@ class TestHandleHealth:
             resp = await client.get("/health")
         assert "application/json" in resp.headers.get("Content-Type", "")
 
+    @pytest.mark.asyncio
+    async def test_health_reports_stale_root_executor_before_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.worklink import worker_client
+
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        async def stale(_socket_path: Path = socket_path) -> None:
+            raise worker_client.StaleWorkerExecutorError(
+                worker_client.STALE_EXECUTOR_DIAGNOSTIC
+            )
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", stale)
+        app = _health_app()
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        assert resp.status == 503
+        assert body["ok"] is False
+        assert "stale root executor image" in body["error"]
+        assert "rebuild the image and restart the container" in body["error"]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # _make_auth_middleware
@@ -1716,13 +1743,6 @@ class TestAuthMiddlewareNoKey:
         async with TestClient(TestServer(_auth_app(""))) as client:
             resp = await client.get("/protected")
         assert resp.status == 200
-
-    @pytest.mark.asyncio
-    async def test_no_key_allows_without_header(self) -> None:
-        async with TestClient(TestServer(_auth_app(""))) as client:
-            resp = await client.get("/protected")
-        assert resp.status == 200
-
 
 class TestBrowserRequestSecurity:
     @pytest.mark.asyncio

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import grp
 import pwd
+
 
 
 @dataclass(frozen=True)
@@ -12,7 +14,8 @@ class WorklinkIdentities:
     worklink_gid: int
 
 
-def _resolve_identities() -> WorklinkIdentities:
+@lru_cache(maxsize=1)
+def get_identities() -> WorklinkIdentities:
     try:
         mimir = pwd.getpwnam("mimir")
     except KeyError as exc:
@@ -30,9 +33,3 @@ def _resolve_identities() -> WorklinkIdentities:
         worklink_uid=worklink.pw_uid,
         worklink_gid=worklink_group.gr_gid,
     )
-
-
-IDENTITIES = _resolve_identities()
-MIMIR_UID = IDENTITIES.mimir_uid
-WORKLINK_UID = IDENTITIES.worklink_uid
-WORKLINK_GID = IDENTITIES.worklink_gid

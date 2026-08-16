@@ -56,6 +56,7 @@ from mimir.repo_tools import (
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir.worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
+from mimir.worklink.worker_client import StaleWorkerExecutorError
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -1630,6 +1631,43 @@ async def test_project_test_containment_unavailable_fails_closed(
         "pull_request": 7,
     })]
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_project_test_names_stale_root_executor_and_rebuild_action(
+    repo_tools,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import project_tests as project_tests_module
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_event(name: str, **fields: object) -> None:
+        events.append((name, fields))
+
+    async def stale(*_args, **_kwargs):
+        raise StaleWorkerExecutorError(
+            "stale root executor image; rebuild the image and restart the container"
+        )
+
+    monkeypatch.setattr(project_tests_module, "safe_log_event", record_event)
+    with pytest.raises(ProjectTestRefusal) as refusal:
+        await RepoProjectTests(
+            state, runner=stale, checkout_factory=_test_checkout_factory,
+        ).execute()
+
+    assert refusal.value.code == "test_stale_root_executor"
+    assert "rebuild the image and restart the container" in str(refusal.value)
+    assert events == [("repo_test_containment_refused", {
+        "reason_code": "stale_root_executor",
+        "repository": "owner/repo",
+        "pull_request": 7,
+    })]
 
 
 @pytest.mark.asyncio

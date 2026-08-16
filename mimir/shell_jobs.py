@@ -15,8 +15,9 @@ Design notes:
   issuing a regular ``Bash`` tool call (which has access to ``kill
   <pid>``). Finished jobs are evicted (and their on-disk output files
   are unlinked) after ``EVICT_AFTER_SECONDS`` (default 1 hour). Eviction
-  runs eagerly on the next ``spawn()`` so no background thread is
-  needed. Jobs still within the window remain accessible via
+  runs on one process-wide background sweeper and eagerly on ``spawn()``.
+  The same sweep reclaims stale logs absent from the in-memory registry
+  after restart. Jobs still within the window remain accessible via
   ``bash_job_output`` / ``read_output``.
 - No algedonic signals on routine completion — the wake-up turn IS
   the signal. ``shell_job_complete_enqueue_failed`` fires only when
@@ -39,6 +40,7 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -50,6 +52,7 @@ log = logging.getLogger(__name__)
 UI_VISIBILITY_THRESHOLD_SECONDS = 10
 POST_EXIT_GRACE_SECONDS = 15
 EVICT_AFTER_SECONDS = 3600  # evict finished jobs + unlink output files after this window
+EVICTION_SWEEP_INTERVAL_SECONDS = 60
 # chainlink #387: a bounded window for the waiter to let the stdout/stderr
 # drainers flush final bytes after the process exits. Never block longer — a
 # backgrounded grandchild can hold the pipe open so a drainer never hits EOF.
@@ -66,6 +69,50 @@ DEFAULT_SHELL_JOB_SCOPE = "running"
 VALID_SHELL_JOB_SCOPES = frozenset({"running", "visible", "all"})
 DEFAULT_SHELL_JOB_STREAM = "both"
 VALID_SHELL_JOB_STREAMS = frozenset({"stdout", "stderr", "both"})
+
+
+class _RegistrySweeper:
+    """Run one periodic eviction thread for every live registry."""
+
+    def __init__(self) -> None:
+        self._registries: weakref.WeakSet[ShellJobRegistry] = weakref.WeakSet()
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+
+    def register(self, registry: ShellJobRegistry) -> None:
+        with self._condition:
+            self._registries.add(registry)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    daemon=True,
+                    name="shelljob-eviction-sweeper",
+                )
+                self._thread.start()
+            self._condition.notify()
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait(
+                    timeout=min(
+                        EVICTION_SWEEP_INTERVAL_SECONDS,
+                        max(0.01, EVICT_AFTER_SECONDS),
+                    )
+                )
+                registries = list(self._registries)
+            for registry in registries:
+                try:
+                    registry._evict_stale()
+                except Exception:
+                    log.exception("shell job scheduled eviction failed")
+
+
+_REGISTRY_SWEEPER = _RegistrySweeper()
 
 
 @dataclass
@@ -155,6 +202,11 @@ class ShellJobRegistry:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, ShellJob] = {}
         self._lock = threading.Lock()
+        # Reclaim stale files left by a prior process before registering for
+        # periodic cleanup. The weak registry set does not keep test/runtime
+        # registries alive after their owner releases them.
+        self._evict_stale()
+        _REGISTRY_SWEEPER.register(self)
 
     def _make_job_id(self) -> str:
         return "j_" + uuid.uuid4().hex[:10]
@@ -164,8 +216,8 @@ class ShellJobRegistry:
 
         Pops evicted entries from ``_jobs`` under ``self._lock``, then
         unlinks their stdout/stderr files outside the lock (I/O while
-        holding a lock degrades throughput). Called from ``spawn()`` so
-        the registry doesn't grow unbounded over daemon lifetime.
+        holding a lock degrades throughput). Also scans for stale files
+        absent from this registry, which are residue from an earlier process.
 
         ``now`` is injectable for deterministic testing.
 
@@ -178,18 +230,38 @@ class ShellJobRegistry:
             to_evict = [
                 job_id
                 for job_id, job in self._jobs.items()
-                if job.exit_code is not None
+                if isinstance(job, ShellJob)
+                and job.exit_code is not None
                 and job.finished_at is not None
                 and (now - job.finished_at) >= EVICT_AFTER_SECONDS
             ]
             for job_id in to_evict:
                 evicted.append(self._jobs.pop(job_id))
+            live_paths = {
+                path
+                for job in self._jobs.values()
+                if isinstance(job, ShellJob)
+                for path in (job.stdout_path, job.stderr_path)
+            }
         for job in evicted:
             for path in (job.stdout_path, job.stderr_path):
                 try:
                     path.unlink(missing_ok=True)
                 except Exception:
                     log.warning("failed to unlink %s during job eviction", path)
+        cutoff = now - EVICT_AFTER_SECONDS
+        try:
+            candidates = tuple(self.jobs_dir.glob("j_*.*"))
+        except OSError:
+            candidates = ()
+        for path in candidates:
+            if path in live_paths or path.suffix not in {".out", ".err"}:
+                continue
+            try:
+                if path.stat().st_mtime <= cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("failed to inspect or unlink stale shell job log %s", path)
         return evicted
 
     def spawn(
@@ -278,6 +350,8 @@ class ShellJobRegistry:
         except Exception:
             stdout_f.close()
             stderr_f.close()
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
             raise
 
         started_at = time.time()
@@ -342,6 +416,10 @@ class ShellJobRegistry:
                     outfile.close()
                 except Exception:
                     pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
         def _waiter():
             try:
@@ -360,22 +438,21 @@ class ShellJobRegistry:
                 remaining = deadline - time.time()
                 if remaining > 0:
                     thread.join(timeout=remaining)
-            # Mark finished regardless, so status/eviction reflect the real exit
-            # even if a drainer is still wedged.
+            # All normal drainers have already reached EOF and closed their own
+            # stream. Unconditionally close after the bounded joins so a wedged
+            # drainer is released too; no live reader is closed before its join.
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+            # Publish completion only after both owned pipe ends are closed, so
+            # callers cannot observe a finished job that still retains them.
             with job._lock:
                 job.exit_code = rc
                 job.finished_at = time.time()
-            # If a drainer is still alive (wedged on a held pipe), close our pipe
-            # ends so its blocked read() unblocks and the thread + FDs are
-            # reclaimed. The detached grandchild keeps its own write end; we only
-            # reap OUR resources here.
-            if any(t.is_alive() for t in drain_threads):
-                for stream in (proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
+            _REGISTRY_SWEEPER.wake()
             if on_complete is not None:
                 try:
                     on_complete(job)
@@ -647,6 +724,7 @@ __all__: tuple[str, ...] = (
     "DEFAULT_SHELL_JOB_SCOPE",
     "DEFAULT_SHELL_JOB_STREAM",
     "EVICT_AFTER_SECONDS",
+    "EVICTION_SWEEP_INTERVAL_SECONDS",
     "POST_EXIT_GRACE_SECONDS",
     "SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM",
     "SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES",

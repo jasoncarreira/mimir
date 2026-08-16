@@ -23,7 +23,28 @@ def _run_identity_import(script: str, *, environment: dict[str, str] | None = No
     )
 
 
-def test_system_account_resolution_is_shared_by_executor_and_handoff() -> None:
+def test_worklink_imports_do_not_resolve_system_accounts() -> None:
+    result = _run_identity_import(
+        """
+import grp
+import pwd
+
+pwd.getpwnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
+grp.getgrnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
+
+import mimir.contained_checkout
+import mimir.project_tests
+import mimir.worklink.checkout
+import mimir.worklink.worker_exec
+print("safe")
+"""
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "safe"
+
+
+def test_system_account_resolution_is_cached_and_shared_by_consumers() -> None:
     result = _run_identity_import(
         """
 import grp
@@ -31,18 +52,32 @@ import json
 import pwd
 from types import SimpleNamespace
 
+calls = []
 uids = {"mimir": 42001, "worklink": 42002}
-pwd.getpwnam = lambda name: SimpleNamespace(pw_uid=uids[name])
-grp.getgrnam = lambda name: SimpleNamespace(gr_gid={"worklink": 42003}[name])
+def user(name):
+    calls.append(["user", name])
+    return SimpleNamespace(pw_uid=uids[name])
+def group(name):
+    calls.append(["group", name])
+    return SimpleNamespace(gr_gid={"worklink": 42003}[name])
+pwd.getpwnam = user
+grp.getgrnam = group
 
 import mimir.contained_checkout as handoff
 import mimir.worklink.checkout as checkout
+import mimir.worklink.identities as identities
 import mimir.worklink.worker_exec as executor
 
+values = [
+    identities.get_identities(),
+    handoff.get_identities(),
+    checkout.get_identities(),
+    executor.get_identities(),
+]
 print(json.dumps({
-    "executor": [executor.MIMIR_UID, executor.WORKLINK_UID, executor.WORKLINK_GID],
-    "checkout": [checkout.MIMIR_UID, checkout.WORKLINK_GID],
-    "handoff": [handoff.MIMIR_UID, handoff.WORKLINK_GID],
+    "values": [[value.mimir_uid, value.worklink_uid, value.worklink_gid] for value in values],
+    "same": all(value is values[0] for value in values),
+    "calls": calls,
 }))
 """,
         environment={
@@ -54,9 +89,9 @@ print(json.dumps({
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "executor": [42001, 42002, 42003],
-        "checkout": [42001, 42003],
-        "handoff": [42001, 42003],
+        "values": [[42001, 42002, 42003]] * 4,
+        "same": True,
+        "calls": [["user", "mimir"], ["user", "worklink"], ["group", "worklink"]],
     }
 
 
@@ -68,7 +103,7 @@ print(json.dumps({
         ("group", "worklink", "required group 'worklink' is missing"),
     ],
 )
-def test_missing_required_identity_fails_during_import(
+def test_missing_required_identity_fails_on_first_containment_use(
     missing_kind: str, missing_name: str, message: str
 ) -> None:
     result = _run_identity_import(
@@ -90,6 +125,8 @@ def group(name):
 pwd.getpwnam = user
 grp.getgrnam = group
 import mimir.worklink.worker_exec
+from mimir.worklink.identities import get_identities
+get_identities()
 """
     )
 
