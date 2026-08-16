@@ -34,6 +34,11 @@ log = logging.getLogger(__name__)
 
 
 def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name) or default
+
+
+def _env_allow_empty(name: str, default: str) -> str:
+    """Read an env value for settings where empty has explicit semantics."""
     return os.environ.get(name, default)
 
 
@@ -545,7 +550,7 @@ def _configure_declared_repositories(home: Path) -> None:
         )
 
     legacy_roots = os.environ.get("MIMIR_FILE_TOOL_ROOTS")
-    if legacy_roots is not None:
+    if legacy_roots:
         effective_legacy = _parse_file_tool_roots(legacy_roots, home, always_rw=())
         if dict(effective_legacy) != dict(declared_roots):
             raise RuntimeError(
@@ -557,7 +562,7 @@ def _configure_declared_repositories(home: Path) -> None:
 
     declared_slugs = tuple(repo.slug for repo in inventory.repositories)
     legacy_slugs = os.environ.get("GITHUB_REPOS")
-    if legacy_slugs is not None:
+    if legacy_slugs:
         effective_slugs = tuple(
             part.strip().lower() for part in legacy_slugs.split(",") if part.strip()
         )
@@ -578,7 +583,7 @@ def _configure_declared_repositories(home: Path) -> None:
     declared_target = str(target.root) if target is not None else None
     for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
         legacy_target = os.environ.get(name)
-        if legacy_target is not None and (
+        if legacy_target and (
             declared_target is None
             or Path(legacy_target).resolve() != Path(declared_target)
         ):
@@ -586,7 +591,7 @@ def _configure_declared_repositories(home: Path) -> None:
                 f"{name} disagrees with worklink.yaml: "
                 f"legacy={legacy_target!r}, declared={declared_target!r}"
             )
-    if declared_target is not None and "WORKLINK_REPO" not in os.environ:
+    if declared_target is not None and not os.environ.get("WORKLINK_REPO"):
         os.environ["WORKLINK_REPO"] = declared_target
 
     git = shutil.which("git")
@@ -1158,6 +1163,8 @@ class Config:
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
     file_tool_roots: tuple[tuple[str, str], ...] = ()
+    # Per-process cap for concurrent web-chat SSE subscribers.
+    chat_stream_max_subscribers: int = 8
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -1198,6 +1205,14 @@ class Config:
         # itself). Computing it twice was redundant and could in theory
         # diverge if env state shifted between the two calls.
         oauth_credentials_path = _oauth_credentials_path()
+        chat_stream_max_subscribers_raw = os.environ.get(
+            "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS"
+        )
+        if chat_stream_max_subscribers_raw == "":
+            log.warning(
+                "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS is empty; using default %r",
+                8,
+            )
 
         return cls(
             home=home,
@@ -1225,21 +1240,25 @@ class Config:
             recent_author_cross=_env_int("MIMIR_RECENT_AUTHOR_CROSS", 10),
             recent_cross_hours=_env_int("MIMIR_RECENT_CROSS_HOURS", 24),
             recent_sources=_parse_sources(
-                _env("MIMIR_RECENT_SOURCES", "slack,discord,bluesky,web,stdin")
+                _env_allow_empty(
+                    "MIMIR_RECENT_SOURCES", "slack,discord,bluesky,web,stdin"
+                )
             ),
             recent_message_chars=_env_int("MIMIR_RECENT_MESSAGE_CHARS", 4096),
 
             saga_session_idle_minutes=_env_int("MIMIR_SAGA_SESSION_IDLE_MINUTES", 10),
             saga_session_max_turns=_env_int("MIMIR_SAGA_SESSION_MAX_TURNS", 10),
-            saga_consolidate_cron=_env("MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"),
+            saga_consolidate_cron=_env_allow_empty(
+                "MIMIR_SAGA_CONSOLIDATE_CRON", "0 4 * * *"
+            ),
             scheduler_tz=_env("MIMIR_SCHEDULER_TZ", "UTC"),
-            commitments_due_check_cron=_env(
+            commitments_due_check_cron=_env_allow_empty(
                 "MIMIR_COMMITMENTS_DUE_CHECK_CRON", "*/5 * * * *",
             ),
             commitments_snooze_pileup_threshold=_env_int(
                 "MIMIR_COMMITMENTS_SNOOZE_PILEUP_THRESHOLD", 3,
             ),
-            introspection_report_cron=_env(
+            introspection_report_cron=_env_allow_empty(
                 "MIMIR_INTROSPECTION_REPORT_CRON", "0 14 * * 5",
             ),
             introspection_report_days=_env_int(
@@ -1303,7 +1322,7 @@ class Config:
             pairing_dm_auto_reply_interval_seconds=_env_float(
                 "MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS", 30.0,
             ),
-            pairing_dm_auto_reply_text=_env(
+            pairing_dm_auto_reply_text=_env_allow_empty(
                 "MIMIR_PAIRING_DM_AUTO_REPLY_TEXT",
                 "Request forwarded to operator; no access until approved.",
             ),
@@ -1329,6 +1348,9 @@ class Config:
             opencode_config_path=resolved_opencode_config,
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
+            chat_stream_max_subscribers=_env_int(
+                "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", 8
+            ),
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
             post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
@@ -1368,14 +1390,14 @@ class Config:
             context_1m=_env_bool("MIMIR_CONTEXT_1M", True),
 
             oauth_credentials_path=oauth_credentials_path,
-            oauth_usage_poll_cron=_env(
+            oauth_usage_poll_cron=_env_allow_empty(
                 "MIMIR_OAUTH_USAGE_POLL_CRON", "*/3 * * * *",
             ),
             oauth_refresh_warn_days=_env_int(
                 "MIMIR_OAUTH_REFRESH_WARN_DAYS", 25,
             ),
 
-            codex_usage_poll_cron=_env(
+            codex_usage_poll_cron=_env_allow_empty(
                 "MIMIR_CODEX_USAGE_POLL_CRON", "*/3 * * * *",
             ),
 
@@ -1393,7 +1415,7 @@ class Config:
                 "MIMIR_MINIMAX_USAGE_MODEL", "general",
             ),
 
-            health_probe_cron=_env(
+            health_probe_cron=_env_allow_empty(
                 "MIMIR_HEALTH_PROBE_CRON", "* * * * *",
             ),
             health_probe_max_restarts_per_hour=_env_int(

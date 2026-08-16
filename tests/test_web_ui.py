@@ -1610,6 +1610,34 @@ async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_WEB_HOST", "")
+    config = Config.from_env()
+    a = web.Application()
+    a["api_key"] = "super-secret"
+    a["config"] = config
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/web/bootstrap")
+        body = await resp.json()
+
+    assert body["server"] == {
+        "web_host": "127.0.0.1",
+        "public_bind": False,
+        "unauthenticated_allowed": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_path: Path):
     class _Config:
         web_host = "0.0.0.0"
