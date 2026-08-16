@@ -466,6 +466,46 @@ def test_worker_identity_verifier_rejects_any_retained_authority(monkeypatch) ->
         worker_exec._verify_worker_identity()
 
 
+def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identifier = str(uuid.uuid4())
+
+    class Incumbent:
+        pass
+
+    incumbent = Incumbent()
+    request = {
+        "version": 1,
+        "op": "launch",
+        "id": identifier,
+        "issue": 41,
+        "attempt": 2,
+        "device": 0,
+        "inode": 0,
+        "argv": ["worker"],
+        "env": {},
+        "projections": [],
+        "timeout_s": 1,
+    }
+    monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *args: None)
+    monkeypatch.setattr(
+        worker_exec.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("duplicate launch reached Popen"),
+    )
+    with worker_exec._jobs_lock:
+        worker_exec._jobs[identifier] = incumbent  # type: ignore[assignment]
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            worker_exec._handle_launch(object(), request, [0, 1, 2])  # type: ignore[arg-type]
+        with worker_exec._jobs_lock:
+            assert worker_exec._jobs[identifier] is incumbent
+    finally:
+        with worker_exec._jobs_lock:
+            worker_exec._jobs.pop(identifier, None)
+
+
 def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monkeypatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()

@@ -2177,8 +2177,9 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
-    checkout = tmp_path / scenario
-    checkout.mkdir()
+    boundary = tmp_path / scenario
+    checkout = boundary / "checkout"
+    checkout.mkdir(parents=True)
     (checkout / "output.txt").write_text("worker output\n")
     closed = []
 
@@ -2204,6 +2205,7 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
 
     assert closed == ["publication", "authorization"]
     assert checkout.exists() is (not delete_checkout)
+    assert boundary.exists() is (not delete_checkout)
     if not delete_checkout:
         assert (checkout / "output.txt").read_text() == "worker output\n"
 

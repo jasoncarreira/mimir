@@ -84,6 +84,23 @@ def test_open_tool_missing_home(monkeypatch) -> None:
     assert "MIMIR_HOME not set" in _inv(tp.open_proposal)
 
 
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        (tp.open_proposal, {}),
+        (tp.submit_proposal, {"title": "title", "rationale": "reason"}),
+        (tp.abandon_proposal, {}),
+    ],
+)
+def test_invalid_lane_returns_tool_failure_string(monkeypatch, tmp_path, tool, kwargs) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+
+    result = _inv(tool, lane="manual", **kwargs)
+
+    assert result.startswith(f"{tool.name} failed (")
+    assert "unsupported proposal lane" in result
+
+
 # ─── submit ──────────────────────────────────────────────────────────
 
 

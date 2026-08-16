@@ -119,6 +119,34 @@ async def test_execute_contained_timeout_cancels_and_reaps(
 
 
 @pytest.mark.asyncio
+async def test_execute_contained_timeout_reaps_when_cancel_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RacedClient(Client):
+        async def cancel(self, identifier: str) -> None:
+            await super().cancel(identifier)
+            raise RuntimeError("unknown worker id")
+
+    client = RacedClient(b"partial", b"error", immediate=False)
+    install_client(monkeypatch, client)
+
+    result = await execute_contained(
+        ("tool",),
+        Capability(),
+        {},
+        identifier="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        timeout_s=0.01,
+        stdout_limit=100,
+        stderr_limit=100,
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code == -15
+    assert result.stdout == b"partial"
+    assert result.stderr == b"error"
+
+
+@pytest.mark.asyncio
 async def test_execute_contained_cancellation_sends_cancel_before_reraising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

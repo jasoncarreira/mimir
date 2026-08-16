@@ -81,6 +81,23 @@ def test_repo_test_checkout_snapshots_without_mutating_source(
     assert list(root.iterdir()) == []
 
 
+def test_prepare_boundary_refuses_collision_without_deleting_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _roots(tmp_path, monkeypatch)
+    scope = "scope"
+    boundary = root / scope / "41-7"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    canary = checkout_path / "live-worker"
+    canary.write_text("running\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        contained_checkout._prepare_boundary(root, scope, "41-7")
+
+    assert canary.read_text(encoding="utf-8") == "running\n"
+
+
 def test_repo_test_checkout_normalizes_venv_without_widening_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

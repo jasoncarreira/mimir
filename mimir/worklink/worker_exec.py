@@ -49,6 +49,7 @@ _LAUNCH_FIELDS = frozenset({
     "argv", "env", "projections", "timeout_s",
 })
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
+_launching: set[str] = set()
 _jobs_lock = threading.Lock()
 
 
@@ -412,16 +413,23 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         or timeout_s <= 0
     ):
         raise RuntimeError("worker timeout must be a positive finite number")
-    anchored_fd = os.open(
-        ".",
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=fds[0],
-    )
-    os.close(fds[0])
-    fds[0] = anchored_fd
-    home = HOME_ROOT / identifier
-    home.mkdir(mode=0o700)
+    with _jobs_lock:
+        if identifier in _jobs or identifier in _launching:
+            raise RuntimeError("worker id is already active")
+        _launching.add(identifier)
+    home = Path()
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        anchored_fd = os.open(
+            ".",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=fds[0],
+        )
+        os.close(fds[0])
+        fds[0] = anchored_fd
+        candidate_home = HOME_ROOT / identifier
+        candidate_home.mkdir(mode=0o700)
+        home = candidate_home
         _project_home(home, request["projections"])
         os.chown(home, WORKLINK_UID, WORKLINK_GID)
         os.chmod(home, 0o700)
@@ -446,10 +454,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             pass_fds=(fds[0],),
         )
         with _jobs_lock:
-            if identifier in _jobs:
-                _terminate_process_group(proc, 0)
-                raise RuntimeError("worker id is already active")
             _jobs[identifier] = proc
+            _launching.remove(identifier)
         os.close(fds[1])
         fds[1] = -1
         os.close(fds[2])
@@ -475,7 +481,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         })
     finally:
         with _jobs_lock:
-            active = _jobs.pop(identifier, None)
+            _launching.discard(identifier)
+            active = _jobs.pop(identifier, None) if _jobs.get(identifier) is proc else None
         if active is not None and active.poll() is None:
             _terminate_process_group(active)
         if home != Path():
