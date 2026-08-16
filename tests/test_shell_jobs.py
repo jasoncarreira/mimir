@@ -72,12 +72,35 @@ from mimir.shell_jobs import ShellJobRegistry
 
 registry = ShellJobRegistry(Path(sys.argv[1]))
 baseline = len(os.listdir('/proc/self/fd'))
-jobs = [registry.spawn('ok', argv=[sys.executable, '-c', 'print(1)']) for _ in range(10)]
+# Keep every child alive until its two pipe identities have been captured.
+jobs = [registry.spawn('ok', argv=[sys.executable, '-c', 'import time; time.sleep(0.2)']) for _ in range(10)]
+job_pipes = {
+    os.readlink(f'/proc/self/fd/{stream.fileno()}')
+    for job in jobs
+    for stream in (job._process.stdout, job._process.stderr)
+}
 deadline = time.time() + 10
 while any(job.exit_code is None for job in jobs) and time.time() < deadline:
     time.sleep(0.01)
 assert all(job.exit_code == 0 for job in jobs)
 assert all(job._process.stdout.closed and job._process.stderr.closed for job in jobs)
+
+def open_fd_targets():
+    targets = set()
+    for name in os.listdir('/proc/self/fd'):
+        try:
+            targets.add(os.readlink(f'/proc/self/fd/{name}'))
+        except FileNotFoundError:
+            pass
+    return targets
+
+assert job_pipes.isdisjoint(open_fd_targets())
+# A completion wakes the registry sweeper, whose glob briefly opens the jobs
+# directory. Wait out that transient FD instead of racing it (Python 3.11 CI
+# exposed the race); a permanently leaked descriptor still fails this bound.
+deadline = time.time() + 2
+while len(os.listdir('/proc/self/fd')) != baseline and time.time() < deadline:
+    time.sleep(0.01)
 assert len(os.listdir('/proc/self/fd')) == baseline
 """
     subprocess.run(
