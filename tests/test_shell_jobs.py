@@ -5,6 +5,8 @@ drop ``channel_name`` (mimir uses just ``channel_id``)."""
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +58,56 @@ def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
     assert "err" in result["stderr_tail"]
     assert result["output_truncated"] is False
     assert result["truncated_streams"] == []
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_finished_jobs_release_all_pipe_descriptors(tmp_path: Path):
+    """Count in an isolated process so unrelated suite activity cannot move FDs."""
+    script = """
+import os
+import sys
+import time
+from pathlib import Path
+from mimir.shell_jobs import ShellJobRegistry
+
+registry = ShellJobRegistry(Path(sys.argv[1]))
+baseline = len(os.listdir('/proc/self/fd'))
+# Keep every child alive until its two pipe identities have been captured.
+jobs = [registry.spawn('ok', argv=[sys.executable, '-c', 'import time; time.sleep(0.2)']) for _ in range(10)]
+job_pipes = {
+    os.readlink(f'/proc/self/fd/{stream.fileno()}')
+    for job in jobs
+    for stream in (job._process.stdout, job._process.stderr)
+}
+deadline = time.time() + 10
+while any(job.exit_code is None for job in jobs) and time.time() < deadline:
+    time.sleep(0.01)
+assert all(job.exit_code == 0 for job in jobs)
+assert all(job._process.stdout.closed and job._process.stderr.closed for job in jobs)
+
+def open_fd_targets():
+    targets = set()
+    for name in os.listdir('/proc/self/fd'):
+        try:
+            targets.add(os.readlink(f'/proc/self/fd/{name}'))
+        except FileNotFoundError:
+            pass
+    return targets
+
+assert job_pipes.isdisjoint(open_fd_targets())
+# A completion wakes the registry sweeper, whose glob briefly opens the jobs
+# directory. Wait out that transient FD instead of racing it (Python 3.11 CI
+# exposed the race); a permanently leaked descriptor still fails this bound.
+deadline = time.time() + 2
+while len(os.listdir('/proc/self/fd')) != baseline and time.time() < deadline:
+    time.sleep(0.01)
+assert len(os.listdir('/proc/self/fd')) == baseline
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "fd-jobs")],
+        check=True,
+        timeout=30,
+    )
 
 
 def test_output_write_failure_keeps_draining_and_completes(
@@ -592,6 +644,50 @@ def test_evict_stale_preserves_recently_finished_job(tmp_path: Path):
 
     assert len(evicted) == 0
     assert registry.get(job.job_id) is not None
+
+
+def test_registry_startup_reclaims_stale_restart_residue(tmp_path: Path):
+    jobs_dir = tmp_path / "shell-jobs"
+    jobs_dir.mkdir()
+    stale = [jobs_dir / "j_pre_restart.out", jobs_dir / "j_pre_restart.err"]
+    recent = jobs_dir / "j_recent.out"
+    unrelated = jobs_dir / "keep.txt"
+    for path in (*stale, recent, unrelated):
+        path.write_text("log", encoding="utf-8")
+    old = time.time() - EVICT_AFTER_SECONDS - 1
+    for path in stale:
+        os.utime(path, (old, old))
+
+    registry = ShellJobRegistry(jobs_dir)
+
+    assert registry.all_jobs() == []
+    assert all(not path.exists() for path in stale)
+    assert recent.exists()
+    assert unrelated.exists()
+
+
+def test_scheduled_eviction_does_not_require_later_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("mimir.shell_jobs.EVICT_AFTER_SECONDS", 0.05)
+    registry = _make_registry(tmp_path)
+    job = registry.spawn("done", argv=[sys.executable, "-c", "pass"])
+    _wait_until_done(registry, job.job_id)
+    deadline = time.time() + 2
+    while registry.get(job.job_id) is not None and time.time() < deadline:
+        time.sleep(0.02)
+
+    assert registry.get(job.job_id) is None
+    assert not job.stdout_path.exists()
+    assert not job.stderr_path.exists()
+
+
+def test_spawn_failure_removes_opened_output_files(tmp_path: Path):
+    registry = _make_registry(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        registry.spawn("missing", argv=[str(tmp_path / "does-not-exist")])
+
+    assert list(registry.jobs_dir.iterdir()) == []
 
 
 def test_spawn_triggers_eviction_of_old_jobs(tmp_path: Path):
