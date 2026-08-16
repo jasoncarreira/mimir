@@ -314,9 +314,10 @@ def get_turn(turn_id: str) -> str:
 # together — half-gating only the sync path is security theatre.
 
 _SHELL_STATE: dict[str, Any] = {
-    "cwd": None,
+    "cwd_by_session": {},
     "timeout_s": 60.0,
 }
+_SHELL_STATE_LOCK = threading.Lock()
 _PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
 
 
@@ -381,12 +382,29 @@ def _initial_shell_cwd() -> Path | None:
     return Path(home).expanduser().resolve()
 
 
-def _effective_shell_cwd(cwd: str | None = None) -> Path | None:
+def _shell_session_id() -> str | None:
+    """Return the conversation session that owns interactive shell state."""
+    from .._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is None:
+        return None
+    return (turn.session_id or turn.channel_id or "").strip() or None
+
+
+def _effective_shell_cwd(
+    cwd: str | None = None, *, allow_session_state: bool = True,
+) -> Path | None:
     if cwd:
         return Path(cwd).expanduser()
-    cwd = _SHELL_STATE["cwd"]
-    if cwd is not None:
-        return Path(cwd)
+    session_id = _shell_session_id() if allow_session_state else None
+    if session_id is not None:
+        with _SHELL_STATE_LOCK:
+            session_cwd = _SHELL_STATE["cwd_by_session"].get(session_id)
+        if session_cwd is not None:
+            return Path(session_cwd)
+    if not allow_session_state:
+        return None
     return _initial_shell_cwd()
 
 
@@ -439,12 +457,17 @@ def shell_exec(
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
-    effective_cwd = _effective_shell_cwd(cwd)
+    is_project_test = False
     try:
         from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
         direct_argv = bound_direct_exec_argv()
         if direct_argv is None:
             direct_argv = mimir_direct_argv
+        # Server-authorized argv must never inherit another session's interactive
+        # cd. An explicit/configured cwd has already been checked by middleware.
+        effective_cwd = _effective_shell_cwd(
+            cwd, allow_session_state=direct_argv is None,
+        )
         argv = (
             direct_argv
             if direct_argv is not None
@@ -488,8 +511,10 @@ def shell_exec(
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     if proc.returncode == 0:
         target = _cd_target(command, effective_cwd)
-        if target is not None and target.is_dir():
-            _SHELL_STATE["cwd"] = target
+        session_id = _shell_session_id() if direct_argv is None else None
+        if target is not None and target.is_dir() and session_id is not None:
+            with _SHELL_STATE_LOCK:
+                _SHELL_STATE["cwd_by_session"][session_id] = target
     if stdout:
         suffix = "\n[shell stdout truncated]" if len(stdout) > 4000 else ""
         parts.append(f"stdout:\n{stdout[:4000]}{suffix}")

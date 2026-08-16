@@ -3705,12 +3705,12 @@ async def test_model_cannot_forge_a_service_shell_refusal(
 
 
 @pytest.mark.asyncio
-async def test_service_shell_without_cwd_preserves_ambient_execution_directory(
+async def test_service_shell_without_cwd_keeps_execution_cwd_unbound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
-    """An omitted cwd stays omitted rather than selecting the first read root."""
+    """An omitted cwd stays omitted and direct execution bypasses sticky cwd."""
     from langchain_core.messages import ToolMessage
 
     from mimir.models import InformationFlowLabels

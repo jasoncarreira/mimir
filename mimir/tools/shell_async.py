@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from pathlib import Path
 from typing import Annotated, Any, Callable, Optional
 
 from langchain.tools import ToolRuntime
@@ -344,7 +345,7 @@ async def bash_async(
             "auth_context": auth_context,
         }
         if cwd:
-            spawn_kwargs["cwd"] = cwd
+            spawn_kwargs["cwd"] = str(Path(cwd).expanduser())
         if direct_argv is not None:
             spawn_kwargs["env_overlay"] = direct_exec_env_overlay(argv)
         job = _REGISTRY.spawn(

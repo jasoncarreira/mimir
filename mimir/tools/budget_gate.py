@@ -594,7 +594,9 @@ def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]
     from ..read_policy import configured_non_admin_read_roots
 
     if raw_cwd is None:
-        # Preserve the existing ambient/sticky cwd when the caller omits cwd.
+        # Keep cwd omitted. Direct service execution deliberately bypasses
+        # interactive per-session cwd; configured project/Chainlink commands
+        # are assigned their server-authorized cwd by their branches below.
         return None, None
     if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
         return None, "working directory must be a non-empty absolute path"

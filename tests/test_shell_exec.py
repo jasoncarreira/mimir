@@ -19,6 +19,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,16 +32,35 @@ from mimir.tools.extra import shell_exec
 
 @pytest.fixture(autouse=True)
 def reset_shell_state(monkeypatch, tmp_path):
-    old_cwd = extra._SHELL_STATE["cwd"]
+    old_cwds = dict(extra._SHELL_STATE["cwd_by_session"])
     old_timeout = extra._SHELL_STATE["timeout_s"]
-    extra._SHELL_STATE["cwd"] = None
+    extra._SHELL_STATE["cwd_by_session"].clear()
     extra._SHELL_STATE["timeout_s"] = 60.0
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     try:
         yield
     finally:
-        extra._SHELL_STATE["cwd"] = old_cwd
+        extra._SHELL_STATE["cwd_by_session"].clear()
+        extra._SHELL_STATE["cwd_by_session"].update(old_cwds)
         extra._SHELL_STATE["timeout_s"] = old_timeout
+
+
+@contextmanager
+def _shell_session(session_id: str):
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.models import TurnContext
+
+    token = set_current_turn(TurnContext(
+        turn_id=f"turn-{session_id}",
+        session_id=session_id,
+        trigger="user_message",
+        channel_id=session_id,
+        started_at=time.time(),
+    ))
+    try:
+        yield
+    finally:
+        reset_current_turn(token)
 
 
 def test_shell_exec_runs_arbitrary_command_in_default_state():
@@ -159,12 +180,52 @@ def test_shell_exec_standalone_cd_persists_for_later_calls(tmp_path):
     target = tmp_path / "workspace"
     target.mkdir()
 
-    cd_out = shell_exec.invoke({"command": f"cd {target}"})
-    pwd_out = shell_exec.invoke({"command": "pwd"})
+    with _shell_session("channel-a"):
+        cd_out = shell_exec.invoke({"command": f"cd {target}"})
+    # A later turn in the same conversation session keeps the interactive cwd.
+    with _shell_session("channel-a"):
+        pwd_out = shell_exec.invoke({"command": "pwd"})
 
     assert "exit=0" in cd_out
     assert "exit=0" in pwd_out
     assert str(target) in pwd_out
+
+
+def test_shell_exec_sticky_cwd_is_scoped_to_session(tmp_path):
+    target = tmp_path / "channel-a-workspace"
+    target.mkdir()
+
+    with _shell_session("channel-a"):
+        assert "exit=0" in shell_exec.invoke({"command": f"cd {target}"})
+        assert str(target) in shell_exec.invoke({"command": "pwd"})
+    with _shell_session("channel-b"):
+        other = shell_exec.invoke({"command": "pwd"})
+
+    assert "exit=0" in other
+    assert str(target) not in other
+
+
+def test_authorized_direct_argv_never_inherits_session_cwd(tmp_path, monkeypatch):
+    target = tmp_path / "interactive-workspace"
+    target.mkdir()
+    with _shell_session("channel-a"):
+        assert "exit=0" in shell_exec.invoke({"command": f"cd {target}"})
+
+    calls: list[dict[str, object]] = []
+
+    def _run(_argv, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(extra.subprocess, "run", _run)
+    with _shell_session("channel-a"):
+        result = shell_exec.invoke({
+            "command": "git status --short",
+            "mimir_direct_argv": ["/usr/bin/git", "status", "--short"],
+        })
+
+    assert "exit=0" in result
+    assert calls[-1]["cwd"] is None
 
 
 def test_shell_exec_supports_redirects(tmp_path):
