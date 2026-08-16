@@ -163,7 +163,8 @@ class OpenCodeBackend:
             "model_diverged": model_diverged,
             "model_source": invocation.model_source,
         }
-        if _coding_enabled():
+        enabled = _coding_enabled()
+        if enabled:
             documents = opencode_worker_documents(invocation, resolution_env)
             projections = [
                 WorkerProjection(
@@ -195,7 +196,9 @@ class OpenCodeBackend:
             env=env,
             backend_config=backend_config,
             local_checkout=order.checkout,
-            local_argv=_local_argv(self.bin, args, order.checkout, prompt),
+            local_argv=_local_argv(
+                self.bin, args, order.checkout, prompt, fd_anchored=enabled
+            ),
         )
 
     async def invoke_with_startup_retry(
@@ -359,9 +362,17 @@ def _prompt_for_order(order: WorkOrder) -> str:
     return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
 
 
-def _local_argv(bin_name: str, args: Sequence[str], checkout: Path, prompt: str) -> tuple[str, ...]:
+def _local_argv(
+    bin_name: str,
+    args: Sequence[str],
+    checkout: Path,
+    prompt: str,
+    *,
+    fd_anchored: bool = False,
+) -> tuple[str, ...]:
     # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
-    return (bin_name, "run", "--dir", str(checkout), *args, "--", prompt)
+    directory = "." if fd_anchored else str(checkout)
+    return (bin_name, "run", "--dir", directory, *args, "--", prompt)
 
 
 def _permission_override(bash_allowlist: Sequence[str]) -> str:
@@ -400,16 +411,27 @@ def _permission_refusal_reason(
     discarded builds, the nearest false positive sat four non-empty lines from
     the end of its stream, so neither rule admits them.
     """
-    pattern = re.compile(
+    permission_pattern = re.compile(
         r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
         re.IGNORECASE,
     )
+    shell_pattern = re.compile(r"\b(?:bash|shell)\b", re.IGNORECASE)
+
+    def is_refusal(value: str) -> bool:
+        permission = permission_pattern.search(value)
+        if permission is None:
+            return False
+        return any(
+            abs(permission.start() - shell.start()) <= 120
+            for shell in shell_pattern.finditer(value)
+        )
+
     positioned = any(
-        (last := last_nonempty_line(stream)) is not None and pattern.search(last)
+        (last := last_nonempty_line(stream)) is not None and is_refusal(last)
         for stream in (stdout, stderr)
     )
     if not positioned and not (
-        exit_code != 0 and pattern.search(f"{stdout}\n{stderr}")
+        exit_code != 0 and is_refusal(f"{stdout}\n{stderr}")
     ):
         return None
     return (
@@ -465,7 +487,7 @@ def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     if "429" in combined or "quota" in combined or "rate limit" in combined:
         return "quota_exhausted"
     auth_text = stderr.lower()
-    if re.search(r"\b(auth|authentication|oauth|login|credential|api key|unauthorized|permission)\b", auth_text):
+    if re.search(r"\b(auth|authentication|oauth|login|credential|api key|unauthorized)\b", auth_text):
         return "auth_error"
     return "failed"
 
@@ -478,13 +500,15 @@ def _error_from_status(
 ) -> str | None:
     if status == "success":
         return None
-    detail = (stderr.strip() or stdout.strip()).splitlines()
-    message = detail[-1] if detail else status
+    detail = stderr.strip() or stdout.strip()
+    message = detail.splitlines()[-1] if detail else status
     if status == "timeout":
         return f"opencode execution timed out: {message}"
     if status == "auth_error":
         provider = _provider_from_command(command)
         return f"OpenCode provider {provider!r} authentication failed: {message}"
+    if re.search(r"\bEACCES\b", detail, re.IGNORECASE):
+        return detail
     return message
 
 

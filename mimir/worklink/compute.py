@@ -304,6 +304,8 @@ def _fd_anchored_opencode_argv(
     for index, arg in enumerate(command[:-1]):
         if arg != "--dir":
             continue
+        if command[index + 1] == ".":
+            return command
         if command[index + 1] != str(checkout):
             raise ComputeLaunchError("enabled OpenCode --dir must name the issued checkout")
         return (*command[: index + 1], ".", *command[index + 2 :])

@@ -98,6 +98,31 @@ def test_prepare_boundary_refuses_collision_without_deleting_incumbent(
     assert canary.read_text(encoding="utf-8") == "running\n"
 
 
+def test_prepare_boundary_remains_controller_owned_0700(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkouts"
+    root.mkdir(mode=0o771)
+    ownership: list[tuple[Path, int, int]] = []
+
+    def record_chown(path: Path, uid: int, gid: int, **_kwargs: object) -> None:
+        ownership.append((path, uid, gid))
+
+    monkeypatch.setattr(contained_checkout.os, "chown", record_chown)
+
+    boundary, checkout_path = contained_checkout._prepare_boundary(
+        root, "scope", "1259-1"
+    )
+
+    assert checkout_path == boundary / "checkout"
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+    assert ownership[-1] == (
+        boundary,
+        checkout.MIMIR_UID,
+        checkout.WORKLINK_GID,
+    )
+
+
 def test_repo_test_checkout_normalizes_venv_without_widening_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

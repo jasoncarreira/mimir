@@ -1209,6 +1209,24 @@ async def test_opencode_permission_refusal_names_effective_allowlist(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_opencode_startup_permission_error_surfaces_backend_stderr(
+    tmp_path: Path,
+) -> None:
+    backend = OpenCodeBackend(bash_allowlist=("git *", "uv *"))
+    order = WorkOrder(1259, tmp_path, "p", None, 30, {}, transcript_root=tmp_path / "t")
+    stderr = (
+        "EACCES: permission denied, lstat\n"
+        "  '/var/lib/mimir-worklink/checkouts/scope/1259-1/checkout'"
+    )
+
+    result = await backend.interpret(order, ComputeResult(1, "", stderr))
+
+    assert result.backend_status == "failed"
+    assert result.error == stderr
+    assert "bash_allowlist" not in result.error
+
+
+@pytest.mark.asyncio
 async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
