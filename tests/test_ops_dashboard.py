@@ -481,24 +481,28 @@ def test_legacy_dashboards_resolve_shared_auth_helpers() -> None:
     import mimir
 
     root = Path(mimir.__file__).parent
-    pages = [
-        root / "file_memory_dashboard.html",
-        root / "ops_dashboard.html",
-        root / "saga_dashboard.html",
-        root / "turn_viewer.html",
-    ]
     auth_source = (root / "web_auth.js").read_text(encoding="utf-8")
     exported = set(re.findall(r"^    (\w+): \1,$", auth_source, re.MULTILINE))
+    expected_exports = {"getApiKey", "promptApiKey", "authedFetch"}
+    assert expected_exports <= exported, (
+        f"failed to parse MimirAuth exports from web_auth.js: {exported}"
+    )
 
-    for page in pages:
-        html = page.read_text(encoding="utf-8")
+    pages = {
+        page: page.read_text(encoding="utf-8")
+        for page in root.glob("*.html")
+        if "/app/auth.js" in page.read_text(encoding="utf-8")
+    }
+    assert pages, "failed to find legacy dashboards loading /app/auth.js"
+
+    for page, html in pages.items():
         for helper in exported:
             bare_call = re.search(rf"(?<![.\w]){helper}\s*\(", html)
             if not bare_call:
                 continue
             alias = re.search(
                 rf"\b(?:const|let|var)\s+{helper}\s*=\s*"
-                rf"window\.MimirAuth\.\w+\s*;",
+                rf"window\.MimirAuth\.{helper}\s*;",
                 html,
             )
             assert alias, f"{page.name} calls unscoped MimirAuth helper {helper}"
