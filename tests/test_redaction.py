@@ -6,6 +6,8 @@ logs. #499 closed the drift where AWS keys and JSON OAuth-token value forms
 
 from __future__ import annotations
 
+import pytest
+
 from mimir.redaction import redact_payload, redact_text
 
 
@@ -46,6 +48,40 @@ def test_redact_payload_masks_nested_aws_key() -> None:
 
 
 # ─── existing patterns still hold (no regression) ──────────────────────
+
+
+FAKE_SECRET = "0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("> X-API-Key: " + FAKE_SECRET, "> X-API-Key: [REDACTED]"),
+        ("MIMIR_API_KEY: " + FAKE_SECRET, "MIMIR_API_KEY: [REDACTED]"),
+        (
+            '{"VOYAGE_API_KEY": "pa-' + FAKE_SECRET + '"}',
+            '{"VOYAGE_API_KEY": "[REDACTED]"}',
+        ),
+        ("MIMIR_API_KEY=" + FAKE_SECRET, "MIMIR_API_KEY=[REDACTED]"),
+    ],
+)
+def test_redacts_credential_key_value_forms(text: str, expected: str) -> None:
+    assert redact_text(text) == expected
+
+
+# Named corpus reviewed for false positives when broadening key/value delimiters.
+FALSE_POSITIVE_CORPUS = (
+    "ordinary prose: this explanation should remain readable",
+    "2026-08-15 12:00:00 INFO server started: ready",
+    'config = {"timeout": 30, "retries": 2}',
+    "headers = {'Content-Type': 'application/json'}",
+    "https://x-access-token:synthetic-secret@github.com/owner/repo",
+)
+
+
+@pytest.mark.parametrize("text", FALSE_POSITIVE_CORPUS)
+def test_key_value_false_positive_corpus_passes_through(text: str) -> None:
+    assert redact_text(text) == text
 
 
 def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:

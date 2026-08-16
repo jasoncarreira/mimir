@@ -36,6 +36,15 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # env var dumps, JSON pretty-prints with bareword keys). The value alphabet
     # stops at common delimiters so the regex doesn't eat the rest of the line.
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
+    # Credential fields in header, YAML, JSON, and Python-repr colon forms.
+    # Requiring a credential-like key and a non-path boundary keeps ordinary
+    # prose, timestamps, unrelated mappings, and URL userinfo intact. An
+    # opening value quote is preserved with the prefix.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?\s*:\s*['\"]?)([^\s\"',&}]+)"
+    ),
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
     # chars are a high-confidence shape; mask the whole value.

@@ -164,13 +164,20 @@ async def test_max_events_trim_eventually_lands_on_cap(tmp_path: Path):
 async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="proc-1")
+    unprefixed_secret = "0123456789abcdef0123456789abcdef"
 
     await logger.log(
         "tool_error",
         error="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def failed",
         args={
             "env": "ANTHROPIC_API_KEY=sk-ant-api03-AbCdEf12_3456-789xyz_long",
-            "nested": ["token=github_pat_11ABCDEFG_xyz0123", "safe context"],
+            "nested": [
+                "token=github_pat_11ABCDEFG_xyz0123",
+                f"> X-API-Key: {unprefixed_secret}",
+                f"MIMIR_API_KEY: {unprefixed_secret}",
+                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}',
+                "safe context",
+            ],
         },
     )
 
@@ -179,9 +186,14 @@ async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
     assert "eyJhbGciOiJIUzI1NiJ9" not in serialized
     assert "sk-ant-api03-" not in serialized
     assert "github_pat_" not in serialized
+    assert unprefixed_secret not in serialized
+    assert "pa-" + unprefixed_secret not in serialized
     assert record["error"] == "Authorization: Bearer [REDACTED] failed"
     assert record["args"]["nested"][0] == "token=[REDACTED]"
-    assert record["args"]["nested"][1] == "safe context"
+    assert record["args"]["nested"][1] == "> X-API-Key: [REDACTED]"
+    assert record["args"]["nested"][2] == "MIMIR_API_KEY: [REDACTED]"
+    assert record["args"]["nested"][3] == '{"VOYAGE_API_KEY": "[REDACTED]"}'
+    assert record["args"]["nested"][4] == "safe context"
 
 
 def test_log_sync_redacts_token_shaped_values(tmp_path: Path):
