@@ -2,28 +2,15 @@
 ``rebuild_index`` tool, or the tool is dead.
 
 The composition root owns both the human-readable IndexGenerator and the search
-Indexer. The wiring is guarded by source inspection and the tool behavior is
-covered directly.
+Indexer. The tool behavior is covered directly here and runtime installation is
+covered by ``test_runtime``.
 """
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 
 from mimir.tools.extra import _INDEX_GEN_STATE, rebuild_index, set_index_generator
-
-
-def test_runtime_wires_the_index_generator() -> None:
-    from mimir.runtime import _install_runtime_globals
-
-    src = inspect.getsource(_install_runtime_globals)
-    assert "set_index_generator(bundle.indexes)" in src, (
-        "the runtime must install its IndexGenerator next to its Indexer — "
-        "without it the rebuild_index tool is dead "
-        '("no IndexGenerator configured").'
-    )
 
 
 class _StubGen:

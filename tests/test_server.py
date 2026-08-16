@@ -1717,13 +1717,6 @@ class TestAuthMiddlewareNoKey:
             resp = await client.get("/protected")
         assert resp.status == 200
 
-    @pytest.mark.asyncio
-    async def test_no_key_allows_without_header(self) -> None:
-        async with TestClient(TestServer(_auth_app(""))) as client:
-            resp = await client.get("/protected")
-        assert resp.status == 200
-
-
 class TestBrowserRequestSecurity:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("expected_key", ["", "secret"])

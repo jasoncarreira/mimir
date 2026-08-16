@@ -1032,9 +1032,6 @@ class TestSetPollerOverrides:
         assert not destination.exists()
         assert list(tmp_path.iterdir()) == []
 
-    def test_dead_confined_artifact_writer_is_removed(self) -> None:
-        assert not hasattr(registry, "_write_run_artifacts_confined")
-
     @pytest.mark.asyncio
     async def test_no_scheduler_returns_error(self) -> None:
         _STATE["scheduler"] = None

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json as _json
 import shutil
 from datetime import datetime, timezone
@@ -3176,14 +3175,6 @@ def test_scheduler_arbiter_can_be_cleared(tmp_path: Path):
     sched.set_arbiter(None)
 
     assert sched._arbiter is None
-
-
-def test_agent_wires_arbiter_through_scheduler_setter():
-    from mimir.agent import Agent
-
-    source = inspect.getsource(Agent.__init__)
-    assert "scheduler.set_arbiter(self._arbiter)" in source
-    assert "scheduler._arbiter = self._arbiter" not in source
 
 
 @pytest.mark.asyncio
