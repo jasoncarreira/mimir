@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -19,28 +21,25 @@ from mimir.version_check import (
 
 
 def test_parse_simple_dotted_int():
-    assert _parse_version("1.2.3") == (1, 2, 3)
-    assert _parse_version("0.1.0") == (0, 1, 0)
-    assert _parse_version("10.0") == (10, 0)
-    assert _parse_version("5") == (5,)
+    assert str(_parse_version("1.2.3")) == "1.2.3"
+    assert str(_parse_version("0.1.0")) == "0.1.0"
+    assert str(_parse_version("10.0")) == "10.0"
+    assert str(_parse_version("5")) == "5"
 
 
-def test_parse_strips_suffix_to_int_prefix():
-    """Pre-release suffix is dropped — comparison happens on the numeric
-    core, the pre-release filter handles eligibility separately."""
-    assert _parse_version("1.0.0rc1") == (1, 0, 0)
-    assert _parse_version("0.2.0.dev42") == (0, 2, 0)
-    assert _parse_version("1.0.0+build.5") == (1, 0, 0)
+def test_parse_preserves_pep440_release_phases():
+    assert str(_parse_version("1.0.0rc1")) == "1.0.0rc1"
+    assert str(_parse_version("0.2.0.dev42")) == "0.2.0.dev42"
+    assert str(_parse_version("1.0.0+build.5")) == "1.0.0+build.5"
 
 
 def test_parse_returns_none_for_garbage():
     assert _parse_version("") is None
     assert _parse_version("not-a-version") is None
-    assert _parse_version("v1.2.3") is None  # leading 'v' not a digit
 
 
 def test_parse_handles_whitespace():
-    assert _parse_version("  1.2.3  ") == (1, 2, 3)
+    assert str(_parse_version("  1.2.3  ")) == "1.2.3"
 
 
 # ─── _is_prerelease ──────────────────────────────────────────────────────
@@ -129,10 +128,30 @@ def test_check_includes_prerelease_when_opted_in():
 
 
 def test_check_local_prerelease_sees_newer_stable():
-    """An operator on a pre-release still sees a newer stable release."""
-    with _patch_pypi("0.3.0"):
+    """Operator on a pre-release sees the stable release that supersedes
+    it because PEP 440 orders the final release after its release candidate."""
+    with _patch_pypi("0.2.0"):
         result = check_for_update(current_version="0.2.0rc1")
     assert result.is_newer
+
+
+@pytest.mark.parametrize(
+    ("current", "latest", "is_newer"),
+    [
+        ("1.0a1", "1.0b1", True),
+        ("1.0b1", "1.0rc1", True),
+        ("1.0.dev1", "1.0a1", True),
+        ("1.0", "1.0.post1", True),
+        ("1.0", "1.0.0", False),
+    ],
+)
+def test_check_uses_pep440_ordering(current, latest, is_newer):
+    with _patch_pypi(latest):
+        result = check_for_update(
+            current_version=current,
+            include_prereleases=True,
+        )
+    assert result.is_newer is is_newer
 
 
 def test_check_handles_404_silently():
@@ -285,3 +304,17 @@ async def test_scheduled_check_silent_on_network_error(tmp_path):
             )
     finally:
         _reset_logger_for_tests()
+@pytest.mark.asyncio
+async def test_scheduled_check_runs_lookup_off_event_loop(tmp_path, monkeypatch):
+    from mimir.version_check import run_scheduled_update_check
+
+    loop_thread = threading.get_ident()
+    lookup_threads: list[int] = []
+
+    def fake_check():
+        lookup_threads.append(threading.get_ident())
+        return VersionCheck(current="1.0", latest="1.0", is_newer=False)
+
+    monkeypatch.setattr("mimir.version_check.check_for_update", fake_check)
+    await asyncio.wait_for(run_scheduled_update_check(tmp_path), timeout=1)
+    assert lookup_threads and lookup_threads[0] != loop_thread

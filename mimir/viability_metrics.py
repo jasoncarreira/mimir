@@ -339,7 +339,8 @@ def compute_collapse_metrics(
                 atom_ids.append(str(aid))
         channel = str(rec.get("channel_id") or "")
         trigger = str(rec.get("trigger") or "")
-        topic_keys.append((channel, trigger, _top_token(output)))
+        if output:
+            topic_keys.append((channel, trigger, _top_token(output)))
 
     # Cap to bound fastembed cost (consecutive-pair cosine is O(n);
     # the embedding step is the actual cost driver).

@@ -585,7 +585,10 @@ def render_usage_block(
             )
             cost_part = f"${w.total_cost_usd:.2f}"
             if budget and budget > 0:
-                cost_part += f" ({w.total_cost_usd / budget * 100:.0f}% of ${budget:.2f})"
+                percent = w.total_cost_usd / budget * 100
+                cost_part += f" ({percent:.0f}% of ${budget:.2f})"
+                if w.total_cost_usd > budget:
+                    cost_part += " ⚠ configured usage ceiling exceeded"
             lines.append(f"{w.label}: {cost_part} / " + " / ".join(tail))
 
     if has_plan_quotas:
