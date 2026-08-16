@@ -555,3 +555,13 @@ def test_dedup_pass_rebuilds_observation_evidence_count(conn):
 
     # The observation is in the rebuild list.
     assert obs in result.evidence_counts_rebuilt
+
+    # The two live evidence edges collapse to a single live target.
+    live = conn.execute(
+        "SELECT COUNT(*) FROM atom_relations r "
+        "JOIN atoms a ON a.id = r.target_id "
+        "WHERE r.source_id = ? AND r.relation_type = 'evidenced_by' "
+        "AND a.tombstoned = 0",
+        (obs,),
+    ).fetchone()[0]
+    assert live == 1, f"expected 1 live evidenced_by edge, got {live}"

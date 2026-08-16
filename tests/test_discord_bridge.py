@@ -503,12 +503,10 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
-async def test_on_message_dedupes_resume_protocol_redelivery(
+async def test_on_message_dedupes_completed_resume_protocol_redelivery(
     bridge_with_fake_client, tmp_path: Path, monkeypatch,
 ):
-    """chainlink #232: Discord's resume protocol can redeliver around
-    disconnects. The bridge must enqueue exactly once for the same
-    message id, no matter how many times it arrives."""
+    """Completed Discord messages are cached against later redelivery."""
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client

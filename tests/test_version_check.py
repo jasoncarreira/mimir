@@ -129,19 +129,10 @@ def test_check_includes_prerelease_when_opted_in():
 
 
 def test_check_local_prerelease_sees_newer_stable():
-    """Operator on a pre-release sees the stable release that supersedes
-    it — the pre-release filter doesn't suppress newer-numeric-core
-    versions even when the operator is on a pre-release."""
-    with _patch_pypi("0.2.0"):
+    """An operator on a pre-release still sees a newer stable release."""
+    with _patch_pypi("0.3.0"):
         result = check_for_update(current_version="0.2.0rc1")
-    # Numeric core 0.2.0 == 0.2.0, so tuple comparison says not newer.
-    # This is a known limitation of the simple tuple parser — it can't
-    # distinguish rc1 from the stable that supersedes it. Operators on
-    # pre-releases see the next NUMERICALLY-NEWER version (0.3.0 etc.).
-    # Acceptable for the open-source-from-day-one case where the
-    # operator is unlikely to be running pre-releases. Could swap for
-    # packaging.version.parse if this becomes a real issue.
-    assert not result.is_newer  # documenting the known limitation
+    assert result.is_newer
 
 
 def test_check_handles_404_silently():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -529,50 +530,81 @@ async def test_user_events_endpoints_filter_to_own_channel(tmp_path: Path) -> No
         assert len((await admin.json())["data"]["events"]) == 3
 
 
-async def test_user_live_events_endpoint_filters_backfill_to_own_channel(tmp_path: Path) -> None:
+async def test_user_live_events_endpoint_filters_every_poll_to_own_channel(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     alice_key = issue_web_key(tmp_path, "alice", roles=["user"])
     app, turns_log, _ = _scoped_web_app(tmp_path, "master-secret")
-    _jsonl(turns_log, [
-        {
-            "turn_id": "a1",
-            "ts": "2026-06-21T01:00:00Z",
+    alice_first = {
+        "turn_id": "a1",
+        "ts": "2026-06-21T01:00:00Z",
+        "channel_id": "web-alice",
+        "events": [
+            {
+                "type": "text",
+                "phase": "chunk",
+                "turn_id": "a1",
+                "channel_id": "web-alice",
+                "seq": 1,
+                "ts": "2026-06-21T01:00:00Z",
+                "text": "a",
+            }
+        ],
+    }
+    bob = {
+        "turn_id": "b1",
+        "ts": "2026-06-21T01:01:00Z",
+        "channel_id": "web-bob",
+        "events": [
+            {
+                "type": "text",
+                "phase": "chunk",
+                "turn_id": "b1",
+                "channel_id": "web-bob",
+                "seq": 1,
+                "ts": "2026-06-21T01:01:00Z",
+                "text": "b",
+            }
+        ],
+    }
+    alice_second = {
+        "turn_id": "a2",
+        "ts": "2026-06-21T01:02:00Z",
+        "channel_id": "web-alice",
+        "events": [{
+            "type": "text",
+            "phase": "chunk",
+            "turn_id": "a2",
             "channel_id": "web-alice",
-            "events": [
-                {
-                    "type": "text",
-                    "phase": "chunk",
-                    "turn_id": "a1",
-                    "channel_id": "web-alice",
-                    "seq": 1,
-                    "ts": "2026-06-21T01:00:00Z",
-                    "text": "a",
-                }
-            ],
-        },
-        {
-            "turn_id": "b1",
-            "ts": "2026-06-21T01:01:00Z",
-            "channel_id": "web-bob",
-            "events": [
-                {
-                    "type": "text",
-                    "phase": "chunk",
-                    "turn_id": "b1",
-                    "channel_id": "web-bob",
-                    "seq": 1,
-                    "ts": "2026-06-21T01:01:00Z",
-                    "text": "b",
-                }
-            ],
-        },
-    ])
+            "seq": 1,
+            "ts": "2026-06-21T01:02:00Z",
+            "text": "a2",
+        }],
+    }
+    _jsonl(turns_log, [alice_first])
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_POLL_S", 0.01)
+
+    async def read_data(response) -> dict:
+        while True:
+            line = await asyncio.wait_for(response.content.readline(), timeout=2)
+            assert line, "live-events stream ended before another event arrived"
+            if line.startswith(b"data: "):
+                return json.loads(line.removeprefix(b"data: "))
 
     async with TestClient(TestServer(app)) as c:
-        r = await c.get("/api/v1/live-events?once=1&limit=10", headers={"X-API-Key": alice_key})
-        text = await r.text()
+        r = await c.get("/api/v1/live-events?limit=10", headers={"X-API-Key": alice_key})
         assert r.status == 200
-        assert "web-alice" in text
-        assert "web-bob" not in text
+        first = await read_data(r)
+        assert first["event"]["channel_id"] == "web-alice"
+
+        _jsonl(turns_log, [alice_first, bob, alice_second])
+        while True:
+            subsequent = await read_data(r)
+            assert subsequent["event"]["channel_id"] == "web-alice"
+            if subsequent["event"]["turn_id"] == "a2":
+                break
+        r.close()
 
         denied = await c.get(
             "/api/v1/live-events?channel=web-bob&once=1",
