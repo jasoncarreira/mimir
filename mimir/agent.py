@@ -1245,23 +1245,30 @@ class Agent:
         # fired before the first turn are still arbitrated.
         from .billing import build_quota_providers
         from .budget import HomeostaticArbiter
+        from .providers import provider_for_quota
         # Auto-discover quota providers based on routing config.
         # Discovery is layered: ``MIMIR_MODEL_SPEC`` prefix wins
         # (``openai:`` / ``claude-code:`` are explicit provider picks),
         # then ``ANTHROPIC_BASE_URL`` host disambiguates ``anthropic:*``
         # routes (Minimax compat vs canonical Anthropic).
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
         quota_providers = build_quota_providers(
             store=self._rate_limits,
             billing_mode=config.billing_mode,
             model_spec=config.model_spec,
-            anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
+            anthropic_base_url=anthropic_base_url,
         )
+        active_quota_provider = provider_for_quota(
+            config.model_spec,
+            anthropic_base_url,
+        ).quota_provider_key
         self._arbiter = HomeostaticArbiter(
             home=config.home,
             rate_limit_store=self._rate_limits,
             turns_log=config.turns_log,
             billing_mode=config.billing_mode,
             quota_providers=quota_providers,
+            active_quota_providers=(active_quota_provider,),
             cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
             cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
