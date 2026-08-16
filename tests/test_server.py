@@ -496,7 +496,7 @@ def _controlled_server_app(
             self._scheduler.running = True
             control.hit("scheduler:start")
 
-        def stop(self) -> None:
+        async def stop(self) -> None:
             self._started = False
             self._scheduler.running = False
             control.hit("scheduler:stop")

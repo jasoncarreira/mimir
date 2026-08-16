@@ -1989,7 +1989,7 @@ def build_app(config: Config) -> web.Application:
 
             attempt_sync(lambda: mark_clean_shutdown(config.home))
         if startup_state.scheduler_start_attempted:
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
         if startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
         if startup_state.bridges_connect_attempted:
@@ -2095,7 +2095,7 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
             if startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
             if startup_state.activity_panel is not None:
