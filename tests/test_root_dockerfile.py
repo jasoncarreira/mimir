@@ -103,10 +103,11 @@ def test_s6_release_downloads_retry_transient_http_errors() -> None:
     )
     assert block is not None, "could not find the s6-overlay download layer"
     body = block.group("body")
+    assert "--fail" in body
+    assert "--show-error" in body
     assert "--retry 5" in body
     assert "--retry-all-errors" in body
     assert body.count("curl ${curl_args}") == 2
-
 
 
 def test_claude_code_build_arg_installs_only_adapter_extra() -> None:
