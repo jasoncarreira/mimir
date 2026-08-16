@@ -4,6 +4,7 @@ import array
 import asyncio
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import socket
@@ -57,6 +58,7 @@ class WorkerProcess:
     stderr: asyncio.StreamReader
     _socket: socket.socket
     returncode: int | None = None
+    timed_out: bool = False
 
     async def wait(self) -> int:
         if self.returncode is None:
@@ -68,6 +70,7 @@ class WorkerProcess:
             if response.get("id") != self.identifier or response.get("status") != "terminal":
                 raise RuntimeError("worker executor returned an invalid terminal result")
             self.returncode = int(response["exit_code"])
+            self.timed_out = response.get("timed_out") is True
             self._socket.close()
         return self.returncode
 
@@ -109,6 +112,7 @@ class WorkerClient:
         env: Mapping[str, str],
         projections: Sequence[WorkerProjection] = (),
         identifier: str,
+        timeout_s: float,
     ) -> WorkerProcess:
         self.checkout.verify(local_checkout)
         _validate_identifier(identifier)
@@ -122,6 +126,13 @@ class WorkerClient:
             raise ValueError("worker projections must use at most two unique destinations")
         if "HOME" in env:
             raise ValueError("worker HOME is assigned by the executor")
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError("worker timeout must be positive")
         if any(
             not isinstance(key, str)
             or not isinstance(value, str)
@@ -144,6 +155,7 @@ class WorkerClient:
                 {"path": item.path, "document": item.document.decode("utf-8")}
                 for item in projections
             ],
+            "timeout_s": timeout_s,
         }
         payload = json.dumps(request, separators=(",", ":")).encode()
         if len(payload) > MAX_REQUEST_BYTES:

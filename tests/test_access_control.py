@@ -1997,7 +1997,7 @@ def test_auth_context_service_identity(tmp_path: Path) -> None:
         people:
           - canonical: mcp-service
             aliases: [mcp-1]
-            access: {roles: [service], is_service: true}
+            access: {is_service: true}
         """,
     )
 
@@ -2006,7 +2006,7 @@ def test_auth_context_service_identity(tmp_path: Path) -> None:
 
     assert auth_ctx is not None
     assert auth_ctx.is_service is True
-    assert "service" in auth_ctx.roles
+    assert auth_ctx.roles == ()
 
 
 def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) -> None:
@@ -2017,10 +2017,10 @@ def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) 
         people:
           - canonical: external-service
             aliases: [service-external]
-            access: {roles: [service], is_service: true}
+            access: {is_service: true}
           - canonical: trusted-service-user
             aliases: [service-trusted]
-            access: {roles: [service, user], is_service: true}
+            access: {roles: [user], is_service: true}
         """,
     )
 
@@ -2029,10 +2029,10 @@ def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) 
 
     assert external.allowed is False
     assert external.reason == DenialReason.USER_NOT_ALLOWLISTED
-    assert external.roles == ("service",)
+    assert external.roles == ()
     assert trusted.allowed is True
     assert trusted.status == AccessStatus.USER_ALLOWED
-    assert trusted.roles == ("service", "user")
+    assert trusted.roles == ("user",)
 
 
 def test_http_ingress_extra_key_blocks_service_grant() -> None:
@@ -2914,10 +2914,12 @@ async def test_service_shell_executes_the_exact_authorized_argv(
         ("repo_review", "poller:github-activity", "poller"),
     ],
 )
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
 def test_declared_shell_authorization_and_execution_gates_agree(
     profile: str,
     canonical: str,
     trigger: str,
+    tool_name: str,
     tmp_path: Path,
 ) -> None:
     """Both gates admit and refuse the same argv for per-job declarations."""
@@ -2936,7 +2938,7 @@ def test_declared_shell_authorization_and_execution_gates_agree(
         trigger=trigger,
         profile="github" if profile == "repo_review" else "heartbeat",
         tier=CapabilityTier.CODE_EXECUTION,
-        capabilities=("shell_exec", "bash_jobs_list", "bash_job_output"),
+        capabilities=("shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"),
         declared_shell_commands=declared,
         creation_path="test",
     )
@@ -2949,8 +2951,9 @@ def test_declared_shell_authorization_and_execution_gates_agree(
         _service_auth(service, InformationFlowLabels()),
         repo_review_state=review_state,
     )
-    policy = service.sink_policy_for("shell_exec")
+    policy = service.sink_policy_for(tool_name)
     assert policy is not None
+    assert policy.destination == profile
     adapter = access_control._SERVICE_SINK_ADAPTERS[policy.adapter]
 
     # This command is outside every shared profile, so either execution branch
@@ -2975,12 +2978,12 @@ def test_declared_shell_authorization_and_execution_gates_agree(
             review_state=review_state,
         )
         gate_admitted = SinkGate.check_sink_flow(
-            "shell_exec", command, auth.ifc_labels, auth, enforce=True,
+            tool_name, command, auth.ifc_labels, auth, enforce=True,
             repo_review_state=review_state,
         ).allowed
         bound = budget_gate._request_for_authorized_execution(
             _tool_request(auth, args={"command": command}),
-            "shell_exec",
+            tool_name,
             auth,
         )
         bound_args = bound.tool_call["args"]
@@ -9213,11 +9216,27 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
     from mimir import access_control
 
     source = Path(access_control.__file__).read_text(encoding="utf-8")
-    body = source.split("_SERVICE_SHELL_DISPLAY_OPTIONS", 1)[0]
-    assert '"--jq"' not in body, (
+    tree = ast.parse(source)
+    display_assignment = next(
+        node for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_SERVICE_SHELL_DISPLAY_OPTIONS"
+            for target in node.targets
+        )
+    )
+    display_nodes = set(ast.walk(display_assignment))
+    authorization_occurrences = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and node.value == "--jq"
+        and node not in display_nodes
+    ]
+    assert not authorization_occurrences, (
         "an authorization option allowlist reintroduced --jq; it is a "
         "credential-read primitive (jq env/$ENV over gh's environment), not an "
-        "output formatter"
+        f"output formatter (lines {authorization_occurrences})"
     )
 
     # ...while the display vocabulary keeps it, so a refusal can still name the

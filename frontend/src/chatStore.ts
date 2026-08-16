@@ -19,6 +19,8 @@ interface ChatState {
   ) => void;
 }
 
+const MAX_CHAT_MESSAGES = 100;
+
 // github #567: chat messages live in a module-level store rather than
 // ChatRoute-local state. Switching to another tab unmounts ChatRoute, and with
 // local useState that dropped the whole conversation — coming back showed an
@@ -28,5 +30,5 @@ interface ChatState {
 export const useChatStore = create<ChatState>((set) => ({
   messages: [],
   setMessages: (updater) =>
-    set((state) => ({ messages: updater(state.messages) }))
+    set((state) => ({ messages: updater(state.messages).slice(-MAX_CHAT_MESSAGES) }))
 }));

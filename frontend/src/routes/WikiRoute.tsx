@@ -139,6 +139,7 @@ function MarkdownView({ markdown, index }: { markdown: string; index: WikiIndexD
   let listItems: string[] = [];
   let codeLines: string[] = [];
   let codeLanguage = "";
+  let inCodeFence = false;
 
   function flushParagraph(key: string) {
     if (!paragraph.length) return;
@@ -175,7 +176,7 @@ function MarkdownView({ markdown, index }: { markdown: string; index: WikiIndexD
   lines.forEach((line, indexInDoc) => {
     const fence = line.match(/^```(.*)$/);
     if (fence) {
-      if (codeLines.length || codeLanguage) {
+      if (inCodeFence) {
         blocks.push(
           <pre key={`code-${indexInDoc}`} className="wiki-markdown__code">
             <code data-language={codeLanguage || undefined}>{codeLines.join("\n")}</code>
@@ -183,14 +184,16 @@ function MarkdownView({ markdown, index }: { markdown: string; index: WikiIndexD
         );
         codeLines = [];
         codeLanguage = "";
+        inCodeFence = false;
       } else {
         flushParagraph(`p-${indexInDoc}`);
         flushList(`ul-${indexInDoc}`);
         codeLanguage = fence[1].trim();
+        inCodeFence = true;
       }
       return;
     }
-    if (codeLanguage || codeLines.length) {
+    if (inCodeFence) {
       codeLines.push(line);
       return;
     }
@@ -224,7 +227,7 @@ function MarkdownView({ markdown, index }: { markdown: string; index: WikiIndexD
   });
   flushParagraph("p-final");
   flushList("ul-final");
-  if (codeLanguage || codeLines.length) {
+  if (inCodeFence) {
     blocks.push(
       <pre key="code-final" className="wiki-markdown__code">
         <code data-language={codeLanguage || undefined}>{codeLines.join("\n")}</code>

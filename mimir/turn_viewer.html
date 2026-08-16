@@ -236,6 +236,7 @@ function lsSet(key, value) {
 
 var authedFetch = window.MimirAuth.authedFetch;
 var getApiKey = window.MimirAuth.getApiKey;
+var promptApiKey = window.MimirAuth.promptApiKey;
 window.__mimir_resetApiKey = function() {
   window.MimirAuth.reset('manual rotation');
   if (typeof loadInitial === 'function') loadInitial();
@@ -266,7 +267,7 @@ function esc(s) {
 function fmtTime(ts) {
   if (!ts) return '\u2014';
   var d = new Date(ts);
-  if (isNaN(d.getTime())) return ts;
+  if (isNaN(d.getTime())) return esc(ts);
   var p = function(n){return n<10?'0'+n:''+n;};
   var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return mo[d.getMonth()]+' '+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
@@ -292,7 +293,8 @@ function fmtDuration(ms) {
   if (ms == null) return '<span style="color:var(--text3)">\u2014</span>';
   if (ms < 1000) return ms + 'ms';
   if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
-  return Math.floor(ms / 60000) + 'm ' + ((ms % 60000) / 1000).toFixed(0) + 's';
+  var seconds = Math.round(ms / 1000);
+  return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
 }
 
 function trunc(str, n) {

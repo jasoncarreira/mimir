@@ -85,8 +85,8 @@ def _prepare_boundary(root: Path, scope: str, boundary_name: str) -> tuple[Path,
     os.chown(scope_path, MIMIR_UID, MIMIR_UID, follow_symlinks=False)
     os.chmod(scope_path, 0o700, follow_symlinks=False)
     boundary = scope_path / boundary_name
+    boundary.mkdir(mode=0o700)
     try:
-        boundary.mkdir(mode=0o700)
         os.chown(boundary, MIMIR_UID, WORKLINK_GID, follow_symlinks=False)
         os.chmod(boundary, 0o700, follow_symlinks=False)
     except Exception:

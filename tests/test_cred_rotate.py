@@ -91,6 +91,36 @@ def test_atomic_replace_creates_timestamped_backup(deployment: Path):
     assert backup.read_text() == original
 
 
+def test_atomic_replace_backups_are_unique_within_same_clock_tick(
+    deployment: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    compose_env = deployment / "compose.env"
+    original = compose_env.read_text()
+    monkeypatch.setattr(cred_rotate.time, "time_ns", lambda: 123456789)
+
+    _, first = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "FIRST")
+    _, second = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "SECOND")
+
+    assert first != second
+    assert first.read_text() == original
+    assert "GITHUB_TOKEN=FIRST" in second.read_text()
+
+
+def test_atomic_replace_retains_only_ten_newest_backups(deployment: Path):
+    compose_env = deployment / "compose.env"
+    for index in range(12):
+        (deployment / f"compose.env.bak.{index:02d}").write_text(f"old-{index}")
+
+    _, current = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "NEW")
+    backups = list(deployment.glob("compose.env.bak.*"))
+
+    assert len(backups) == cred_rotate._KEEP_ROTATION_BACKUPS
+    assert current in backups
+    assert not (deployment / "compose.env.bak.00").exists()
+    assert not (deployment / "compose.env.bak.01").exists()
+    assert not (deployment / "compose.env.bak.02").exists()
+
+
 def test_atomic_replace_only_changes_first_match(deployment: Path):
     """Duplicate ``GITHUB_TOKEN=...`` lines in compose.env (rare but
     legal) — only the first is replaced so we don't accidentally
@@ -156,19 +186,12 @@ def test_resolve_service_multi_service_requires_explicit(deployment: Path):
 
 def test_emit_writes_jsonl(deployment: Path):
     cred_rotate._emit(deployment, "credential_rotation_started",
-                      env="GITHUB_TOKEN", new_value_hash="sha256:abc123")
+                      env="GITHUB_TOKEN", rotation_id="fake-rotation-id")
     log = (deployment / "rotations.jsonl").read_text()
     record = json.loads(log.strip())
     assert record["type"] == "credential_rotation_started"
     assert record["env"] == "GITHUB_TOKEN"
     assert "timestamp" in record
-
-
-def test_value_hash_is_sha256_prefix():
-    h = cred_rotate._value_hash("secret-value")
-    assert h.startswith("sha256:")
-    # 12-char hex prefix.
-    assert len(h.split(":", 1)[1]) == 12
 
 
 # ── full rotation flow (docker mocked) ──────────────────────────────
@@ -230,6 +253,12 @@ def test_rotate_happy_path(
     types = [json.loads(line)["type"] for line in log]
     assert "credential_rotation_started" in types
     assert "credential_rotation_completed" in types
+    records = [json.loads(line) for line in log]
+    started = next(row for row in records if row["type"] == "credential_rotation_started")
+    completed = next(row for row in records if row["type"] == "credential_rotation_completed")
+    assert started["rotation_id"] == completed["rotation_id"]
+    assert "old_value_hash" not in started
+    assert "new_value_hash" not in started
     # docker compose was invoked: up + ps + exec at minimum.
     invoked_verbs = {c[0] for c in calls}
     assert {"up", "ps", "exec"}.issubset(invoked_verbs)

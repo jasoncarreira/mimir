@@ -192,6 +192,50 @@ def test_store_triples_with_embedding(conn):
     assert row[1] == 4
 
 
+def test_store_triples_backfills_transient_embedding_failure(conn, caplog):
+    _seed_atom(conn, "obs1", "obs")
+    triple = {"subject": "Alice", "predicate": "prefers", "object": "concise"}
+    succeeding_embed = _stub_embed([1.0, 0.0, 0.0, 0.0])
+    calls = 0
+
+    def embed(text):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("429 rate limited")
+        return succeeding_embed(text)
+
+    store_triples(conn, [triple], source_atom_id="obs1", embed_fn=embed)
+    assert conn.execute("SELECT embedding FROM triples").fetchone()[0] is None
+    assert "transient" in caplog.text
+
+    assert store_triples(
+        conn, [triple], source_atom_id="obs1", embed_fn=embed,
+    ) == []
+    assert calls == 2
+    assert conn.execute("SELECT embedding FROM triples").fetchone()[0] is not None
+    assert triple_augment_search(
+        conn, [1.0, 0.0, 0.0, 0.0], auth_context=ADMIN_SCOPE,
+    )[0][0] == "obs1"
+
+
+def test_store_triples_does_not_retry_permanent_embedding_failure(conn, caplog):
+    _seed_atom(conn, "obs1", "obs")
+    triple = {"subject": "Alice", "predicate": "prefers", "object": "concise"}
+    calls = 0
+
+    def embed(_text):
+        nonlocal calls
+        calls += 1
+        raise ValueError("unsupported embedding input")
+
+    for _ in range(3):
+        store_triples(conn, [triple], source_atom_id="obs1", embed_fn=embed)
+
+    assert calls == 1
+    assert "permanent" in caplog.text
+
+
 def test_store_triples_inherits_intersected_acl_and_world_state(conn):
     _seed_atom(
         conn, "raw1", "source one", owner="user:123", domain="tenant:one",
@@ -386,6 +430,19 @@ def test_world_state_no_op_on_reassertion(conn):
     assert len(history) == 1
 
 
+def test_world_state_reasserting_superseded_value_makes_it_current(conn):
+    _seed_atom(conn, "obs1", "obs1")
+    for value in ("Boston", "Paris", "Boston"):
+        store_triples(conn, [
+            {"subject": "Alice", "predicate": "lives_in", "object": value},
+        ], source_atom_id="obs1")
+
+    fact = get_current_value(conn, "Alice", "lives_in", auth_context=ADMIN_SCOPE)
+    assert fact is not None
+    assert fact.value == "Boston"
+    assert conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0] == 2
+
+
 def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
     """chainlink #304: a value change that shares the prior row's
     ``valid_from`` collides on the PK (subject, predicate, valid_from)
@@ -407,6 +464,9 @@ def test_world_state_same_valid_from_value_change_keeps_new_current(conn):
     assert fact is not None, "new value dropped — no current row (the #304 bug)"
     assert fact.value == "inactive"
     assert fact.is_current is True
+    history = get_history(conn, "Alice", "status", auth_context=ADMIN_SCOPE)
+    assert [row.value for row in history] == ["active", "inactive"]
+    assert [row.is_current for row in history] == [False, True]
 
 
 def test_get_current_value_is_deterministic_with_dual_current_rows(conn):

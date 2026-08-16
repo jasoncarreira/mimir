@@ -80,6 +80,34 @@ def test_format_probe_passes_with_correct_prefix(
     assert "format ok" in result.detail
 
 
+@pytest.mark.parametrize("value", ["sk-ant-" + "x" * 20 + "\r", " sk-ant-" + "x" * 20])
+def test_format_probe_rejects_surrounding_whitespace_used_by_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_KEY", value)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_KEY
+            cred_type: D
+            env_vars: [FAKE_KEY]
+            description: "fake"
+            probe:
+              kind: format
+              env: FAKE_KEY
+              prefix: "sk-ant-"
+              min_len: 20
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "missing.yaml")
+
+    result = verify("FAKE_KEY")
+
+    assert not result.ok
+    assert "surrounding whitespace" in result.detail
+    assert f"got {len(value)} chars" in result.detail
+    assert os.environ["FAKE_KEY"] == value
+
+
 def test_format_probe_rejects_disallowed_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

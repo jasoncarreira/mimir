@@ -221,6 +221,9 @@ def test_coerce_relative_hint_leaves_start_unix_none():
             f"hint={hint!r} incorrectly parsed as ISO; got {rec.due_window_start_unix}"
         )
         assert rec.due_window_hint == hint  # verbatim preserved
+        assert rec.due_window_end_unix == pytest.approx(
+            rec.created_at_unix + 30 * 86400,
+        )
 
 
 def test_coerce_iso_datetime_dedupe_key_uses_day_bucket():

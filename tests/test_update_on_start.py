@@ -1112,6 +1112,22 @@ async def test_version_bump_first_boot_baselines_silently(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_unknown_version_preserves_existing_baseline(tmp_path, monkeypatch):
+    from mimir.update_on_start import (
+        _read_last_booted_version,
+        _write_last_booted_version,
+        emit_version_bump_digest,
+    )
+
+    _write_last_booted_version(tmp_path, "0.2.12")
+    monkeypatch.setattr("mimir.update_on_start._current_version", lambda: "unknown")
+    log, calls = _capture_log()
+    assert await emit_version_bump_digest(tmp_path, log) == 0
+    assert calls == []
+    assert _read_last_booted_version(tmp_path) == "0.2.12"
+
+
+@pytest.mark.asyncio
 async def test_version_bump_skipped_when_already_drained(tmp_path, monkeypatch):
     from mimir.update_on_start import emit_version_bump_digest, _write_last_booted_version, _read_last_booted_version
     _write_last_booted_version(tmp_path, "0.2.11")

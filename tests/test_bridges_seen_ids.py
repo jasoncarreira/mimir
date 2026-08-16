@@ -39,6 +39,14 @@ class TestSeenIdCacheBasic:
         assert len(cache) == 0
         assert "" not in cache
 
+    def test_discard_releases_a_claim(self) -> None:
+        cache = SeenIdCache()
+        assert cache.add_if_new("abc") is True
+
+        cache.discard("abc")
+
+        assert cache.add_if_new("abc") is True
+
 
 class TestSeenIdCacheEviction:
     def test_oldest_evicted_when_maxlen_exceeded(self) -> None:

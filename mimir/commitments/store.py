@@ -111,6 +111,7 @@ class CommitmentsStore:
 
     def __post_init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._inflight_lifecycle_ids: set[str] = set()
         # Guard: warn at most once per process instance to avoid log spam.
         self._warned_large_store: bool = False
 
@@ -249,6 +250,7 @@ class CommitmentsStore:
 
     def _can_apply(
         self,
+        state: dict[str, CommitmentRecord],
         id: str,
         target_status: str,
         *,
@@ -262,9 +264,9 @@ class CommitmentsStore:
         But without a pre-write check, the JSONL accumulates no-op
         events and the CLI gives no feedback when an operator does
         ``commitments complete <id>`` against an already-terminal
-        record. This helper reads current state once, consults the
-        adjacency, and returns False (with a warning log) on rejection.
-        Public lifecycle methods consult it before appending.
+        record. The caller supplies state replayed under the write lock;
+        this helper consults the adjacency and returns False (with a warning
+        log) on rejection. Public lifecycle methods consult it before append.
 
         Authorization: recipient_principal does NOT grant mutation authority.
         Owner mutations require an exact owner match (or admin). The trusted
@@ -275,7 +277,6 @@ class CommitmentsStore:
         if the record is unknown, unauthorized, or the transition
         violates ``VALID_TRANSITIONS``.
         """
-        state = self.current_state()
         rec = state.get(id)
         if rec is None:
             log.warning(
@@ -305,6 +306,41 @@ class CommitmentsStore:
             )
             return False
         return True
+
+    async def _append_transition(
+        self,
+        event: dict[str, Any],
+        target_status: str,
+        *,
+        actor_principal: str | None = None,
+        actor_is_admin: bool = False,
+    ) -> bool:
+        """Atomically validate and append one lifecycle transition."""
+        event = {**event, "v": COMMITMENTS_JSONL_SCHEMA_VERSION}
+        id = event["id"]
+        # Coalesce calls that overlap in this process. This preserves valid
+        # sequential redelivery while preventing one poll tick from recording
+        # the same delivery twice.
+        if id in self._inflight_lifecycle_ids:
+            return False
+        self._inflight_lifecycle_ids.add(id)
+        try:
+            async with self._lock:
+                state = await asyncio.to_thread(self.current_state)
+                if not self._can_apply(
+                    state,
+                    id,
+                    target_status,
+                    actor_principal=actor_principal,
+                    actor_is_admin=actor_is_admin,
+                ):
+                    return False
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+            return True
+        finally:
+            self._inflight_lifecycle_ids.remove(id)
 
     def _is_authorized(
         self,
@@ -352,20 +388,17 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected (unknown id, terminal record, unauthorized)."""
-        if not self._can_apply(
-            id,
+        return await self._append_transition(
+            {
+                "type": "commitment_delivered",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+            },
             CommitmentStatus.DELIVERED.value,
             actor_principal=actor_principal,
             actor_is_admin=actor_is_admin,
-        ):
-            return False
-        await self._append({
-            "type": "commitment_delivered",
-            "ts_unix": time.time(),
-            "id": id,
-            "at_unix": time.time(),
-        })
-        return True
+        )
 
     async def complete(
         self,
@@ -379,21 +412,18 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(
-            id,
+        return await self._append_transition(
+            {
+                "type": "commitment_completed",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+                "message_id": message_id,
+            },
             CommitmentStatus.COMPLETED.value,
             actor_principal=actor_principal,
             actor_is_admin=actor_is_admin,
-        ):
-            return False
-        await self._append({
-            "type": "commitment_completed",
-            "ts_unix": time.time(),
-            "id": id,
-            "at_unix": time.time(),
-            "message_id": message_id,
-        })
-        return True
+        )
 
     async def snooze(
         self,
@@ -410,21 +440,18 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(
-            id,
+        return await self._append_transition(
+            {
+                "type": "commitment_snoozed",
+                "ts_unix": time.time(),
+                "id": id,
+                "until_unix": until_unix,
+                "reason": reason,
+            },
             CommitmentStatus.SNOOZED.value,
             actor_principal=actor_principal,
             actor_is_admin=actor_is_admin,
-        ):
-            return False
-        await self._append({
-            "type": "commitment_snoozed",
-            "ts_unix": time.time(),
-            "id": id,
-            "until_unix": until_unix,
-            "reason": reason,
-        })
-        return True
+        )
 
     async def dismiss(
         self,
@@ -438,21 +465,18 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(
-            id,
+        return await self._append_transition(
+            {
+                "type": "commitment_dismissed",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+                "reason": reason,
+            },
             CommitmentStatus.DISMISSED.value,
             actor_principal=actor_principal,
             actor_is_admin=actor_is_admin,
-        ):
-            return False
-        await self._append({
-            "type": "commitment_dismissed",
-            "ts_unix": time.time(),
-            "id": id,
-            "at_unix": time.time(),
-            "reason": reason,
-        })
-        return True
+        )
 
     async def expire(
         self,
@@ -466,20 +490,17 @@ class CommitmentsStore:
 
         Returns True if the event was appended; False if the
         transition was rejected or unauthorized."""
-        if not self._can_apply(
-            id,
+        return await self._append_transition(
+            {
+                "type": "commitment_expired",
+                "ts_unix": time.time(),
+                "id": id,
+                "at_unix": time.time(),
+            },
             CommitmentStatus.EXPIRED.value,
             actor_principal=actor_principal,
             actor_is_admin=actor_is_admin,
-        ):
-            return False
-        await self._append({
-            "type": "commitment_expired",
-            "ts_unix": time.time(),
-            "id": id,
-            "at_unix": time.time(),
-        })
-        return True
+        )
 
     async def alarm_pileup(self, id: str) -> bool:
         """Record that a ``commitment_snooze_pileup`` algedonic event
@@ -812,12 +833,20 @@ class CommitmentsStore:
         for rid, rec in self.current_state().items():
             if not rec.is_terminal():
                 continue
-            terminal_at = (
-                rec.completed_at_unix
-                or rec.dismissed_at_unix
-                or rec.expired_at_unix
-                or 0.0
+            terminal_at = next(
+                (
+                    value
+                    for value in (
+                        rec.completed_at_unix,
+                        rec.dismissed_at_unix,
+                        rec.expired_at_unix,
+                    )
+                    if value is not None
+                ),
+                None,
             )
+            if terminal_at is None:
+                continue
             if (now_unix - terminal_at) > retention_secs:
                 out.append((rid, rec))
         return out

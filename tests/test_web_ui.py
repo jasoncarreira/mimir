@@ -142,6 +142,72 @@ async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Pa
         assert store.load()["tool-1"]["is_tombstoned"] is True
 
 
+@pytest.mark.asyncio
+async def test_admin_mcp_discovers_before_persisting_and_reports_missing_command(
+    tmp_path: Path,
+) -> None:
+    from mimir.mcp_client import MCPPolicyStore
+
+    command = "mimir-definitely-missing-mcp-1234"
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/admin/mcp/servers", json={
+            "name": "broken",
+            "command": command,
+            "args": [],
+            "env": {},
+        })
+        body = await resp.json()
+
+    assert resp.status == 400
+    assert body["error"]["code"] == "mcp_discovery_failed"
+    assert command in body["error"]["message"]
+    assert MCPPolicyStore(
+        tmp_path / "state" / "mcp-policy.json"
+    ).load_server_records() == {}
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_persists_after_successful_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore
+
+    start_servers = AsyncMock(return_value=[])
+    monkeypatch.setattr(MCPManager, "start_servers", start_servers)
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        home=tmp_path,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/v1/admin/mcp/servers", json={
+            "name": "valid",
+            "command": "valid-mcp",
+            "args": [],
+            "env": {},
+        })
+
+    assert resp.status == 200
+    records = MCPPolicyStore(
+        tmp_path / "state" / "mcp-policy.json"
+    ).load_server_records()
+    assert next(iter(records.values()))["command"] == "valid-mcp"
+    assert start_servers.await_args.kwargs == {"fail_fast": True}
+
+
 def test_dashboard_extension_registry_sorts_hides_and_validates_scope():
     registry = first_party_dashboard_extensions(
         [
@@ -522,6 +588,14 @@ def test_dashboard_extension_route_path_allows_app_prefix_words_only():
             route_path="/app/child",
             label="App Child",
         ).validate()
+
+    for unsafe_path in ("//status", "/../status", "/status/../secret", "/\\status"):
+        with pytest.raises(ValueError, match="route_path"):
+            DashboardExtensionManifest(
+                id="unsafe",
+                route_path=unsafe_path,
+                label="Unsafe",
+            ).validate()
 
 
 @pytest.mark.asyncio
@@ -1066,6 +1140,31 @@ async def test_api_v1_turn_events_sse_scrubs_tool_args_results_and_text(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_api_v1_turn_events_rejects_when_stream_cap_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(web_ui, "TURN_EVENTS_MAX_STREAMS", 1)
+    bus = TurnEventBus()
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns.jsonl",
+        events_log=tmp_path / "events.jsonl",
+        turn_event_bus=bus,
+    )
+
+    async with TestClient(TestServer(app)) as client:
+        first = await client.get("/api/v1/turn-events?channel=web-alice")
+        second = await client.get("/api/v1/turn-events?channel=web-alice")
+        body = await second.text()
+        first.close()
+
+    assert first.status == 200
+    assert second.status == 429
+    assert "too many turn event streams" in body
+
+
+@pytest.mark.asyncio
 async def test_api_v1_live_events_backfill_orders_and_dedups(app):
     a, turns_log, _ = app
     rows = [
@@ -1179,6 +1278,44 @@ async def test_api_v1_live_events_since_backfill_is_strict(app):
     assert resp.status == 200
     items = _sse_data_items(body)
     assert [item["cursor"] for item in items] == ["2026-01-01T00:00:02Z:t2:000000", "2026-01-01T00:00:02Z:t2:000001"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_live_events_poll_advances_past_filtered_records(
+    app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir.live_events import read_live_event_items_since, turn_record_to_live_items
+
+    a, turns_log, _ = app
+    rows = [
+        {"turn_id": "alice", "ts": "2026-01-01T00:00:01Z", "channel_id": "web-alice"},
+        {"turn_id": "bob", "ts": "2026-01-01T00:00:02Z", "channel_id": "web-bob"},
+    ]
+    turns_log.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    calls: list[str | None] = []
+
+    def recording_reader(path: Path, **kwargs):
+        calls.append(kwargs.get("since"))
+        return read_live_event_items_since(path, **kwargs)
+
+    monkeypatch.setattr(web_ui, "read_live_event_items_since", recording_reader)
+    monkeypatch.setattr(web_ui, "LIVE_EVENTS_POLL_S", 0.01)
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/v1/live-events?channel=web-alice")
+        delivered = await _read_sse_data(resp)
+        for _ in range(100):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        resp.close()
+
+    scanned_cursor = turn_record_to_live_items(rows[-1])[-1].cursor
+    assert delivered["event"]["channel_id"] == "web-alice"
+    assert len(calls) >= 2
+    assert calls[:2] == [None, scanned_cursor]
 
 
 @pytest.mark.asyncio
@@ -1470,6 +1607,34 @@ async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
     assert body["server"]["public_bind"] is True
     assert body["stream_auth"]["shape"] == "fetch-event-stream"
     assert body["stream_auth"]["native_eventsource_supported_when_auth_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_WEB_HOST", "")
+    config = Config.from_env()
+    a = web.Application()
+    a["api_key"] = "super-secret"
+    a["config"] = config
+    web_ui.register_routes(
+        a,
+        turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl",
+        react_app_dist=tmp_path / "missing-dist",
+    )
+
+    async with TestClient(TestServer(a)) as client:
+        resp = await client.get("/api/web/bootstrap")
+        body = await resp.json()
+
+    assert body["server"] == {
+        "web_host": "127.0.0.1",
+        "public_bind": False,
+        "unauthenticated_allowed": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -2209,6 +2374,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
         "https://example.invalid/hook?api_key=sk-public-admin-config-value",
     )
     monkeypatch.setenv("MIMIR_PUBLIC_BARE_VALUE", "ghp_adminconfigbaretoken")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "private-operator-channel")
     config = Config.from_env()
     config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
     config.file_tool_roots = ((str(tmp_path / "private-extra-root"), "ro"),)
@@ -2260,6 +2426,8 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert env_by_name["ANTHROPIC_API_KEY"]["present"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["secret"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["value"] == "[REDACTED]"
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["secret"] is True
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["value"] == "[REDACTED]"
     serialized = json.dumps(data)
     assert "sk-ant-admin-config-secret" not in serialized
     assert "nested-admin-config-secret" not in serialized
@@ -2269,6 +2437,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert "ghp_adminconfigbaretoken" not in serialized
     assert "channel-with-secret-shaped-value" not in serialized
     assert "private-extra-root" not in serialized
+    assert "private-operator-channel" not in serialized
     assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
     assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
     assert (
