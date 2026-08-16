@@ -37,6 +37,15 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+def secret_matches(text: str) -> set[str]:
+    """Return the distinct secret-shaped substrings in ``text``."""
+    return {
+        match.group(0)
+        for pattern in _SECRET_PATTERNS
+        for match in pattern.finditer(text)
+    }
+
+
 def contains_secret(text: str) -> bool:
     """True if ``text`` contains a high-signal, secret-shaped credential.
 
