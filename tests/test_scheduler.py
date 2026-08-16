@@ -4448,8 +4448,20 @@ async def test_rearming_quota_recheck_preserves_existing_countdown(tmp_path: Pat
     first_job = sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID)
     assert first_job is not None
 
-    sched.arm_quota_pause_recheck()
+    calls: list[str | None] = []
+    real_add_job = sched._scheduler.add_job
 
+    def _counting_add_job(*args, **kwargs):
+        calls.append(kwargs.get("id"))
+        return real_add_job(*args, **kwargs)
+
+    sched._scheduler.add_job = _counting_add_job
+    try:
+        sched.arm_quota_pause_recheck()
+    finally:
+        sched._scheduler.add_job = real_add_job
+
+    assert calls == [], f"re-arm must not re-add the job; got {calls}"
     assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is first_job
 
 
