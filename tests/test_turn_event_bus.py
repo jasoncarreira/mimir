@@ -95,7 +95,10 @@ def test_publish_scrubs_tool_args_results_and_text_at_bus_boundary():
 def test_publish_caps_pathological_single_line_arg_before_live_delivery():
     bus = TurnEventBus()
     q = bus.subscribe("web-default")
-    payload = "a1-" * 200_000
+    # Cross the cap with short benign fragments so this remains a live-delivery
+    # boundary test, not an accidental stress test of the credential regexes.
+    payload = "a!" * (MAX_LIVE_STRING_CHARS // 2 + 1)
+    assert len(payload) > MAX_LIVE_STRING_CHARS
 
     bus.publish({
         "type": "tool_call",
