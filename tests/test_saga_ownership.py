@@ -84,6 +84,7 @@ def test_intersect_acl_same_owner_domain_keeps_common_authority() -> None:
     ])
 
     assert result.owner_principal == "user:123"
+    assert result.origin_channel == "channel:one"
     assert result.origin_domain == "tenant:one"
     assert result.visibility == Visibility.PRIVATE
     assert result.provenance == {"a": 1, "b": 2}

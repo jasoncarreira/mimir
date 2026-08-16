@@ -772,7 +772,19 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
         (alice_id, bob_id),
     ).fetchall())
 
-    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+    synth_calls: list[list[dict]] = []
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        synth_calls.append(cluster)
+        return {
+            "content": "unexpected mixed-owner observation",
+            "topics": [],
+            "triples": [],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=True, min_cluster_size=2)
 
     assert result["dedup"]["candidates_scanned"] == 2
     assert result["dedup"]["duplicates_tombstoned"] == []
@@ -793,6 +805,7 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
         (alice_id, bob_id),
     ).fetchall())
     assert after_events == before_events
+    assert synth_calls == [], "thematic consolidation crossed ownership scopes"
 
 
 @pytest.mark.asyncio
@@ -839,12 +852,12 @@ async def test_consolidate_thematic_clusters_and_observations_are_owner_scoped(
         frozenset(expected_ids["bob"]),
     }
     observations = store._ensure_conn().execute(
-        "SELECT content, owner_principal, origin_domain, visibility "
+        "SELECT content, owner_principal, origin_channel, origin_domain, visibility "
         "FROM atoms WHERE memory_type = 'observation'"
     ).fetchall()
     assert set(observations) == {
-        ("alice synthesized observation", "alice", "tenant:alice", "private"),
-        ("bob synthesized observation", "bob", "tenant:bob", "private"),
+        ("alice synthesized observation", "alice", "channel:alice", "tenant:alice", "private"),
+        ("bob synthesized observation", "bob", "channel:bob", "tenant:bob", "private"),
     }
 
 

@@ -3269,10 +3269,12 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
     # Regression guard: without a registered callable, _install_callable is
     # never reached and this test cannot detect its historical second read.
     sched.register_callable("maintenance", callable_noop, "0 9 * * *")
+    sched._scheduler.add_job(lambda: None, "date", id="scheduler:stale")
 
     loop_thread = threading.get_ident()
     io_threads: list[int] = []
-    mutate_threads: list[int] = []
+    add_threads: list[int] = []
+    removals: list[tuple[str, int]] = []
 
     real_load = sched_mod.load_jobs
 
@@ -3284,17 +3286,26 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
     real_add = sched._scheduler.add_job
 
     def spy_add(*a, **k):
-        mutate_threads.append(threading.get_ident())
+        add_threads.append(threading.get_ident())
         return real_add(*a, **k)
     monkeypatch.setattr(sched._scheduler, "add_job", spy_add)
+
+    real_remove = sched._scheduler.remove_job
+
+    def spy_remove(*a, **k):
+        job_id = a[0] if a else k["job_id"]
+        removals.append((job_id, threading.get_ident()))
+        return real_remove(*a, **k)
+    monkeypatch.setattr(sched._scheduler, "remove_job", spy_remove)
 
     await sched._reload_async()
 
     assert len(io_threads) == 1, "reload must parse scheduler.yaml exactly once"
     assert all(t != loop_thread for t in io_threads), \
         "yaml read ran on the loop thread (should be in to_thread)"
-    assert mutate_threads, "no APScheduler mutation happened"
-    assert all(t == loop_thread for t in mutate_threads), \
+    assert add_threads, "no APScheduler addition happened"
+    assert "scheduler:stale" in {job_id for job_id, _ in removals}
+    assert all(t == loop_thread for t in add_threads + [t for _, t in removals]), \
         "APScheduler mutation ran off the loop thread"
 
 

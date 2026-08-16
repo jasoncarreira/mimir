@@ -623,12 +623,17 @@ def test_backgrounded_grandchild_does_not_block_waiter(tmp_path: Path, monkeypat
     leaked the job + its drainer threads + pipe FDs)."""
     monkeypatch.setattr("mimir.shell_jobs.DRAIN_JOIN_TIMEOUT_SECONDS", 0.5)
     registry = _make_registry(tmp_path)
+    waiter_done = threading.Event()
     # Parent exits 0 immediately but backgrounds a sleeper that inherits the
     # pipe, so the drainers can't EOF on the parent's exit.
-    job = registry.spawn("bg", argv=["sh", "-c", "sleep 3 & exit 0"])
+    job = registry.spawn(
+        "bg",
+        argv=["sh", "-c", "sleep 3 & exit 0"],
+        on_complete=lambda _job: waiter_done.set(),
+    )
     # Pre-fix the waiter would block ~3s on the unbounded drainer join; the fix
     # marks it finished within the 0.5s bounded window + pipe close.
-    _wait_until_done(registry, job.job_id, timeout=2.5)
+    assert waiter_done.wait(timeout=2.5), "waiter remained blocked by grandchild pipes"
     assert job.exit_code == 0
 
 

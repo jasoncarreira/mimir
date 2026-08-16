@@ -4802,7 +4802,7 @@ def test_overrides_invalid_cron_keeps_manifest_cron(tmp_path: Path, caplog):
         {"name": "p", "command": "echo", "cron": "0 * * * *"},
     ])
     ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
-        "p:\n  cron: 'not a cron'\n  priority: high\n"
+        "p:\n  cron: '61 * * * *'\n  priority: high\n"
     ))
     with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
         [p] = discover_pollers(skills, overrides_path=ov)

@@ -679,10 +679,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
-async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
-    """chainlink #232: Socket Mode is documented to redeliver events on
-    ACK loss. The bridge must enqueue exactly once for the same ts,
-    no matter how many times Slack redelivers."""
+async def test_on_message_dedupes_completed_socket_mode_redelivery(bridge_with_fake_app):
+    """Completed Slack messages are cached against later redelivery."""
     bridge, enqueued, _ = bridge_with_fake_app
 
     async def yielding_user_info(user_id: str):
