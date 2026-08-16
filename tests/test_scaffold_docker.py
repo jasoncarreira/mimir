@@ -804,7 +804,8 @@ def test_scaffold_appends_compose_env_to_gitignore(home_with_two_skills: Path):
     home = home_with_two_skills
     scaffold(home)
     gi = (home / ".gitignore").read_text()
-    assert "compose.env" in gi
+    assert "compose.env\n" in gi
+    assert "compose.env.bak.*\n" in gi
     assert "mimir-scaffold-docker" in gi  # sentinel comment
 
 

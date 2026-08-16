@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.models import AgentEvent
+from mimir.turn_event_redaction import MAX_LIVE_STRING_CHARS
 
 
 def _drain(queue: "asyncio.Queue[dict]") -> list[dict]:
@@ -89,6 +90,22 @@ def test_publish_scrubs_tool_args_results_and_text_at_bus_boundary():
     assert event["args"]["password"] == "[redacted]"
     assert "[redacted]" in serialized
     assert "[path]" in serialized
+
+
+def test_publish_caps_pathological_single_line_arg_before_live_delivery():
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    payload = "a1-" * 200_000
+
+    bus.publish({
+        "type": "tool_call",
+        "phase": "chunk",
+        "channel_id": "web-default",
+        "args_delta": payload,
+    })
+
+    [event] = _drain(q)
+    assert event["args_delta"] == payload[:MAX_LIVE_STRING_CHARS]
 
 
 def test_emitter_noop_when_bus_none():

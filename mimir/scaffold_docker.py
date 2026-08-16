@@ -989,15 +989,16 @@ def _ensure_compose_env_gitignored(home: Path) -> bool:
     Returns True if the file was modified.
     """
     gi = home / ".gitignore"
-    sentinel = "# mimir-scaffold-docker: NEVER track compose.env (contains secrets)"
+    sentinel = "# mimir-scaffold-docker: NEVER track compose.env or rotation backups (contain secrets)"
+    entries = "compose.env\ncompose.env.bak.*\n"
     if gi.is_file():
         existing = gi.read_text()
-        if sentinel in existing or "\ncompose.env\n" in existing or existing.startswith("compose.env\n"):
+        if sentinel in existing:
             return False
-        new = existing.rstrip() + f"\n\n{sentinel}\ncompose.env\n"
+        new = existing.rstrip() + f"\n\n{sentinel}\n{entries}"
         gi.write_text(new)
     else:
-        gi.write_text(f"{sentinel}\ncompose.env\n")
+        gi.write_text(f"{sentinel}\n{entries}")
     return True
 
 
