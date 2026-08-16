@@ -1820,13 +1820,6 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
-                # The shell may already have exited after spawning a child, so
-                # proc.wait() can complete without yielding. Let inherited pipe
-                # holders observe SIGKILL and close their descriptors before
-                # run_poller returns; keep the wait bounded for cleanup safety.
-                _, pending = await asyncio.wait(
-                    pending, timeout=POLLER_EXIT_GRACE_SECONDS,
-                )
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
