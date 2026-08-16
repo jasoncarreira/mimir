@@ -165,6 +165,59 @@ def test_discover_treats_null_string_fields_as_missing(tmp_path: Path):
     assert pollers[0].deliver is None
 
 
+def test_discover_rejects_unsafe_names_before_state_creation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    state_root = tmp_path / "state" / "pollers"
+    absolute_target = tmp_path / "absolute-target"
+    names = [
+        "nested/name", "nested\\name", "../outside", ".", "..", str(absolute_target),
+    ]
+    manifests = []
+    for index, name in enumerate(names):
+        skill_dir = skills / f"bad-{index}"
+        _write_pollers_json(skill_dir, [
+            {"name": name, "command": "true", "cron": "* * * * *"},
+        ])
+        manifests.append(skill_dir / "pollers.json")
+
+    assert discover_pollers(skills, state_root=state_root) == []
+
+    assert not state_root.exists()
+    assert not (tmp_path / "outside").exists()
+    assert not absolute_target.exists()
+    messages = [record.getMessage() for record in caplog.records]
+    for manifest, name in zip(manifests, names, strict=True):
+        assert any(
+            "poller_invalid_name" in message
+            and str(manifest) in message
+            and repr(name) in message
+            for message in messages
+        )
+
+
+def test_discover_rejects_resolved_persist_dir_escape(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "demo", [
+        {"name": "demo", "command": "true", "cron": "* * * * *"},
+    ])
+    state_root = tmp_path / "state" / "pollers"
+    outside = tmp_path / "outside"
+    state_root.mkdir(parents=True)
+    outside.mkdir()
+    (state_root / "demo").symlink_to(outside, target_is_directory=True)
+
+    assert discover_pollers(skills, state_root=state_root) == []
+    assert any(
+        "poller_persist_dir_rejected" in record.getMessage()
+        and "name='demo'" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def _authority(**updates: object) -> dict:
     value = {
         "profile": "research",
@@ -174,6 +227,68 @@ def _authority(**updates: object) -> dict:
     }
     value.update(updates)
     return value
+
+
+def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) -> None:
+    state_root = tmp_path / "state" / "pollers"
+    outside = tmp_path / "outside"
+    state_root.mkdir(parents=True)
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="scoped root 'state' escapes allowed base"):
+        _parse_poller_authority(
+            _authority(),
+            name="demo",
+            persist_dir=outside,
+            state_root=state_root,
+            manifest_path=tmp_path / "skills" / "demo" / "pollers.json",
+        )
+
+
+def test_valid_state_poller_creates_and_grants_only_its_instance_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    skills = tmp_path / "skills"
+    state_root = tmp_path / "state" / "pollers"
+    _write_pollers_json(skills / "demo", [
+        {
+            "name": "demo",
+            "command": "true",
+            "cron": "* * * * *",
+            "authority": _authority(capabilities=["write_file"]),
+        },
+    ])
+
+    [poller] = discover_pollers(skills, state_root=state_root)
+
+    expected = (state_root / "demo").resolve()
+    assert poller.persist_dir == expected
+    assert expected.is_dir()
+    policy = poller.authority.sink_policy_for("write_file")
+    assert policy is not None
+    assert policy.adapter == "trigger_service_write_roots"
+    granted_roots = [Path(root) for root in json.loads(policy.destination)]
+    assert granted_roots == [expected]
+
+
+def test_reserved_github_activity_name_requires_github_poller_skill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    manifest = skills / "arbitrary" / "pollers.json"
+    _write_pollers_json(manifest.parent, [
+        {"name": "github-activity", "command": "true", "cron": "* * * * *"},
+    ])
+
+    assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
+    assert any(
+        "poller_invalid_name" in record.getMessage()
+        and str(manifest) in record.getMessage()
+        and "name='github-activity'" in record.getMessage()
+        and "reserved poller name" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_research_profile_has_bounded_shell_and_append_credit_authority() -> None:
@@ -301,7 +416,7 @@ def test_github_profile_allows_only_its_bounded_fetch_capability(
         name="github-activity",
         persist_dir=persist_dir,
         state_root=tmp_path,
-        manifest_path=tmp_path / "pollers.json",
+        manifest_path=tmp_path / "github-poller" / "pollers.json",
     )
 
     assert authority.sink_policy_for("fetch_url") == access_control.ServiceSinkPolicy(
@@ -349,13 +464,14 @@ def test_shipped_poller_shell_authorities_have_job_inspection_companions(
                     declaration["script"] = str(
                         installed / "scripts" / Path(declaration["script"]).name
                     )
-            persist_dir = tmp_path / entry["name"]
-            persist_dir.mkdir()
+            state_root = tmp_path / "state" / "pollers"
+            persist_dir = state_root / entry["name"]
+            persist_dir.mkdir(parents=True)
             principal = _parse_poller_authority(
                 entry["authority"],
                 name=entry["name"],
                 persist_dir=persist_dir,
-                state_root=tmp_path / "state" / "pollers",
+                state_root=state_root,
                 manifest_path=installed_manifest,
             )
             capabilities = set(principal.capabilities)
@@ -2373,6 +2489,24 @@ time.sleep(120)
 
 
 
+def _live_process_group_members(process_group: int) -> list[int]:
+    """PIDs still alive in ``process_group``, excluding zombies.
+
+    Fields after the parenthesized command begin with state, parent PID, and
+    process-group ID. Zombies are already dead and may await PID 1.
+    """
+    members: list[int] = []
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            stat_text = stat_path.read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        fields = stat_text[stat_text.rfind(")") + 2:].split()
+        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == process_group:
+            members.append(int(stat_path.parent.name))
+    return members
+
+
 @pytest.mark.asyncio
 async def test_run_poller_timeout_kills_child_holding_pipes(
     tmp_path: Path, home: Path,
@@ -2421,22 +2555,22 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 
     child_pgid = int((skill_dir / "child.pgid").read_text())
 
-    live_group_members: list[int] = []
-    for _ in range(100):
-        live_group_members = []
-        for stat_path in Path("/proc").glob("[0-9]*/stat"):
-            try:
-                stat_text = stat_path.read_text()
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            # Fields after the parenthesized command begin with state, parent PID,
-            # and process-group ID. Zombies are already dead and may await PID 1.
-            fields = stat_text[stat_text.rfind(")") + 2:].split()
-            if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == child_pgid:
-                live_group_members.append(int(stat_path.parent.name))
-        if not live_group_members:
+    # Poll rather than sampling once. ``run_poller`` returns after killing the
+    # group, but ``proc.wait()`` reaps only the direct child — a descendant
+    # killed microseconds earlier is neither gone nor yet a zombie, so a single
+    # scan races the kernel. On an idle runner the window closes before the
+    # scan; under load (a build sandbox sharing a box with other builds) it does
+    # not, and this assertion failed spuriously — which sent eight Worklink
+    # executors editing ``mimir/pollers.py`` to satisfy it (chainlink #1258).
+    #
+    # This still asserts the teardown property: a group that genuinely retains a
+    # live member stays non-empty until the deadline expires and then fails.
+    deadline = time.monotonic() + 5.0
+    while True:
+        live_group_members = _live_process_group_members(child_pgid)
+        if not live_group_members or time.monotonic() >= deadline:
             break
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
 
     assert live_group_members == []
 

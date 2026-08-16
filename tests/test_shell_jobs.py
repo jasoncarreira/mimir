@@ -5,6 +5,7 @@ drop ``channel_name`` (mimir uses just ``channel_id``)."""
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -53,6 +54,107 @@ def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
     assert result["exit_code"] == 0
     assert "out" in result["stdout_tail"]
     assert "err" in result["stderr_tail"]
+    assert result["output_truncated"] is False
+    assert result["truncated_streams"] == []
+
+
+def test_output_write_failure_keeps_draining_and_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    real_open = Path.open
+    failed_writes: list[int] = []
+
+    class FailSecondWrite:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.writes = 0
+
+        def write(self, data):
+            self.writes += 1
+            if self.writes == 2:
+                failed_writes.append(len(data))
+                raise OSError(28, "No space left on device")
+            return self.wrapped.write(data)
+
+        def flush(self):
+            return self.wrapped.flush()
+
+        def close(self):
+            return self.wrapped.close()
+
+    def failing_open(path: Path, mode: str = "r", *args, **kwargs):
+        opened = real_open(path, mode, *args, **kwargs)
+        if mode == "wb" and path.suffix == ".out":
+            return FailSecondWrite(opened)
+        return opened
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr("mimir.shell_jobs.MAX_LIVE_SHELL_JOBS", 1)
+    registry = _make_registry(tmp_path)
+    completed = threading.Event()
+    job = registry.spawn(
+        "large producer",
+        argv=[
+            sys.executable,
+            "-c",
+            "import os; [os.write(1, b'x' * 4096) for _ in range(64)]",
+        ],
+        on_complete=lambda _job: completed.set(),
+    )
+
+    assert completed.wait(timeout=30), "write failure wedged the child"
+    assert failed_writes, "the injected write failure did not execute"
+    assert job.exit_code == 0
+    assert job._process is not None and job._process.poll() == 0
+    result = registry.read_output(job.job_id, stream="stdout")
+    assert result["output_truncated"] is True
+    assert result["truncated_streams"] == ["stdout"]
+    assert result["stdout_tail"].startswith("[shell job output incomplete;")
+
+    # Completion releases the sole live-job slot and makes the record evictable.
+    next_job = registry.spawn("true", argv=[sys.executable, "-c", "pass"])
+    _wait_until_done(registry, next_job.job_id)
+    job.finished_at = time.time() - EVICT_AFTER_SECONDS
+    assert registry._evict_stale()[0].job_id == job.job_id
+
+
+def test_output_write_bound_discards_excess_without_wedging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    limit = 8192
+    monkeypatch.setattr(
+        "mimir.shell_jobs.SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM", limit,
+    )
+    registry = _make_registry(tmp_path)
+    completed = threading.Event()
+    job = registry.spawn(
+        "bounded producer",
+        argv=[
+            sys.executable,
+            "-c",
+            "import os; "
+            "[(os.write(1, b'y' * 4096), os.write(2, b'z' * 4096)) "
+            "for _ in range(64)]",
+        ],
+        on_complete=lambda _job: completed.set(),
+    )
+
+    assert completed.wait(timeout=30), "output cap wedged the child"
+    assert job.exit_code == 0
+    assert job.stdout_path.stat().st_size == limit
+    assert job.stderr_path.stat().st_size == limit
+    assert (
+        job.stdout_path.stat().st_size + job.stderr_path.stat().st_size
+        == 2 * limit
+    )
+    result = registry.read_output(job.job_id, stream="both")
+    assert result["output_truncated"] is True
+    assert result["truncated_streams"] == ["stdout", "stderr"]
+    warning = (
+        "[shell job output incomplete; capture truncated for stdout, stderr]"
+    )
+    assert warning in result["stdout_tail"]
+    assert warning in result["stderr_tail"]
 
 
 def test_nonzero_exit_marked_exited_error(tmp_path: Path):

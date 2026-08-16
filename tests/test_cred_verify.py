@@ -219,8 +219,11 @@ def test_not_implemented_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
     result = verify("FUTURE_BRIDGE_TOKEN")
     assert not result.ok
+    assert result.skipped
     assert "not_implemented" in result.detail
     assert "Type B" in result.detail
+    assert "SKIP" in result.render()
+    assert run_verify_cred_cmd("FUTURE_BRIDGE_TOKEN") == 0
 
 
 def test_python_probe_loads_skill_local_script(
