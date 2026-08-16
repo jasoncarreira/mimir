@@ -774,6 +774,36 @@ async def test_live_connection_bounds_active_inbound_runners() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_stop_is_bounded_when_queue_drain_stalls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = sdk.BoundedMessageQueue()
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    dispatcher = sdk.BoundedMessageDispatcher(
+        queue,
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        lambda message: message,
+        lambda message: message,
+    )
+    stalled = asyncio.create_task(asyncio.Event().wait())
+    dispatcher._task = stalled
+    await queue.publish(RpcTask(RpcTaskKind.REQUEST, {"method": "stalled"}))
+    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(dispatcher.stop(), 0.1)
+
+    assert stalled.cancelled()
+    assert queue._queue.qsize() == 2
+    assert dispatcher._task is None
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_stop_drains_buffered_requests_before_shutdown() -> None:
     transport = MemoryTransport()
     gate = asyncio.Event()
@@ -820,6 +850,182 @@ async def test_dispatcher_stop_drains_buffered_requests_before_shutdown() -> Non
     responses = [await transport.outgoing.get() for _ in range(3)]
     assert sorted(response["id"] for response in responses) == [0, 1, 2]
     assert queue._queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stop_timeout_cancels_active_runners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def request_runner(message: dict[str, Any]) -> dict[str, Any]:
+        del message
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return {}
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    queue = sdk.BoundedMessageQueue()
+    dispatcher = sdk.BoundedMessageDispatcher(
+        queue,
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        request_runner,
+        lambda message: message,
+    )
+    dispatcher.start()
+    await queue.publish(RpcTask(
+        RpcTaskKind.REQUEST,
+        {"jsonrpc": "2.0", "id": 1, "method": "blocked", "params": {}},
+    ))
+    await started.wait()
+    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(dispatcher.stop(), 0.1)
+
+    assert cancelled.is_set()
+    assert not dispatcher._runner_tasks
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stop_cancellation_waits_for_bounded_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def request_runner(message: dict[str, Any]) -> dict[str, Any]:
+        del message
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return {}
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    queue = sdk.BoundedMessageQueue()
+    dispatcher = sdk.BoundedMessageDispatcher(
+        queue,
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        request_runner,
+        lambda message: message,
+    )
+    dispatcher.start()
+    await queue.publish(RpcTask(
+        RpcTaskKind.REQUEST,
+        {"jsonrpc": "2.0", "id": 1, "method": "blocked", "params": {}},
+    ))
+    await started.wait()
+    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
+
+    stopping = asyncio.create_task(dispatcher.stop())
+    await asyncio.sleep(0)
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    assert cancelled.is_set()
+    assert dispatcher._task is None
+    assert not dispatcher._runner_tasks
+
+
+@pytest.mark.asyncio
+async def test_authentication_waiters_do_not_consume_runner_slots() -> None:
+    gate = asyncio.Event()
+    started: list[str] = []
+
+    async def request_runner(message: dict[str, Any]) -> dict[str, Any]:
+        method = message["method"]
+        started.append(method)
+        if method == "authenticate":
+            await gate.wait()
+        return {}
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    dispatcher = sdk.BoundedMessageDispatcher(
+        sdk.BoundedMessageQueue(),
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        request_runner,
+        lambda message: message,
+        max_active=1,
+    )
+    authentication = asyncio.create_task(dispatcher._dispatch_request({
+        "jsonrpc": "2.0", "id": 1, "method": "authenticate", "params": {},
+    }))
+    while started != ["authenticate"]:
+        await asyncio.sleep(0)
+    waiter = asyncio.create_task(dispatcher._dispatch_request({
+        "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {},
+    }))
+    await asyncio.sleep(0)
+
+    assert started == ["authenticate"]
+    assert dispatcher._runner_slots.locked()
+    gate.set()
+    await asyncio.wait_for(authentication, 1)
+    await asyncio.wait_for(waiter, 1)
+
+
+@pytest.mark.asyncio
+async def test_second_authentication_waits_for_first_without_runner_slot() -> None:
+    first_gate = asyncio.Event()
+    started: list[int] = []
+
+    async def request_runner(message: dict[str, Any]) -> dict[str, Any]:
+        started.append(message["id"])
+        if message["id"] == 1:
+            await first_gate.wait()
+        return {}
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    dispatcher = sdk.BoundedMessageDispatcher(
+        sdk.BoundedMessageQueue(),
+        Supervisor(),
+        sdk.StrictMessageStateStore(),
+        request_runner,
+        lambda message: message,
+        max_active=1,
+    )
+    first = asyncio.create_task(dispatcher._dispatch_request({
+        "jsonrpc": "2.0", "id": 1, "method": "authenticate", "params": {},
+    }))
+    while started != [1]:
+        await asyncio.sleep(0)
+    second = asyncio.create_task(dispatcher._dispatch_request({
+        "jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {},
+    }))
+    await asyncio.sleep(0)
+
+    assert started == [1]
+    assert dispatcher._runner_slots.locked()
+    first_gate.set()
+    await asyncio.wait_for(first, 1)
+    await asyncio.wait_for(second, 1)
+    while started != [1, 2]:
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -1176,19 +1382,19 @@ async def test_runner_closes_and_generation_teardown_is_exception_safe(
             await sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
         assert str(exc_info.value) == expected_primary
     generation = 0 if failure in {"connect", "connect_close"} else 37
-    assert events == [("connect", None), ("transport_closed", generation), ("close", None)]
+    assert events == [("connect", None), ("close", None), ("transport_closed", generation)]
     assert instances[0].closed is True
     assert agent.closed_generations == [generation]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("main_loop_error", [None, RuntimeError("receive failed")])
-async def test_runner_marks_peer_dead_before_draining_queued_handlers(
+async def test_runner_drains_queued_handlers_before_marking_peer_dead(
     monkeypatch: pytest.MonkeyPatch, main_loop_error: RuntimeError | None
 ) -> None:
     instances: list[Any] = []
     handler_tasks: list[asyncio.Task[Any]] = []
-    rejected = asyncio.Event()
+    handled = asyncio.Event()
     callback_done = asyncio.Event()
 
     class OwnedConnection:
@@ -1203,8 +1409,6 @@ async def test_runner_marks_peer_dead_before_draining_queued_handlers(
 
             async def handle() -> None:
                 try:
-                    while not agent.peer.closed:
-                        await asyncio.sleep(0)
                     await self.route("queued/request", {}, False)
                 finally:
                     self.queue.task_done()
@@ -1228,15 +1432,15 @@ async def test_runner_marks_peer_dead_before_draining_queued_handlers(
         async def on_transport_closed(self, generation: int) -> None:
             assert generation == 41
             assert self.peer.closed is True
+            assert handled.is_set()
             callback_done.set()
 
     agent = OwnedAgent()
 
     async def route(method: str, params: Any, is_notification: bool) -> Any:
         assert method == "queued/request"
-        with pytest.raises(ConnectionError, match="Connection closed"):
-            await agent.peer.start_request("session/prompt", {})
-        rejected.set()
+        assert agent.peer.closed is False
+        handled.set()
         return None
 
     monkeypatch.setattr(sdk, "Connection", OwnedConnection)
@@ -1257,7 +1461,7 @@ async def test_runner_marks_peer_dead_before_draining_queued_handlers(
             )
         assert exc_info.value is main_loop_error
 
-    assert rejected.is_set()
+    assert handled.is_set()
     assert callback_done.is_set()
     assert instances[0].closed is True
     assert handler_tasks and all(task.done() and not task.cancelled() for task in handler_tasks)
@@ -1340,6 +1544,34 @@ async def test_mcp_handle_cancel_notification_uses_exact_outer_id_and_retains_co
     assert next_request["id"] == next_handle.outer_id == 1
     await transport.incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
     assert await next_handle.task == {"tools": []}
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_message_mcp_cancellation_quarantines_late_reply() -> None:
+    transport = MemoryTransport()
+    state = sdk.StrictMessageStateStore()
+    connection = sdk.Connection(lambda *_: asyncio.sleep(0), transport, state_store=state)
+    peer = sdk.AcpPeer(connection, ContractAgent(), state)
+    peer._active_connections.add("connection")
+
+    request_task = asyncio.create_task(
+        peer.message_mcp("connection", "tools/call", {"name": "read", "arguments": {}})
+    )
+    emitted = await transport.outgoing.get()
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": emitted["id"], "result": {"content": []}}
+    )
+    next_task = asyncio.create_task(peer.message_mcp("connection", "tools/list", {}))
+    next_request = await transport.outgoing.get()
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": next_request["id"], "result": {"tools": []}}
+    )
+    assert await next_task == {"tools": []}
     await connection.close()
 
 
@@ -1614,6 +1846,21 @@ async def test_pending_request_limit_admits_exact_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_abandoned_request_tombstones_share_pending_limit() -> None:
+    store = sdk.StrictMessageStateStore()
+    for request_id in range(sdk.MAX_PENDING_REQUESTS):
+        store.register_outgoing(request_id, "method")
+        store.abandon_outgoing(request_id)
+    with pytest.raises(sdk.AcpProtocolError, match="Too many pending"):
+        store.register_outgoing(sdk.MAX_PENDING_REQUESTS, "method")
+
+    store.resolve_outgoing(0, {"late": True})
+    future = store.register_outgoing(sdk.MAX_PENDING_REQUESTS, "method")
+    store.resolve_outgoing(sdk.MAX_PENDING_REQUESTS, {"ok": True})
+    assert await future == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_input_queue_item_limit_times_out_only_after_exact_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1648,46 +1895,20 @@ async def test_input_queue_byte_limit_admits_exact_boundary(
     assert queue.pending_bytes == 0
 
 
-class ControlledWaitFor:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.decision = asyncio.Event()
-        self.expire = False
-        self.calls = 0
-
-    async def __call__(self, awaitable, timeout):
-        self.calls += 1
-        if self.calls > 1:
-            return await awaitable
-        task = asyncio.ensure_future(awaitable)
-        self.started.set()
-        await self.decision.wait()
-        if self.expire:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise asyncio.TimeoutError
-        return await task
-
-
 @pytest.mark.asyncio
-async def test_input_queue_capacity_release_wins_before_controlled_expiry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    timeout = ControlledWaitFor()
+async def test_input_queue_capacity_release_admits_waiting_publisher() -> None:
     queue = sdk.BoundedMessageQueue()
     for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
         await queue.publish(SimpleNamespace(message={"index": index}))
-    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
 
     waiting = asyncio.create_task(
         queue.publish(SimpleNamespace(message={"index": "waiting"}))
     )
-    await timeout.started.wait()
+    await asyncio.sleep(0)
     assert waiting.done() is False
     await queue._queue.get()
     queue.task_done()
-    timeout.decision.set()
-    await waiting
+    await asyncio.wait_for(waiting, 1)
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
 
     while not queue._queue.empty():
@@ -1696,28 +1917,48 @@ async def test_input_queue_capacity_release_wins_before_controlled_expiry(
 
 
 @pytest.mark.asyncio
-async def test_input_queue_controlled_expiry_wins_before_capacity_release(
+async def test_input_queue_expiry_leaves_capacity_and_bytes_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timeout = ControlledWaitFor()
     queue = sdk.BoundedMessageQueue()
     for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
         await queue.publish(SimpleNamespace(message={"index": index}))
-    monkeypatch.setattr(sdk.asyncio, "wait_for", timeout)
+    before_bytes = queue.pending_bytes
+    monkeypatch.setattr(sdk, "INPUT_QUEUE_DRAIN_TIMEOUT", 0.01)
 
-    waiting = asyncio.create_task(
-        queue.publish(SimpleNamespace(message={"index": "waiting"}))
-    )
-    await timeout.started.wait()
-    assert waiting.done() is False
-    timeout.expire = True
-    timeout.decision.set()
     with pytest.raises(sdk.AcpProtocolError, match="drain timed out"):
-        await waiting
+        await queue.publish(SimpleNamespace(message={"index": "waiting"}))
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
+    assert queue.pending_bytes == before_bytes
 
-    await queue._queue.get()
-    queue.task_done()
     while not queue._queue.empty():
         await queue._queue.get()
         queue.task_done()
+
+
+@pytest.mark.asyncio
+async def test_input_queue_close_rejects_blocked_publisher_without_tail_item() -> None:
+    queue = sdk.BoundedMessageQueue()
+    for index in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        await queue.publish(SimpleNamespace(message={"index": index}))
+    waiting = asyncio.create_task(
+        queue.publish(SimpleNamespace(message={"index": "waiting"}))
+    )
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(queue.close())
+    await asyncio.sleep(0)
+
+    for _ in range(sdk.INPUT_QUEUE_MAX_ITEMS):
+        item = await queue._queue.get()
+        assert item is not None
+        queue.task_done()
+    await closing
+    with pytest.raises(RuntimeError, match="already closed"):
+        await waiting
+    sentinel = await queue._queue.get()
+    assert sentinel is None
+    queue.task_done()
+
+    assert queue._queue.empty()
+    assert queue.pending_bytes == 0
+    await asyncio.wait_for(queue.join(), 1)
