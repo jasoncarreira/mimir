@@ -278,6 +278,32 @@ async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails() -
     assert tools == []
 
 
+@pytest.mark.asyncio
+async def test_start_mcp_servers_emits_operator_event_for_skipped_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(return_value=[])
+    manager.startup_failures = [{
+        "server_config_id": "broken-id",
+        "server_name": "broken",
+        "error": "binary not found",
+    }]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", capture)
+    returned_manager, tools = await _start_mcp_servers(
+        manager, [SimpleNamespace(policy_version="")]
+    )
+
+    assert returned_manager is manager
+    assert tools == []
+    assert events == [("mcp_server_start_failed", manager.startup_failures[0])]
+
+
 def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
     from types import SimpleNamespace
 
@@ -2124,6 +2150,22 @@ class TestHandleEvent:
             resp = await client.post("/event", json={})
             body = await resp.json()
         assert "channel_id" in body.get("error", "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", [["web-x"], 123])
+    async def test_non_string_channel_id_returns_400_before_enqueue(
+        self, channel_id: Any
+    ) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event", json={"channel_id": channel_id, "content": "hi"}
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"] == "channel_id must be a string"
+        stub.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_dict_extra_returns_400(self) -> None:
