@@ -429,23 +429,37 @@ async function loadSearch(q) {
   searchResults.innerHTML = '<div class="tree-loading">Searching...</div>';
   try {
     const data = await authedFetch("/api/memory?view=search&q=" + encodeURIComponent(q));
-    let html = '<div class="search-results-header">'
-      + esc(String(data.total)) + " result(s)"
-      + (data.truncated ? " (truncated)" : "")
-      + "</div>";
+    searchResults.innerHTML = "";
+
+    const header = document.createElement("div");
+    header.className = "search-results-header";
+    header.textContent = String(data.total) + " result(s)" + (data.truncated ? " (truncated)" : "");
+    searchResults.appendChild(header);
+
     if (!data.hits || !data.hits.length) {
-      html += '<div class="tree-loading">No results.</div>';
+      const empty = document.createElement("div");
+      empty.className = "tree-loading";
+      empty.textContent = "No results.";
+      searchResults.appendChild(empty);
     } else {
       for (const hit of data.hits) {
-        html += '<div class="search-hit" data-path="' + esc(hit.path) + '">';
-        html += '<div class="search-hit-path">' + esc(hit.path) + ":" + esc(String(hit.line_no)) + "</div>";
-        html += '<div class="search-hit-snippet">' + esc(hit.snippet) + "</div>";
-        html += "</div>";
+        const hitEl = document.createElement("div");
+        hitEl.className = "search-hit";
+        hitEl.dataset.path = hit.path;
+
+        const pathEl = document.createElement("div");
+        pathEl.className = "search-hit-path";
+        pathEl.textContent = hit.path + ":" + String(hit.line_no);
+
+        const snippetEl = document.createElement("div");
+        snippetEl.className = "search-hit-snippet";
+        snippetEl.textContent = hit.snippet;
+
+        hitEl.appendChild(pathEl);
+        hitEl.appendChild(snippetEl);
+        hitEl.addEventListener("click", () => loadFile(hitEl.dataset.path, null));
+        searchResults.appendChild(hitEl);
       }
-    }
-    searchResults.innerHTML = html;
-    for (const el of searchResults.querySelectorAll(".search-hit")) {
-      el.addEventListener("click", () => loadFile(el.dataset.path, null));
     }
   } catch (e) {
     searchResults.innerHTML = '<div class="error-msg">Search failed: ' + esc(String(e)) + "</div>";
