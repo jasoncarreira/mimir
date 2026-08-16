@@ -141,7 +141,7 @@ def spec(
 
 
 @pytest.mark.asyncio
-async def test_enabled_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
+async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     checkout = tmp_path / "checkouts" / ("a" * 64) / "1-1" / "checkout"
@@ -189,6 +189,12 @@ def test_fd_anchored_opencode_argv_passes_through_non_checkout_commands() -> Non
     command = ("python", "-c", "print('ok')")
 
     assert compute._fd_anchored_opencode_argv(command, checkout) == command
+
+
+def test_fd_anchored_opencode_argv_accepts_relative_issued_checkout() -> None:
+    command = ("opencode", "run", "--dir", ".", "--", "prompt")
+
+    assert compute._fd_anchored_opencode_argv(command, Path("/authorized")) == command
 
 
 def test_fd_anchored_opencode_argv_rejects_a_different_checkout() -> None:
