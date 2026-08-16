@@ -257,7 +257,7 @@ async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
 
     agent._config.access_control_enforced = True
     prompt, _ = await agent._build_turn_prompt(
-        _make_ctx(event), event, None, None, initial_auth_context=auth,
+        _make_ctx(event), event, None, initial_auth_context=auth,
     )
     assert "## Autonomous trigger authority" in prompt
     assert "profile: ``heartbeat``" in prompt
@@ -265,7 +265,7 @@ async def test_heartbeat_authority_guidance_renders_only_under_enforcement(
 
     agent._config.access_control_enforced = False
     shadow_prompt, _ = await agent._build_turn_prompt(
-        _make_ctx(event), event, None, None, initial_auth_context=auth,
+        _make_ctx(event), event, None, initial_auth_context=auth,
     )
     assert "## Autonomous trigger authority" not in shadow_prompt
 
@@ -307,7 +307,7 @@ async def test_poller_authority_guidance_matches_granted_capabilities(
     )
 
     prompt, _ = await agent._build_turn_prompt(
-        _make_ctx(event), event, None, None, initial_auth_context=auth,
+        _make_ctx(event), event, None, initial_auth_context=auth,
     )
 
     assert "profile: ``github``; tier ``code-execution``" in prompt
@@ -337,7 +337,7 @@ async def test_build_turn_prompt_emits_labeled_sections(tmp_path: Path) -> None:
     )
     ctx = _make_ctx(event)
     turn_prompt, recent = await agent._build_turn_prompt(
-        ctx, event, saga_block=None, subagent_block=None,
+        ctx, event, saga_block=None,
     )
     # The user-side body is in the prompt (proof we wired through
     # build_turn_prompt rather than echoing event.content alone).
@@ -354,11 +354,11 @@ async def test_build_turn_prompt_emits_labeled_sections(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_turn_prompt_surfaces_saga_and_subagent_blocks(
+async def test_build_turn_prompt_surfaces_saga_block(
     tmp_path: Path,
 ) -> None:
-    """When the pre-message SAGA hook + subagent inbox supply
-    blocks, they appear in the prompt under their canonical labels.
+    """When the pre-message SAGA hook supplies a block, it appears in
+    the prompt under its canonical label.
     Verifies the wiring from ``_run_turn_body`` → ``_build_turn_prompt``
     actually threads those args through (181-H regression: pre-fix
     they were discarded and only ``event.content`` made it through).
@@ -373,12 +373,10 @@ async def test_build_turn_prompt_surfaces_saga_and_subagent_blocks(
     turn_prompt, _ = await agent._build_turn_prompt(
         ctx, event,
         saga_block="- atom-foo: prior fact",
-        subagent_block="- [completed] task_id=t1 — climber",
     )
     assert "## Possibly relevant memories (from SAGA)" in turn_prompt
     assert "atom-foo: prior fact" in turn_prompt
-    assert "## Subagent updates" in turn_prompt
-    assert "task_id=t1" in turn_prompt
+    assert "## Subagent updates" not in turn_prompt
 
 
 # ─── Synthesis branch ───────────────────────────────────────────────
@@ -401,7 +399,7 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
     )
     ctx = _make_ctx(event, saga_session_id="sess-xyz")
     turn_prompt, recent = await agent._build_turn_prompt(
-        ctx, event, saga_block=None, subagent_block=None,
+        ctx, event, saga_block=None,
     )
     # The synthesis template carries the session id verbatim
     # (placeholder ``{saga_session_id}`` is filled by render).
@@ -521,7 +519,6 @@ _OPTIONAL_BLOCK_LABELS = (
     "Self-state",
     "Recent activity",
     "Possibly relevant memories (from SAGA)",
-    "Subagent updates",
 )
 
 
@@ -602,7 +599,6 @@ def test_build_turn_prompt_function_emits_all_blocks_when_supplied() -> None:
         event,
         recent_messages=recent,
         saga_block="- atom-x: saga-fact",
-        subagent_block="- t1 [completed]",
         recent_message_chars=200,
         resolver=resolver_obj,
         feedback_block="recent feedback ledger",
@@ -628,6 +624,10 @@ def test_build_turn_prompt_function_emits_all_blocks_when_supplied() -> None:
             f"mimir/prompts.py:build_turn_prompt for a missing "
             f"_add_labeled(\"{label}\", ...) call."
         )
+
+    import inspect
+
+    assert "subagent_block" not in inspect.signature(build_turn_prompt).parameters
 
 
 def test_build_turn_prompt_directs_scratch_to_server_supplied_turn_path() -> None:
@@ -764,7 +764,6 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
     turn_prompt, _ = await agent._build_turn_prompt(
         ctx, event,
         saga_block="SAGA_SENTINEL",
-        subagent_block="SUBAGENT_SENTINEL",
         initial_auth_context=admin_auth,
     )
 
@@ -781,7 +780,6 @@ async def test_agent_build_turn_prompt_threads_all_helper_outputs(
         ("Self-state", "SELFSTATE_SENTINEL"),
         ("Recent activity", "seeded recent"),
         ("Possibly relevant memories (from SAGA)", "SAGA_SENTINEL"),
-        ("Subagent updates", "SUBAGENT_SENTINEL"),
     )
     missing: list[str] = []
     for label, sentinel in expected_pairs:
@@ -821,7 +819,7 @@ async def test_channel_memory_omits_for_principal_less_auth_context(
     )
 
     prompt, _ = await agent._build_turn_prompt(
-        _make_ctx(event), event, saga_block=None, subagent_block=None,
+        _make_ctx(event), event, saga_block=None,
         initial_auth_context=auth,
     )
 
@@ -871,7 +869,7 @@ async def test_feedback_block_renders_off_event_loop(
         author="user-a",
     )
     turn_prompt, _ = await agent._build_turn_prompt(
-        _make_ctx(event), event, saga_block=None, subagent_block=None,
+        _make_ctx(event), event, saga_block=None,
     )
 
     assert "FEEDBACK_SENTINEL" in turn_prompt
@@ -999,7 +997,7 @@ async def test_reflection_turn_assembles_recent_cross_channel_sessions(
 
     try:
         prompt, _ = await agent._build_turn_prompt(
-            _make_ctx(event), event, saga_block=None, subagent_block=None,
+            _make_ctx(event), event, saga_block=None,
         )
     finally:
         conn.close()
@@ -1042,7 +1040,7 @@ async def test_ordinary_turn_session_summaries_remain_channel_scoped(
 
     try:
         prompt, _ = await agent._build_turn_prompt(
-            _make_ctx(event), event, saga_block=None, subagent_block=None,
+            _make_ctx(event), event, saga_block=None,
         )
     finally:
         conn.close()
@@ -1190,7 +1188,7 @@ async def test_agent_build_turn_prompt_omits_blocks_for_none_helpers(
     )
     ctx = _make_ctx(event)
     turn_prompt, _ = await agent._build_turn_prompt(
-        ctx, event, saga_block=None, subagent_block=None,
+        ctx, event, saga_block=None,
     )
 
     # None of the optional headers should appear — they're conditional

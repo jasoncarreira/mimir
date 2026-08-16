@@ -1426,7 +1426,9 @@ def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
     tmp = Path(tmp_str)
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -1440,10 +1442,11 @@ def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
         except OSError:
             pass
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         tmp.unlink(missing_ok=True)
         raise
 
@@ -1979,66 +1982,6 @@ def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
             f"({home_resolved}); got {base}"
         )
     return base
-
-
-def _write_run_artifacts_confined(
-    home: str | Path,
-    artifact_base: Path,
-    run_id: str,
-    files: dict[str, str],
-) -> Path:
-    """Create ``<artifact_base>/.factory/runs/<run_id>/`` and write ``files``
-    into it without ever following a symlink.
-
-    ``_confined_artifact_base`` validates the root BEFORE the spawn, but the
-    untrusted subprocess runs between that check and these writes and can plant
-    a symlink at a predictable path component (``.factory`` / ``runs``) so a
-    later ``Path.mkdir``/``write_text`` would escape the home — a TOCTOU that a
-    single pre-spawn ``resolve()`` cannot close. Walk from the trusted
-    (already-resolved, confined) home directory fd, creating and re-opening each
-    component with ``O_NOFOLLOW`` (openat semantics), and write each file with
-    ``O_NOFOLLOW | O_CREAT | O_EXCL``. A symlink planted at any component is
-    rejected (``OSError``) rather than followed, so the writes cannot leave the
-    home. ``run_id`` is unpredictable to the subprocess, so the run dir and its
-    files cannot be pre-planted. Returns the lexical run-dir path on success;
-    raises ``OSError`` if any component is a symlink or a write fails.
-    """
-    home_resolved = Path(home).expanduser().resolve()
-    rel_parts = artifact_base.relative_to(home_resolved).parts
-    components = [*rel_parts, ".factory", "runs", run_id]
-    # Anchor on the trusted, fully-resolved home (resolve() leaves no symlinks
-    # in it); every child below is opened O_NOFOLLOW.
-    opened: list[int] = [os.open(home_resolved, os.O_RDONLY | os.O_DIRECTORY)]
-    try:
-        for part in components:
-            try:
-                os.mkdir(part, 0o700, dir_fd=opened[-1])
-            except FileExistsError:
-                pass
-            opened.append(
-                os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=opened[-1],
-                )
-            )
-        run_fd = opened[-1]
-        for name, content in files.items():
-            fd = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=run_fd,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(content)
-    finally:
-        for fd in opened:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-    return artifact_base / ".factory" / "runs" / run_id
 
 
 async def _spawn_open_code_impl(

@@ -125,7 +125,7 @@ class AccessMetadata:
         return "admin" in self.roles
 
 
-_KNOWN_ACCESS_VALUES = {"user", "admin", "service"}
+_KNOWN_ACCESS_VALUES = {"user", "admin"}
 
 
 @dataclass

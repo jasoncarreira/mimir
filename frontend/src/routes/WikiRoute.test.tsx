@@ -247,6 +247,28 @@ describe("WikiRoute", () => {
     await waitFor(() => expect(screen.getAllByRole("heading", { name: "Beta" }).length).toBeGreaterThan(0));
   });
 
+  it("renders a bare fence as code without interpreting inline markdown", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/api/v1/wiki")) return jsonResponse(envelope(indexPayload()));
+      if (url.includes("/api/v1/wiki/")) {
+        return jsonResponse(envelope({
+          ...pagePayload(url),
+          markdown: "# Alpha\n```\n**bold** [[beta]]\n```"
+        }));
+      }
+      return jsonResponse(envelope({}));
+    }));
+
+    renderRoute();
+
+    await waitFor(() => expect(screen.getAllByRole("heading", { name: "Alpha" }).length).toBeGreaterThan(0));
+    const reader = screen.getByText("concepts/alpha.md").closest("article") as HTMLElement;
+    const code = reader.querySelector("pre > code");
+    expect(code?.textContent).toBe("**bold** [[beta]]");
+    expect(code?.querySelector("strong")).toBeNull();
+    expect(code?.querySelector("a")).toBeNull();
+  });
+
   it("browses by title, slug, and category filters", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (url.endsWith("/api/v1/wiki")) return jsonResponse(envelope(indexPayload()));

@@ -149,6 +149,24 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
+describe("chat store", () => {
+  it("retains only the newest 100 messages", () => {
+    useChatStore.getState().setMessages(() => Array.from({ length: 101 }, (_, index) => ({
+      id: `message-${index}`,
+      role: "user" as const,
+      channelId: "web-default",
+      text: String(index),
+      timestamp: new Date(index).toISOString(),
+      status: "done" as const
+    })));
+
+    const messages = useChatStore.getState().messages;
+    expect(messages).toHaveLength(100);
+    expect(messages[0].id).toBe("message-1");
+    expect(messages[99].id).toBe("message-100");
+  });
+});
+
 describe("ChatRoute", () => {
   it("submits optimistically, clears the composer, and marks accepted messages done", async () => {
     chatApi.sendChatMessage.mockResolvedValue({

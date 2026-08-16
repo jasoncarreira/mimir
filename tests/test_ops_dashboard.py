@@ -175,18 +175,16 @@ def test_compute_stats_summary_counts(tmp_path: Path):
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message", "channel_id": "c1"},
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "scheduled_tick", "channel_id": "c1"},
         {"timestamp": _ts(0.1), "type": "send_message_sent"},
-        {"timestamp": _ts(0.1), "type": "subagent_started", "task_id": "t1"},
-        {"timestamp": _ts(0.1), "type": "subagent_notification", "task_id": "t1"},
         {"timestamp": _ts(0.1), "type": "client_pool_drained"},
         {"timestamp": _ts(0.1), "type": "event_queue_high_water"},
     ])
     payload = build_dashboard_payload(log, days=1)
     s = payload["summary"]
-    assert s["total_events"] == 7
+    assert s["total_events"] == 5
     assert s["events_queued"] == 2
     assert s["messages_sent"] == 1
-    assert s["subagents_started"] == 1
-    assert s["subagents_completed"] == 1
+    assert "subagents_started" not in s
+    assert "subagents_completed" not in s
     assert s["client_pool_drains"] == 1
     assert s["high_water_events"] == 1
 

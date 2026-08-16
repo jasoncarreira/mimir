@@ -33,7 +33,7 @@ def test_loopback_with_key_is_allowed(host: str) -> None:
 # ─── non-loopback bind: requires a key ───────────────────────────────────
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "::"])
+@pytest.mark.parametrize("host", ["", "0.0.0.0", "192.168.1.10", "::"])
 def test_non_loopback_without_key_refused(host: str) -> None:
     """Binding any non-loopback interface without ``MIMIR_API_KEY`` is
     refused at startup — open to any reachable peer otherwise."""

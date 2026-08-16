@@ -542,16 +542,16 @@ async function loadAtom(atomId, rowEl) {
       ["Pinned", d.is_pinned ? "yes" : "no"],
       ["Created", fmtTs(d.created_at)],
       ["Access count", d.access_count != null ? d.access_count : "—"],
-      ["Last access", d.last_access_ts ? fmtTs(d.last_access_ts) + " (" + esc(d.last_access_source) + ")" : "—"],
+      ["Last access", d.last_access_ts ? fmtTs(d.last_access_ts) + " (" + (d.last_access_source || "") + ")" : "—"],
       ["Embedding", d.embedding ? d.embedding.provider + "/" + d.embedding.model + " dim=" + d.embedding.dim : "none"],
-      ["Tombstoned", d.tombstoned ? "yes (" + esc(d.tombstoned_reason || "?") + ")" : "no"],
+      ["Tombstoned", d.tombstoned ? "yes (" + (d.tombstoned_reason || "?") + ")" : "no"],
       ["Topics", Array.isArray(d.topics) ? d.topics.join(", ") || "—" : "—"],
     ].map(([k, v]) => kv(k, v)).join("");
 
     const relHtml = (d.relations_out && d.relations_out.length)
       ? d.relations_out.map(r =>
           '<div class="relation-row"><b>' + esc(r.relation_type) + '</b> → '
-          + esc(r.target_id) + ' (conf ' + (r.confidence || 1).toFixed(2) + ')'
+          + esc(r.target_id) + ' (conf ' + (r.confidence ?? 1).toFixed(2) + ')'
           + (r.target_preview ? ' — <span style="color:var(--muted)">' + esc(r.target_preview) + "…</span>" : "")
           + "</div>"
         ).join("")

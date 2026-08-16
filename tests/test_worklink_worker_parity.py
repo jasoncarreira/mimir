@@ -279,6 +279,51 @@ async def run_direct(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["timeout", "overflow"])
+async def test_direct_termination_kills_pipe_holding_grandchild(
+    monkeypatch: pytest.MonkeyPatch, trigger: str
+) -> None:
+    original_terminate = worker_exec._terminate_process_group_pid
+    signals: list[int] = []
+    original_killpg = os.killpg
+
+    def expedited_terminate(process_group: int, timeout_s: float = 5.0) -> None:
+        original_terminate(process_group, 0.05)
+
+    def observed_killpg(process_group: int, sig: int) -> None:
+        signals.append(sig)
+        original_killpg(process_group, sig)
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", expedited_terminate)
+    monkeypatch.setattr(worker_exec.os, "killpg", observed_killpg)
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    if trigger == "overflow":
+        monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
+    output = "overflow" if trigger == "overflow" else "ready"
+    source = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)']); "
+        "time.sleep(.1); "
+        f"print({output!r},flush=True); "
+        "time.sleep(30)"
+    )
+    backend = LocalSubprocessComputeBackend()
+    handle = await backend.launch(direct_spec(source))
+
+    result = await asyncio.wait_for(
+        # Let the source pass its 100ms startup delay so the grandchild owns
+        # the SIGTERM-ignore state this assertion is intended to exercise.
+        backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
+    )
+    await backend.cleanup(handle)
+
+    assert result.timed_out is (trigger == "timeout")
+    assert result.output_overflow is (trigger == "overflow")
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", SCENARIOS)
 async def test_closed_worker_direct_parity_inventory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str

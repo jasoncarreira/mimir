@@ -12,7 +12,8 @@ import type { ReactNode } from "react";
 
 const STORAGE_KEY = "mimir.api_key";
 
-const { whoami, wikiRouteLoads } = vi.hoisted(() => ({
+const { routeFailures, whoami, wikiRouteLoads } = vi.hoisted(() => ({
+  routeFailures: { chat: false },
   whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() },
   wikiRouteLoads: { count: 0 }
 }));
@@ -99,7 +100,12 @@ vi.mock("./agent-character", () => ({
   characterStateFromLiveEvent: () => "idle",
   withComposerListening: (state: string) => state
 }));
-vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
+vi.mock("./ChatRoute", () => ({
+  ChatRoute: () => {
+    if (routeFailures.chat) throw new Error("chat route exploded");
+    return <div>chat-stub</div>;
+  }
+}));
 vi.mock("./routes/WikiRoute", () => {
   wikiRouteLoads.count += 1;
   return {
@@ -139,7 +145,9 @@ afterEach(() => {
     apiKeyPresent: false
   });
   wikiRouteLoads.count = 0;
+  routeFailures.chat = false;
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 
@@ -182,6 +190,38 @@ describe("API key changes reset browser-scoped user data (#594)", () => {
 });
 
 describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
+  it("contains and reports an invalid dashboard extension manifest", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false },
+      dashboard_extensions: [
+        { ...protectedBootstrap.dashboard_extensions[0], route_path: "//status" }
+      ]
+    } as typeof protectedBootstrap;
+
+    renderApp();
+
+    expect((await screen.findByRole("alert")).textContent).toContain("The dashboard could not be rendered");
+    expect(screen.getByRole("alert").textContent).toContain("safe same-origin path");
+    consoleError.mockRestore();
+  });
+
+  it("contains a route render failure without removing dashboard navigation", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false }
+    };
+    routeFailures.chat = true;
+
+    renderApp(["/chat"]);
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Chat could not be rendered");
+    expect(screen.getByRole("link", { name: /Chat/ })).toBeTruthy();
+    consoleError.mockRestore();
+  });
+
   it("gates the whole app behind a login screen until a key is saved", async () => {
     renderApp();
 

@@ -12,6 +12,7 @@ import {
   Panel
 } from "../ui";
 import type { ApiError } from "../api/http";
+import { sanitizeHref } from "../routeState";
 
 interface FactoryRunsRouteProps {
   surface: DashboardSurface;
@@ -91,7 +92,7 @@ function GateStatus({ statuses }: { statuses: Array<[string, string]> }) {
   );
 }
 
-function RunDetail({ runId }: { runId: string }) {
+export function RunDetail({ runId }: { runId: string }) {
   const { data, isLoading, error } = useQuery({
     queryKey: ["factory-run", runId],
     queryFn: async () => {
@@ -106,6 +107,8 @@ function RunDetail({ runId }: { runId: string }) {
 
   const run = data as FactoryRunDetail;
   const status = run.status || "unknown";
+  const prHref = sanitizeHref(run.pr_url);
+  const terminalPrHref = sanitizeHref(run.terminal_result?.pr_url);
 
   return (
     <div className="factory-run-detail">
@@ -122,7 +125,7 @@ function RunDetail({ runId }: { runId: string }) {
           <div><dt>Terminal</dt><dd>{run.is_terminal ? "Yes" : "No"}</dd></div>
           <div><dt>Stale</dt><dd>{run.is_stale ? "Yes" : "No"}</dd></div>
           <div><dt>Heartbeat</dt><dd>{formatTime(run.heartbeat_at)}</dd></div>
-          {run.pr_url && <div><dt>PR URL</dt><dd><a href={run.pr_url} target="_blank" rel="noopener noreferrer">{run.pr_url}</a></dd></div>}
+          {run.pr_url && <div><dt>PR URL</dt><dd>{prHref ? <a href={prHref} target="_blank" rel="noopener noreferrer">{run.pr_url}</a> : run.pr_url}</dd></div>}
           {run.error && <div><dt>Error</dt><dd>{run.error}</dd></div>}
           {run.pending_gate && <div><dt>Pending Gate</dt><dd>{run.pending_gate}</dd></div>}
           {run.validator_verdict && <div><dt>Validator</dt><dd><Badge tone={run.validator_verdict === "GO" ? "success" : "danger"}>{run.validator_verdict}</Badge></dd></div>}
@@ -166,7 +169,7 @@ function RunDetail({ runId }: { runId: string }) {
         <Panel title="Terminal Result">
           <dl className="facts-grid">
             <div><dt>Status</dt><dd>{run.terminal_result.status}</dd></div>
-            {run.terminal_result.pr_url && <div><dt>PR URL</dt><dd><a href={run.terminal_result.pr_url} target="_blank" rel="noopener noreferrer">{run.terminal_result.pr_url}</a></dd></div>}
+            {run.terminal_result.pr_url && <div><dt>PR URL</dt><dd>{terminalPrHref ? <a href={terminalPrHref} target="_blank" rel="noopener noreferrer">{run.terminal_result.pr_url}</a> : run.terminal_result.pr_url}</dd></div>}
             {run.terminal_result.reason && <div><dt>Reason</dt><dd>{run.terminal_result.reason}</dd></div>}
             {run.terminal_result.summary && <div><dt>Summary</dt><dd>{run.terminal_result.summary}</dd></div>}
           </dl>

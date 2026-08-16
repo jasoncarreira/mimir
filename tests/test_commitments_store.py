@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -300,6 +301,56 @@ async def test_deliver_bumps_attempts_and_sets_status(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_deliver_is_coalesced(tmp_path: Path):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+
+    results = await asyncio.gather(store.deliver(rec.id), store.deliver(rec.id))
+
+    assert sorted(results) == [False, True]
+    assert store.current_state()[rec.id].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_complete_and_expire_append_one_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="X",
+    ))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def paused_to_thread(func, /, *args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", paused_to_thread)
+    complete = asyncio.create_task(store.complete(rec.id, message_id="m-1"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    expire = asyncio.create_task(store.expire(rec.id))
+    await asyncio.sleep(0)
+    assert not complete.done()
+    release.set()
+
+    results = await asyncio.gather(complete, expire)
+    events = [json.loads(line) for line in store.path.read_text().splitlines()]
+    transitions = [event for event in events if event["type"] != "commitment_added"]
+
+    assert sorted(results) == [False, True]
+    assert len(transitions) == 1
+    assert transitions[0]["type"] == "commitment_completed"
+    state = store.current_state()[rec.id]
+    assert state.status == CommitmentStatus.COMPLETED.value
+    assert state.completion_message_id == "m-1"
+
+
+@pytest.mark.asyncio
 async def test_complete_is_terminal(tmp_path: Path):
     store = CommitmentsStore(path=tmp_path / "c.jsonl")
     rec = await store.add(CommitmentRecord(
@@ -511,6 +562,28 @@ async def test_trim_never_drops_pending_no_matter_how_old(tmp_path: Path):
         due_window_start_unix=now + 30 * 86400,
     ))
     dropped = await store.trim(now_unix=now)
+    assert dropped == 0
+    assert rec.id in store.current_state()
+
+
+@pytest.mark.asyncio
+async def test_trim_retains_terminal_record_without_terminal_timestamp(tmp_path: Path):
+    store = CommitmentsStore(
+        path=tmp_path / "c.jsonl",
+        terminal_retention_days=30,
+    )
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="imported",
+    ))
+    with store.path.open("a") as f:
+        f.write(json.dumps({
+            "type": "commitment_completed",
+            "id": rec.id,
+            "at_unix": None,
+        }) + "\n")
+
+    dropped = await store.trim(now_unix=time.time() + 365 * 86400)
+
     assert dropped == 0
     assert rec.id in store.current_state()
 

@@ -337,6 +337,7 @@ class DiscordBridge(Bridge):
         default_factory=SeenIdCache,
         init=False, repr=False,
     )
+    _inbound_claims: set[str] = field(default_factory=set, init=False, repr=False)
 
     prefixes = ("discord-", "dm-discord-")
     name = "discord"
@@ -611,6 +612,8 @@ class DiscordBridge(Bridge):
 
         discord_embed = _coerce_discord_embed(embed)
         chunks = [c for c in _chunk_message(text) if c.strip()]
+        if not chunks and not attachment_paths and discord_embed is None:
+            return SendResult(sent=False, error="empty message")
 
         send_kwargs: dict[str, Any] = {}
         if reply_to_message_id:
@@ -934,16 +937,18 @@ class DiscordBridge(Bridge):
         # dedupes rather than bypassing the cache.
         _raw_message_id = getattr(message, "id", None)
         source_id = str(_raw_message_id) if _raw_message_id is not None else None
-        # Truthy-check matches the Slack bridge pattern; SeenIdCache also
-        # treats empty strings as "no id" so this is doubly safe.
-        if source_id and source_id in self._seen_ids:
-            self._seen_ids.add_if_new(source_id)
+        if source_id and (
+            source_id in self._inbound_claims
+            or not self._seen_ids.add_if_new(source_id)
+        ):
             log.debug(
                 "DiscordBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Discord resume-protocol redelivery",
                 source_id,
             )
             return
+        if source_id:
+            self._inbound_claims.add(source_id)
 
         channel = message.channel
         channel_id = _channel_to_id(channel)
@@ -995,10 +1000,14 @@ class DiscordBridge(Bridge):
                 chat_id=str(getattr(message.channel, "id", "") or ""),
                 filename=str(name),
             )
-            ok = await download_to_path(
-                str(url), target, max_bytes=self.attachments_max_bytes,
-                allowed_host_suffixes=_DISCORD_CDN_HOSTS,
-            )
+            try:
+                ok = await download_to_path(
+                    str(url), target, max_bytes=self.attachments_max_bytes,
+                    allowed_host_suffixes=_DISCORD_CDN_HOSTS,
+                )
+            except BaseException:
+                self._release_inbound_claim(source_id)
+                raise
             if ok:
                 attachment_paths.append(str(target))
 
@@ -1052,9 +1061,20 @@ class DiscordBridge(Bridge):
             self.send_typing_indicator(channel_id),
             name=f"mimir-discord-typing-trigger-{channel_id}",
         )
-        accepted = await self.enqueue(event)
-        if accepted:
-            self._seen_ids.add_if_new(source_id or "")
+        try:
+            accepted = await self.enqueue(event)
+        except BaseException:
+            self._release_inbound_claim(source_id)
+            raise
+        if source_id:
+            self._inbound_claims.discard(source_id)
+            if not accepted:
+                self._seen_ids.discard(source_id)
+
+    def _release_inbound_claim(self, source_id: str | None) -> None:
+        if source_id and source_id in self._inbound_claims:
+            self._inbound_claims.remove(source_id)
+            self._seen_ids.discard(source_id)
 
     # VSM: algedonic (in) — inbound reactions on the bot's own messages,
     #                       classified by emoji polarity, time-gated by

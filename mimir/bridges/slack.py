@@ -45,6 +45,7 @@ from ..background_tasks import spawn_background
 from ..models import AgentEvent
 from ..redaction import redact_text
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
+from ._emoji import resolve_for_slack
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
 from .base import Bridge, MessageUpdate, SendResult
@@ -255,6 +256,7 @@ class SlackBridge(Bridge):
         default_factory=SeenIdCache,
         init=False, repr=False,
     )
+    _inbound_claims: set[str] = field(default_factory=set, init=False, repr=False)
 
     prefixes = ("slack-", "dm-slack-")
     name = "slack"
@@ -770,7 +772,7 @@ class SlackBridge(Bridge):
         slack_channel = _channel_id_to_slack(channel_id)
         if slack_channel is None:
             return False
-        name = _normalize_emoji(emoji)
+        name = resolve_for_slack(emoji)
         if not name:
             return False
         try:
@@ -876,14 +878,18 @@ class SlackBridge(Bridge):
         # redelivers events on ACK loss; without the cache we'd burn a
         # turn (plus an attachment download) on every redelivery.
         source_id = event.get("ts")
-        if source_id and source_id in self._seen_ids:
-            self._seen_ids.add_if_new(source_id)
+        if source_id and (
+            source_id in self._inbound_claims
+            or not self._seen_ids.add_if_new(source_id)
+        ):
             log.debug(
                 "SlackBridge: duplicate inbound message dropped "
                 "(source_id=%s) — Socket-Mode redelivery",
                 source_id,
             )
             return
+        if source_id:
+            self._inbound_claims.add(source_id)
 
         slack_channel = event.get("channel") or ""
         channel_type = event.get("channel_type")
@@ -904,7 +910,11 @@ class SlackBridge(Bridge):
         # (identity proposal flow, EmailBridge cross-reference, etc.).
         author_display = user_id
         slack_email: str | None = None
-        info = await self._user_info_cached(user_id)
+        try:
+            info = await self._user_info_cached(user_id)
+        except BaseException:
+            self._release_inbound_claim(source_id)
+            raise
         if info:
             author_display = (
                 info.get("real_name") or info.get("display_name") or user_id
@@ -947,13 +957,17 @@ class SlackBridge(Bridge):
             # Authorization header. Use the shared download_to_path
             # helper so the streaming-size cap is enforced (no unbounded
             # disk write if the endpoint streams more than advertised).
-            ok = await download_to_path(
-                str(url),
-                target,
-                max_bytes=self.attachments_max_bytes,
-                headers={"Authorization": f"Bearer {self.bot_token}"},
-                allowed_host_suffixes=_SLACK_CDN_HOSTS,
-            )
+            try:
+                ok = await download_to_path(
+                    str(url),
+                    target,
+                    max_bytes=self.attachments_max_bytes,
+                    headers={"Authorization": f"Bearer {self.bot_token}"},
+                    allowed_host_suffixes=_SLACK_CDN_HOSTS,
+                )
+            except BaseException:
+                self._release_inbound_claim(source_id)
+                raise
             if ok:
                 attachment_paths.append(str(target))
 
@@ -981,9 +995,20 @@ class SlackBridge(Bridge):
                 ),
             },
         )
-        accepted = await self.enqueue(agent_event)
-        if accepted:
-            self._seen_ids.add_if_new(source_id or "")
+        try:
+            accepted = await self.enqueue(agent_event)
+        except BaseException:
+            self._release_inbound_claim(source_id)
+            raise
+        if source_id:
+            self._inbound_claims.discard(source_id)
+            if not accepted:
+                self._seen_ids.discard(source_id)
+
+    def _release_inbound_claim(self, source_id: str | None) -> None:
+        if source_id and source_id in self._inbound_claims:
+            self._inbound_claims.remove(source_id)
+            self._seen_ids.discard(source_id)
 
     # VSM: algedonic (in) — see DiscordBridge._on_reaction; identical
     #                       semantics, different protocol.

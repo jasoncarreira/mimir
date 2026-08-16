@@ -162,8 +162,8 @@ def test_callback_writes_both_windows_when_present(tmp_path: Path):
     primary_reset = int(time.time()) + 5 * 3600        # 5h window
     secondary_reset = int(time.time()) + 7 * 24 * 3600  # 7d window
     callback(_FakeRateLimits(
-        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=primary_reset),
-        secondary=_FakeQuotaWindow(used_percent=8.0, reset_at=secondary_reset),
+        primary=_FakeQuotaWindow(used_percent=25.0, window_minutes=300, reset_at=primary_reset),
+        secondary=_FakeQuotaWindow(used_percent=8.0, window_minutes=10080, reset_at=secondary_reset),
     ))
     loaded = store.current()
     assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
@@ -249,6 +249,22 @@ def test_callback_windowless_response_preserves_existing_records(tmp_path: Path)
     assert loaded["openai_five_hour"].utilization == pytest.approx(0.25)
 
 
+def test_callback_refuses_ambiguous_window_and_preserves_existing_records(tmp_path: Path):
+    store = RateLimitStore(path=tmp_path / "rl.json")
+    reset_7d = int(time.time()) + 7 * 24 * 3600
+    store.record_sync(
+        "openai_seven_day",
+        RateLimitSnapshot(status="allowed", utilization=0.4, resets_at=reset_7d),
+    )
+    callback = make_codex_plus_rate_limit_callback(store)
+    callback(_FakeRateLimits(
+        primary=_FakeQuotaWindow(used_percent=90.0, reset_at=reset_7d),
+    ))
+    loaded = store.current()
+    assert "openai_five_hour" not in loaded
+    assert loaded["openai_seven_day"].utilization == pytest.approx(0.4)
+
+
 def test_callback_skips_when_used_percent_missing(tmp_path: Path):
     """A window with ``used_percent=None`` (gateway omitted the
     header) — skip rather than write a misleading utilization=0."""
@@ -267,7 +283,11 @@ def test_callback_observed_at_is_iso_utc(tmp_path: Path):
     callback = make_codex_plus_rate_limit_callback(store)
     before = datetime.now(tz=timezone.utc)
     callback(_FakeRateLimits(
-        primary=_FakeQuotaWindow(used_percent=5.0, reset_at=int(time.time() + 3600)),
+        primary=_FakeQuotaWindow(
+            used_percent=5.0,
+            window_minutes=300,
+            reset_at=int(time.time() + 3600),
+        ),
     ))
     after = datetime.now(tz=timezone.utc)
     obs = datetime.fromisoformat(
@@ -317,8 +337,12 @@ def test_callback_emits_codex_plus_usage_ok_event(tmp_path: Path):
     primary_reset = int(time.time()) + 5 * 3600
     secondary_reset = int(time.time()) + 7 * 24 * 3600
     callback(_FakeRateLimits(
-        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=primary_reset),
-        secondary=_FakeQuotaWindow(used_percent=8.0, reset_at=secondary_reset),
+        primary=_FakeQuotaWindow(
+            used_percent=25.0, window_minutes=300, reset_at=primary_reset,
+        ),
+        secondary=_FakeQuotaWindow(
+            used_percent=8.0, window_minutes=10080, reset_at=secondary_reset,
+        ),
     ))
     lines = events_path.read_text().splitlines()
     assert len(lines) == 1
@@ -373,7 +397,11 @@ async def test_callback_on_running_loop_returns_before_sync_io(
 
     start = time.monotonic()
     callback(_FakeRateLimits(
-        primary=_FakeQuotaWindow(used_percent=25.0, reset_at=int(time.time() + 3600)),
+        primary=_FakeQuotaWindow(
+            used_percent=25.0,
+            window_minutes=300,
+            reset_at=int(time.time() + 3600),
+        ),
     ))
     elapsed = time.monotonic() - start
 

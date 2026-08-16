@@ -2,7 +2,7 @@
 
 The hot path of a turn reads ``events.jsonl`` and ``turns.jsonl`` from
 6+ call sites — feedback assembly, usage block, self-state block,
-session summaries, subagent aggregate, budget partition. Each one used
+session summaries and budget partition. Each one used
 to call ``tail_jsonl_records(path)`` directly, walking the file from
 the tail in 8-KiB chunks. With WAL'd writers happening concurrently,
 that's a real I/O storm at high turn rates (~50–200 ms per turn just on

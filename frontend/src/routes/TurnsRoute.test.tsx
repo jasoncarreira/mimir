@@ -9,13 +9,15 @@ import { TurnsRoute } from "./TurnsRoute";
 
 const { turnsApi } = vi.hoisted(() => ({
   turnsApi: {
-    listTurns: vi.fn()
+    listTurns: vi.fn(),
+    listSessions: vi.fn()
   }
 }));
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
-  listTurns: turnsApi.listTurns
+  listTurns: turnsApi.listTurns,
+  listSessions: turnsApi.listSessions
 }));
 
 function renderTurns() {
@@ -36,6 +38,7 @@ function renderTurns() {
 afterEach(() => {
   cleanup();
   turnsApi.listTurns.mockReset();
+  turnsApi.listSessions.mockReset();
 });
 
 describe("TurnsRoute", () => {
@@ -182,6 +185,49 @@ describe("TurnsRoute", () => {
     expect(screen.getByText("Load sessions")).toBeTruthy();
     expect(turnsApi.listTurns).toHaveBeenCalledTimes(1);
     expect(turnsApi.listTurns).toHaveBeenCalledWith({ limit: 200 }, { cache: "no-store" });
+  });
+
+  it("preserves a local turn search when selecting a matching result", async () => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: {
+        turns: [
+          { ...turnsFixture.turns[0], turn_id: "turn-deploy", input: "Deploy the release." },
+          { ...turnsFixture.turns[0], turn_id: "turn-unrelated", input: "Summarize the current state." }
+        ]
+      },
+      meta: { cursor: null, limit: 200, total: 2, truncated: false }
+    });
+
+    renderTurns();
+    const search = await screen.findByLabelText("Search input, output, and injected messages");
+    fireEvent.change(search, { target: { value: "deploy" } });
+
+    const list = screen.getByRole("list", { name: "Turns" });
+    expect(within(list).getByText("Deploy the release.")).toBeTruthy();
+    expect(within(list).queryByText("Summarize the current state.")).toBeNull();
+    fireEvent.click(within(list).getByText("Deploy the release."));
+
+    await screen.findByText("Selected Turn");
+    expect((search as HTMLInputElement).value).toBe("deploy");
+    expect(within(list).queryByText("Summarize the current state.")).toBeNull();
+  });
+
+  it("does not load sessions when a Browse Turns trigger tab is selected", async () => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true,
+      version: "v1",
+      data: { turns: [turnsFixture.turns[0]] },
+      meta: { cursor: null, limit: 200, total: 1, truncated: false }
+    });
+
+    renderTurns();
+    await screen.findByRole("list", { name: "Turns" });
+    fireEvent.click(screen.getByRole("tab", { name: "Heartbeat" }));
+
+    expect(screen.getByText("Load sessions")).toBeTruthy();
+    expect(turnsApi.listSessions).not.toHaveBeenCalled();
   });
 
   it("shows an empty state for missing payloads", async () => {

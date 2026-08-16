@@ -128,6 +128,10 @@ class VectorIndex:
         if not vecs:
             with self._lock:
                 self._index = None
+                self._id_to_pos.clear()
+                self._pos_to_id.clear()
+                self._removed.clear()
+                self._next_pos = 0
                 self._built = True
             return
 
@@ -227,10 +231,13 @@ class VectorIndex:
         )
 
     def add(self, atom_id: str, vec_bytes: bytes) -> None:
-        """Incremental add after a successful store. No-op if the
-        index hasn't been built yet — the next build_from_db will pick
-        up the atom from disk."""
-        if not FAISS_AVAILABLE or self._index is None:
+        """Incremental add after a successful store.
+
+        No-op if the index hasn't been built yet. A completed empty build,
+        however, initializes its FlatIP index on the first add so an early
+        query cannot permanently disable vector recall.
+        """
+        if not FAISS_AVAILABLE:
             return
         if len(vec_bytes) < self.dimension * 4:
             return
@@ -240,6 +247,10 @@ class VectorIndex:
         faiss.normalize_L2(vec)
 
         with self._lock:
+            if not self._built:
+                return
+            if self._index is None:
+                self._index = faiss.IndexFlatIP(self.dimension)
             # chainlink #235: if this atom_id was added before (re-embed,
             # calibration, future re-add path), mark the OLD position as
             # removed BEFORE overwriting ``_id_to_pos``. Otherwise the prior
@@ -309,6 +320,9 @@ class VectorIndex:
 
     def rebuild_if_needed(self, conn: sqlite3.Connection) -> bool:
         """Rebuild from disk if accumulated removals exceed 10% of total."""
+        if self._built and self._index is None:
+            self.build_from_db(conn)
+            return self._index is not None
         if self._next_pos > 0 and len(self._removed) > self._next_pos * 0.1:
             self.build_from_db(conn)
             return True

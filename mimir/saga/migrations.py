@@ -91,6 +91,42 @@ WHERE a.source_type = 'session_boundary'
         -- (atom.content); we top up the structured fields from
         -- atom.metadata here in case the row was inserted with empty
         -- topics_discussed/decisions_made/etc.
+        -- triples was initially greenfield-only, but v5 defensively cleans
+        -- boundary references from it. Give legacy DBs the pre-v6 base shape
+        -- before that cleanup; v6 performs the cascade rebuild afterward.
+        CREATE TABLE IF NOT EXISTS triples (
+            id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            source_atom_id TEXT,
+            confidence REAL DEFAULT 1.0,
+            valid_from TEXT,
+            valid_until TEXT,
+            embedding BLOB,
+            embedding_dim INTEGER,
+            tombstoned INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
+        );
+
+        -- Refuse the destructive cleanup unless migration 2's data
+        -- postcondition holds. The detector normally replays v2 when this
+        -- is false, but the guard also protects explicitly stamped or
+        -- otherwise inconsistent databases.
+        CREATE TEMP TRIGGER migration_v5_require_session_backfill
+        BEFORE DELETE ON atoms
+        WHEN OLD.source_type = 'session_boundary'
+          AND (
+              OLD.session_id IS NULL
+              OR NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = OLD.session_id)
+          )
+        BEGIN
+            SELECT RAISE(ABORT,
+                'migration v5 refused: session_boundary atom has no matching sessions row');
+        END;
+
         UPDATE sessions
         SET
             topics_discussed = COALESCE(
@@ -150,6 +186,28 @@ WHERE a.source_type = 'session_boundary'
                     LIMIT 1
                 ),
                 closed_since
+            ),
+            embedding = COALESCE(
+                embedding,
+                (
+                    SELECT e.vec
+                    FROM atoms a
+                    JOIN embeddings e ON e.atom_id = a.id
+                    WHERE a.source_type = 'session_boundary'
+                      AND a.session_id = sessions.id
+                    LIMIT 1
+                )
+            ),
+            embedding_dim = COALESCE(
+                embedding_dim,
+                (
+                    SELECT e.dim
+                    FROM atoms a
+                    JOIN embeddings e ON e.atom_id = a.id
+                    WHERE a.source_type = 'session_boundary'
+                      AND a.session_id = sessions.id
+                    LIMIT 1
+                )
             )
         WHERE EXISTS (
             SELECT 1 FROM atoms a
@@ -218,6 +276,7 @@ WHERE a.source_type = 'session_boundary'
         -- Finally drop the atoms themselves. atoms_fts is kept in sync
         -- by the DELETE trigger in schema.sql.
         DELETE FROM atoms WHERE source_type = 'session_boundary';
+        DROP TRIGGER migration_v5_require_session_backfill;
     """,
     6: """
         -- v6: Add ON DELETE CASCADE to all FK constraints that reference
@@ -239,6 +298,35 @@ WHERE a.source_type = 'session_boundary'
         -- restored afterwards. PRAGMA foreign_keys=OFF/ON inside the
         -- migration script would be a no-op because PRAGMAs that modify
         -- connection state cannot be set within a transaction.
+
+        -- These two tables were greenfield-only when this migration shipped.
+        -- Create their complete pre-v7 shape before cleanup/copy so older DBs
+        -- that lack either table can still traverse v6 in order.
+        CREATE TABLE IF NOT EXISTS observations_metadata (
+            atom_id TEXT PRIMARY KEY,
+            evidence_count INTEGER DEFAULT 0,
+            trend TEXT,
+            last_evidence_at TEXT,
+            consolidated_at TEXT NOT NULL,
+            consolidation_session TEXT,
+            FOREIGN KEY (atom_id) REFERENCES atoms(id)
+        );
+        CREATE TABLE IF NOT EXISTS triples (
+            id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            source_atom_id TEXT,
+            confidence REAL DEFAULT 1.0,
+            valid_from TEXT,
+            valid_until TEXT,
+            embedding BLOB,
+            embedding_dim INTEGER,
+            tombstoned INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (source_atom_id) REFERENCES atoms(id)
+        );
 
         -- ── Orphan cleanup (belt + suspenders; the COPY step filters
         --    too, but explicit DELETEs make the before/after legible) ──
@@ -581,6 +669,33 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
         }
     except sqlite3.OperationalError:
         atoms_cols = set()
+
+    # Migration 2 includes a data backfill, so schema shape alone cannot prove
+    # it ran. Force replay from v1 whenever its postcondition is false; later
+    # ADD COLUMN migrations tolerate replay and v5 then cleans up only after
+    # every boundary has a durable sessions row.
+    if {"source_type", "session_id"} <= atoms_cols:
+        has_sessions = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='sessions'"
+        ).fetchone() is not None
+        if not has_sessions:
+            return 1
+        sessions_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "id" not in sessions_cols:
+            return 1
+        missing_backfill = conn.execute(
+            "SELECT 1 FROM atoms a "
+            "WHERE a.source_type = 'session_boundary' "
+            "AND (a.session_id IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM sessions s WHERE s.id = a.session_id)) "
+            "LIMIT 1"
+        ).fetchone()
+        if missing_backfill is not None:
+            return 1
+
     if {"integrity", "origin_trigger", "origin_ref"} <= atoms_cols:
         return 10
 
@@ -832,6 +947,7 @@ def apply_pending_migrations(
         detector = detect_schema_version
 
     applied: set[int] = set()
+    inferred_baselines: set[int] = set()
     try:
         for (v,) in conn.execute(
             "SELECT version FROM schema_version"
@@ -865,27 +981,20 @@ def apply_pending_migrations(
         # that. After detection, we stamp the inferred version's
         # baselines so the subsequent migrations loop only runs
         # changes beyond what's already there.
-        now = datetime.now(tz=timezone.utc).isoformat()
         if fresh:
             # Scenario A: schema.sql just ran — DB is at target.
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version "
                 "(version, applied_at) VALUES (?, ?)",
-                (target_version, now),
+                (target_version, datetime.now(tz=timezone.utc).isoformat()),
             )
             conn.commit()
             return
 
         # Scenario B: introspect to figure out where we actually are.
         inferred = detector(conn)
-        for v in range(1, inferred + 1):
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_version "
-                "(version, applied_at) VALUES (?, ?)",
-                (v, now),
-            )
-        conn.commit()
         applied = set(range(1, inferred + 1))
+        inferred_baselines = set(applied)
         # Else fall through to the migrations loop below, which
         # will apply versions max(applied)+1 .. target_version.
 
@@ -898,6 +1007,14 @@ def apply_pending_migrations(
             stamped_version=stamped_version,
             target_version=target_version,
         )
+        if inferred_baselines:
+            now = datetime.now(tz=timezone.utc).isoformat()
+            conn.executemany(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at) VALUES (?, ?)",
+                [(version, now) for version in sorted(inferred_baselines)],
+            )
+            conn.commit()
         return
 
     for version, ddl in sorted(migrations.items()):
@@ -918,6 +1035,13 @@ def apply_pending_migrations(
         conn.execute("PRAGMA foreign_keys=OFF")
         try:
             conn.execute("BEGIN")
+            if inferred_baselines:
+                now = datetime.now(tz=timezone.utc).isoformat()
+                conn.executemany(
+                    "INSERT OR IGNORE INTO schema_version "
+                    "(version, applied_at) VALUES (?, ?)",
+                    [(v, now) for v in sorted(inferred_baselines)],
+                )
             _execute_migration_script(conn, ddl)
             conn.execute(
                 "INSERT INTO schema_version (version, applied_at) "
@@ -926,6 +1050,7 @@ def apply_pending_migrations(
             )
             conn.commit()
             applied.add(version)
+            inferred_baselines.clear()
         except Exception:
             conn.rollback()
             raise
