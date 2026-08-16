@@ -96,10 +96,14 @@ _REMEDIATION_EFFECT_TOOLS = frozenset({
 def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
-    arguments: dict[str, Any],
+    arguments: Mapping[str, Any] | None,
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
-    if tool_name not in _STANDING_REVIEW_TOOLS or auth_context is None:
+    if (
+        tool_name not in _STANDING_REVIEW_TOOLS
+        or auth_context is None
+        or not isinstance(arguments, Mapping)
+    ):
         return None
     from .forge import resolve_review_state_for_context
 
@@ -1348,6 +1352,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
@@ -1626,6 +1632,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return await handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
