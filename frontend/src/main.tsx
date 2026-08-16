@@ -541,11 +541,12 @@ function AppStatus() {
   );
 }
 
-function LoginScreen({ bootstrap, error, isError, isLoading }: {
+function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = false }: {
   bootstrap?: WebBootstrapData;
   error: Error | null;
   isError: boolean;
   isLoading: boolean;
+  reauthenticate?: boolean;
 }) {
   const [entry, setEntry] = React.useState("");
   const setApiKey = useSetApiKey();
@@ -564,7 +565,9 @@ function LoginScreen({ bootstrap, error, isError, isLoading }: {
         ) : (
           <>
             <p className="login-screen__subtitle">
-              Protected server on {host}. Enter your API key to continue.
+              {reauthenticate
+                ? "Your API key was rejected or revoked. Enter a valid key to re-authenticate."
+                : `Protected server on ${host}. Enter your API key to continue.`}
             </p>
             <form
               className="login-screen__form"
@@ -753,6 +756,7 @@ function AppFrameContent() {
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const apiKeyRejected = useUiState((state) => state.apiKeyRejected);
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
   // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
   const { data: whoami } = useWhoami(signedIn);
@@ -781,9 +785,15 @@ function AppFrameContent() {
 
   // Protected + not signed in (or still resolving the policy): show a focused
   // login screen instead of a dashboard full of 401 error panels.
-  if (isLoading || isError || !signedIn) {
+  if (isLoading || isError || !signedIn || apiKeyRejected) {
     return (
-      <LoginScreen bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+      <LoginScreen
+        bootstrap={bootstrap}
+        error={error}
+        isError={isError}
+        isLoading={isLoading}
+        reauthenticate={apiKeyRejected}
+      />
     );
   }
 

@@ -77,7 +77,8 @@ export function LiveActivityPanel() {
 
   const toggle = (key: string) => setOpenKey((current) => (current === key ? null : key));
 
-  const statusTone = status === "open" ? "success" : status === "error" ? "danger" : "info";
+  const statusTone = status === "open" ? "success" : status === "idle" ? "info" : "danger";
+  const statusLabel = status === "reauthenticate" ? "re-authenticate" : status;
 
   const subtitle = latest && !latest.done
     ? `Working — ${spanTitle(latest)}`
@@ -91,7 +92,7 @@ export function LiveActivityPanel() {
 
   return (
     <Panel
-      actions={<Badge tone={statusTone}>{status}</Badge>}
+      actions={<Badge tone={statusTone}>{statusLabel}</Badge>}
       aria-label="Field log"
       className="live-activity"
       subtitle={subtitle}
