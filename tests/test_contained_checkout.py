@@ -81,6 +81,40 @@ def test_repo_test_checkout_snapshots_without_mutating_source(
     assert list(root.iterdir()) == []
 
 
+def test_repo_test_checkout_normalizes_venv_without_widening_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roots(tmp_path, monkeypatch)
+    source = _repo(tmp_path)
+    venv = source / ".venv" / "bin"
+    venv.mkdir(parents=True, mode=0o700)
+    runner = venv / "pytest"
+    runner.write_text("#!/bin/sh\n", encoding="utf-8")
+    data = venv / "metadata"
+    data.write_text("data\n", encoding="utf-8")
+    (source / ".venv").chmod(0o700)
+    venv.chmod(0o700)
+    runner.chmod(0o700)
+    data.chmod(0o600)
+
+    issued = create_repo_test_checkout(source, scope_id="owner/repo", pr_number=44)
+
+    copied_venv = issued.path / ".venv"
+    copied_runner = copied_venv / "bin" / "pytest"
+    copied_data = copied_venv / "bin" / "metadata"
+    boundary = issued.path.parent
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+    assert stat.S_IMODE(boundary.stat().st_mode) & stat.S_IXGRP == 0
+    assert stat.S_IMODE(copied_venv.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(copied_runner.stat().st_mode) == 0o770
+    assert stat.S_IMODE(copied_data.stat().st_mode) == 0o660
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) & 0o007 == 0
+        for path in (copied_venv, copied_runner, copied_data)
+    )
+    issued.close()
+
+
 def test_repo_test_checkout_allows_tracked_credential_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
