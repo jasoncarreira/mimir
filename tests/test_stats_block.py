@@ -2,11 +2,10 @@
 
 The agent loop and the ``mimir stats`` CLI both feed through
 ``assemble_stats_block``. These tests pin:
-- the happy path: aggregate + alert + plan + subagent → rendered body
+- the happy path: aggregate + alert + plan → rendered body
 - partial-failure: rate_limits ``.current()`` raises → block still renders
 - partial-failure: rate_limits projection raises → block still renders
-- partial-failure: subagent_stats raises → block still renders
-  (subagent body None)
+- no subagent event-log aggregation remains
 - ``betas`` auto-defaults from ``cfg.context_1m``
 - aggregate() exceptions BUBBLE (caller decides to skip)
 """
@@ -140,21 +139,24 @@ def test_assemble_degrades_on_rate_limits_projection_exception(tmp_path: Path):
     assert result.off_pace == []
 
 
-def test_assemble_degrades_on_subagent_stats_exception(tmp_path: Path):
-    """``subagent_stats.aggregate`` blowing up must NOT take out the
-    block — pre-refactor caught + logged, rendered with no subagent
-    section. Shared helper preserves that."""
+def test_assemble_does_not_scan_subagent_events(tmp_path: Path):
+    """The retired SDK telemetry must not add event-log work or renderer input."""
+    import mimir.stats_block as stats_block
+
     cfg = _StubCfg(tmp_path)
     _write_turn(cfg.turns_log, hours_ago=1, cost=0.50)
+    captured: dict = {}
 
-    with patch(
-        "mimir.stats_block.aggregate_subagents",
-        side_effect=RuntimeError("boom"),
-    ):
+    def _capture(*args, **kwargs):
+        captured.update(kwargs)
+        return "[rendered]"
+
+    with patch("mimir.stats_block.render_usage_block", side_effect=_capture):
         result = assemble_stats_block(cfg, _StubStore())
 
-    # Body still rendered.
     assert result.body is not None
+    assert "subagent_block" not in captured
+    assert not hasattr(stats_block, "aggregate_subagents")
 
 
 def test_assemble_aggregate_exception_bubbles(tmp_path: Path):

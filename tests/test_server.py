@@ -583,7 +583,6 @@ def _controlled_server_app(
             self.indexer = Indexer()
             self.saga_client = object()
             self.sessions = object()
-            self.subagent_inbox = object()
             self.commitments_store = SimpleNamespace(list=lambda *args, **kwargs: [])
             self.turn_event_bus = SimpleNamespace(
                 subscribe=lambda channel: asyncio.Queue(),
@@ -1339,7 +1338,6 @@ def test_complete_prestartup_app_key_contract_and_benchmark_access(
         "indexer",
         "saga_client",
         "sessions",
-        "subagent_inbox",
         "agent_runtime",
         "replayed_messages",
     }
@@ -1385,7 +1383,6 @@ async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_life
     assert app["indexer"] is control.bundle.indexer
     assert app["saga_client"] is control.bundle.saga_client
     assert app["sessions"] is control.bundle.sessions
-    assert app["subagent_inbox"] is control.bundle.subagent_inbox
     assert app["replayed_messages"] == 9
     assert get_global_buffer() is control.bundle.message_buffer
     assert app["dispatcher"] is dispatcher
@@ -1403,7 +1400,6 @@ async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_life
         "indexer",
         "saga_client",
         "sessions",
-        "subagent_inbox",
         "agent_runtime",
         "replayed_messages",
     ))

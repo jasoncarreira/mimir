@@ -245,7 +245,6 @@ def build_turn_prompt(
     *,
     recent_messages: Iterable[Message] | None = None,
     saga_block: str | None = None,
-    subagent_block: str | None = None,
     recent_message_chars: int = 0,
     resolver: object | None = None,
     feedback_block: str | None = None,
@@ -267,8 +266,7 @@ def build_turn_prompt(
     turn_scratch_path: str | None = None,
 ) -> str:
     """Assemble the turn prompt: known identities, recent activity, SAGA
-    atom hits, subagent completion notifications (from prior turns), event
-    header + body.
+    atom hits, event header + body.
 
     ``recent_message_chars`` (>0) caps each Recent-activity message's
     rendered content with ``…[truncated]``; protects against single huge
@@ -455,9 +453,6 @@ def build_turn_prompt(
 
     if saga_block:
         _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
-
-    if subagent_block:
-        _add_labeled("Subagent updates", subagent_block)
 
     # Auto-surfaced skill block — when the turn lands on a
     # ``poller:<name>`` channel and the named poller's parent skill

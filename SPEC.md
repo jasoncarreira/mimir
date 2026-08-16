@@ -1046,9 +1046,6 @@ input is empty):
 ## Possibly relevant memories (from SAGA)
 {pre_message_saga_block — see §9.3}
 
-## Subagent updates                      # only when there are pending notifications
-{TaskNotificationMessage payloads from prior turns}
-
 ## Today's date
 {YYYY-MM-DD}
 
@@ -1493,7 +1490,7 @@ Slack and Discord bridge config is live (both implemented). Bluesky is handled b
 - `add_schedule` / `list_schedules` / `remove_schedule`.
 - In-process scheduler thread that POSTs scheduled prompts to `/event`.
 - `climber.md` (background), `researcher.md`, `critic.md` agent definitions under `home/.claude/agents/`.
-- `subagent_inbox` queue for `background=True` results — parent picks up `TaskNotificationMessage` and injects on next turn.
+- DeepAgents `task` tool with synchronous child results returned to the parent turn.
 - Parallelism smoke test: parent fans out 3 researchers in one turn, viewer shows interleaved subagent traces.
 
 ### Phase 6 — web tools (0.5 day)

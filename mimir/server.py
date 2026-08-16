@@ -360,7 +360,6 @@ _RUNTIME_APP_FIELDS = (
     "indexer",
     "saga_client",
     "sessions",
-    "subagent_inbox",
     "agent_runtime",
     "replayed_messages",
 )
@@ -408,7 +407,6 @@ def _publish_runtime(
     app["indexer"] = bundle.indexer
     app["saga_client"] = bundle.saga_client
     app["sessions"] = bundle.sessions
-    app["subagent_inbox"] = bundle.subagent_inbox
     app["replayed_messages"] = bundle.replayed_messages
     app["agent_runtime"] = bundle
     app["agent"] = bundle.agent
