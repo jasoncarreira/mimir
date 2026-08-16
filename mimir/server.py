@@ -1069,6 +1069,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         chat_skill_registry=core.chat_skill_registry,
     )
+    web_chat.max_subscribers = config.chat_stream_max_subscribers
     channels.register(web_chat)
 
     # Inbound attachments land here; the agent reads files by path. The
