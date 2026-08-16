@@ -114,6 +114,33 @@ def test_yaml_block_scalar_body_is_masked_not_the_indicator(indicator: str) -> N
     assert out.startswith(f"password: {indicator}")
 
 
+# Blank lines are part of a block scalar, and a header may carry a comment.
+# Ending the body at the first blank line masks the opening fragment and leaves
+# the rest — the log then reads as scrubbed while holding half the credential.
+@pytest.mark.parametrize(
+    "header",
+    ["password: |", "password: >-", "password: | # supplied externally"],
+)
+@pytest.mark.parametrize("gap", ["\n", "\n\n", "\n   \n"])
+def test_yaml_block_scalar_masks_every_fragment_across_blank_lines(
+    header: str, gap: str
+) -> None:
+    first = "aa" + "-secret-fragment"
+    second = "bb" + "-secret-fragment"
+    out = redact_text(f"{header}\n  {first}\n{gap}  {second}\n")
+
+    assert first not in out
+    assert second not in out
+
+
+def test_yaml_block_scalar_leaves_the_following_key_intact() -> None:
+    secret = "cc" + "-secret-fragment"
+    out = redact_text(f"password: |\n  {secret}\n\nnextkey: plain\n")
+
+    assert secret not in out
+    assert out.endswith("\nnextkey: plain\n")
+
+
 def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:
     assert redact_text("sk-ant-abc123def456ghi789") == "[REDACTED]"
     assert redact_text("Authorization: Bearer abcdef123456") == (

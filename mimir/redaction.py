@@ -61,11 +61,18 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # as if it were a bare value prints ``password: [REDACTED]`` directly above
     # an untouched credential, which is worse than not matching at all because
     # the log then reads as though it had been scrubbed.
+    # The body runs to the first line that is neither indented nor blank. Blank
+    # lines are part of a block scalar, so requiring every line to be non-blank
+    # ends the match at the first one and leaves the remainder of a multiline
+    # credential in the log — partially masked, which still reads as scrubbed.
+    # A blank run is only absorbed when another indented line follows, so a
+    # blank line separating the block from the next key is left alone.
     re.compile(
         r"(?im)^([ \t]*[\"']?[A-Za-z0-9_.-]*"
         r"(?:token|api[_-]?key|password|passwd|secret)[\"']?"
-        r"[ \t]*:[ \t]*[|>][-+0-9]*[ \t]*\n)"
-        r"((?:[ \t]+\S.*(?:\n|$))+)"
+        r"[ \t]*:[ \t]*[|>][-+0-9]*[ \t]*(?:\#[^\n]*)?\n)"
+        r"([ \t]+\S.*(?:\n|$)"
+        r"(?:(?:[ \t]*\n)+(?=[ \t]+\S)|[ \t]+\S.*(?:\n|$))*)"
     ),
     # Bare (unquoted) values. The alphabet stops at common delimiters so the
     # regex doesn't eat the rest of the line, and a block-scalar indicator is
