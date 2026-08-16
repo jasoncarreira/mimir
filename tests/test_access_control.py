@@ -1997,7 +1997,7 @@ def test_auth_context_service_identity(tmp_path: Path) -> None:
         people:
           - canonical: mcp-service
             aliases: [mcp-1]
-            access: {roles: [service], is_service: true}
+            access: {is_service: true}
         """,
     )
 
@@ -2006,7 +2006,7 @@ def test_auth_context_service_identity(tmp_path: Path) -> None:
 
     assert auth_ctx is not None
     assert auth_ctx.is_service is True
-    assert "service" in auth_ctx.roles
+    assert auth_ctx.roles == ()
 
 
 def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) -> None:
@@ -2017,10 +2017,10 @@ def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) 
         people:
           - canonical: external-service
             aliases: [service-external]
-            access: {roles: [service], is_service: true}
+            access: {is_service: true}
           - canonical: trusted-service-user
             aliases: [service-trusted]
-            access: {roles: [service, user], is_service: true}
+            access: {roles: [user], is_service: true}
         """,
     )
 
@@ -2029,10 +2029,10 @@ def test_service_only_identity_does_not_get_user_inbound_access(tmp_path: Path) 
 
     assert external.allowed is False
     assert external.reason == DenialReason.USER_NOT_ALLOWLISTED
-    assert external.roles == ("service",)
+    assert external.roles == ()
     assert trusted.allowed is True
     assert trusted.status == AccessStatus.USER_ALLOWED
-    assert trusted.roles == ("service", "user")
+    assert trusted.roles == ("user",)
 
 
 def test_http_ingress_extra_key_blocks_service_grant() -> None:

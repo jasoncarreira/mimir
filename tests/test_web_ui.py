@@ -2346,6 +2346,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
         "https://example.invalid/hook?api_key=sk-public-admin-config-value",
     )
     monkeypatch.setenv("MIMIR_PUBLIC_BARE_VALUE", "ghp_adminconfigbaretoken")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "private-operator-channel")
     config = Config.from_env()
     config.resend_nudge_channels = ("channel-with-secret-shaped-value",)
     config.file_tool_roots = ((str(tmp_path / "private-extra-root"), "ro"),)
@@ -2397,6 +2398,8 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert env_by_name["ANTHROPIC_API_KEY"]["present"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["secret"] is True
     assert env_by_name["ANTHROPIC_API_KEY"]["value"] == "[REDACTED]"
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["secret"] is True
+    assert env_by_name["MIMIR_OPERATOR_ALERT_CHANNEL"]["value"] == "[REDACTED]"
     serialized = json.dumps(data)
     assert "sk-ant-admin-config-secret" not in serialized
     assert "nested-admin-config-secret" not in serialized
@@ -2406,6 +2409,7 @@ async def test_api_v1_admin_config_requires_auth_and_redacts_env(
     assert "ghp_adminconfigbaretoken" not in serialized
     assert "channel-with-secret-shaped-value" not in serialized
     assert "private-extra-root" not in serialized
+    assert "private-operator-channel" not in serialized
     assert data["raw_config"]["anthropic_api_key"] == "[REDACTED]"
     assert data["raw_config"]["mcp_servers"][0]["env"]["API_KEY"] == "[REDACTED]"
     assert (

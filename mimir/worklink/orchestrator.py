@@ -1983,7 +1983,7 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                shutil.rmtree(checkout)
+                shutil.rmtree(checkout.parent)
 
 
 def _cleanup_checkout_after_transition(

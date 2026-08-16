@@ -323,8 +323,12 @@ async def execute_contained(
             values = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
         except TimeoutError:
             timed_out = True
-            await client.cancel(identifier)
-            values = await collect_task
+            try:
+                await client.cancel(identifier)
+            except Exception:
+                pass
+            finally:
+                values = await collect_task
     except asyncio.CancelledError:
         await asyncio.shield(client.cancel(identifier))
         try:
