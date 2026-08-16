@@ -227,8 +227,8 @@ async def bash_async(
     """Args:
         command: The command to spawn. User/admin calls run via ``bash -lc``;
             trusted-service calls execute one server-authorized argv directly.
-        session_id: Optional saga session id, threaded onto the
-            completion event so it routes back to the right channel.
+        session_id: Optional saga session id used only to confirm the caller's
+            active turn. It cannot select a different completion channel.
         cwd: Working directory for the command. Trusted-service calls require an
             authorized absolute directory and execute with its resolved path.
         mimir_direct_argv: Server-injected exact argv for trusted-service calls.
@@ -238,35 +238,51 @@ async def bash_async(
     if not command or not command.strip():
         return "bash_async failed: command is required"
 
-    # Resolve channel for completion-event routing. We prefer the
-    # turn-current channel (set by Agent.run_turn) when available; if
-    # we can't find one, the job still spawns but the completion
-    # event fires on no channel (operator-visible via events.jsonl).
-    # chainlink #392: resolve the routing channel via the purpose-built
-    # three-level chain (saga_session_id -> single_active -> contextvar). The
-    # old _STATE["current_channel_id"] fallback was DEAD — the S2-1 fix moved the
-    # per-turn channel to a ContextVar (_current_channel_id_var) this path never
-    # read — and get_current_turn() alone returns stale None under SDK/MCP
-    # forked-task dispatch. The result was channel_id=None: the dup-spawn guard
-    # below was silently skipped and the shell_job_complete wake-up was dropped
-    # (_on_shell_job_complete early-returns on a None channel).
-    from .._context import resolve_active_ctx
+    # Resolve the caller's channel independently of the model-provided session
+    # id. The session id may identify the caller's turn, but must never select
+    # where completion output is delivered.
+    # The runtime auth carrier and dispatcher ContextVar survive the SDK/MCP
+    # forked-task path and are server-controlled. get_current_turn() remains the
+    # direct-call fallback used by tests and in-process handlers.
+    from .._context import get_current_turn, resolve_active_ctx
     from .registry import _current_channel_id_var
-    ctx, _resolution = resolve_active_ctx({"session_id": session_id})
-    channel_id: str | None = None
-    if ctx is not None:
-        channel_id = getattr(ctx, "channel_id", None)
-    if not channel_id:
-        # Live per-task channel id (set by the dispatcher), replacing the dead
-        # _STATE key.
-        channel_id = (_current_channel_id_var.get() or "").strip() or None
-
-    auth_context = (
+    runtime_auth = (
         runtime.context
         if runtime is not None and isinstance(runtime.context, AuthContext)
-        else getattr(ctx, "auth_context", None)
+        else None
     )
-    if not isinstance(auth_context, AuthContext) or auth_context.channel_id != channel_id:
+    current_ctx = get_current_turn()
+    channel_id = (
+        runtime_auth.channel_id
+        if runtime_auth is not None
+        else (_current_channel_id_var.get() or "").strip() or None
+    )
+    if channel_id is None and current_ctx is not None:
+        channel_id = getattr(current_ctx, "channel_id", None)
+
+    if channel_id is None:
+        # Preserve the deliberate in-process behavior: callers without a
+        # resolvable delivery channel may still spawn a job. In that case the
+        # model-provided session id selects neither routing nor authorization.
+        ctx = current_ctx
+        resolution = "contextvar" if ctx is not None else "missing"
+    else:
+        ctx, resolution = resolve_active_ctx(
+            {"session_id": session_id}, caller_channel_id=channel_id,
+        )
+    if resolution == "channel_mismatch":
+        return (
+            "bash_async refused: session_id belongs to a different channel; "
+            "use the current turn's session_id"
+        )
+
+    auth_context = runtime_auth or getattr(ctx, "auth_context", None)
+    if isinstance(auth_context, AuthContext) and auth_context.channel_id != channel_id:
+        return (
+            "bash_async refused: authorization context does not belong to the "
+            "caller's channel"
+        )
+    if not isinstance(auth_context, AuthContext):
         auth_context = None
 
     # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent

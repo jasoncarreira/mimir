@@ -232,7 +232,11 @@ def active_pr_checkout_lease_paths() -> set[Path]:
     return paths
 
 
-def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]:
+def resolve_active_ctx(
+    args: dict[str, Any],
+    *,
+    caller_channel_id: str | None = None,
+) -> tuple["TurnContext | None", str]:
     """Standard three-level lookup chain for MCP tool handlers running
     on a forked task that can't see ``_current_turn``.
 
@@ -246,8 +250,13 @@ def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]
     3. ``get_current_turn()`` contextvar — works for the direct-handler-
        call test path. Won't fire under SDK dispatch.
 
+    When ``caller_channel_id`` is supplied, every candidate must belong to that
+    channel. An explicit SAGA session belonging to another channel fails with
+    ``"channel_mismatch"`` instead of falling through to a heuristic.
+
     Returns ``(ctx, resolution_path)`` where resolution_path is one of
-    ``"saga_session_id" | "single_active" | "contextvar" | "missing"``.
+    ``"saga_session_id" | "single_active" | "contextvar" | "channel_mismatch"
+    | "missing"``.
     The path is logged via per-tool ``<tool>_ctx_resolution`` events so
     the rate of each path is visible in events.jsonl.
 
@@ -258,11 +267,17 @@ def resolve_active_ctx(args: dict[str, Any]) -> tuple["TurnContext | None", str]
     sid = args.get("session_id") if args else None
     ctx = get_turn_by_saga_session_id(sid) if sid else None
     if ctx is not None:
+        if caller_channel_id is not None and ctx.channel_id != caller_channel_id:
+            return None, "channel_mismatch"
         return ctx, "saga_session_id"
     ctx = get_only_active_turn()
-    if ctx is not None:
+    if ctx is not None and (
+        caller_channel_id is None or ctx.channel_id == caller_channel_id
+    ):
         return ctx, "single_active"
     ctx = get_current_turn()
-    if ctx is not None:
+    if ctx is not None and (
+        caller_channel_id is None or ctx.channel_id == caller_channel_id
+    ):
         return ctx, "contextvar"
     return None, "missing"
