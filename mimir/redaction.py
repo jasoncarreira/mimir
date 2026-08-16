@@ -88,8 +88,12 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+# ``indent`` spans everything left of the key, including any sequence-entry
+# dashes: in ``  - password: |`` the key's column is what bounds the body, and
+# YAML counts the ``- `` as part of the nested mapping's indentation. Nested
+# sequences (``- - password: |``) repeat the prefix.
 _BLOCK_SCALAR_HEADER = re.compile(
-    r"(?i)^(?P<indent>[ \t]*)"
+    r"(?i)^(?P<indent>[ \t]*(?:-[ \t]+)*)"
     r"[\"']?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)[\"']?"
     r"[ \t]*:[ \t]*[|>](?P<mods>[-+0-9]*)[ \t]*(?:\#.*)?$"
 )

@@ -159,7 +159,7 @@ def test_yaml_block_scalar_body_may_begin_after_blank_lines(lead: str) -> None:
 )
 @pytest.mark.parametrize("lead", ["", "\n", "\n\n", "   \n"])
 @pytest.mark.parametrize("gap", ["", "\n", "  \n"])
-@pytest.mark.parametrize("key_indent", ["", "  ", "    "])
+@pytest.mark.parametrize("key_indent", ["", "  ", "    ", "  - ", "  - - "])
 def test_yaml_block_scalar_grammar_sweep_leaks_no_fragment(
     header: str, lead: str, gap: str, key_indent: str
 ) -> None:
@@ -172,8 +172,10 @@ def test_yaml_block_scalar_grammar_sweep_leaks_no_fragment(
     """
     first = "ee" + "-frag-one"
     second = "ff" + "-frag-two"
-    body = key_indent + "    "
-    sibling = f"{key_indent}sibling: must-survive"
+    # A sequence entry's ``- `` counts toward the nested mapping's indentation,
+    # so the key's COLUMN — not the leading whitespace — bounds the body.
+    body = " " * (len(key_indent) + 4)
+    sibling = " " * len(key_indent) + "sibling: must-survive"
     ancestor = "root: must-survive"
     out = redact_text(
         f"{key_indent}{header}\n{lead}{body}{first}\n{gap}{body}{second}\n"
@@ -204,6 +206,30 @@ def test_explicit_indentation_indicator_bounds_the_body() -> None:
 
     assert "deep-secret" not in out
     assert "sibling: keep" in out
+
+
+def test_block_scalar_in_a_sequence_entry_is_masked() -> None:
+    """``- password: |`` is a legal mapping-in-sequence and common config shape."""
+    out = redact_text(
+        "credentials:\n  - password: |\n      secret-body\n"
+        "  - name: keep-me\nroot: keep-root\n"
+    )
+
+    assert "secret-body" not in out
+    assert "name: keep-me" in out
+    assert "keep-root" in out
+
+
+def test_block_scalar_in_a_nested_sequence_entry_is_masked() -> None:
+    out = redact_text(
+        "a:\n  - - password: |\n        deep-secret\n    - name: keep-inner\n"
+        "  - top: keep-top\nz: keep-z\n"
+    )
+
+    assert "deep-secret" not in out
+    assert "name: keep-inner" in out
+    assert "top: keep-top" in out
+    assert "keep-z" in out
 
 
 def test_yaml_block_scalar_leaves_the_following_key_intact() -> None:
