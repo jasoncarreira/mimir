@@ -4742,6 +4742,26 @@ def test_overrides_apply_cron_priority_and_budget(tmp_path: Path):
     assert p.command == "echo"
 
 
+def test_override_standard_sunday_cron_is_accepted_and_builds_sunday_trigger(
+    tmp_path: Path,
+):
+    from mimir.scheduler import _cron_trigger_from_standard_crontab
+
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  cron: '0 4 * * 7'\n"
+    ))
+
+    [poller] = discover_pollers(skills, overrides_path=ov)
+    trigger = _cron_trigger_from_standard_crontab(poller.cron)
+
+    assert poller.cron == "0 4 * * 7"
+    assert str(trigger.fields[4]) == "sun"
+
+
 def test_discover_parses_manifest_budget(tmp_path: Path):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
