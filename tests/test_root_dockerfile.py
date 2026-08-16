@@ -94,6 +94,21 @@ def test_apt_layer_keeps_cache_hygiene() -> None:
     assert "rm -rf /var/lib/apt/lists/*" in text
 
 
+def test_s6_release_downloads_retry_transient_http_errors() -> None:
+    """A transient GitHub release error must not fail the published image build."""
+    text = _text()
+    block = re.search(
+        r'base="https://github.com/just-containers/s6-overlay(?P<body>[\s\S]*?)tar -C /',
+        text,
+    )
+    assert block is not None, "could not find the s6-overlay download layer"
+    body = block.group("body")
+    assert "--retry 5" in body
+    assert "--retry-all-errors" in body
+    assert body.count("curl ${curl_args}") == 2
+
+
+
 def test_claude_code_build_arg_installs_only_adapter_extra() -> None:
     text = _text()
     assert "ARG MIMIR_ENABLE_CLAUDE_CODE=0" in text
