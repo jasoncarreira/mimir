@@ -16,11 +16,11 @@ import subprocess
 import sys
 from typing import Any, Callable, Sequence
 
+from .identities import MIMIR_UID, WORKLINK_GID
+
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
-MIMIR_UID = 1001
-WORKLINK_GID = 1002
 _ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")

@@ -105,6 +105,42 @@ async def test_client_authenticates_root_before_sending_fds(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
+async def test_client_reports_executor_peer_uid_refusal(tmp_path: Path, monkeypatch) -> None:
+    path = _issued(tmp_path)
+
+    class Peer:
+        def connect(self, path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, *args: object) -> None:
+            pass
+
+        def recv(self, size: int) -> bytes:
+            return json.dumps({
+                "id": None,
+                "error": "worker executor refused peer uid 1000; required mimir uid is 1001",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    with _authorization(path) as checkout:
+        with pytest.raises(RuntimeError, match="peer uid 1000.*mimir uid is 1001"):
+            await WorkerClient(checkout).launch(
+                local_checkout=path,
+                argv=["true"],
+                env={},
+                identifier=str(uuid.uuid4()),
+                timeout_s=1,
+            )
+
+
+@pytest.mark.asyncio
 async def test_worker_process_requires_identity_bound_terminal_result(monkeypatch) -> None:
     identifier = str(uuid.uuid4())
 
@@ -386,12 +422,16 @@ def test_executor_requires_positive_integer_issue_and_attempt(
 
 def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path: Path) -> None:
     dispatched: list[object] = []
+    responses: list[dict[str, object]] = []
 
     class Connection:
         closed = False
 
         def getsockopt(self, *args: object) -> bytes:
             return struct.pack("3i", 12, 999, 999)
+
+        def send(self, payload: bytes) -> None:
+            responses.append(json.loads(payload))
 
         def close(self) -> None:
             self.closed = True
@@ -421,6 +461,10 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
         worker_exec.serve(tmp_path / "socket")
     assert connection.closed
     assert dispatched == []
+    assert responses == [{
+        "id": None,
+        "error": "worker executor refused peer uid 999; required mimir uid is 1001",
+    }]
 
 
 def test_drop_worker_uses_irreversible_identity_sequence(monkeypatch) -> None:

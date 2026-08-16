@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from .checkout import _normalize_checkout_fd
+from .identities import MIMIR_UID, WORKLINK_GID, WORKLINK_UID
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -27,9 +28,6 @@ from .worker_client import (
     _validate_identifier,
 )
 
-MIMIR_UID = 1001
-WORKLINK_UID = 1002
-WORKLINK_GID = 1002
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
@@ -551,6 +549,16 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
             ),
         )
         if uid != MIMIR_UID:
+            try:
+                _send(connection, {
+                    "id": None,
+                    "error": (
+                        f"worker executor refused peer uid {uid}; "
+                        f"required mimir uid is {MIMIR_UID}"
+                    ),
+                })
+            except OSError:
+                pass
             connection.close()
             continue
         threading.Thread(target=handle_connection, args=(connection,), daemon=True).start()

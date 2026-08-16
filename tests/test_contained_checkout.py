@@ -318,9 +318,13 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     scope_identity = _identity(scope)
     boundary_identity = _identity(boundary)
     checkout_identity = _identity(issued.path)
-    assert ("chown", scope_identity, (1001, 1001)) in mutations
-    assert ("chown", boundary_identity, (1001, 1002)) in mutations
-    assert ("fchown", checkout_identity, (1001, 1002)) in mutations
+    assert ("chown", scope_identity, (checkout.MIMIR_UID, checkout.MIMIR_UID)) in mutations
+    assert (
+        "chown", boundary_identity, (checkout.MIMIR_UID, checkout.WORKLINK_GID)
+    ) in mutations
+    assert (
+        "fchown", checkout_identity, (checkout.MIMIR_UID, checkout.WORKLINK_GID)
+    ) in mutations
     assert ("fchmod", checkout_identity, 0o2770) in mutations
     issued.close()
 
