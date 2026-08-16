@@ -159,15 +159,51 @@ def test_yaml_block_scalar_body_may_begin_after_blank_lines(lead: str) -> None:
 )
 @pytest.mark.parametrize("lead", ["", "\n", "\n\n", "   \n"])
 @pytest.mark.parametrize("gap", ["", "\n", "  \n"])
+@pytest.mark.parametrize("key_indent", ["", "  ", "    "])
 def test_yaml_block_scalar_grammar_sweep_leaks_no_fragment(
-    header: str, lead: str, gap: str
+    header: str, lead: str, gap: str, key_indent: str
 ) -> None:
+    """Sweep both directions: the secret must go AND the record must survive.
+
+    A redactor that erases surrounding configuration is a different defect from
+    one that leaks, and asserting only the first hid it through three rounds of
+    review. Body membership is relative to the scalar header's own indentation,
+    so a same-indent sibling and every ancestor key must be untouched.
+    """
     first = "ee" + "-frag-one"
     second = "ff" + "-frag-two"
-    out = redact_text(f"{header}\n{lead}  {first}\n{gap}  {second}\n")
+    body = key_indent + "    "
+    sibling = f"{key_indent}sibling: must-survive"
+    ancestor = "root: must-survive"
+    out = redact_text(
+        f"{key_indent}{header}\n{lead}{body}{first}\n{gap}{body}{second}\n"
+        f"{sibling}\n{ancestor}\n"
+    )
 
     assert first not in out
     assert second not in out
+    assert sibling in out
+    assert ancestor in out
+
+
+def test_nested_block_scalar_preserves_same_indent_sibling() -> None:
+    """A nested scalar must not swallow keys up to the next column-zero line."""
+    out = redact_text(
+        "a:\n  b:\n    password: |\n      s3cret-here\n"
+        "    peer: keep-me\n  c: keep-c\nd: keep-d\n"
+    )
+
+    assert "s3cret-here" not in out
+    assert "peer: keep-me" in out
+    assert "c: keep-c" in out
+    assert "d: keep-d" in out
+
+
+def test_explicit_indentation_indicator_bounds_the_body() -> None:
+    out = redact_text("config:\n  password: |2\n    deep-secret\n  sibling: keep\n")
+
+    assert "deep-secret" not in out
+    assert "sibling: keep" in out
 
 
 def test_yaml_block_scalar_leaves_the_following_key_intact() -> None:
