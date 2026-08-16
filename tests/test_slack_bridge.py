@@ -403,6 +403,16 @@ async def test_react_calls_reactions_add(bridge_with_fake_app):
 
 
 @pytest.mark.asyncio
+async def test_react_resolves_unicode_glyph(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+
+    ok = await bridge.react("slack-C01ABC", "1234567890.000001", "👍")
+
+    assert ok is True
+    assert sent[0]["reaction"] == "thumbsup"
+
+
+@pytest.mark.asyncio
 async def test_react_rejects_unknown_channel_id(bridge_with_fake_app):
     bridge, _, _ = bridge_with_fake_app
     ok = await bridge.react("discord-foo", "1.0", "thumbsup")
@@ -674,6 +684,13 @@ async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
     ACK loss. The bridge must enqueue exactly once for the same ts,
     no matter how many times Slack redelivers."""
     bridge, enqueued, _ = bridge_with_fake_app
+
+    async def yielding_user_info(user_id: str):
+        del user_id
+        await asyncio.sleep(0)
+        return {"real_name": "Alice", "display_name": None, "email": None}
+
+    bridge._user_info_cached = yielding_user_info  # type: ignore[method-assign]
     event = {
         "user": "U05ALICE",
         "channel": "C01ENG",
@@ -681,9 +698,8 @@ async def test_on_message_dedupes_socket_mode_redelivery(bridge_with_fake_app):
         "text": "hello mimir",
         "ts": "1234567890.000042",
     }
-    await bridge._on_message(event)
-    await bridge._on_message(event)  # simulated redelivery
-    await bridge._on_message(event)  # and again
+    await asyncio.gather(bridge._on_message(event), bridge._on_message(event))
+
     assert len(enqueued) == 1
 
 
