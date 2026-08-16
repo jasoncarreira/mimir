@@ -467,15 +467,16 @@ function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
 }
 
 function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  const { activeTab } = useRouteState(surface);
+  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
+  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
   if (surface.id === "state-memory") {
     return <StateMemoryRoute surface={surface} />;
   }
   if (surface.id === "chat") return <ChatRoute surface={surface} />;
 
-  const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
-  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
-  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
 
   if (surface.id === "saga") {
     return <SagaDashboard />;
