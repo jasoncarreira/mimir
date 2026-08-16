@@ -410,7 +410,7 @@ def test_stop_clears_state_claim_and_label_and_missing_is_noop(tmp_path: Path) -
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
-def test_stop_refuses_reused_pid_without_mutation(tmp_path: Path) -> None:
+def test_stop_clears_state_for_reused_pid_without_signalling(tmp_path: Path) -> None:
     # PID-reuse refusal depends on comparing Linux /proc process birth markers.
     calls: list[list[str]] = []
     _state(
@@ -432,8 +432,9 @@ def test_stop_refuses_reused_pid_without_mutation(tmp_path: Path) -> None:
 
     assert not result.stopped
     assert result.reason == "no live run"
+    assert result.state_cleared
     assert calls == []
-    assert load_run_state(tmp_path, 9) is not None
+    assert load_run_state(tmp_path, 9) is None
 
 
 def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
@@ -446,6 +447,20 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
         started_at=now,
     )
     _state(tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90))
+    shim_state = WorklinkRunState(
+        **{
+            **_state(
+                tmp_path,
+                12,
+                999_999_998,
+                ticks=1,
+                started_at=now - timedelta(seconds=60),
+            ).to_json(),
+            "handle_identifier": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "shim_pid": 999_999_998,
+        }
+    )
+    save_run_state(tmp_path, shim_state)
     events: list[tuple[str, dict[str, object]]] = []
 
     alive = reconcile_run_states(
@@ -457,9 +472,14 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
     assert [state.issue_id for state in alive] == [10]
     assert load_run_state(tmp_path, 10) is not None
     assert load_run_state(tmp_path, 11) is None
+    assert load_run_state(tmp_path, 12) is None
     assert events == [
         (
             "worklink_run_orphaned",
             {"issue_id": 11, "attempt": 2, "elapsed_s": 90.0, "reaped": True},
-        )
+        ),
+        (
+            "worklink_run_orphaned",
+            {"issue_id": 12, "attempt": 2, "elapsed_s": 60.0, "reaped": True},
+        ),
     ]

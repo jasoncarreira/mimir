@@ -91,6 +91,7 @@ async def test_execute_contained_returns_only_a_capped_collected_value(
     assert result.stderr_dropped_bytes == 2
     assert client.cancelled == ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
     assert client.launched[0]["local_checkout"] == Capability.path
+    assert client.launched[0]["timeout_s"] == 1
 
 
 @pytest.mark.asyncio
