@@ -579,7 +579,7 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         worker_exec,
         "_execution_checkout_fd",
-        lambda _command, anchored_fd, _home: os.dup(anchored_fd),
+        lambda _command, anchored_fd, _home, **_kwargs: os.dup(anchored_fd),
     )
     monkeypatch.setattr(worker_exec.subprocess, "Popen", lambda *args, **kwargs: process)
 
