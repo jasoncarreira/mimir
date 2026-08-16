@@ -184,6 +184,8 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if "error" in response:
                 error = str(response["error"])
+                # Executors predating the identity operation can only signal drift
+                # through their exact-contract error; keep that legacy fallback.
                 if "exact contract" in error or "stale root executor image" in error:
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)

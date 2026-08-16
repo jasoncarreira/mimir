@@ -435,6 +435,26 @@ def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
     assert stat.S_IMODE(copied_runner.stat().st_mode) & 0o007 == 0
 
 
+def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
+    request = {
+        "version": 1,
+        "op": "launch",
+        "executor_identity": "stale-controller-protocol",
+        "id": str(uuid.uuid4()),
+        "issue": 41,
+        "attempt": 2,
+        "device": 1,
+        "inode": 2,
+        "argv": ["true"],
+        "env": {},
+        "projections": [],
+        "timeout_s": 30,
+    }
+
+    with pytest.raises(RuntimeError, match=worker_exec._STALE_EXECUTOR_DIAGNOSTIC):
+        worker_exec._handle_launch(object(), request, [-1, -1, -1])
+
+
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
     identifier = str(uuid.uuid4())
     payload = json.dumps({"version": 1, "op": "launch", "id": identifier, "uid": 0}).encode()
