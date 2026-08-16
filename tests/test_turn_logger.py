@@ -1010,7 +1010,7 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
                 # A block scalar with an internal blank line and a header
                 # comment: every fragment must go, not just the first.
                 f"password: | # supplied externally\n"
-                f"  {block_secret}\n\n  {block_secret_tail}\n"
+                f"\n  {block_secret}\n\n  {block_secret_tail}\n"
             ),
         }],
         total_cost_usd=0.0123,

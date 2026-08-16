@@ -133,6 +133,43 @@ def test_yaml_block_scalar_masks_every_fragment_across_blank_lines(
     assert second not in out
 
 
+# The body may also BEGIN after blank lines. Requiring the first body line to
+# be indented and non-blank misses such a scalar entirely — the block rule does
+# not fire and the bare-value guard correctly declines the indicator, so the
+# credential is left wholly unredacted.
+@pytest.mark.parametrize("lead", ["\n", "\n\n", "   \n", "\t\n"])
+def test_yaml_block_scalar_body_may_begin_after_blank_lines(lead: str) -> None:
+    secret = "dd" + "-secret-fragment"
+    out = redact_text(f"password: |\n{lead}  {secret}\n")
+
+    assert secret not in out
+    assert "[REDACTED]" in out
+
+
+# Sweep the block-scalar grammar rather than adding one case per report: three
+# rounds of review found three separate holes in this one pattern, each a legal
+# YAML shape the previous fix had not considered.
+@pytest.mark.parametrize(
+    "header",
+    [
+        "password: |", "password: >", "password: |-", "password: >+",
+        "password: |2", "password: | # supplied externally",
+        "PASSWORD: |", '"api_key": |',
+    ],
+)
+@pytest.mark.parametrize("lead", ["", "\n", "\n\n", "   \n"])
+@pytest.mark.parametrize("gap", ["", "\n", "  \n"])
+def test_yaml_block_scalar_grammar_sweep_leaks_no_fragment(
+    header: str, lead: str, gap: str
+) -> None:
+    first = "ee" + "-frag-one"
+    second = "ff" + "-frag-two"
+    out = redact_text(f"{header}\n{lead}  {first}\n{gap}  {second}\n")
+
+    assert first not in out
+    assert second not in out
+
+
 def test_yaml_block_scalar_leaves_the_following_key_intact() -> None:
     secret = "cc" + "-secret-fragment"
     out = redact_text(f"password: |\n  {secret}\n\nnextkey: plain\n")

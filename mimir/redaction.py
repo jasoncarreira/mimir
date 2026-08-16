@@ -71,8 +71,8 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?im)^([ \t]*[\"']?[A-Za-z0-9_.-]*"
         r"(?:token|api[_-]?key|password|passwd|secret)[\"']?"
         r"[ \t]*:[ \t]*[|>][-+0-9]*[ \t]*(?:\#[^\n]*)?\n)"
-        r"([ \t]+\S.*(?:\n|$)"
-        r"(?:(?:[ \t]*\n)+(?=[ \t]+\S)|[ \t]+\S.*(?:\n|$))*)"
+        r"((?:(?:[ \t]*\n)+(?=[ \t]+\S)|[ \t]+\S.*(?:\n|$))*"
+        r"[ \t]+\S.*(?:\n|$))"
     ),
     # Bare (unquoted) values. The alphabet stops at common delimiters so the
     # regex doesn't eat the rest of the line, and a block-scalar indicator is
