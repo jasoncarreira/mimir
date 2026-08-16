@@ -2373,6 +2373,24 @@ time.sleep(120)
 
 
 
+def _live_process_group_members(process_group: int) -> list[int]:
+    """PIDs still alive in ``process_group``, excluding zombies.
+
+    Fields after the parenthesized command begin with state, parent PID, and
+    process-group ID. Zombies are already dead and may await PID 1.
+    """
+    members: list[int] = []
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            stat_text = stat_path.read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        fields = stat_text[stat_text.rfind(")") + 2:].split()
+        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == process_group:
+            members.append(int(stat_path.parent.name))
+    return members
+
+
 @pytest.mark.asyncio
 async def test_run_poller_timeout_kills_child_holding_pipes(
     tmp_path: Path, home: Path,
@@ -2421,17 +2439,22 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 
     child_pgid = int((skill_dir / "child.pgid").read_text())
 
-    live_group_members: list[int] = []
-    for stat_path in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            stat_text = stat_path.read_text()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        # Fields after the parenthesized command begin with state, parent PID,
-        # and process-group ID. Zombies are already dead and may await PID 1.
-        fields = stat_text[stat_text.rfind(")") + 2:].split()
-        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == child_pgid:
-            live_group_members.append(int(stat_path.parent.name))
+    # Poll rather than sampling once. ``run_poller`` returns after killing the
+    # group, but ``proc.wait()`` reaps only the direct child — a descendant
+    # killed microseconds earlier is neither gone nor yet a zombie, so a single
+    # scan races the kernel. On an idle runner the window closes before the
+    # scan; under load (a build sandbox sharing a box with other builds) it does
+    # not, and this assertion failed spuriously — which sent eight Worklink
+    # executors editing ``mimir/pollers.py`` to satisfy it (chainlink #1258).
+    #
+    # This still asserts the teardown property: a group that genuinely retains a
+    # live member stays non-empty until the deadline expires and then fails.
+    deadline = time.monotonic() + 5.0
+    while True:
+        live_group_members = _live_process_group_members(child_pgid)
+        if not live_group_members or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.05)
 
     assert live_group_members == []
 
