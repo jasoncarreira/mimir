@@ -1982,6 +1982,7 @@ class SagaStore:
         def _precompute_embeddings():
             obs_embeds: list[tuple[bytes, str, str, int] | None] = []
             triple_vecs: dict[str, tuple[bytes, str, str, int]] = {}
+            triple_embed_errors: dict[str, Exception] = {}
             for result in results:
                 content = (result.get("content") or "").strip()
                 if not content:
@@ -1989,6 +1990,7 @@ class SagaStore:
                     continue
                 obs_embeds.append(_embed_text_sync(content))
                 for t in result.get("triples", []):
+                    text = None
                     try:
                         text = _triple_text(
                             t["subject"],
@@ -1999,10 +2001,14 @@ class SagaStore:
                             continue
                         triple_vecs[text] = _embed_text_sync(text)
                     except Exception as exc:  # noqa: BLE001
+                        if text is not None:
+                            triple_embed_errors[text] = exc
                         log.warning("triple embed precompute failed: %s", exc)
-            return obs_embeds, triple_vecs
+            return obs_embeds, triple_vecs, triple_embed_errors
 
-        obs_embeds, triple_vecs = await asyncio.to_thread(_precompute_embeddings)
+        obs_embeds, triple_vecs, triple_embed_errors = await asyncio.to_thread(
+            _precompute_embeddings
+        )
 
         def _lookup_triple_embed(text: str) -> tuple[bytes, str, str, int]:
             """Pure dict lookup over the precomputed vectors — never does
@@ -2011,6 +2017,8 @@ class SagaStore:
             store_triples to its existing store-unembedded fallback."""
             vec = triple_vecs.get(text)
             if vec is None:
+                if text in triple_embed_errors:
+                    raise triple_embed_errors[text]
                 raise RuntimeError(f"no precomputed embedding for triple text {text!r}")
             return vec
 

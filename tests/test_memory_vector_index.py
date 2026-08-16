@@ -162,6 +162,25 @@ def test_add_before_build_is_noop(conn):
     assert idx.total_vectors == 0
 
 
+def test_add_after_empty_build_initializes_index(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+
+    idx.add("a1", _vec_bytes([1.0, 0.0, 0.0]))
+
+    assert idx.total_vectors == 1
+    assert idx.search([1.0, 0.0, 0.0], top_k=1)[0][0] == "a1"
+
+
+def test_rebuild_if_needed_recovers_empty_built_index(conn):
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    _insert_atom_with_embedding(conn, "a1", "alpha", [1.0, 0.0, 0.0])
+
+    assert idx.rebuild_if_needed(conn) is True
+    assert idx.search([1.0, 0.0, 0.0], top_k=1)[0][0] == "a1"
+
+
 # ─── remove (soft) ───────────────────────────────────────────────────
 
 

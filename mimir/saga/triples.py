@@ -60,6 +60,7 @@ logger = logging.getLogger("mimir.saga.triples")
 MAX_SUBJECT_CHARS = 30
 MAX_OBJECT_CHARS = 30
 MIN_TERM_CHARS = 2
+_EMBED_RETRY_KEY = "_mimir_embedding_retry"
 
 
 # ─── Triple identity ─────────────────────────────────────────────────
@@ -308,8 +309,9 @@ def store_triples(
     embed_fn: TripleEmbedFn | None = None,
     evidence_ids: list[str] | None = None,
 ) -> list[str]:
-    """Insert a batch of triples. Returns the triple IDs that were
-    newly inserted (skips ones already present by content-hash).
+    """Insert a batch of triples. Returns the triple IDs that were newly
+    inserted. Existing content-hash matches still run idempotent world-state
+    and embedding-recovery side effects.
 
     ``embed_fn`` is optional — pass None to skip embeddings (the
     retrieval pathway will exclude un-embedded rows). When provided,
@@ -341,56 +343,92 @@ def store_triples(
     for t in triples:
         triple_id = make_triple_id(t["subject"], t["predicate"], t["object"])
         existing = conn.execute(
-            "SELECT id FROM triples WHERE id = ?",
+            "SELECT embedding, embedding_dim, metadata, owner_principal, "
+            "origin_channel, origin_domain, visibility, provenance "
+            "FROM triples WHERE id = ?",
             (triple_id,),
         ).fetchone()
         if existing is not None:
             if intersected_acl is not None:
                 _update_triple_acl_on_dedup(conn, triple_id, intersected_acl)
-            continue
-        emb_bytes = None
-        emb_dim = None
-        if embed_fn is not None:
+                existing = conn.execute(
+                    "SELECT embedding, embedding_dim, metadata, owner_principal, "
+                    "origin_channel, origin_domain, visibility, provenance "
+                    "FROM triples WHERE id = ?",
+                    (triple_id,),
+                ).fetchone()
+            emb_bytes, emb_dim = existing[0], existing[1]
+            metadata = json.loads(existing[2] or "{}")
+            acl = Ownership(
+                owner_principal=existing[3],
+                origin_channel=existing[4],
+                origin_domain=existing[5],
+                visibility=existing[6],
+                provenance=json.loads(existing[7] or "{}"),
+            )
+        else:
+            emb_bytes = None
+            emb_dim = None
+            metadata = dict(t.get("metadata", {}))
+            acl = intersected_acl if intersected_acl is not None else Ownership()
+
+        retry_state = metadata.get(_EMBED_RETRY_KEY)
+        embedding_attempted = False
+        if embed_fn is not None and emb_bytes is None and retry_state != "permanent":
+            embedding_attempted = True
             try:
                 emb_bytes, _provider, _model, emb_dim = embed_fn(
                     _triple_text(t["subject"], t["predicate"], t["object"]),
                 )
+                metadata.pop(_EMBED_RETRY_KEY, None)
             except Exception as exc:
-                logger.warning("triple embed failed: %s", exc)
                 emb_bytes = None
                 emb_dim = None
-        if intersected_acl is not None:
-            acl = intersected_acl
-        else:
-            acl = Ownership()
-        conn.execute(
-            "INSERT INTO triples "
-            "(id, subject, predicate, object, source_atom_id, confidence, "
-            " valid_from, valid_until, embedding, embedding_dim, "
-            " created_at, metadata, owner_principal, origin_channel, "
-            " origin_domain, visibility, provenance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                triple_id,
-                t["subject"],
-                t["predicate"],
-                t["object"],
-                source_atom_id,
-                t.get("confidence", 1.0),
-                t.get("valid_from"),
-                t.get("valid_until"),
-                emb_bytes,
-                emb_dim,
-                now,
-                json.dumps(t.get("metadata", {})),
-                acl.owner_principal,
-                acl.origin_channel,
-                acl.origin_domain,
-                acl.visibility,
-                json.dumps(acl.provenance),
-            ),
-        )
-        inserted.append(triple_id)
+                if retry_state == "pending" or not _is_transient_embed_failure(exc):
+                    metadata[_EMBED_RETRY_KEY] = "permanent"
+                    logger.error("triple embed permanent failure: %s", exc)
+                else:
+                    metadata[_EMBED_RETRY_KEY] = "pending"
+                    logger.warning(
+                        "triple embed transient failure; one re-store retry pending: %s",
+                        exc,
+                    )
+
+        if existing is not None and embedding_attempted:
+            conn.execute(
+                "UPDATE triples SET embedding = ?, embedding_dim = ?, metadata = ? "
+                "WHERE id = ?",
+                (emb_bytes, emb_dim, json.dumps(metadata), triple_id),
+            )
+        elif existing is None:
+            conn.execute(
+                "INSERT INTO triples "
+                "(id, subject, predicate, object, source_atom_id, confidence, "
+                " valid_from, valid_until, embedding, embedding_dim, "
+                " created_at, metadata, owner_principal, origin_channel, "
+                " origin_domain, visibility, provenance) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    triple_id,
+                    t["subject"],
+                    t["predicate"],
+                    t["object"],
+                    source_atom_id,
+                    t.get("confidence", 1.0),
+                    t.get("valid_from"),
+                    t.get("valid_until"),
+                    emb_bytes,
+                    emb_dim,
+                    now,
+                    json.dumps(metadata),
+                    acl.owner_principal,
+                    acl.origin_channel,
+                    acl.origin_domain,
+                    acl.visibility,
+                    json.dumps(acl.provenance),
+                ),
+            )
+            inserted.append(triple_id)
         # Update the world-state model: end-date prior current rows
         # for the same (subj, pred), insert the new value as current.
         _update_world_state(
@@ -405,6 +443,14 @@ def store_triples(
             acl=acl,
         )
     return inserted
+
+
+def _is_transient_embed_failure(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status == 429 or isinstance(status, int) and status >= 500:
+        return True
+    message = str(exc).lower()
+    return any(token in message for token in ("429", "rate limit", "timeout", "temporar"))
 
 
 def _update_world_state(
@@ -430,17 +476,9 @@ def _update_world_state(
       first claim.
     - Else: mark the prior current row as is_current=0, set its
       valid_until to the new row's valid_from (or now() if missing),
-      then upsert the new row as is_current=1.
-
-    chainlink #304: the insert is ``INSERT OR REPLACE``, not ``OR
-    IGNORE``. When a new (different) value shares the current row's
-    ``valid_from`` — a same-timestamp change — the PK
-    (subject, predicate, valid_from) collides with the row we just
-    end-dated, and ``OR IGNORE`` silently dropped the new value, leaving
-    is_current=0 on the old row and NO current row at all. ``OR REPLACE``
-    makes the new value win. Re-assertions of the SAME value are still a
-    no-op via the ``cur_value == value`` early return above, so a triple
-    appearing from multiple atoms stays idempotent.
+      then upsert the new row as is_current=1. If both rows share that
+      timestamp, first copy the end-dated value to a nullable-key history
+      row so ``INSERT OR REPLACE`` cannot delete it.
 
     The ACL is inherited from the source triple (chainlink #884).
     """
@@ -465,10 +503,23 @@ def _update_world_state(
             "WHERE subject = ? AND predicate = ? AND valid_from = ?",
             (end_ts, now, subject, predicate, cur_valid_from),
         )
+        if cur_valid_from == new_valid_from:
+            # The legacy PK includes valid_from, so preserve the end-dated row
+            # under SQLite's distinct nullable-key slot before replacing its
+            # timestamp with the new current value.
+            conn.execute(
+                "INSERT INTO world_state "
+                "(subject, predicate, value, valid_from, valid_until, is_current, "
+                " source_triple_id, updated_at, owner_principal, origin_channel, "
+                " origin_domain, visibility, provenance) "
+                "SELECT subject, predicate, value, NULL, valid_until, is_current, "
+                "source_triple_id, updated_at, owner_principal, origin_channel, "
+                "origin_domain, visibility, provenance FROM world_state "
+                "WHERE subject = ? AND predicate = ? AND valid_from = ?",
+                (subject, predicate, cur_valid_from),
+            )
     conn.execute(
-        # OR REPLACE (not OR IGNORE): a same-valid_from value change
-        # collides with the row we just end-dated; IGNORE would drop the
-        # new value and leave no current row (chainlink #304).
+        # The same-valid_from case above preserved the old value separately.
         "INSERT OR REPLACE INTO world_state "
         "(subject, predicate, value, valid_from, valid_until, "
         " is_current, source_triple_id, updated_at, "
