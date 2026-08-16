@@ -63,13 +63,14 @@ def test_ownership_instances_do_not_share_default_provenance() -> None:
 def _owned(
     *,
     owner: str = "user:123",
+    channel: str = "channel:one",
     domain: str = "tenant:one",
     visibility: str = "public",
     provenance: dict | None = None,
 ) -> Ownership:
     return Ownership(
         owner_principal=owner,
-        origin_channel="channel:one",
+        origin_channel=channel,
         origin_domain=domain,
         visibility=visibility,
         provenance={"atom": "a1"} if provenance is None else provenance,
@@ -93,10 +94,14 @@ def test_intersect_acl_same_owner_domain_keeps_common_authority() -> None:
     [
         [_owned(owner="user:one"), _owned(owner="user:two")],
         [_owned(domain="tenant:one"), _owned(domain="tenant:two")],
+        [_owned(channel="channel:one"), _owned(channel="channel:two")],
         [_owned(owner="legacy_admin")],
         [_owned(provenance={})],
     ],
-    ids=["mixed-owner", "mixed-domain", "legacy-source", "missing-provenance"],
+    ids=[
+        "mixed-owner", "mixed-domain", "mixed-channel", "legacy-source",
+        "missing-provenance",
+    ],
 )
 def test_intersect_acl_ambiguous_inputs_fail_closed(acls: list[Ownership]) -> None:
     result = intersect_acl(acls)

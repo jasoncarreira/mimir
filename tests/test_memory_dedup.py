@@ -31,6 +31,7 @@ from mimir.saga.dedup import (
     DEFAULT_DEDUP_THRESHOLD,
     DedupResult,
     dedup_pass,
+    merge_duplicate_into_canonical,
     pick_canonical,
 )
 from mimir.saga.mark_access import AccessEvent, mark_access
@@ -180,6 +181,60 @@ def test_dedup_pass_merges_near_duplicates(conn):
         (b, a),
     ).fetchone()[0]
     assert rel == 1
+
+
+@pytest.mark.parametrize(
+    ("canonical_integrity", "duplicate_integrity"),
+    [("trusted", "untrusted"), ("untrusted", "trusted")],
+)
+def test_dedup_pass_does_not_merge_across_integrity(
+    conn, canonical_integrity, duplicate_integrity,
+):
+    embed_fn = _embed_fn_factory({
+        "canonical": [1.0, 0.0, 0.0, 0.0],
+        "duplicate": [1.0, 0.0, 0.0, 0.0],
+    })
+    canonical = store(
+        conn, "canonical", embed_fn=embed_fn,
+        integrity=canonical_integrity, topics=["canonical-topic"],
+        metadata={"tags": ["canonical-tag"]},
+    ).atom_id
+    duplicate = store(
+        conn, "duplicate", embed_fn=embed_fn,
+        integrity=duplicate_integrity, topics=["duplicate-topic"],
+        metadata={"tags": ["duplicate-tag"]},
+    ).atom_id
+    for _ in range(3):
+        mark_access(conn, [AccessEvent(atom_id=canonical, source="retrieval")])
+    conn.commit()
+
+    assert merge_duplicate_into_canonical(
+        conn,
+        canonical={"id": canonical},
+        duplicate={"id": duplicate},
+    ) is False
+
+    results = [
+        dedup_pass(
+            conn,
+            cluster_fn=make_default_cluster_fn(conn, threshold=0.92),
+            integrity=integrity,
+        )
+        for integrity in ("trusted", "untrusted")
+    ]
+
+    assert all(result.duplicates_tombstoned == [] for result in results)
+    rows = conn.execute(
+        "SELECT id, tombstoned, topics, metadata FROM atoms WHERE id IN (?, ?)",
+        (canonical, duplicate),
+    ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    assert by_id[canonical][1] == 0
+    assert by_id[duplicate][1] == 0
+    assert json.loads(by_id[canonical][2]) == ["canonical-topic"]
+    assert json.loads(by_id[duplicate][2]) == ["duplicate-topic"]
+    assert json.loads(by_id[canonical][3]) == {"tags": ["canonical-tag"]}
+    assert json.loads(by_id[duplicate][3]) == {"tags": ["duplicate-tag"]}
 
 
 def test_dedup_pass_preserves_activation_sum(conn):

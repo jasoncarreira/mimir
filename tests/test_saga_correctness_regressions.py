@@ -796,6 +796,59 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
 
 
 @pytest.mark.asyncio
+async def test_consolidate_thematic_clusters_and_observations_are_owner_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "thematic-owner.saga.db", embedding_dim=4)
+    expected_ids: dict[str, set[str]] = {"alice": set(), "bob": set()}
+    for owner in expected_ids:
+        for index in range(2):
+            stored = await store.store(
+                content=f"{owner} private project update {index}",
+                owner_principal=owner,
+                origin_channel=f"channel:{owner}",
+                origin_domain=f"tenant:{owner}",
+                visibility="private",
+                provenance={"owner": owner, "index": index},
+            )
+            expected_ids[owner].add(stored["atom_id"])
+
+    seen_clusters: list[set[str]] = []
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        ids = {atom["id"] for atom in cluster}
+        seen_clusters.append(ids)
+        owner = next(owner for owner, owner_ids in expected_ids.items() if ids <= owner_ids)
+        return {
+            "content": f"{owner} synthesized observation",
+            "topics": [owner],
+            "triples": [],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=False, min_cluster_size=2)
+
+    assert result["observations_created"] == 2
+    assert {frozenset(cluster) for cluster in seen_clusters} == {
+        frozenset(expected_ids["alice"]),
+        frozenset(expected_ids["bob"]),
+    }
+    observations = store._ensure_conn().execute(
+        "SELECT content, owner_principal, origin_domain, visibility "
+        "FROM atoms WHERE memory_type = 'observation'"
+    ).fetchall()
+    assert set(observations) == {
+        ("alice synthesized observation", "alice", "tenant:alice", "private"),
+        ("bob synthesized observation", "bob", "tenant:bob", "private"),
+    }
+
+
+@pytest.mark.asyncio
 async def test_dedup_inner_guards_reject_mixed_owner_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

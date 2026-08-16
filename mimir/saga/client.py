@@ -1765,7 +1765,7 @@ class SagaStore:
                 lambda: distinct_dedup_scopes(conn, agent_id=self._agent_id)
             )
             dedup_result = DedupResult()
-            for owner, domain, scope_visibility in scopes:
+            for owner, domain, scope_visibility, integrity in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -1778,6 +1778,7 @@ class SagaStore:
                     owner=owner,
                     domain=domain,
                     scope_visibility=scope_visibility,
+                    integrity=integrity,
                     remaining=remaining,
                 ):
                     return dedup_pass(
@@ -1787,6 +1788,7 @@ class SagaStore:
                         owner_principal=owner,
                         origin_domain=domain,
                         visibility=scope_visibility,
+                        integrity=integrity,
                         lookback_days=lookback_days,
                         min_cluster_size=2,
                         dry_run=dry_run,
@@ -1885,7 +1887,7 @@ class SagaStore:
                 "dedup": dedup_payload,
             }
 
-        cluster_fn = make_default_cluster_fn(conn)
+        cluster_fn = make_default_cluster_fn(conn, scope_acl=True)
         clusters = await self._db_locked(lambda: cluster_fn(raws))  # chainlink #386
 
         if dry_run:
@@ -2355,7 +2357,7 @@ class SagaStore:
                 )
             )
             res = DedupResult()
-            for owner, domain, scope_visibility in scopes:
+            for owner, domain, scope_visibility, integrity in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -2369,6 +2371,7 @@ class SagaStore:
                     owner=owner,
                     domain=domain,
                     scope_visibility=scope_visibility,
+                    integrity=integrity,
                     remaining=remaining,
                 ):
                     return dedup_pass(
@@ -2378,6 +2381,7 @@ class SagaStore:
                         owner_principal=owner,
                         origin_domain=domain,
                         visibility=scope_visibility,
+                        integrity=integrity,
                         lookback_days=lookback_days,
                         min_cluster_size=min_cluster_size,
                         dry_run=dry_run,

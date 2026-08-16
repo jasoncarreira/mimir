@@ -406,7 +406,7 @@ def merge_duplicate_into_canonical(
 
     Pre-conditions enforced here:
     - duplicate is not already tombstoned
-    - duplicate and canonical share an agent_id and exact ownership scope
+    - duplicate and canonical share an agent_id, ownership scope, and integrity
 
     If ``touched_observations`` is provided, any observation whose
     ``evidenced_by`` edge set was redirected during this merge is added
@@ -425,7 +425,7 @@ def merge_duplicate_into_canonical(
     # even if candidate selection or a custom clusterer is defective.
     rows = conn.execute(
         "SELECT id, topics, metadata, agent_id, owner_principal, "
-        "origin_domain, visibility, tombstoned, encoding_confidence "
+        "origin_domain, visibility, tombstoned, encoding_confidence, integrity "
         "FROM atoms WHERE id IN (?, ?)",
         (can_id, dup_id),
     ).fetchall()
@@ -434,8 +434,8 @@ def merge_duplicate_into_canonical(
     dup_row = current.get(dup_id)
     if can_row is None or dup_row is None or can_row[7] or dup_row[7]:
         return False
-    can_scope = (can_row[3], can_row[4], can_row[5], can_row[6])
-    dup_scope = (dup_row[3], dup_row[4], dup_row[5], dup_row[6])
+    can_scope = (can_row[3], can_row[4], can_row[5], can_row[6], can_row[9])
+    dup_scope = (dup_row[3], dup_row[4], dup_row[5], dup_row[6], dup_row[9])
     if not can_row[4] or not can_row[6] or can_scope != dup_scope:
         return False
 
@@ -520,7 +520,7 @@ def merge_duplicate_into_canonical(
         "UPDATE atoms SET tombstoned = 1, tombstoned_at = ?, "
         "tombstoned_reason = 'merged' WHERE id = ? AND tombstoned = 0 "
         "AND agent_id = ? AND owner_principal = ? "
-        "AND origin_domain IS ? AND visibility = ?",
+        "AND origin_domain IS ? AND visibility = ? AND integrity = ?",
         (now, dup_id, *can_scope),
     )
     return True
@@ -531,8 +531,8 @@ def distinct_dedup_scopes(
     *,
     agent_id: str,
     skill_scope: str | None = None,
-) -> list[tuple[str, str | None, str]]:
-    """Return fail-closed ACL partitions containing dedup candidates."""
+) -> list[tuple[str, str | None, str, str]]:
+    """Return fail-closed ACL and integrity partitions for dedup candidates."""
     where = [
         "memory_type = 'raw'",
         "tombstoned = 0",
@@ -558,9 +558,9 @@ def distinct_dedup_scopes(
         ])
         params.extend([_SKILL_LEARNING_SOURCE_TYPE, skill_scope])
     return conn.execute(
-        "SELECT DISTINCT owner_principal, origin_domain, visibility "
+        "SELECT DISTINCT owner_principal, origin_domain, visibility, integrity "
         f"FROM atoms WHERE {' AND '.join(where)} "
-        "ORDER BY owner_principal, origin_domain, visibility",
+        "ORDER BY owner_principal, origin_domain, visibility, integrity",
         params,
     ).fetchall()
 
@@ -573,6 +573,7 @@ def _candidate_raws_for_dedup(
     owner_principal: str = "legacy_admin",
     origin_domain: str | None = None,
     visibility: str = "legacy_admin",
+    integrity: str = "untrusted",
     skill_scope: str | None = None,
     reference_date: "datetime | None" = None,
 ) -> list[dict]:
@@ -603,8 +604,9 @@ def _candidate_raws_for_dedup(
         "a.owner_principal = ?",
         "a.origin_domain IS ?",
         "a.visibility = ?",
+        "a.integrity = ?",
     ]
-    params: list = [agent_id, owner_principal, origin_domain, visibility]
+    params: list = [agent_id, owner_principal, origin_domain, visibility, integrity]
     if skill_scope is None:
         where.append(
             "a.source_type NOT IN ({})".format(
@@ -635,7 +637,7 @@ def _candidate_raws_for_dedup(
         f"SELECT a.id, a.content, a.stream, a.memory_type, a.source_type, "
         f"  a.created_at, a.topics, a.metadata, a.is_pinned, a.agent_id, "
         f"  a.session_id, a.encoding_confidence, a.owner_principal, "
-        f"  a.origin_domain, a.visibility "
+        f"  a.origin_domain, a.visibility, a.integrity "
         f"FROM atoms a "
         f"WHERE {' AND '.join(where)} "
         f"ORDER BY a.created_at",
@@ -644,7 +646,7 @@ def _candidate_raws_for_dedup(
     cols = ("id", "content", "stream", "memory_type", "source_type",
             "created_at", "topics", "metadata", "is_pinned",
              "agent_id", "session_id", "encoding_confidence",
-             "owner_principal", "origin_domain", "visibility")
+             "owner_principal", "origin_domain", "visibility", "integrity")
     return [dict(zip(cols, r)) for r in rows]
 
 
@@ -661,6 +663,7 @@ def dedup_pass(
     owner_principal: str = "legacy_admin",
     origin_domain: str | None = None,
     visibility: str = "legacy_admin",
+    integrity: str = "untrusted",
     lookback_days: int | None = None,
     min_cluster_size: int = 2,
     dry_run: bool = False,
@@ -694,7 +697,7 @@ def dedup_pass(
     raws = _candidate_raws_for_dedup(
         conn, lookback_days=lookback_days, agent_id=agent_id,
         owner_principal=owner_principal, origin_domain=origin_domain,
-        visibility=visibility,
+        visibility=visibility, integrity=integrity,
         skill_scope=skill_scope, reference_date=reference_date,
     )
     result.candidates_scanned = len(raws)
@@ -740,22 +743,23 @@ def dedup_pass(
             # but make the merge idempotent regardless.
             current_can = conn.execute(
                 "SELECT id, topics, metadata, agent_id, tombstoned, "
-                "owner_principal, origin_domain, visibility "
+                "owner_principal, origin_domain, visibility, integrity "
                 "FROM atoms WHERE id = ?",
                 (canonical["id"],),
             ).fetchone()
-            expected_scope = (owner_principal, origin_domain, visibility)
+            expected_scope = (owner_principal, origin_domain, visibility, integrity)
             if (
                 current_can is None
                 or current_can[4] == 1
-                or (current_can[5], current_can[6], current_can[7]) != expected_scope
+                or tuple(current_can[5:9]) != expected_scope
             ):
                 conn.rollback()
                 continue
             live_duplicates: list[dict] = []
             for dup in duplicates:
                 current_dup = conn.execute(
-                    "SELECT tombstoned, owner_principal, origin_domain, visibility "
+                    "SELECT tombstoned, owner_principal, origin_domain, visibility, "
+                    "integrity "
                     "FROM atoms WHERE id = ?",
                     (dup["id"],),
                 ).fetchone()
@@ -773,6 +777,7 @@ def dedup_pass(
                 "metadata": current_can[2], "agent_id": current_can[3],
                 "owner_principal": current_can[5],
                 "origin_domain": current_can[6], "visibility": current_can[7],
+                "integrity": current_can[8],
             }
             merged_duplicates: list[dict] = []
             for dup in live_duplicates:
@@ -790,7 +795,7 @@ def dedup_pass(
                 # topics+metadata (so dedup_merged_ids accumulates).
                 row = conn.execute(
                     "SELECT id, topics, metadata, agent_id, owner_principal, "
-                    "origin_domain, visibility "
+                    "origin_domain, visibility, integrity "
                     "FROM atoms WHERE id = ?",
                     (canonical["id"],),
                 ).fetchone()
@@ -799,7 +804,7 @@ def dedup_pass(
                         "id": row[0], "topics": row[1],
                         "metadata": row[2], "agent_id": row[3],
                         "owner_principal": row[4], "origin_domain": row[5],
-                        "visibility": row[6],
+                        "visibility": row[6], "integrity": row[7],
                     }
             if not merged_duplicates:
                 conn.rollback()
