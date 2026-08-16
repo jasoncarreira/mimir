@@ -142,8 +142,8 @@ def recall_skill_learnings(
     true. Otherwise the legacy unrestricted ordering is preserved and a strict
     counterfactual decision is logged when applicable.
 
-    Each result: ``{"id", "content", "kind", "created_at"}``. Tombstoned
-    atoms are excluded.
+    Each result includes ``id``, ``content``, ``kind``, ``created_at``,
+    ``owner_principal``, and ``integrity``. Tombstoned atoms are excluded.
     """
     if not skill or not skill.strip():
         return []
@@ -175,7 +175,8 @@ def recall_skill_learnings(
     # sort (#268).
     rows = conn.execute(
         f"""
-        SELECT id, content, json_extract(metadata, '$.kind') AS kind, created_at
+        SELECT id, content, json_extract(metadata, '$.kind') AS kind, created_at,
+               owner_principal, integrity
         FROM atoms
         WHERE source_type = ?
           AND json_extract(metadata, '$.skill') = ?
@@ -204,7 +205,10 @@ def recall_skill_learnings(
         reverse=True,
     )
     result = [
-        {"id": r[0], "content": r[1], "kind": r[2], "created_at": r[3]}
+        {
+            "id": r[0], "content": r[1], "kind": r[2], "created_at": r[3],
+            "owner_principal": r[4], "integrity": r[5],
+        }
         for r in ranked[: int(limit)]
     ]
     read_authorization.observe_selected(
@@ -256,7 +260,7 @@ def augment_skill_body(
     limit: int = 8,
     now=None,
     auth_context: Any = None,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[dict[str, str | None]]]:
     """Append a skill's recalled learnings to its SKILL.md *body* for
     load-time injection (chainlink #266 read path).
 
@@ -267,12 +271,13 @@ def augment_skill_body(
     *auth_context* filters recalled learnings by authorization scope
     (visibility/owner). When omitted, recall fails closed to public atoms only.
 
-    Returns ``(augmented_body, injected_atom_ids)``. The atom IDs let the
-    caller record which learnings were injected this turn so the
-    session-boundary synthesis turn can curate feedback on them (slice 6).
-    When the skill has no learnings, returns ``(body, [])`` unchanged (a
+    Returns ``(augmented_body, injected_atom_ids, ifc_sources)``. The atom IDs
+    let the caller record which learnings were injected this turn so the
+    session-boundary synthesis turn can curate feedback on them (slice 6), and
+    ``ifc_sources`` carries provenance for the exact selected atoms. When the
+    skill has no learnings, returns ``(body, [], [])`` unchanged (a
     skill with no accumulated memory injects exactly its SKILL.md, no empty
-    section). Best-effort: any DB error returns ``(body, [])`` rather than
+    section). Best-effort: any DB error returns ``(body, [], [])`` rather than
     failing the skill load.
     """
     try:
@@ -280,16 +285,25 @@ def augment_skill_body(
             conn, skill, limit=limit, now=now, auth_context=auth_context
         )
     except Exception:  # noqa: BLE001 — skill load must not fail on a recall error
-        return body, []
+        return body, [], []
     rendered = render_skill_learnings(learnings)
     if not rendered:
-        return body, []
+        return body, [], []
     ids = [str(item["id"]) for item in learnings if item.get("id")]
+    ifc_sources = [
+        {
+            "resource_id": f"atom:{item['id']}",
+            "owner_principal": item.get("owner_principal"),
+            "integrity": item.get("integrity"),
+        }
+        for item in learnings
+        if item.get("id")
+    ]
     augmented = (
         f"{body}\n\n{_LEARNINGS_HEADING}\n{rendered}"
         f"\n\n{_LEARNINGS_NUDGE}"
     )
-    return augmented, ids
+    return augmented, ids, ifc_sources
 
 
 def count_negative_learnings(

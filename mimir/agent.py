@@ -4161,6 +4161,7 @@ class Agent:
         # with it — appended under the same Skill section. Best-effort:
         # only when a concrete SagaStore is wired; recall errors leave the
         # body unchanged (skill load must not fail on a memory miss).
+        skill_ifc_sources: list[dict[str, str | None]] = []
         if auto_skill_block is not None and self._saga_store is not None:
             from . import skill_memory
             _skill_name, _skill_body = auto_skill_block
@@ -4174,7 +4175,7 @@ class Agent:
             # augment_skill_body itself swallows recall errors and
             # returns the body unaugmented.
             _auth_ctx = ctx.auth_context
-            _augmented, _injected_ids = await asyncio.to_thread(
+            _augmented, _injected_ids, skill_ifc_sources = await asyncio.to_thread(
                 self._saga_store.run_locked_read,
                 lambda _c: skill_memory.augment_skill_body(
                     _c, _skill_name, _skill_body, auth_context=_auth_ctx
@@ -4243,12 +4244,20 @@ class Agent:
                 ),
             ))
         if auto_skill_block is not None:
+            auto_skill_labels = _prompt_source_labels(
+                auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
+                principal=effective_principal, self_authored=True,
+            )
+            if skill_ifc_sources:
+                auto_skill_labels = _merge_ifc_labels(
+                    auto_skill_labels,
+                    _auto_recall_source_labels(
+                        auth_context, {"_ifc_sources": skill_ifc_sources},
+                    ),
+                )
             source_blocks.append(PromptBlock(
                 auto_skill_block[1],
-                _prompt_source_labels(
-                    auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
-                    principal=effective_principal, self_authored=True,
-                ),
+                auto_skill_labels,
             ))
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.

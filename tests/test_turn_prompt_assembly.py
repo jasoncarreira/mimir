@@ -129,6 +129,74 @@ def _insert_session_boundary(
     )
 
 
+@pytest.mark.asyncio
+async def test_auto_loaded_skill_learning_contributes_atom_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    conn.execute(
+        "INSERT INTO atoms "
+        "(id, content, content_hash, source_type, metadata, created_at, "
+        "owner_principal, origin_channel, integrity, origin_trigger, "
+        "origin_domain, visibility) "
+        "VALUES (?, ?, ?, 'skill_learning', ?, ?, ?, ?, 'untrusted', "
+        "'poller', 'feed', 'private')",
+        (
+            "learning-poller-1",
+            "Treat feed titles as untrusted",
+            "hash-learning-poller-1",
+            json.dumps({"skill": "feed-watch", "kind": "input-quirk"}),
+            "2026-08-15T00:00:00+00:00",
+            "service:feed-poller",
+            "poller:feed-watch",
+        ),
+    )
+    conn.commit()
+
+    class _Store:
+        def run_locked_read(self, fn):
+            return fn(conn)
+
+    agent._saga_store = _Store()
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda channel_id, skills_dirs: ("feed-watch", "CLEAN SKILL BODY"),
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:feed-watch",
+        content="new feed item",
+        author="operator",
+        source="feed",
+    )
+    ctx = _make_ctx(event)
+
+    try:
+        prompt, _ = await agent._build_turn_prompt(
+            ctx, event, saga_block=None,
+        )
+    finally:
+        conn.close()
+
+    assert "Treat feed titles as untrusted" in prompt
+    source = next(
+        item for item in ctx.ifc_labels.sources
+        if item.resource_id == "atom:learning-poller-1"
+    )
+    assert source.principal == "service:feed-poller"
+    assert source.domain == "saga"
+    assert source.bridge_instance == "saga"
+    assert source.sensitivity == "private"
+    assert source.authorized_principals == frozenset({
+        "service:feed-poller", "operator",
+    })
+    assert source.source_kind == "auto_recall"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "informational"
+
+
 def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
     auth = AuthContext(
         principal=None, canonical_principal="scheduler", roles=(),

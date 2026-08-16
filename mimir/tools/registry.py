@@ -477,6 +477,8 @@ async def request_operator_approval(
     normalized_reason = " ".join((reason or "").split())[:500]
     if not normalized_tool or not normalized_target:
         return "request_operator_approval refused: tool_name and target are required"
+    if sink_category is None:
+        return "request_operator_approval refused: sink_category is required"
 
     category = None
     request_carrier = None
