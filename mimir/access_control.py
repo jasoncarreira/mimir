@@ -2732,9 +2732,9 @@ def _target_matches_repo_review_shell_command(
 
     # ``--jq`` is deliberately absent from every option set below, here and in
     # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
-    # ``env`` / ``$ENV`` builtins read the process environment — which
-    # ``direct_exec_env`` copies wholesale from the parent, credentials included.
-    # ``gh pr view <n> --repo <r> --json reviews --jq env`` was therefore an
+    # ``env`` / ``$ENV`` builtins read the process environment. ``gh`` is the one
+    # service-shell executable explicitly given GITHUB_TOKEN, so ``gh pr view
+    # <n> --repo <r> --json reviews --jq env`` was therefore an
     # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
     # MIMIR_API_KEY and the provider keys into the tool result, and from there
     # into the model's context and the turn transcript. Enforcement was no
