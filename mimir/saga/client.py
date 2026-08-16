@@ -562,7 +562,6 @@ class SagaStore:
                 "Construct with SagaStore(db_path=Path(...)) or pass conn=..."
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        fresh = not self._db_path.exists()
         # Assign to a LOCAL variable first; only promote to ``self._conn``
         # after schema setup + pending migrations succeed. If we assign
         # ``self._conn`` first and the migration then raises, the next
@@ -573,6 +572,12 @@ class SagaStore:
         # that mimir kept working through with a stale schema.)
         conn = self._connect_db_path()
         try:
+            # sqlite3 creates the path while connecting, so file existence is
+            # not a freshness signal. An empty catalog includes zero-byte files
+            # and interrupted restores that never created a schema object.
+            fresh = conn.execute(
+                "SELECT 1 FROM sqlite_master LIMIT 1"
+            ).fetchone() is None
             if fresh:
                 schema_path = Path(__file__).parent / "schema.sql"
                 conn.executescript(schema_path.read_text())
