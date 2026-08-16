@@ -759,6 +759,19 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+def test_agent_wires_resolved_provider_into_budget_arbiter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5")
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+    )
+
+    assert agent._arbiter.active_quota_providers == ("openai",)
+
+
 async def test_run_turn_writes_record_with_extracted_events(tmp_path: Path):
     fake_agent = _FakeAgent(response_messages=[
         AIMessage(
