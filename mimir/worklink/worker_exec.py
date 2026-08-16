@@ -173,7 +173,7 @@ def _issued_checkout_relative(resolved: Path) -> tuple[Path, Path]:
     return matches[0]
 
 
-def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
+def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
     device = _identity_integer(request, "device")
@@ -205,6 +205,7 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
+    return root
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -218,8 +219,10 @@ def _validate_command(request: dict[str, Any]) -> list[str]:
     return argv
 
 
-def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> int:
-    if Path(command[0]).name != "uv":
+def _execution_checkout_fd(
+    command: list[str], checkout_fd: int, home: Path, *, checkout_root: Path | None = None
+) -> int:
+    if checkout_root != REPO_TEST_CHECKOUT_ROOT and Path(command[0]).name != "uv":
         return os.dup(checkout_fd)
     project = home / "project"
     shutil.copytree(f"/proc/self/fd/{checkout_fd}", project, symlinks=True)
@@ -398,7 +401,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    _validate_checkout(fds[0], request)
+    checkout_root = _validate_checkout(fds[0], request)
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
     timeout_s = request["timeout_s"]
@@ -423,7 +426,12 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         os.chown(home, WORKLINK_UID, WORKLINK_GID)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
-        execution_fd = _execution_checkout_fd(command, anchored_fd, home)
+        execution_fd = _execution_checkout_fd(
+            command,
+            anchored_fd,
+            home,
+            checkout_root=checkout_root,
+        )
         os.close(anchored_fd)
         anchored_fd = execution_fd
         fds[0] = anchored_fd

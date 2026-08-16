@@ -266,6 +266,91 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     assert not home.exists()
 
 
+def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied: list[tuple[str, Path, bool]] = []
+    normalized: list[int] = []
+    monkeypatch.setattr(
+        worker_exec.shutil,
+        "copytree",
+        lambda source, destination, *, symlinks: copied.append(
+            (source, destination, symlinks)
+        ),
+    )
+    monkeypatch.setattr(worker_exec.os, "open", lambda *_args, **_kwargs: 29)
+    monkeypatch.setattr(
+        worker_exec,
+        "_normalize_checkout_fd",
+        lambda fd, **_kwargs: normalized.append(fd),
+    )
+
+    result = worker_exec._execution_checkout_fd(
+        ["./.venv/bin/pytest", "-q"],
+        17,
+        tmp_path / "home",
+        checkout_root=worker_exec.REPO_TEST_CHECKOUT_ROOT,
+    )
+
+    assert result == 29
+    assert copied == [("/proc/self/fd/17", tmp_path / "home" / "project", True)]
+    assert normalized == [29]
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "boundary" / "checkout"
+    venv = source / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    runner = venv / "pytest"
+    runner.write_text("#!/bin/sh\necho fd-anchored\n", encoding="utf-8")
+    source.chmod(0o2770)
+    (source / ".venv").chmod(0o2770)
+    venv.chmod(0o2770)
+    runner.chmod(0o770)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
+    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        execution_fd = worker_exec._execution_checkout_fd(
+            ["./.venv/bin/pytest", "-q"],
+            source_fd,
+            home,
+            checkout_root=worker_exec.REPO_TEST_CHECKOUT_ROOT,
+        )
+    finally:
+        os.close(source_fd)
+    try:
+        assert os.path.samefile(f"/proc/self/fd/{execution_fd}", home / "project")
+        assert not os.path.samefile(f"/proc/self/fd/{execution_fd}", source)
+        completed = subprocess.run(
+            ["./.venv/bin/pytest", "-q"],
+            preexec_fn=lambda: os.fchdir(execution_fd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (completed.returncode, completed.stdout, completed.stderr) == (
+            0,
+            "fd-anchored\n",
+            "",
+        )
+    finally:
+        os.close(execution_fd)
+
+    copied_venv = home / "project" / ".venv"
+    copied_runner = copied_venv / "bin" / "pytest"
+    assert stat.S_IMODE(copied_venv.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(copied_runner.stat().st_mode) == 0o770
+    assert stat.S_IMODE(copied_venv.stat().st_mode) & 0o007 == 0
+    assert stat.S_IMODE(copied_runner.stat().st_mode) & 0o007 == 0
+
+
 def test_executor_rejects_fd_count_and_extra_request_fields() -> None:
     identifier = str(uuid.uuid4())
     payload = json.dumps({"version": 1, "op": "launch", "id": identifier, "uid": 0}).encode()
@@ -788,7 +873,7 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
         lambda value: str(path) if str(value).startswith("/proc/self/fd/") else real_readlink(value),
     )
     try:
-        worker_exec._validate_checkout(
+        accepted_root = worker_exec._validate_checkout(
             fd,
             {
                 "device": observed.st_dev,
@@ -797,6 +882,7 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
                 "attempt": attempt,
             },
         )
+        assert accepted_root == roots[root_name]
     finally:
         os.close(fd)
 

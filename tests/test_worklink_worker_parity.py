@@ -631,8 +631,12 @@ async def test_closed_worker_direct_parity_inventory(
 
         monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
         direct_backend = LocalSubprocessComputeBackend()
+        direct_ready = tmp_path / "direct-one-ready"
         direct_first = await direct_backend.launch(
-            direct_spec("import time; print('direct one',flush=True); time.sleep(30)")
+            direct_spec(
+                "import pathlib,time; print('direct one',flush=True); "
+                f"pathlib.Path({str(direct_ready)!r}).touch(); time.sleep(30)"
+            )
         )
         direct_second = await direct_backend.launch(direct_spec("print('direct two')"))
         assert direct_first.identifier != direct_second.identifier
@@ -651,6 +655,11 @@ async def test_closed_worker_direct_parity_inventory(
         assert direct_first.identifier in direct_backend._jobs
         assert direct_second.identifier in direct_backend._jobs
         direct_second_result = await direct_backend.wait(direct_second, 2)
+        for _ in range(200):
+            if direct_ready.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert direct_ready.exists()
         await direct_backend.cancel(direct_first)
         direct_first_result = await direct_backend.wait(direct_first, 2)
         await direct_backend.cleanup(direct_first)
