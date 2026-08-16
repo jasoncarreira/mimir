@@ -34,6 +34,13 @@ HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 MAX_FDS = 3
+# Deliberately not imported from worker_client: this value must describe the
+# immutable executor installed in the root-owned image, not mutable controller code.
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v2-repo-copy-timeout"
+_STALE_EXECUTOR_DIAGNOSTIC = (
+    "stale root executor image: controller and mimir.worklink.worker_exec protocol "
+    "identities do not match; rebuild the image and restart the container"
+)
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
@@ -46,8 +53,10 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections", "timeout_s",
+    "argv", "env", "projections", "timeout_s", "executor_identity",
 })
+_CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
+_IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
@@ -384,9 +393,25 @@ def _send(connection: socket.socket, response: dict[str, object]) -> None:
     connection.send(json.dumps(response, separators=(",", ":")).encode())
 
 
+def _validate_executor_identity(request: dict[str, Any]) -> None:
+    if request.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY:
+        raise RuntimeError(_STALE_EXECUTOR_DIAGNOSTIC)
+
+
+def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    if fds or set(request) != _IDENTITY_FIELDS:
+        raise RuntimeError("invalid executor identity request")
+    _validate_executor_identity(request)
+    _send(connection, {
+        "status": "identity",
+        "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+    })
+
+
 def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    if fds or set(request) != {"version", "op", "id"}:
+    if fds or set(request) != _CANCEL_FIELDS:
         raise RuntimeError("invalid cancel request")
+    _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
@@ -398,6 +423,7 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if set(request) != _LAUNCH_FIELDS or len(fds) != MAX_FDS:
         raise RuntimeError("launch request must carry the exact contract and three FDs")
+    _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
@@ -509,6 +535,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_launch(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
+        elif request.get("op") == "identity":
+            _handle_identity(connection, request, fds)
         else:
             raise RuntimeError("unsupported worker operation")
     except Exception as exc:
