@@ -41,7 +41,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     )
     refl_ma_p.add_argument(
         "id_match",
-        help="Substring of the proposal heading (case-insensitive).",
+        help="Full proposal heading (case-insensitive).",
     )
     refl_ma_p.add_argument(
         "--home", type=Path, default=None,
@@ -140,7 +140,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 home / "state" / "applied-proposals.jsonl",
                 args.id_match,
             )
-        except (FileNotFoundError, LookupError, ValueError) as exc:
+        except (LookupError, OSError, ValueError) as exc:
             print(f"mark-applied: {exc}", file=sys.stderr)
             return 1
         print(f"Applied: {proposal.id}")
@@ -204,7 +204,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
         # Resolve all (action, num) → heading before mutating so that
         # numbering shifts after earlier mutations don't affect later ones.
-        resolved: list[tuple[str, str, str]] = []  # (action, heading, reason)
+        resolved: list[tuple[str, int, str, str]] = []
         errors: list[str] = []
         for action, num, reason in ops:
             match = next((h for n, h, _ in snapshot if n == num), None)
@@ -214,33 +214,26 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                     if snapshot else f"  {num}: no pending proposals"
                 )
                 continue
-            resolved.append((action, match, reason))
+            resolved.append((action, num, match, reason))
 
         accepted: list[str] = []
         rejected: list[str] = []
 
-        for action, heading, reason in resolved:
+        for action, num, heading, reason in resolved:
             if action == "accept":
                 try:
                     _applied_audit.mark_applied(pc_path, log_path, heading)
-                    # Find original num for output label.
-                    num_label = next(
-                        str(n) for n, h, _ in snapshot if h == heading
-                    )
-                    accepted.append(num_label)
-                except (LookupError, ValueError) as exc:
-                    errors.append(f"  {heading!r}: {exc}")
+                    accepted.append(str(num))
+                except (LookupError, OSError, ValueError) as exc:
+                    errors.append(f"  {num} ({heading!r}): {exc}")
             else:
                 default_reason = "operator declined"
                 effective_reason = reason.strip() if reason.strip() else default_reason
                 try:
                     _applied_audit.mark_reject(pc_path, heading, effective_reason)
-                    num_label = next(
-                        str(n) for n, h, _ in snapshot if h == heading
-                    )
-                    rejected.append(f"{num_label} ({effective_reason!r})")
-                except (LookupError, ValueError) as exc:
-                    errors.append(f"  {heading!r}: {exc}")
+                    rejected.append(f"{num} ({effective_reason!r})")
+                except (LookupError, OSError, ValueError) as exc:
+                    errors.append(f"  {num} ({heading!r}): {exc}")
 
         parts = []
         if accepted:

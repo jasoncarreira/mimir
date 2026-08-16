@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -79,6 +80,8 @@ async def _start_mcp_servers(
             log.warning("MCP shutdown after startup failure failed: %s", shutdown_exc)
             return mcp_manager, []
         return None, []
+    for failure in getattr(mcp_manager, "startup_failures", []):
+        await log_event("mcp_server_start_failed", **failure)
     if mcp_tools:
         await log_event(
             "mcp_servers_ready",
@@ -357,7 +360,6 @@ _RUNTIME_APP_FIELDS = (
     "indexer",
     "saga_client",
     "sessions",
-    "subagent_inbox",
     "agent_runtime",
     "replayed_messages",
 )
@@ -405,7 +407,6 @@ def _publish_runtime(
     app["indexer"] = bundle.indexer
     app["saga_client"] = bundle.saga_client
     app["sessions"] = bundle.sessions
-    app["subagent_inbox"] = bundle.subagent_inbox
     app["replayed_messages"] = bundle.replayed_messages
     app["agent_runtime"] = bundle
     app["agent"] = bundle.agent
@@ -438,6 +439,8 @@ async def _handle_event(request: web.Request) -> web.Response:
     channel_id = body.get("channel_id")
     if not channel_id:
         return web.json_response({"error": "channel_id required"}, status=400)
+    if not isinstance(channel_id, str):
+        return web.json_response({"error": "channel_id must be a string"}, status=400)
 
     # #487: type-check structured fields, don't coerce. A truthy non-dict
     # ``extra`` (or non-list ``attachment_names``) survives ``or {}``/``or []``
@@ -599,13 +602,69 @@ def _is_admin_required(path: str) -> bool:
     )
 
 
-def _make_auth_middleware(expected_key: str):
+_STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+_UNAUTHENTICATED_WARNING = (
+    "MIMIR_API_KEY is not set — local clients can use POST /event and "
+    "POST /chat without authentication. Loopback binding limits network "
+    "exposure but is not an authentication boundary; browser cross-site "
+    "writes and DNS-rebinding Host headers are rejected, while local "
+    "processes can still inject messages or trigger saga_end_session. "
+    "Set MIMIR_API_KEY before exposing to a network. "
+    "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
+    "to suppress this warning."
+)
+
+
+def _request_authority(request: web.Request) -> tuple[str, int | None] | None:
+    """Return a normalized Host header, or None when it is malformed."""
+    host_header = request.headers.get("Host", "")
+    try:
+        parsed = urlsplit(f"//{host_header}")
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    return parsed.hostname.rstrip(".").lower(), port
+
+
+def _origin_matches_request(request: web.Request, origin: str) -> bool:
+    """Return whether a serialized browser Origin matches this request."""
+    authority = _request_authority(request)
+    try:
+        parsed = urlsplit(origin)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        authority is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+
+    origin_port = port or (443 if parsed.scheme == "https" else 80)
+    request_port = authority[1] or (443 if request.scheme == "https" else 80)
+    return (
+        parsed.scheme == request.scheme
+        and parsed.hostname.rstrip(".").lower() == authority[0]
+        and origin_port == request_port
+    )
+
+
+def _make_auth_middleware(expected_key: str, web_host: str | None = None):
     """Build an aiohttp middleware that gates every non-exempt route on
     a matching ``X-API-Key`` header.
 
-    Empty ``expected_key`` (``MIMIR_API_KEY`` unset) disables the gate
-    entirely — the warning at startup tells the operator they're
-    running open. Any non-empty key activates the middleware.
+    Browser-origin and loopback Host validation always run before the API-key
+    gate. Empty ``expected_key`` (``MIMIR_API_KEY`` unset) disables only that
+    gate; any non-empty key activates it.
 
     Why middleware (vs per-handler checks):
 
@@ -620,6 +679,20 @@ def _make_auth_middleware(expected_key: str):
       ad hoc shape the next author picked).
     """
     async def _auth_middleware(request: web.Request, handler):
+        authority = _request_authority(request)
+        if web_host in _LOOPBACK_HOSTS and (
+            authority is None or authority[0] not in _LOOPBACK_HOSTS
+        ):
+            return web.json_response({"error": "invalid_host"}, status=403)
+
+        if request.method in _STATE_CHANGING_METHODS:
+            fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
+            origin = request.headers.get("Origin")
+            if fetch_site == "cross-site" or (
+                origin is not None and not _origin_matches_request(request, origin)
+            ):
+                return web.json_response({"error": "cross_site_request"}, status=403)
+
         if _is_auth_exempt(request.method, request.path):
             return await handler(request)
 
@@ -900,28 +973,21 @@ def build_app(config: Config) -> web.Application:
     # paths (``attachment_names``), not from the request body, so the cap
     # doesn't need to accommodate binary uploads.
     #
-    # Auth middleware: gates every non-exempt route on ``X-API-Key`` when
-    # ``MIMIR_API_KEY`` is set. Empty key → middleware passes through
-    # unconditionally (dev / localhost). See ``_make_auth_middleware``
-    # and ``_AUTH_EXEMPT``.
+    # Request middleware always rejects cross-site writes and DNS-rebinding
+    # Host headers on loopback binds. It additionally gates every non-exempt
+    # route on ``X-API-Key`` when ``MIMIR_API_KEY`` is set.
     app = web.Application(
         client_max_size=10 * 1024 * 1024,
-        middlewares=[_make_auth_middleware(config.api_key or "")],
+        middlewares=[
+            _make_auth_middleware(config.api_key or "", web_host=config.web_host)
+        ],
     )
 
     if not config.api_key:
-        _msg = (
-            "MIMIR_API_KEY is not set — POST /event and POST /chat are "
-            "unauthenticated. Any host that can reach this server can inject "
-            "messages or trigger saga_end_session. "
-            "Set MIMIR_API_KEY before exposing to a network. "
-            "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
-            "to suppress this warning."
-        )
         if getattr(config, "allow_unauthenticated", False):
-            log.debug("unauthenticated mode acknowledged: %s", _msg)
+            log.debug("unauthenticated mode acknowledged: %s", _UNAUTHENTICATED_WARNING)
         else:
-            log.warning(_msg)
+            log.warning(_UNAUTHENTICATED_WARNING)
 
     # Access-log filter: mask stale ``?api_key=`` query values so accidental
     # URL secrets do not land in stdout / log files. Idempotent — multiple
@@ -1001,6 +1067,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         chat_skill_registry=core.chat_skill_registry,
     )
+    web_chat.max_subscribers = config.chat_stream_max_subscribers
     channels.register(web_chat)
 
     # Inbound attachments land here; the agent reads files by path. The
@@ -1922,7 +1989,7 @@ def build_app(config: Config) -> web.Application:
 
             attempt_sync(lambda: mark_clean_shutdown(config.home))
         if startup_state.scheduler_start_attempted:
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
         if startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
         if startup_state.bridges_connect_attempted:
@@ -2028,7 +2095,7 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
             if startup_state.bundle is not None:
                 await attempt(startup_state.bundle.aclose)
             if startup_state.activity_panel is not None:
@@ -2064,9 +2131,11 @@ def _validate_bind_security(host: str, api_key: str) -> None:
     network peer with no auth at all. We now refuse the unsafe
     combination at startup with an actionable message.
 
-    Loopback binds (``127.0.0.1``, ``::1``, ``localhost``) are
-    allowed without an API key — the safe local-dev posture. Any
-    other host requires ``MIMIR_API_KEY`` to be set.
+    Loopback binds (``127.0.0.1``, ``::1``, ``localhost``) are allowed
+    without an API key for local development. This limits network exposure but
+    does not authenticate local processes; HTTP middleware separately rejects
+    browser cross-site writes and DNS-rebinding Host headers. Any other host
+    requires ``MIMIR_API_KEY`` to be set.
     """
     if not api_key and host not in _LOOPBACK_HOSTS:
         raise SystemExit(

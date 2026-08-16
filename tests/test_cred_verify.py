@@ -80,6 +80,34 @@ def test_format_probe_passes_with_correct_prefix(
     assert "format ok" in result.detail
 
 
+@pytest.mark.parametrize("value", ["sk-ant-" + "x" * 20 + "\r", " sk-ant-" + "x" * 20])
+def test_format_probe_rejects_surrounding_whitespace_used_by_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_KEY", value)
+    _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
+        credentials:
+          - name: FAKE_KEY
+            cred_type: D
+            env_vars: [FAKE_KEY]
+            description: "fake"
+            probe:
+              kind: format
+              env: FAKE_KEY
+              prefix: "sk-ant-"
+              min_len: 20
+    """)
+    monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "missing.yaml")
+
+    result = verify("FAKE_KEY")
+
+    assert not result.ok
+    assert "surrounding whitespace" in result.detail
+    assert f"got {len(value)} chars" in result.detail
+    assert os.environ["FAKE_KEY"] == value
+
+
 def test_format_probe_rejects_disallowed_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -219,8 +247,11 @@ def test_not_implemented_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(cred_verify, "_PACKAGE_MANIFEST", tmp_path / "no-such-file.yaml")
     result = verify("FUTURE_BRIDGE_TOKEN")
     assert not result.ok
+    assert result.skipped
     assert "not_implemented" in result.detail
     assert "Type B" in result.detail
+    assert "SKIP" in result.render()
+    assert run_verify_cred_cmd("FUTURE_BRIDGE_TOKEN") == 0
 
 
 def test_python_probe_loads_skill_local_script(

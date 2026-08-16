@@ -12,9 +12,11 @@ import type { ReactNode } from "react";
 
 const STORAGE_KEY = "mimir.api_key";
 
-const { whoami, wikiRouteLoads } = vi.hoisted(() => ({
+const { routeFailures, whoami, wikiRouteLoads, liveEventsState } = vi.hoisted(() => ({
+  routeFailures: { chat: false },
   whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() },
-  wikiRouteLoads: { count: 0 }
+  wikiRouteLoads: { count: 0 },
+  liveEventsState: { status: "idle", lastEvent: null as unknown }
 }));
 
 // whoami reflects the *current* stored key, exactly as the real client would:
@@ -79,7 +81,7 @@ vi.mock("./api", async (orig) => ({
 // doesn't exercise.
 vi.mock("./live-events", () => ({
   LiveEventsProvider: ({ children }: { children: ReactNode }) => children,
-  useLiveEvents: () => ({ status: "idle", lastEvent: null })
+  useLiveEvents: () => liveEventsState
 }));
 vi.mock("./skins/SkinProvider", () => ({
   SkinProvider: ({ children }: { children: ReactNode }) => children,
@@ -99,7 +101,12 @@ vi.mock("./agent-character", () => ({
   characterStateFromLiveEvent: () => "idle",
   withComposerListening: (state: string) => state
 }));
-vi.mock("./ChatRoute", () => ({ ChatRoute: () => <div>chat-stub</div> }));
+vi.mock("./ChatRoute", () => ({
+  ChatRoute: () => {
+    if (routeFailures.chat) throw new Error("chat route exploded");
+    return <div>chat-stub</div>;
+  }
+}));
 vi.mock("./routes/WikiRoute", () => {
   wikiRouteLoads.count += 1;
   return {
@@ -136,10 +143,14 @@ afterEach(() => {
     selectedChatMessageId: "",
     composerActive: false,
     collapsedRegions: {},
-    apiKeyPresent: false
+    apiKeyPresent: false,
+    apiKeyRejected: false
   });
   wikiRouteLoads.count = 0;
+  liveEventsState.status = "idle";
+  routeFailures.chat = false;
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 
@@ -182,6 +193,38 @@ describe("API key changes reset browser-scoped user data (#594)", () => {
 });
 
 describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
+  it("contains and reports an invalid dashboard extension manifest", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false },
+      dashboard_extensions: [
+        { ...protectedBootstrap.dashboard_extensions[0], route_path: "//status" }
+      ]
+    } as typeof protectedBootstrap;
+
+    renderApp();
+
+    expect((await screen.findByRole("alert")).textContent).toContain("The dashboard could not be rendered");
+    expect(screen.getByRole("alert").textContent).toContain("safe same-origin path");
+    consoleError.mockRestore();
+  });
+
+  it("contains a route render failure without removing dashboard navigation", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false }
+    };
+    routeFailures.chat = true;
+
+    renderApp(["/chat"]);
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Chat could not be rendered");
+    expect(screen.getByRole("link", { name: /Chat/ })).toBeTruthy();
+    consoleError.mockRestore();
+  });
+
   it("gates the whole app behind a login screen until a key is saved", async () => {
     renderApp();
 
@@ -221,6 +264,21 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
       expect(screen.queryByRole("link", { name: /Users/ })).toBeNull()
     );
     expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
+  });
+
+  it("shows a re-authentication message and lets the user replace a rejected key", async () => {
+    window.localStorage.setItem(STORAGE_KEY, "revoked-key");
+    useUiState.setState({ apiKeyRejected: true });
+    renderApp();
+
+    expect(await screen.findByText(/rejected or revoked/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), {
+      target: { value: "replacement-key" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe("replacement-key");
+    expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
   });
 
   it("redirects the legacy /admin/users path to the Admin Users sub-tab (#1169)", async () => {

@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { LiveEventsProvider } from "./LiveEventsProvider";
+import { LiveEventsProvider, useLiveEvents } from "./LiveEventsProvider";
 
 afterEach(cleanup);
+
+function StatusProbe() {
+  return <span>{useLiveEvents().status}</span>;
+}
 
 // Regression for PR #785 review: a protected server must not open the
 // authenticated /api/v1/live-events stream before the user has signed in.
@@ -37,5 +41,17 @@ describe("LiveEventsProvider stream gating", () => {
 
     await waitFor(() => expect(fetchImpl).toHaveBeenCalled());
     expect(fetchImpl.mock.calls[0]?.[0]).toContain("/api/v1/live-events");
+  });
+
+  it("distinguishes rejected credentials from a transient stream error", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
+    render(
+      <LiveEventsProvider enabled fetchImpl={fetchImpl as unknown as typeof fetch}>
+        <StatusProbe />
+      </LiveEventsProvider>
+    );
+
+    expect(await screen.findByText("reauthenticate")).toBeTruthy();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

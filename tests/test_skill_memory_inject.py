@@ -19,7 +19,7 @@ from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import AuthContext, TurnContext
+from mimir.models import AuthContext, InformationFlowLabels, TurnContext
 from mimir.saga.client import SagaStore
 from mimir.skill_memory import (
     SKILL_LEARNING_SOURCE_TYPE,
@@ -293,6 +293,20 @@ class TestInjectedIdCapture:
             )
             assert "a useful tip" in out.content  # augmentation happened
             assert ctx.injected_skill_atom_ids == [sl["atom_id"]]
+            sources = ctx.auth_context.ifc_state.current().sources
+            learning_source = next(
+                source for source in sources
+                if source.resource_id == f"atom:{sl['atom_id']}"
+            )
+            assert learning_source.domain == "saga"
+            assert learning_source.bridge_instance == "saga"
+            assert learning_source.sensitivity == "private"
+            assert learning_source.source_kind == "auto_recall"
+            assert learning_source.integrity == "untrusted"
+            assert learning_source.integrity_effect == "informational"
+            assert learning_source.authorized_principals == frozenset({
+                "legacy_admin", "test-admin",
+            })
         finally:
             reset_current_turn(tok)
 
@@ -314,5 +328,6 @@ class TestInjectedIdCapture:
                 _read_request("/x/skills/never-used/SKILL.md"), ahandler,
             )
             assert ctx.injected_skill_atom_ids == []
+            assert ctx.ifc_labels is None
         finally:
             reset_current_turn(tok)

@@ -313,6 +313,15 @@ def test_render_includes_budget_percent_when_configured(tmp_path: Path):
     assert "25% of $10.00" in out
 
 
+def test_render_alerts_when_weekly_usage_ceiling_exceeded(tmp_path: Path):
+    path = tmp_path / "turns.jsonl"
+    _write_turns(path, [_turn(hours_ago=24, cost=220.0, input_tokens=1000)])
+    out = render_usage_block(aggregate(path), budget_weekly_usd=200.0)
+    assert out is not None
+    assert "110% of $200.00" in out
+    assert "configured usage ceiling exceeded" in out
+
+
 def test_render_omits_budget_when_unset(tmp_path: Path):
     path = tmp_path / "turns.jsonl"
     _write_turns(path, [_turn(hours_ago=0.1, cost=1.0, input_tokens=10)])

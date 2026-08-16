@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 from pathlib import Path, PurePosixPath
+import math
 import re
 import shutil
 import signal
@@ -33,6 +34,7 @@ HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 MAX_FDS = 3
+_CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
 _PR_CAP_AMBIENT = 47
@@ -44,9 +46,10 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections",
+    "argv", "env", "projections", "timeout_s",
 })
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
+_launching: set[str] = set()
 _jobs_lock = threading.Lock()
 
 
@@ -171,7 +174,7 @@ def _issued_checkout_relative(resolved: Path) -> tuple[Path, Path]:
     return matches[0]
 
 
-def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
+def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
     device = _identity_integer(request, "device")
@@ -203,6 +206,7 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
+    return root
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -216,8 +220,10 @@ def _validate_command(request: dict[str, Any]) -> list[str]:
     return argv
 
 
-def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> int:
-    if Path(command[0]).name != "uv":
+def _execution_checkout_fd(
+    command: list[str], checkout_fd: int, home: Path, *, checkout_root: Path | None = None
+) -> int:
+    if checkout_root != REPO_TEST_CHECKOUT_ROOT and Path(command[0]).name != "uv":
         return os.dup(checkout_fd)
     project = home / "project"
     shutil.copytree(f"/proc/self/fd/{checkout_fd}", project, symlinks=True)
@@ -314,7 +320,7 @@ def _process_group_has_live_members(process_group: int) -> bool:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 if int(fields[2]) == process_group and fields[0] not in {"Z", "X"}:
                     return True
-            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+            except (OSError, IndexError, ValueError):
                 continue
         return False
     observed = subprocess.run(
@@ -347,18 +353,22 @@ def _wait_process_group(process_group: int, deadline: float | None) -> None:
         time.sleep(0.01)
 
 
-def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    _wait_process_group(proc.pid, time.monotonic() + timeout_s)
-    if _process_group_has_live_members(proc.pid):
+    _wait_process_group(process_group, time.monotonic() + timeout_s)
+    if _process_group_has_live_members(process_group):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _wait_process_group(proc.pid, None)
+        _wait_process_group(process_group, None)
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+    _terminate_process_group_pid(proc.pid, timeout_s)
     proc.wait()
 
 
@@ -392,24 +402,44 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    _validate_checkout(fds[0], request)
+    checkout_root = _validate_checkout(fds[0], request)
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
-    anchored_fd = os.open(
-        ".",
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=fds[0],
-    )
-    os.close(fds[0])
-    fds[0] = anchored_fd
-    home = HOME_ROOT / identifier
-    home.mkdir(mode=0o700)
+    timeout_s = request["timeout_s"]
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+    ):
+        raise RuntimeError("worker timeout must be a positive finite number")
+    with _jobs_lock:
+        if identifier in _jobs or identifier in _launching:
+            raise RuntimeError("worker id is already active")
+        _launching.add(identifier)
+    home = Path()
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        anchored_fd = os.open(
+            ".",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=fds[0],
+        )
+        os.close(fds[0])
+        fds[0] = anchored_fd
+        candidate_home = HOME_ROOT / identifier
+        candidate_home.mkdir(mode=0o700)
+        home = candidate_home
         _project_home(home, request["projections"])
         os.chown(home, WORKLINK_UID, WORKLINK_GID)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
-        execution_fd = _execution_checkout_fd(command, anchored_fd, home)
+        execution_fd = _execution_checkout_fd(
+            command,
+            anchored_fd,
+            home,
+            checkout_root=checkout_root,
+        )
         os.close(anchored_fd)
         anchored_fd = execution_fd
         fds[0] = anchored_fd
@@ -424,25 +454,35 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             pass_fds=(fds[0],),
         )
         with _jobs_lock:
-            if identifier in _jobs:
-                _terminate_process_group(proc, 0)
-                raise RuntimeError("worker id is already active")
             _jobs[identifier] = proc
+            _launching.remove(identifier)
         os.close(fds[1])
         fds[1] = -1
         os.close(fds[2])
         fds[2] = -1
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        exit_code = proc.wait()
-        _terminate_process_group(proc, 0)
+        timed_out = False
+        try:
+            exit_code = proc.wait(timeout=timeout_s + _CONTROLLER_CANCELLATION_GRACE_S)
+            _terminate_process_group(proc, 0)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_group(proc)
+            exit_code = proc.returncode
         with _jobs_lock:
             _jobs.pop(identifier, None)
         _cleanup_home(home)
         home = Path()
-        _send(connection, {"id": identifier, "status": "terminal", "exit_code": exit_code})
+        _send(connection, {
+            "id": identifier,
+            "status": "terminal",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+        })
     finally:
         with _jobs_lock:
-            active = _jobs.pop(identifier, None)
+            _launching.discard(identifier)
+            active = _jobs.pop(identifier, None) if _jobs.get(identifier) is proc else None
         if active is not None and active.poll() is None:
             _terminate_process_group(active)
         if home != Path():

@@ -10,6 +10,7 @@ working against the full home tree.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -578,6 +579,33 @@ class TestWriteGuardBackend:
         ):
             with pytest.raises(AttributeError):
                 getattr(b, obsolete)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["aedit", "aupload_files"])
+    async def test_async_mutations_run_filesystem_work_off_loop(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+    ) -> None:
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        loop_thread = threading.get_ident()
+        worker_threads: list[int] = []
+
+        if method == "aedit":
+            monkeypatch.setattr(
+                backend,
+                "edit",
+                lambda **_kwargs: worker_threads.append(threading.get_ident()),
+            )
+            await backend.aedit("/state/file", "old", "new")
+        else:
+            monkeypatch.setattr(
+                backend,
+                "upload_files",
+                lambda _files: worker_threads.append(threading.get_ident()),
+            )
+            await backend.aupload_files([("/state/file", b"content")])
+
+        assert len(worker_threads) == 1
+        assert worker_threads[0] != loop_thread
 
 
 class TestCreateOnlyWrites:

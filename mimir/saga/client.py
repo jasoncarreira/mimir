@@ -562,7 +562,6 @@ class SagaStore:
                 "Construct with SagaStore(db_path=Path(...)) or pass conn=..."
             )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        fresh = not self._db_path.exists()
         # Assign to a LOCAL variable first; only promote to ``self._conn``
         # after schema setup + pending migrations succeed. If we assign
         # ``self._conn`` first and the migration then raises, the next
@@ -573,6 +572,12 @@ class SagaStore:
         # that mimir kept working through with a stale schema.)
         conn = self._connect_db_path()
         try:
+            # sqlite3 creates the path while connecting, so file existence is
+            # not a freshness signal. An empty catalog includes zero-byte files
+            # and interrupted restores that never created a schema object.
+            fresh = conn.execute(
+                "SELECT 1 FROM sqlite_master LIMIT 1"
+            ).fetchone() is None
             if fresh:
                 schema_path = Path(__file__).parent / "schema.sql"
                 conn.executescript(schema_path.read_text())
@@ -1760,7 +1765,7 @@ class SagaStore:
                 lambda: distinct_dedup_scopes(conn, agent_id=self._agent_id)
             )
             dedup_result = DedupResult()
-            for owner, domain, scope_visibility in scopes:
+            for owner, domain, scope_visibility, integrity in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -1773,6 +1778,7 @@ class SagaStore:
                     owner=owner,
                     domain=domain,
                     scope_visibility=scope_visibility,
+                    integrity=integrity,
                     remaining=remaining,
                 ):
                     return dedup_pass(
@@ -1782,6 +1788,7 @@ class SagaStore:
                         owner_principal=owner,
                         origin_domain=domain,
                         visibility=scope_visibility,
+                        integrity=integrity,
                         lookback_days=lookback_days,
                         min_cluster_size=2,
                         dry_run=dry_run,
@@ -1880,7 +1887,7 @@ class SagaStore:
                 "dedup": dedup_payload,
             }
 
-        cluster_fn = make_default_cluster_fn(conn)
+        cluster_fn = make_default_cluster_fn(conn, scope_acl=True)
         clusters = await self._db_locked(lambda: cluster_fn(raws))  # chainlink #386
 
         if dry_run:
@@ -1975,6 +1982,7 @@ class SagaStore:
         def _precompute_embeddings():
             obs_embeds: list[tuple[bytes, str, str, int] | None] = []
             triple_vecs: dict[str, tuple[bytes, str, str, int]] = {}
+            triple_embed_errors: dict[str, Exception] = {}
             for result in results:
                 content = (result.get("content") or "").strip()
                 if not content:
@@ -1982,6 +1990,7 @@ class SagaStore:
                     continue
                 obs_embeds.append(_embed_text_sync(content))
                 for t in result.get("triples", []):
+                    text = None
                     try:
                         text = _triple_text(
                             t["subject"],
@@ -1992,10 +2001,14 @@ class SagaStore:
                             continue
                         triple_vecs[text] = _embed_text_sync(text)
                     except Exception as exc:  # noqa: BLE001
+                        if text is not None:
+                            triple_embed_errors[text] = exc
                         log.warning("triple embed precompute failed: %s", exc)
-            return obs_embeds, triple_vecs
+            return obs_embeds, triple_vecs, triple_embed_errors
 
-        obs_embeds, triple_vecs = await asyncio.to_thread(_precompute_embeddings)
+        obs_embeds, triple_vecs, triple_embed_errors = await asyncio.to_thread(
+            _precompute_embeddings
+        )
 
         def _lookup_triple_embed(text: str) -> tuple[bytes, str, str, int]:
             """Pure dict lookup over the precomputed vectors — never does
@@ -2004,6 +2017,8 @@ class SagaStore:
             store_triples to its existing store-unembedded fallback."""
             vec = triple_vecs.get(text)
             if vec is None:
+                if text in triple_embed_errors:
+                    raise triple_embed_errors[text]
                 raise RuntimeError(f"no precomputed embedding for triple text {text!r}")
             return vec
 
@@ -2067,10 +2082,26 @@ class SagaStore:
                     provenance=intersected_acl.provenance,
                 )
                 if not store_result.stored:
-                    # Dedupe hit on the observation content — relations
-                    # were already in place from the prior cluster pass.
-                    # See note above: no consolidation access_event.
-                    continue
+                    # A hard kill can land the observation atom while missing
+                    # the following relations transaction. Complete exactly
+                    # that orphan on retry; ordinary content dedupe remains a
+                    # no-op (including observations backed by other evidence).
+                    repairable = conn.execute(
+                        "SELECT 1 FROM atoms a "
+                        "WHERE a.id = ? AND a.memory_type = 'observation' "
+                        "AND a.tombstoned = 0 "
+                        "AND NOT EXISTS ("
+                        "  SELECT 1 FROM atom_relations ar "
+                        "  WHERE ar.source_id = a.id "
+                        "    AND ar.relation_type = 'evidenced_by'"
+                        ") AND NOT EXISTS ("
+                        "  SELECT 1 FROM observations_metadata om "
+                        "  WHERE om.atom_id = a.id"
+                        ")",
+                        (store_result.atom_id,),
+                    ).fetchone()
+                    if repairable is None:
+                        continue
 
                 observation_id = store_result.atom_id
                 try:
@@ -2350,7 +2381,7 @@ class SagaStore:
                 )
             )
             res = DedupResult()
-            for owner, domain, scope_visibility in scopes:
+            for owner, domain, scope_visibility, integrity in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -2364,6 +2395,7 @@ class SagaStore:
                     owner=owner,
                     domain=domain,
                     scope_visibility=scope_visibility,
+                    integrity=integrity,
                     remaining=remaining,
                 ):
                     return dedup_pass(
@@ -2373,6 +2405,7 @@ class SagaStore:
                         owner_principal=owner,
                         origin_domain=domain,
                         visibility=scope_visibility,
+                        integrity=integrity,
                         lookback_days=lookback_days,
                         min_cluster_size=min_cluster_size,
                         dry_run=dry_run,
@@ -2870,7 +2903,7 @@ class SagaStore:
             joins = []
             where = [
                 "a.tombstoned = 0",
-                "a.agent_id = ?",
+                "a.agent_id IN (?, 'shared')",
                 "e.ts >= ?",
                 f"e.source IN ({placeholders})",
             ]

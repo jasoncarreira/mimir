@@ -181,6 +181,7 @@ SKIN_TOKEN_NAMES = frozenset(
 LIVE_EVENTS_HEARTBEAT_S = 15.0
 LIVE_EVENTS_POLL_S = 1.0
 LIVE_EVENTS_MAX_STREAMS = int(os.environ.get("MIMIR_LIVE_EVENTS_MAX_STREAMS", "8"))
+TURN_EVENTS_MAX_STREAMS = LIVE_EVENTS_MAX_STREAMS
 # The scheduler dashboard needs older persisted state than the generic 5k event
 # tail, but it must stay bounded: newly-added or monthly jobs may have no event
 # yet, so "scan until every configured job is found" can otherwise become a
@@ -751,6 +752,16 @@ def _filter_records_by_channel(
     return [r for r in records if _record_matches_channel(r, channel)]
 
 
+_TURNS_MAX_PAGE_RECORDS = 500
+_TURNS_MAX_SCAN_RECORDS = 5000
+
+
+class _TurnCursorNotFound(Exception):
+    def __init__(self, cursor: str) -> None:
+        super().__init__(cursor)
+        self.cursor = cursor
+
+
 def _turns_tail_page(
     path: Path,
     *,
@@ -759,9 +770,10 @@ def _turns_tail_page(
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
+    limit = min(limit, _TURNS_MAX_PAGE_RECORDS)
     out: list[dict[str, Any]] = []
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             out.append(record)
@@ -778,21 +790,21 @@ def _turns_after_page(
     *,
     after: str,
     channel: str | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     if not after:
-        return []
+        return [], False
     newest_first: list[dict[str, Any]] = []
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             if record.get("turn_id") == after:
                 newest_first.reverse()
-                return newest_first
+                return newest_first, True
             newest_first.append(record)
     except OSError:
-        return []
-    return []
+        return [], False
+    return [], False
 
 
 def _turns_before_page(
@@ -801,14 +813,17 @@ def _turns_before_page(
     before: str,
     limit: int,
     channel: str | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, bool]:
     if not before or limit <= 0:
-        return [], False
+        return [], False, False
+    limit = min(limit, _TURNS_MAX_PAGE_RECORDS)
     out: list[dict[str, Any]] = []
     found = False
     has_more = False
+    scanned = 0
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
+            scanned += 1
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             if not found:
@@ -820,11 +835,11 @@ def _turns_before_page(
                 has_more = True
                 break
     except OSError:
-        return [], False
+        return [], False, False
     if not found:
-        return [], False
+        return [], False, False
     out.reverse()
-    return out, has_more
+    return out, has_more or scanned >= _TURNS_MAX_SCAN_RECORDS, True
 
 
 def _event_record_matches_channel(record: dict[str, Any], channel: str) -> bool:
@@ -930,16 +945,21 @@ def register_routes(
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
+        limit = max(0, min(limit, _TURNS_MAX_PAGE_RECORDS))
 
         if after:
-            window = _turns_after_page(turns_log, after=after, channel=channel)
+            window, found = _turns_after_page(turns_log, after=after, channel=channel)
+            if not found:
+                raise _TurnCursorNotFound(after)
             cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
             return window, list_meta(cursor=cursor, limit=limit or None, total=None, truncated=False)
 
         if before:
-            window, has_more = _turns_before_page(
+            window, has_more, found = _turns_before_page(
                 turns_log, before=before, limit=limit, channel=channel
             )
+            if not found:
+                raise _TurnCursorNotFound(before)
             cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
             return window, list_meta(
                 cursor=cursor,
@@ -967,18 +987,40 @@ def register_routes(
         return records, list_meta(cursor=cursor, limit=None, total=total, truncated=False)
 
     async def turns_data(request: web.Request) -> web.Response:
-        records, _meta = await asyncio.to_thread(
-            _turns_response,
-            request,
-            channel=_request_user_web_channel(request),
-        )
+        try:
+            records, _meta = await asyncio.to_thread(
+                _turns_response,
+                request,
+                channel=_request_user_web_channel(request),
+            )
+        except _TurnCursorNotFound as exc:
+            return web.json_response(
+                {
+                    "turns": [],
+                    "error": {
+                        "code": "cursor_not_found",
+                        "message": "turn cursor was not found within the scan window",
+                        "cursor": exc.cursor,
+                        "scan_limit": _TURNS_MAX_SCAN_RECORDS,
+                    },
+                },
+                status=409,
+            )
         return web.json_response({"turns": records})
 
     async def turns_data_v1(request: web.Request) -> web.Response:
         channel, error = _scoped_channel_from_query(request)
         if error is not None:
             return error
-        turns, meta = await asyncio.to_thread(_turns_response, request, channel=channel)
+        try:
+            turns, meta = await asyncio.to_thread(_turns_response, request, channel=channel)
+        except _TurnCursorNotFound as exc:
+            return json_error(
+                "cursor_not_found",
+                "turn cursor was not found within the scan window",
+                status=409,
+                details={"cursor": exc.cursor, "scan_limit": _TURNS_MAX_SCAN_RECORDS},
+            )
         return json_success({"turns": turns}, meta=meta)
 
     async def sessions_data_v1(request: web.Request) -> web.Response:
@@ -1105,7 +1147,7 @@ def register_routes(
         since: str | None,
         *,
         channel: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         try:
             limit = int(request.query.get("limit") or 0)
         except ValueError:
@@ -1119,12 +1161,13 @@ def register_routes(
             # newer events than their own.
             limit=None if channel is not None else limit or None,
         )
+        scanned_cursor = items[-1].cursor if items else since
         out = [item.as_dict() for item in items]
         if channel is not None:
             out = [item for item in out if _live_event_item_channel(item) == channel]
             if limit > 0:
                 out = out[-limit:]
-        return out
+        return out, scanned_cursor
 
     async def live_events_stream(request: web.Request) -> web.StreamResponse:
         """Fetch-authenticated SSE stream for React live dashboards.
@@ -1157,9 +1200,10 @@ def register_routes(
         try:
             await resp.prepare(request)
             while True:
-                items = await _live_event_items(request, delivered, channel=channel)
+                items, scanned_cursor = await _live_event_items(
+                    request, delivered, channel=channel
+                )
                 for item in items:
-                    delivered = str(item["cursor"])
                     block = (
                         f"id: {item['cursor']}\n"
                         "event: live-event\n"
@@ -1168,6 +1212,7 @@ def register_routes(
                         + "\n\n"
                     )
                     await resp.write(block.encode("utf-8"))
+                delivered = scanned_cursor
                 if once:
                     break
                 if items:
@@ -1184,6 +1229,22 @@ def register_routes(
             await _release_live_event_slot()
         return resp
 
+    turn_events_active = 0
+    turn_events_lock = asyncio.Lock()
+
+    async def _try_acquire_turn_event_slot() -> bool:
+        nonlocal turn_events_active
+        async with turn_events_lock:
+            if turn_events_active >= TURN_EVENTS_MAX_STREAMS:
+                return False
+            turn_events_active += 1
+            return True
+
+    async def _release_turn_event_slot() -> None:
+        nonlocal turn_events_active
+        async with turn_events_lock:
+            turn_events_active = max(0, turn_events_active - 1)
+
     async def turn_events_stream(request: web.Request) -> web.StreamResponse:
         """Live SSE stream of in-turn events (chainlink #583 slice 1).
 
@@ -1198,6 +1259,8 @@ def register_routes(
         if error is not None:
             return error
         channel = channel if channel is not None else request.query.get("channel") or "*"
+        if not await _try_acquire_turn_event_slot():
+            return web.Response(text="too many turn event streams", status=429)
         resp = web.StreamResponse(
             status=200,
             headers={
@@ -1207,9 +1270,10 @@ def register_routes(
                 "X-Accel-Buffering": "no",
             },
         )
-        await resp.prepare(request)
-        queue = turn_event_bus.subscribe(channel)
+        queue = None
         try:
+            await resp.prepare(request)
+            queue = turn_event_bus.subscribe(channel)
             while True:
                 try:
                     event = await asyncio.wait_for(
@@ -1230,7 +1294,9 @@ def register_routes(
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
-            turn_event_bus.unsubscribe(channel, queue)
+            if queue is not None:
+                turn_event_bus.unsubscribe(channel, queue)
+            await _release_turn_event_slot()
         return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:
@@ -1792,7 +1858,9 @@ def register_routes(
         store = _mcp_store()
         manager = MCPManager()
         try:
-            tools = await manager.start_servers([MCPServerConfig.from_dict(record)])
+            tools = await manager.start_servers(
+                [MCPServerConfig.from_dict(record)], fail_fast=True
+            )
         finally:
             await manager.shutdown()
         records = store.load()
@@ -1844,8 +1912,8 @@ def register_routes(
                     key: prior_env.get(key, value) if value == "[REDACTED]" else value
                     for key, value in record["env"].items()
                 }
-            store.upsert_server(record)
             await _discover_mcp_server(record)
+            store.upsert_server(record)
             payload = _mcp_payload()
         except json.JSONDecodeError:
             return json_error("bad_request", "invalid json", status=400)
@@ -1853,6 +1921,8 @@ def register_routes(
             return json_error("bad_request", str(exc), status=400)
         except RuntimeError as exc:
             return json_error("mcp_store_unavailable", str(exc), status=503)
+        except OSError as exc:
+            return json_error("mcp_discovery_failed", str(exc), status=400)
         return json_success(payload, headers=_no_store_headers())
 
     async def admin_mcp_remove_v1(request: web.Request) -> web.Response:

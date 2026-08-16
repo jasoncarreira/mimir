@@ -271,8 +271,6 @@ def compute_stats(events: list[dict[str, Any]], days: int) -> dict[str, Any]:
         "total_events": sum(by_event.values()),
         "events_queued": by_event.get("event_queued", 0),
         "messages_sent": by_event.get("send_message_sent", 0),
-        "subagents_started": by_event.get("subagent_started", 0),
-        "subagents_completed": by_event.get("subagent_notification", 0),
         "shell_jobs_spawned": shell_spawned,
         "shell_jobs_routed": shell_routed,
         "failures": sum(failures_by_kind.values()),

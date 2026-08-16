@@ -17,7 +17,6 @@ import os
 import posixpath
 import re
 from pathlib import Path
-import signal
 import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -128,6 +127,7 @@ _LOCAL_ENV_CRED_PREFIXES = (
 
 DEFAULT_WORKLINK_STDOUT_BYTES = 64 * 1024 * 1024
 DEFAULT_WORKLINK_STDERR_BYTES = 16 * 1024 * 1024
+_TERMINATED_DRAIN_TIMEOUT_S = 5.0
 
 
 def _output_limit(env_name: str, default: int) -> int:
@@ -153,11 +153,12 @@ async def _drain_capped(
     stream: asyncio.StreamReader | None,
     limit: int,
     on_overflow: Callable[[], None],
+    retained: bytearray | None = None,
 ) -> bytes:
     """Retain at most ``limit`` bytes while always draining the pipe."""
     if stream is None:
         return b""
-    retained = bytearray()
+    retained = retained if retained is not None else bytearray()
     overflowed = False
     while chunk := await stream.read(64 * 1024):
         remaining = limit - len(retained)
@@ -513,6 +514,8 @@ class LocalSubprocessComputeBackend:
         output_overflow = False
         kill_task: asyncio.Task[None] | None = None
         stdout_limit, stderr_limit = _worklink_output_limits()
+        stdout_retained = bytearray()
+        stderr_retained = bytearray()
 
         def overflow() -> None:
             nonlocal output_overflow, kill_task
@@ -523,13 +526,33 @@ class LocalSubprocessComputeBackend:
 
         async def collect() -> tuple[bytes, bytes]:
             stdout_task = asyncio.create_task(
-                _drain_capped(getattr(proc, "stdout", None), stdout_limit, overflow)
+                _drain_capped(
+                    getattr(proc, "stdout", None), stdout_limit, overflow, stdout_retained
+                )
             )
             stderr_task = asyncio.create_task(
-                _drain_capped(getattr(proc, "stderr", None), stderr_limit, overflow)
+                _drain_capped(
+                    getattr(proc, "stderr", None), stderr_limit, overflow, stderr_retained
+                )
             )
-            await getattr(proc, "wait")()
-            return await asyncio.gather(stdout_task, stderr_task)
+            try:
+                await getattr(proc, "wait")()
+                return await asyncio.gather(stdout_task, stderr_task)
+            except asyncio.CancelledError:
+                stdout_task.cancel()
+                stderr_task.cancel()
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                raise
+
+        async def collect_after_termination() -> tuple[bytes, bytes]:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(collect_task), _TERMINATED_DRAIN_TIMEOUT_S
+                )
+            except TimeoutError:
+                collect_task.cancel()
+                await asyncio.gather(collect_task, return_exceptions=True)
+                return bytes(stdout_retained), bytes(stderr_retained)
 
         collect_task = asyncio.create_task(collect())
         try:
@@ -539,9 +562,11 @@ class LocalSubprocessComputeBackend:
         except TimeoutError:
             timed_out = True
             await self.cancel(handle)
-            stdout_b, stderr_b = await collect_task
+            stdout_b, stderr_b = await collect_after_termination()
         if kill_task is not None:
             await kill_task
+            if not collect_task.done():
+                stdout_b, stderr_b = await collect_after_termination()
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
@@ -657,7 +682,6 @@ async def _kill_process_group(proc: object) -> None:
         return
     try:
         pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
     except OSError:
@@ -665,14 +689,9 @@ async def _kill_process_group(proc: object) -> None:
         if kill:
             kill()
         return
+    from .worker_exec import _terminate_process_group_pid
+
+    await asyncio.to_thread(_terminate_process_group_pid, pgid)
     wait = getattr(proc, "wait", None)
-    if wait is None:
-        return
-    try:
-        await asyncio.wait_for(wait(), timeout=5)
-    except TimeoutError:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
+    if wait is not None:
         await wait()

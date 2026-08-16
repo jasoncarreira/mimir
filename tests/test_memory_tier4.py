@@ -146,6 +146,21 @@ def test_forget_nonexistent_atom_is_no_op(conn):
     assert result.tombstoned_count == 0
 
 
+def test_forget_does_not_rollback_transaction_when_begin_fails(conn):
+    atom_id = store(conn, "eligible", embed_fn=_fake_embed).atom_id
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("UPDATE atoms SET metadata = '{\"pending\": true}' WHERE id = ?", (atom_id,))
+
+    with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+        forget(conn, [atom_id])
+
+    assert conn.in_transaction
+    assert conn.execute(
+        "SELECT metadata FROM atoms WHERE id = ?", (atom_id,),
+    ).fetchone()[0] == '{"pending": true}'
+    conn.rollback()
+
+
 # ────────────────────────────────────────────────────────────────────
 # forget_by_criteria — bulk
 # ────────────────────────────────────────────────────────────────────

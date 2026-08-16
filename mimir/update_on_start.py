@@ -528,9 +528,10 @@ async def emit_version_bump_digest(
     except Exception:  # noqa: BLE001 — notice is best-effort, never block boot
         log.exception("version-bump digest emit failed")
     finally:
-        # Record current as the baseline regardless, so the notice fires once
-        # per bump (and a self-update boot just re-baselines without re-emit).
-        _write_last_booted_version(home, current)
+        # Record a known current version so the notice fires once per bump.
+        # An unknown lookup must not destroy the last trustworthy baseline.
+        if current != "unknown":
+            _write_last_booted_version(home, current)
     return emitted
 
 

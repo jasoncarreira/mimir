@@ -772,7 +772,19 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
         (alice_id, bob_id),
     ).fetchall())
 
-    result = await store.consolidate(dedup_first=True, min_cluster_size=99)
+    synth_calls: list[list[dict]] = []
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        synth_calls.append(cluster)
+        return {
+            "content": "unexpected mixed-owner observation",
+            "topics": [],
+            "triples": [],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=True, min_cluster_size=2)
 
     assert result["dedup"]["candidates_scanned"] == 2
     assert result["dedup"]["duplicates_tombstoned"] == []
@@ -793,6 +805,60 @@ async def test_consolidate_dedup_isolates_owner_metadata_and_activation(
         (alice_id, bob_id),
     ).fetchall())
     assert after_events == before_events
+    assert synth_calls == [], "thematic consolidation crossed ownership scopes"
+
+
+@pytest.mark.asyncio
+async def test_consolidate_thematic_clusters_and_observations_are_owner_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir.saga.client import SagaStore
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "thematic-owner.saga.db", embedding_dim=4)
+    expected_ids: dict[str, set[str]] = {"alice": set(), "bob": set()}
+    for owner in expected_ids:
+        for index in range(2):
+            stored = await store.store(
+                content=f"{owner} private project update {index}",
+                owner_principal=owner,
+                origin_channel=f"channel:{owner}",
+                origin_domain=f"tenant:{owner}",
+                visibility="private",
+                provenance={"owner": owner, "index": index},
+            )
+            expected_ids[owner].add(stored["atom_id"])
+
+    seen_clusters: list[set[str]] = []
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        ids = {atom["id"] for atom in cluster}
+        seen_clusters.append(ids)
+        owner = next(owner for owner, owner_ids in expected_ids.items() if ids <= owner_ids)
+        return {
+            "content": f"{owner} synthesized observation",
+            "topics": [owner],
+            "triples": [],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=False, min_cluster_size=2)
+
+    assert result["observations_created"] == 2
+    assert {frozenset(cluster) for cluster in seen_clusters} == {
+        frozenset(expected_ids["alice"]),
+        frozenset(expected_ids["bob"]),
+    }
+    observations = store._ensure_conn().execute(
+        "SELECT content, owner_principal, origin_channel, origin_domain, visibility "
+        "FROM atoms WHERE memory_type = 'observation'"
+    ).fetchall()
+    assert set(observations) == {
+        ("alice synthesized observation", "alice", "channel:alice", "tenant:alice", "private"),
+        ("bob synthesized observation", "bob", "channel:bob", "tenant:bob", "private"),
+    }
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1072,72 @@ async def test_consolidate_restructure_tombstones_orphan_on_rollback(
         "orphaned observation must be tombstoned after the relations rollback "
         "(#391) — found a live unbacked observation"
     )
+
+
+@pytest.mark.asyncio
+async def test_consolidate_repairs_observation_orphaned_before_relations_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A retry completes an observation atom committed before a hard kill."""
+    import struct
+
+    from mimir.saga.client import SagaStore
+    from mimir.saga.store import store as store_atom
+
+    _stub_embeddings(monkeypatch)
+    store = SagaStore(db_path=tmp_path / "t.saga.db", embedding_dim=4)
+    raw_ids = []
+    for i in range(3):
+        result = await store.store(content=f"repair seed {i}", stream="semantic")
+        raw_ids.append(result["atom_id"])
+
+    conn = store._ensure_conn()
+    orphan = store_atom(
+        conn,
+        "repairable synthesized observation",
+        embed_fn=lambda _text: (
+            struct.pack("4f", 1.0, 0.0, 0.0, 0.0),
+            "stub",
+            "stub-4d",
+            4,
+        ),
+        memory_type="observation",
+        stream="semantic",
+    ).atom_id
+    assert conn.execute(
+        "SELECT 1 FROM atom_relations WHERE source_id = ?", (orphan,),
+    ).fetchone() is None
+
+    async def _stub_synth(cluster, *, prior_block="", vocab_block=""):
+        return {
+            "content": "repairable synthesized observation",
+            "topics": [],
+            "triples": [],
+            "contradictions": [],
+        }
+
+    store._rich_synth_fn = _stub_synth
+    result = await store.consolidate(dedup_first=False, min_cluster_size=2)
+
+    assert result["observations_emitted"] == [orphan]
+    evidence = {
+        row[0]
+        for row in conn.execute(
+            "SELECT target_id FROM atom_relations "
+            "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+            (orphan,),
+        )
+    }
+    assert evidence == set(raw_ids)
+    assert conn.execute(
+        "SELECT evidence_count FROM observations_metadata WHERE atom_id = ?",
+        (orphan,),
+    ).fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM atoms WHERE memory_type = 'observation' "
+        "AND tombstoned = 0"
+    ).fetchone()[0] == 1
 
 
 # ─── chainlink #425: skill-memory index sync + rebuild_if_needed wiring ──

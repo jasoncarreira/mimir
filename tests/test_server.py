@@ -278,6 +278,32 @@ async def test_start_mcp_servers_retains_manager_when_failure_shutdown_fails() -
     assert tools == []
 
 
+@pytest.mark.asyncio
+async def test_start_mcp_servers_emits_operator_event_for_skipped_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MagicMock()
+    manager.start_servers = AsyncMock(return_value=[])
+    manager.startup_failures = [{
+        "server_config_id": "broken-id",
+        "server_name": "broken",
+        "error": "binary not found",
+    }]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", capture)
+    returned_manager, tools = await _start_mcp_servers(
+        manager, [SimpleNamespace(policy_version="")]
+    )
+
+    assert returned_manager is manager
+    assert tools == []
+    assert events == [("mcp_server_start_failed", manager.startup_failures[0])]
+
+
 def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
     from types import SimpleNamespace
 
@@ -470,7 +496,7 @@ def _controlled_server_app(
             self._scheduler.running = True
             control.hit("scheduler:start")
 
-        def stop(self) -> None:
+        async def stop(self) -> None:
             self._started = False
             self._scheduler.running = False
             control.hit("scheduler:stop")
@@ -557,7 +583,6 @@ def _controlled_server_app(
             self.indexer = Indexer()
             self.saga_client = object()
             self.sessions = object()
-            self.subagent_inbox = object()
             self.commitments_store = SimpleNamespace(list=lambda *args, **kwargs: [])
             self.turn_event_bus = SimpleNamespace(
                 subscribe=lambda channel: asyncio.Queue(),
@@ -1313,7 +1338,6 @@ def test_complete_prestartup_app_key_contract_and_benchmark_access(
         "indexer",
         "saga_client",
         "sessions",
-        "subagent_inbox",
         "agent_runtime",
         "replayed_messages",
     }
@@ -1359,7 +1383,6 @@ async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_life
     assert app["indexer"] is control.bundle.indexer
     assert app["saga_client"] is control.bundle.saga_client
     assert app["sessions"] is control.bundle.sessions
-    assert app["subagent_inbox"] is control.bundle.subagent_inbox
     assert app["replayed_messages"] == 9
     assert get_global_buffer() is control.bundle.message_buffer
     assert app["dispatcher"] is dispatcher
@@ -1377,7 +1400,6 @@ async def test_runtime_and_server_owned_app_keys_follow_success_and_cleanup_life
         "indexer",
         "saga_client",
         "sessions",
-        "subagent_inbox",
         "agent_runtime",
         "replayed_messages",
     ))
@@ -1664,11 +1686,17 @@ async def _ok_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def _auth_app(expected_key: str) -> web.Application:
+def _auth_app(expected_key: str, *, web_host: str | None = None) -> web.Application:
     """Minimal app wiring the auth middleware around a simple route."""
-    app = web.Application(middlewares=[_make_auth_middleware(expected_key)])
+    app = web.Application(
+        middlewares=[_make_auth_middleware(expected_key, web_host=web_host)]
+    )
     app.router.add_get("/protected", _ok_handler)
     app.router.add_post("/protected", _ok_handler)
+    app.router.add_put("/protected", _ok_handler)
+    app.router.add_patch("/protected", _ok_handler)
+    app.router.add_delete("/protected", _ok_handler)
+    app.router.add_get("/api/v1/sessions", _ok_handler)
     # Register all exempt paths so we can hit them in tests
     app.router.add_get("/health", _handle_health)
     app.router.add_get("/turns", _ok_handler)
@@ -1693,6 +1721,69 @@ class TestAuthMiddlewareNoKey:
     async def test_no_key_allows_without_header(self) -> None:
         async with TestClient(TestServer(_auth_app(""))) as client:
             resp = await client.get("/protected")
+        assert resp.status == 200
+
+
+class TestBrowserRequestSecurity:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expected_key", ["", "secret"])
+    @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+    async def test_cross_site_fetch_metadata_rejects_write_before_auth(
+        self, expected_key: str, method: str,
+    ) -> None:
+        headers = {"Sec-Fetch-Site": "cross-site"}
+        if expected_key:
+            headers["X-API-Key"] = expected_key
+        async with TestClient(TestServer(_auth_app(expected_key))) as client:
+            resp = await client.request(method, "/protected", headers=headers)
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "cross_site_request"}
+
+    @pytest.mark.asyncio
+    async def test_foreign_origin_rejects_write_when_gate_is_inactive(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": "https://attacker.example"},
+            )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_same_origin_write_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            origin = str(client.make_url("/")).rstrip("/")
+            resp = await client.post(
+                "/protected",
+                headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"},
+            )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_non_browser_write_without_origin_headers_is_allowed(self) -> None:
+        async with TestClient(TestServer(_auth_app(""))) as client:
+            resp = await client.post("/protected")
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_loopback_bind_rejects_rebinding_host_on_read_route(self) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/v1/sessions", headers={"Host": "attacker.example"}
+            )
+            body = await resp.json()
+        assert resp.status == 403
+        assert body == {"error": "invalid_host"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "host", ["127.0.0.1:8080", "localhost:8080", "[::1]:8080"]
+    )
+    async def test_loopback_bind_accepts_loopback_hostnames(self, host: str) -> None:
+        app = _auth_app("", web_host="127.0.0.1")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/v1/sessions", headers={"Host": host})
         assert resp.status == 200
 
 
@@ -1819,7 +1910,7 @@ def _event_app(
     stub = MagicMock()
     stub.enqueue = AsyncMock(return_value=enqueue_returns)
 
-    app = web.Application()
+    app = web.Application(middlewares=[_make_auth_middleware("")])
     app["dispatcher"] = stub
     app.router.add_post("/event", _handle_event)
     return app, stub
@@ -1852,6 +1943,22 @@ def _event_app_authed(
 
 
 class TestHandleEvent:
+    @pytest.mark.asyncio
+    async def test_cross_site_text_plain_event_is_rejected_before_enqueue(self) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event",
+                data='{"channel_id":"web-default","content":"run"}',
+                headers={
+                    "Content-Type": "text/plain",
+                    "Origin": "https://attacker.example",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            )
+        assert resp.status == 403
+        stub.enqueue.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_valid_event_returns_200(self) -> None:
         app, _ = _event_app()
@@ -2039,6 +2146,22 @@ class TestHandleEvent:
             resp = await client.post("/event", json={})
             body = await resp.json()
         assert "channel_id" in body.get("error", "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", [["web-x"], 123])
+    async def test_non_string_channel_id_returns_400_before_enqueue(
+        self, channel_id: Any
+    ) -> None:
+        app, stub = _event_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/event", json={"channel_id": channel_id, "content": "hi"}
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"] == "channel_id must be a string"
+        stub.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_dict_extra_returns_400(self) -> None:

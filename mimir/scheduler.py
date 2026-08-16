@@ -46,6 +46,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
     SCHEDULER_AUTHORITY_PROFILES,
     agent_writable_roots,
@@ -847,11 +848,7 @@ class Scheduler:
         return value.  This helper retains the task in ``_background_tasks``
         until it finishes, matching the cpython-documented strong-ref pattern.
         """
-        loop = asyncio.get_running_loop()
-        task: asyncio.Task[Any] = loop.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+        return spawn_background(self._background_tasks, coro, name=name)
 
     # ---- LLM-tick jobs ------------------------------------------------
 
@@ -881,9 +878,12 @@ class Scheduler:
         return self._apply_reload(yaml_jobs)
 
     def _apply_reload(self, yaml_jobs: list[SchedulerJob]) -> dict[str, int]:
-        """APScheduler-mutating half of ``reload``. ``yaml_jobs`` is
-        pre-loaded by the caller (the only file IO), so this method does
-        no IO and MUST run on the loop thread."""
+        """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
+
+        Async callers load the workload-sized YAML off-loop before entering
+        this method. The synchronous ``reload`` convenience does that read on
+        its caller's thread.
+        """
         # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
@@ -894,7 +894,7 @@ class Scheduler:
         # propagates to APScheduler here.
         for cdef in list(self._callables.values()):
             try:
-                self._install_callable(cdef)
+                self._install_callable(cdef, yaml_jobs=yaml_jobs)
             except ValueError as exc:
                 log.warning(
                     "reload: callable %r install failed: %s",
@@ -1138,19 +1138,23 @@ class Scheduler:
         self.arm_quota_pause_recheck()
 
     def arm_quota_pause_recheck(self) -> None:
-        """Register/replace the interval probe that early-clears an
+        """Register the interval probe that early-clears an
         authoritative 429 pause when fresh quota evidence shows the
         provider recovered before the recorded reset. Idempotent;
         disarms itself once the pause is gone. Best-effort like the
         one-shot wake."""
         try:
+            # Keep the first probe's countdown. Repeated 429s should not defer
+            # recovery indefinitely by replacing it with a fresh interval.
+            if self._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is not None:
+                return
             self._scheduler.add_job(
                 self._recheck_quota_pause,
                 trigger=IntervalTrigger(seconds=_quota_recheck_seconds()),
                 id=_QUOTA_RECHECK_JOB_ID,
-                replace_existing=True,
                 coalesce=True,
                 max_instances=1,
+                misfire_grace_time=300,
             )
         except Exception:  # noqa: BLE001 — recovery degrades to the one-shot wake
             log.exception("failed to arm quota-pause recheck")
@@ -1434,7 +1438,12 @@ class Scheduler:
         self._callables[name] = cdef
         return self._install_callable(cdef)
 
-    def _install_callable(self, cdef: _CallableDef) -> bool:
+    def _install_callable(
+        self,
+        cdef: _CallableDef,
+        *,
+        yaml_jobs: list[SchedulerJob] | None = None,
+    ) -> bool:
         """Resolve the effective cron for ``cdef`` and (re-)add the
         APScheduler job. Returns True if a job was installed."""
         # Drop any existing APScheduler job under this id. This makes
@@ -1445,11 +1454,11 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
             pass
 
-        yaml_jobs: list[SchedulerJob]
-        try:
-            yaml_jobs = load_jobs(self._yaml_path)
-        except Exception:  # noqa: BLE001 — already logged inside load_jobs
-            yaml_jobs = []
+        if yaml_jobs is None:
+            try:
+                yaml_jobs = load_jobs(self._yaml_path)
+            except Exception:  # noqa: BLE001 — already logged inside load_jobs
+                yaml_jobs = []
 
         effective_cron, source = _resolve_callable_cron(
             yaml_jobs, cdef.name, cdef.default_cron,
@@ -3264,7 +3273,7 @@ class Scheduler:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         if self._loop_lag_task is not None:
             self._loop_lag_task.cancel()
             self._loop_lag_task = None
@@ -3277,6 +3286,12 @@ class Scheduler:
         if self._started or self._scheduler.running:
             self._scheduler.shutdown(wait=False)
             self._started = False
+        errors = await cancel_background_tasks(
+            self._background_tasks,
+            label="scheduler",
+        )
+        if errors:
+            raise BaseExceptionGroup("scheduler shutdown failed", errors)
 
 
 def _summarize_consolidate(payload: Any) -> dict:

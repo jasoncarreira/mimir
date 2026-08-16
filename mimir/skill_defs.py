@@ -47,9 +47,11 @@ independent of each other.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -91,6 +93,46 @@ SKILLS_DIR_NAME = "skills"
 _LEGACY_SKILLS_DIR_NAME = ".claude/skills"
 
 _BUNDLED_ROOT = Path(__file__).parent / "skills"
+
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
+_RENAME_SWAP = 0x00000002
+
+
+def _atomic_exchange_directories(staged: Path, destination: Path) -> None:
+    """Atomically exchange two existing directories on Linux or Darwin."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    staged_bytes = os.fsencode(staged)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError("renameat2(RENAME_EXCHANGE) is unavailable on Linux")
+        renameat2.argtypes = (
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            _AT_FDCWD, staged_bytes,
+            _AT_FDCWD, destination_bytes,
+            _RENAME_EXCHANGE,
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError("renamex_np(RENAME_SWAP) is unavailable on Darwin")
+        renamex_np.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(staged_bytes, destination_bytes, _RENAME_SWAP)
+    else:
+        raise OSError(
+            f"atomic directory exchange is unsupported on {sys.platform}"
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
 
 #: Default ``scheduler.yaml`` shipped with mimir. Seeded to the
 #: deployment home on first setup so a fresh install has working
@@ -246,10 +288,13 @@ def refresh_builtin_skills(home: Path) -> dict[str, str]:
             # dereferencing their contents.
             reject_escaping_symlinks(src)
             shutil.copytree(src, tmp, symlinks=True)
-            # Atomic-replace: remove old, rename tmp into place.
+            # Exchange keeps dst present throughout an update. Afterward tmp
+            # names the old tree and can be removed without affecting readers.
             if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
-            tmp.rename(dst)
+                _atomic_exchange_directories(tmp, dst)
+                shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                tmp.rename(dst)
             out[name] = "refreshed"
         except (OSError, ValueError) as exc:
             log.warning(

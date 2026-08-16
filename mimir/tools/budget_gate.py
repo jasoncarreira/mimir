@@ -96,10 +96,14 @@ _REMEDIATION_EFFECT_TOOLS = frozenset({
 def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
-    arguments: dict[str, Any],
+    arguments: Mapping[str, Any] | None,
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
-    if tool_name not in _STANDING_REVIEW_TOOLS or auth_context is None:
+    if (
+        tool_name not in _STANDING_REVIEW_TOOLS
+        or auth_context is None
+        or not isinstance(arguments, Mapping)
+    ):
         return None
     from .forge import resolve_review_state_for_context
 
@@ -559,6 +563,24 @@ def _duplicate_review_result(request: ToolCallRequest, claim: Any) -> ToolMessag
     )
 
 
+async def _claim_review_submission_async(claim: Callable[[], Any]) -> Any:
+    """Keep ownership of a thread-acquired claim when the caller is cancelled."""
+    task = asyncio.create_task(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def release_late_claim(completed: asyncio.Task[Any]) -> None:
+            try:
+                late_claim = completed.result()
+            except BaseException:
+                return
+            if late_claim is not None:
+                late_claim.release()
+
+        task.add_done_callback(release_late_claim)
+        raise
+
+
 def _record_repo_review_checkout(
     request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
 ) -> None:
@@ -665,8 +687,6 @@ def _request_for_authorized_execution(
     A trusted service receives only the direct argv admitted by its operation-
     specific sink policy; the handler never sees the original command string.
     """
-    if tool_name not in {"shell_exec", "bash_async"}:
-        return request
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     # Never trust a model-supplied internal execution override. Ordinary calls
     # discard it; trusted-service calls below replace it with server-parsed argv
@@ -679,6 +699,8 @@ def _request_for_authorized_execution(
         if had_model_override
         else request
     )
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return sanitized_request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
     if policy is None or policy.adapter != "shell_profile":
@@ -1348,11 +1370,14 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
+        authorization = None
         for target_channel in target_channels:
-            authorization, admin_denial = _authorize_tool_call(
+            target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
                 target_channel,
@@ -1360,6 +1385,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 getattr(request, "tool", None),
                 validated_arguments,
             )
+            if authorization is None:
+                # The first target is the operation target; later targets are
+                # additional writable destinations that must also be admitted.
+                authorization = target_authorization
             if admin_denial is not None:
                 break
         if admin_denial is not None:
@@ -1500,28 +1529,35 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = _duplicate_review_result(request, review_claim)
             _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
             return result
-        if isinstance(direct_argv, list):
-            from ._shell_env import bind_direct_exec_argv
-
-            direct_argv_token = bind_direct_exec_argv(direct_argv)
-        from ..access_control import (
-            begin_protected_result_capture,
-            end_protected_result_capture,
-        )
-
-        capture_token = begin_protected_result_capture()
+        capture_token = None
+        provenance = None
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-            tool_name, auth_context, _extract_sink_target(request, auth_context),
-        )
-        if authorized_fetch_urls is not None:
-            from .web import begin_authorized_fetch
-
-            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
+            if (
+                tool_name in {"shell_exec", "bash_async"}
+                and isinstance(direct_argv, list)
+            ):
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(direct_argv)
+            from ..access_control import (
+                begin_protected_result_capture,
+                end_protected_result_capture,
+            )
+
+            capture_token = begin_protected_result_capture()
+            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, _extract_sink_target(request, auth_context),
+            )
+            if authorized_fetch_urls is not None:
+                from .web import begin_authorized_fetch
+
+                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
             result = handler(execution_request)
         except ToolException as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -1544,7 +1580,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -1572,7 +1610,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
-        provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)
@@ -1623,11 +1662,14 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return await handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
+        authorization = None
         for target_channel in target_channels:
-            authorization, admin_denial = _authorize_tool_call(
+            target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
                 target_channel,
@@ -1635,6 +1677,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 getattr(request, "tool", None),
                 validated_arguments,
             )
+            if authorization is None:
+                # The first target is the operation target; later targets are
+                # additional writable destinations that must also be admitted.
+                authorization = target_authorization
             if admin_denial is not None:
                 break
         if admin_denial is not None:
@@ -1772,7 +1818,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         review_spec = review_submission_from_request(execution_request)
         review_claim = (
-            await asyncio.to_thread(claim_review_submission, review_spec)
+            await _claim_review_submission_async(
+                lambda: claim_review_submission(review_spec)
+            )
             if review_spec is not None
             else None
         )
@@ -1781,28 +1829,35 @@ class BudgetGateMiddleware(AgentMiddleware):
             result = _duplicate_review_result(request, review_claim)
             _emit_tool_call_sync(tool_name, ok=True, duration_ms=(time.monotonic() - started) * 1000.0)
             return result
-        if isinstance(direct_argv, list):
-            from ._shell_env import bind_direct_exec_argv
-
-            direct_argv_token = bind_direct_exec_argv(direct_argv)
-        from ..access_control import (
-            begin_protected_result_capture,
-            end_protected_result_capture,
-        )
-
-        capture_token = begin_protected_result_capture()
+        capture_token = None
+        provenance = None
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-            tool_name, auth_context, _extract_sink_target(request, auth_context),
-        )
-        if authorized_fetch_urls is not None:
-            from .web import begin_authorized_fetch
-
-            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
+            if (
+                tool_name in {"shell_exec", "bash_async"}
+                and isinstance(direct_argv, list)
+            ):
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(direct_argv)
+            from ..access_control import (
+                begin_protected_result_capture,
+                end_protected_result_capture,
+            )
+
+            capture_token = begin_protected_result_capture()
+            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, _extract_sink_target(request, auth_context),
+            )
+            if authorized_fetch_urls is not None:
+                from .web import begin_authorized_fetch
+
+                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
             result = await handler(execution_request)
         except ToolException as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -1825,7 +1880,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -1853,7 +1910,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
-        provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)

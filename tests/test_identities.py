@@ -359,6 +359,32 @@ def test_malformed_access_metadata_falls_back_without_breaking_identity_load(
     assert r.is_admin("slack-U999") is True
 
 
+def test_service_role_is_rejected_and_cannot_authenticate_as_operator(tmp_path: Path):
+    from mimir.models import AgentEvent
+    from mimir.operator_approval import _is_authenticated_operator
+
+    resolver = _write_identities(
+        tmp_path,
+        """\
+        people:
+          - canonical: deploy-bot
+            aliases: [slack-BOT]
+            access:
+              roles: [admin, service]
+        """,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ops",
+        content="approve",
+        author="slack-BOT",
+        source="slack",
+    )
+
+    assert resolver.access_metadata("slack-BOT") == AccessMetadata()
+    assert _is_authenticated_operator(event, resolver) is False
+
+
 # ---------------------------------------------------------------------------
 # Channels (chainlink #40 Phase A) — the channels: section is parallel to
 # people: with ``kind`` added. Backwards-compat: missing channels: = empty.

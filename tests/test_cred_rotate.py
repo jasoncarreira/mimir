@@ -36,6 +36,7 @@ def deployment(tmp_path: Path) -> Path:
 
         OTHER_VAR=stable
         ATPROTO_HANDLE=alice.bsky.social
+        DISCORD_TOKEN=old-revoked-token
     """).lstrip())
     compose_yml = tmp_path / "compose.yml"
     compose_yml.write_text(textwrap.dedent("""
@@ -88,6 +89,36 @@ def test_atomic_replace_creates_timestamped_backup(deployment: Path):
     _, backup = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "NEW")
     assert backup.name.startswith("compose.env.bak.")
     assert backup.read_text() == original
+
+
+def test_atomic_replace_backups_are_unique_within_same_clock_tick(
+    deployment: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    compose_env = deployment / "compose.env"
+    original = compose_env.read_text()
+    monkeypatch.setattr(cred_rotate.time, "time_ns", lambda: 123456789)
+
+    _, first = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "FIRST")
+    _, second = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "SECOND")
+
+    assert first != second
+    assert first.read_text() == original
+    assert "GITHUB_TOKEN=FIRST" in second.read_text()
+
+
+def test_atomic_replace_retains_only_ten_newest_backups(deployment: Path):
+    compose_env = deployment / "compose.env"
+    for index in range(12):
+        (deployment / f"compose.env.bak.{index:02d}").write_text(f"old-{index}")
+
+    _, current = cred_rotate._atomic_replace_env(compose_env, "GITHUB_TOKEN", "NEW")
+    backups = list(deployment.glob("compose.env.bak.*"))
+
+    assert len(backups) == cred_rotate._KEEP_ROTATION_BACKUPS
+    assert current in backups
+    assert not (deployment / "compose.env.bak.00").exists()
+    assert not (deployment / "compose.env.bak.01").exists()
+    assert not (deployment / "compose.env.bak.02").exists()
 
 
 def test_atomic_replace_only_changes_first_match(deployment: Path):
@@ -155,19 +186,12 @@ def test_resolve_service_multi_service_requires_explicit(deployment: Path):
 
 def test_emit_writes_jsonl(deployment: Path):
     cred_rotate._emit(deployment, "credential_rotation_started",
-                      env="GITHUB_TOKEN", new_value_hash="sha256:abc123")
+                      env="GITHUB_TOKEN", rotation_id="fake-rotation-id")
     log = (deployment / "rotations.jsonl").read_text()
     record = json.loads(log.strip())
     assert record["type"] == "credential_rotation_started"
     assert record["env"] == "GITHUB_TOKEN"
     assert "timestamp" in record
-
-
-def test_value_hash_is_sha256_prefix():
-    h = cred_rotate._value_hash("secret-value")
-    assert h.startswith("sha256:")
-    # 12-char hex prefix.
-    assert len(h.split(":", 1)[1]) == 12
 
 
 # ── full rotation flow (docker mocked) ──────────────────────────────
@@ -192,10 +216,7 @@ def fake_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deployment: P
               prefix: ghp_
               min_len: 20
     """))
-    # Replace the package manifest so the test only sees our fixture.
-    monkeypatch.setattr(
-        cred_verify, "_PACKAGE_MANIFEST", deployment / "no-such-file.yaml",
-    )
+    # The operator entry shadows only GITHUB_TOKEN; shipped entries remain visible.
     cred_verify.reset_probes_cache()
     return deployment
 
@@ -232,6 +253,12 @@ def test_rotate_happy_path(
     types = [json.loads(line)["type"] for line in log]
     assert "credential_rotation_started" in types
     assert "credential_rotation_completed" in types
+    records = [json.loads(line) for line in log]
+    started = next(row for row in records if row["type"] == "credential_rotation_started")
+    completed = next(row for row in records if row["type"] == "credential_rotation_completed")
+    assert started["rotation_id"] == completed["rotation_id"]
+    assert "old_value_hash" not in started
+    assert "new_value_hash" not in started
     # docker compose was invoked: up + ps + exec at minimum.
     invoked_verbs = {c[0] for c in calls}
     assert {"up", "ps", "exec"}.issubset(invoked_verbs)
@@ -274,9 +301,62 @@ def test_rotate_rollback_on_verify_failure(
     assert recreate_calls == 2
     # Audit trail recorded the failure.
     log = (fake_registry / "rotations.jsonl").read_text().splitlines()
-    types = [json.loads(line)["type"] for line in log]
+    records = [json.loads(line) for line in log]
+    types = [record["type"] for record in records]
     assert "credential_rotation_started" in types
     assert "credential_rotation_failed" in types
+    failure = next(
+        record for record in records
+        if record["type"] == "credential_rotation_failed"
+    )
+    assert failure["stage"] == "verify"
+    assert failure["rolled_back"] is True
+
+
+def test_rotate_skips_unimplemented_probe_from_shipped_registry(
+    deployment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    """A shipped not_implemented probe is an explicit skip, not failure."""
+    monkeypatch.setenv("MIMIR_HOME", str(deployment))
+    recreate_calls = 0
+
+    def fake_docker_compose(compose_file, *args, capture=True, timeout=120):
+        nonlocal recreate_calls
+        if args[0] == "up":
+            recreate_calls += 1
+            return (0, "", "")
+        if args[0] == "ps":
+            return (0, json.dumps({"Service": "agent", "State": "running"}), "")
+        raise AssertionError(f"unexpected docker compose call: {args}")
+
+    monkeypatch.setattr(cred_rotate, "_docker_compose", fake_docker_compose)
+
+    rc = cred_rotate.run_rotate(
+        env_name="DISCORD_TOKEN",
+        new_value="new-working-token",
+        deployment_dir=deployment,
+    )
+
+    assert rc == 0
+    assert "DISCORD_TOKEN=new-working-token" in (deployment / "compose.env").read_text()
+    assert recreate_calls == 1
+    output = capsys.readouterr().out
+    assert "verification skipped" in output
+    assert "DISCORD_TOKEN" in output
+
+    records = [
+        json.loads(line)
+        for line in (deployment / "rotations.jsonl").read_text().splitlines()
+    ]
+    assert [record["type"] for record in records] == [
+        "credential_rotation_started",
+        "credential_rotation_completed",
+    ]
+    assert records[-1]["verify"] == (
+        "verification skipped (no probe implemented for DISCORD_TOKEN)"
+    )
 
 
 def test_rotate_recreate_failure_rolls_back_immediately(

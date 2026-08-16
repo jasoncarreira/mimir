@@ -25,14 +25,16 @@ PATTERNS=(
   'sk-[A-Za-z0-9]{20,}'                 # OpenAI classic keys (base62 body — no hyphens; keeps wiki slugs like sk-foo-bar from matching)
   'ghp_[A-Za-z0-9]{30,}'               # GitHub PAT (classic)
   'gho_[A-Za-z0-9]{30,}'               # GitHub OAuth
+  'gh[usr]_[A-Za-z0-9]{30,}'           # GitHub user-to-server, app-installation, and refresh tokens
   'github_pat_[A-Za-z0-9_]{60,}'       # GitHub fine-grained PAT
   'AKIA[0-9A-Z]{16}'                   # AWS access key
   'ASIA[0-9A-Z]{16}'                   # AWS STS temp key
+  'AWS_SECRET_ACCESS_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9/+=]{20,}'
   '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
   '"access_token"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
   '"client_secret"[[:space:]]*:[[:space:]]*"[^"]{20,}"'
-  'xoxb-[0-9A-Za-z-]{20,}'             # Slack bot token
-  'xoxp-[0-9A-Za-z-]{20,}'             # Slack user token
+  'xox[bpasr]-[0-9A-Za-z-]{20,}'       # Slack bot, user, app, refresh, and config tokens
+  '[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}' # Discord bot token
 )
 
 # Filename heuristics — refuse outright on suspicious names. The

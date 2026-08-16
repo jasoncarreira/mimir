@@ -57,6 +57,9 @@ DRAIN_JOIN_TIMEOUT_SECONDS = 10.0
 # chainlink #387: refuse to start more than this many concurrently-live jobs so
 # a flood can't spawn unbounded subprocesses/threads/FDs.
 MAX_LIVE_SHELL_JOBS = 32
+# Bound each stream on the write side. A single job can therefore consume at
+# most twice this amount across its stdout/stderr files.
+SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM = 10 * 1024 * 1024
 SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES = 1000
 SHELL_JOB_OUTPUT_MAX_TAIL_LINES = 2000
 DEFAULT_SHELL_JOB_SCOPE = "running"
@@ -81,6 +84,8 @@ class ShellJob:
     channel_id: Optional[str] = None
     ifc_labels: object | None = None
     auth_context: object | None = None
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -105,6 +110,13 @@ class ShellJob:
         with self._lock:
             self.last_live_signal = time.time()
 
+    def mark_output_truncated(self, stream: str) -> None:
+        with self._lock:
+            if stream == "stdout":
+                self.stdout_truncated = True
+            else:
+                self.stderr_truncated = True
+
     def snapshot(self) -> dict:
         """JSON-serializable view for tools and event payloads."""
         return {
@@ -118,6 +130,15 @@ class ShellJob:
             "status": self.status,
             "exit_code": self.exit_code,
             "channel_id": self.channel_id,
+            "output_truncated": self.stdout_truncated or self.stderr_truncated,
+            "truncated_streams": [
+                stream
+                for stream, truncated in (
+                    ("stdout", self.stdout_truncated),
+                    ("stderr", self.stderr_truncated),
+                )
+                if truncated
+            ],
         }
 
 
@@ -273,7 +294,9 @@ class ShellJobRegistry:
             _process=proc,
         )
 
-        def _drain(stream, outfile, on_signal):
+        def _drain(stream, outfile, stream_name, on_signal):
+            written = 0
+            write_enabled = True
             try:
                 while True:
                     try:
@@ -284,8 +307,35 @@ class ShellJobRegistry:
                         break
                     if not chunk:
                         break
-                    outfile.write(chunk)
-                    outfile.flush()
+                    if write_enabled:
+                        remaining = SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM - written
+                        if remaining <= 0:
+                            job.mark_output_truncated(stream_name)
+                            write_enabled = False
+                        else:
+                            to_write = chunk[:remaining]
+                            try:
+                                count = outfile.write(to_write)
+                                outfile.flush()
+                                if count != len(to_write):
+                                    raise OSError("short shell-job output write")
+                                written += count
+                                if len(to_write) < len(chunk):
+                                    job.mark_output_truncated(stream_name)
+                                    write_enabled = False
+                            except OSError as exc:
+                                # The pipe must keep being drained after disk
+                                # failure or the child can block forever once
+                                # the kernel pipe buffer fills.
+                                job.mark_output_truncated(stream_name)
+                                write_enabled = False
+                                log.warning(
+                                    "shell job %s %s capture failed; discarding "
+                                    "remaining output: %s",
+                                    job_id,
+                                    stream_name,
+                                    exc,
+                                )
                     on_signal()
             finally:
                 try:
@@ -336,13 +386,13 @@ class ShellJobRegistry:
         drain_threads = [
             threading.Thread(
                 target=_drain,
-                args=(proc.stdout, stdout_f, job.touch),
+                args=(proc.stdout, stdout_f, "stdout", job.touch),
                 daemon=True,
                 name=f"shelljob-out-{job_id}",
             ),
             threading.Thread(
                 target=_drain,
-                args=(proc.stderr, stderr_f, job.touch),
+                args=(proc.stderr, stderr_f, "stderr", job.touch),
                 daemon=True,
                 name=f"shelljob-err-{job_id}",
             ),
@@ -511,6 +561,15 @@ class ShellJobRegistry:
         out = _tail(job.stdout_path, tail_lines) if stream in ("stdout", "both") else ""
         err = _tail(job.stderr_path, tail_lines) if stream in ("stderr", "both") else ""
         result = job.snapshot()
+        if result["output_truncated"]:
+            warning = (
+                "[shell job output incomplete; capture truncated for "
+                f"{', '.join(result['truncated_streams'])}]"
+            )
+            if stream in ("stdout", "both"):
+                out = f"{warning}\n{out}" if out else warning
+            if stream in ("stderr", "both"):
+                err = f"{warning}\n{err}" if err else warning
         result["stdout_tail"] = out
         result["stderr_tail"] = err
         result["stdout_path"] = str(job.stdout_path)
@@ -589,6 +648,7 @@ __all__: tuple[str, ...] = (
     "DEFAULT_SHELL_JOB_STREAM",
     "EVICT_AFTER_SECONDS",
     "POST_EXIT_GRACE_SECONDS",
+    "SHELL_JOB_OUTPUT_MAX_BYTES_PER_STREAM",
     "SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES",
     "SHELL_JOB_OUTPUT_MAX_TAIL_LINES",
     "UI_VISIBILITY_THRESHOLD_SECONDS",

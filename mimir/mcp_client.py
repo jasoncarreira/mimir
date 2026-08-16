@@ -702,6 +702,7 @@ class MCPManager:
         self._shutdown_timeout = shutdown_timeout_s
         self._policy_store = MCPPolicyStore(policy_store_path) if policy_store_path else None
         self.policy_records: dict[str, dict[str, Any]] = {}
+        self.startup_failures: list[dict[str, str]] = []
 
     def _validate_identities(
         self,
@@ -752,7 +753,12 @@ class MCPManager:
             resolved.append(replace(config, tool_policies=tuple(policies)))
         return resolved
 
-    async def start_servers(self, configs: list[MCPServerConfig]) -> list[StructuredTool]:
+    async def start_servers(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool = False,
+    ) -> list[StructuredTool]:
         """Start every configured server, bridge their tools, return flat list.
 
         Detects ``mcp_{server}_{tool}`` namespaced-name collisions
@@ -762,6 +768,7 @@ class MCPManager:
         configures the same server name twice or when underscore-laden
         tool names happen to produce the same namespaced string.
         """
+        self.startup_failures = []
         records = self._policy_store.load() if self._policy_store else {}
         configs = self._apply_stored_policies(configs, records)
         self._validate_identities(configs, records)
@@ -783,16 +790,30 @@ class MCPManager:
                     config.name, [tool.name for tool in tools],
                 )
             except asyncio.TimeoutError:
+                self.startup_failures.append({
+                    "server_config_id": config.server_config_id,
+                    "server_name": config.name,
+                    "error": f"initialize timed out after {self._init_timeout:.1f}s",
+                })
                 log.warning(
                     "MCP server '%s' initialize timed out after %.1fs",
                     config.name, self._init_timeout,
                 )
+                if fail_fast:
+                    raise
             except Exception as exc:
+                self.startup_failures.append({
+                    "server_config_id": config.server_config_id,
+                    "server_name": config.name,
+                    "error": str(exc),
+                })
                 # Don't block startup — log + skip so the agent still
                 # boots with native tools + the MCP servers that worked.
                 log.warning(
                     "MCP server '%s' failed to start: %s", config.name, exc,
                 )
+                if fail_fast:
+                    raise
         display_identities: dict[str, str] = {}
         for tool in all_tools:
             provenance = get_tool_provenance(tool)

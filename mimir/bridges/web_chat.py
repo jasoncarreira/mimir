@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,7 +56,6 @@ log = logging.getLogger(__name__)
 EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 
 DEFAULT_CHANNEL = DEFAULT_WEB_CHANNEL
-CHAT_STREAM_MAX_SUBSCRIBERS = int(os.environ.get("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "8"))
 
 
 @dataclass(frozen=True)
@@ -181,6 +179,7 @@ class WebChatBridge(Bridge):
     enqueue: EnqueueFn
     home: Path
     chat_skill_registry: ChatSkillRegistry | None = None
+    max_subscribers: int = 8
     _subscribers: list[_Subscriber] = field(default_factory=list, init=False)
     _lock: asyncio.Lock | None = field(default=None, init=False)
 
@@ -436,7 +435,7 @@ class WebChatBridge(Bridge):
         q: asyncio.Queue = asyncio.Queue(maxsize=128)
         subscriber = _Subscriber(q, self._allowed_stream_channels(request))
         async with self._lock:
-            if len(self._subscribers) >= CHAT_STREAM_MAX_SUBSCRIBERS:
+            if len(self._subscribers) >= self.max_subscribers:
                 return web.Response(text="too many chat streams", status=429)
             self._subscribers.append(subscriber)
 

@@ -635,13 +635,17 @@ async def test_repeated_refused_turns_never_exhaust_remediation_budget(
     }
     for attempt in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1):
         source_id = f"refused-{attempt}"
-        poller_recovery.stash_enqueued_event(tmp_path, AgentEvent(
-            trigger="poller",
-            channel_id="poller:github-activity",
-            content="fix PR",
-            source_id=source_id,
-            extra={"poller_name": "github-activity", "items": [item]},
-        ))
+        await poller_recovery.stash_enqueued_event(
+            tmp_path,
+            AgentEvent(
+                trigger="poller",
+                channel_id="poller:github-activity",
+                content="fix PR",
+                source_id=source_id,
+                extra={"poller_name": "github-activity", "items": [item]},
+            ),
+            enqueued_at=(NOW - timedelta(minutes=1)).isoformat(),
+        )
         with events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
                 "type": "turn_completed",

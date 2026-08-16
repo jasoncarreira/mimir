@@ -15,10 +15,9 @@ commitment:
   AND mark ``expired`` via ``store.expire()``. Negative polarity —
   the actual miss signal.
 
-- Commitments with no ``due_window_start_unix`` (open-ended) are
-  skipped entirely — they're surfaced via the Phase 3 prompt-builder
-  block, not via time-based delivery. The agent decides when to act
-  on those.
+- Commitments with no ``due_window_start_unix`` are not delivered, but
+  an end-only window can still expire them. Fully open-ended records are
+  surfaced via the Phase 3 prompt-builder block instead.
 
 - ``snoozed`` commitments: ``snoozed_until_unix`` was applied to
   ``due_window_start_unix`` at snooze time (PR #120 fix #3), so the
@@ -174,10 +173,6 @@ async def check_due_and_expired(
                         "commitment snooze pileup emit failed for %s",
                         rec.id,
                     )
-        if rec.due_window_start_unix is None:
-            result.skipped_no_due_window += 1
-            continue
-
         # Expired check first — even if we'd also fire a "due" event on
         # the same tick (rare: commitment due window fully elapsed
         # between two poll ticks), the expire is the load-bearing
@@ -212,6 +207,10 @@ async def check_due_and_expired(
                     "commitment expire failed for %s; continuing sweep",
                     rec.id,
                 )
+            continue
+
+        if rec.due_window_start_unix is None:
+            result.skipped_no_due_window += 1
             continue
 
         if rec.status == CommitmentStatus.DELIVERED.value:

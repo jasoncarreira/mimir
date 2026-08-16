@@ -1,5 +1,6 @@
 import { buildQuery, getStoredApiKey } from "./http";
 import type { LiveEventStreamItem } from "./generated/contracts";
+import { runReconnectingSse, SseResponseError } from "./sse-reconnect";
 
 export type { LiveEventStreamItem };
 
@@ -10,30 +11,38 @@ export interface LiveEventStreamOptions {
   initialCursor?: string;
   backfillLimit?: number;
   reconnectDelayMs?: number;
+  maxReconnectDelayMs?: number;
   maxSeenIds?: number;
   onOpen?: () => void;
   onError?: (error: unknown) => void;
   onCursor?: (cursor: string) => void;
+  onMalformedFrame?: (error: unknown, cursor: string) => void;
 }
 
 export interface LiveEventStreamHandle {
   close(): void;
   getCursor(): string;
+  getMalformedFrameCount(): number;
 }
 
-function parseSseBlock(block: string): unknown[] {
+function parseSseBlock(block: string): { data: string; cursor: string } | null {
   const data = block
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).replace(/^ /, ""))
     .join("\n");
-  return data ? [JSON.parse(data)] : [];
+  if (!data) return null;
+  const cursor = block
+    .split(/\r?\n/)
+    .find((line) => line.startsWith("id:"))
+    ?.slice(3).trim() ?? "";
+  return { data, cursor };
 }
 
 async function readSse(
   response: Response,
   signal: AbortSignal,
-  onItem: (item: LiveEventStreamItem) => void
+  onBlock: (data: string, cursor: string) => void
 ): Promise<void> {
   if (!response.body) throw new Error("live-events response body missing");
   const reader = response.body.getReader();
@@ -47,13 +56,15 @@ async function readSse(
     const parts = buffer.split(/\r?\n\r?\n/);
     buffer = parts.pop() ?? "";
     for (const part of parts) {
-      for (const parsed of parseSseBlock(part)) onItem(parsed as LiveEventStreamItem);
+      const parsed = parseSseBlock(part);
+      if (parsed) onBlock(parsed.data, parsed.cursor);
     }
   }
 
   buffer += decoder.decode();
   if (buffer && !signal.aborted) {
-    for (const parsed of parseSseBlock(buffer)) onItem(parsed as LiveEventStreamItem);
+    const parsed = parseSseBlock(buffer);
+    if (parsed) onBlock(parsed.data, parsed.cursor);
   }
 }
 
@@ -68,15 +79,18 @@ export function createLiveEventStream(
     initialCursor = "",
     backfillLimit = 500,
     reconnectDelayMs = 1000,
+    maxReconnectDelayMs = 30_000,
     maxSeenIds = 1000,
     onOpen,
     onError,
-    onCursor
+    onCursor,
+    onMalformedFrame
   } = options;
   const controller = new AbortController();
   const seen = new Set<string>();
   const seenOrder: string[] = [];
   let cursor = initialCursor;
+  let malformedFrameCount = 0;
 
   const remember = (id: string) => {
     seen.add(id);
@@ -89,34 +103,63 @@ export function createLiveEventStream(
 
   const deliver = (item: LiveEventStreamItem) => {
     if (!item.id || seen.has(item.id)) return;
+    onItem(item);
     remember(item.id);
     cursor = item.cursor || cursor;
     onCursor?.(cursor);
-    onItem(item);
   };
 
-  void (async () => {
-    while (!controller.signal.aborted) {
+  const skipMalformedFrame = (error: unknown, frameCursor: string) => {
+    if (!frameCursor) throw error;
+    malformedFrameCount += 1;
+    cursor = frameCursor;
+    onCursor?.(cursor);
+    onMalformedFrame?.(error, cursor);
+  };
+
+  const parseAndDeliver = (data: string, frameCursor: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      skipMalformedFrame(error, frameCursor);
+      return;
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof (parsed as Partial<LiveEventStreamItem>).id !== "string" ||
+      typeof (parsed as Partial<LiveEventStreamItem>).cursor !== "string" ||
+      !(parsed as Partial<LiveEventStreamItem>).event ||
+      typeof (parsed as Partial<LiveEventStreamItem>).event !== "object"
+    ) {
+      skipMalformedFrame(new Error("invalid live-event envelope"), frameCursor);
+      return;
+    }
+    deliver(parsed as LiveEventStreamItem);
+  };
+
+  void runReconnectingSse({
+    signal: controller.signal,
+    reconnectDelayMs,
+    maxReconnectDelayMs,
+    onError,
+    connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
       const key = apiKey ?? getStoredApiKey();
       if (key) headers.set("X-API-Key", key);
-      try {
-        const response = await fetchImpl(
-          `${baseUrl}/api/v1/live-events${buildQuery({ since: cursor, limit: backfillLimit })}`,
-          { headers, signal: controller.signal }
-        );
-        if (!response.ok) throw response;
-        onOpen?.();
-        await readSse(response, controller.signal, deliver);
-      } catch (error) {
-        if (!controller.signal.aborted) onError?.(error);
-      }
-      if (!controller.signal.aborted) {
-        const jitterMs = Math.floor(Math.random() * Math.max(1, reconnectDelayMs));
-        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs + jitterMs));
-      }
+      const response = await fetchImpl(
+        `${baseUrl}/api/v1/live-events${buildQuery({ since: cursor, limit: backfillLimit })}`,
+        { headers, signal: controller.signal }
+      );
+      if (!response.ok) throw new SseResponseError(response.status);
+      if (!response.body) throw new Error("live-events response body missing");
+      markConnected();
+      onOpen?.();
+      await readSse(response, controller.signal, parseAndDeliver);
     }
-  })();
+  });
 
   return {
     close() {
@@ -124,7 +167,9 @@ export function createLiveEventStream(
     },
     getCursor() {
       return cursor;
+    },
+    getMalformedFrameCount() {
+      return malformedFrameCount;
     }
   };
 }
-

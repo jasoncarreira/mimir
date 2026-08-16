@@ -39,23 +39,22 @@ def _call_build_app_warning_logic(config) -> None:
     same logic extracted so we don't need to stand up aiohttp.
     """
     import logging as _logging
+    from mimir.server import _UNAUTHENTICATED_WARNING
     log = _logging.getLogger("mimir.server")
     if not config.api_key:
-        _msg = (
-            "MIMIR_API_KEY is not set — POST /event and POST /chat are "
-            "unauthenticated. Any host that can reach this server can inject "
-            "messages or trigger saga_end_session. "
-            "Set MIMIR_API_KEY before exposing to a network. "
-            "For development on localhost, set MIMIR_ALLOW_UNAUTHENTICATED=true "
-            "to suppress this warning."
-        )
         if getattr(config, "allow_unauthenticated", False):
-            log.debug("unauthenticated mode acknowledged: %s", _msg)
+            log.debug("unauthenticated mode acknowledged: %s", _UNAUTHENTICATED_WARNING)
         else:
-            log.warning(_msg)
+            log.warning(_UNAUTHENTICATED_WARNING)
 
 
 class TestApiKeyStartupWarning:
+    def test_warning_qualifies_keyless_loopback_exposure(self) -> None:
+        from mimir.server import _UNAUTHENTICATED_WARNING
+
+        assert "not an authentication boundary" in _UNAUTHENTICATED_WARNING
+        assert "local processes can still inject messages" in _UNAUTHENTICATED_WARNING
+
     def test_no_api_key_logs_warning(self, tmp_path: Path, caplog) -> None:
         """Empty api_key + allow_unauthenticated=False → WARNING in caplog."""
         cfg = _make_config(tmp_path, api_key="", allow_unauthenticated=False)

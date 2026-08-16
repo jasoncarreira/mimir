@@ -20,7 +20,7 @@ What's gone:
   - claude_agent_sdk dependency at the import level.
 
 What's kept:
-  - mimir.SessionManager / SubagentInbox / ChannelRegistry /
+  - mimir.SessionManager / ChannelRegistry /
     Dispatcher constructor wiring (runtime-agnostic infrastructure).
   - TurnRecord schema (mimir/models.py).
   - The Agent class shape so server.py + tests don't need
@@ -100,7 +100,6 @@ from .session_boundary_log import (
     render_session_summaries,
     validate_unfinished_work,
 )
-from .subagent_inbox import SubagentInbox, render_subagent_updates
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
@@ -1146,7 +1145,6 @@ class Agent:
         saga_client: SagaClient | None = None,
         session_manager: SessionManager | None = None,
         scheduler: Any = None,
-        subagent_inbox: SubagentInbox | None = None,
         channel_registry: ChannelRegistry | None = None,
         dispatcher: Any = None,
         commitments_store: Any = None,
@@ -1168,7 +1166,6 @@ class Agent:
         self._saga_store: Any = None
         self._sessions = session_manager
         self._scheduler = scheduler
-        self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
         self._dispatcher = dispatcher
         # chainlink #583 slice 1: optional live turn-event bus. When wired
@@ -1245,23 +1242,30 @@ class Agent:
         # fired before the first turn are still arbitrated.
         from .billing import build_quota_providers
         from .budget import HomeostaticArbiter
+        from .providers import provider_for_quota
         # Auto-discover quota providers based on routing config.
         # Discovery is layered: ``MIMIR_MODEL_SPEC`` prefix wins
         # (``openai:`` / ``claude-code:`` are explicit provider picks),
         # then ``ANTHROPIC_BASE_URL`` host disambiguates ``anthropic:*``
         # routes (Minimax compat vs canonical Anthropic).
+        anthropic_base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
         quota_providers = build_quota_providers(
             store=self._rate_limits,
             billing_mode=config.billing_mode,
             model_spec=config.model_spec,
-            anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
+            anthropic_base_url=anthropic_base_url,
         )
+        active_quota_provider = provider_for_quota(
+            config.model_spec,
+            anthropic_base_url,
+        ).quota_provider_key
         self._arbiter = HomeostaticArbiter(
             home=config.home,
             rate_limit_store=self._rate_limits,
             turns_log=config.turns_log,
             billing_mode=config.billing_mode,
             quota_providers=quota_providers,
+            active_quota_providers=(active_quota_provider,),
             cost_hourly_limit_usd=config.cost_hourly_limit_usd or None,
             cost_spike_ratio=config.cost_rate_spike_ratio or None,
             cost_spike_floor_usd=config.cost_rate_spike_floor_usd or None,
@@ -2569,15 +2573,6 @@ class Agent:
             except Exception as exc:
                 log.warning("pre-message saga.query failed: %s", exc)
 
-        # Drain any pending subagent completion notifications from
-        # prior turns on this channel — SPEC §4.4. Empty list → block
-        # is None (build_turn_prompt skips the section).
-        pending_subagents = await self._inbox.drain(event.channel_id or "")
-        subagent_block = (
-            render_subagent_updates(pending_subagents)
-            if pending_subagents else None
-        )
-
         # Per-turn prompt assembly — Recent activity, Recent feedback,
         # Session summaries, Resource usage, Upcoming, Upcoming
         # commitments, Self-state, etc. Synthesis turns
@@ -2585,7 +2580,6 @@ class Agent:
         turn_prompt, recent = await self._build_turn_prompt(
             ctx, event,
             saga_block=memory_block,
-            subagent_block=subagent_block,
             initial_auth_context=initial_auth_context,
             saga_labels=memory_labels,
         )
@@ -3630,7 +3624,6 @@ class Agent:
                 self._config,
                 self._rate_limits,
                 turns_snapshot=self._turns_snapshot,
-                events_snapshot=self._events_snapshot,
             )
         except Exception:  # noqa: BLE001
             log.exception("assemble_stats_block failed; skipping block")
@@ -3969,7 +3962,6 @@ class Agent:
         ctx: Any,
         event: AgentEvent,
         saga_block: str | None,
-        subagent_block: str | None,
         initial_auth_context: AuthContext | None = None,
         saga_labels: InformationFlowLabels | None = None,
     ) -> tuple[str, list]:
@@ -4169,6 +4161,7 @@ class Agent:
         # with it — appended under the same Skill section. Best-effort:
         # only when a concrete SagaStore is wired; recall errors leave the
         # body unchanged (skill load must not fail on a memory miss).
+        skill_ifc_sources: list[dict[str, str | None]] = []
         if auto_skill_block is not None and self._saga_store is not None:
             from . import skill_memory
             _skill_name, _skill_body = auto_skill_block
@@ -4182,7 +4175,7 @@ class Agent:
             # augment_skill_body itself swallows recall errors and
             # returns the body unaugmented.
             _auth_ctx = ctx.auth_context
-            _augmented, _injected_ids = await asyncio.to_thread(
+            _augmented, _injected_ids, skill_ifc_sources = await asyncio.to_thread(
                 self._saga_store.run_locked_read,
                 lambda _c: skill_memory.augment_skill_body(
                     _c, _skill_name, _skill_body, auth_context=_auth_ctx
@@ -4250,22 +4243,21 @@ class Agent:
                     self_authored=True,
                 ),
             ))
-        if subagent_block:
-            source_blocks.append(PromptBlock(
-                subagent_block,
-                _prompt_source_labels(
-                    auth_context, domain="subagents", resource="channel_inbox",
-                    channel_id=event.channel_id, principal=effective_principal,
-                    self_authored=True,
-                ),
-            ))
         if auto_skill_block is not None:
+            auto_skill_labels = _prompt_source_labels(
+                auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
+                principal=effective_principal, self_authored=True,
+            )
+            if skill_ifc_sources:
+                auto_skill_labels = _merge_ifc_labels(
+                    auto_skill_labels,
+                    _auto_recall_source_labels(
+                        auth_context, {"_ifc_sources": skill_ifc_sources},
+                    ),
+                )
             source_blocks.append(PromptBlock(
                 auto_skill_block[1],
-                _prompt_source_labels(
-                    auth_context, domain="skills", resource=f"skill:{auto_skill_block[0]}",
-                    principal=effective_principal, self_authored=True,
-                ),
+                auto_skill_labels,
             ))
         # chainlink #508: resolve an optional deliver: channel (poller / tick),
         # mapping the OPERATOR_CHANNEL sentinel → the operator alert channel.
@@ -4283,7 +4275,6 @@ class Agent:
             event,
             recent_messages=recent,
             saga_block=saga_block,
-            subagent_block=subagent_block,
             recent_message_chars=self._config.recent_message_chars,
             resolver=self._buffer.resolver,
             feedback_block=feedback_block,

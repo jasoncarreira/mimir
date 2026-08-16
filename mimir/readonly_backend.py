@@ -1843,7 +1843,8 @@ class WriteGuardBackend:
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
-        return self.edit(
+        return await asyncio.to_thread(
+            self.edit,
             file_path=file_path,
             old_string=old_string,
             new_string=new_string,
@@ -1875,7 +1876,7 @@ class WriteGuardBackend:
         return self._fs.upload_files(files)
 
     async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        return self.upload_files(files)
+        return await asyncio.to_thread(self.upload_files, files)
 
 
 class ReadOnlyFilesystemBackend:

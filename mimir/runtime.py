@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from .scheduler import Scheduler
     from .search import Indexer
     from .session_manager import SessionManager
-    from .subagent_inbox import SubagentInbox
     from .turn_event_bus import TurnEventBus
     from .turn_logger import TurnLogger
 
@@ -93,7 +92,6 @@ class AgentRuntimeBundle:
     indexer: Indexer
     saga_client: SagaClient
     sessions: SessionManager
-    subagent_inbox: SubagentInbox
     commitments_store: CommitmentsStore
     turn_event_bus: TurnEventBus
     replayed_messages: int
@@ -239,7 +237,6 @@ async def create_agent_runtime(
         from .saga_client import make_saga_client
         from .search import Indexer
         from .session_manager import SessionManager
-        from .subagent_inbox import SubagentInbox
         from .turn_event_bus import TurnEventBus
         from .turn_logger import TurnLogger
 
@@ -269,8 +266,6 @@ async def create_agent_runtime(
         )
         owned_closers.append(("sessions", sessions.shutdown))
 
-        subagent_inbox = SubagentInbox()
-
         commitments_store = CommitmentsStore(
             path=config.commitments_log,
             provenance_db_path=core.saga_db_path,
@@ -293,7 +288,6 @@ async def create_agent_runtime(
             saga_client=saga_client,
             session_manager=sessions,
             scheduler=adapters.scheduler,
-            subagent_inbox=subagent_inbox,
             channel_registry=adapters.channels,
             dispatcher=adapters.dispatcher,
             commitments_store=commitments_store,
@@ -312,7 +306,6 @@ async def create_agent_runtime(
             indexer=indexer,
             saga_client=saga_client,
             sessions=sessions,
-            subagent_inbox=subagent_inbox,
             commitments_store=commitments_store,
             turn_event_bus=turn_event_bus,
             replayed_messages=replayed_messages,
@@ -322,11 +315,8 @@ async def create_agent_runtime(
             _close_task=None,
         )
 
-        def on_channel_idle(channel_id: str) -> tuple[bool, bool]:
-            return (
-                message_buffer.evict_channel(channel_id),
-                subagent_inbox.evict_channel(channel_id),
-            )
+        def on_channel_idle(channel_id: str) -> bool:
+            return message_buffer.evict_channel(channel_id)
 
         async def capture_dm_channel(event: Any) -> None:
             try:

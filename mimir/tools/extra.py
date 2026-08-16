@@ -381,7 +381,9 @@ def _initial_shell_cwd() -> Path | None:
     return Path(home).expanduser().resolve()
 
 
-def _effective_shell_cwd() -> Path | None:
+def _effective_shell_cwd(cwd: str | None = None) -> Path | None:
+    if cwd:
+        return Path(cwd).expanduser()
     cwd = _SHELL_STATE["cwd"]
     if cwd is not None:
         return Path(cwd)
@@ -437,7 +439,7 @@ def shell_exec(
     """
     if not command or not command.strip():
         return "shell_exec failed: command is required"
-    effective_cwd = Path(cwd).expanduser() if cwd else _effective_shell_cwd()
+    effective_cwd = _effective_shell_cwd(cwd)
     try:
         from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
         direct_argv = bound_direct_exec_argv()

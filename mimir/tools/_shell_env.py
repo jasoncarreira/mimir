@@ -25,9 +25,11 @@ _TRUSTED_PATH_DIRS = (
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
 _GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
 Path(_GH_CONFIG_DIR).chmod(0o500)
-_ALTERNATE_GITHUB_ENV = ("GH_TOKEN", "GH_HOST")
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
-_JQ_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
+_MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
+_CREDENTIAL_ENV_BY_EXECUTABLE = {
+    "gh": frozenset({"GITHUB_TOKEN"}),
+}
 _DIRECT_EXEC_ARGV: ContextVar[tuple[str, ...] | None] = ContextVar(
     "mimir_direct_exec_argv", default=None,
 )
@@ -69,7 +71,7 @@ def login_shell_command(command: str) -> str:
 
 def _is_git_argv(argv: list[str] | None) -> bool:
     """Return whether *argv* invokes the server-pinned maintenance Git binary."""
-    return bool(argv) and argv[0] == "/usr/bin/git"
+    return bool(argv) and Path(argv[0]).name == "git"
 
 
 def _is_gh_argv(argv: list[str] | None) -> bool:
@@ -78,8 +80,14 @@ def _is_gh_argv(argv: list[str] | None) -> bool:
     return bool(argv) and Path(argv[0]).name == "gh"
 
 
-def _is_jq_argv(argv: list[str] | None) -> bool:
-    return bool(argv) and Path(argv[0]).name == "jq"
+def _minimal_direct_exec_env() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _MINIMAL_ENV_NAMES or key.startswith("LC_")
+    }
+    env["PATH"] = _TRUSTED_PATH
+    return env
 
 
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
@@ -89,22 +97,14 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     only root-owned deployment directories; in particular, it excludes the
     workspace virtualenv. The project test executable and fixed arguments come
     from operator configuration rather than language-specific inference here.
+    Children receive only non-secret process settings by default. Executables
+    that genuinely require a credential are enumerated explicitly above.
     """
-    if _is_jq_argv(argv):
-        # A jq filter is a program and can read every inherited variable through
-        # env/$ENV. Keep only process settings jq legitimately needs.
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in _JQ_ENV_NAMES or key.startswith("LC_")
-        }
-        env["PATH"] = _TRUSTED_PATH
-        return env
-
-    env = os.environ.copy()
-    scrub_model_selection_env(env)
-    for key in _ALTERNATE_GITHUB_ENV:
-        env.pop(key, None)
+    env = _minimal_direct_exec_env()
+    executable = Path(argv[0]).name if argv else ""
+    for key in _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ()):
+        if key in os.environ:
+            env[key] = os.environ[key]
     if _is_gh_argv(argv):
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
         from .forge import confirm_github_tool_identity
@@ -113,21 +113,15 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
             os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
             env.get("GITHUB_TOKEN", ""),
         )
-    else:
-        env.pop("GH_CONFIG_DIR", None)
     if _is_git_argv(argv):
         # The maintenance profile binds Git to a configured -C root and injects
         # config-neutralizing argv. Inherited GIT_* variables must not select a
         # different repository, config source, helper executable, or diff tool.
-        for key in tuple(env):
-            if key.startswith("GIT_"):
-                env.pop(key, None)
         env.update({
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_PAGER": "cat",
             "GIT_OPTIONAL_LOCKS": "0",
         })
-    env["PATH"] = _TRUSTED_PATH
     return env
 
 
@@ -137,20 +131,12 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     ``ShellJobRegistry`` overlays values onto its own inherited environment.
     """
     overlay: dict[str, str | None] = direct_exec_env(argv)
-    if _is_jq_argv(argv):
-        # ShellJobRegistry starts from its own inherited environment and adds
-        # PYTHONUNBUFFERED before applying this overlay.
-        for key in (*os.environ, "PYTHONUNBUFFERED"):
-            if key not in overlay:
-                overlay[key] = None
-        return overlay
-    for key in (*_ALTERNATE_GITHUB_ENV, "GH_CONFIG_DIR", _MODEL_SELECTION_ENV):
-        if key in os.environ and key not in overlay:
+    # ShellJobRegistry starts from its own inherited environment and adds
+    # PYTHONUNBUFFERED before applying this overlay. Remove everything outside
+    # the direct-exec policy so async and sync children receive the same env.
+    for key in (*os.environ, "PYTHONUNBUFFERED"):
+        if key not in overlay:
             overlay[key] = None
-    if _is_git_argv(argv):
-        for key in os.environ:
-            if key.startswith("GIT_") and key not in overlay:
-                overlay[key] = None
     return overlay
 
 

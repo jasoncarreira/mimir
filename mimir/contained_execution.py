@@ -286,6 +286,7 @@ async def execute_contained(
         env=dict(worker_env),
         projections=checked_projections,
         identifier=identifier,
+        timeout_s=timeout_s,
     )
     started = getattr(directory, "_contained_started", None)
     if started is not None:
@@ -322,8 +323,12 @@ async def execute_contained(
             values = await asyncio.wait_for(asyncio.shield(collect_task), timeout_s)
         except TimeoutError:
             timed_out = True
-            await client.cancel(identifier)
-            values = await collect_task
+            try:
+                await client.cancel(identifier)
+            except Exception:
+                pass
+            finally:
+                values = await collect_task
     except asyncio.CancelledError:
         await asyncio.shield(client.cancel(identifier))
         try:
@@ -337,7 +342,7 @@ async def execute_contained(
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
-        timed_out=timed_out,
+        timed_out=timed_out or getattr(process, "timed_out", False),
         output_overflow=output_overflow,
         stdout_dropped_bytes=stdout_dropped,
         stderr_dropped_bytes=stderr_dropped,

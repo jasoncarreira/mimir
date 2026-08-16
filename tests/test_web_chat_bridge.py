@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from textwrap import dedent
 from types import SimpleNamespace
 
@@ -776,11 +779,9 @@ async def test_stream_rejects_anonymous_dev_open_request(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_rejects_when_subscriber_cap_reached(authed_bridge_app, monkeypatch):
-    from mimir.bridges import web_chat
-
-    monkeypatch.setattr(web_chat, "CHAT_STREAM_MAX_SUBSCRIBERS", 1)
+async def test_chat_stream_rejects_when_subscriber_cap_reached(authed_bridge_app):
     bridge, a, _ = authed_bridge_app
+    bridge.max_subscribers = 1
 
     async with TestClient(TestServer(a)) as client:
         resp1 = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
@@ -792,6 +793,21 @@ async def test_chat_stream_rejects_when_subscriber_cap_reached(authed_bridge_app
         assert resp2.status == 429
         assert await resp2.text() == "too many chat streams"
         assert len(bridge._subscribers) == 1
+
+
+def test_empty_subscriber_cap_does_not_crash_web_chat_import() -> None:
+    child_env = os.environ.copy()
+    child_env["MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS"] = ""
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import mimir.bridges.web_chat"],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.asyncio
