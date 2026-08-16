@@ -22,11 +22,16 @@ def test_direct_exec_env_defaults_to_minimal_non_secret_environment(monkeypatch)
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
     monkeypatch.setenv("HOME", "/safe/home")
     monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("LC_TEST_SENTINEL", "terminal-setting")
 
     env = direct_exec_env(["/bin/echo", "status"])
 
     assert env == {
-        "HOME": "/safe/home", "LANG": "C.UTF-8", "PATH": _shell_env._TRUSTED_PATH,
+        "HOME": "/safe/home",
+        "LANG": "C.UTF-8",
+        "PATH": _shell_env._TRUSTED_PATH,
+    } | {
+        key: value for key, value in os.environ.items() if key.startswith("LC_")
     }
 
 
