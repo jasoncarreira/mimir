@@ -2713,6 +2713,30 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_delivery_receipt_is_written_only_after_accepted_enqueue(
+    tmp_path: Path,
+    accepted: bool,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "state"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue(accept=accepted))
+
+    receipts = list((persist_dir / ".delivery-receipts").glob("*"))
+    assert len(receipts) == int(accepted)
+
+
+@pytest.mark.asyncio
 async def test_run_poller_emits_rejection_events_for_back_pressure(
     tmp_path: Path, home: Path,
 ) -> None:

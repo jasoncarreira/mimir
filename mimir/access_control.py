@@ -969,6 +969,11 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.PR_EDIT.value,
     RepoPRAction.PR_REREQUEST.value,
 })
+_REPO_PR_CI_REMEDIATION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS - frozenset({
+    RepoPRAction.PR_COMMENT.value,
+    RepoPRAction.PR_EDIT.value,
+    RepoPRAction.PR_REREQUEST.value,
+})
 _REPO_PR_CONFLICT_RESOLUTION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS
 _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
@@ -1139,6 +1144,7 @@ def _repo_pr_scope_resolution(
     )
     is_remediation = is_fresh_changes_requested_remediation or event_type in {
         "pr_changes_requested_stale",
+        "pr_ci_failure",
         "pr_mergeability_rebase",
         "pr_mergeability_conflicting",
     }
@@ -1187,6 +1193,8 @@ def _repo_pr_scope_resolution(
         allowed_operations=(
             _REPO_PR_CONFLICT_RESOLUTION_ACTIONS
             if event_type == "pr_mergeability_conflicting"
+            else _REPO_PR_CI_REMEDIATION_ACTIONS
+            if event_type == "pr_ci_failure"
             else _REPO_PR_REMEDIATION_ACTIONS
             if is_remediation
             else _REPO_PR_REVIEW_ACTIONS

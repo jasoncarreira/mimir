@@ -372,6 +372,38 @@ def test_review_scope_has_no_event_or_requested_reviewer_gate_and_exact_safe_act
         assert candidate.allowed_operations == scope.allowed_operations
 
 
+def test_ci_remediation_scope_requires_checkout_before_every_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control,
+        "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            ("/tmp/repo", "ssh://forge.invalid/owner/repo"), ("/tmp/repo",), 1,
+        ),
+    )
+
+    scope = access_control._repo_pr_scope(
+        provenance="poller_payload",
+        repo="owner/repo",
+        principal="reviewer",
+        event_type="pr_ci_failure",
+        number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        head_ref="worklink/17",
+        head_sha="a" * 40,
+        base_ref="main",
+        base_sha="b" * 40,
+    )
+
+    assert scope.allowed_operations == frozenset({
+        "repo.inspect", "repo.checkout", "repo.test", "repo.write",
+        "repo.commit", "repo.push",
+    })
+
+
 @dataclass(frozen=True)
 class _TestResult:
     status: str
