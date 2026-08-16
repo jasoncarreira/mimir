@@ -21,8 +21,39 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+
+SYNTHETIC_MIMIR_UID = 42001
+SYNTHETIC_WORKLINK_UID = 42002
+SYNTHETIC_WORKLINK_GID = 42003
+
+
+@pytest.fixture(autouse=True)
+def synthetic_worklink_identities(monkeypatch):
+    """Keep containment tests independent of deployment-local accounts.
+
+    Dedicated identity-resolution tests invoke the real accessor in child
+    processes with their own injected pwd/grp implementations. All other tests
+    receive non-production synthetic values, so they still catch regressions to
+    the former 1001/1002 literals without requiring host account provisioning.
+    """
+    identities = SimpleNamespace(
+        mimir_uid=SYNTHETIC_MIMIR_UID,
+        worklink_uid=SYNTHETIC_WORKLINK_UID,
+        worklink_gid=SYNTHETIC_WORKLINK_GID,
+    )
+    for module_name in (
+        "mimir.contained_checkout",
+        "mimir.project_tests",
+        "mimir.worklink.checkout",
+        "mimir.worklink.worker_exec",
+    ):
+        module = __import__(module_name, fromlist=["get_identities"])
+        monkeypatch.setattr(module, "get_identities", lambda: identities)
+    return identities
 
 
 @pytest.fixture

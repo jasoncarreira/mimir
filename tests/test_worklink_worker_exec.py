@@ -591,7 +591,9 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
     }]
 
 
-def test_drop_worker_uses_irreversible_identity_sequence(monkeypatch) -> None:
+def test_drop_worker_uses_irreversible_identity_sequence(
+    monkeypatch, synthetic_worklink_identities
+) -> None:
     events: list[object] = []
 
     class Libc:
@@ -610,18 +612,32 @@ def test_drop_worker_uses_irreversible_identity_sequence(monkeypatch) -> None:
     monkeypatch.setattr(worker_exec.os, "fchdir", lambda fd: events.append(("cwd", fd)))
     monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: events.append(("verify",)))
     worker_exec._drop_worker(9)
+    worker_uid = synthetic_worklink_identities.worklink_uid
+    worker_gid = synthetic_worklink_identities.worklink_gid
     assert ("groups", []) in events
-    assert ("gid", (1002, 1002, 1002)) in events
-    assert ("uid", (1002, 1002, 1002)) in events
-    assert events.index(("groups", [])) < events.index(("gid", (1002, 1002, 1002)))
-    assert events.index(("gid", (1002, 1002, 1002))) < events.index(("uid", (1002, 1002, 1002)))
+    assert ("gid", (worker_gid, worker_gid, worker_gid)) in events
+    assert ("uid", (worker_uid, worker_uid, worker_uid)) in events
+    assert events.index(("groups", [])) < events.index(
+        ("gid", (worker_gid, worker_gid, worker_gid))
+    )
+    assert events.index(("gid", (worker_gid, worker_gid, worker_gid))) < events.index(
+        ("uid", (worker_uid, worker_uid, worker_uid))
+    )
     assert events[-1] == ("verify",)
     assert events.count(("caps", set())) == 1
 
 
-def test_worker_identity_verifier_rejects_any_retained_authority(monkeypatch) -> None:
-    monkeypatch.setattr(worker_exec.os, "getresuid", lambda: (1002, 1002, 1002), raising=False)
-    monkeypatch.setattr(worker_exec.os, "getresgid", lambda: (1002, 1002, 1002), raising=False)
+def test_worker_identity_verifier_rejects_any_retained_authority(
+    monkeypatch, synthetic_worklink_identities
+) -> None:
+    worker_uid = synthetic_worklink_identities.worklink_uid
+    worker_gid = synthetic_worklink_identities.worklink_gid
+    monkeypatch.setattr(
+        worker_exec.os, "getresuid", lambda: (worker_uid,) * 3, raising=False
+    )
+    monkeypatch.setattr(
+        worker_exec.os, "getresgid", lambda: (worker_gid,) * 3, raising=False
+    )
     monkeypatch.setattr(worker_exec.os, "getgroups", lambda: [])
     clean = {
         "CapInh": "0", "CapPrm": "0", "CapEff": "0", "CapAmb": "0",

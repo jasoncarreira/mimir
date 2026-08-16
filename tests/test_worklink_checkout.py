@@ -962,7 +962,14 @@ def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(
     assert external.read_text(encoding="utf-8") == "external"
 
 
-def test_fd_normalization_rejects_special_files(tmp_path: Path) -> None:
+def test_fd_normalization_rejects_special_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        checkout_module,
+        "get_identities",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit identities ignored")),
+    )
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     os.mkfifo(checkout / "fifo")

@@ -55,7 +55,6 @@ from mimir.repo_tools import (
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
-from mimir.worklink.identities import get_identities
 from mimir.worklink.worker_client import StaleWorkerExecutorError
 
 
@@ -1675,6 +1674,7 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
     repo_tools,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
 ) -> None:
     from mimir import project_tests as project_tests_module
 
@@ -1713,7 +1713,7 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
         ).execute()
 
     assert refusal.value.code == "test_path_permission_denied"
-    identities = get_identities()
+    identities = synthetic_worklink_identities
     message = str(refusal.value)
     assert f"path={failed_path}" in message
     assert "path_mode=0o000" in message
