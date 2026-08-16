@@ -54,7 +54,7 @@ from .run_state import (
 from .checkout import CheckoutLease, cleanup_checkout, coding_enabled, create_isolated_checkout
 from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
-from ..secret_scan import contains_secret
+from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -2333,7 +2333,7 @@ def _assert_staged_diff_has_no_secret(
     runner: Runner,
     publication: ControllerGitPublication | None = None,
 ) -> None:
-    """Refuse if a staged blob contains a secret-shaped token or cannot be scanned.
+    """Refuse if a staged blob adds a secret-shaped token or cannot be scanned.
 
     The Worklink factory runs an untrusted backend and then commits, pushes,
     and opens a PR autonomously — so a token the backend emitted into a file
@@ -2345,7 +2345,9 @@ def _assert_staged_diff_has_no_secret(
     as binary, including paths marked ``-diff`` by an untrusted attributes file.
     Byte output also makes arbitrary binary content scannable without relying on
     subprocess' strict text decoding. Use the shared high-signal patterns
-    (``secret_scan.contains_secret``), not the broader log redactor.
+    (``secret_scan.secret_matches``), not the broader log redactor. Compare
+    exact matches with the base blob so existing credential fixtures remain
+    editable without allowing a different credential-shaped value.
     """
 
     def run_git_bytes(*args: str) -> subprocess.CompletedProcess:
@@ -2381,7 +2383,51 @@ def _assert_staged_diff_has_no_secret(
         # unchanged, so legitimate binary blobs remain scannable rather than
         # being blanket-refused or silently skipped.
         text = blob.stdout.decode("utf-8", errors="surrogateescape")
-        if contains_secret(text):
+        staged_matches = secret_matches(text)
+        if not staged_matches:
+            continue
+
+        base_blob = run_git_bytes("cat-file", "blob", f"HEAD:{path}")
+        if base_blob.returncode == 0:
+            if not isinstance(base_blob.stdout, bytes):
+                raise WorklinkError(
+                    "cannot scan base Worklink path "
+                    f"{path!r} for secrets; refusing to commit/push"
+                )
+            base_text = base_blob.stdout.decode("utf-8", errors="surrogateescape")
+            base_matches = secret_matches(base_text)
+        else:
+            # A missing path is an added file and therefore has an empty base.
+            # Verify absence from HEAD's tree so other blob-read failures remain
+            # fail-closed. An unborn repository has no HEAD and no base paths.
+            head = run_git_bytes("rev-parse", "--verify", "HEAD")
+            if head.returncode != 0:
+                unborn = run_git_bytes("symbolic-ref", "-q", "HEAD")
+                if unborn.returncode != 0 or not isinstance(unborn.stdout, bytes):
+                    raise WorklinkError(
+                        "cannot scan base Worklink path "
+                        f"{path!r} for secrets; refusing to commit/push"
+                    )
+                base_matches = set()
+            elif not isinstance(head.stdout, bytes):
+                raise WorklinkError(
+                    "cannot scan base Worklink path "
+                    f"{path!r} for secrets; refusing to commit/push"
+                )
+            else:
+                base_entry = run_git_bytes("ls-tree", "-z", "HEAD", "--", path)
+                if (
+                    base_entry.returncode != 0
+                    or not isinstance(base_entry.stdout, bytes)
+                    or base_entry.stdout
+                ):
+                    raise WorklinkError(
+                        "cannot scan base Worklink path "
+                        f"{path!r} for secrets; refusing to commit/push"
+                    )
+                base_matches = set()
+
+        if staged_matches - base_matches:
             # Do not echo the offending line — it holds the secret.
             raise WorklinkError(
                 f"staged Worklink path {path!r} contains a secret-shaped token; refusing "

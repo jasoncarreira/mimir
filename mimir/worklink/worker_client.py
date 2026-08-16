@@ -180,8 +180,6 @@ class WorkerClient:
             rights = array.array("i", [checkout_fd, write_out, write_err])
             sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             response = json.loads(await asyncio.to_thread(sock.recv, 4096))
-            if response.get("id") != identifier:
-                raise RuntimeError("worker executor response identity mismatch")
             if "error" in response:
                 error = str(response["error"])
                 # Executors predating the identity operation can only signal drift
@@ -189,6 +187,8 @@ class WorkerClient:
                 if "exact contract" in error or "stale root executor image" in error:
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)
+            if response.get("id") != identifier:
+                raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "started":
                 raise RuntimeError("worker executor returned an invalid launch response")
             stdout = asyncio.StreamReader()
@@ -228,13 +228,13 @@ class WorkerClient:
         try:
             sock.send(payload)
             response = json.loads(await asyncio.to_thread(sock.recv, 4096))
-            if response.get("id") != identifier:
-                raise RuntimeError("worker executor response identity mismatch")
             if "error" in response:
                 error = str(response["error"])
                 if "invalid cancel request" in error or "stale root executor image" in error:
                     raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
                 raise RuntimeError(error)
+            if response.get("id") != identifier:
+                raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "cancelled":
                 raise RuntimeError("worker executor returned an invalid cancel response")
         finally:

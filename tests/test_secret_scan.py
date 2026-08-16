@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from mimir.redaction import redact_text
-from mimir.secret_scan import contains_secret
+from mimir.secret_scan import contains_secret, secret_matches
 
 
 CREDENTIAL_CORPUS = [
@@ -55,6 +55,13 @@ CREDENTIAL_CORPUS = [
 )
 def test_contains_secret_matches_high_signal_shapes(text: str) -> None:
     assert contains_secret(text) is True
+
+
+def test_secret_matches_returns_distinct_matched_text() -> None:
+    first = "ghp_" + "a" * 36
+    second = "ghp_" + "b" * 36
+
+    assert secret_matches(f"{first} {first} {second}") == {first, second}
 
 
 @pytest.mark.parametrize("text", CREDENTIAL_CORPUS)

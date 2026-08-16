@@ -13,14 +13,13 @@ from typing import Callable, Iterable
 
 from .contained_snapshot import SnapshotResult, create_git_snapshot, preflight_git_snapshot
 from .worklink.checkout import (
-    MIMIR_UID,
-    WORKLINK_GID,
     CheckoutAuthorization,
     _mint_checkout_authorization,
     _normalize_checkout_fd,
     _open_opencode_checkout,
     _open_repo_test_checkout,
 )
+from .worklink.identities import get_identities
 
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
@@ -72,6 +71,7 @@ def _scope_hash(value: str) -> str:
 
 
 def _prepare_boundary(root: Path, scope: str, boundary_name: str) -> tuple[Path, Path]:
+    identities = get_identities()
     observed_root = root.stat(follow_symlinks=False)
     if not stat.S_ISDIR(observed_root.st_mode):
         raise RuntimeError("contained checkout root is unavailable")
@@ -82,12 +82,19 @@ def _prepare_boundary(root: Path, scope: str, boundary_name: str) -> tuple[Path,
         observed_scope = scope_path.stat(follow_symlinks=False)
         if not stat.S_ISDIR(observed_scope.st_mode):
             raise RuntimeError("contained checkout scope is unavailable")
-    os.chown(scope_path, MIMIR_UID, MIMIR_UID, follow_symlinks=False)
+    os.chown(
+        scope_path, identities.mimir_uid, identities.mimir_uid, follow_symlinks=False
+    )
     os.chmod(scope_path, 0o700, follow_symlinks=False)
     boundary = scope_path / boundary_name
     boundary.mkdir(mode=0o700)
     try:
-        os.chown(boundary, MIMIR_UID, WORKLINK_GID, follow_symlinks=False)
+        os.chown(
+            boundary,
+            identities.mimir_uid,
+            identities.worklink_gid,
+            follow_symlinks=False,
+        )
         os.chmod(boundary, 0o700, follow_symlinks=False)
     except Exception:
         _remove_boundary(boundary)
@@ -119,7 +126,12 @@ def _issue_checkout(
         prepared = prepare(destination) if prepare is not None else None
         relative = destination.relative_to(root)
         checkout_fd = open_checkout(relative)
-        _normalize_checkout_fd(checkout_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID)
+        identities = get_identities()
+        _normalize_checkout_fd(
+            checkout_fd,
+            owner_uid=identities.mimir_uid,
+            group_gid=identities.worklink_gid,
+        )
         authorization = _mint_checkout_authorization(destination, issue_id, attempt, checkout_fd)
         checkout_fd = -1
         return snapshot, authorization, prepared
