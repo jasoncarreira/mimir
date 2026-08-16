@@ -2,6 +2,7 @@ import React from "react";
 import { isChatTurnEvent } from "../agent-character/state";
 import type { TurnStreamEvent } from "../api/generated/contracts";
 import { createTurnEventStream } from "../api/turn-events";
+import { isAuthenticationSseError } from "../api/sse-reconnect";
 import type { AgentCharacterState } from "../skins/types";
 import { useUiState } from "../uiState";
 import {
@@ -12,7 +13,7 @@ import {
   type TurnSpansState
 } from "./turnSpansModel";
 
-export type TurnSpansConnectionStatus = "idle" | "open" | "error";
+export type TurnSpansConnectionStatus = "idle" | "open" | "error" | "reauthenticate";
 
 export interface TurnSpansValue extends TurnSpansState {
   status: TurnSpansConnectionStatus;
@@ -99,7 +100,11 @@ export function TurnSpansProvider({
       {
         channel,
         onOpen: () => setStatus("open"),
-        onError: () => setStatus("error")
+        onError: (error) => {
+          const reauthenticate = isAuthenticationSseError(error);
+          if (reauthenticate) useUiState.getState().setApiKeyRejected(true);
+          setStatus(reauthenticate ? "reauthenticate" : "error");
+        }
       }
     );
     return () => {
