@@ -526,11 +526,11 @@ async def test_actual_router_uses_only_meta_key_and_emits_no_notification_respon
         ],
     )
 
-    assert responses[0] == {"jsonrpc": "2.0", "id": 1, "result": {}}
-    assert responses[1]["jsonrpc"] == "2.0"
-    assert responses[1]["id"] == 2
-    assert set(responses[1]["result"]) == {"sessionId"}
-    assert responses[2] == {
+    by_id = {response["id"]: response for response in responses}
+    assert by_id[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert by_id[2]["jsonrpc"] == "2.0"
+    assert set(by_id[2]["result"]) == {"sessionId"}
+    assert by_id[3] == {
         "jsonrpc": "2.0",
         "id": 3,
         "error": {

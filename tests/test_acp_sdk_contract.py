@@ -1490,6 +1490,23 @@ async def test_ndjson_frame_limit_is_counted_before_decode(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_ndjson_send_bounds_non_draining_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Writer:
+        def write(self, data: bytes) -> None:
+            self.data = data
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(sdk, "OUTPUT_DRAIN_TIMEOUT", 0.01)
+    transport = sdk.StrictNdjsonTransport(asyncio.StreamReader(), Writer())
+    with pytest.raises(TimeoutError):
+        await transport.send({"jsonrpc": "2.0", "method": "test"})
+
+
+@pytest.mark.asyncio
 async def test_pending_request_limit_admits_exact_boundary() -> None:
     store = sdk.StrictMessageStateStore()
     for request_id in range(sdk.MAX_PENDING_REQUESTS):

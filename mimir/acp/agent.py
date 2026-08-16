@@ -84,6 +84,7 @@ ACP_GENERATION_RETIRE_GRACE_SECONDS = 2.0
 ACP_GENERATION_RETIRE_CANCEL_SECONDS = 2.0
 ACP_DISCONNECT_TIMEOUT_SECONDS = 1.0
 ACP_AUDIT_EVENT_LIMIT = 256
+ACP_SESSION_SWEEP_INTERVAL_SECONDS = 60 * 60
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -149,6 +150,7 @@ class ActivePrompt:
     mcp_handles: list[AcpRequestHandle] = field(default_factory=list)
     mcp_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     cancelling: bool = False
+    transport_dead: bool = False
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     progress_tokens: dict[str, ProgressTokenOwnership] = field(default_factory=dict)
@@ -326,6 +328,8 @@ class MimirAcpAgent:
             home = Path(self._identity_resolver._yaml_path).parents[1]
         self._ttl_days = getattr(config, "acp_journal_ttl_days", 7)
         self._store = SessionStore(home)
+        self._last_sweep: float | None = None
+        self._sweep_lock = asyncio.Lock()
         self._journals = JournalCache(self._store)
         self._client: Client | None = None
         self._generation = 0
@@ -443,7 +447,7 @@ class MimirAcpAgent:
         return AuthenticateResponse()
 
     async def new_session(self, cwd: str, additional_directories: list[str] | None = None, mcp_servers: object | None = None, **kwargs: Any) -> NewSessionResponse:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         self._validate_directories(additional_directories)
         client = self._require_client()
         declaration = self._validate_declaration(cwd, mcp_servers)
@@ -473,7 +477,7 @@ class MimirAcpAgent:
         return NewSessionResponse(sessionId=record.session_id)
 
     async def load_session(self, cwd: str, session_id: str, mcp_servers: object | None = None, additional_directories: list[str] | None = None, **kwargs: Any) -> LoadSessionResponse | None:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         self._validate_directories(additional_directories)
         client = self._require_client()
         declaration = self._validate_declaration(cwd, mcp_servers)
@@ -506,7 +510,7 @@ class MimirAcpAgent:
         return LoadSessionResponse()
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
-        owner = self._begin_stateful()
+        owner = await self._begin_stateful()
         blocks = self._validate_prompt(prompt)
         client = self._require_client()
         state = self._sessions.get(session_id)
@@ -563,6 +567,8 @@ class MimirAcpAgent:
                     await dispatcher.terminalize_failure(exc)
                 except BaseException:
                     pass
+            elif active.transport_dead:
+                failed = exc
             else:
                 await self._finish_cancel(active)
                 response = PromptResponse(stopReason="cancelled")
@@ -598,7 +604,7 @@ class MimirAcpAgent:
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         refusal_reason: str | None = None
         try:
-            owner = self._begin_stateful()
+            owner = await self._begin_stateful()
         except RequestError:
             connection = self._calling_connection()
             if connection is None or connection.auth_context is None:
@@ -634,6 +640,7 @@ class MimirAcpAgent:
                 return False
             active.cancelling = True
             if transport:
+                active.transport_dead = True
                 active.journal_lease.close()
             else:
                 await active.journal_lease.close_boundary(active.dispatcher.publisher._journal.lock)
@@ -871,7 +878,7 @@ class MimirAcpAgent:
             return None
         return self._connections.get(generation)
 
-    def _begin_stateful(self) -> str:
+    async def _begin_stateful(self) -> str:
         connection = self._calling_connection()
         if connection is None:
             auth_context = self._auth_context
@@ -891,10 +898,33 @@ class MimirAcpAgent:
             )
         ):
             raise auth_required_error()
-        try:
-            self._store.sweep(self._ttl_days)
-        except BaseException:
-            raise internal_error() from None
+        now = asyncio.get_running_loop().time()
+        if (
+            self._last_sweep is None
+            or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
+        ):
+            async with self._sweep_lock:
+                now = asyncio.get_running_loop().time()
+                if (
+                    self._last_sweep is None
+                    or now - self._last_sweep >= ACP_SESSION_SWEEP_INTERVAL_SECONDS
+                ):
+                    try:
+                        await asyncio.to_thread(self._store.sweep, self._ttl_days)
+                    except BaseException:
+                        raise internal_error() from None
+                    self._last_sweep = now
+        if connection is None:
+            if self._auth_context is not auth_context:
+                raise auth_required_error()
+        elif (
+            connection.closed
+            or connection is not self._connection
+            or connection.generation != self._generation
+            or connection.auth_context is not auth_context
+            or connection.principal != auth_context.canonical_principal
+        ):
+            raise auth_required_error()
         return auth_context.canonical_principal
 
     def _auth_context_for(self, state: SessionState) -> AuthContext | None:

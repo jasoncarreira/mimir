@@ -403,6 +403,49 @@ async def test_authenticated_connection_outlives_preauth_deadline(
 
 
 @pytest.mark.asyncio
+async def test_postauth_watchdog_terminates_non_draining_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = _short_home()
+    authenticated = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class Agent:
+        def on_connect(self, peer: object) -> int:
+            return 1
+
+        async def authenticate(self, *args: object, **kwargs: object) -> object:
+            authenticated.set()
+            return object()
+
+    async def runner(agent: object, **kwargs: object) -> None:
+        try:
+            await agent.authenticate("mimir-web-key")
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    class BlockedWriter(_Writer):
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+    daemon = AcpDaemon(_bundle(home))
+    daemon._agent = Agent()
+    monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 0.01)
+    writer = BlockedWriter()
+    with pytest.raises(AcpDaemonError, match="stopped draining"):
+        await asyncio.wait_for(
+            daemon._run_peer(asyncio.StreamReader(), writer), 0.1
+        )
+    assert authenticated.is_set()
+    assert cancelled.is_set()
+    assert writer.closed
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
 async def test_transport_death_retires_only_that_peer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -16,6 +16,8 @@ from .agent import MimirAcpAgent
 from .sdk import run_stdio_agent
 
 ACP_AUTH_TIMEOUT = 10.0
+ACP_PEER_WATCHDOG_INTERVAL = 5.0
+ACP_PEER_DRAIN_TIMEOUT = 30.0
 ACP_PEER_GRACE_TIMEOUT = 5.0
 ACP_PEER_CANCEL_TIMEOUT = 2.0
 ACP_PEER_ABORT_TIMEOUT = 1.0
@@ -313,6 +315,7 @@ class AcpDaemon:
 
         runner.add_done_callback(runner_finished)
         auth_wait = asyncio.create_task(connection_agent.authenticated.wait())
+        watchdog: asyncio.Task[None] | None = None
         try:
             done, _ = await asyncio.wait(
                 {runner, auth_wait}, timeout=ACP_AUTH_TIMEOUT,
@@ -323,16 +326,35 @@ class AcpDaemon:
             if runner in done:
                 await runner
             else:
+                watchdog = asyncio.create_task(self._watch_peer(writer))
+                done, _ = await asyncio.wait(
+                    {runner, watchdog}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if watchdog in done:
+                    await watchdog
                 await runner
         finally:
             auth_wait.cancel()
-            await asyncio.gather(auth_wait, return_exceptions=True)
+            if watchdog is not None:
+                watchdog.cancel()
+            await asyncio.gather(
+                *(task for task in (auth_wait, watchdog) if task is not None),
+                return_exceptions=True,
+            )
             await self._finish_runner(runner, writer)
             writer.close()
             try:
                 await asyncio.wait_for(writer.wait_closed(), ACP_PEER_ABORT_TIMEOUT)
             except (TimeoutError, OSError):
                 writer.transport.abort()
+
+    async def _watch_peer(self, writer: asyncio.StreamWriter) -> None:
+        while True:
+            await asyncio.sleep(ACP_PEER_WATCHDOG_INTERVAL)
+            try:
+                await asyncio.wait_for(writer.drain(), ACP_PEER_DRAIN_TIMEOUT)
+            except TimeoutError as exc:
+                raise AcpDaemonError("authenticated ACP peer stopped draining") from exc
 
     async def _finish_runner(
         self,

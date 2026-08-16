@@ -71,6 +71,7 @@ MAX_PENDING_REQUESTS = 64
 INPUT_QUEUE_MAX_ITEMS = 64
 INPUT_QUEUE_MAX_BYTES = 8 * 1024 * 1024
 INPUT_QUEUE_DRAIN_TIMEOUT = 2.0
+OUTPUT_DRAIN_TIMEOUT = 30.0
 MAX_ACTIVE_INBOUND_RUNNERS = 64
 
 
@@ -232,7 +233,7 @@ class StrictNdjsonTransport:
         validate_jsonrpc_envelope(message)
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         self._writer.write((payload + "\n").encode("utf-8"))
-        await self._writer.drain()
+        await asyncio.wait_for(self._writer.drain(), OUTPUT_DRAIN_TIMEOUT)
 
     async def close(self) -> None:
         return None

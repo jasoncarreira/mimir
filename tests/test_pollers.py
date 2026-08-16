@@ -2422,16 +2422,21 @@ print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
     child_pgid = int((skill_dir / "child.pgid").read_text())
 
     live_group_members: list[int] = []
-    for stat_path in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            stat_text = stat_path.read_text()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        # Fields after the parenthesized command begin with state, parent PID,
-        # and process-group ID. Zombies are already dead and may await PID 1.
-        fields = stat_text[stat_text.rfind(")") + 2:].split()
-        if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == child_pgid:
-            live_group_members.append(int(stat_path.parent.name))
+    for _ in range(100):
+        live_group_members = []
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                stat_text = stat_path.read_text()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            # Fields after the parenthesized command begin with state, parent PID,
+            # and process-group ID. Zombies are already dead and may await PID 1.
+            fields = stat_text[stat_text.rfind(")") + 2:].split()
+            if len(fields) > 2 and fields[0] != "Z" and int(fields[2]) == child_pgid:
+                live_group_members.append(int(stat_path.parent.name))
+        if not live_group_members:
+            break
+        await asyncio.sleep(0.01)
 
     assert live_group_members == []
 
