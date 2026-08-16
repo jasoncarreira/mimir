@@ -272,3 +272,6 @@ def _discard_expired_locked(now: float) -> None:
     for channel_id, request in tuple(_PENDING.items()):
         if request.expires_at <= now:
             _PENDING.pop(channel_id, None)
+    for request_id, grant in tuple(_GRANTS.items()):
+        if grant.request_expires_at is not None and grant.request_expires_at <= now:
+            _GRANTS.pop(request_id, None)

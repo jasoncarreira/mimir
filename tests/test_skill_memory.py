@@ -384,7 +384,7 @@ class TestRenderAndAugment:
         from mimir.skill_memory import augment_skill_body
 
         conn = store._ensure_conn()
-        out, ids = augment_skill_body(
+        out, ids, ifc_sources = augment_skill_body(
             conn, "cb", "ORIGINAL BODY", auth_context=ADMIN_AUTH
         )
         assert out.startswith("ORIGINAL BODY")
@@ -393,13 +393,20 @@ class TestRenderAndAugment:
         # slice 6: the injected learning's atom_id is returned so the turn
         # can record it for session-boundary voting.
         assert ids == [sl["atom_id"]]
+        assert ifc_sources == [{
+            "resource_id": f"atom:{sl['atom_id']}",
+            "owner_principal": "legacy_admin",
+            "integrity": "untrusted",
+        }]
 
     @pytest.mark.asyncio
     async def test_augment_no_learnings_returns_body_unchanged(self, store):
         from mimir.skill_memory import augment_skill_body
 
         conn = store._ensure_conn()
-        assert augment_skill_body(conn, "never-used", "ORIGINAL") == ("ORIGINAL", [])
+        assert augment_skill_body(conn, "never-used", "ORIGINAL") == (
+            "ORIGINAL", [], [],
+        )
 
     @pytest.mark.asyncio
     async def test_augment_swallows_db_error(self, store, monkeypatch):
@@ -412,7 +419,7 @@ class TestRenderAndAugment:
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
         )
         conn = store._ensure_conn()
-        assert sm.augment_skill_body(conn, "cb", "BODY") == ("BODY", [])
+        assert sm.augment_skill_body(conn, "cb", "BODY") == ("BODY", [], [])
 
 
 class TestSagaStoreConnection:

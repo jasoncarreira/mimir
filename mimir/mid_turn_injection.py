@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_APPROVAL_FAILURE_EXTRA_KEY = "operator_approval_failure"
+
 
 @dataclass
 class _Inflight:
@@ -273,7 +275,7 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             )
             if grant is None or reply_source is None:
                 continue
-            grant.ifc_state.install_sink_category_capability(
+            installed = grant.ifc_state.install_sink_category_capability(
                 sink_category=grant.sink_category,
                 turn_id=grant.turn_id,
                 canonical_principal=grant.requesting_principal,
@@ -283,6 +285,26 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
                 reply_source=grant.reply_source,
                 fold_receipt=receipt,
             )
+            if not installed:
+                failure = (
+                    f"operator approval {grant.request_id} was invalidated because "
+                    "the turn's information-flow sources changed; request a new approval"
+                )
+                event.extra[_APPROVAL_FAILURE_EXTRA_KEY] = failure
+                log.warning("%s", failure)
+                try:
+                    from .event_logger import log_event_sync
+
+                    log_event_sync(
+                        "operator_approval_install_failed",
+                        channel_id=grant.channel_id,
+                        request_id=grant.request_id,
+                        turn_id=grant.turn_id,
+                        sink_category=grant.sink_category,
+                        reason="information_flow_binding_changed",
+                    )
+                except Exception:  # noqa: BLE001 - observability cannot break folding
+                    log.debug("operator approval failure event emit failed", exc_info=True)
     if emitter is not None:
         try:
             if ctx is not None:
@@ -376,6 +398,9 @@ def render_injected_message(event: "AgentEvent") -> str:
     if event.attachment_names:
         paths = "\n".join(f"- {p}" for p in event.attachment_names)
         body = f"{body}\n\nAttachments:\n{paths}"
+    approval_failure = event.extra.get(_APPROVAL_FAILURE_EXTRA_KEY)
+    if isinstance(approval_failure, str) and approval_failure:
+        body = f"{body}\n\n[operator approval refused: {approval_failure}]"
     return f"[mid-turn message from {author}{msg_id_part}]\n{body}"
 
 
