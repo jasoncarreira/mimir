@@ -9,6 +9,7 @@ is involved — outcomes are written directly and ``enqueue`` is a fake.
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,22 +73,22 @@ class _FakeEnqueue:
 # ── stash ────────────────────────────────────────────────────────────
 
 
-def test_stash_roundtrip(tmp_path: Path):
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+async def test_stash_roundtrip(tmp_path: Path):
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     state = poller_recovery._load_state(tmp_path)
     assert "sid-1" in state["inflight"]
     assert state["inflight"]["sid-1"]["attempts"] == 0
     assert state["inflight"]["sid-1"]["event"]["source_id"] == "sid-1"
 
 
-def test_stash_noop_without_source_id(tmp_path: Path):
+async def test_stash_noop_without_source_id(tmp_path: Path):
     ev = _make_event("x")
     ev.source_id = None
-    poller_recovery.stash_enqueued_event(tmp_path, ev)
+    await poller_recovery.stash_enqueued_event(tmp_path, ev)
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
 
 
-def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: Path):
+async def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: Path):
     source = SourceLabel(
         principal="service:poller",
         domain="channel",
@@ -101,7 +102,7 @@ def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: 
     event.service_principal = "poller"
     event.ifc_labels = InformationFlowLabels().with_source(source)
 
-    poller_recovery.stash_enqueued_event(tmp_path, event)
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
     raw_event = poller_recovery._load_state(tmp_path)["inflight"]["sid-ifc"]["event"]
     restored = poller_recovery._event_from_stash(raw_event)
 
@@ -113,12 +114,40 @@ def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: 
     assert frozenset(restored.ifc_labels.sources) == frozenset({source})
 
 
+async def test_stash_recovery_document_io_runs_off_loop(
+    tmp_path: Path, monkeypatch,
+):
+    loop_thread = threading.get_ident()
+    io_threads: list[int] = []
+    real_load = poller_recovery._load_state
+    real_save = poller_recovery._save_state
+
+    def load_spy(path):
+        io_threads.append(threading.get_ident())
+        return real_load(path)
+
+    def save_spy(path, state):
+        io_threads.append(threading.get_ident())
+        return real_save(path, state)
+
+    monkeypatch.setattr(poller_recovery, "_load_state", load_spy)
+    monkeypatch.setattr(poller_recovery, "_save_state", save_spy)
+
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-thread"))
+
+    assert len(io_threads) == 2
+    assert all(thread != loop_thread for thread in io_threads)
+    assert "sid-thread" in real_load(tmp_path)["inflight"]
+
+
 # ── reconcile ────────────────────────────────────────────────────────
 
 
 async def test_reconcile_drops_completed(tmp_path: Path):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, _make_event("sid-1"), enqueued_at=_ts(10),
+    )
     _write_outcome(events, type_="turn_completed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
@@ -136,7 +165,7 @@ async def test_reconcile_retains_completed_outcome_for_live_state_accounting(
     tmp_path: Path,
 ):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-completed"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-completed"))
     _write_outcome(
         events,
         type_="turn_completed",
@@ -162,7 +191,7 @@ async def test_reconcile_retains_completed_outcome_for_live_state_accounting(
 
 async def test_reconcile_reenqueues_failed(tmp_path: Path):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
@@ -183,7 +212,7 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
 
 async def test_reconcile_counts_failure_when_reenqueue_is_disabled(tmp_path: Path):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     outcome_at = _ts(5)
     _write_outcome(
         events, type_="turn_failed", channel_id="poller:github-activity",
@@ -209,7 +238,7 @@ async def test_reconcile_counts_failure_when_reenqueue_is_disabled(tmp_path: Pat
 
 async def test_reconcile_records_hard_refusal_without_charging_attempt(tmp_path: Path):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
     outcome_at = _ts(5)
     _write_outcome(
         events,
@@ -242,7 +271,7 @@ async def test_reconcile_completed_hard_refusal_without_charging_attempt(
     tmp_path: Path,
 ):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-refused"))
     _write_outcome(
         events,
         type_="turn_completed",
@@ -278,7 +307,7 @@ async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Pa
     same poller item under the unchanged budget would deterministically fail
     again and re-run any partial side effects."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-budget"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-budget"))
     _write_outcome(
         events,
         type_="turn_failed",
@@ -312,7 +341,7 @@ async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path
     before a later unclean-restart marker is replayed once. If the turn really
     completed but its outcome record died in the crash, this may duplicate it."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-lost"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-lost"))
     _set_enqueued_at(tmp_path, "sid-lost", _ts(20))
     _write_unclean_restart(events, ts=_ts(10))
     enq = _FakeEnqueue()
@@ -335,7 +364,7 @@ async def test_unclean_restart_reenqueues_no_outcome_exactly_once(tmp_path: Path
 
 async def test_unclean_restart_completed_outcome_is_not_reenqueued(tmp_path: Path):
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-done"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-done"))
     _set_enqueued_at(tmp_path, "sid-done", _ts(30))
     _write_outcome(
         events, type_="turn_completed", channel_id="poller:gmail",
@@ -359,7 +388,7 @@ async def test_unclean_restart_completed_outcome_is_not_reenqueued(tmp_path: Pat
 async def test_unclean_restart_leaves_current_epoch_enqueue_alone(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     _write_unclean_restart(events, ts=_ts(20))
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-current"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-current"))
     enq = _FakeEnqueue()
 
     summary = await poller_recovery.reconcile_failed_turns(
@@ -377,7 +406,7 @@ async def test_unclean_restart_replay_respects_attempt_cap(tmp_path: Path):
     event_logger._reset_logger_for_tests()
     event_logger.init_logger(events, session_id="test")
     try:
-        poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-capped"))
+        await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-capped"))
         _set_enqueued_at(tmp_path, "sid-capped", _ts(20))
         _write_unclean_restart(events, ts=_ts(10))
         enq = _FakeEnqueue()
@@ -401,7 +430,7 @@ async def test_reconcile_gives_up_at_cap(tmp_path: Path):
     event_logger._reset_logger_for_tests()
     event_logger.init_logger(events, session_id="test")
     try:
-        poller_recovery.stash_enqueued_event(
+        await poller_recovery.stash_enqueued_event(
             tmp_path, _make_event("sid-1", items=[{"id": "m1"}, {"id": "m2"}]),
         )
         _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
@@ -437,7 +466,7 @@ async def test_reconcile_cap_boundary_reenqueue_then_give_up(tmp_path: Path):
     event_logger._reset_logger_for_tests()
     event_logger.init_logger(events, session_id="test")
     try:
-        poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+        await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
         _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                        source_id="sid-1", ts=_ts(10))
         _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
@@ -458,7 +487,7 @@ async def test_reconcile_ignores_other_channel(tmp_path: Path):
     """A turn_failed on a DIFFERENT poller's channel must not touch this
     poller's in-flight entry (channels are isolated)."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     _write_outcome(events, type_="turn_failed", channel_id="poller:OTHER",
                    source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
@@ -489,7 +518,7 @@ async def test_reconcile_watermark_prevents_reprocessing(tmp_path: Path):
     """An outcome processed in one reconcile is older than the advanced
     watermark on the next, so it isn't acted on twice."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
@@ -517,7 +546,7 @@ async def test_reconcile_reenqueue_restamps_forged_stash_fields(tmp_path: Path):
     forged.trigger = "user_message"
     forged.source = "discord"
     forged.extra["poller_name"] = "not-gmail"
-    poller_recovery.stash_enqueued_event(tmp_path, forged)
+    await poller_recovery.stash_enqueued_event(tmp_path, forged)
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     enq = _FakeEnqueue()
@@ -582,6 +611,41 @@ def test_read_outcomes_terminates_past_grace_window(tmp_path: Path):
     assert [r["source_id"] for r in out] == ["new"]
 
 
+async def test_reconcile_empty_watermark_uses_bounded_off_loop_scan(
+    tmp_path: Path, monkeypatch,
+):
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    state = poller_recovery._load_state(tmp_path)
+    state["last_reconciled"] = ""
+    state["inflight"]["sid-1"]["enqueued_at"] = _ts(100)
+    state["inflight"]["sid-1"]["scan_from"] = state["inflight"]["sid-1"]["enqueued_at"]
+    poller_recovery._save_state(tmp_path, state)
+
+    loop_thread = threading.get_ident()
+    scan_threads: list[int] = []
+    cutoffs: list[str] = []
+    real_read = poller_recovery._read_outcomes_since
+
+    def read_spy(events_path, channel_id, since_iso):
+        scan_threads.append(threading.get_ident())
+        cutoffs.append(since_iso)
+        return real_read(events_path, channel_id, since_iso)
+
+    monkeypatch.setattr(poller_recovery, "_read_outcomes_since", read_spy)
+    monkeypatch.setattr(poller_recovery, "_read_last_unclean_restart", lambda path: "")
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail",
+        channel_id="poller:gmail",
+        persist_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl",
+        enqueue=_FakeEnqueue(),
+    )
+
+    assert cutoffs == [state["inflight"]["sid-1"]["enqueued_at"]]
+    assert scan_threads and all(thread != loop_thread for thread in scan_threads)
+
+
 async def test_reconcile_watermark_survives_out_of_order_outcomes(tmp_path: Path):
     """chainlink #418: outcomes are processed in APPEND order, which the
     #316 writer disorder can leave slightly out of timestamp order. The
@@ -591,7 +655,7 @@ async def test_reconcile_watermark_survives_out_of_order_outcomes(tmp_path: Path
     it, double-burning a wedge-guard attempt. The watermark must be
     monotonic (``max``)."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     # The #316 disorder shape: the NEWER-stamped turn_failed is appended
     # FIRST, then an OLDER-stamped (but still in-window) outcome lands
     # behind it. Processing order = append order, so the old code ended
@@ -645,7 +709,7 @@ async def test_reconcile_defers_on_queue_full_without_burning_attempt(tmp_path: 
     with capacity re-fires it (rather than the item being silently re-dropped
     and the attempt wasted)."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     full = _FullEnqueue()
@@ -672,7 +736,7 @@ async def test_reconcile_defers_when_enqueue_raises(tmp_path: Path):
     """chainlink #305: a raising enqueue() is treated as back-pressure —
     deferred, not a burned attempt or a lost item."""
     events = tmp_path / "events.jsonl"
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-1"))
     _write_outcome(events, type_="turn_failed", channel_id="poller:gmail",
                    source_id="sid-1", ts=_ts(5))
     s = await poller_recovery.reconcile_failed_turns(
@@ -689,7 +753,7 @@ async def test_reconcile_gcs_expired_stash(tmp_path: Path):
     """chainlink #310: an in-flight entry with no terminal outcome within the
     TTL is GC'd, so a vanished turn (crash/restart that never logged an
     outcome) can't grow .recovery.json forever."""
-    poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-old"))
+    await poller_recovery.stash_enqueued_event(tmp_path, _make_event("sid-old"))
     st = poller_recovery._load_state(tmp_path)
     st["inflight"]["sid-old"]["stashed_at"] = _ts(72 * 3600)  # 72h ago
     poller_recovery._save_state(tmp_path, st)

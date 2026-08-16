@@ -1987,7 +1987,9 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
         source_id="poller:x:123:batch:0",
         extra={"poller_name": "x", "items": [{"id": "old"}]},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     events_path = home / "logs" / "events.jsonl"
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -2028,7 +2030,9 @@ async def test_run_poller_recovery_back_pressure_does_not_advance_attempts(
         source="poller", source_id="poller:x:456:batch:0",
         extra={"poller_name": "x", "items": []},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     events_path = home / "logs" / "events.jsonl"
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -2067,7 +2071,9 @@ async def test_run_poller_recovery_give_up_logs_summary_and_drops_entry(
         source="poller", source_id="poller:x:789:batch:0",
         extra={"poller_name": "x", "items": []},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     state = poller_recovery._load_state(persist_dir)
     state["inflight"]["poller:x:789:batch:0"]["attempts"] = 3
     poller_recovery._save_state(persist_dir, state)

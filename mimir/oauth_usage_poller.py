@@ -1302,7 +1302,8 @@ async def record_usage(
                 and seven_day_for_derive is not None
                 and seven_day_for_derive.utilization is not None
             ):
-                derived_util = derive_5h_from_cost(
+                derived_util = await asyncio.to_thread(
+                    derive_5h_from_cost,
                     cfg.turns_log_path,
                     prior_7d_utilization=seven_day_for_derive.utilization,
                 )

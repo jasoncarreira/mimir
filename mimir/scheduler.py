@@ -881,9 +881,12 @@ class Scheduler:
         return self._apply_reload(yaml_jobs)
 
     def _apply_reload(self, yaml_jobs: list[SchedulerJob]) -> dict[str, int]:
-        """APScheduler-mutating half of ``reload``. ``yaml_jobs`` is
-        pre-loaded by the caller (the only file IO), so this method does
-        no IO and MUST run on the loop thread."""
+        """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
+
+        Async callers load the workload-sized YAML off-loop before entering
+        this method. The synchronous ``reload`` convenience does that read on
+        its caller's thread.
+        """
         # Drop existing scheduler:* jobs; leave non-prefixed (e.g. saga-consolidate).
         for job in list(self._scheduler.get_jobs()):
             if job.id.startswith(SCHEDULER_CHANNEL_PREFIX):
@@ -894,7 +897,7 @@ class Scheduler:
         # propagates to APScheduler here.
         for cdef in list(self._callables.values()):
             try:
-                self._install_callable(cdef)
+                self._install_callable(cdef, yaml_jobs=yaml_jobs)
             except ValueError as exc:
                 log.warning(
                     "reload: callable %r install failed: %s",
@@ -1434,7 +1437,12 @@ class Scheduler:
         self._callables[name] = cdef
         return self._install_callable(cdef)
 
-    def _install_callable(self, cdef: _CallableDef) -> bool:
+    def _install_callable(
+        self,
+        cdef: _CallableDef,
+        *,
+        yaml_jobs: list[SchedulerJob] | None = None,
+    ) -> bool:
         """Resolve the effective cron for ``cdef`` and (re-)add the
         APScheduler job. Returns True if a job was installed."""
         # Drop any existing APScheduler job under this id. This makes
@@ -1445,11 +1453,11 @@ class Scheduler:
         except Exception:  # noqa: BLE001 — JobLookupError or other; both fine
             pass
 
-        yaml_jobs: list[SchedulerJob]
-        try:
-            yaml_jobs = load_jobs(self._yaml_path)
-        except Exception:  # noqa: BLE001 — already logged inside load_jobs
-            yaml_jobs = []
+        if yaml_jobs is None:
+            try:
+                yaml_jobs = load_jobs(self._yaml_path)
+            except Exception:  # noqa: BLE001 — already logged inside load_jobs
+                yaml_jobs = []
 
         effective_cron, source = _resolve_callable_cron(
             yaml_jobs, cdef.name, cdef.default_cron,

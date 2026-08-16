@@ -80,6 +80,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -2207,6 +2208,7 @@ async def run_poller(
             # ambient state after a failed turn.
             ifc_labels=item_labels,
         )
+        enqueued_at = datetime.now(tz=timezone.utc).isoformat()
         try:
             accepted = await enqueue(event)
         except Exception as exc:  # noqa: BLE001
@@ -2221,7 +2223,9 @@ async def run_poller(
             event_count += 1
             # Best-effort durable handoff: every accepted poller event is
             # stashed so an unclean restart cannot erase the in-memory turn.
-            poller_recovery.stash_enqueued_event(persist_dir, event)
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at,
+            )
         else:
             rejected_count += 1
             # Back-pressure observability: when the dispatcher refuses
