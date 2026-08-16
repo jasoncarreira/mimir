@@ -799,6 +799,48 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         if max_active <= 0:
             raise ValueError("max_active must be positive")
         self._runner_slots = asyncio.BoundedSemaphore(max_active)
+        self._authentication_task: asyncio.Task[Any] | None = None
+
+    async def _dispatch_request(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+        method = message.get("method", "")
+        authentication_task = self._authentication_task
+        try:
+            record = self._store.begin_incoming(method, message.get("params"))
+        except BaseException:
+            self._runner_slots.release()
+            raise
+
+        async def runner() -> None:
+            try:
+                if method != "authenticate" and authentication_task is not None:
+                    await authentication_task
+                result = await self._request_runner(message)
+            except Exception as exc:
+                self._store.fail_incoming(record, exc)
+                raise
+            else:
+                self._store.complete_incoming(record, result)
+            finally:
+                self._runner_slots.release()
+
+        task = self._create_runner(runner(), "mimir.acp.Dispatcher.request")
+        if method == "authenticate":
+            self._authentication_task = task
+
+    async def _dispatch_notification(self, message: dict[str, Any]) -> None:
+        await self._runner_slots.acquire()
+        authentication_task = self._authentication_task
+
+        async def runner() -> None:
+            try:
+                if authentication_task is not None:
+                    await authentication_task
+                await self._notification_runner(message)
+            finally:
+                self._runner_slots.release()
+
+        self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
 
     async def stop(self) -> None:
         self._queue.close_nowait()
@@ -810,43 +852,9 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
                 pass
             self._task = None
 
-    async def _dispatch_request(self, message: dict[str, Any]) -> None:
-        await self._runner_slots.acquire()
+    def _create_runner(self, coroutine: Any, name: str) -> asyncio.Task[Any]:
         try:
-            record = self._store.begin_incoming(
-                message.get("method", ""), message.get("params")
-            )
-        except BaseException:
-            self._runner_slots.release()
-            raise
-
-        async def runner() -> None:
-            try:
-                result = await self._request_runner(message)
-            except Exception as exc:
-                self._store.fail_incoming(record, exc)
-                raise
-            else:
-                self._store.complete_incoming(record, result)
-            finally:
-                self._runner_slots.release()
-
-        self._create_runner(runner(), "mimir.acp.Dispatcher.request")
-
-    async def _dispatch_notification(self, message: dict[str, Any]) -> None:
-        await self._runner_slots.acquire()
-
-        async def runner() -> None:
-            try:
-                await self._notification_runner(message)
-            finally:
-                self._runner_slots.release()
-
-        self._create_runner(runner(), "mimir.acp.Dispatcher.notification")
-
-    def _create_runner(self, coroutine: Any, name: str) -> None:
-        try:
-            self._supervisor.create(coroutine, name=name)
+            return self._supervisor.create(coroutine, name=name)
         except BaseException:
             coroutine.close()
             self._runner_slots.release()

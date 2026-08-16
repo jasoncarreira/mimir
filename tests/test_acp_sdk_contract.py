@@ -772,6 +772,52 @@ async def test_live_connection_bounds_active_inbound_runners() -> None:
     await connection.close()
 
 
+@pytest.mark.asyncio
+async def test_buffered_stateful_request_waits_for_authentication() -> None:
+    transport = MemoryTransport()
+    authentication_started = asyncio.Event()
+    release_authentication = asyncio.Event()
+    authenticated = False
+
+    async def route(method: str, params: Any, is_notification: bool) -> Any:
+        nonlocal authenticated
+        if method == "authenticate":
+            authentication_started.set()
+            await release_authentication.wait()
+            authenticated = True
+            return {}
+        if not authenticated:
+            raise sdk.auth_required_error()
+        return {"sessionId": "session-1"}
+
+    connection = sdk.Connection(
+        route,
+        transport,
+        queue=sdk.BoundedMessageQueue(),
+        dispatcher_factory=sdk.BoundedMessageDispatcher,
+    )
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": 1, "method": "authenticate", "params": {}}
+    )
+    await transport.incoming.put(
+        {"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {}}
+    )
+    await authentication_started.wait()
+    await asyncio.sleep(0)
+    assert transport.outgoing.empty()
+
+    release_authentication.set()
+    responses = [await transport.outgoing.get() for _ in range(2)]
+    by_id = {response["id"]: response for response in responses}
+    assert by_id[1]["result"] == {}
+    assert by_id[2]["result"] == {"sessionId": "session-1"}
+
+    await transport.incoming.put(None)
+    assert connection._recv_task is not None
+    await connection._recv_task
+    await connection.close()
+
+
 @pytest.mark.parametrize(
     "model,payload",
     [
