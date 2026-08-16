@@ -230,6 +230,42 @@ async def test_nonreplayable_load_has_no_replay_prefix(tmp_path: Path) -> None:
     assert client.updates == []
 
 
+async def test_prompt_auth_context_is_scoped_to_the_session_channel(
+    tmp_path: Path,
+) -> None:
+    """The turn's auth context targets the session channel, not the connection.
+
+    ``authenticate`` builds one context per connection against ``acp:stdio``,
+    but each prompt runs on ``acp:<session-id>``. The same-channel sink check
+    resolves the triggering channel from ``auth_context.channel_id``, so a
+    connection-scoped context made a reply to the turn's own channel
+    unsatisfiable — every ACP turn was refused with
+    ``ifc_label_blocked:same_channel``. Authority fields must carry through
+    unchanged; only the channel narrows.
+    """
+    agent, _client, core = await _ready(tmp_path)
+    created = await agent.new_session("/workspace")
+    session_id = created.session_id
+    connection_context = agent._connections[agent._generation].auth_context
+
+    await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="hello")])
+
+    [(event, _kwargs)] = core.calls
+    context = event.continuation_auth_context
+    assert context is not None
+    assert event.channel_id == f"acp:{session_id}"
+    assert context.channel_id == f"acp:{session_id}"
+    assert context.resource_id == f"acp:{session_id}"
+    # Narrowed, not widened: the connection context was a different channel,
+    # and every authority field is carried through untouched.
+    assert connection_context.channel_id != f"acp:{session_id}"
+    assert context.principal == connection_context.principal
+    assert context.canonical_principal == connection_context.canonical_principal
+    assert context.roles == connection_context.roles
+    assert context.is_service == connection_context.is_service
+    assert context.enforcement_enabled == connection_context.enforcement_enabled
+
+
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:
     agent, client, core = await _ready(tmp_path)
     session_id = (await agent.new_session("/one")).session_id

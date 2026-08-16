@@ -616,6 +616,29 @@ _PROVIDER_EXTRAS: dict[str, str] = {
 }
 
 
+def _is_acp_delivery_turn() -> bool:
+    """True when this turn delivers through the ACP bridge.
+
+    On ACP turns ``send_message`` is removed from the tool surface
+    (``_request_for_acp_model``) and refused if called anyway
+    (``_acp_send_message_refusal``), so harness auto-delivery is not an opt-in
+    recovery for a tool-shy model — it is the only path the reply can take.
+    Read through the same capability context those two sites use, so all three
+    agree on what an ACP turn is.
+
+    Module-level rather than a method: the resend-nudge path is exercised with
+    a SimpleNamespace stub for ``self``, so an attribute lookup there would
+    raise instead of answering the question.
+    """
+    try:
+        from .tools.client_provider import get_turn_capability_context
+
+        context = get_turn_capability_context()
+    except Exception:  # noqa: BLE001 — delivery must not break on import.
+        return False
+    return getattr(context, "acp_delivery", None) is True
+
+
 def _supports_responses_api() -> bool:
     """Heuristic for whether to flip ``use_responses_api=True`` on OpenAI.
 
@@ -2313,7 +2336,11 @@ class Agent:
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
             return messages, events, output
-        if channel_prefix_enabled(
+        # Same reasoning as the auto-deliver gate: on an ACP turn auto-delivery
+        # always runs, so the nudge is redundant — and worse than redundant,
+        # since it spends an extra model call asking for a send_message the ACP
+        # tool surface does not offer.
+        if _is_acp_delivery_turn() or channel_prefix_enabled(
             event.channel_id,
             getattr(self._config, "auto_deliver_final_text_channels", ()),
         ):
@@ -2394,6 +2421,15 @@ class Agent:
 
         parsed = parse_directives(output or "")
         clean_text = self._substantive_final_text(parsed.clean_text)
+        acp_delivery = _is_acp_delivery_turn()
+        if clean_text is None and acp_delivery:
+            # The substantiveness floor (>= 20 chars, >= 3 words) exists to
+            # judge whether output is worth auto-shipping as *recovery* on a
+            # channel where the model could have called send_message. On an ACP
+            # turn this is the only delivery path, so the floor would silently
+            # drop exactly the answers ACP clients ask for — "Paris", "42",
+            # "yes". Any non-empty final text ships.
+            clean_text = (parsed.clean_text or "").strip() or None
         if clean_text is None and not parsed.directives:
             return
         if event.trigger != "user_message" or not turn_is_interactive:
@@ -2401,7 +2437,10 @@ class Agent:
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
             return
-        if not channel_prefix_enabled(
+        # ACP turns are always eligible: the opt-in list exists to choose which
+        # channels get recovery when send_message was available and unused, but
+        # on ACP the tool does not exist, so gating here would drop every reply.
+        if not acp_delivery and not channel_prefix_enabled(
             event.channel_id,
             getattr(self._config, "auto_deliver_final_text_channels", ()),
         ):
