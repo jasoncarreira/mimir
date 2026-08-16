@@ -242,6 +242,18 @@ def test_overflow_footer():
     assert "…and 7 more" in out
 
 
+def test_overflow_keeps_newest_unanchored_commitments():
+    recs = [
+        _rec(id=f"c-{i}", created_at_unix=float(i))
+        for i in range(9)
+    ]
+
+    out = render_commitments_block(recs, max_entries=8)
+
+    assert "[c-8]" in out
+    assert "[c-0]" not in out
+
+
 def test_pending_delivered_snoozed_all_visible():
     """All three active statuses surface; only terminal ones hide."""
     recs = [

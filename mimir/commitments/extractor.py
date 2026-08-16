@@ -40,12 +40,18 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .models import (
+    DEFAULT_SNOOZE_WINDOW_SECS,
     CommitmentKind,
     CommitmentRecord,
     CommitmentSensitivity,
     make_commitment_id,
     make_dedupe_key,
 )
+
+
+# Hint-only extracted commitments still need a terminal path. Keep them visible
+# long enough to span normal planning cycles, then let the poller expire them.
+DEFAULT_UNANCHORED_LIFETIME_SECS = 30 * 86400
 
 if TYPE_CHECKING:
     from mimir.models import SessionACL
@@ -328,6 +334,12 @@ def _coerce_to_record(
             # Not an ISO datetime string; leave hint-only, start_unix = None.
             pass
 
+    created_at_unix = time.time()
+    due_window_end_unix = (
+        due_window_start_unix + DEFAULT_SNOOZE_WINDOW_SECS
+        if due_window_start_unix is not None
+        else created_at_unix + DEFAULT_UNANCHORED_LIFETIME_SECS
+    )
     rec = CommitmentRecord(
         id=make_commitment_id(),
         channel_id=bound_channel,
@@ -336,13 +348,13 @@ def _coerce_to_record(
         sensitivity=sensitivity,
         suggested_reminder=suggested_reminder[:300],
         due_window_start_unix=due_window_start_unix,
-        due_window_end_unix=None,
+        due_window_end_unix=due_window_end_unix,
         due_window_hint=due_window_hint,
         recipient_identity=recipient_identity,
         confidence=confidence,
         source_turn_id=source_turn_id,
         saga_session_id=saga_session_id,
-        created_at_unix=time.time(),
+        created_at_unix=created_at_unix,
         # PR #125 review #1: provenance — which prompt version produced
         # this record. Filterable in backtest comparisons.
         extraction_prompt_version=EXTRACTION_PROMPT_VERSION,
