@@ -47,6 +47,7 @@ independent of each other.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import shutil
@@ -91,6 +92,31 @@ SKILLS_DIR_NAME = "skills"
 _LEGACY_SKILLS_DIR_NAME = ".claude/skills"
 
 _BUNDLED_ROOT = Path(__file__).parent / "skills"
+
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
+
+
+def _atomic_exchange_directories(staged: Path, destination: Path) -> None:
+    """Atomically exchange two existing directories on Linux."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError("atomic directory exchange is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD, os.fsencode(staged),
+        _AT_FDCWD, os.fsencode(destination),
+        _RENAME_EXCHANGE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
 
 #: Default ``scheduler.yaml`` shipped with mimir. Seeded to the
 #: deployment home on first setup so a fresh install has working
@@ -246,10 +272,13 @@ def refresh_builtin_skills(home: Path) -> dict[str, str]:
             # dereferencing their contents.
             reject_escaping_symlinks(src)
             shutil.copytree(src, tmp, symlinks=True)
-            # Atomic-replace: remove old, rename tmp into place.
+            # Exchange keeps dst present throughout an update. Afterward tmp
+            # names the old tree and can be removed without affecting readers.
             if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
-            tmp.rename(dst)
+                _atomic_exchange_directories(tmp, dst)
+                shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                tmp.rename(dst)
             out[name] = "refreshed"
         except (OSError, ValueError) as exc:
             log.warning(

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import mimir.skill_defs as skill_defs
+
 from mimir.skill_defs import (
     _bundled_skill_names,
     installed_skill_names,
@@ -167,6 +169,31 @@ def test_refresh_overwrites_existing_content(tmp_path: Path):
     # Content was replaced with the canonical bundle.
     body = (target / "SKILL.md").read_text()
     assert "stale content from before refresh" not in body
+
+
+def test_refresh_atomically_exchanges_existing_directory(tmp_path: Path, monkeypatch):
+    target = tmp_path / ".mimir_builtin_skills" / "memory"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("# old\n")
+    real_exchange = skill_defs._atomic_exchange_directories
+    exchanges = 0
+
+    def observing_exchange(staged: Path, destination: Path) -> None:
+        nonlocal exchanges
+        exchanges += 1
+        assert destination.is_dir()
+        assert (destination / "SKILL.md").read_text() == "# old\n"
+        real_exchange(staged, destination)
+        assert destination.is_dir()
+
+    monkeypatch.setattr(
+        skill_defs, "_atomic_exchange_directories", observing_exchange,
+    )
+    out = seed_skills(tmp_path)
+
+    assert out["memory"] == "refreshed"
+    assert exchanges >= 1
+    assert "# old" not in (target / "SKILL.md").read_text()
 
 
 def test_memory_skill_no_brand_leaks(tmp_path: Path):
