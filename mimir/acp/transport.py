@@ -7,6 +7,7 @@ WRITER_DRAIN_TIMEOUT = 2.0
 WRITER_CLOSE_TIMEOUT = 1.0
 WRITER_ABORT_TIMEOUT = 1.0
 FORCE_CLOSE_TIMEOUT = 5.0
+PEER_EOF_GRACE_TIMEOUT = 5.0
 _COPY_CHUNK_BYTES = 64 * 1024
 
 
@@ -42,12 +43,12 @@ async def pump_stream(reader: Any, writer: Any) -> None:
             if write_eof is not None:
                 try:
                     write_eof()
-                    await asyncio.wait_for(writer.drain(), WRITER_DRAIN_TIMEOUT)
-                except (NotImplementedError, TimeoutError, ConnectionError, OSError):
+                    await writer.drain()
+                except (NotImplementedError, ConnectionError, OSError):
                     pass
             return
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), WRITER_DRAIN_TIMEOUT)
+        await writer.drain()
 
 
 async def pump_bidirectional(
@@ -61,7 +62,15 @@ async def pump_bidirectional(
         asyncio.create_task(pump_stream(right_reader, left_writer)),
     }
     try:
-        await asyncio.gather(*tasks)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.gather(*done)
+        if pending:
+            _, pending = await asyncio.wait(
+                pending, timeout=PEER_EOF_GRACE_TIMEOUT
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
     except BaseException:
         for task in tasks:
             if not task.done():
@@ -81,6 +90,7 @@ async def pump_bidirectional(
 
 __all__ = [
     "FORCE_CLOSE_TIMEOUT",
+    "PEER_EOF_GRACE_TIMEOUT",
     "WRITER_ABORT_TIMEOUT",
     "WRITER_CLOSE_TIMEOUT",
     "WRITER_DRAIN_TIMEOUT",

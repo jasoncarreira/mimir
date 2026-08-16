@@ -115,21 +115,45 @@ async def test_close_writer_close_timeout_escalates_to_abort(
 
 
 @pytest.mark.asyncio
-async def test_pump_drain_timeout_is_connection_scoped(
+async def test_pump_allows_slow_reader_until_peer_eof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.01)
+    gate = asyncio.Event()
     left = asyncio.StreamReader()
     right = asyncio.StreamReader()
     left.feed_data(b"blocked")
+    left_writer = Writer()
+    right_writer = StagedWriter(drain_gate=gate)
+    pumping = asyncio.create_task(
+        pump_bidirectional(left, left_writer, right, right_writer)
+    )
+    await asyncio.sleep(0.03)
+    assert not pumping.done()
+    gate.set()
     left.feed_eof()
+    right.feed_eof()
+    await pumping
+    assert left_writer.closed
+    assert right_writer.closed
+
+
+@pytest.mark.asyncio
+async def test_peer_eof_cancels_blocked_opposite_pump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.01)
+    monkeypatch.setattr("mimir.acp.transport.PEER_EOF_GRACE_TIMEOUT", 0.01)
+    left = asyncio.StreamReader()
+    right = asyncio.StreamReader()
+    left.feed_data(b"blocked")
     right.feed_eof()
     left_writer = Writer()
     right_writer = StagedWriter(drain_gate=asyncio.Event())
-    with pytest.raises(TimeoutError):
-        await pump_bidirectional(left, left_writer, right, right_writer)
-    assert left_writer.closed
-    assert right_writer.closed
+    await asyncio.wait_for(
+        pump_bidirectional(left, left_writer, right, right_writer), 0.1
+    )
+    assert left_writer.closed and right_writer.closed
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ _SENSITIVE = {"authorization", "cookie", "password", "passwd", "secret", "token"
 _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 MAX_UPDATE_ITEMS = 128
 MAX_UPDATE_BYTES = 8 * 1024 * 1024
+UPDATE_CLOSE_TIMEOUT = 2.0
 
 
 class UpdateDispatcher:
@@ -122,13 +123,27 @@ class UpdateDispatcher:
     async def close(self) -> None:
         if self._worker is None:
             return
-        while self.queue.full():
-            await asyncio.sleep(0)
-        self.queue.put_nowait(None)
+        worker = self._worker
+        try:
+            await asyncio.wait_for(self._close_gracefully(worker), UPDATE_CLOSE_TIMEOUT)
+        except TimeoutError as exc:
+            if self._failure is None:
+                self._failure = exc
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            while not self.queue.empty():
+                self.queue.get_nowait()
+                size = self._queued_sizes.get_nowait()
+                self._queued_sizes.task_done()
+                self._queued_bytes -= size
+                self.queue.task_done()
+        self._worker = None
+
+    async def _close_gracefully(self, worker: asyncio.Task[None]) -> None:
+        await self.queue.put(None)
         self._queued_sizes.put_nowait(0)
         await self.queue.join()
-        await self._worker
-        self._worker = None
+        await worker
 
     def invalidate(self) -> None:
         if self._failure is None:
