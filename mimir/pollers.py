@@ -1820,11 +1820,7 @@ async def run_poller(
             if pending:
                 _kill_process_group(proc)
                 await proc.wait()
-                _, still_pending = await asyncio.wait(
-                    pending,
-                    timeout=min(POLLER_EXIT_GRACE_SECONDS, timeout),
-                )
-                for task in still_pending:
+                for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
                 raise asyncio.TimeoutError
