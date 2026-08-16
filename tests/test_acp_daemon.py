@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import stat
@@ -195,6 +196,7 @@ class _Writer:
     def __init__(self, sock: object | None = object()) -> None:
         self.sock = sock
         self.closed = False
+        self.data = bytearray()
         self.transport = _Transport()
 
     def get_extra_info(self, name: str) -> object | None:
@@ -202,6 +204,12 @@ class _Writer:
 
     def close(self) -> None:
         self.closed = True
+
+    def write(self, data: bytes) -> None:
+        self.data.extend(data)
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)
 
     async def wait_closed(self) -> None:
         await asyncio.sleep(0)
@@ -220,7 +228,9 @@ async def test_peer_uid_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_cap_admits_exactly_eight(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_single_peer_cap_refuses_second_with_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     home = _short_home()
     daemon = AcpDaemon(_bundle(home))
     daemon._agent = object()
@@ -235,8 +245,21 @@ async def test_peer_cap_admits_exactly_eight(monkeypatch: pytest.MonkeyPatch) ->
     for writer in writers:
         await daemon._admit_peer(asyncio.StreamReader(), writer)
     assert daemon._admitted == ACP_MAX_PEERS
+    assert ACP_MAX_PEERS == 1
     assert all(not writer.closed for writer in writers[:ACP_MAX_PEERS])
     assert writers[-1].closed
+    refusal = json.loads(writers[-1].data)
+    assert refusal == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {
+            "code": -32001,
+            "data": None,
+            "message": (
+                "An ACP client is already connected; close it before opening another editor"
+            ),
+        },
+    }
     release.set()
     await asyncio.gather(*(peer.task for peer in tuple(daemon._peers)))
     await asyncio.sleep(0)

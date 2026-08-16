@@ -56,6 +56,7 @@ from .sdk import (
     TextContentBlock,
     UserMessageChunk,
     auth_required_error,
+    connection_replaced_error,
     internal_error,
     invalid_params_error,
     method_not_found_error,
@@ -109,6 +110,7 @@ class ConnectionState:
     closed: bool = False
     transport_dead: bool = False
     retirement_task: asyncio.Task[Any] | None = None
+    replaced: bool = False
 
 
 @dataclass
@@ -154,6 +156,7 @@ class ActivePrompt:
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     progress_tokens: dict[str, ProgressTokenOwnership] = field(default_factory=dict)
+    replaced: bool = False
 
     async def request_permission(
         self, eligibility: PermissionEligibility
@@ -339,6 +342,7 @@ class MimirAcpAgent:
             "mimir_acp_connection_generation", default=None
         )
         self._connections: dict[int, ConnectionState] = {}
+        self._replaced_generations: set[int] = set()
         self._retirement_tasks: set[asyncio.Task[Any]] = set()
         self._sessions: dict[str, SessionState] = {}
         self._environments: dict[str, tuple[int, SessionEnvironment]] = {}
@@ -395,6 +399,8 @@ class MimirAcpAgent:
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         connection = self._calling_connection()
+        if connection is not None and connection.replaced:
+            raise connection_replaced_error()
         if connection is not None:
             connection.principal = None
             connection.auth_context = None
@@ -433,8 +439,11 @@ class MimirAcpAgent:
         self._display_name = display_name
         self._bridge._connected = True
         if old is not None and old is not connection and not old.closed:
+            old.replaced = True
+            self._replaced_generations.add(old.generation)
             for session_id, active in tuple(self._active_prompts.items()):
                 if active.generation == old.generation:
+                    active.replaced = True
                     self._active_prompts.pop(session_id, None)
             for session_id, (generation, _) in tuple(self._environments.items()):
                 if generation == old.generation:
@@ -597,6 +606,8 @@ class MimirAcpAgent:
                 self._active_prompts.pop(record.session_id, None)
             active.progress_tokens.clear()
             active.completed.set()
+        if active.replaced:
+            raise connection_replaced_error()
         if failed is not None:
             raise internal_error() from None
         return response
@@ -713,6 +724,9 @@ class MimirAcpAgent:
                 await _await_cancelled(retirement)
                 connection.closed = False
         await self._retire_generation(generation)
+        replaced_generations = getattr(self, "_replaced_generations", None)
+        if replaced_generations is not None:
+            replaced_generations.discard(generation)
 
     async def _retire_replaced_generation(self, generation: int) -> None:
         await asyncio.sleep(ACP_GENERATION_RETIRE_GRACE_SECONDS)
@@ -879,6 +893,10 @@ class MimirAcpAgent:
         return self._connections.get(generation)
 
     async def _begin_stateful(self) -> str:
+        generation_context = getattr(self, "_connection_generation", None)
+        generation = generation_context.get() if generation_context is not None else None
+        if generation in getattr(self, "_replaced_generations", ()):
+            raise connection_replaced_error()
         connection = self._calling_connection()
         if connection is None:
             auth_context = self._auth_context

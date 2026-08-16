@@ -402,10 +402,25 @@ async def test_replacement_retirement_waits_for_grace_then_completes_cancel_wind
     grace_release.set()
     await old_cancelled.wait()
     assert active.cancelling is True
-    response = await running
+    with pytest.raises(sdk.RequestError) as replaced_prompt:
+        await running
     await asyncio.gather(*agent._retirement_tasks)
 
-    assert response.stop_reason == "cancelled"
+    assert replaced_prompt.value.to_error_obj() == {
+        "code": -32002,
+        "data": None,
+        "message": "This ACP connection was replaced by another client; reconnect to continue",
+    }
+    token = agent._connection_generation.set(old_generation)
+    try:
+        with pytest.raises(sdk.RequestError) as replaced_session:
+            await agent.prompt(
+                session_id,
+                [sdk.TextContentBlock(type="text", text="again")],
+            )
+    finally:
+        agent._connection_generation.reset(token)
+    assert replaced_session.value.to_error_obj() == replaced_prompt.value.to_error_obj()
     assert old_generation not in agent._connections
     assert active.completed.is_set()
 
@@ -516,9 +531,10 @@ async def test_replacement_retirement_force_quarantines_old_and_preserves_succes
     old_release.set()
     successor_release.set()
     old_response, successor_response = await asyncio.gather(
-        old_request, successor_request
+        old_request, successor_request, return_exceptions=True
     )
-    assert old_response.stop_reason == "end_turn"
+    assert isinstance(old_response, sdk.RequestError)
+    assert old_response.to_error_obj()["code"] == -32002
     assert successor_response.stop_reason == "end_turn"
 
 
