@@ -313,12 +313,33 @@ def get_turn(turn_id: str) -> str:
 # do it at the container layer, or gate ``bash_async`` and ``shell_exec``
 # together — half-gating only the sync path is security theatre.
 
+SHELL_CWD_SESSION_MAX = 256
 _SHELL_STATE: dict[str, Any] = {
     "cwd_by_session": {},
     "timeout_s": 60.0,
 }
 _SHELL_STATE_LOCK = threading.Lock()
 _PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
+
+
+def _remember_shell_cwd(session_id: str, cwd: Path) -> None:
+    """Remember a session cwd in a bounded least-recently-used map."""
+    with _SHELL_STATE_LOCK:
+        cwd_by_session = _SHELL_STATE["cwd_by_session"]
+        cwd_by_session.pop(session_id, None)
+        cwd_by_session[session_id] = cwd
+        while len(cwd_by_session) > SHELL_CWD_SESSION_MAX:
+            cwd_by_session.pop(next(iter(cwd_by_session)))
+
+
+def _remembered_shell_cwd(session_id: str) -> Path | None:
+    """Read and refresh one session's position in the cwd LRU."""
+    with _SHELL_STATE_LOCK:
+        cwd_by_session = _SHELL_STATE["cwd_by_session"]
+        session_cwd = cwd_by_session.pop(session_id, None)
+        if session_cwd is not None:
+            cwd_by_session[session_id] = session_cwd
+        return session_cwd
 
 
 def _run_bounded_project_test(
@@ -399,8 +420,7 @@ def _effective_shell_cwd(
         return Path(cwd).expanduser()
     session_id = _shell_session_id() if allow_session_state else None
     if session_id is not None:
-        with _SHELL_STATE_LOCK:
-            session_cwd = _SHELL_STATE["cwd_by_session"].get(session_id)
+        session_cwd = _remembered_shell_cwd(session_id)
         if session_cwd is not None:
             return Path(session_cwd)
     if not allow_session_state:
@@ -513,8 +533,7 @@ def shell_exec(
         target = _cd_target(command, effective_cwd)
         session_id = _shell_session_id() if direct_argv is None else None
         if target is not None and target.is_dir() and session_id is not None:
-            with _SHELL_STATE_LOCK:
-                _SHELL_STATE["cwd_by_session"][session_id] = target
+            _remember_shell_cwd(session_id, target)
     if stdout:
         suffix = "\n[shell stdout truncated]" if len(stdout) > 4000 else ""
         parts.append(f"stdout:\n{stdout[:4000]}{suffix}")

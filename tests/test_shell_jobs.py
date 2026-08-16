@@ -60,6 +60,7 @@ def test_spawn_captures_stdout_and_stderr(tmp_path: Path):
     assert result["truncated_streams"] == []
 
 
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
 def test_finished_jobs_release_all_pipe_descriptors(tmp_path: Path):
     """Count in an isolated process so unrelated suite activity cannot move FDs."""
     script = """

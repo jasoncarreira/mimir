@@ -205,6 +205,23 @@ def test_shell_exec_sticky_cwd_is_scoped_to_session(tmp_path):
     assert str(target) not in other
 
 
+def test_shell_exec_session_cwd_map_is_bounded_lru(tmp_path, monkeypatch):
+    monkeypatch.setattr(extra, "SHELL_CWD_SESSION_MAX", 2)
+    targets = []
+    for name in ("a", "b", "c"):
+        target = tmp_path / name
+        target.mkdir()
+        targets.append(target)
+
+    extra._remember_shell_cwd("session-a", targets[0])
+    extra._remember_shell_cwd("session-b", targets[1])
+    assert extra._remembered_shell_cwd("session-a") == targets[0]
+    extra._remember_shell_cwd("session-c", targets[2])
+
+    assert list(extra._SHELL_STATE["cwd_by_session"]) == ["session-a", "session-c"]
+    assert extra._remembered_shell_cwd("session-b") is None
+
+
 def test_authorized_direct_argv_never_inherits_session_cwd(tmp_path, monkeypatch):
     target = tmp_path / "interactive-workspace"
     target.mkdir()
