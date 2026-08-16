@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLiveEventStream } from "./live-events";
 import { SseResponseError } from "./sse-reconnect";
 
+async function flushAsyncWork(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 function sseResponse(body: string): Response {
   const encoder = new TextEncoder();
   return new Response(new ReadableStream({
@@ -43,17 +48,21 @@ describe("createLiveEventStream", () => {
       maxReconnectDelayMs: 20
     });
 
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    await flushAsyncWork();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(9);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    await flushAsyncWork();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(19);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(1);
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3));
+    await flushAsyncWork();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(20);
-    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(4));
+    await flushAsyncWork();
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
     handle.close();
   });
 
