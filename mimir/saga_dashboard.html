@@ -418,6 +418,16 @@ function esc(s) {
   return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function escAttr(s) {
+  return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function bindAtomRows(container) {
+  container.querySelectorAll(".atom-row[data-atom-id]").forEach(row => {
+    row.addEventListener("click", () => loadAtom(row.dataset.atomId, row));
+  });
+}
+
 // ── Stats ─────────────────────────────────────────────────────────
 async function loadStats() {
   try {
@@ -477,7 +487,7 @@ async function loadRecent() {
       const stream = esc(a.stream || "semantic");
       const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">📌</span>' : '';
       const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
-      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+      return '<div class="atom-row" data-atom-id="' + escAttr(a.id) + '">'
         + '<span class="atom-preview">' + preview + "</span>"
         + typeBadge
         + '<span class="meta">' + stream + "</span>"
@@ -487,6 +497,7 @@ async function loadRecent() {
     }).join("");
 
     list.innerHTML = totalLine + header + rows;
+    bindAtomRows(list);
   } catch (e) {
     list.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
   }
@@ -597,7 +608,7 @@ async function runSearch() {
       const stream = esc(a.stream || "semantic");
       const pinned = a.is_pinned ? '<span class="pinned-mark" title="Pinned">\u{1F4CC}</span>' : '';
       const ts = '<span class="ts">' + fmtTs(a.created_at) + "</span>";
-      return '<div class="atom-row" onclick="loadAtom(' + JSON.stringify(a.id) + ', this)">'
+      return '<div class="atom-row" data-atom-id="' + escAttr(a.id) + '">'
         + '<span class="atom-preview">' + preview + "</span>"
         + typeBadge
         + '<span class="meta">' + stream + "</span>"
@@ -607,6 +618,7 @@ async function runSearch() {
     }).join("");
 
     container.innerHTML = '<div class="atom-list">' + meta + header + rows + "</div>";
+    bindAtomRows(container);
   } catch (e) {
     container.innerHTML = '<div class="error-msg">Fetch failed: ' + esc(String(e)) + "</div>";
   }

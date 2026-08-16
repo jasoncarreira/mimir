@@ -474,6 +474,65 @@ def test_ops_dashboard_html_file_bundled() -> None:
     assert "X-API-Key" in body
 
 
+def test_legacy_dashboards_resolve_shared_auth_helpers() -> None:
+    """Bare MimirAuth helper calls must have a page-scope alias."""
+    import re
+
+    import mimir
+
+    root = Path(mimir.__file__).parent
+    pages = [
+        root / "file_memory_dashboard.html",
+        root / "ops_dashboard.html",
+        root / "saga_dashboard.html",
+        root / "turn_viewer.html",
+    ]
+    auth_source = (root / "web_auth.js").read_text(encoding="utf-8")
+    exported = set(re.findall(r"^    (\w+): \1,$", auth_source, re.MULTILINE))
+
+    for page in pages:
+        html = page.read_text(encoding="utf-8")
+        for helper in exported:
+            bare_call = re.search(rf"(?<![.\w]){helper}\s*\(", html)
+            if not bare_call:
+                continue
+            alias = re.search(
+                rf"\b(?:const|let|var)\s+{helper}\s*=\s*"
+                rf"window\.MimirAuth\.\w+\s*;",
+                html,
+            )
+            assert alias, f"{page.name} calls unscoped MimirAuth helper {helper}"
+
+
+def test_first_visit_prompts_before_turns_and_ops_load() -> None:
+    """An empty getApiKey result reaches the prompt, then the initial request."""
+    import mimir
+
+    root = Path(mimir.__file__).parent
+    pages = {
+        "turn_viewer.html": "loadInitial();",
+        "ops_dashboard.html": "authedFetch('/api/ops'",
+    }
+    for filename, load_call in pages.items():
+        body = (root / filename).read_text(encoding="utf-8")
+        alias = "promptApiKey = window.MimirAuth.promptApiKey;"
+        prompt = "if (!getApiKey()) promptApiKey('first visit');"
+        prompt_pos = body.index(prompt)
+        assert body.index(alias) < prompt_pos
+        assert body.index(load_call, prompt_pos) > prompt_pos
+
+
+def test_ops_tabs_are_bound_before_data_fetch_or_render() -> None:
+    """Tab navigation remains live when the /api/ops request fails."""
+    from mimir import ops_dashboard
+
+    body = (Path(ops_dashboard.__file__).parent / "ops_dashboard.html").read_text()
+    binding = "document.querySelectorAll('.tab').forEach(t => t.addEventListener"
+    assert body.count(binding) == 1
+    assert body.index(binding) < body.index("function render(D)")
+    assert body.index(binding) < body.index("authedFetch('/api/ops'")
+
+
 def test_ops_dashboard_loader_caches() -> None:
     """The loader reads from disk once and caches the result."""
     from mimir import ops_dashboard
