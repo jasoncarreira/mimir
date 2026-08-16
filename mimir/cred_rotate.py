@@ -5,14 +5,14 @@ flow:
 
   1. Validate inputs — credential is registered, env var name is
      listed for that credential.
-  2. Snapshot ``compose.env`` to a timestamped backup so a failed
-     rotation can be rolled back atomically.
+   2. Prune old backups to the newest 10, then snapshot ``compose.env``
+      to a unique backup so a failed rotation can be rolled back atomically.
   3. Atomic edit — write to a sibling tmp file, fsync, rename over
      ``compose.env``. Single line replaced; surrounding lines + comments
      preserved verbatim.
-  4. Emit ``credential_rotation_started`` to ``./rotations.jsonl`` with
-     SHA-256 prefixes of old + new values (12 chars — enough to
-     distinguish across rotations without exposing the secret).
+   4. Emit ``credential_rotation_started`` to ``./rotations.jsonl`` with
+      a random rotation ID that correlates the audit records without
+      deriving anything from the old or new secret.
   5. ``docker compose up -d --force-recreate`` (per the §14
      reload-semantics gotcha — ``restart`` doesn't reload env_file).
   6. Wait for the container to come back up (poll ``docker compose ps
@@ -37,7 +37,6 @@ single-env-var.
 from __future__ import annotations
 
 import getpass
-import hashlib
 import json
 import os
 import re
@@ -46,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +55,7 @@ from .cred_verify import get_probes
 
 
 _COMPOSE_FILES = ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
+_KEEP_ROTATION_BACKUPS = 10
 
 
 @dataclass
@@ -72,16 +73,11 @@ class RotationContext:
     cred_type: str | None = None
     probe_kind: str | None = None
     backup_path: Path | None = None
+    rotation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     started_at: float = field(default_factory=time.monotonic)
 
 
 # ── audit ────────────────────────────────────────────────────────────
-
-
-def _value_hash(value: str) -> str:
-    """SHA-256 prefix of a value. Enough to disambiguate rotations
-    without exposing the secret in audit logs."""
-    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 def _emit(deployment_dir: Path, kind: str, **fields: Any) -> None:
@@ -158,6 +154,22 @@ def _resolve_service_name(compose_file: Path, requested: str | None) -> str:
 _ENV_LINE_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$")
 
 
+def _prune_rotation_backups(
+    compose_env: Path, *, keep: int = _KEEP_ROTATION_BACKUPS,
+) -> None:
+    """Keep only the newest ``keep`` cleartext rotation backups."""
+    backups = sorted(
+        compose_env.parent.glob(f"{compose_env.name}.bak.*"),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for stale in backups[max(0, keep):]:
+        try:
+            stale.unlink()
+        except OSError as exc:
+            print(f"warn: failed to prune backup {stale.name}: {exc}", file=sys.stderr)
+
+
 def _read_env_value(compose_env: Path, env_name: str) -> str | None:
     """Return the current value of ``env_name`` in ``compose.env``, or
     None if not set. Preserves no surrounding state — pure read."""
@@ -178,9 +190,8 @@ def _atomic_replace_env(
 ) -> tuple[str | None, Path]:
     """Replace the value of ``env_name`` in ``compose.env`` atomically.
     Returns ``(old_value, backup_path)``. Creates a sibling
-    ``compose.env.bak.<ts>`` BEFORE writing so rollback always has a
-    target — see PR #283 review note about the prior wording's
-    rollback gap.
+    unique ``compose.env.bak.<timestamp>.<random>`` BEFORE writing so
+    rollback always has a target. The newest 10 backups are retained.
 
     The replacement preserves the file verbatim except for one line:
     only the matching ``<name>=...`` line is changed. Comments,
@@ -189,10 +200,20 @@ def _atomic_replace_env(
     if not compose_env.is_file():
         raise FileNotFoundError(f"compose.env not found: {compose_env}")
 
-    backup_path = compose_env.with_suffix(
-        compose_env.suffix + f".bak.{int(time.time())}",
+    # Prune before creating this rotation's backup, so retention cannot remove
+    # the backup that the in-flight rollback is about to depend on.
+    _prune_rotation_backups(compose_env, keep=_KEEP_ROTATION_BACKUPS - 1)
+    backup_fd, backup_path_str = tempfile.mkstemp(
+        prefix=f"{compose_env.name}.bak.{time.time_ns()}.",
+        dir=str(compose_env.parent),
     )
-    shutil.copy2(compose_env, backup_path)
+    os.close(backup_fd)
+    backup_path = Path(backup_path_str)
+    try:
+        shutil.copy2(compose_env, backup_path)
+    except Exception:
+        backup_path.unlink(missing_ok=True)
+        raise
 
     old_value: str | None = None
     lines = compose_env.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -450,7 +471,7 @@ def run_rotate(
 
 
 def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
-    old_value, backup_path = _atomic_replace_env(
+    _old_value, backup_path = _atomic_replace_env(
         ctx.compose_env_path, ctx.env_name, ctx.new_value,
     )
     ctx.backup_path = backup_path
@@ -460,8 +481,7 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
         env=ctx.env_name,
         cred=ctx.cred_name,
         cred_type=ctx.cred_type,
-        old_value_hash=_value_hash(old_value) if old_value is not None else None,
-        new_value_hash=_value_hash(ctx.new_value),
+        rotation_id=ctx.rotation_id,
         backup=str(backup_path.name),
         service=ctx.service_name,
     )
@@ -471,7 +491,8 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
         print("--no-recreate set; skipping docker compose + verify steps")
         _emit(
             ctx.deployment_dir, "credential_rotation_completed",
-            env=ctx.env_name, duration_s=round(time.monotonic() - ctx.started_at, 2),
+            env=ctx.env_name, rotation_id=ctx.rotation_id,
+            duration_s=round(time.monotonic() - ctx.started_at, 2),
             verify="skipped (--no-recreate)",
         )
         return 0
@@ -484,7 +505,8 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
         _recreate(ctx.compose_file_path, ctx.service_name)
         _emit(
             ctx.deployment_dir, "credential_rotation_failed",
-            env=ctx.env_name, stage="recreate", detail=recreate_detail,
+            env=ctx.env_name, rotation_id=ctx.rotation_id,
+            stage="recreate", detail=recreate_detail,
             rolled_back=True,
         )
         print(f"recreate failed: {recreate_detail}", file=sys.stderr)
@@ -499,7 +521,8 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
         _recreate(ctx.compose_file_path, ctx.service_name)
         _emit(
             ctx.deployment_dir, "credential_rotation_failed",
-            env=ctx.env_name, stage="wait_for_running", detail=ready_detail,
+            env=ctx.env_name, rotation_id=ctx.rotation_id,
+            stage="wait_for_running", detail=ready_detail,
             rolled_back=True,
         )
         print(f"container didn't reach running: {ready_detail}", file=sys.stderr)
@@ -519,7 +542,8 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
             _recreate(ctx.compose_file_path, ctx.service_name)
             _emit(
                 ctx.deployment_dir, "credential_rotation_failed",
-                env=ctx.env_name, stage="verify", detail=verify_detail,
+                env=ctx.env_name, rotation_id=ctx.rotation_id,
+                stage="verify", detail=verify_detail,
                 rolled_back=True,
             )
             print(f"post-rotation verify failed: {verify_detail}", file=sys.stderr)
@@ -532,6 +556,7 @@ def _execute(ctx: RotationContext, *, skip_recreate: bool) -> int:
     _emit(
         ctx.deployment_dir, "credential_rotation_completed",
         env=ctx.env_name,
+        rotation_id=ctx.rotation_id,
         duration_s=round(time.monotonic() - ctx.started_at, 2),
         verify=verify_summary,
     )

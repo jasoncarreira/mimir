@@ -98,7 +98,7 @@ class Probe:
 
 
 def _env_set(name: str) -> tuple[bool, str | None]:
-    v = os.environ.get(name, "").strip()
+    v = os.environ.get(name, "")
     return (bool(v), v if v else None)
 
 
@@ -174,6 +174,11 @@ def _make_format_probe(
         ok, value = _env_set(env)
         if not ok or value is None:
             return _unavailable(f"{env} not set")
+        if value != value.strip():
+            return (
+                False,
+                f"format wrong (surrounding whitespace, got {len(value)} chars)",
+            )
         if length is not None and len(value) != length:
             return (False, f"format wrong (expected {length} chars, got {len(value)})")
         if length is None and len(value) < min_len:
