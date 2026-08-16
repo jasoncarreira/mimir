@@ -41,6 +41,7 @@ _RECENT_AGENT_PUSH_LIMIT = 1024
 _URL_USERINFO_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]{0,31}://)[^/@\s]+@")
 _HISTORY_REWRITE_EVENT_TYPES = frozenset({
     "pr_changes_requested_stale",
+    "pr_ci_failure",
     "pr_mergeability_rebase",
     "pr_mergeability_conflicting",
 })

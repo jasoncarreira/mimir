@@ -71,6 +71,7 @@ jobs that emit on completion.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -144,9 +145,32 @@ POLLER_BATCH_SIZE_DEFAULT = 1
 _POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
 _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = frozenset({
     "pr_changes_requested_stale",
+    "pr_ci_failure",
     "pr_mergeability_rebase",
     "pr_mergeability_conflicting",
 })
+_DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
+
+
+def _write_delivery_receipt(persist_dir: Path, delivery_key: object) -> None:
+    """Durably acknowledge one poller item only after framework handoff."""
+    if not isinstance(delivery_key, str) or not delivery_key or len(delivery_key) > 512:
+        return
+    directory = persist_dir / _DELIVERY_RECEIPTS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    fd = os.open(directory / digest, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 # Circuit-breaker: after this many consecutive failures the poller is
 # suspended for ``POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS``. "Failure"
 # means a non-zero exit, timeout, or subprocess launch error — clean
@@ -2108,6 +2132,9 @@ async def run_poller(
                     poller=poller.name,
                     **payload,
                 )
+                await asyncio.to_thread(
+                    _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
+                )
                 signals_emitted += 1
             except Exception as exc:  # noqa: BLE001
                 # log_event should be best-effort but defend against
@@ -2292,6 +2319,12 @@ async def run_poller(
             await poller_recovery.stash_enqueued_event(
                 persist_dir, event, enqueued_at=enqueued_at,
             )
+            for item in batch:
+                await asyncio.to_thread(
+                    _write_delivery_receipt,
+                    persist_dir,
+                    item["extras"].get("delivery_key"),
+                )
         else:
             rejected_count += 1
             # Back-pressure observability: when the dispatcher refuses

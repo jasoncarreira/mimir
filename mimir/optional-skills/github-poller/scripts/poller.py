@@ -2,8 +2,8 @@
 """GitHub repository poller — pollers.json contract (chainlink #3).
 
 Checks each ``GITHUB_REPOS`` entry for new issues, PRs, conversation
-comments, PR review comments (inline diff), and PR reviews since the
-last cursor. Emits one JSONL event per actionable item to stdout.
+comments, PR review comments (inline diff), PR reviews, and newly completed
+check failures on open PRs. Emits one JSONL event per actionable item.
 
 Differences from the open-strix port this is based on:
 
@@ -59,6 +59,7 @@ Output contract:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -173,6 +174,12 @@ CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
 MERGEABILITY_RETRY_INTERVAL = timedelta(hours=1)
+CI_DELIVERY_RETRY_INTERVAL = timedelta(minutes=5)
+CI_FAILURE_CONCLUSIONS = frozenset({
+    "failure", "timed_out", "startup_failure", "action_required",
+})
+_DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
+_DELIVERY_CLAIMS_DIR = ".delivery-claims"
 
 
 def _utc_now_iso() -> str:
@@ -190,9 +197,75 @@ def _load_cursor() -> dict:
 
 def _save_cursor(cursor: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    CURSOR_FILE.write_text(
-        json.dumps(cursor, indent=2), encoding="utf-8",
+    tmp = STATE_DIR / f"cursor.{os.getpid()}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(cursor, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, CURSOR_FILE)
+        directory_fd = os.open(STATE_DIR, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _delivery_key(repo: str, number: int, head_sha: str, failures: list[dict]) -> str:
+    failure_set = sorted(
+        f"{check.get('name', '')}\0{check.get('conclusion', '')}"
+        for check in failures
     )
+    digest = hashlib.sha256(json.dumps(failure_set).encode()).hexdigest()
+    return f"github-pr-ci:{repo.lower()}:{number}:{head_sha.lower()}:{digest}"
+
+
+def _delivery_receipt_exists(delivery_key: str) -> bool:
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    return (STATE_DIR / _DELIVERY_RECEIPTS_DIR / digest).is_file()
+
+
+def _claim_delivery(delivery_key: str, now: datetime) -> bool:
+    """Atomically claim an emit so overlapping poll processes cannot duplicate it."""
+    directory = STATE_DIR / _DELIVERY_CLAIMS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    path = directory / digest
+    for _attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                claimed_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            except OSError:
+                return False
+            if now - claimed_at < CI_DELIVERY_RETRY_INTERVAL:
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+            continue
+        os.close(fd)
+        os.utime(path, (now.timestamp(), now.timestamp()))
+        return True
+    return False
+
+
+def _remove_delivery_artifacts(delivery_key: object) -> None:
+    if not isinstance(delivery_key, str) or not delivery_key:
+        return
+    digest = hashlib.sha256(delivery_key.encode()).hexdigest()
+    for directory in (_DELIVERY_RECEIPTS_DIR, _DELIVERY_CLAIMS_DIR):
+        try:
+            (STATE_DIR / directory / digest).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _coerce_review_requests(value: object) -> dict[str, int]:
@@ -1830,6 +1903,184 @@ def _blocking_reviewers(reviews: list, me: str) -> list[str]:
     )
 
 
+def _check_pr_ci_failures(
+    repo: str,
+    since: str,
+    token: str,
+    me: str,
+    prior: dict[str, object],
+    *,
+    now: datetime | None = None,
+) -> tuple[int, dict[str, object]]:
+    """Route newly completed check failures for open PRs.
+
+    Owned PRs receive a mutation-capable remediation event. Other authors only
+    produce a notification signal. API failures preserve affected cursor entries.
+    """
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    observed_iso = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    prior_checked = prior.get("_last_checked")
+    window_since = prior_checked if isinstance(prior_checked, str) else since
+    since_dt = _parse_utc_datetime(window_since)
+    prs = _gh_api(
+        f"repos/{repo}/pulls?state=open&sort=updated&direction=desc&per_page=100",
+        token,
+    )
+    if not isinstance(prs, list):
+        preserved = dict(prior)
+        preserved["_last_checked"] = window_since
+        return 0, preserved
+
+    count = 0
+    new: dict[str, object] = {}
+    collection_complete = True
+    for listed in prs:
+        number = listed.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        key = str(number)
+        pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
+        if not isinstance(pr, dict):
+            collection_complete = False
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
+            continue
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        head_sha = head.get("sha") or ""
+        if not head_sha:
+            collection_complete = False
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        checks_data = _gh_api(
+            f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100", token,
+        )
+        checks = checks_data.get("check_runs") if isinstance(checks_data, dict) else None
+        total_checks = checks_data.get("total_count") if isinstance(checks_data, dict) else None
+        if (
+            not isinstance(checks, list)
+            or isinstance(total_checks, int) and total_checks > len(checks)
+        ):
+            collection_complete = False
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        failures = [
+            check for check in checks
+            if isinstance(check, dict)
+            and check.get("status") == "completed"
+            and check.get("conclusion") in CI_FAILURE_CONCLUSIONS
+        ]
+        if not failures:
+            continue
+
+        delivery_key = _delivery_key(repo, number, head_sha, failures)
+        entry = prior.get(key)
+        same_failure = isinstance(entry, dict) and entry.get("delivery_key") == delivery_key
+        raw_emitted_at = entry.get("emitted_at") if isinstance(entry, dict) else None
+        emitted_at = (
+            _parse_utc_datetime(raw_emitted_at)
+            if isinstance(raw_emitted_at, str) else None
+        )
+        delivered = _delivery_receipt_exists(delivery_key)
+        if same_failure and (
+            entry.get("baseline") is True
+            or delivered
+            or emitted_at is not None
+            and observed_at - emitted_at < CI_DELIVERY_RETRY_INTERVAL
+        ):
+            new[key] = entry
+            continue
+
+        newly_completed = any(
+            isinstance(check.get("completed_at"), str)
+            and (completed := _parse_utc_datetime(check["completed_at"])) is not None
+            and (since_dt is None or completed > since_dt)
+            for check in failures
+        )
+        if not newly_completed and not (same_failure and not delivered):
+            new[key] = {
+                "head_sha": head_sha,
+                "delivery_key": delivery_key,
+                "emitted_at": observed_iso,
+                "baseline": True,
+            }
+            continue
+
+        if not _claim_delivery(delivery_key, observed_at):
+            new[key] = {
+                "head_sha": head_sha,
+                "delivery_key": delivery_key,
+                "emitted_at": observed_iso,
+            }
+            continue
+
+        failed_checks = [
+            {
+                "id": check.get("id"),
+                "name": check.get("name") or "unknown",
+                "conclusion": check.get("conclusion"),
+                "url": check.get("html_url") or check.get("details_url") or "",
+                "details_url": check.get("details_url") or "",
+                "external_id": check.get("external_id"),
+            }
+            for check in failures
+        ]
+        names = ", ".join(
+            f"{check['name']} ({check['conclusion']})" for check in failed_checks
+        )
+        author = (pr.get("user") or {}).get("login") or ""
+        common = dict(
+            repo=repo,
+            number=number,
+            url=pr.get("html_url", ""),
+            head_sha=head_sha,
+            author=author,
+            failed_checks=failed_checks,
+            delivery_key=delivery_key,
+        )
+        if me and author == me:
+            prompt = (
+                f"CI failed on your open PR #{number} on {repo} at immutable head "
+                f"{head_sha}: {names}. Re-check the live PR, exact head, and current "
+                "checks before changing anything. If it is still open at this head and "
+                "still red, inspect the linked check logs, fix the failure, run the "
+                f"repository's configured tests, and push with a lease.\n{pr.get('html_url', '')}"
+            )
+            _emit(
+                prompt,
+                event_type="pr_ci_failure",
+                head_repo=((head.get("repo") or {}).get("full_name")),
+                head_remote="origin",
+                head_ref=head.get("ref"),
+                base_ref=base.get("ref"),
+                base_sha=base.get("sha"),
+                **common,
+            )
+        else:
+            _emit_signal("pr_ci_failure_external", **common)
+        count += 1
+        new[key] = {
+            "head_sha": head_sha,
+            "delivery_key": delivery_key,
+            "emitted_at": observed_iso,
+        }
+    for key, old_entry in prior.items():
+        if not isinstance(old_entry, dict):
+            continue
+        current_entry = new.get(key)
+        if (
+            not isinstance(current_entry, dict)
+            or current_entry.get("delivery_key") != old_entry.get("delivery_key")
+        ):
+            _remove_delivery_artifacts(old_entry.get("delivery_key"))
+    new["_last_checked"] = observed_iso if collection_complete else window_since
+    return count, new
+
+
 def _check_own_mergeability(
     repo: str,
     token: str,
@@ -2100,6 +2351,8 @@ _STATE_GITIGNORE = """\
 # while the home allowlist still tracks anything durable.
 cursor.json
 *.tmp
+.delivery-receipts/
+.delivery-claims/
 """
 
 
@@ -2173,6 +2426,8 @@ def main() -> None:
     new_cr_all: dict[str, dict[str, object]] = {}
     mergeability_all: dict = cursor.get("pr_mergeability", {}) or {}
     new_mergeability_all: dict[str, dict[str, object]] = {}
+    ci_failures_all: dict = cursor.get("pr_ci_failures", {}) or {}
+    new_ci_failures_all: dict[str, dict[str, object]] = {}
     mergeability_attempt_budget = [1]
     untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
     new_untrusted_all: dict[str, list[str]] = {}
@@ -2232,12 +2487,19 @@ def main() -> None:
         )
         total += mergeability_count
         new_mergeability_all[repo] = new_repo_mergeability
+        repo_ci = ci_failures_all.get(repo, {}) or {}
+        ci_count, new_repo_ci = _check_pr_ci_failures(
+            repo, since, token, me, repo_ci,
+        )
+        total += ci_count
+        new_ci_failures_all[repo] = new_repo_ci
 
     cursor["last_checked"] = new_cursor_ts
     cursor["pr_heads"] = new_pr_heads_all
     cursor["pr_review_requests"] = new_rr_all
     cursor["pr_changes_requested"] = new_cr_all
     cursor["pr_mergeability"] = new_mergeability_all
+    cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
     _save_cursor(cursor)
     print(

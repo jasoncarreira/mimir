@@ -231,7 +231,7 @@ def remediation_checkout_preflight(
     if original is None:
         return resolve_review_state_for_context(context, repository, pull_request), None
     scope = original.action_scope
-    if scope.event_type != "pr_changes_requested_stale" or scope.provenance.value != "poller_payload":
+    if scope.event_type not in {"pr_changes_requested_stale", "pr_ci_failure"} or scope.provenance.value != "poller_payload":
         return resolve_review_state_for_context(context, repository, pull_request), None
 
     client = _client_for_repository(repository)
@@ -241,6 +241,22 @@ def remediation_checkout_preflight(
         raise ToolException(f"repository checkout rejected: {exc}") from exc
     if snapshot.state != "open":
         return None, "pull request is closed or merged"
+    if scope.event_type == "pr_ci_failure":
+        if snapshot.head_sha.lower() != scope.observed_head_sha.lower():
+            return None, "pull request head was superseded"
+        try:
+            checks = client.list_checks(scope)
+        except ForgeError as exc:
+            raise ToolException(f"repository checkout rejected: {exc}") from exc
+        if not any(
+            check.status == "completed"
+            and check.conclusion in {
+                "failure", "timed_out", "startup_failure", "action_required",
+            }
+            for check in checks
+        ):
+            return None, "pull request checks are no longer failing"
+        return original, None
     if snapshot.head_sha.lower() == scope.observed_head_sha.lower():
         return original, None
 
