@@ -104,10 +104,14 @@ _REMEDIATION_EFFECT_TOOLS = frozenset({
 def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
-    arguments: dict[str, Any],
+    arguments: Mapping[str, Any] | None,
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
-    if tool_name not in _STANDING_REVIEW_TOOLS or auth_context is None:
+    if (
+        tool_name not in _STANDING_REVIEW_TOOLS
+        or auth_context is None
+        or not isinstance(arguments, Mapping)
+    ):
         return None
     from .forge import resolve_review_state_for_context
 
@@ -673,8 +677,6 @@ def _request_for_authorized_execution(
     A trusted service receives only the direct argv admitted by its operation-
     specific sink policy; the handler never sees the original command string.
     """
-    if tool_name not in {"shell_exec", "bash_async"}:
-        return request
     args = dict((getattr(request, "tool_call", None) or {}).get("args") or {})
     # Never trust a model-supplied internal execution override. Ordinary calls
     # discard it; trusted-service calls below replace it with server-parsed argv
@@ -687,6 +689,8 @@ def _request_for_authorized_execution(
         if had_model_override
         else request
     )
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return sanitized_request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None
     if policy is None or policy.adapter != "shell_profile":
@@ -1684,6 +1688,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
@@ -1852,7 +1858,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        if isinstance(direct_argv, list):
+        if (
+            tool_name in {"shell_exec", "bash_async"}
+            and isinstance(direct_argv, list)
+        ):
             from ._shell_env import bind_direct_exec_argv
 
             direct_argv_token = bind_direct_exec_argv(direct_argv)
@@ -1983,6 +1992,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 content=review_denial, tool_call_id=_tool_call_id(request),
                 name=tool_name, status="error",
             )
+        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+            return await handler(request)
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
@@ -2157,7 +2168,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        if isinstance(direct_argv, list):
+        if (
+            tool_name in {"shell_exec", "bash_async"}
+            and isinstance(direct_argv, list)
+        ):
             from ._shell_env import bind_direct_exec_argv
 
             direct_argv_token = bind_direct_exec_argv(direct_argv)
