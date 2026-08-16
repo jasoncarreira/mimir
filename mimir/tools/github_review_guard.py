@@ -17,6 +17,8 @@ from .refusals import ToolPolicyRefusal
 
 _locks_guard = threading.Lock()
 _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
+_lock_users: dict[tuple[str, int, str, str, str], int] = {}
+_LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -38,11 +40,30 @@ class ReviewClaim:
     state: str
     duplicate: bool
     _lock: threading.Lock | None = None
+    _key: tuple[str, int, str, str, str] | None = None
 
     def release(self) -> None:
         if self._lock is not None:
-            self._lock.release()
+            lock = self._lock
+            key = self._key
             self._lock = None
+            self._key = None
+            lock.release()
+            if key is not None:
+                _release_lock_user(key, lock)
+
+
+def _release_lock_user(
+    key: tuple[str, int, str, str, str], lock: threading.Lock,
+) -> None:
+    with _locks_guard:
+        users = _lock_users[key] - 1
+        if users:
+            _lock_users[key] = users
+        else:
+            _lock_users.pop(key, None)
+            if _locks.get(key) is lock:
+                _locks.pop(key, None)
 
 
 def _option_value(argv: list[str], names: set[str]) -> str | None:
@@ -287,19 +308,26 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
         key = (repo.casefold(), number, head, reviewer.casefold(), spec.state)
         with _locks_guard:
             lock = _locks.setdefault(key, threading.Lock())
-        lock.acquire()
+            _lock_users[key] = _lock_users.get(key, 0) + 1
+        if not lock.acquire(timeout=_LOCK_ACQUIRE_TIMEOUT_SECONDS):
+            _release_lock_user(key, lock)
+            raise _review_refusal(
+                "timed out waiting for another matching review submission"
+            )
         # If the PR moved while this caller waited, claim the new-head key
         # instead. This keeps the key aligned with the head checked immediately
         # before submission.
         current_head = _head(spec, repo)
         if current_head != head:
             lock.release()
+            _release_lock_user(key, lock)
             if not current_head:
                 return None
             continue
         exists = _matching_review_exists(spec, repo, head, reviewer)
         if exists is None:
             lock.release()
+            _release_lock_user(key, lock)
             return None
         return ReviewClaim(
             repo=repo,
@@ -309,4 +337,5 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
             state=spec.state,
             duplicate=exists,
             _lock=lock,
+            _key=key,
         )
