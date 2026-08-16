@@ -536,7 +536,6 @@ def render_usage_block(
     alert: CostRateAlert | None = None,
     plan_quota_lines: list[str] | None = None,
     off_pace_warning: list[str] | None = None,
-    subagent_block: str | None = None,
     betas: Iterable[str] | None = None,
 ) -> str | None:
     """Format the usage report as a markdown body for the
@@ -545,13 +544,11 @@ def render_usage_block(
     has_windows = any(w.turns > 0 for w in report.windows)
     has_plan_quotas = bool(plan_quota_lines)
     has_off_pace = bool(off_pace_warning)
-    has_subagents = bool(subagent_block)
     if (
         report.last_turn.ts is None
         and not has_windows
         and not has_plan_quotas
         and not has_off_pace
-        and not has_subagents
     ):
         return None
 
@@ -590,13 +587,6 @@ def render_usage_block(
             if budget and budget > 0:
                 cost_part += f" ({w.total_cost_usd / budget * 100:.0f}% of ${budget:.2f})"
             lines.append(f"{w.label}: {cost_part} / " + " / ".join(tail))
-
-    if has_subagents:
-        if lines:
-            lines.append("")
-        lines.append("Subagent spend:")
-        for line in (subagent_block or "").splitlines():
-            lines.append(line)
 
     if has_plan_quotas:
         if lines:

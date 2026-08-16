@@ -20,7 +20,7 @@ What's gone:
   - claude_agent_sdk dependency at the import level.
 
 What's kept:
-  - mimir.SessionManager / SubagentInbox / ChannelRegistry /
+  - mimir.SessionManager / ChannelRegistry /
     Dispatcher constructor wiring (runtime-agnostic infrastructure).
   - TurnRecord schema (mimir/models.py).
   - The Agent class shape so server.py + tests don't need
@@ -100,7 +100,6 @@ from .session_boundary_log import (
     render_session_summaries,
     validate_unfinished_work,
 )
-from .subagent_inbox import SubagentInbox, render_subagent_updates
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
@@ -1146,7 +1145,6 @@ class Agent:
         saga_client: SagaClient | None = None,
         session_manager: SessionManager | None = None,
         scheduler: Any = None,
-        subagent_inbox: SubagentInbox | None = None,
         channel_registry: ChannelRegistry | None = None,
         dispatcher: Any = None,
         commitments_store: Any = None,
@@ -1168,7 +1166,6 @@ class Agent:
         self._saga_store: Any = None
         self._sessions = session_manager
         self._scheduler = scheduler
-        self._inbox = subagent_inbox or SubagentInbox()
         self._channels = channel_registry
         self._dispatcher = dispatcher
         # chainlink #583 slice 1: optional live turn-event bus. When wired
@@ -2576,15 +2573,6 @@ class Agent:
             except Exception as exc:
                 log.warning("pre-message saga.query failed: %s", exc)
 
-        # Drain any pending subagent completion notifications from
-        # prior turns on this channel — SPEC §4.4. Empty list → block
-        # is None (build_turn_prompt skips the section).
-        pending_subagents = await self._inbox.drain(event.channel_id or "")
-        subagent_block = (
-            render_subagent_updates(pending_subagents)
-            if pending_subagents else None
-        )
-
         # Per-turn prompt assembly — Recent activity, Recent feedback,
         # Session summaries, Resource usage, Upcoming, Upcoming
         # commitments, Self-state, etc. Synthesis turns
@@ -2592,7 +2580,6 @@ class Agent:
         turn_prompt, recent = await self._build_turn_prompt(
             ctx, event,
             saga_block=memory_block,
-            subagent_block=subagent_block,
             initial_auth_context=initial_auth_context,
             saga_labels=memory_labels,
         )
@@ -3637,7 +3624,6 @@ class Agent:
                 self._config,
                 self._rate_limits,
                 turns_snapshot=self._turns_snapshot,
-                events_snapshot=self._events_snapshot,
             )
         except Exception:  # noqa: BLE001
             log.exception("assemble_stats_block failed; skipping block")
@@ -3976,7 +3962,6 @@ class Agent:
         ctx: Any,
         event: AgentEvent,
         saga_block: str | None,
-        subagent_block: str | None,
         initial_auth_context: AuthContext | None = None,
         saga_labels: InformationFlowLabels | None = None,
     ) -> tuple[str, list]:
@@ -4257,15 +4242,6 @@ class Agent:
                     self_authored=True,
                 ),
             ))
-        if subagent_block:
-            source_blocks.append(PromptBlock(
-                subagent_block,
-                _prompt_source_labels(
-                    auth_context, domain="subagents", resource="channel_inbox",
-                    channel_id=event.channel_id, principal=effective_principal,
-                    self_authored=True,
-                ),
-            ))
         if auto_skill_block is not None:
             source_blocks.append(PromptBlock(
                 auto_skill_block[1],
@@ -4290,7 +4266,6 @@ class Agent:
             event,
             recent_messages=recent,
             saga_block=saga_block,
-            subagent_block=subagent_block,
             recent_message_chars=self._config.recent_message_chars,
             resolver=self._buffer.resolver,
             feedback_block=feedback_block,

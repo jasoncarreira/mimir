@@ -1,9 +1,8 @@
 """Shared assembly for the Resource usage stats block.
 
 Both ``Agent._assemble_usage_block`` and the ``mimir stats`` CLI need
-to aggregate the same five inputs (turns.jsonl cost windows, plan-
-quota snapshot, off-pace projection, subagent token spend, the
-optional 1M-context beta flag) and feed them to
+to aggregate the same four inputs (turns.jsonl cost windows, plan-
+quota snapshot, off-pace projection, and the optional 1M-context beta flag) and feed them to
 ``usage_stats.render_usage_block``. Pre-refactor (code-review-
 2026-05-09 CR2-#6) the assembly was duplicated across ``agent.py``
 and ``cli.py`` with subtle drift (the CLI skipped billing-mode
@@ -33,10 +32,6 @@ from .rate_limits import (
     off_pace_buckets,
     render_off_pace_warning,
     render_plan_quota_lines,
-)
-from .subagent_stats import (
-    aggregate as aggregate_subagents,
-    render_subagent_block,
 )
 from .usage_stats import (
     CONTEXT_1M_BETA,
@@ -85,12 +80,10 @@ def assemble_stats_block(
     rate_limits: RateLimitStore,
     *,
     turns_snapshot: "JsonlSnapshot | None" = None,
-    events_snapshot: "JsonlSnapshot | None" = None,
     betas: list[str] | None = None,
 ) -> StatsBlockResult:
-    """Aggregate usage stats + rate-limit projection + subagent spend,
-    return a ``StatsBlockResult`` with the rendered body and the
-    underlying state.
+    """Aggregate usage stats and rate-limit projection, returning a
+    ``StatsBlockResult`` with the rendered body and underlying state.
 
     ``rate_limits`` is the ``RateLimitStore`` from either the agent's
     ``self._rate_limits`` (worker-loop path) or a per-CLI-invocation
@@ -99,9 +92,8 @@ def assemble_stats_block(
     or transient stat() error degrades to empty plan lines instead
     of taking down the whole block (PR #116 review-fix).
 
-    ``turns_snapshot`` / ``events_snapshot`` are JsonlSnapshot caches
-    used by the agent path to avoid re-scanning turns.jsonl /
-    events.jsonl every turn; the CLI passes None.
+    ``turns_snapshot`` is a JsonlSnapshot cache used by the agent path
+    to avoid re-scanning turns.jsonl every turn; the CLI passes None.
 
     ``betas`` defaults to ``[CONTEXT_1M_BETA]`` when
     ``cfg.context_1m`` is true. Pre-refactor the CLI didn't pass
@@ -115,8 +107,6 @@ def assemble_stats_block(
       raise) → ``off_pace = []`` + empty plan/off_pace lines;
       ``rate_limit_current = {}`` echoed on the result; the block
       still renders.
-    - subagent_stats exception → ``subagent_block = None``; the
-      block still renders.
     """
     if betas is None:
         betas = []
@@ -161,14 +151,6 @@ def assemble_stats_block(
     except Exception:  # noqa: BLE001
         log.exception("rate_limits read/projection failed")
 
-    subagent_body: str | None = None
-    try:
-        subagent_body = render_subagent_block(
-            aggregate_subagents(cfg.events_log)
-        )
-    except Exception:  # noqa: BLE001
-        log.exception("subagent_stats aggregate failed")
-
     body = render_usage_block(
         report,
         fallback_model=cfg.model,
@@ -177,7 +159,6 @@ def assemble_stats_block(
         alert=alert,
         plan_quota_lines=plan_lines,
         off_pace_warning=off_pace_lines,
-        subagent_block=subagent_body,
         betas=betas or None,
     )
 
