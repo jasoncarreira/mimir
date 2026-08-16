@@ -2082,10 +2082,26 @@ class SagaStore:
                     provenance=intersected_acl.provenance,
                 )
                 if not store_result.stored:
-                    # Dedupe hit on the observation content — relations
-                    # were already in place from the prior cluster pass.
-                    # See note above: no consolidation access_event.
-                    continue
+                    # A hard kill can land the observation atom while missing
+                    # the following relations transaction. Complete exactly
+                    # that orphan on retry; ordinary content dedupe remains a
+                    # no-op (including observations backed by other evidence).
+                    repairable = conn.execute(
+                        "SELECT 1 FROM atoms a "
+                        "WHERE a.id = ? AND a.memory_type = 'observation' "
+                        "AND a.tombstoned = 0 "
+                        "AND NOT EXISTS ("
+                        "  SELECT 1 FROM atom_relations ar "
+                        "  WHERE ar.source_id = a.id "
+                        "    AND ar.relation_type = 'evidenced_by'"
+                        ") AND NOT EXISTS ("
+                        "  SELECT 1 FROM observations_metadata om "
+                        "  WHERE om.atom_id = a.id"
+                        ")",
+                        (store_result.atom_id,),
+                    ).fetchone()
+                    if repairable is None:
+                        continue
 
                 observation_id = store_result.atom_id
                 try:
@@ -2887,7 +2903,7 @@ class SagaStore:
             joins = []
             where = [
                 "a.tombstoned = 0",
-                "a.agent_id = ?",
+                "a.agent_id IN (?, 'shared')",
                 "e.ts >= ?",
                 f"e.source IN ({placeholders})",
             ]

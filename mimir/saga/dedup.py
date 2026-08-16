@@ -486,6 +486,14 @@ def merge_duplicate_into_canonical(
             can_id,
         ),
     )
+    # ``atom_topics`` is the membership table recall reads. Keep it in sync
+    # with the JSON compatibility column and remove the merged row's stale
+    # membership in the same transaction as the atom merge.
+    conn.execute("DELETE FROM atom_topics WHERE atom_id IN (?, ?)", (can_id, dup_id))
+    conn.executemany(
+        "INSERT INTO atom_topics (atom_id, topic) VALUES (?, ?)",
+        [(can_id, topic) for topic in merged_topics],
+    )
 
     # 2. Redirect access_events and rebuild summary.
     _rewrite_access_events(conn, dup_id, can_id)
@@ -830,8 +838,11 @@ def dedup_pass(
             conn.execute("BEGIN IMMEDIATE")
             for obs_id in touched_observations:
                 live_count = conn.execute(
-                    "SELECT COUNT(*) FROM atom_relations "
-                    "WHERE source_id = ? AND relation_type = 'evidenced_by'",
+                    "SELECT COUNT(*) FROM atom_relations ar "
+                    "JOIN atoms t ON t.id = ar.target_id "
+                    "WHERE ar.source_id = ? "
+                    "AND ar.relation_type = 'evidenced_by' "
+                    "AND t.tombstoned = 0",
                     (obs_id,),
                 ).fetchone()[0]
                 cur = conn.execute(
