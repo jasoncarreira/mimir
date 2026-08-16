@@ -3263,6 +3263,13 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
         return True
     sched = Scheduler(scheduler_yaml=path, enqueue=noop)
 
+    async def callable_noop():
+        return None
+
+    # Regression guard: without a registered callable, _install_callable is
+    # never reached and this test cannot detect its historical second read.
+    sched.register_callable("maintenance", callable_noop, "0 9 * * *")
+
     loop_thread = threading.get_ident()
     io_threads: list[int] = []
     mutate_threads: list[int] = []
@@ -3283,7 +3290,7 @@ async def test_reload_async_io_off_loop_mutations_on_loop(
 
     await sched._reload_async()
 
-    assert io_threads, "load_jobs was not called"
+    assert len(io_threads) == 1, "reload must parse scheduler.yaml exactly once"
     assert all(t != loop_thread for t in io_threads), \
         "yaml read ran on the loop thread (should be in to_thread)"
     assert mutate_threads, "no APScheduler mutation happened"

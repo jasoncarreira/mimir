@@ -1412,6 +1412,49 @@ async def test_record_usage_writes_derived_5h_on_anomaly(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_record_usage_derives_cost_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import threading
+    import mimir.oauth_usage_poller as op
+    from mimir.oauth_usage_poller import PollerConfig, record_usage
+    from mimir.rate_limits import RateLimitSnapshot, RateLimitStore
+
+    store = RateLimitStore(path=tmp_path / "rate_limits.json")
+    await store.record("five_hour", RateLimitSnapshot(
+        status="allowed", utilization=0.10,
+    ))
+    await store.record("seven_day", RateLimitSnapshot(
+        status="allowed", utilization=0.50,
+    ))
+    payload = {
+        "five_hour": {"status": "allowed", "utilization": 0.70},
+        "seven_day": {"status": "allowed", "utilization": 0.51},
+    }
+    cfg = PollerConfig(
+        credentials_path=tmp_path / "creds.json",
+        turns_log_path=tmp_path / "turns.jsonl",
+    )
+    loop_thread = threading.get_ident()
+    derive_threads: list[int] = []
+
+    def derive_spy(*args, **kwargs):
+        derive_threads.append(threading.get_ident())
+        return 0.20
+
+    async def discard_event(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(op, "derive_5h_from_cost", derive_spy)
+    monkeypatch.setattr(op, "log_event", discard_event)
+
+    recorded = await record_usage(store, payload, cfg=cfg)
+
+    assert recorded["five_hour"]["derived"] is True
+    assert derive_threads and all(thread != loop_thread for thread in derive_threads)
+
+
+@pytest.mark.asyncio
 async def test_record_usage_derive_uses_prior_7d_when_new_7d_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

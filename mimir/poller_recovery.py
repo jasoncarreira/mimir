@@ -46,6 +46,7 @@ Hardening (chainlink #305/#309/#310/#318/#329, 2026-06-01 review):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import asdict
@@ -184,26 +185,44 @@ def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
     return payload
 
 
-def stash_enqueued_event(persist_dir: Path, event: AgentEvent) -> None:
+async def stash_enqueued_event(
+    persist_dir: Path,
+    event: AgentEvent,
+    *,
+    enqueued_at: str | None = None,
+) -> None:
     """Record an enqueued poller ``AgentEvent`` as in-flight, keyed by its
     ``source_id``, so a later failed turn can re-enqueue it.
 
-    No-op when the event has no ``source_id`` — without it the outcome
-    event can't be correlated back, so it isn't recoverable this way.
+    The workload-sized recovery document read and atomic rewrite run off the
+    event loop; the in-memory state mutation remains on it. ``enqueued_at``
+    should be captured immediately before the accepted enqueue so an empty
+    reconciliation watermark has a safe lower scan bound.
+
+    No-op when the event has no ``source_id`` — without it the outcome event
+    can't be correlated back, so it isn't recoverable this way.
     """
     if not event.source_id:
         return
-    state = _load_state(persist_dir)
+    state = await asyncio.to_thread(_load_state, persist_dir)
+    stashed_dt = _utc_now()
+    stashed_at = stashed_dt.isoformat()
     state["inflight"][event.source_id] = {
         "attempts": 0,
         # First-seen timestamp drives the GC TTL (#310).
-        "stashed_at": _utc_now_iso(),
+        "stashed_at": stashed_at,
         # Updated after every accepted retry. This identifies the particular
         # enqueue whose in-memory queue may have been lost in a crash.
-        "enqueued_at": _utc_now_iso(),
+        "enqueued_at": enqueued_at or stashed_at,
+        # Callers should capture enqueue time themselves. Retain a one-minute
+        # conservative scan fallback for direct API callers so a fast consumer
+        # cannot record its outcome just before this stash runs.
+        "scan_from": enqueued_at or (
+            stashed_dt - timedelta(minutes=1)
+        ).isoformat(),
         "event": _event_to_stash(event),
     }
-    _save_state(persist_dir, state)
+    await asyncio.to_thread(_save_state, persist_dir, state)
 
 
 def _event_from_stash(d: Any) -> AgentEvent | None:
@@ -326,6 +345,25 @@ def _read_outcomes_since(
     return out
 
 
+def _oldest_inflight_timestamp(inflight: dict) -> str:
+    """Earliest timestamp before which no stashed outcome can be relevant.
+
+    This supplies the initial cutoff when an old or newly-created recovery
+    document has no watermark. Every outcome for these entries must follow
+    its pre-enqueue timestamp, so stopping before it cannot lose recovery data.
+    """
+    timestamps: list[str] = []
+    for entry in inflight.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("scan_from", "enqueued_at", "stashed_at"):
+            value = entry.get(key)
+            if isinstance(value, str) and _parse_iso(value) is not None:
+                timestamps.append(value)
+                break
+    return min(timestamps, default="")
+
+
 def _read_last_unclean_restart(events_path: Path) -> str:
     """Return the newest durable unclean-restart marker timestamp."""
     if not events_path.exists():
@@ -445,7 +483,7 @@ async def reconcile_failed_turns(
         "reenqueued": 0, "completed": 0, "gave_up": 0,
         "deferred": 0, "expired": 0, "unclean_reenqueued": 0,
     }
-    state = _load_state(persist_dir)
+    state = await asyncio.to_thread(_load_state, persist_dir)
     inflight: dict = state["inflight"]
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
@@ -460,16 +498,17 @@ async def reconcile_failed_turns(
     # a future timestamp).
     if not inflight:
         state["last_reconciled"] = now_iso
-        _save_state(persist_dir, state)
+        await asyncio.to_thread(_save_state, persist_dir, state)
         return summary
 
-    outcomes = _read_outcomes_since(
-        events_path, channel_id, state.get("last_reconciled", ""),
+    watermark = state.get("last_reconciled", "")
+    scan_cutoff = watermark or _oldest_inflight_timestamp(inflight)
+    outcomes = await asyncio.to_thread(
+        _read_outcomes_since, events_path, channel_id, scan_cutoff,
     )
     # Advance the watermark only past outcomes we FULLY handle (#309). On
     # enqueue back-pressure we stop early and leave it before the un-handled
     # outcome so it's retried (#305).
-    watermark = state.get("last_reconciled", "")
     for rec in outcomes:
         ts = rec.get("timestamp")
         source_id = rec.get("source_id")
@@ -617,7 +656,7 @@ async def reconcile_failed_turns(
     # once for this marker. This is deliberately at-least-once: if the outcome
     # record itself was lost in the same crash, a duplicate turn is preferable
     # to silently losing a one-shot notification.
-    restart_iso = _read_last_unclean_restart(events_path)
+    restart_iso = await asyncio.to_thread(_read_last_unclean_restart, events_path)
     restart_dt = _parse_iso(restart_iso)
     if restart_dt is not None and not summary["deferred"]:
         for source_id in list(inflight):
@@ -683,5 +722,5 @@ async def reconcile_failed_turns(
         # No outcomes seen → keep advancing so we don't rescan history; any
         # future outcome for an in-flight item has a later timestamp anyway.
         state["last_reconciled"] = watermark or now_iso
-    _save_state(persist_dir, state)
+    await asyncio.to_thread(_save_state, persist_dir, state)
     return summary
