@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from types import SimpleNamespace
 import signal
 import socket
 import stat
@@ -105,6 +106,42 @@ async def test_client_authenticates_root_before_sending_fds(tmp_path: Path, monk
                 timeout_s=1,
             )
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_client_reports_executor_peer_uid_refusal(tmp_path: Path, monkeypatch) -> None:
+    path = _issued(tmp_path)
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, *args: object) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": None,
+                "error": "worker executor refused peer uid 1000; required mimir uid is 1001",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    with _authorization(path) as checkout:
+        with pytest.raises(RuntimeError, match="peer uid 1000.*mimir uid is 1001"):
+            await WorkerClient(checkout).launch(
+                local_checkout=path,
+                argv=["true"],
+                env={},
+                identifier=str(uuid.uuid4()),
+                timeout_s=1,
+            )
 
 
 @pytest.mark.asyncio
@@ -208,8 +245,13 @@ def test_validate_checkout_refuses_arbitrary_and_replaced_fds(tmp_path: Path, mo
     root = tmp_path / "checkouts"
     issued = _issued(tmp_path)
     monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", root)
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
     issued.chmod(0o2770)
     issued.parent.chmod(0o700)
 
@@ -312,8 +354,13 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
 
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", runner_gid)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=runner_uid, worklink_gid=runner_gid
+        ),
+    )
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
     try:
         execution_fd = worker_exec._execution_checkout_fd(["uv", "run"], source_fd, home)
@@ -396,8 +443,13 @@ def test_repo_test_execution_copy_is_fd_sourced_for_checkout_local_runner(
     runner.chmod(0o770)
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
 
     source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -490,12 +542,16 @@ def test_executor_requires_positive_integer_issue_and_attempt(
 
 def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path: Path) -> None:
     dispatched: list[object] = []
+    responses: list[dict[str, object]] = []
 
     class Connection:
         closed = False
 
         def getsockopt(self, *args: object) -> bytes:
             return struct.pack("3i", 12, 999, 999)
+
+        def send(self, payload: bytes) -> None:
+            responses.append(json.loads(payload))
 
         def close(self) -> None:
             self.closed = True
@@ -516,7 +572,11 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
 
     monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
     monkeypatch.setattr(socket, "socket", lambda *args: Listener())
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", 1001)
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(mimir_uid=1001, worklink_uid=1002, worklink_gid=1002),
+    )
     monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
     monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
     monkeypatch.setattr(worker_exec.os, "chmod", lambda *args: None)
@@ -525,9 +585,15 @@ def test_executor_authenticates_mimir_peer_before_dispatch(monkeypatch, tmp_path
         worker_exec.serve(tmp_path / "socket")
     assert connection.closed
     assert dispatched == []
+    assert responses == [{
+        "id": None,
+        "error": "worker executor refused peer uid 999; required mimir uid is 1001",
+    }]
 
 
-def test_drop_worker_uses_irreversible_identity_sequence(monkeypatch) -> None:
+def test_drop_worker_uses_irreversible_identity_sequence(
+    monkeypatch, synthetic_worklink_identities
+) -> None:
     events: list[object] = []
 
     class Libc:
@@ -546,18 +612,32 @@ def test_drop_worker_uses_irreversible_identity_sequence(monkeypatch) -> None:
     monkeypatch.setattr(worker_exec.os, "fchdir", lambda fd: events.append(("cwd", fd)))
     monkeypatch.setattr(worker_exec, "_verify_worker_identity", lambda: events.append(("verify",)))
     worker_exec._drop_worker(9)
+    worker_uid = synthetic_worklink_identities.worklink_uid
+    worker_gid = synthetic_worklink_identities.worklink_gid
     assert ("groups", []) in events
-    assert ("gid", (1002, 1002, 1002)) in events
-    assert ("uid", (1002, 1002, 1002)) in events
-    assert events.index(("groups", [])) < events.index(("gid", (1002, 1002, 1002)))
-    assert events.index(("gid", (1002, 1002, 1002))) < events.index(("uid", (1002, 1002, 1002)))
+    assert ("gid", (worker_gid, worker_gid, worker_gid)) in events
+    assert ("uid", (worker_uid, worker_uid, worker_uid)) in events
+    assert events.index(("groups", [])) < events.index(
+        ("gid", (worker_gid, worker_gid, worker_gid))
+    )
+    assert events.index(("gid", (worker_gid, worker_gid, worker_gid))) < events.index(
+        ("uid", (worker_uid, worker_uid, worker_uid))
+    )
     assert events[-1] == ("verify",)
     assert events.count(("caps", set())) == 1
 
 
-def test_worker_identity_verifier_rejects_any_retained_authority(monkeypatch) -> None:
-    monkeypatch.setattr(worker_exec.os, "getresuid", lambda: (1002, 1002, 1002), raising=False)
-    monkeypatch.setattr(worker_exec.os, "getresgid", lambda: (1002, 1002, 1002), raising=False)
+def test_worker_identity_verifier_rejects_any_retained_authority(
+    monkeypatch, synthetic_worklink_identities
+) -> None:
+    worker_uid = synthetic_worklink_identities.worklink_uid
+    worker_gid = synthetic_worklink_identities.worklink_gid
+    monkeypatch.setattr(
+        worker_exec.os, "getresuid", lambda: (worker_uid,) * 3, raising=False
+    )
+    monkeypatch.setattr(
+        worker_exec.os, "getresgid", lambda: (worker_gid,) * 3, raising=False
+    )
     monkeypatch.setattr(worker_exec.os, "getgroups", lambda: [])
     clean = {
         "CapInh": "0", "CapPrm": "0", "CapEff": "0", "CapAmb": "0",
@@ -1005,8 +1085,13 @@ def test_executor_accepts_only_the_three_issued_checkout_shapes(
     monkeypatch.setattr(worker_exec, "ENABLED_CHECKOUT_ROOT", roots["checkouts"])
     monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", roots["repo-test-checkouts"])
     monkeypatch.setattr(worker_exec, "OPENCODE_CHECKOUT_ROOT", roots["opencode-checkouts"])
-    monkeypatch.setattr(worker_exec, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(worker_exec, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        worker_exec,
+        "get_identities",
+        lambda: SimpleNamespace(
+            mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid()
+        ),
+    )
     path = roots[root_name] / ("a" * 64) / f"{issue}-{attempt}" / "checkout"
     path.mkdir(parents=True)
     path.parent.chmod(0o700)

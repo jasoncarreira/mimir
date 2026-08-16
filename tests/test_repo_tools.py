@@ -55,7 +55,6 @@ from mimir.repo_tools import (
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
-from mimir.worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
 from mimir.worklink.worker_client import StaleWorkerExecutorError
 
 
@@ -1675,6 +1674,7 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
     repo_tools,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_worklink_identities,
 ) -> None:
     from mimir import project_tests as project_tests_module
 
@@ -1713,13 +1713,14 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
         ).execute()
 
     assert refusal.value.code == "test_path_permission_denied"
+    identities = synthetic_worklink_identities
     message = str(refusal.value)
     assert f"path={failed_path}" in message
     assert "path_mode=0o000" in message
     assert f"path_uid={os.geteuid()}" in message
     assert f"path_gid={os.getegid()}" in message
-    assert f"runner_effective_uid={WORKLINK_UID}" in message
-    assert f"runner_effective_gid={WORKLINK_GID}" in message
+    assert f"runner_effective_uid={identities.worklink_uid}" in message
+    assert f"runner_effective_gid={identities.worklink_gid}" in message
     assert f"traversal_failed={boundary}" in message
     assert "file-content-must-not-be-logged" not in message
     assert events == [("repo_test_containment_refused", {
@@ -1730,8 +1731,8 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
         "path_mode": "0o000",
         "path_uid": os.geteuid(),
         "path_gid": os.getegid(),
-        "runner_effective_uid": WORKLINK_UID,
-        "runner_effective_gid": WORKLINK_GID,
+        "runner_effective_uid": identities.worklink_uid,
+        "runner_effective_gid": identities.worklink_gid,
         "traversal_failed": str(boundary),
     })]
     assert "file-content-must-not-be-logged" not in repr(events)

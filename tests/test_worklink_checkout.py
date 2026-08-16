@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
@@ -961,7 +962,14 @@ def test_fd_normalization_breaks_hardlinks_and_sets_shared_modes(
     assert external.read_text(encoding="utf-8") == "external"
 
 
-def test_fd_normalization_rejects_special_files(tmp_path: Path) -> None:
+def test_fd_normalization_rejects_special_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        checkout_module,
+        "get_identities",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit identities ignored")),
+    )
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     os.mkfifo(checkout / "fifo")
@@ -984,8 +992,11 @@ def test_enabled_eligible_checkout_retains_exact_authorization_and_shared_modes(
     calls: list[list[str]] = []
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", enabled_root)
-    monkeypatch.setattr(checkout_module, "MIMIR_UID", os.getuid())
-    monkeypatch.setattr(checkout_module, "WORKLINK_GID", os.getgid())
+    monkeypatch.setattr(
+        checkout_module,
+        "get_identities",
+        lambda: SimpleNamespace(mimir_uid=os.getuid(), worklink_gid=os.getgid()),
+    )
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))

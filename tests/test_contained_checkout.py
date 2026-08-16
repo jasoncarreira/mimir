@@ -99,7 +99,7 @@ def test_prepare_boundary_refuses_collision_without_deleting_incumbent(
 
 
 def test_prepare_boundary_remains_controller_owned_0700(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_worklink_identities,
 ) -> None:
     root = tmp_path / "checkouts"
     root.mkdir(mode=0o771)
@@ -118,8 +118,8 @@ def test_prepare_boundary_remains_controller_owned_0700(
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert ownership[-1] == (
         boundary,
-        checkout.MIMIR_UID,
-        checkout.WORKLINK_GID,
+        synthetic_worklink_identities.mimir_uid,
+        synthetic_worklink_identities.worklink_gid,
     )
 
 
@@ -252,7 +252,10 @@ def test_opencode_checkout_refuses_seed_outside_default_tree(
 
 @pytest.mark.parametrize("surface", ["repo_test", "opencode"])
 def test_checkout_provisioning_mutates_only_its_admitted_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    synthetic_worklink_identities,
 ) -> None:
     repo_test_root, opencode_root = _roots(tmp_path, monkeypatch)
     default = tmp_path / "projects"
@@ -315,12 +318,19 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     assert stat.S_IMODE(scope.stat().st_mode) == 0o700
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert stat.S_IMODE(issued.path.stat().st_mode) == 0o2770
+    identities = synthetic_worklink_identities
     scope_identity = _identity(scope)
     boundary_identity = _identity(boundary)
     checkout_identity = _identity(issued.path)
-    assert ("chown", scope_identity, (1001, 1001)) in mutations
-    assert ("chown", boundary_identity, (1001, 1002)) in mutations
-    assert ("fchown", checkout_identity, (1001, 1002)) in mutations
+    assert (
+        "chown", scope_identity, (identities.mimir_uid, identities.mimir_uid)
+    ) in mutations
+    assert (
+        "chown", boundary_identity, (identities.mimir_uid, identities.worklink_gid)
+    ) in mutations
+    assert (
+        "fchown", checkout_identity, (identities.mimir_uid, identities.worklink_gid)
+    ) in mutations
     assert ("fchmod", checkout_identity, 0o2770) in mutations
     issued.close()
 

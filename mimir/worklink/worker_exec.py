@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from .checkout import _normalize_checkout_fd
+from .identities import get_identities
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -27,9 +28,6 @@ from .worker_client import (
     _validate_identifier,
 )
 
-MIMIR_UID = 1001
-WORKLINK_UID = 1002
-WORKLINK_GID = 1002
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
@@ -115,8 +113,8 @@ def _drop_worker(checkout_fd: int) -> None:
             raise OSError(error, os.strerror(error))
     _set_capabilities({_CAP_SETUID, _CAP_SETGID})
     os.setgroups([])
-    os.setresgid(WORKLINK_GID, WORKLINK_GID, WORKLINK_GID)
-    os.setresuid(WORKLINK_UID, WORKLINK_UID, WORKLINK_UID)
+    os.setresgid(get_identities().worklink_gid, get_identities().worklink_gid, get_identities().worklink_gid)
+    os.setresuid(get_identities().worklink_uid, get_identities().worklink_uid, get_identities().worklink_uid)
     _set_capabilities(set())
     os.umask(0o002)
     os.setsid()
@@ -134,7 +132,7 @@ def _status_fields() -> dict[str, str]:
 
 
 def _verify_worker_identity() -> None:
-    if os.getresuid() != (WORKLINK_UID,) * 3 or os.getresgid() != (WORKLINK_GID,) * 3:
+    if os.getresuid() != (get_identities().worklink_uid,) * 3 or os.getresgid() != (get_identities().worklink_gid,) * 3:
         raise RuntimeError("worker identity drop failed")
     if os.getgroups():
         raise RuntimeError("worker supplementary groups were not cleared")
@@ -206,12 +204,12 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     boundary = resolved.parent.stat(follow_symlinks=False)
     if (
         not stat.S_ISDIR(boundary.st_mode)
-        or boundary.st_uid != MIMIR_UID
-        or boundary.st_gid != WORKLINK_GID
+        or boundary.st_uid != get_identities().mimir_uid
+        or boundary.st_gid != get_identities().worklink_gid
         or stat.S_IMODE(boundary.st_mode) != 0o700
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
-    if observed.st_uid != MIMIR_UID or observed.st_gid != WORKLINK_GID:
+    if observed.st_uid != get_identities().mimir_uid or observed.st_gid != get_identities().worklink_gid:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
@@ -242,7 +240,7 @@ def _execution_checkout_fd(
     )
     try:
         _normalize_checkout_fd(
-            project_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+            project_fd, owner_uid=get_identities().mimir_uid, group_gid=get_identities().worklink_gid
         )
     except Exception:
         os.close(project_fd)
@@ -306,10 +304,10 @@ def _project_home(home: Path, projections: object) -> None:
             os.close(fd)
     for root, directories, files in os.walk(home):
         for name in directories:
-            os.chown(Path(root) / name, WORKLINK_UID, WORKLINK_GID, follow_symlinks=False)
+            os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
             os.chmod(Path(root) / name, 0o700, follow_symlinks=False)
         for name in files:
-            os.chown(Path(root) / name, WORKLINK_UID, WORKLINK_GID, follow_symlinks=False)
+            os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
             os.chmod(Path(root) / name, 0o600, follow_symlinks=False)
 
 
@@ -457,7 +455,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         candidate_home.mkdir(mode=0o700)
         home = candidate_home
         _project_home(home, request["projections"])
-        os.chown(home, WORKLINK_UID, WORKLINK_GID)
+        os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
         execution_fd = _execution_checkout_fd(
@@ -557,7 +555,7 @@ def handle_connection(connection: socket.socket) -> None:
 def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
     socket_path.parent.mkdir(mode=0o710, parents=True, exist_ok=True)
     HOME_ROOT.mkdir(mode=0o710, parents=True, exist_ok=True)
-    os.chown(HOME_ROOT, 0, WORKLINK_GID)
+    os.chown(HOME_ROOT, 0, get_identities().worklink_gid)
     os.chmod(HOME_ROOT, 0o710)
     try:
         socket_path.unlink()
@@ -565,7 +563,7 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
         pass
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     listener.bind(str(socket_path))
-    os.chown(socket_path, 0, MIMIR_UID)
+    os.chown(socket_path, 0, get_identities().mimir_uid)
     os.chmod(socket_path, 0o660)
     listener.listen(16)
     while True:
@@ -578,7 +576,17 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
                 struct.calcsize("3i"),
             ),
         )
-        if uid != MIMIR_UID:
+        if uid != get_identities().mimir_uid:
+            try:
+                _send(connection, {
+                    "id": None,
+                    "error": (
+                        f"worker executor refused peer uid {uid}; "
+                        f"required mimir uid is {get_identities().mimir_uid}"
+                    ),
+                })
+            except OSError:
+                pass
             connection.close()
             continue
         threading.Thread(target=handle_connection, args=(connection,), daemon=True).start()
