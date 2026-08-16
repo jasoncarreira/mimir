@@ -98,6 +98,21 @@ def test_build_from_db_skips_dim_mismatch(conn):
     assert idx.total_vectors == 1
 
 
+def test_build_from_db_all_skipped_clears_previous_state(conn):
+    _insert_atom_with_embedding(conn, "old", "old", [1.0, 0.0, 0.0])
+    idx = VectorIndex(dimension=3)
+    idx.build_from_db(conn)
+    assert idx.total_vectors == 1
+
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = 'old'")
+    _insert_atom_with_embedding(conn, "wrong", "wrong", [1.0, 0.0])
+    idx.build_from_db(conn)
+
+    assert idx.total_vectors == 0
+    assert idx._id_to_pos == {}
+    assert idx.search([1.0, 0.0, 0.0], top_k=5) == []
+
+
 # ─── search ──────────────────────────────────────────────────────────
 
 

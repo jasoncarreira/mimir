@@ -128,6 +128,10 @@ class VectorIndex:
         if not vecs:
             with self._lock:
                 self._index = None
+                self._id_to_pos.clear()
+                self._pos_to_id.clear()
+                self._removed.clear()
+                self._next_pos = 0
                 self._built = True
             return
 

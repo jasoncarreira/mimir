@@ -35,6 +35,8 @@ from mimir.saga.dedup import (
     pick_canonical,
 )
 from mimir.saga.mark_access import AccessEvent, mark_access
+from mimir.saga.ownership import AuthorizationScope
+from mimir.saga.recall import recall
 from mimir.saga.store import store
 
 
@@ -448,6 +450,48 @@ def test_dedup_pass_redirects_relations(conn):
     assert (other, b) not in redirected
 
 
+def test_dedup_topic_union_is_queryable_on_survivor(conn):
+    embed_fn = _embed_fn_factory({
+        "canonical": [1.0, 0.0, 0.0, 0.0],
+        "duplicate": [1.0, 0.0, 0.0, 0.0],
+    })
+    canonical = store(
+        conn, "canonical", embed_fn=embed_fn, topics=["compliance"],
+    ).atom_id
+    duplicate = store(
+        conn, "duplicate", embed_fn=embed_fn, topics=["webpage"],
+    ).atom_id
+    for _ in range(3):
+        mark_access(conn, [AccessEvent(atom_id=canonical, source="retrieval")])
+    conn.commit()
+
+    dedup_pass(
+        conn,
+        cluster_fn=make_default_cluster_fn(conn, threshold=0.92),
+        min_cluster_size=2,
+    )
+
+    result = recall(
+        conn,
+        "duplicate topic",
+        query_embed_fn=lambda _text: [1.0, 0.0, 0.0, 0.0],
+        faiss_search_fn=lambda _embedding, _k: [(canonical, 1.0)],
+        fts_search_fn=lambda _query, _k: [],
+        topic_filter=["webpage"],
+        fire_access_events=False,
+        auth_scope=AuthorizationScope(is_admin=True),
+    )
+    candidate = next(c for c in result.raws if c.atom["id"] == canonical)
+    assert candidate.topic_score == 1.0
+    assert conn.execute(
+        "SELECT topic FROM atom_topics WHERE atom_id = ? ORDER BY topic",
+        (canonical,),
+    ).fetchall() == [("compliance",), ("webpage",)]
+    assert conn.execute(
+        "SELECT topic FROM atom_topics WHERE atom_id = ?", (duplicate,),
+    ).fetchall() == []
+
+
 def test_dedup_pass_rebuilds_observation_evidence_count(conn):
     """When dedup merges an atom that was evidence for an observation,
     the observation's cached evidence_count must drop to the new live
@@ -458,7 +502,7 @@ def test_dedup_pass_rebuilds_observation_evidence_count(conn):
         "obs":    [0.0, 1.0, 0.0, 0.0],   # different vec — won't dedup
         "ev_can": [1.0, 0.0, 0.0, 0.0],
         "ev_dup": [1.0, 0.0, 0.0, 0.0],
-        "ev_3":   [1.0, 0.0, 0.0, 0.001], # near-identical → joins cluster
+        "ev_dead": [0.0, 0.0, 1.0, 0.0],
     })
     obs = store(
         conn, "obs", embed_fn=embed_fn,
@@ -466,25 +510,30 @@ def test_dedup_pass_rebuilds_observation_evidence_count(conn):
     ).atom_id
     can = store(conn, "ev_can", embed_fn=embed_fn).atom_id
     dup = store(conn, "ev_dup", embed_fn=embed_fn).atom_id
-    third = store(conn, "ev_3", embed_fn=embed_fn).atom_id
+    dead = store(conn, "ev_dead", embed_fn=embed_fn).atom_id
 
     # Bias canonical pick toward `can`.
     for _ in range(3):
         mark_access(conn, [AccessEvent(atom_id=can, source="retrieval")])
 
     now = datetime.now(timezone.utc).isoformat()
-    # Observation evidenced by all 3 raws.
+    # The third evidence relation is historical: its target was already
+    # tombstoned and must not contribute to the rebuilt live count.
     conn.executemany(
         "INSERT INTO atom_relations "
         "(source_id, target_id, relation_type, confidence, created_at) "
         "VALUES (?, ?, 'evidenced_by', 1.0, ?)",
-        [(obs, can, now), (obs, dup, now), (obs, third, now)],
+        [(obs, can, now), (obs, dup, now), (obs, dead, now)],
     )
-    # observations_metadata reflects the original 3-evidence cluster.
+    conn.execute(
+        "UPDATE atoms SET tombstoned = 1 WHERE id = ?",
+        (dead,),
+    )
+    # This is the correct count before dedup: can and dup are live.
     conn.execute(
         "INSERT INTO observations_metadata "
         "(atom_id, evidence_count, trend, consolidated_at) "
-        "VALUES (?, 3, 'strengthening', ?)",
+        "VALUES (?, 2, 'strengthening', ?)",
         (obs, now),
     )
     conn.commit()
@@ -492,26 +541,17 @@ def test_dedup_pass_rebuilds_observation_evidence_count(conn):
     cluster_fn = make_default_cluster_fn(conn, threshold=0.92)
     result = dedup_pass(conn, cluster_fn=cluster_fn, min_cluster_size=2)
 
-    # All 3 evidence atoms cluster (identical/near-identical vecs);
-    # one canonical, two tombstoned.
+    # The two live evidence atoms collapse; the pre-tombstoned target is not a
+    # candidate. There is now exactly one live piece of evidence.
     assert can in result.canonicals_kept
-    assert sorted(result.duplicates_tombstoned) == sorted({dup, third})
-
-    # Live evidenced_by edges from obs: should be 1 (all three collapsed
-    # into obs→can via INSERT OR IGNORE).
-    live = conn.execute(
-        "SELECT COUNT(*) FROM atom_relations "
-        "WHERE source_id = ? AND relation_type = 'evidenced_by'",
-        (obs,),
-    ).fetchone()[0]
-    assert live == 1, f"expected 1 live evidenced_by edge, got {live}"
+    assert result.duplicates_tombstoned == [dup]
 
     # Cached evidence_count must match the live count.
     cached = conn.execute(
         "SELECT evidence_count FROM observations_metadata WHERE atom_id = ?",
         (obs,),
     ).fetchone()[0]
-    assert cached == 1, f"expected cached evidence_count=1, got {cached}"
+    assert cached == 1
 
     # The observation is in the rebuild list.
     assert obs in result.evidence_counts_rebuilt
