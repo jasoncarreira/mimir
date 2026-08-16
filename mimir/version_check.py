@@ -18,12 +18,9 @@ Design choices
 
 **Pre-release filtering.** PyPI returns the latest released version in
 ``info.version``, which by convention excludes pre-releases. We
-additionally guard against operators who explicitly publish
-``0.2.0rc1`` as a non-prerelease and against parsing edge cases by
-filtering version strings containing ``a``, ``b``, ``rc``, ``dev``,
-``alpha``, ``beta`` (case-insensitive) unless the local version is
-itself a pre-release. Operators who want pre-release surfacing pass
-``include_prereleases=True``.
+additionally classify versions with PEP 440 and filter pre/dev releases
+unless the local version is itself a pre-release. Operators who want
+pre-release surfacing pass ``include_prereleases=True``.
 
 **Failure mode is silent.** Network errors / 404 (package not yet
 published) / malformed JSON all return a ``VersionCheck`` with
@@ -38,14 +35,16 @@ imports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
+
+from packaging.version import InvalidVersion, Version
 
 log = logging.getLogger(__name__)
 
@@ -72,12 +71,6 @@ def _pypi_package_name() -> str:
 # just delay the cron when network is degraded.
 _HTTP_TIMEOUT_S = 5.0
 
-# Pre-release markers that bar a version from "latest" auto-surfacing.
-# Case-insensitive match against any of these substrings in the
-# version string.
-_PRERELEASE_MARKERS = ("dev", "alpha", "beta", "rc", "pre", "a", "b")
-
-
 @dataclass(frozen=True)
 class VersionCheck:
     """Result of a PyPI version-check call.
@@ -96,47 +89,18 @@ class VersionCheck:
     error_msg: Optional[str] = None
 
 
-def _parse_version(text: str) -> Optional[tuple[int, ...]]:
-    """Return a comparable tuple-of-ints for a dotted-int version
-    string. Returns ``None`` for any input that doesn't match the
-    common ``N[.N[.N…]]`` shape — pre-release suffixes etc. fall
-    through to the marker-based filter rather than trying to parse
-    semver completely.
-    """
-    text = text.strip()
-    if not text:
-        return None
-    # Match leading dotted-int prefix. ``0.1.0.post1`` → ``(0, 1, 0)``;
-    # ``1.0.0rc1`` → ``(1, 0, 0)``. The numeric core is what we order on;
-    # the trailing junk is handled by the pre-release marker filter.
-    m = re.match(r"(\d+(?:\.\d+)*)", text)
-    if not m:
-        return None
+def _parse_version(text: str) -> Optional[Version]:
+    """Parse a PEP 440 version, returning ``None`` for invalid input."""
     try:
-        return tuple(int(p) for p in m.group(1).split("."))
-    except ValueError:
+        return Version(text.strip())
+    except InvalidVersion:
         return None
 
 
 def _is_prerelease(version: str) -> bool:
-    """True iff the version string contains a pre-release marker.
-
-    Case-insensitive substring match — ``0.2.0rc1`` and
-    ``1.0.0.dev42`` both qualify. ``a`` and ``b`` are matched only
-    when they appear AFTER a digit (so version ``2.0`` doesn't trip,
-    but ``2.0a1`` does)."""
-    lowered = version.lower()
-    # The single-letter markers ``a`` and ``b`` need anchoring to a
-    # digit boundary; otherwise they'd match version names containing
-    # those letters (e.g., "abc-package-1.0"). We're parsing a version
-    # string here, not a package name, so leading-letter cases are
-    # unlikely — but the anchoring is cheap insurance.
-    for marker in ("dev", "alpha", "beta", "rc", "pre"):
-        if marker in lowered:
-            return True
-    if re.search(r"\d[ab]\d", lowered):
-        return True
-    return False
+    """Return whether a valid PEP 440 version is a pre/dev release."""
+    parsed = _parse_version(version)
+    return parsed is not None and parsed.is_prerelease
 
 
 def _http_get_json(url: str, timeout_s: float = _HTTP_TIMEOUT_S) -> dict:
@@ -163,8 +127,8 @@ def check_for_update(
 
     Returns a :class:`VersionCheck` with ``is_newer`` True iff:
       1. PyPI lookup succeeded
-      2. The reported latest version's numeric prefix is strictly
-         greater than the current version's
+       2. The reported latest PEP 440 version is strictly greater than
+          the current version
       3. The latest version is not a pre-release (unless
          ``include_prereleases=True``)
 
@@ -223,9 +187,9 @@ def check_for_update(
             error_msg="PyPI response missing info.version",
         )
 
-    current_tuple = _parse_version(current_version)
-    latest_tuple = _parse_version(latest)
-    if current_tuple is None or latest_tuple is None:
+    current_parsed = _parse_version(current_version)
+    latest_parsed = _parse_version(latest)
+    if current_parsed is None or latest_parsed is None:
         return VersionCheck(
             current=current_version,
             latest=latest,
@@ -250,7 +214,7 @@ def check_for_update(
             error_msg=None,
         )
 
-    is_newer = latest_tuple > current_tuple
+    is_newer = latest_parsed > current_parsed
     return VersionCheck(
         current=current_version,
         latest=latest,
@@ -277,7 +241,7 @@ async def run_scheduled_update_check(home) -> None:  # type: ignore[no-untyped-d
     from .event_logger import log_event
 
     try:
-        result = check_for_update()
+        result = await asyncio.to_thread(check_for_update)
     except Exception as exc:  # noqa: BLE001 — defensive scheduler boundary
         log.exception("update-check raised unexpectedly")
         await log_event(
