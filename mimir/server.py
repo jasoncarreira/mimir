@@ -80,6 +80,8 @@ async def _start_mcp_servers(
             log.warning("MCP shutdown after startup failure failed: %s", shutdown_exc)
             return mcp_manager, []
         return None, []
+    for failure in getattr(mcp_manager, "startup_failures", []):
+        await log_event("mcp_server_start_failed", **failure)
     if mcp_tools:
         await log_event(
             "mcp_servers_ready",
@@ -439,6 +441,8 @@ async def _handle_event(request: web.Request) -> web.Response:
     channel_id = body.get("channel_id")
     if not channel_id:
         return web.json_response({"error": "channel_id required"}, status=400)
+    if not isinstance(channel_id, str):
+        return web.json_response({"error": "channel_id must be a string"}, status=400)
 
     # #487: type-check structured fields, don't coerce. A truthy non-dict
     # ``extra`` (or non-list ``attachment_names``) survives ``or {}``/``or []``
