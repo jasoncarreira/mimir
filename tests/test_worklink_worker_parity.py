@@ -519,7 +519,12 @@ async def test_closed_worker_direct_parity_inventory(
         worker_exec._jobs.pop(handle.identifier, None)
         assert authorization.verifications == 1
         assert sent == [
-            {"version": 1, "op": "cancel", "id": handle.identifier}
+            {
+                "version": 1,
+                "op": "cancel",
+                "id": handle.identifier,
+                "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+            }
         ]
         assert socket_events == [
             "socket",

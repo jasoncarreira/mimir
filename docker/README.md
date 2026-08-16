@@ -9,6 +9,12 @@ in-process workspace dep (v0.5 §2), so there's no sidecar to supervise.
 docker build -t mimir:latest .
 ```
 
+The root-owned Worklink executor is installed into the image under
+`/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
+After any change to `mimir/worklink/worker_exec.py` or its protocol, rebuild the
+image and recreate/restart the container. The `/health` endpoint reports a stale
+executor identity until the rebuilt image and root executor are running.
+
 The build pre-warms the fastembed model cache (~80MB,
 `BAAI/bge-small-en-v1.5`) so the first inbound doesn't pay the
 download. If the build host is offline, the pre-warm is a no-op and

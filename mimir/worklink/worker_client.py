@@ -16,6 +16,13 @@ DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_PROJECTION_BYTES = 1024 * 1024
+# Keep this literal independent from worker_exec. The executor runs its image-owned
+# copy, so changing either side of the launch contract requires an image rebuild.
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v2-repo-copy-timeout"
+STALE_EXECUTOR_DIAGNOSTIC = (
+    "stale root executor image: controller and mimir.worklink.worker_exec protocol "
+    "identities do not match; rebuild the image and restart the container"
+)
 _PROJECTION_PATHS = frozenset({
     ".config/opencode/opencode.json",
     ".local/share/opencode/auth.json",
@@ -32,6 +39,10 @@ class CheckoutCapability(Protocol):
     def verify(self, local_checkout: Path | None) -> None: ...
 
     def duplicate_fd(self) -> int: ...
+
+
+class StaleWorkerExecutorError(RuntimeError):
+    """The root-owned executor image does not implement this controller contract."""
 
 
 @dataclass(frozen=True)
@@ -144,6 +155,7 @@ class WorkerClient:
         request = {
             "version": 1,
             "op": "launch",
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
             "issue": self.checkout.issue_id,
             "attempt": self.checkout.attempt,
@@ -171,7 +183,10 @@ class WorkerClient:
             if response.get("id") != identifier:
                 raise RuntimeError("worker executor response identity mismatch")
             if "error" in response:
-                raise RuntimeError(str(response["error"]))
+                error = str(response["error"])
+                if "exact contract" in error or "stale root executor image" in error:
+                    raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+                raise RuntimeError(error)
             if response.get("status") != "started":
                 raise RuntimeError("worker executor returned an invalid launch response")
             stdout = asyncio.StreamReader()
@@ -199,7 +214,12 @@ class WorkerClient:
     async def cancel(self, identifier: str) -> None:
         _validate_identifier(identifier)
         payload = json.dumps(
-            {"version": 1, "op": "cancel", "id": identifier},
+            {
+                "version": 1,
+                "op": "cancel",
+                "id": identifier,
+                "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            },
             separators=(",", ":"),
         ).encode()
         sock = await asyncio.to_thread(self._connect)
@@ -209,11 +229,41 @@ class WorkerClient:
             if response.get("id") != identifier:
                 raise RuntimeError("worker executor response identity mismatch")
             if "error" in response:
-                raise RuntimeError(str(response["error"]))
+                error = str(response["error"])
+                if "invalid cancel request" in error or "stale root executor image" in error:
+                    raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+                raise RuntimeError(error)
             if response.get("status") != "cancelled":
                 raise RuntimeError("worker executor returned an invalid cancel response")
         finally:
             sock.close()
+
+
+async def verify_executor_identity(
+    socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+) -> None:
+    """Verify the image-owned executor before a launch contract is needed."""
+    client = object.__new__(WorkerClient)
+    client.socket_path = socket_path
+    sock = await asyncio.to_thread(client._connect)
+    try:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "op": "identity",
+                "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            },
+            separators=(",", ":"),
+        ).encode()
+        sock.send(payload)
+        response = json.loads(await asyncio.to_thread(sock.recv, 4096))
+        if (
+            response.get("status") != "identity"
+            or response.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY
+        ):
+            raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+    finally:
+        sock.close()
 
 
 def _validate_identifier(identifier: str) -> None:

@@ -771,6 +771,13 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 
 
 async def _handle_health(request: web.Request) -> web.Response:
+    from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
+
+    if request.app.get("check_worker_executor_health") and DEFAULT_EXECUTOR_SOCKET.exists():
+        try:
+            await verify_executor_identity()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=503)
     return web.json_response({"ok": True})
 
 
@@ -1164,6 +1171,7 @@ def build_app(config: Config) -> web.Application:
     app["runtime_adapters"] = runtime_adapters
     app["startup_background_tasks"] = startup_background_tasks
     app["startup_state"] = startup_state
+    app["check_worker_executor_health"] = True
     for field in _RUNTIME_APP_FIELDS:
         app[field] = None
     # chainlink #233: single-flight guard for POST /api/memory/consolidate.

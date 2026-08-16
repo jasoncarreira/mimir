@@ -18,10 +18,13 @@ import pytest
 
 from mimir.worklink.checkout import CheckoutAuthorization, _mint_checkout_authorization
 from mimir.worklink.worker_client import (
+    EXECUTOR_PROTOCOL_IDENTITY,
     MAX_PROJECTION_BYTES,
+    StaleWorkerExecutorError,
     WorkerClient,
     WorkerProcess,
     WorkerProjection,
+    verify_executor_identity,
 )
 import mimir.worklink.worker_exec as worker_exec
 
@@ -102,6 +105,87 @@ async def test_client_authenticates_root_before_sending_fds(tmp_path: Path, monk
                 timeout_s=1,
             )
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> None:
+    sent: list[dict[str, object]] = []
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def send(self, payload: bytes) -> None:
+            sent.append(json.loads(payload))
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "status": "identity",
+                "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+
+    await verify_executor_identity(Path("/executor.sock"))
+
+    assert sent == [{
+        "version": 1,
+        "op": "identity",
+        "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_client_names_stale_old_launch_contract_with_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _issued(tmp_path)
+    requests: list[dict[str, object]] = []
+
+    class Peer:
+        def connect(self, _path: str) -> None:
+            pass
+
+        def getsockopt(self, *args: object) -> bytes:
+            return struct.pack("3i", 123, 0, 0)
+
+        def sendmsg(self, buffers: list[bytes], _ancillary: object) -> None:
+            requests.append(json.loads(buffers[0]))
+
+        def recv(self, _size: int) -> bytes:
+            return json.dumps({
+                "id": requests[0]["id"],
+                "error": "launch request must carry the exact contract and three FDs",
+            }).encode()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", getattr(socket, "SO_PEERCRED", 17), raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: Peer())
+    with _authorization(path) as checkout:
+        with pytest.raises(StaleWorkerExecutorError, match="rebuild the image and restart"):
+            await WorkerClient(checkout).launch(
+                local_checkout=path,
+                argv=["true"],
+                env={},
+                identifier=str(uuid.uuid4()),
+                timeout_s=30,
+            )
+
+    old_launch_fields = {
+        "version", "op", "id", "issue", "attempt", "device", "inode",
+        "argv", "env", "projections",
+    }
+    assert set(requests[0]) == old_launch_fields | {"timeout_s", "executor_identity"}
+    assert requests[0]["timeout_s"] == 30
 
 
 @pytest.mark.asyncio
@@ -478,6 +562,7 @@ def test_duplicate_worker_id_is_refused_before_popen_without_touching_live_job(
     request = {
         "version": 1,
         "op": "launch",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "id": identifier,
         "issue": 41,
         "attempt": 2,
@@ -551,6 +636,7 @@ def test_terminal_waits_for_in_group_writers_before_cleanup(tmp_path: Path, monk
     request = {
         "version": 1,
         "op": "launch",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "id": identifier,
         "issue": 41,
         "attempt": 2,
@@ -632,6 +718,7 @@ def test_executor_enforces_worker_deadline(tmp_path: Path, monkeypatch) -> None:
     request = {
         "version": 1,
         "op": "launch",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "id": identifier,
         "issue": 41,
         "attempt": 2,

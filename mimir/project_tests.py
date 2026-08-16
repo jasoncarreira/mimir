@@ -31,6 +31,7 @@ from .repo_tools import GitRefusal, RepoGitTools
 from .repository_config import RepositoryInventory
 from .worklink.backends.registry import WorklinkConfig
 from .worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
+from .worklink.worker_client import StaleWorkerExecutorError
 
 
 _TIMEOUT_SECONDS = 300.0
@@ -395,6 +396,17 @@ class RepoProjectTests:
                     stderr_limit=self._output_limit,
                     scrubber=scrubber,
                 )
+            except StaleWorkerExecutorError as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="stale_root_executor",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_stale_root_executor",
+                    str(exc),
+                ) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 diagnostic = _permission_diagnostic_from_error(exc)
                 if diagnostic is not None:
