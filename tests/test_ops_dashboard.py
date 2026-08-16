@@ -502,10 +502,14 @@ def test_legacy_dashboards_resolve_shared_auth_helpers() -> None:
                 continue
             alias = re.search(
                 rf"\b(?:const|let|var)\s+{helper}\s*=\s*"
-                rf"window\.MimirAuth\.{helper}\s*;",
+                rf"window\.MimirAuth\.(\w+)\s*;",
                 html,
             )
             assert alias, f"{page.name} calls unscoped MimirAuth helper {helper}"
+            assert alias.group(1) in exported, (
+                f"{page.name} aliases {helper} to unknown MimirAuth member "
+                f"{alias.group(1)}"
+            )
 
 
 def test_first_visit_prompts_before_turns_and_ops_load() -> None:
