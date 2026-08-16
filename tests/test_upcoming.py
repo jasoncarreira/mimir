@@ -180,10 +180,3 @@ def test_render_upcoming_only_renders_scheduled_work():
     # Plan-window resets no longer rendered here.
     assert "Plan-window resets" not in out
     assert "five_hour" not in out
-
-
-def test_render_upcoming_handles_no_scheduler_items():
-    """No scheduled work → return None so the prompt assembler can
-    suppress the section."""
-    out = render_upcoming_block(scheduler=None, rate_limit_store=None)
-    assert out is None

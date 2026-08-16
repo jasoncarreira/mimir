@@ -8,7 +8,6 @@ isn't appropriate for unit tests.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sqlite3
 import time
@@ -25,22 +24,6 @@ from mimir.search import (
     _to_fts_query,
 )
 from mimir.index_skip import INDEX_SKIP_PATHS, INDEX_SKIP_PREFIXES, is_index_skipped
-
-# ``mimir.hooks`` and ``mimir.searchtools`` were retired in the
-# deepagents migration (post-PR #185 merge target). Tests that use
-# them are skipped when the modules aren't importable; the remaining
-# tests (including the PR #185 _to_fts_query regression coverage)
-# still exercise mimir.search directly.
-try:
-    from mimir.hooks import make_post_tool_use_hook  # type: ignore[import-not-found]
-except ImportError:
-    make_post_tool_use_hook = None  # type: ignore[assignment]
-
-try:
-    from mimir.searchtools import build_search_tools  # type: ignore[import-not-found]
-except ImportError:
-    build_search_tools = None  # type: ignore[assignment]
-
 
 def _seed(home: Path) -> None:
     (home / "memory" / "core").mkdir(parents=True)
@@ -548,104 +531,6 @@ def test_query_embedding_cache_returns_immutable_tuple(tmp_path: Path):
     assert isinstance(vec, tuple)
     with pytest.raises(TypeError):
         vec[0] = 0.0  # type: ignore[index]
-
-
-# ---- file_search tool wrapper --------------------------------------------
-
-
-@pytest.mark.skipif(
-    build_search_tools is None,
-    reason="mimir.searchtools retired in deepagents migration; tool surface "
-    "is now mimir.tools.* (covered by separate tests).",
-)
-@pytest.mark.asyncio
-async def test_file_search_tool_returns_json(tmp_path: Path):
-    _seed(tmp_path)
-    idx = _make_indexer(tmp_path)
-    await idx.start(run_initial_sweep=True, sweep_loop=False)
-
-    tools = {t.name: t for t in build_search_tools(idx)}
-    out = await tools["file_search"].handler({"query": "boids", "scope": "memory", "k": 3})
-    assert out.get("is_error") is not True
-    text = out["content"][0]["text"]
-    payload = json.loads(text)
-    assert isinstance(payload, list)
-    assert any("boids.md" in r["path"] for r in payload)
-
-
-@pytest.mark.skipif(
-    build_search_tools is None,
-    reason="mimir.searchtools retired in deepagents migration",
-)
-@pytest.mark.asyncio
-async def test_file_search_tool_invalid_scope(tmp_path: Path):
-    idx = _make_indexer(tmp_path)
-    await idx.start(run_initial_sweep=False, sweep_loop=False)
-    tools = {t.name: t for t in build_search_tools(idx)}
-    out = await tools["file_search"].handler({"query": "x", "scope": "weird"})
-    assert out.get("is_error") is True
-
-
-@pytest.mark.skipif(
-    build_search_tools is None,
-    reason="mimir.searchtools retired in deepagents migration",
-)
-@pytest.mark.asyncio
-async def test_rebuild_index_tool_reports_counts(tmp_path: Path):
-    _seed(tmp_path)
-    idx = _make_indexer(tmp_path)
-    await idx.start(run_initial_sweep=False, sweep_loop=False)
-
-    tools = {t.name: t for t in build_search_tools(idx)}
-    out = await tools["rebuild_index"].handler({"scope": "all"})
-    assert out.get("is_error") is not True
-    text = out["content"][0]["text"]
-    # First-time sweep should add the seeded files.
-    assert "added=" in text
-
-
-# ---- PostToolUse hook → indexer reindex ---------------------------------
-
-
-@pytest.mark.skipif(
-    make_post_tool_use_hook is None,
-    reason="mimir.hooks retired in deepagents migration; reindex-on-write is "
-    "wired via WikiBacklinksHook + post-turn hooks in mimir/agent.py "
-    "(covered by separate tests).",
-)
-@pytest.mark.asyncio
-async def test_post_tool_use_hook_reindexes_after_write(tmp_path: Path):
-    """SDK preset Write fires PostToolUse; the hook calls indexer.reindex_path."""
-    _seed(tmp_path)
-    idx = _make_indexer(tmp_path)
-    await idx.start(run_initial_sweep=True, sweep_loop=False)
-
-    async def reindex(rel: str) -> None:
-        await idx.reindex_path(rel)
-
-    hook = make_post_tool_use_hook(tmp_path, reindex)
-
-    # Simulate the SDK invoking Write successfully then firing PostToolUse.
-    target = tmp_path / "memory" / "topics" / "relativity.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        "<!-- desc: special and general -->\nE=mc^2 and curved spacetime."
-    )
-
-    await hook(
-        {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": str(target)},
-            "tool_response": {"is_error": False},
-            "tool_use_id": "tu-1",
-        },
-        "tu-1",
-        {"signal": None},
-    )
-
-    results = await idx.search("relativity", scope="memory", k=5)
-    assert any("relativity.md" in r.path for r in results)
 
 
 # ---- SagaProviderEmbedder routing (PR feat/mimir-file-search-via-saga-provider) ----

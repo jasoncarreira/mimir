@@ -214,10 +214,6 @@ def test_unknown_question_type_not_counted_as_known_category():
     assert "6 of 6" in output
 
 
-def test_category_constant_has_six_entries():
-    assert len(_LONGMEMEVAL_CATEGORIES) == 6
-
-
 def test_category_constant_matches_known_benchmark_types():
     expected = {
         "single-session-user",

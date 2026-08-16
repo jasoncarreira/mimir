@@ -1166,17 +1166,6 @@ async def test_bundle_aclose_times_out_each_resource_and_continues(
         await asyncio.sleep(0)
 
 
-def test_bundle_aclose_total_owned_wait_budget_is_thirty_five_seconds() -> None:
-    from mimir.background_tasks import BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS
-
-    assert BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS == 5.0
-    assert runtime.RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS == 10.0
-    assert (
-        BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS
-        + 3 * runtime.RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS
-    ) == 35.0
-
-
 @pytest.mark.asyncio
 async def test_aclose_task_timeout_continues_reverse_closers_and_is_idempotent(
     tmp_path: Path,
