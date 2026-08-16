@@ -13,6 +13,8 @@ Covers:
 from __future__ import annotations
 
 import json
+import stat
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import pytest
@@ -192,6 +194,8 @@ def test_collect_required_env_vars_includes_baseline(home_with_two_skills: Path)
     assert "MIMIR_API_KEY" in keys
     assert "VOYAGE_API_KEY" in keys
     assert "GITHUB_TOKEN" in keys
+    assert "MIMIR_ENABLE_CLAUDE_CODE" not in keys
+    assert "MIMIR_ENABLE_OPENCODE" not in keys
 
 
 def test_collect_required_env_vars_appends_poller_pass_env(
@@ -282,6 +286,36 @@ def test_render_compose_env_idempotent_on_re_run():
 # ── render_dockerfile ──────────────────────────────────────────────
 
 
+_DOCKERFILE_INSTRUCTIONS = {
+    "ARG",
+    "COPY",
+    "ENTRYPOINT",
+    "ENV",
+    "EXPOSE",
+    "FROM",
+    "RUN",
+    "USER",
+    "WORKDIR",
+}
+
+
+def _assert_structurally_parseable_dockerfile(text: str) -> None:
+    """Reject physical lines that Docker would interpret as unknown instructions."""
+    continued = False
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not continued:
+            instruction = stripped.split(None, 1)[0].upper()
+            assert instruction in _DOCKERFILE_INSTRUCTIONS, (
+                f"line {line_number} starts unknown Docker instruction "
+                f"{instruction!r}: {line!r}"
+            )
+        continued = line.rstrip().endswith("\\")
+    assert not continued, "Dockerfile ends inside a continued instruction"
+
+
 def test_render_dockerfile_inserts_fragments():
     frags = [
         Fragment(skill_name="a", content="RUN echo a"),
@@ -353,6 +387,14 @@ def test_scaffold_codex_plus_extra_does_not_install_codex_cli(tmp_path: Path):
     assert "npm install -g @openai/codex" not in (home / "Dockerfile").read_text()
 
 
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+@pytest.mark.parametrize("install_opencode", [False, True])
+def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
+    _assert_structurally_parseable_dockerfile(
+        render_dockerfile([], mode=mode, install_opencode=install_opencode)
+    )
+
+
 def test_render_dockerfile_installs_opencode_when_enabled():
     """install_opencode=True adds the OpenCode runtime install to both modes."""
     for mode in ("workspace", "pypi"):
@@ -363,7 +405,11 @@ def test_render_dockerfile_installs_opencode_when_enabled():
         assert "npm install -g opencode-openai-codex-auth@4.4.0" in out, mode
         assert "npm install -g opencode-anthropic-auth@0.0.13" in out, mode
         assert "/home/mimir/.config/opencode/opencode.json" in out, mode
-        assert '"memoryDir": ".opencode/memory"' in out, mode
+        assert "COPY --chown=mimir:mimir .config/opencode/opencode.json" in out, mode
+        assert "printf '%s'" not in out, mode
+        assert out.index("useradd --uid") < out.index(
+            "chown -R mimir:mimir /home/mimir/.config"
+        ), mode
 
 
 def test_render_dockerfile_omits_opencode_by_default():
@@ -506,9 +552,13 @@ def test_scaffold_writes_all_four_files(home_with_two_skills: Path):
     assert "start.sh" in result.files_written
 
 
+def test_scaffold_creates_compose_env_private(home_with_two_skills: Path):
+    scaffold(home_with_two_skills)
+    assert stat.S_IMODE((home_with_two_skills / "compose.env").stat().st_mode) == 0o600
+
+
 def test_scaffold_start_sh_is_executable(home_with_two_skills: Path):
     scaffold(home_with_two_skills)
-    import stat
     mode = (home_with_two_skills / "start.sh").stat().st_mode
     assert mode & stat.S_IXUSR, "start.sh must be executable"
 
@@ -714,10 +764,74 @@ def test_resolve_home_cwd_fallback(tmp_path: Path, monkeypatch):
 # ── cmd() CLI handler ────────────────────────────────────────────────
 
 
+def test_cli_exposes_opencode_opt_in(tmp_path: Path, capsys):
+    from mimir.scaffold_docker import add_argparse, cmd
+
+    parser = ArgumentParser()
+    add_argparse(parser)
+    assert parser.parse_args(["--opencode"]).opencode is True
+    assert parser.parse_args(["--no-opencode"]).opencode is False
+    assert "--opencode" in parser.format_help()
+    args = parser.parse_args(
+        ["--home", str(tmp_path), "--mode", "pypi", "--opencode"]
+    )
+    assert cmd(args) == 0
+    assert "npm install -g opencode-ai@1.18.9" in (tmp_path / "Dockerfile").read_text()
+
+
+def test_cmd_flagless_rerun_preserves_deployment_shape(tmp_path: Path, capsys):
+    from mimir.scaffold_docker import add_argparse, cmd
+
+    home = tmp_path / "renamed-home"
+    home.mkdir()
+    scaffold(
+        home,
+        mode="pypi",
+        web_port=9000,
+        service_name="stable-service",
+        install_opencode=True,
+    )
+    parser = ArgumentParser()
+    add_argparse(parser)
+    args = parser.parse_args(["--home", str(home)])
+
+    assert cmd(args) == 0
+    dockerfile = (home / "Dockerfile").read_text()
+    compose = (home / "compose.yml").read_text()
+    assert "Generated by `mimir scaffold-docker --mode pypi`" in dockerfile
+    assert "npm install -g opencode-ai@1.18.9" in dockerfile
+    assert "container_name: stable-service" in compose
+    assert '"127.0.0.1:9000:8080"' in compose
+
+
+def test_explicit_rerun_flags_override_recovered_shape(tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+    scaffold(
+        home,
+        mode="pypi",
+        web_port=9000,
+        service_name="old",
+        install_opencode=True,
+    )
+    scaffold(
+        home,
+        mode="workspace",
+        web_port=9001,
+        service_name="new",
+        install_opencode=False,
+    )
+    dockerfile = (home / "Dockerfile").read_text()
+    compose = (home / "compose.yml").read_text()
+    assert "Generated by `mimir scaffold-docker --mode pypi`" not in dockerfile
+    assert "npm install -g opencode-ai" not in dockerfile
+    assert "container_name: new" in compose
+    assert '"127.0.0.1:9001:8080"' in compose
+
+
 def test_cmd_rejects_invalid_web_port(home_with_two_skills: Path, capsys):
     """--web-port 99999 must error cleanly, not silently emit a broken
     compose.yml."""
-    from argparse import Namespace
     from mimir.scaffold_docker import cmd
     args = Namespace(
         home=home_with_two_skills, service_name=None,
@@ -729,7 +843,6 @@ def test_cmd_rejects_invalid_web_port(home_with_two_skills: Path, capsys):
 
 
 def test_cmd_returns_2_for_missing_home(tmp_path: Path, capsys):
-    from argparse import Namespace
     from mimir.scaffold_docker import cmd
     args = Namespace(
         home=tmp_path / "does-not-exist", service_name=None,
@@ -742,7 +855,6 @@ def test_cmd_returns_2_for_missing_home(tmp_path: Path, capsys):
 
 def test_cmd_passes_extras_through(home_with_two_skills: Path, capsys):
     """--uv-extras csv parses correctly and lands in start.sh."""
-    from argparse import Namespace
     from mimir.scaffold_docker import cmd
     args = Namespace(
         home=home_with_two_skills, service_name=None,
@@ -1058,8 +1170,13 @@ def test_render_compose_yml_exposes_claude_code_build_switch():
 
     for mode in ("workspace", "pypi"):
         out = render_compose_yml(service_name="x", web_port=8080, mode=mode)
-        assert "MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}" in out
-        assert "MIMIR_ENABLE_OPENCODE: ${MIMIR_ENABLE_OPENCODE:-0}" in out
+        assert (
+            out.count("MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}")
+            == 2
+        )
+        assert out.count("MIMIR_ENABLE_OPENCODE: ${MIMIR_ENABLE_OPENCODE:-0}") == 2
+        assert "Set them in .env or the shell" in out
+        assert "Compose interpolation does not read env_file" in out
 
 
 def test_render_dockerfile_pypi_mode_preserves_skill_fragments():
