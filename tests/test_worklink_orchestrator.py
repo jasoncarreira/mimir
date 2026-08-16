@@ -1867,6 +1867,122 @@ def _init_commit_repo(path: Path) -> None:
     )
 
 
+def _commit_seed(repo: Path, files: dict[str, bytes]) -> None:
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "seed"], check=True)
+
+
+def _stage_file(repo: Path, name: str, content: bytes) -> None:
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    subprocess.run(["git", "-C", str(repo), "add", "--", name], check=True)
+
+
+def test_staged_secret_guard_allows_match_already_in_base(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    secret = b"ghp_" + b"A" * 36
+    _commit_seed(repo, {"fixture.txt": b"credential=" + secret + b"\nold\n"})
+    _stage_file(repo, "fixture.txt", b"credential=" + secret + b"\nnew\n")
+
+    _assert_staged_diff_has_no_secret(repo, runner=_real_git_runner)
+
+
+def test_staged_secret_guard_allows_reusing_base_match(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    secret = b"ghp_" + b"A" * 36
+    _commit_seed(repo, {"fixture.txt": secret + b"\n"})
+    _stage_file(repo, "fixture.txt", secret + b"\ncopy=" + secret + b"\n")
+
+    _assert_staged_diff_has_no_secret(repo, runner=_real_git_runner)
+
+
+def test_staged_secret_guard_refuses_new_match_without_echoing_it(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    existing = b"ghp_" + b"A" * 36
+    introduced = b"ghp_" + b"B" * 36
+    _commit_seed(repo, {"fixture.txt": existing + b"\n"})
+    _stage_file(repo, "fixture.txt", existing + b"\ncredential=" + introduced + b"\n")
+
+    with pytest.raises(WorklinkError, match="fixture.txt.*secret-shaped") as raised:
+        _assert_staged_diff_has_no_secret(repo, runner=_real_git_runner)
+
+    assert introduced.decode() not in str(raised.value)
+    assert "credential=" not in str(raised.value)
+
+
+def test_staged_secret_guard_refuses_secret_in_added_file(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    _commit_seed(repo, {"tracked.txt": b"clean\n"})
+    secret = b"ghp_" + b"A" * 36
+    _stage_file(repo, "added.txt", secret + b"\n")
+
+    with pytest.raises(WorklinkError, match="added.txt.*secret-shaped"):
+        _assert_staged_diff_has_no_secret(repo, runner=_real_git_runner)
+
+
+def test_staged_secret_guard_scans_binary_blob_marked_no_diff(tmp_path: Path) -> None:
+    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+
+    repo = tmp_path / "repo"
+    _init_commit_repo(repo)
+    secret = b"ghp_" + b"A" * 36
+    _commit_seed(
+        repo,
+        {
+            ".gitattributes": b"fixture.bin -diff\n",
+            "fixture.bin": b"\x00\xff" + secret + b"\nold\n",
+        },
+    )
+    _stage_file(repo, "fixture.bin", b"\x00\xff" + secret + b"\nnew\n")
+
+    _assert_staged_diff_has_no_secret(repo, runner=_real_git_runner)
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "non-byte"])
+def test_staged_secret_guard_fails_closed_for_base_blob(failure: str) -> None:
+    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+
+    secret = b"ghp_" + b"A" * 36
+
+    def runner(
+        args: Sequence[str], *, text: bool = True
+    ) -> subprocess.CompletedProcess:
+        tail = list(args)[3:]
+        if tail[:2] == ["diff", "--cached"]:
+            return cp(args, stdout=b"fixture.txt\0")
+        if tail == ["cat-file", "blob", ":fixture.txt"]:
+            return cp(args, stdout=secret)
+        if tail == ["cat-file", "blob", "HEAD:fixture.txt"]:
+            if failure == "non-byte":
+                return cp(args, stdout=secret.decode())
+            return cp(args, returncode=128, stdout=b"")
+        if tail == ["rev-parse", "--verify", "HEAD"]:
+            return cp(args, stdout=b"a" * 40 + b"\n")
+        if tail == ["ls-tree", "-z", "HEAD", "--", "fixture.txt"]:
+            return cp(args, stdout=b"100644 blob abc\tfixture.txt\0")
+        raise AssertionError(args)
+
+    with pytest.raises(WorklinkError, match="base Worklink path 'fixture.txt'"):
+        _assert_staged_diff_has_no_secret(Path("/tmp/wt"), runner=runner)
+
+
 @pytest.mark.parametrize("case", ["plain", "nul", "attributes"])
 def test_commit_checkout_changes_refuses_secret_in_staged_blob(
     tmp_path: Path, case: str
