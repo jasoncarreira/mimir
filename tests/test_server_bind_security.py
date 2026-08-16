@@ -13,10 +13,16 @@ from mimir.server import _LOOPBACK_HOSTS, _validate_bind_security
 
 @pytest.mark.parametrize("host", sorted(_LOOPBACK_HOSTS))
 def test_loopback_without_key_is_allowed(host: str) -> None:
-    """``127.0.0.1`` / ``::1`` / ``localhost`` are loopback — safe with
-    no auth because only the operator can reach them."""
+    """Loopback limits network exposure but does not authenticate local clients."""
     # Does not raise.
     _validate_bind_security(host, api_key="")
+
+
+def test_loopback_docstring_qualifies_keyless_exposure() -> None:
+    doc = _validate_bind_security.__doc__ or ""
+    assert "safe local-dev posture" not in doc
+    assert "does not authenticate local processes" in doc
+    assert "browser cross-site writes" in doc
 
 
 @pytest.mark.parametrize("host", sorted(_LOOPBACK_HOSTS))
