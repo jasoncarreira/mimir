@@ -751,6 +751,16 @@ def _filter_records_by_channel(
     return [r for r in records if _record_matches_channel(r, channel)]
 
 
+_TURNS_MAX_PAGE_RECORDS = 500
+_TURNS_MAX_SCAN_RECORDS = 5000
+
+
+class _TurnCursorNotFound(Exception):
+    def __init__(self, cursor: str) -> None:
+        super().__init__(cursor)
+        self.cursor = cursor
+
+
 def _turns_tail_page(
     path: Path,
     *,
@@ -759,9 +769,10 @@ def _turns_tail_page(
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
+    limit = min(limit, _TURNS_MAX_PAGE_RECORDS)
     out: list[dict[str, Any]] = []
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             out.append(record)
@@ -778,21 +789,21 @@ def _turns_after_page(
     *,
     after: str,
     channel: str | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     if not after:
-        return []
+        return [], False
     newest_first: list[dict[str, Any]] = []
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             if record.get("turn_id") == after:
                 newest_first.reverse()
-                return newest_first
+                return newest_first, True
             newest_first.append(record)
     except OSError:
-        return []
-    return []
+        return [], False
+    return [], False
 
 
 def _turns_before_page(
@@ -801,14 +812,17 @@ def _turns_before_page(
     before: str,
     limit: int,
     channel: str | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, bool]:
     if not before or limit <= 0:
-        return [], False
+        return [], False, False
+    limit = min(limit, _TURNS_MAX_PAGE_RECORDS)
     out: list[dict[str, Any]] = []
     found = False
     has_more = False
+    scanned = 0
     try:
-        for record in tail_jsonl_records(path):
+        for record in tail_jsonl_records(path, max_records=_TURNS_MAX_SCAN_RECORDS):
+            scanned += 1
             if not isinstance(record, dict) or not _record_matches_channel(record, channel):
                 continue
             if not found:
@@ -820,11 +834,11 @@ def _turns_before_page(
                 has_more = True
                 break
     except OSError:
-        return [], False
+        return [], False, False
     if not found:
-        return [], False
+        return [], False, False
     out.reverse()
-    return out, has_more
+    return out, has_more or scanned >= _TURNS_MAX_SCAN_RECORDS, True
 
 
 def _event_record_matches_channel(record: dict[str, Any], channel: str) -> bool:
@@ -930,16 +944,21 @@ def register_routes(
             limit = int(request.query.get("limit") or 0)
         except ValueError:
             limit = 0
+        limit = max(0, min(limit, _TURNS_MAX_PAGE_RECORDS))
 
         if after:
-            window = _turns_after_page(turns_log, after=after, channel=channel)
+            window, found = _turns_after_page(turns_log, after=after, channel=channel)
+            if not found:
+                raise _TurnCursorNotFound(after)
             cursor = str(window[-1].get("turn_id")) if window and window[-1].get("turn_id") else None
             return window, list_meta(cursor=cursor, limit=limit or None, total=None, truncated=False)
 
         if before:
-            window, has_more = _turns_before_page(
+            window, has_more, found = _turns_before_page(
                 turns_log, before=before, limit=limit, channel=channel
             )
+            if not found:
+                raise _TurnCursorNotFound(before)
             cursor = str(window[0].get("turn_id")) if window and window[0].get("turn_id") else None
             return window, list_meta(
                 cursor=cursor,
@@ -967,18 +986,40 @@ def register_routes(
         return records, list_meta(cursor=cursor, limit=None, total=total, truncated=False)
 
     async def turns_data(request: web.Request) -> web.Response:
-        records, _meta = await asyncio.to_thread(
-            _turns_response,
-            request,
-            channel=_request_user_web_channel(request),
-        )
+        try:
+            records, _meta = await asyncio.to_thread(
+                _turns_response,
+                request,
+                channel=_request_user_web_channel(request),
+            )
+        except _TurnCursorNotFound as exc:
+            return web.json_response(
+                {
+                    "turns": [],
+                    "error": {
+                        "code": "cursor_not_found",
+                        "message": "turn cursor was not found within the scan window",
+                        "cursor": exc.cursor,
+                        "scan_limit": _TURNS_MAX_SCAN_RECORDS,
+                    },
+                },
+                status=409,
+            )
         return web.json_response({"turns": records})
 
     async def turns_data_v1(request: web.Request) -> web.Response:
         channel, error = _scoped_channel_from_query(request)
         if error is not None:
             return error
-        turns, meta = await asyncio.to_thread(_turns_response, request, channel=channel)
+        try:
+            turns, meta = await asyncio.to_thread(_turns_response, request, channel=channel)
+        except _TurnCursorNotFound as exc:
+            return json_error(
+                "cursor_not_found",
+                "turn cursor was not found within the scan window",
+                status=409,
+                details={"cursor": exc.cursor, "scan_limit": _TURNS_MAX_SCAN_RECORDS},
+            )
         return json_success({"turns": turns}, meta=meta)
 
     async def sessions_data_v1(request: web.Request) -> web.Response:

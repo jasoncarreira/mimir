@@ -90,10 +90,8 @@ class ClaimRecord:
     budget_attempt: int | None = None
     # How many honoured ``WORKLINK_CLAIM_RESET`` markers precede this record.
     # Derived from position in the comment history rather than carried on the
-    # wire, so ``to_comment`` stays byte-identical. A reset restarts attempt
-    # numbering, which means ``attempt`` alone no longer orders the history:
-    # without this, a fresh attempt 1 is outranked by a dead attempt 3 from
-    # before the reset, and the reaper judges a live claim by that dead record.
+    # wire, so ``to_comment`` stays byte-identical. Generation still orders
+    # legacy histories whose reset restarted attempt numbering.
     generation: int = 0
 
     def is_stale(self, now: datetime, ttl: timedelta) -> bool:
@@ -253,9 +251,9 @@ def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
 def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
     """True when ``candidate`` supersedes ``current`` for the same issue.
 
-    Generation is compared first because a reset restarts attempt numbering, so
-    attempt numbers are only monotonic within a generation. Comparing attempt
-    first made every post-reset build lose to the stale pre-reset record with
+    Generation is compared first for persisted histories from before attempt
+    ordinals became monotonic across resets. Comparing attempt first made every
+    post-reset build in those histories lose to the stale pre-reset record with
     the higher attempt number, and the reaper then judged staleness from that
     dead record's anchor and released a claim that was still heartbeating.
     Within one generation: a higher attempt, then a later claim/heartbeat
@@ -628,7 +626,7 @@ class ChainlinkClaims:
             self._run("issue", "comment", str(issue_id), f"{prefix} {reason}")
 
     def next_attempt(self, comments: Iterable[str]) -> int:
-        """The attempt number a fresh claim would take, honouring reset markers.
+        """The globally monotonic attempt number a fresh claim would take.
 
         Only the attempt BUDGET is reset. ``claim_records_from_comments`` still
         reports every claim, because the duplicate-liveness guard and the stale
@@ -637,15 +635,12 @@ class ChainlinkClaims:
         checks liveness before exhaustion, so a reset cannot smuggle a concurrent
         build past that guard.
 
-        Shares ``_scan_claim_comments`` with the reaper's record selection so the
-        two cannot disagree about which records a reset applies to. They did
-        disagree once: the budget honoured resets while the selection ordered by
-        attempt number alone, so every reset leaf's next build was reaped.
+        Reset markers forgive the attempt budget, not attempt ordinals. Keeping
+        ordinals monotonic prevents collisions with retained checkout directories,
+        branches, and evidence files from earlier reset generations.
         """
-        records, generation = _scan_claim_comments(comments)
-        attempts = [
-            record.attempt for record in records if record.generation == generation
-        ]
+        records, _generation = _scan_claim_comments(comments)
+        attempts = [record.attempt for record in records]
         if not attempts:
             return 1
         return max(attempts) + 1

@@ -46,7 +46,7 @@ from mimir.tools.forge import (
     set_forge_client,
     unsupported_operation,
 )
-from mimir.tools.repo import repo_test
+from mimir.tools.repo import repo_status, repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
@@ -533,6 +533,70 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
     assert called is True
     assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is not None
     assert client.calls == [("snapshot", "owner/repo", 1291)]
+
+
+@pytest.mark.parametrize(
+    ("forge_tool", "arguments", "missing_field"),
+    [
+        (
+            pr_submit_review,
+            {"repository": "owner/repo", "pull_request": 7, "verdict": "approve"},
+            "body",
+        ),
+        (repo_status, {"repository": "owner/repo"}, "pull_request"),
+    ],
+)
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.asyncio
+async def test_schema_invalid_standing_review_call_is_recoverable(
+    forge_tool,
+    arguments: dict[str, object],
+    missing_field: str,
+    is_async: bool,
+) -> None:
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+        enforcement_enabled=True, ifc_labels=InformationFlowLabels(),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "name": forge_tool.name, "args": arguments,
+            "id": "invalid-standing-review", "type": "tool_call",
+        },
+        tool=forge_tool, state={}, runtime=Runtime(context=context),
+    )
+    node = ToolNode([forge_tool])
+    middleware = BudgetGateMiddleware()
+
+    if is_async:
+        async def handler(tool_request):
+            return await node._execute_tool_async(tool_request, "tool_calls", {})
+
+        result = await middleware.awrap_tool_call(request, handler)
+    else:
+        result = middleware.wrap_tool_call(
+            request,
+            lambda tool_request: node._execute_tool_sync(tool_request, "tool_calls", {}),
+        )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert missing_field in str(result.content)
+    assert "field required" in str(result.content).lower()
+    assert "fix the error and try again" in str(result.content).lower()
+
+
+@pytest.mark.parametrize("arguments", [None, [], "not-a-mapping"])
+def test_standing_review_resolution_ignores_non_mapping_arguments(arguments) -> None:
+    from mimir.tools.budget_gate import _resolve_standing_review
+
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="message", channel_id="operator", interactivity=None,
+    )
+
+    assert _resolve_standing_review("pr_metadata", context, arguments) is None
 
 
 @pytest.mark.parametrize(
