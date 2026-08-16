@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,14 +13,22 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.tools import github_review_guard as guard
+from mimir.tools import extra
 from mimir.tools.refusals import ToolPolicyRefusal
 from tests.auth_helpers import middleware_auth_context
 
 
-def _request(command: str, *, direct_argv: list[str] | None = None) -> SimpleNamespace:
+def _request(
+    command: str,
+    *,
+    direct_argv: list[str] | None = None,
+    cwd: str | None = None,
+) -> SimpleNamespace:
     args: dict[str, object] = {"command": command}
     if direct_argv is not None:
         args["mimir_direct_argv"] = direct_argv
+    if cwd is not None:
+        args["cwd"] = cwd
     return SimpleNamespace(tool_call={"name": "shell_exec", "args": args})
 
 
@@ -30,20 +40,36 @@ class FakeGitHub:
         self.review_side_effects = 0
         self.current_number = 152
         self.lock = threading.Lock()
+        self.repos_by_cwd: dict[str, str] = {}
+        self.calls: list[tuple[list[str], str | None]] = []
 
     def run(self, spec: guard.ReviewSubmission, arguments: list[str]):
+        self.calls.append((arguments, spec.cwd))
+        returncode = 0
         if arguments[:2] == ["api", "user"]:
             output = self.reviewer
-        elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}"]:
-            output = self.head
-        elif arguments[:2] == ["api", f"repos/o/r/pulls/{spec.number}/reviews"]:
+        elif arguments[:2] == ["repo", "view"]:
+            cwd = str(Path(spec.cwd or Path.cwd()).resolve())
+            output = self.repos_by_cwd.get(cwd, "")
+            returncode = 0 if output else 1
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
+            and arguments[1].endswith(f"/pulls/{spec.number}/reviews")
+        ):
             with self.lock:
                 output = json.dumps(self.reviews)
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
+            and arguments[1].endswith(f"/pulls/{spec.number}")
+        ):
+            output = self.head
         elif arguments[:2] == ["pr", "view"]:
             output = str(self.current_number)
         else:  # pragma: no cover - catches an unexpected API shape clearly
             raise AssertionError(arguments)
-        return SimpleNamespace(returncode=0, stdout=output)
+        return SimpleNamespace(returncode=returncode, stdout=output)
 
     def submit(self, spec: guard.ReviewSubmission) -> None:
         with self.lock:
@@ -59,6 +85,7 @@ class FakeGitHub:
 def github(monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
     fake = FakeGitHub()
     monkeypatch.setattr(guard, "_run", fake.run)
+    monkeypatch.setitem(extra._SHELL_STATE, "cwd", None)
     guard._locks.clear()
     return fake
 
@@ -128,7 +155,7 @@ def test_review_submission_is_found_in_compound_command(
 ) -> None:
     spec = guard.review_submission_from_request(_request(command))
 
-    assert spec == expected
+    assert replace(spec, cwd=None) == expected
 
 
 @pytest.mark.parametrize(
@@ -289,6 +316,107 @@ def test_current_pull_request_is_inferred_when_number_is_omitted(
     assert claim is not None
     assert claim.number == github.current_number
     claim.release()
+
+
+def test_omitted_cwd_uses_shell_exec_home_not_process_cwd(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    process_repo = tmp_path / "workspace-mimir"
+    shell_home.mkdir()
+    process_repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    monkeypatch.chdir(process_repo)
+    github.repos_by_cwd = {
+        str(shell_home.resolve()): "o/shell-home",
+        str(process_repo.resolve()): "o/process-repo",
+    }
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(extra._effective_shell_cwd()) == str(shell_home.resolve())
+    assert claim is not None
+    assert claim.repo == "o/shell-home"
+    assert {cwd for _, cwd in github.calls} == {str(shell_home.resolve())}
+    claim.release()
+
+
+def test_explicit_cwd_still_overrides_shell_home(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    explicit = tmp_path / "explicit"
+    shell_home.mkdir()
+    explicit.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(explicit.resolve())] = "o/explicit"
+
+    spec = guard.review_submission_from_request(
+        _request("gh pr review 152 --approve", cwd=str(explicit)),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(explicit)
+    assert claim is not None
+    assert claim.repo == "o/explicit"
+    claim.release()
+
+
+def test_compound_cd_resolves_repository_from_command_directory(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    repo = shell_home / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(repo.resolve())] = "o/compound"
+
+    spec = guard.review_submission_from_request(
+        _request("cd repo && gh pr review 152 --approve --body ok"),
+    )
+    assert spec is not None
+    claim = guard.claim_review_submission(spec)
+
+    assert spec.cwd == str(repo.resolve())
+    assert claim is not None
+    assert claim.repo == "o/compound"
+    claim.release()
+
+
+def test_ambiguous_shell_cwd_cannot_return_duplicate(
+    github: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shell_home = tmp_path / "mimir-home"
+    shell_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(shell_home))
+    github.repos_by_cwd[str(shell_home.resolve())] = "o/wrong-repo"
+    github.reviews.append({
+        "user": {"login": github.reviewer},
+        "commit_id": github.head,
+        "state": "APPROVED",
+    })
+
+    spec = guard.review_submission_from_request(
+        _request('cd "$REVIEW_REPO" && gh pr review 152 --approve'),
+    )
+    assert spec is not None
+
+    assert spec.repository_context_known is False
+    assert guard.claim_review_submission(spec) is None
+    assert github.calls == []
 
 
 def test_same_head_same_reviewer_same_state_is_suppressed(github: FakeGitHub) -> None:
