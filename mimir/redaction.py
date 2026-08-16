@@ -38,12 +38,42 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
     # Credential fields in header, YAML, JSON, and Python-repr colon forms.
     # Requiring a credential-like key and a non-path boundary keeps ordinary
-    # prose, timestamps, unrelated mappings, and URL userinfo intact. An
-    # opening value quote is preserved with the prefix.
+    # prose, timestamps, unrelated mappings, and URL userinfo intact.
+    #
+    # Quoted values run to the CLOSING QUOTE, not to the first space. A
+    # passphrase is a credential and contains whitespace, so stopping at the
+    # space masks one word and persists the rest. There is one pattern per
+    # quote style because a backreference for the quote character would push
+    # the group count past two, which ``redact_text`` uses to decide whether
+    # the prefix is preserved.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(\"?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"\"?[ \t]*:[ \t]*\")([^\"]*)"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"'?[ \t]*:[ \t]*')([^']*)"
+    ),
+    # YAML block scalars (``password: |``). The indicator is not the value —
+    # the secret lives on the indented lines beneath it. Matching the indicator
+    # as if it were a bare value prints ``password: [REDACTED]`` directly above
+    # an untouched credential, which is worse than not matching at all because
+    # the log then reads as though it had been scrubbed.
+    re.compile(
+        r"(?im)^([ \t]*[\"']?[A-Za-z0-9_.-]*"
+        r"(?:token|api[_-]?key|password|passwd|secret)[\"']?"
+        r"[ \t]*:[ \t]*[|>][-+0-9]*[ \t]*\n)"
+        r"((?:[ \t]+\S.*(?:\n|$))+)"
+    ),
+    # Bare (unquoted) values. The alphabet stops at common delimiters so the
+    # regex doesn't eat the rest of the line, and a block-scalar indicator is
+    # excluded so it can never be reported as a redacted value.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?\s*:\s*['\"]?)([^\s\"',&}]+)"
+        r"['\"]?\s*:\s*)(?![|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
     ),
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit

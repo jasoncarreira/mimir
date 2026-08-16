@@ -84,6 +84,36 @@ def test_key_value_false_positive_corpus_passes_through(text: str) -> None:
     assert redact_text(text) == text
 
 
+# A passphrase is a credential and contains whitespace. Stopping the value at
+# the first space masks one word and persists the rest, which reads as redacted.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"password": "correct horse battery staple"}', '{"password": "[REDACTED]"}'),
+        ("password: 'my secret pass phrase'", "password: '[REDACTED]'"),
+        ('API_KEY: "abc def ghi"', 'API_KEY: "[REDACTED]"'),
+    ],
+)
+def test_quoted_credential_is_masked_through_the_closing_quote(
+    text: str, expected: str
+) -> None:
+    assert redact_text(text) == expected
+
+
+# The block-scalar indicator is not the value. Masking it prints a redacted
+# line directly above an untouched secret, so the log reads as safe when it
+# is not — the failure mode this pins is worse than a plain miss.
+@pytest.mark.parametrize("indicator", ["|", ">", "|-", ">-", "|+", "|2"])
+def test_yaml_block_scalar_body_is_masked_not_the_indicator(indicator: str) -> None:
+    secret = "s3cr3t" + "-value-here"
+    out = redact_text(f"password: {indicator}\n  {secret}\n")
+
+    assert secret not in out
+    assert "[REDACTED]" in out
+    # The indicator survives so the structure stays readable.
+    assert out.startswith(f"password: {indicator}")
+
+
 def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:
     assert redact_text("sk-ant-abc123def456ghi789") == "[REDACTED]"
     assert redact_text("Authorization: Bearer abcdef123456") == (

@@ -986,6 +986,8 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     log = TurnLogger(path)
     secret = "ghp_" + "A" * 36
     unprefixed_secret = "0123456789abcdef0123456789abcdef"
+    passphrase = "correct horse battery staple"
+    block_secret = "s3cr3t" + "-block-value"
     record = TurnRecord(
         ts="2026-05-15T12:00:00Z",
         turn_id="0123456789abcdef",         # make_turn_id() shape (16 hex)
@@ -1000,7 +1002,11 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
             "content": (
                 f"> X-API-Key: {unprefixed_secret}\n"
                 f"MIMIR_API_KEY: {unprefixed_secret}\n"
-                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}'
+                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}\n'
+                # A passphrase is a credential and holds whitespace; a value
+                # rule that stops at the first space persists most of it.
+                f'{{"password": "{passphrase}"}}\n'
+                f"password: |\n  {block_secret}\n"
             ),
         }],
         total_cost_usd=0.0123,
@@ -1014,6 +1020,11 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     assert secret not in line
     assert unprefixed_secret not in line
     assert "pa-" + unprefixed_secret not in line
+    # Not just the first word of the passphrase, and not just the block
+    # indicator: no fragment of either may survive into the durable line.
+    for fragment in passphrase.split():
+        assert fragment not in line
+    assert block_secret not in line
     assert "[REDACTED]" in rec["input"]
     assert "[REDACTED]" in rec["output"]
     assert "[REDACTED]" in rec["events"][0]["content"]
