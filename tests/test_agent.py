@@ -29,7 +29,7 @@ from langgraph.runtime import Runtime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
-from mimir.access_control import ServicePrincipal, SinkGate
+from mimir.access_control import ServicePrincipal
 from mimir.agent import Agent, _initialize_ifc_labels
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
@@ -46,6 +46,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    Integrity,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
@@ -2607,10 +2608,10 @@ async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     assert no_reply[0].get("output_chars", 0) > 0
 
 
-async def test_framework_silence_then_cross_channel_recall_allows_reply_sink(
+async def test_framework_no_reply_signal_is_visible_as_trusted_feedback(
     tmp_path: Path,
 ):
-    """A framework-filed no-reply signal must not perpetuate the silence."""
+    """The agent can recall its own framework-filed no-reply telemetry."""
     first_agent = _FakeAgent(response_messages=[
         AIMessage(content="I reasoned about this but did not send it"),
     ])
@@ -2658,32 +2659,23 @@ async def test_framework_silence_then_cross_channel_recall_allows_reply_sink(
         events_path=agent._config.events_log,
         turns_path=agent._config.turns_log,
     ).recent_prompt_block(second_auth)
+
     assert recalled is not None
-    assert "no_reply" in recalled.content
-    second_turn_labels = InformationFlowLabels().with_source(SourceLabel(
-        principal="admin",
-        domain="channel",
-        resource_id="ch-new",
-        bridge_instance="stub",
-        sensitivity="private",
-        authorized_principals=frozenset({"admin"}),
-        source_kind="channel",
-        integrity="trusted",
-        integrity_effect="active_ingest",
-    ))
-    for source in recalled.labels.sources:
-        second_turn_labels = second_turn_labels.with_source(source)
-
-    decision = SinkGate.check_sink_flow(
-        "send_message",
-        "ch-new",
-        second_turn_labels,
-        second_auth,
-        enforce=True,
+    assert "no_reply [ch-old]" in recalled.content
+    trusted_no_reply_sources = [
+        source
+        for source in recalled.labels.sources
+        if source.domain == "feedback"
+        and source.resource_id == "ch-old"
+        and source.principal == "admin"
+        and source.integrity == Integrity.TRUSTED
+    ]
+    assert trusted_no_reply_sources
+    assert all(source.is_complete for source in trusted_no_reply_sources)
+    assert all(
+        source.authorized_principals == frozenset({"admin"})
+        for source in trusted_no_reply_sources
     )
-
-    assert decision.allowed is True, decision.reason
-    assert decision.reason == "ifc_allowed"
 
 
 async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):

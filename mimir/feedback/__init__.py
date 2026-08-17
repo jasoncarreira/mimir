@@ -726,13 +726,14 @@ class FeedbackLog:
                     # untrusted either way.
                     #
                     # Omitting this entirely let SourceLabel's UNTRUSTED
-                    # default apply to the agent's own telemetry. Because
-                    # `resource_id` is the record's ORIGINATING channel, one
-                    # recalled signal from any other channel then failed the
-                    # all-or-nothing SAME_CHANNEL check and silenced the reply
-                    # — including, self-perpetuatingly, the
-                    # `interactive_turn_no_send_message` signal that a silenced
-                    # turn files itself.
+                    # default apply to the agent's own telemetry. The explicit
+                    # kind allowlist therefore controls both visibility to a
+                    # non-privileged agent and trusted provenance once the
+                    # record is admitted. In particular,
+                    # `interactive_turn_no_send_message` is framework-written
+                    # self-regulation data; without its allowlist entry the
+                    # agent silently loses that feedback rather than receiving
+                    # a complete trusted source.
                     integrity=(
                         Integrity.TRUSTED
                         if not record_owner and _is_agent_self_record(record)

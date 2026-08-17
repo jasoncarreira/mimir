@@ -291,6 +291,39 @@ def test_ownerless_commitment_feedback_with_external_text_stays_untrusted(
     }
 
 
+def test_interactive_no_reply_is_visible_as_trusted_agent_self_feedback(
+    tmp_path: Path,
+):
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": "interactive_turn_no_send_message",
+        "channel_id": "another-channel",
+        "turn_id": "turn-1",
+        "trigger": "user_message",
+        "output_chars": 137,
+    }])
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+        bridge_instance="stub",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "no_reply [another-channel]" in block.content
+    assert block.labels.sources
+    assert {source.integrity for source in block.labels.sources} == {
+        Integrity.TRUSTED
+    }
+    assert all(source.is_complete for source in block.labels.sources)
+    assert all(
+        source.authorized_principals == frozenset({"bob"})
+        for source in block.labels.sources
+    )
+
+
 def test_classified_kind_absent_from_agent_self_allowlist_stays_untrusted(
     tmp_path: Path,
 ):
