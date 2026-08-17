@@ -99,6 +99,7 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "cross_turn_loop",
     "cross_turn_send_duplicate",
     "error",
+    "interactive_turn_no_send_message",
     "loop_stop",
     "loop_warn",
     "send_message_loop_hard_stop",

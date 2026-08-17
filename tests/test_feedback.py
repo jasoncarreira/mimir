@@ -9,6 +9,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from mimir.feedback import (
     FeedbackLog,
     FeedbackSignal,
@@ -251,6 +253,64 @@ def test_privileged_view_of_ownerless_non_agent_record_stays_untrusted(tmp_path:
         "precondition: the privileged view must actually render this record"
     )
     assert block.labels.sources
+    assert {source.integrity for source in block.labels.sources} == {
+        Integrity.UNTRUSTED
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["commitment_due", "commitment_expired", "commitment_snooze_pileup"],
+)
+def test_ownerless_commitment_feedback_with_external_text_stays_untrusted(
+    tmp_path: Path,
+    kind: str,
+):
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": kind,
+        "channel_id": "another-channel",
+        "commitment_id": "legacy-ownerless",
+        "text": "conversation-derived text",
+        "recipient_identity": "model-extracted recipient",
+        "snooze_count": 4,
+        "threshold": 3,
+    }])
+    admin = AuthContext(
+        principal="root", canonical_principal="root", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(admin)
+
+    assert block is not None
+    assert "conversation-derived text" in block.content
+    assert {source.integrity for source in block.labels.sources} == {
+        Integrity.UNTRUSTED
+    }
+
+
+def test_classified_kind_absent_from_agent_self_allowlist_stays_untrusted(
+    tmp_path: Path,
+):
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": "tool_call_denied",
+        "channel_id": "another-channel",
+        "tool": "external_tool_name",
+        "reason": "external denial detail",
+    }])
+    admin = AuthContext(
+        principal="root", canonical_principal="root", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(admin)
+
+    assert block is not None
+    assert "external denial detail" in block.content
     assert {source.integrity for source in block.labels.sources} == {
         Integrity.UNTRUSTED
     }
