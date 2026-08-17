@@ -118,6 +118,15 @@ def maintenance_git_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture
+def repo_review_git_root(tmp_path):
+    """Bind repo-review authorization tests to a Git root they own."""
+    root = tmp_path / "repo-review"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    return root.resolve()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _clear_host_mimir_environment():
     """Pop host-only Mimir settings from os.environ for the test session.
