@@ -61,6 +61,7 @@ from mimir.models import (
     SourceLabel,
     TurnInteractivity,
 )
+from mimir.prompt_sources import prompt_source_label
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
 from mimir.worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -795,20 +796,63 @@ def test_cross_channel_recent_activity_uses_requester_acl_for_same_channel_sinks
         assert untrusted.allowed is True, (tool, untrusted.reason)
 
 
-def test_protected_prompt_sources_are_informational():
+def test_prompt_source_labels_preserve_full_trusted_label():
     source = next(iter(_prompt_source_labels(
         _auth(), domain="saga", resource="auto-recall", self_authored=True,
     ).sources))
-    assert source.integrity == "trusted"
-    assert source.integrity_effect == "informational"
+    assert source == SourceLabel(
+        principal="user-1",
+        domain="saga",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_prompt",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
 
 
-def test_protected_prompt_source_defaults_fail_closed():
+def test_prompt_source_labels_preserve_full_untrusted_label():
     source = next(iter(_prompt_source_labels(
-        _auth(), domain="saga", resource="future-caller",
+        _auth(),
+        domain="recent_activity",
+        resource="message:42",
+        channel_id="discord-C2",
+        principal="user-2",
+        bridge="discord",
+        authorized_principals=frozenset({"user-1", "user-2"}),
+        source_kind="recent_message",
+        self_authored=False,
     ).sources))
-    assert source.integrity == "untrusted"
-    assert source.integrity_effect == "informational"
+    assert source == SourceLabel(
+        principal="user-2",
+        domain="recent_activity",
+        resource_id="discord-C2",
+        bridge_instance="discord",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1", "user-2"}),
+        source_kind="recent_message",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+
+
+def test_prompt_source_constructor_requires_explicit_provenance():
+    with pytest.raises(TypeError, match="self_authored"):
+        prompt_source_label(
+            _auth(),
+            domain="saga",
+            resource="future-caller",
+            principal="user-1",
+            bridge_instance="slack",
+            authorized_principals=frozenset({"user-1"}),
+        )
+
+    with pytest.raises(TypeError, match="self_authored"):
+        _prompt_source_labels(
+            _auth(), domain="saga", resource="future-wrapper-caller",
+        )
 
 
 def test_turn_history_result_is_untrusted_active_ingest():

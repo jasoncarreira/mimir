@@ -42,10 +42,9 @@ from ..jsonl_snapshot import (
 from ..models import (
     AuthContext,
     InformationFlowLabels,
-    Integrity,
     PromptBlock,
-    SourceLabel,
 )
+from .. import prompt_sources
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -691,17 +690,13 @@ class FeedbackLog:
                     or (not record_owner and _is_agent_self_record(record))
                 ):
                     acl_principals.add(effective_requester)
-                labels = labels.with_source(SourceLabel(
+                labels = labels.with_source(prompt_sources.prompt_source_label(
+                    auth_context,
                     principal=principal,
                     domain="feedback",
-                    resource_id=(
-                        record.get("channel_id")
-                        or auth_context.resource_id
-                        or auth_context.channel_id
-                        or f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}"
-                    ),
+                    resource=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+                    channel_id=record.get("channel_id"),
                     bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
-                    sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
                     # Integrity from persisted server provenance, never from
@@ -732,12 +727,9 @@ class FeedbackLog:
                     # — including, self-perpetuatingly, the
                     # `interactive_turn_no_send_message` signal that a silenced
                     # turn files itself.
-                    integrity=(
-                        Integrity.TRUSTED
-                        if not record_owner and _is_agent_self_record(record)
-                        else Integrity.UNTRUSTED
+                    self_authored=(
+                        not record_owner and _is_agent_self_record(record)
                     ),
-                    integrity_effect="informational",
                 ))
         return PromptBlock(content=content, labels=labels)
 

@@ -92,6 +92,7 @@ from .access_control import (
     get_trusted_service_from_auth_context,
 )
 from .prompts import ENFORCEMENT_GUIDANCE, build_system_prompt, build_turn_prompt
+from . import prompt_sources
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
@@ -229,7 +230,7 @@ def _prompt_source_labels(
     bridge: str | None = None,
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
-    self_authored: bool = False,
+    self_authored: bool,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -237,23 +238,20 @@ def _prompt_source_labels(
         f"service:{requester}" if auth_context.is_service and requester else requester
     )
     owner = principal or effective_requester
-    target_channel = channel_id or auth_context.resource_id or auth_context.channel_id
     bridge_instance = bridge or auth_context.bridge_instance or "mimir"
     acl = authorized_principals
     if acl is None:
         acl = frozenset({effective_requester}) if effective_requester else frozenset()
-    return InformationFlowLabels().with_source(SourceLabel(
+    return InformationFlowLabels().with_source(prompt_sources.prompt_source_label(
+        auth_context,
         principal=owner,
         domain=domain,
-        resource_id=target_channel or resource,
+        resource=resource,
+        channel_id=channel_id,
         bridge_instance=bridge_instance,
-        sensitivity="private",
         authorized_principals=acl,
         source_kind=source_kind,
-        # These blocks are loaded by the framework from its own memory/state by
-        # default. Callers injecting externally authored history opt out below.
-        integrity=Integrity.TRUSTED if self_authored else Integrity.UNTRUSTED,
-        integrity_effect=IntegrityEffect.INFORMATIONAL,
+        self_authored=self_authored,
     ))
 
 

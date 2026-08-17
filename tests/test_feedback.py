@@ -6,6 +6,8 @@ classifies records by polarity, renders a prompt block."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -291,6 +293,50 @@ def test_agent_self_feedback_sources_are_trusted(tmp_path: Path):
         source.integrity_effect == "informational"
         for source in block.labels.sources
     )
+
+
+def test_feedback_and_agent_labels_use_shared_prompt_source_constructor(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir import prompt_sources
+    from mimir.agent import _prompt_source_labels
+
+    domains = []
+    constructor = prompt_sources.prompt_source_label
+
+    def record_call(*args, **kwargs):
+        domains.append(kwargs["domain"])
+        return constructor(*args, **kwargs)
+
+    monkeypatch.setattr(prompt_sources, "prompt_source_label", record_call)
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    _prompt_source_labels(
+        auth, domain="saga", resource="query", self_authored=True,
+    )
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1), "type": "send_message_loop_warning",
+        "channel_id": "shared", "count": 3,
+    }])
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert domains == ["saga", "feedback"]
+
+
+def test_feedback_imports_first_in_fresh_interpreter():
+    result = subprocess.run(
+        [sys.executable, "-c", "import mimir.feedback"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_user_attributable_feedback_sources_stay_untrusted(tmp_path: Path):
