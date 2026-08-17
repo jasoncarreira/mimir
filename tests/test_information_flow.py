@@ -2453,6 +2453,31 @@ def test_protected_prompt_acl_still_blocks_cross_principal_reply():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
+def test_ownerless_protected_prompt_without_independent_acl_is_refused():
+    source = SourceLabel(
+        principal="user-1",
+        domain="feedback",
+        resource_id="slack-C-other",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset(),
+        source_kind="protected_prompt",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert source.is_complete is False
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
 @pytest.mark.parametrize(
     "mismatch",
     ["principal", "domain", "bridge_instance", "resource_id"],
