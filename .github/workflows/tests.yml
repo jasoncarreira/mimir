@@ -210,6 +210,9 @@ jobs:
   pytest-macos:
     # Keep this separate from the required pytest matrix so its existing
     # ``pytest (3.11)`` and ``pytest (3.12)`` check names remain unchanged.
+    # This is an observational canary: expose macOS-only failures without
+    # making the experiment a merge gate while the runner delta is triaged.
+    continue-on-error: true
     runs-on: macos-latest
     timeout-minutes: 15
     strategy:
