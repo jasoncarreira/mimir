@@ -72,13 +72,14 @@ def _due_phrase(rec: CommitmentRecord, *, now_unix: float) -> str:
 
 def _sort_key(rec: CommitmentRecord) -> tuple[float, float]:
     """Order: explicit time anchor first (sorted by start asc),
-    then hint-only / no-anchor by ``created_at_unix`` asc.
+    then hint-only / no-anchor by ``created_at_unix`` descending.
 
-    ``due_window_start_unix`` sentinel: ``inf`` so records without one
-    sort after anchored ones."""
+    This keeps imminent commitments first without letting the oldest stale
+    unanchored records permanently crowd newly extracted commitments out."""
     start = rec.due_window_start_unix
-    primary = start if start is not None else float("inf")
-    return (primary, rec.created_at_unix or 0.0)
+    if start is not None:
+        return (0.0, start)
+    return (1.0, -(rec.created_at_unix or 0.0))
 
 
 def render_commitments_block(

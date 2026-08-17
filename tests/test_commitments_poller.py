@@ -272,6 +272,25 @@ async def test_open_ended_commitments_skipped(tmp_path: Path, home: Path):
 
 
 @pytest.mark.asyncio
+async def test_end_only_commitment_expires(tmp_path: Path, home: Path):
+    """Extracted hint-only records have an age limit but no delivery start."""
+    store = CommitmentsStore(path=tmp_path / "c.jsonl")
+    now = time.time()
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="c1", text="Thursday task",
+        due_window_start_unix=None,
+        due_window_end_unix=now - 1,
+        due_window_hint="Thursday",
+    ))
+
+    result = await check_due_and_expired(store, now_unix=now)
+
+    assert result.expired_emitted == 1
+    assert result.skipped_no_due_window == 0
+    assert store.current_state()[rec.id].status == CommitmentStatus.EXPIRED.value
+
+
+@pytest.mark.asyncio
 async def test_snoozed_respects_new_window(tmp_path: Path, home: Path):
     """Snooze slides due_window_start; the same "now ≥ start" check
     naturally respects the snooze. No special-case needed."""

@@ -322,6 +322,37 @@ async def test_shutdown_cancels_pending_turn_cap_task():
 
 
 @pytest.mark.asyncio
+async def test_idle_fire_task_is_strongly_held_and_cancelled_by_shutdown():
+    dispatch_started = asyncio.Event()
+    dispatch_release = asyncio.Event()
+    fired: list[ChannelSession] = []
+
+    async def on_idle(session: ChannelSession) -> None:
+        dispatch_started.set()
+        await dispatch_release.wait()
+        fired.append(session)
+
+    mgr = SessionManager(idle_minutes=60, on_idle=on_idle)
+    session = await mgr.touch("c1")
+    timer = session.idle_handle
+    assert isinstance(timer, asyncio.TimerHandle)
+    timer._run()
+    timer.cancel()
+    task = session.idle_handle
+    assert isinstance(task, asyncio.Task)
+
+    await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+    assert "c1" not in mgr._sessions
+    assert session.idle_handle is None
+    assert task in mgr._pending_tasks
+
+    await mgr.shutdown()
+    assert task.cancelled()
+    assert mgr._pending_tasks == set()
+    assert fired == []
+
+
+@pytest.mark.asyncio
 async def test_end_now_triggers_synthesis_callback():
     fired: list[ChannelSession] = []
 

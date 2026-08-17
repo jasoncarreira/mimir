@@ -12,7 +12,6 @@ don't attempt them in unit tests. We do cover:
 
 from __future__ import annotations
 
-import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -28,18 +27,6 @@ from mimir.mcp_client import (
     parse_mcp_server_configs,
 )
 from mimir.tools.mcp import clear_mcp_tools, get_mcp_tools, set_mcp_tools
-
-
-def test_server_mcp_handoff_leaves_tool_publication_to_runtime_bundle() -> None:
-    from mimir.runtime import AgentRuntimeBundle
-    from mimir.server import _start_mcp_servers
-
-    helper_source = inspect.getsource(_start_mcp_servers)
-    install_source = inspect.getsource(AgentRuntimeBundle.install_mcp_tools)
-
-    assert "set_mcp_tools" not in helper_source
-    assert "return mcp_manager, mcp_tools" in helper_source
-    assert "set_mcp_tools(tools)" in install_source
 
 
 # ─── MCPServerConfig.from_dict ──────────────────────────────────────

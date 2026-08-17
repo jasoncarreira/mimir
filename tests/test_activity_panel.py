@@ -696,6 +696,37 @@ async def test_panel_auto_deletes_after_real_reply():
 
 
 @pytest.mark.asyncio
+async def test_panel_stop_cancels_grace_task_and_deletes_panel():
+    panel, bridge = _panel(delete_grace=60.0)
+
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "start",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "trigger": "user_message",
+        }
+    )
+    await panel.handle_event(
+        {
+            "type": "turn",
+            "phase": "end",
+            "turn_id": "t1",
+            "channel_id": "slack-C01",
+            "outbound_message_sent": True,
+        }
+    )
+    delete_task = panel._delete_tasks["t1"]
+
+    await panel.stop()
+
+    assert delete_task.cancelled()
+    assert bridge.deletes == [("slack-C01", "panel-1")]
+    assert "t1" not in panel.models
+
+
+@pytest.mark.asyncio
 async def test_panel_delete_failure_leaves_compact_done_state(caplog):
     panel, bridge = _panel(delete_grace=0.0)
     bridge.delete_result = SendResult(sent=False, message_id="panel-1", error="delete unsupported")

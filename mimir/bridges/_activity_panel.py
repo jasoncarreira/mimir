@@ -116,6 +116,7 @@ class ActivityPanel:
         self._models: dict[str, ActivityPanelModel] = {}
         self._last_edit_by_channel: dict[str, float] = {}
         self._pending: dict[str, asyncio.Task[Any]] = {}
+        self._delete_tasks: dict[str, asyncio.Task[Any]] = {}
 
     @property
     def models(self) -> dict[str, ActivityPanelModel]:
@@ -137,6 +138,19 @@ class ActivityPanel:
         for task in list(self._pending.values()):
             task.cancel()
         self._pending.clear()
+        shutdown_deletes = [
+            model
+            for model in self._models.values()
+            if model.message_id and model.outbound_message_sent and not model.failed
+        ]
+        delete_tasks = tuple(self._delete_tasks.values())
+        for task in delete_tasks:
+            task.cancel()
+        if delete_tasks:
+            await asyncio.gather(*delete_tasks, return_exceptions=True)
+        self._delete_tasks.clear()
+        for model in shutdown_deletes:
+            await self._delete(model)
         self._models.clear()
         if self._task is not None:
             self._task.cancel()
@@ -224,7 +238,7 @@ class ActivityPanel:
             model.finalized = True
             await self._flush(model)
             if model.outbound_message_sent and not model.failed:
-                asyncio.create_task(
+                self._delete_tasks[model.turn_id] = asyncio.create_task(
                     self._delete_after_grace(model.turn_id),
                     name=f"mimir-activity-panel-delete-{model.turn_id}",
                 )
@@ -361,23 +375,29 @@ class ActivityPanel:
             model = self._models.get(turn_id)
             if model is None or not model.message_id or not model.outbound_message_sent or model.failed:
                 return
-            bridge = self._channels.find(model.channel_id)
-            if bridge is None:
-                return
-            try:
-                result = await bridge.delete_message(model.channel_id, model.message_id)
-                if not getattr(result, "sent", False):
-                    log.debug(
-                        "activity panel delete failed: %s",
-                        getattr(result, "error", None) or "unknown error",
-                    )
-            except Exception:  # noqa: BLE001
-                log.debug("activity panel delete failed", exc_info=True)
+            await self._delete(model)
         finally:
             # The model is finalized and its panel message handled (deleted,
             # or the delete was skipped/cancelled) — drop the entry so the
             # dict doesn't retain one model per turn for process lifetime.
             self._models.pop(turn_id, None)
+            self._delete_tasks.pop(turn_id, None)
+
+    async def _delete(self, model: ActivityPanelModel) -> None:
+        if not model.message_id:
+            return
+        bridge = self._channels.find(model.channel_id)
+        if bridge is None:
+            return
+        try:
+            result = await bridge.delete_message(model.channel_id, model.message_id)
+            if not getattr(result, "sent", False):
+                log.debug(
+                    "activity panel delete failed: %s",
+                    getattr(result, "error", None) or "unknown error",
+                )
+        except Exception:  # noqa: BLE001
+            log.debug("activity panel delete failed", exc_info=True)
 
 
 def _render_for_bridge(

@@ -16,6 +16,7 @@ from aiohttp import web
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 _API_NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+_SAFE_ROUTE_PATH_RE = re.compile(r"^(?!.*\\)(?!.*(?:^|/)\.\.(?:/|$))/(?!/)")
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class DashboardExtensionManifest:
     def validate(self) -> None:
         if not _ID_RE.fullmatch(self.id):
             raise ValueError(f"dashboard extension id must be kebab-case: {self.id!r}")
-        if not self.route_path.startswith("/") or (
+        if not _SAFE_ROUTE_PATH_RE.match(self.route_path) or (
             self.route_path == "/app" or self.route_path.startswith("/app/")
         ):
             raise ValueError(

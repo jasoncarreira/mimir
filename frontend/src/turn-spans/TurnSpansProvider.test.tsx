@@ -2,14 +2,24 @@
 import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TurnStreamEvent } from "../api/generated/contracts";
+import { SseResponseError } from "../api/sse-reconnect";
+import { useUiState } from "../uiState";
 
 const { bus } = vi.hoisted(() => ({
-  bus: { onEvent: undefined as ((e: unknown) => void) | undefined, close: vi.fn() }
+  bus: {
+    onEvent: undefined as ((e: unknown) => void) | undefined,
+    onError: undefined as ((e: unknown) => void) | undefined,
+    close: vi.fn()
+  }
 }));
 
 vi.mock("../api/turn-events", () => ({
-  createTurnEventStream: (onEvent: (e: unknown) => void, opts?: { onOpen?: () => void }) => {
+  createTurnEventStream: (
+    onEvent: (e: unknown) => void,
+    opts?: { onOpen?: () => void; onError?: (e: unknown) => void }
+  ) => {
     bus.onEvent = onEvent;
+    bus.onError = opts?.onError;
     opts?.onOpen?.();
     return { close: bus.close };
   }
@@ -39,10 +49,23 @@ function emit(partial: Partial<TurnStreamEvent>) {
 afterEach(() => {
   cleanup();
   bus.onEvent = undefined;
+  bus.onError = undefined;
   vi.useRealTimers();
 });
 
 describe("TurnSpansProvider character decay (#583)", () => {
+  it("requests re-authentication when the turn stream rejects the key", () => {
+    render(
+      <TurnSpansProvider channel="web-x">
+        <Probe />
+      </TurnSpansProvider>
+    );
+
+    act(() => bus.onError?.(new SseResponseError(403)));
+
+    expect(useUiState.getState().apiKeyRejected).toBe(true);
+  });
+
   it("decays active → idle after 30s, then → bored after 3 min", () => {
     vi.useFakeTimers();
     const view = render(

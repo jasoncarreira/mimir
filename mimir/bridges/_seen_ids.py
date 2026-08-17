@@ -63,6 +63,10 @@ class SeenIdCache:
             self._seen.popitem(last=False)
         return True
 
+    def discard(self, source_id: str) -> None:
+        """Forget *source_id* when a claimed message is not enqueued."""
+        self._seen.pop(source_id, None)
+
     def __len__(self) -> int:
         return len(self._seen)
 

@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 import mimir.turn_event_bus as turn_event_bus
 from mimir.models import AgentEvent
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
+from mimir.turn_event_redaction import MAX_LIVE_STRING_CHARS
 
 
 def _drain(queue: "asyncio.Queue[dict]") -> list[dict]:
@@ -273,6 +274,25 @@ def test_publish_scrubs_tool_args_results_and_text_at_bus_boundary():
     assert event["args"]["password"] == "[redacted]"
     assert "[redacted]" in serialized
     assert "[path]" in serialized
+
+
+def test_publish_caps_pathological_single_line_arg_before_live_delivery():
+    bus = TurnEventBus()
+    q = bus.subscribe("web-default")
+    # Cross the cap with short benign fragments so this remains a live-delivery
+    # boundary test, not an accidental stress test of the credential regexes.
+    payload = "a!" * (MAX_LIVE_STRING_CHARS // 2 + 1)
+    assert len(payload) > MAX_LIVE_STRING_CHARS
+
+    bus.publish({
+        "type": "tool_call",
+        "phase": "chunk",
+        "channel_id": "web-default",
+        "args_delta": payload,
+    })
+
+    [event] = _drain(q)
+    assert event["args_delta"] == payload[:MAX_LIVE_STRING_CHARS]
 
 
 def test_emitter_noop_when_bus_none():

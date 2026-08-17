@@ -2103,7 +2103,9 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
         source_id="poller:x:123:batch:0",
         extra={"poller_name": "x", "items": [{"id": "old"}]},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     events_path = home / "logs" / "events.jsonl"
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -2144,7 +2146,9 @@ async def test_run_poller_recovery_back_pressure_does_not_advance_attempts(
         source="poller", source_id="poller:x:456:batch:0",
         extra={"poller_name": "x", "items": []},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     events_path = home / "logs" / "events.jsonl"
     with events_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -2183,7 +2187,9 @@ async def test_run_poller_recovery_give_up_logs_summary_and_drops_entry(
         source="poller", source_id="poller:x:789:batch:0",
         extra={"poller_name": "x", "items": []},
     )
-    poller_recovery.stash_enqueued_event(persist_dir, prior)
+    await poller_recovery.stash_enqueued_event(
+        persist_dir, prior, enqueued_at="2026-06-04T07:59:00+00:00",
+    )
     state = poller_recovery._load_state(persist_dir)
     state["inflight"]["poller:x:789:batch:0"]["attempts"] = 3
     poller_recovery._save_state(persist_dir, state)
@@ -2704,6 +2710,30 @@ print(json.dumps({"poller": "x", "prompt": "second"}))
     assert len(completes) == 1
     assert completes[0]["events_emitted"] == 0
     assert completes[0]["events_rejected"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_delivery_receipt_is_written_only_after_accepted_enqueue(
+    tmp_path: Path,
+    accepted: bool,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "state"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir,
+    )
+
+    await run_poller(cfg, enqueue=_CapturingEnqueue(accept=accepted))
+
+    receipts = list((persist_dir / ".delivery-receipts").glob("*"))
+    assert len(receipts) == int(accepted)
 
 
 @pytest.mark.asyncio
@@ -4736,6 +4766,26 @@ def test_overrides_apply_cron_priority_and_budget(tmp_path: Path):
     assert p.command == "echo"
 
 
+def test_override_standard_sunday_cron_is_accepted_and_builds_sunday_trigger(
+    tmp_path: Path,
+):
+    from mimir.scheduler import _cron_trigger_from_standard_crontab
+
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *"},
+    ])
+    ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  cron: '0 4 * * 7'\n"
+    ))
+
+    [poller] = discover_pollers(skills, overrides_path=ov)
+    trigger = _cron_trigger_from_standard_crontab(poller.cron)
+
+    assert poller.cron == "0 4 * * 7"
+    assert str(trigger.fields[4]) == "sun"
+
+
 def test_discover_parses_manifest_budget(tmp_path: Path):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
@@ -4796,7 +4846,7 @@ def test_overrides_invalid_cron_keeps_manifest_cron(tmp_path: Path, caplog):
         {"name": "p", "command": "echo", "cron": "0 * * * *"},
     ])
     ov = _write_overrides(tmp_path / "pollers-overrides.yaml", (
-        "p:\n  cron: 'not a cron'\n  priority: high\n"
+        "p:\n  cron: '61 * * * *'\n  priority: high\n"
     ))
     with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
         [p] = discover_pollers(skills, overrides_path=ov)

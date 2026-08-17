@@ -28,6 +28,7 @@ _PATH_PATTERN = re.compile(
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(?i)(?:token|api[_-]?key|secret|password|authorization)"
 )
+MAX_LIVE_STRING_CHARS = 64 * 1024
 
 
 def scrub_detail(value: Any, *, limit: int = 320) -> str | None:
@@ -62,7 +63,7 @@ def scrub_value(value: Any, *, key: str | None = None) -> Any:
     if isinstance(value, tuple):
         return tuple(scrub_value(item) for item in value)
     if isinstance(value, str):
-        return scrub_text(value)
+        return scrub_text(value[:MAX_LIVE_STRING_CHARS])
     return value
 
 

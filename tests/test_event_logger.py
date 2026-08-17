@@ -164,13 +164,20 @@ async def test_max_events_trim_eventually_lands_on_cap(tmp_path: Path):
 async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="proc-1")
+    unprefixed_secret = "0123456789abcdef0123456789abcdef"
 
     await logger.log(
         "tool_error",
         error="Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc.def failed",
         args={
             "env": "ANTHROPIC_API_KEY=sk-ant-api03-AbCdEf12_3456-789xyz_long",
-            "nested": ["token=github_pat_11ABCDEFG_xyz0123", "safe context"],
+            "nested": [
+                "token=github_pat_11ABCDEFG_xyz0123",
+                f"> X-API-Key: {unprefixed_secret}",
+                f"MIMIR_API_KEY: {unprefixed_secret}",
+                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}',
+                "safe context",
+            ],
         },
     )
 
@@ -179,9 +186,51 @@ async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
     assert "eyJhbGciOiJIUzI1NiJ9" not in serialized
     assert "sk-ant-api03-" not in serialized
     assert "github_pat_" not in serialized
+    assert unprefixed_secret not in serialized
+    assert "pa-" + unprefixed_secret not in serialized
     assert record["error"] == "Authorization: Bearer [REDACTED] failed"
     assert record["args"]["nested"][0] == "token=[REDACTED]"
-    assert record["args"]["nested"][1] == "safe context"
+    assert record["args"]["nested"][1] == "> X-API-Key: [REDACTED]"
+    assert record["args"]["nested"][2] == "MIMIR_API_KEY: [REDACTED]"
+    assert record["args"]["nested"][3] == '{"VOYAGE_API_KEY": "[REDACTED]"}'
+    assert record["args"]["nested"][4] == "safe context"
+
+
+@pytest.mark.asyncio
+async def test_event_logger_redacts_yaml_block_scalars_without_erasing_context(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    secret = "s3cr3t" + "-event-block"
+    content = (
+        "ancestor:\n"
+        "  items:\n"
+        "    - password: &event_value !!str | # retained\n"
+        f"        {secret}-implicit\n"
+        "      sibling: keep-implicit-sibling\n"
+        "    - ? password\n"
+        "      : >-\n"
+        f"        {secret}-explicit\n"
+        "      sibling: keep-explicit-sibling\n"
+        "    - keep-following-item\n"
+        "  ancestor_sibling: keep-ancestor\n"
+    )
+
+    await EventLogger(path, session_id="proc-block").log("tool_result", content=content)
+
+    persisted = json.loads(path.read_text())["content"]
+    assert secret not in persisted
+    for context in (
+        "password: &event_value !!str | # retained",
+        "? password",
+        ": >-",
+        "sibling: keep-implicit-sibling",
+        "sibling: keep-explicit-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in persisted
 
 
 def test_log_sync_redacts_token_shaped_values(tmp_path: Path):

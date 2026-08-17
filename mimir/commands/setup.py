@@ -1201,6 +1201,13 @@ def regenerate_api_key(home: Path) -> str:
             f"{home}' first to scaffold the home directory before "
             f"regenerating the API key."
         )
+    if "MIMIR_API_KEY" in os.environ:
+        raise RuntimeError(
+            "MIMIR_API_KEY is set in the process environment, which overrides "
+            f"{env_path}. Refusing to write a key the runtime would ignore. "
+            "For a Docker deployment, rotate the effective compose.env value "
+            "with `mimir rotate --env MIMIR_API_KEY`."
+        )
     new_key = _generate_api_key()
     _env_set_api_key(env_path, new_key)
     _ensure_env_secure(env_path)
@@ -1220,7 +1227,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> "argparse.ArgumentParser"
         help="Scaffold a mimir home (dirs, .env, scheduler.yaml, skills, subagents).",
     )
     setup_p.add_argument(
-        "--home", type=Path, default=Path.cwd(),
+        "--home", type=Path, default=None,
         help="Target directory (default: current working dir).",
     )
     setup_p.add_argument(

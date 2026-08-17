@@ -610,6 +610,136 @@ def test_hard_refusal_is_uncharged_and_retries_only_at_daily_backstop(
     assert cursor["638"]["attempts"] == 0
     assert captured_emits[0]["attempt"] == 1
     assert captured_emits[0]["prior_refusal_reasons"] == ["service_scope_denied"]
+    assert captured_emits[0]["prior_refusal_classification"] == "operator_gated"
+
+
+def test_real_retained_lease_refusal_retries_at_hourly_floor_without_charge(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    reason = (
+        "repository checkout rejected: superseded PR checkout lease has retained "
+        "work; refusing release: deadbeef (/workspace/pr-leases/retained-lease)"
+    )
+    refused = _recovery_entry(
+        outcome_at="2026-07-19T12:01:00+00:00",
+        disposition="exempt_hard_refusal",
+    )
+    refused["outcome_reason"] = reason
+    _write_recovery(tmp_path, {"refused": refused})
+    prior = {"638": _entry("aaa111", attempts=0)}
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior,
+        now=NOW + timedelta(minutes=58, seconds=59),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor,
+        now=NOW + timedelta(minutes=59),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    [event] = captured_emits
+    assert event["attempt"] == 1
+    assert event["prior_refusal_reasons"] == [reason]
+    assert event["prior_refusal_classification"] == "self_clearing"
+    assert event["prior_self_clearing_refusals"] == 1
+
+
+@pytest.mark.parametrize("outcome_reason", [None, "new_unrecognised_boundary"])
+def test_absent_and_unknown_refusal_reasons_default_to_operator_gated(
+    monkeypatch, captured_emits, tmp_path, outcome_reason,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    refused = _recovery_entry(
+        outcome_at="2026-07-19T12:00:00+00:00",
+        disposition="exempt_hard_refusal",
+    )
+    if outcome_reason is not None:
+        refused["outcome_reason"] = outcome_reason
+    _write_recovery(tmp_path, {"refused": refused})
+    prior = {"638": _entry("aaa111", attempts=0)}
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW + timedelta(hours=2),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor, now=NOW + timedelta(days=1),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    [event] = captured_emits
+    assert event["prior_refusal_classification"] == "operator_gated"
+    assert event["prior_refusal_reasons"] == [
+        outcome_reason or "hard_boundary_refusal"
+    ]
+
+
+def test_self_clearing_refusal_series_is_bounded_and_rearms_daily(
+    monkeypatch, captured_emits, tmp_path,
+):
+    _patch_api(
+        monkeypatch,
+        prs=[_pr(638, "aaa111")],
+        reviews_by_pr={638: [_review(
+            "reviewer", "CHANGES_REQUESTED", "2026-07-19T11:00:00Z",
+        )]},
+        commit_dates={"aaa111": "2026-07-19T10:00:00Z"},
+    )
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    reason = "repository checkout rejected: PR checkout lease collision"
+    refused_entries = {}
+    for attempt in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS):
+        refused = _recovery_entry(
+            outcome_at=f"2026-07-19T{12 + attempt:02d}:01:00+00:00",
+            disposition="exempt_hard_refusal",
+        )
+        refused["outcome_reason"] = reason
+        refused_entries[str(attempt)] = refused
+    _write_recovery(tmp_path, refused_entries)
+    prior = {
+        "638": _entry("aaa111", "2026-07-19T14:00:00Z", attempts=0),
+    }
+
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", prior, now=NOW + timedelta(hours=3),
+    )
+    assert count == 0
+    assert cursor["638"]["attempts"] == 0
+
+    rearmed_at = "2026-07-20T14:01:00Z"
+    count, cursor = poller._check_own_changes_requested(
+        "o/r", "tok", "mimir-bot", cursor,
+        now=NOW + timedelta(days=1, hours=2, minutes=1),
+    )
+    assert count == 1
+    assert cursor["638"]["attempts"] == 0
+    assert cursor["638"]["rearmed_at"] == rearmed_at
+    [event] = captured_emits
+    assert event["prior_refusal_classification"] == "self_clearing"
+    assert event["prior_self_clearing_refusals"] == poller.REVIEW_REQUEST_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
@@ -635,13 +765,17 @@ async def test_repeated_refused_turns_never_exhaust_remediation_budget(
     }
     for attempt in range(poller.REVIEW_REQUEST_MAX_ATTEMPTS + 1):
         source_id = f"refused-{attempt}"
-        poller_recovery.stash_enqueued_event(tmp_path, AgentEvent(
-            trigger="poller",
-            channel_id="poller:github-activity",
-            content="fix PR",
-            source_id=source_id,
-            extra={"poller_name": "github-activity", "items": [item]},
-        ))
+        await poller_recovery.stash_enqueued_event(
+            tmp_path,
+            AgentEvent(
+                trigger="poller",
+                channel_id="poller:github-activity",
+                content="fix PR",
+                source_id=source_id,
+                extra={"poller_name": "github-activity", "items": [item]},
+            ),
+            enqueued_at=(NOW - timedelta(minutes=1)).isoformat(),
+        )
         with events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({
                 "type": "turn_completed",

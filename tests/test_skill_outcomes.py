@@ -11,13 +11,25 @@ import pytest
 from mimir.skill_outcomes import (
     SkillOutcome,
     SkillSuccessCriteria,
-    _classify_skill_calls,
+    _classify_skill_calls as _classify_skill_calls_impl,
     _parse_criteria_from_skill_md,
+    _skill_roots,
     aggregate,
     load_skill_success_criteria,
     order_skills,
     render_skill_telemetry,
 )
+
+
+_TEST_SKILL_ROOTS = (
+    *_skill_roots(Path("/h")),
+    *_skill_roots(Path("/mimir-home")),
+)
+
+
+def _classify_skill_calls(events, turn_ts, **kwargs):
+    kwargs.setdefault("skill_roots", _TEST_SKILL_ROOTS)
+    return _classify_skill_calls_impl(events, turn_ts, **kwargs)
 
 
 def _ts(minutes_ago: float, base: datetime) -> str:
@@ -142,14 +154,12 @@ def test_classify_read_file_skill_md_failure():
 
 
 def test_classify_read_file_tolerates_path_prefixes():
-    """Match works regardless of container-absolute, relative, or
-    workspace-root prefix."""
+    """Match works for absolute and relative paths under a trusted root."""
     base = datetime(2026, 5, 22, 14, 0, tzinfo=timezone.utc)
     cases = [
         "/mimir-home/.claude/skills/moltbook/SKILL.md",
         "./.claude/skills/moltbook/SKILL.md",
         ".claude/skills/moltbook/SKILL.md",
-        "/some/other/prefix/.claude/skills/moltbook/SKILL.md",
     ]
     for path in cases:
         events = [
@@ -311,11 +321,64 @@ def test_aggregate_window_filters_old_turns(tmp_path):
         ],
     }
     turns.write_text(
-        json.dumps(in_window) + "\n" + json.dumps(out_of_window) + "\n"
+        json.dumps(out_of_window) + "\n" + json.dumps(in_window) + "\n"
     )
     aggs = aggregate(turns, window_hours=24 * 7, now=base)
     assert aggs["memory"].success == 1
     assert aggs["memory"].failure == 0
+
+
+def test_aggregate_tail_parsing_scales_with_window(tmp_path, monkeypatch):
+    """Old records before the cutoff are not JSON-decoded past the boundary."""
+    import mimir._jsonl_tail as jsonl_tail
+
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "logs" / "turns.jsonl"
+    turns.parent.mkdir()
+    old = {"ts": _ts(60 * 24 * 30, base), "events": [], "payload": "x" * 1000}
+    recent = {"ts": _ts(5, base), "events": []}
+    turns.write_text(
+        "".join(json.dumps(old) + "\n" for _ in range(500))
+        + json.dumps(recent) + "\n"
+    )
+    real_loads = jsonl_tail.json.loads
+    parsed = 0
+
+    def counting_loads(value):
+        nonlocal parsed
+        parsed += 1
+        return real_loads(value)
+
+    monkeypatch.setattr(jsonl_tail.json, "loads", counting_loads)
+    aggregate(turns, now=base, home=tmp_path)
+
+    assert parsed == 2
+
+
+def test_aggregate_attributes_only_real_skill_roots(tmp_path):
+    base = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
+    turns = tmp_path / "logs" / "turns.jsonl"
+    turns.parent.mkdir()
+    paths = [
+        tmp_path / "skills" / "operator" / "SKILL.md",
+        tmp_path / ".mimir_builtin_skills" / "builtin" / "SKILL.md",
+        tmp_path / ".claude" / "skills" / "legacy" / "SKILL.md",
+        tmp_path / "state" / "scratch" / "skills" / "wiki" / "SKILL.md",
+    ]
+    events = []
+    for index, path in enumerate(paths):
+        tool_id = f"r{index}"
+        events.extend([
+            {"type": "tool_call", "id": tool_id, "name": "read_file",
+             "args": {"file_path": str(path)}},
+            {"type": "tool_result", "id": tool_id, "is_error": False},
+        ])
+    turns.write_text(json.dumps({"ts": _ts(1, base), "events": events}) + "\n")
+
+    aggs = aggregate(turns, now=base, home=tmp_path)
+
+    assert set(aggs) == {"operator", "builtin", "legacy"}
+    assert "wiki" not in aggs
 
 
 def test_aggregate_accumulates_across_turns(tmp_path):
@@ -660,7 +723,9 @@ def test_aggregate_threads_criteria_through_to_classifier(tmp_path):
             any_of=[{"tool_call": {"name": "send_message"}}],
         ),
     }
-    aggs = aggregate(turns, now=base, skill_criteria=criteria)
+    aggs = aggregate(
+        turns, now=base, skill_criteria=criteria, home=Path("/h"),
+    )
     alert = aggs["alert"]
     assert alert.incomplete == 1
     assert alert.load_incomplete == 1
@@ -725,6 +790,32 @@ def test_load_skill_success_criteria_scans_both_dirs(tmp_path: Path):
     assert "alert" in crits
     # Operator entry wins on collision.
     assert crits["alert"].any_of[0]["tool_call"]["name"] == "OPERATOR_OVERRIDE"
+
+
+def test_load_skill_success_criteria_caches_per_home(tmp_path: Path, monkeypatch):
+    import mimir.skill_outcomes as skill_outcomes
+
+    skill = tmp_path / "skills" / "cached" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: cached\nsuccess_criteria:\n  any_of: []\n---\nbody\n"
+    )
+    skill_outcomes.load_skill_success_criteria.cache_clear()
+    real_parse = skill_outcomes._parse_criteria_from_skill_md
+    parses = 0
+
+    def counting_parse(path):
+        nonlocal parses
+        parses += 1
+        return real_parse(path)
+
+    monkeypatch.setattr(
+        skill_outcomes, "_parse_criteria_from_skill_md", counting_parse,
+    )
+    skill_outcomes.load_skill_success_criteria(tmp_path)
+    skill_outcomes.load_skill_success_criteria(tmp_path)
+
+    assert parses == 1
 
 
 def test_load_skill_success_criteria_real_bundle(tmp_path: Path):

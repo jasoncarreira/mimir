@@ -255,7 +255,11 @@ surface described in [configuration.md](configuration.md).
 For each watched repository it detects new issues, new PRs, issue/PR comments,
 inline review comments, submitted reviews, pushes to open PRs, review requests,
 stale unresolved changes-requested reviews on Mimir's PRs, and mergeability
-state on Mimir's PRs. It deliberately does not poll workflow/check results or
+state on Mimir's PRs, and completed check failures on open PR heads. A failed
+check on a PR authored by `MIMIR_GITHUB_SELF_LOGIN` creates a remediation turn
+bound to the observed repository, PR, and immutable head; external contributors'
+failures are notification-only. Main-branch workflow failures remain the
+separate `github-ci-watch` responsibility. The poller deliberately does not poll
 general issue/PR close, reopen, merge, and label changes.
 
 The poller emits an agent turn for actionable activity; it does not
@@ -275,3 +279,19 @@ repository and survives its self-identity and trust filters. Its cursor is
 stored at `<MIMIR_HOME>/state/pollers/github-activity/cursor.json`; inspect
 `<MIMIR_HOME>/logs/events.jsonl` for `poller_complete`, `poller_stderr`, or
 review give-up signals when expected activity is missing.
+
+CI remediation requires `MIMIR_GITHUB_SELF_LOGIN` to identify owned PRs and the
+same writable repository binding and coding surface used by other remediation
+events. Its scope keeps `pr_comment` so an unsuccessful repair can leave an
+operator-visible trace, while excluding `pr_edit` and `pr_rerequest`. Delivery
+receipts are stored beside the cursor under `.delivery-receipts/`; enqueue
+rejection leaves no receipt, so the failure is retried rather than silently
+consumed. Before checkout, Mimir re-fetches the PR and current checks and
+terminates closed, superseded-head, or already-green work.
+
+The first observation after rollout deliberately baselines failures that already
+predate its collection window: an untouched red head stays quiet until its head
+or failure set changes. Open-PR discovery is also intentionally bounded to the
+100 most recently updated PRs. Newly completed checks normally refresh the
+relevant PR into that window; this is a bounded approximation, not complete
+enumeration of repositories with more than 100 open pull requests.

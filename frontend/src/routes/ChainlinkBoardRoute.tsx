@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { getChainlinkBoard, type ChainlinkBoardIssue } from "../api";
-import { drilldownHref } from "../routeState";
+import { drilldownHref, sanitizeHref } from "../routeState";
 import {
   Badge,
   Button,
@@ -150,7 +150,7 @@ function TreeNode({
   );
 }
 
-function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
+export function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
   const worklink = issue.worklink;
   if (!worklink) {
     return (
@@ -160,6 +160,9 @@ function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
       </div>
     );
   }
+  const evidenceHref = sanitizeHref(worklink.evidence_href);
+  const transcriptHref = sanitizeHref(worklink.transcript_href);
+  const prHref = sanitizeHref(worklink.pr_url);
   return (
     <div className="chainlink-drawer-section">
       <h3>Worklink</h3>
@@ -174,9 +177,9 @@ function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
       <div className="chainlink-artifact-links">
         <Link to={drilldownHref("/turns", { issue: issue.id, filter: `#${issue.id}`, q: String(issue.id) })}>Related turns</Link>
         <Link to={drilldownHref("/ops", { tab: "chainlink", issue: issue.id, filter: `#${issue.id}` })}>Ops signals</Link>
-        {worklink.evidence_href ? <a href={worklink.evidence_href}>Evidence JSON</a> : null}
-        {worklink.transcript_href ? <a href={worklink.transcript_href}>Run transcript</a> : null}
-        {worklink.pr_url ? <a href={worklink.pr_url}>Review PR</a> : null}
+        {evidenceHref ? <a href={evidenceHref}>Evidence JSON</a> : null}
+        {transcriptHref ? <a href={transcriptHref}>Run transcript</a> : null}
+        {prHref ? <a href={prHref}>Review PR</a> : null}
       </div>
       {worklink.tests ? <CodeBlock code={JSON.stringify(worklink.tests, null, 2)} language="json" title="Tests" /> : null}
     </div>

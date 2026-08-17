@@ -8,8 +8,10 @@ the folded ``HumanMessage`` content.
 """
 from __future__ import annotations
 
+import ast
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -73,6 +75,61 @@ def _resolver(tmp_path) -> IdentityResolver:
     resolver = IdentityResolver(tmp_path)
     resolver.reload()
     return resolver
+
+
+def _recorded_grant_for_test(
+    channel_id: str, tool_name: str, target: str, *, now: float | None = None,
+):
+    now = time.monotonic() if now is None else now
+    with approval._LOCK:
+        approval._discard_expired_locked(now)
+        return next((
+            grant for grant in approval._GRANTS.values()
+            if grant.channel_id == channel_id
+            and grant.tool_name == tool_name
+            and grant.target == target
+        ), None)
+
+
+def _create_bound_request_for_test(
+    *, channel_id: str = "slack-C1", tool_name: str = "post_message",
+    target: str = "slack-C2", requesting_principal: str = "user",
+    now: float | None = None,
+):
+    carrier = InformationFlowLabels(sources=(_source("user", channel_id),))
+    auth = AuthContext(
+        principal=requesting_principal,
+        canonical_principal=requesting_principal,
+        roles=("user",),
+        event_ingress="slack",
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=carrier,
+    )
+    auth.ifc_state.merge(carrier)
+    return approval.create_request(
+        channel_id=channel_id,
+        tool_name=tool_name,
+        target=target,
+        requesting_principal=requesting_principal,
+        sink_category="cross_channel",
+        turn_id="turn-bound-request",
+        request_carrier=carrier,
+        ifc_state=auth.ifc_state,
+        request_source_arrival_ordinal=auth.ifc_state.source_arrival_ordinal(),
+        now=now,
+    )
+
+
+def _record_authenticated_response_for_test(event, resolver, *, now=None):
+    return approval.record_authenticated_response(
+        event,
+        resolver,
+        now=now,
+        approval_event=event,
+        reply_source=_source("operator", event.channel_id),
+    )
 
 
 def _approval_event(content: str, *, author: str = "slack-U1") -> AgentEvent:
@@ -385,7 +442,7 @@ def test_before_model_folds_attachments_not_just_content(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_request_tool_records_pending_and_uses_operator_alert_path(
+async def test_non_category_approval_is_removed_without_occupying_channel_slot(
     tmp_path, monkeypatch,
 ):
     sent: list[tuple[str, str]] = []
@@ -417,7 +474,9 @@ async def test_request_tool_records_pending_and_uses_operator_alert_path(
         trigger="user_message",
         channel_id="slack-C1",
         interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=InformationFlowLabels(sources=(_source("user", "slack-C1"),)),
     )
+    auth.ifc_state.merge(auth.ifc_labels)
     ctx = TurnContext(
         turn_id="turn-approval",
         session_id="slack-C1",
@@ -425,6 +484,7 @@ async def test_request_tool_records_pending_and_uses_operator_alert_path(
         channel_id="slack-C1",
         started_at=time.monotonic(),
         auth_context=auth,
+        ifc_labels=auth.ifc_labels,
         interactivity=TurnInteractivity.INTERACTIVE,
     )
     token = set_current_turn(ctx)
@@ -437,27 +497,34 @@ async def test_request_tool_records_pending_and_uses_operator_alert_path(
     finally:
         reset_current_turn(token)
 
-    token = set_current_turn(ctx)
-    try:
-        repeated = await tool_registry.request_operator_approval.ainvoke({
-            "tool_name": "post_message",
-            "target": "slack-C2",
-            "reason": "repeat the request",
-        })
-    finally:
-        reset_current_turn(token)
+    assert result == "request_operator_approval refused: sink_category is required"
+    assert approval.pending_request("slack-C1") is None
+    assert sent == []
+    removed, removed_status = approval.create_request(
+        channel_id="slack-C1",
+        tool_name="post_message",
+        target="slack-C2",
+        requesting_principal="user",
+    )
+    assert removed is None
+    assert removed_status == "invalid_category_binding"
+    assert approval.pending_request("slack-C1") is None
 
-    pending = approval.pending_request("slack-C1")
-    assert pending is not None
-    assert (pending.tool_name, pending.target) == ("post_message", "slack-C2")
-    assert sent and sent[0][0] == "slack-C1"
-    assert 'Tool: "post_message"' in sent[0][1]
-    assert 'Target: "slack-C2"' in sent[0][1]
-    assert pending.request_id not in sent[0][1]
-    assert pending.request_id not in result
-    assert "request_already_pending" in repeated
-    assert len(sent) == 1
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    labels = InformationFlowLabels(sources=(_source("user", "slack-C1"),))
+    auth.ifc_state.merge(labels)
+    request, status = approval.create_request(
+        channel_id="slack-C1",
+        tool_name="post_message",
+        target="slack-C2",
+        requesting_principal="user",
+        turn_id=ctx.turn_id,
+        sink_category="cross_channel",
+        request_carrier=labels,
+        ifc_state=auth.ifc_state,
+        request_source_arrival_ordinal=auth.ifc_state.source_arrival_ordinal(),
+    )
+    assert request is not None
+    assert status == "pending"
 
 
 @pytest.mark.asyncio
@@ -496,6 +563,7 @@ async def test_autonomous_turns_cannot_create_approval_request(
     try:
         result = await tool_registry.request_operator_approval.ainvoke({
             "tool_name": "post_message", "target": "slack-C2", "reason": "x",
+            "sink_category": "cross_channel",
         })
     finally:
         reset_current_turn(token)
@@ -522,20 +590,15 @@ async def test_dispatcher_records_exact_grant_only_from_authenticated_admin_inje
     dispatcher = Dispatcher(cfg, resolver=resolver)
     dispatcher._in_flight.add("slack-C1")
     mti.register_inflight("slack-C1")
-    request, _ = approval.create_request(
-        channel_id="slack-C1",
-        tool_name="post_message",
-        target="slack-C2",
-        requesting_principal="user",
-    )
+    request, _ = _create_bound_request_for_test()
 
     accepted = await dispatcher.enqueue(_approval_event("APPROVE"))
 
     assert accepted is True
-    grant = approval.recorded_grant("slack-C1", "post_message", "slack-C2")
+    grant = _recorded_grant_for_test("slack-C1", "post_message", "slack-C2")
     assert grant is not None and grant.request_id == request.request_id
     assert grant.operator_principal == "operator"
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C3") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C3") is None
     assert [event.content for event in mti._drain("slack-C1")] == ["APPROVE"]
 
 
@@ -546,20 +609,15 @@ async def test_dispatcher_records_exact_grant_only_from_authenticated_admin_inje
 )
 def test_resolved_nonoperator_responder_is_refused(tmp_path, author):
     resolver = _resolver(tmp_path)
-    approval.create_request(
-        channel_id="slack-C1",
-        tool_name="post_message",
-        target="slack-C2",
-        requesting_principal="user",
-    )
+    _create_bound_request_for_test()
 
-    result = approval.record_authenticated_response(
+    result = _record_authenticated_response_for_test(
         _approval_event("APPROVE", author=author), resolver,
     )
 
     assert result == "unauthenticated_operator"
     assert approval.pending_request("slack-C1") is not None
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
 
 
 @pytest.mark.parametrize(
@@ -577,74 +635,114 @@ def test_model_reachable_content_and_nonoperator_ingress_cannot_grant(
 ):
     resolver = _resolver(tmp_path)
     mti.register_inflight("slack-C1")
-    approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user",
-    )
+    _create_bound_request_for_test()
     event = _approval_event(content, author=author)
     event.source = source
 
     # The model-reachable registry API only queues text; it never invokes the
     # server-authenticated response recorder used by Dispatcher.enqueue.
     assert mti.inject_message("slack-C1", event) == "injected"
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
     assert approval.pending_request("slack-C1") is not None
 
     # There is deliberately no file-backed grant reader for model-writable
     # content to target.
     (tmp_path / "forged-approval").write_text("APPROVE", encoding="utf-8")
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
+
+
+def test_authenticated_injection_is_only_production_approval_recorder():
+    callers = []
+    root = Path(__file__).resolve().parents[1] / "mimir"
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = (
+                function.id if isinstance(function, ast.Name)
+                else function.attr if isinstance(function, ast.Attribute)
+                else None
+            )
+            if name == "record_authenticated_response":
+                callers.append(path.relative_to(root).as_posix())
+
+    assert callers == ["mid_turn_injection.py"]
 
 
 def test_nonmatching_declined_timed_out_and_unreachable_requests_fail_closed(tmp_path):
     resolver = _resolver(tmp_path)
-    request, _ = approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user", now=10.0,
-    )
-    assert approval.record_authenticated_response(
+    request, _ = _create_bound_request_for_test(now=10.0)
+    assert _record_authenticated_response_for_test(
         _approval_event("maybe"), resolver, now=11.0,
     ) == "not_an_approval_response"
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2", now=11.0) is None
-    assert approval.record_authenticated_response(
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2", now=11.0) is None
+    assert _record_authenticated_response_for_test(
         _approval_event("DECLINE"), resolver, now=12.0,
     ) == "declined"
     assert approval.pending_request("slack-C1", now=12.0) is None
 
-    approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user", now=20.0,
-    )
+    _create_bound_request_for_test(now=20.0)
     assert approval.pending_request(
         "slack-C1", now=20.0 + approval.APPROVAL_TIMEOUT_SECONDS,
     ) is None
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
     assert request is not None
+
+
+def test_recorded_grant_expires_at_original_request_deadline(tmp_path):
+    resolver = _resolver(tmp_path)
+    request, status = _create_bound_request_for_test(now=10.0)
+    assert status == "pending"
+    assert _record_authenticated_response_for_test(
+        _approval_event("APPROVE"), resolver, now=11.0,
+    ) == "granted"
+    assert _recorded_grant_for_test(
+        "slack-C1", "post_message", "slack-C2", now=11.0,
+    ) is not None
+
+    deadline = 10.0 + approval.APPROVAL_TIMEOUT_SECONDS
+    assert _recorded_grant_for_test(
+        "slack-C1", "post_message", "slack-C2", now=deadline,
+    ) is None
+    replacement, replacement_status = _create_bound_request_for_test(now=deadline)
+    assert request is not None
+    assert replacement is not None
+    assert replacement_status == "pending"
 
 
 def test_grant_is_one_shot_and_cannot_replay_against_second_request(tmp_path):
     resolver = _resolver(tmp_path)
-    first, _ = approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user",
-    )
-    assert approval.record_authenticated_response(
+    first, _ = _create_bound_request_for_test()
+    assert _record_authenticated_response_for_test(
         _approval_event("APPROVE"), resolver,
     ) == "granted"
-    assert approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user",
-    )[1] == "grant_already_recorded"
-    consumed = approval.consume_grant("slack-C1", "post_message", "slack-C2")
-    assert consumed is not None and consumed.request_id == first.request_id
-    assert approval.consume_grant("slack-C1", "post_message", "slack-C2") is None
-
-    second, status = approval.create_request(
-        channel_id="slack-C1", tool_name="post_message", target="slack-C2",
-        requesting_principal="user",
+    assert _create_bound_request_for_test()[1] == "grant_already_recorded"
+    grant = _recorded_grant_for_test("slack-C1", "post_message", "slack-C2")
+    assert grant is not None
+    consume_args = {
+        "request_id": grant.request_id,
+        "turn_id": grant.turn_id,
+        "requesting_principal": grant.requesting_principal,
+        "sink_category": grant.sink_category,
+        "request_carrier": grant.request_carrier,
+        "ifc_state": grant.ifc_state,
+        "request_source_arrival_ordinal": grant.request_source_arrival_ordinal,
+        "approval_event": grant.approval_event,
+        "reply_source": grant.reply_source,
+    }
+    consumed = approval.consume_grant(
+        "slack-C1", "post_message", "slack-C2", **consume_args,
     )
+    assert consumed is not None and consumed.request_id == first.request_id
+    assert approval.consume_grant(
+        "slack-C1", "post_message", "slack-C2", **consume_args,
+    ) is None
+
+    second, status = _create_bound_request_for_test()
     assert status == "pending" and second.request_id != first.request_id
-    assert approval.recorded_grant("slack-C1", "post_message", "slack-C2") is None
+    assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
 
 
 @pytest.mark.asyncio
@@ -674,7 +772,9 @@ async def test_unreachable_operator_cancels_pending_request(tmp_path, monkeypatc
         trigger="user_message",
         channel_id="slack-C1",
         interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_labels=InformationFlowLabels(sources=(_source("user", "slack-C1"),)),
     )
+    auth.ifc_state.merge(auth.ifc_labels)
     ctx = TurnContext(
         turn_id="turn-unreachable",
         session_id="slack-C1",
@@ -682,12 +782,14 @@ async def test_unreachable_operator_cancels_pending_request(tmp_path, monkeypatc
         channel_id="slack-C1",
         started_at=time.monotonic(),
         auth_context=auth,
+        ifc_labels=auth.ifc_labels,
         interactivity=TurnInteractivity.INTERACTIVE,
     )
     token = set_current_turn(ctx)
     try:
         result = await tool_registry.request_operator_approval.ainvoke({
             "tool_name": "post_message", "target": "slack-C2", "reason": "x",
+            "sink_category": "cross_channel",
         })
     finally:
         reset_current_turn(token)
@@ -829,7 +931,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
     ) in sent[0]
     assert 'principal="user"' in sent[0]
     assert 'resource_id="slack-C1"' in sent[0]
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "ignored by category authority",
     ) is None
     current = auth.ifc_state.current()
@@ -957,7 +1059,7 @@ async def test_category_request_without_live_ifc_refuses_before_pending_authorit
             "request_operator_approval refused: no live information-flow state"
         )
         assert approval.pending_request("slack-C1") is None
-        assert approval.recorded_grant(
+        assert _recorded_grant_for_test(
             "slack-C1", "shell_exec", "category target has no authority",
         ) is None
         assert channels.alerts == []
@@ -1004,7 +1106,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
     assert request is None
     assert status == "invalid_category_binding"
     assert approval.pending_request("slack-C1") is None
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
     assert not auth.ifc_state.consume_sink_approval(
@@ -1032,7 +1134,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
     assert valid is not None
     assert valid_status == "pending"
     assert approval.pending_request("slack-C1") is valid
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
     assert not auth.ifc_state.consume_sink_approval(
@@ -1412,7 +1514,7 @@ async def test_intervening_source_before_authenticated_reply_spends_category_gra
         reset_current_turn(token)
 
     assert not _category_admitted(auth, ctx)
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
 
@@ -1446,7 +1548,7 @@ async def test_same_provenance_source_before_authenticated_reply_spends_category
         reset_current_turn(token)
 
     assert not _category_admitted(auth, ctx)
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
 
@@ -1469,7 +1571,7 @@ async def test_wrong_fold_event_identity_spends_category_grant(tmp_path, monkeyp
         reset_current_turn(token)
 
     assert not _category_admitted(auth, ctx)
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
 
@@ -1479,23 +1581,42 @@ async def test_pre_fold_state_change_refuses_authenticated_category_install(
     tmp_path, monkeypatch,
 ):
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
+    emitted = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **fields: emitted.append((event_type, fields)),
+    )
     token = set_current_turn(ctx)
     try:
         await _request_shell_category()
+        request = approval.pending_request("slack-C1")
+        assert request is not None
         auth.ifc_state.merge(
             InformationFlowLabels().with_source(
                 _source("filesystem", "/tmp/new-secret", domain="filesystem", bridge_instance="local", source_kind="file")
             )
         )
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
-        mti.MidTurnInjectionMiddleware().before_model({}, None)
+        folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
         reset_current_turn(token)
 
     assert not _category_admitted(auth, ctx)
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
+    assert "operator approval refused" in folded["messages"][0].content
+    assert "information-flow sources changed" in folded["messages"][0].content
+    assert len(emitted) == 1
+    event_type, fields = emitted[0]
+    assert event_type == "operator_approval_install_failed"
+    assert fields == {
+        "channel_id": "slack-C1",
+        "request_id": request.request_id,
+        "turn_id": ctx.turn_id,
+        "sink_category": "shell_process",
+        "reason": "information_flow_binding_changed",
+    }
 
 
 @pytest.mark.asyncio
@@ -1531,7 +1652,7 @@ async def test_post_fold_live_state_race_refuses_and_spends_category_grant(
 
     assert raced
     assert not _category_admitted(auth, ctx)
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
 
@@ -1613,7 +1734,7 @@ async def test_category_dispatcher_refuses_unauthorized_approving_responder(
 
     assert "APPROVE" in folded["messages"][0].content
     assert approval.pending_request("slack-C1") is not None
-    assert approval.recorded_grant(
+    assert _recorded_grant_for_test(
         "slack-C1", "shell_exec", "category target has no authority",
     ) is None
     assert not _category_admitted(auth, ctx)

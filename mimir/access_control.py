@@ -1043,6 +1043,10 @@ _REPO_PR_REMEDIATION_ACTIONS = frozenset({
     RepoPRAction.PR_EDIT.value,
     RepoPRAction.PR_REREQUEST.value,
 })
+_REPO_PR_CI_REMEDIATION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS - frozenset({
+    RepoPRAction.PR_EDIT.value,
+    RepoPRAction.PR_REREQUEST.value,
+})
 _REPO_PR_CONFLICT_RESOLUTION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS
 _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.INSPECT.value,
@@ -1213,6 +1217,7 @@ def _repo_pr_scope_resolution(
     )
     is_remediation = is_fresh_changes_requested_remediation or event_type in {
         "pr_changes_requested_stale",
+        "pr_ci_failure",
         "pr_mergeability_rebase",
         "pr_mergeability_conflicting",
     }
@@ -1261,6 +1266,8 @@ def _repo_pr_scope_resolution(
         allowed_operations=(
             _REPO_PR_CONFLICT_RESOLUTION_ACTIONS
             if event_type == "pr_mergeability_conflicting"
+            else _REPO_PR_CI_REMEDIATION_ACTIONS
+            if event_type == "pr_ci_failure"
             else _REPO_PR_REMEDIATION_ACTIONS
             if is_remediation
             else _REPO_PR_REVIEW_ACTIONS
@@ -2280,7 +2287,12 @@ def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
     # controls are explicit. Requiring them makes the argv safe independently
     # of .gitconfig/.gitattributes in the inspected checkout.
     required_safety_options = {"--no-ext-diff", "--no-textconv"}
-    if not required_safety_options.issubset(subcommand_arguments):
+    option_arguments = (
+        subcommand_arguments[:subcommand_arguments.index("--")]
+        if "--" in subcommand_arguments
+        else subcommand_arguments
+    )
+    if not required_safety_options.issubset(option_arguments):
         return False
     return _arguments_match_allowlist(
         subcommand_arguments,
@@ -2801,9 +2813,9 @@ def _target_matches_repo_review_shell_command(
 
     # ``--jq`` is deliberately absent from every option set below, here and in
     # the maintenance profile. ``gh`` evaluates the filter in-process, and jq's
-    # ``env`` / ``$ENV`` builtins read the process environment — which
-    # ``direct_exec_env`` copies wholesale from the parent, credentials included.
-    # ``gh pr view <n> --repo <r> --json reviews --jq env`` was therefore an
+    # ``env`` / ``$ENV`` builtins read the process environment. ``gh`` is the one
+    # service-shell executable explicitly given GITHUB_TOKEN, so ``gh pr view
+    # <n> --repo <r> --json reviews --jq env`` was therefore an
     # admitted command that printed DISCORD_TOKEN, GITHUB_TOKEN, GPG_KEY,
     # MIMIR_API_KEY and the provider keys into the tool result, and from there
     # into the model's context and the turn transcript. Enforcement was no
@@ -3924,6 +3936,11 @@ def parse_service_shell_argv_with_diagnostics(
 
     allowed = False
     if destination == "scheduler_read_only":
+        # Unlike maintenance and repo_review, this profile is not bound to one
+        # server-selected repository: scheduler/custom jobs may select any
+        # authorized cwd. It therefore pins Git and requires effective safety
+        # options in the input, while the root-bound profiles additionally add
+        # -C, config, and discovered-filter overrides in their binders.
         allowed = _target_matches_read_only_shell_command(argv)
     elif destination == "repo_review":
         if not _target_matches_repo_review_shell_command(argv, review_state):
@@ -4658,6 +4675,19 @@ def _live_untrusted_active_ingest(
     return result if isinstance(result, bool) else None
 
 
+def _has_untrusted_active_ingest(
+    auth_context: Any, fallback: Any, *, missing_is_tainted: bool = False,
+) -> bool:
+    """Resolve taint consistently, failing closed for indeterminate live state."""
+    state = getattr(auth_context, "ifc_state", None)
+    if callable(getattr(state, "has_untrusted_active_ingest", None)):
+        live_taint = _live_untrusted_active_ingest(auth_context, fallback)
+        return True if live_taint is None else live_taint
+    return missing_is_tainted or bool(
+        getattr(fallback, "has_untrusted_active_ingest", False)
+    )
+
+
 def _source_is_triggering_channel_compatible(
     source: Any,
     *,
@@ -4877,22 +4907,20 @@ class SinkGate:
         if tool_name in {"shell_exec", "bash_async"}:
             chainlink_argv = _chainlink_target_argv(target)
             if chainlink_argv is not None:
-                live_taint = _live_untrusted_active_ingest(
+                has_untrusted_active_ingest = _has_untrusted_active_ingest(
                     auth_context, getattr(auth_context, "ifc_labels", None),
+                    missing_is_tainted=True,
                 )
                 if (
                     _chainlink_command_is_mutation(chainlink_argv)
-                    and live_taint is not False
+                    and has_untrusted_active_ingest
                 ):
                     return False, _CHAINLINK_TAINT_REFUSAL
                 # Bounded tracker queries remain available even where the
                 # surrounding profile's shell is taint-gated.
                 return True, None
-        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
-        has_untrusted_active_ingest = (
-            live_taint
-            if live_taint is not None
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
         )
         # Shell is an executable sink even when argv is tightly scoped. The
         # profile bounds capability; IFC independently prevents untrusted PR
@@ -4951,13 +4979,8 @@ class SinkGate:
     @classmethod
     def _is_admin_operator_turn(cls, ifc_labels: Any, auth_context: Any) -> bool:
         """Recognize an untainted, bridge-authenticated admin operator turn."""
-        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
-        state = getattr(auth_context, "ifc_state", None)
-        has_untrusted_active_ingest = (
-            live_taint
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
         )
         return (
             cls._is_trusted_operator_turn(ifc_labels, auth_context)
@@ -5082,12 +5105,8 @@ class SinkGate:
                 resolved_sink_target=resolved_target,
             )
         state = getattr(auth_context, "ifc_state", None)
-        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
-        has_untrusted_active_ingest = (
-            live_taint
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
         )
         if (
             is_application_egress
@@ -5241,23 +5260,17 @@ class SinkGate:
             )
             service_target_allowed = False
             if service_policy is not None and adapter is not None:
-                if (
-                    adapter is _target_matches_shell_profile
-                    and service_policy.destination == "repo_review"
-                ):
-                    service_target_allowed = (
-                        repo_review_state_refusal is None
-                        and parse_service_shell_argv(
-                            target,
-                            service_policy.destination,
-                            review_state=review_state,
-                        ) is not None
+                service_target_allowed = (
+                    not (
+                        adapter is _target_matches_shell_profile
+                        and service_policy.destination == "repo_review"
+                        and repo_review_state_refusal is not None
                     )
-                else:
-                    service_target_allowed = _sink_adapter_admits(
+                    and _sink_adapter_admits(
                         adapter, target, service_policy.destination, service,
                         review_state=review_state,
                     )
+                )
             if (
                 not service_target_allowed
                 and sink_category is SinkCategory.FILE
@@ -5485,13 +5498,8 @@ class SinkGate:
         trusted_operator_turn = cls._is_trusted_operator_turn(
             ifc_labels, auth_context,
         )
-        state = getattr(auth_context, "ifc_state", None)
-        live_taint = _live_untrusted_active_ingest(auth_context, ifc_labels)
-        has_untrusted_active_ingest = (
-            live_taint
-            if state is not None
-            and callable(getattr(state, "has_untrusted_active_ingest", None))
-            else bool(getattr(ifc_labels, "has_untrusted_active_ingest", False))
+        has_untrusted_active_ingest = _has_untrusted_active_ingest(
+            auth_context, ifc_labels,
         )
         triggering_channel = getattr(auth_context, "channel_id", None)
         resolved_target_channel = (

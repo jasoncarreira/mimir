@@ -147,7 +147,6 @@ def _patch_factory(
     import mimir.saga_client
     import mimir.search
     import mimir.session_manager
-    import mimir.subagent_inbox
     import mimir.tools
     import mimir.tools.forge
     import mimir.turn_event_bus
@@ -214,13 +213,6 @@ def _patch_factory(
             if "sessions" in failing_closers:
                 raise OSError("sessions cleanup failed")
 
-    class SubagentInbox:
-        def __init__(self) -> None:
-            events.append(("construct", "inbox"))
-
-        def evict_channel(self, channel_id: str) -> bool:
-            return True
-
     class CommitmentsStore:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
@@ -258,7 +250,6 @@ def _patch_factory(
     monkeypatch.setattr(mimir.saga_client, "make_saga_client", make_saga_client)
     monkeypatch.setattr(mimir.search, "Indexer", Indexer)
     monkeypatch.setattr(mimir.session_manager, "SessionManager", SessionManager)
-    monkeypatch.setattr(mimir.subagent_inbox, "SubagentInbox", SubagentInbox)
     monkeypatch.setattr(mimir.commitments, "CommitmentsStore", CommitmentsStore)
     monkeypatch.setattr(mimir.turn_event_bus, "TurnEventBus", TurnEventBus)
     monkeypatch.setattr(mimir.agent, "Agent", Agent)
@@ -359,7 +350,6 @@ def test_runtime_public_two_phase_api() -> None:
         "indexer",
         "saga_client",
         "sessions",
-        "subagent_inbox",
         "commitments_store",
         "turn_event_bus",
         "replayed_messages",
@@ -502,7 +492,6 @@ def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
     import mimir.scheduler
     import mimir.search
     import mimir.session_manager
-    import mimir.subagent_inbox
     import mimir.turn_event_bus
     import mimir.turn_logger
     from mimir.saga import _config_io
@@ -538,7 +527,6 @@ def test_core_phase_does_not_construct_runtime_or_entrypoint_collaborators(
         (mimir.scheduler, "Scheduler"),
         (mimir.search, "Indexer"),
         (mimir.session_manager, "SessionManager"),
-        (mimir.subagent_inbox, "SubagentInbox"),
         (mimir.turn_event_bus, "TurnEventBus"),
         (mimir.turn_logger, "TurnLogger"),
     ):
@@ -654,7 +642,6 @@ async def test_agent_collaborator_parity_and_final_commit(
         "saga_client": bundle.saga_client,
         "session_manager": bundle.sessions,
         "scheduler": adapters.scheduler,
-        "subagent_inbox": bundle.subagent_inbox,
         "channel_registry": adapters.channels,
         "dispatcher": adapters.dispatcher,
         "commitments_store": bundle.commitments_store,
@@ -668,7 +655,6 @@ async def test_agent_collaborator_parity_and_final_commit(
         ("saga", core.saga_db_path),
         "indexer",
         "sessions",
-        "inbox",
         "commitments",
         "turn_event_bus",
         "agent",
@@ -686,12 +672,10 @@ async def test_runtime_registers_closers_as_resources_are_constructed(
 ) -> None:
     import mimir.search
     import mimir.session_manager
-    import mimir.subagent_inbox
 
     for failure_point, expected_closes in (
         ("indexer", ["saga"]),
         ("sessions", ["indexer", "saga"]),
-        ("inbox", ["sessions", "indexer", "saga"]),
     ):
         events: list[tuple[str, Any]] = []
         with monkeypatch.context() as isolated:
@@ -709,13 +693,6 @@ async def test_runtime_registers_closers_as_resources_are_constructed(
                         raise original
 
                 isolated.setattr(mimir.session_manager, "SessionManager", FailingSessions)
-            else:
-                class FailingInbox:
-                    def __init__(self) -> None:
-                        raise original
-
-                isolated.setattr(mimir.subagent_inbox, "SubagentInbox", FailingInbox)
-
             with pytest.raises(LookupError) as caught:
                 await runtime.create_agent_runtime(
                     _config(tmp_path),
@@ -826,7 +803,7 @@ async def test_dispatcher_and_session_callback_parity_and_order(
     ]
     assert events[-1] == ("run_turn", bundle.agent.run_turn)
 
-    assert dispatcher._on_channel_idle("channel-1") == (True, True)
+    assert dispatcher._on_channel_idle("channel-1") is True
     injected_event = object()
     await dispatcher._on_inject(injected_event)
     assert ("injected", injected_event) in events
@@ -1187,17 +1164,6 @@ async def test_bundle_aclose_times_out_each_resource_and_continues(
     finally:
         release.set()
         await asyncio.sleep(0)
-
-
-def test_bundle_aclose_total_owned_wait_budget_is_thirty_five_seconds() -> None:
-    from mimir.background_tasks import BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS
-
-    assert BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS == 5.0
-    assert runtime.RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS == 10.0
-    assert (
-        BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS
-        + 3 * runtime.RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS
-    ) == 35.0
 
 
 @pytest.mark.asyncio

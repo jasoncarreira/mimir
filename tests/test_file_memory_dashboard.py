@@ -396,6 +396,24 @@ def test_render_memory_html_has_search_ui() -> None:
     assert "view=search" in html
 
 
+def test_search_result_quote_bearing_path_is_inert_and_selectable(tmp_path: Path) -> None:
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    filename = 'x" onmouseover="alert(1).md'
+    (memory / filename).write_text("matching content\n")
+
+    result = search_files([memory], "matching")
+    path = f"memory/{filename}"
+    assert result["hits"][0]["path"] == path
+
+    html = render_memory_html()
+    assert "hitEl.dataset.path = hit.path;" in html
+    assert "pathEl.textContent = hit.path" in html
+    assert 'snippetEl.textContent = hit.snippet;' in html
+    assert 'loadFile(hitEl.dataset.path, null)' in html
+    assert 'data-path="\' + esc(hit.path)' not in html
+
+
 # ─── /memory web routes ────────────────────────────────────────────
 
 

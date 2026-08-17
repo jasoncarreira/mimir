@@ -38,6 +38,7 @@ import asyncio
 import os
 import re
 import sys
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,11 +217,13 @@ class BacklinksGraph:
         orphans: list[str],
         dangling: list[dict],
         collisions: dict[str, list[Path]] | None = None,
+        titles: dict[str, str] | None = None,
     ) -> None:
         self.pages = pages
         self.orphans = orphans
         self.dangling = dangling
         self.collisions = collisions or {}
+        self.titles = titles or {}
 
 
 def build_graph(wiki_dir: Path) -> BacklinksGraph:
@@ -240,6 +243,7 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
     page_data: dict[str, dict] = {}
     inbound: defaultdict[str, set[str]] = defaultdict(set)
     dangling: list[dict] = []
+    titles: dict[str, str] = {}
 
     # Re-derive collisions from the slug index instead of a second
     # filesystem scan — same result, half the IO.
@@ -279,6 +283,7 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
             "path": source_path,
             "outbound": sorted(set(outbound)),
         }
+        titles[source_path] = _title_from_markdown(text, rel_path.stem)
 
     for path_str in page_data:
         page_data[path_str]["inbound"] = sorted(inbound.get(path_str, set()))
@@ -287,7 +292,7 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
 
     return BacklinksGraph(
         pages=page_data, orphans=orphans, dangling=dangling,
-        collisions=collisions,
+        collisions=collisions, titles=titles,
     )
 
 
@@ -324,14 +329,9 @@ def build_wiki_payload(wiki_dir: Path) -> dict[str, Any]:
             mtime = datetime.fromtimestamp(
                 stat.st_mtime, tz=timezone.utc,
             ).isoformat(timespec="seconds")
-        try:
-            text = full_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            text = ""
-        title = _title_from_markdown(text, data["slug"])
         page = {
             "slug": data["slug"],
-            "title": title,
+            "title": graph.titles.get(path_str, data["slug"]),
             "category": _category_of(rel_path),
             "path": path_str,
             "mtime": mtime,
@@ -489,6 +489,23 @@ def render_backlinks_index_md(
 # ─── Driver ──────────────────────────────────────────────────────────
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write text via a same-directory temporary file and atomic replace."""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 async def run(home: Path) -> dict:
     """Walk the wiki, write all three reports, emit the algedonic event
     if the wiki has any orphans or dangling links.
@@ -502,14 +519,14 @@ async def run(home: Path) -> dict:
     graph = build_graph(wiki_dir)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    (wiki_dir / "orphans.md").write_text(
-        render_orphans_md(graph, generated_at), encoding="utf-8",
+    _atomic_write_text(
+        wiki_dir / "orphans.md", render_orphans_md(graph, generated_at),
     )
-    (wiki_dir / "dangling-links.md").write_text(
-        render_dangling_md(graph, generated_at), encoding="utf-8",
+    _atomic_write_text(
+        wiki_dir / "dangling-links.md", render_dangling_md(graph, generated_at),
     )
-    (wiki_dir / "backlinks-index.md").write_text(
-        render_backlinks_index_md(graph, generated_at), encoding="utf-8",
+    _atomic_write_text(
+        wiki_dir / "backlinks-index.md", render_backlinks_index_md(graph, generated_at),
     )
 
     page_count = len(graph.pages)

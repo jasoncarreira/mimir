@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,15 +16,23 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
-def test_direct_exec_env_preserves_unrelated_command_environment(monkeypatch) -> None:
+def test_direct_exec_env_defaults_to_minimal_non_secret_environment(monkeypatch) -> None:
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q")
     monkeypatch.setenv("PYTEST_PLUGINS", "example")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("HOME", "/safe/home")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("LC_TEST_SENTINEL", "terminal-setting")
 
     env = direct_exec_env(["/bin/echo", "status"])
 
-    assert env["PYTEST_ADDOPTS"] == "-q"
-    assert env["PYTEST_PLUGINS"] == "example"
-    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD" not in env
+    assert env == {
+        "HOME": "/safe/home",
+        "LANG": "C.UTF-8",
+        "PATH": _shell_env._TRUSTED_PATH,
+    } | {
+        key: value for key, value in os.environ.items() if key.startswith("LC_")
+    }
 
 
 def test_login_shell_command_keeps_venv_console_scripts_after_system_tools() -> None:
@@ -144,6 +153,26 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch)
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
 
 
+def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
+    """Only review pull/push need auth, supplied by the configured helper.
+
+    Inspection Git has ``credential.helper=`` injected into argv. Authorized
+    review pull/push omit that override and use the operator-installed,
+    repository-scoped credential helper; neither case needs a token in env.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("GIT_ASKPASS", "/tmp/credential-helper")
+
+    env = direct_exec_env(["/usr/bin/git", "push", "origin", "topic"])
+
+    assert "GITHUB_TOKEN" not in env
+    assert "GIT_ASKPASS" not in env
+    assert set(env) <= {
+        "PATH", "HOME", "LANG", "TZ", "GIT_CONFIG_NOSYSTEM", "GIT_PAGER",
+        "GIT_OPTIONAL_LOCKS",
+    } | {key for key in env if key.startswith("LC_")}
+
+
 def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatch) -> None:
     from mimir.forge import github as github_module
 
@@ -214,6 +243,117 @@ def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
     assert overlay["JQ_ENV_SENTINEL"] is None
     assert overlay["GITHUB_TOKEN"] is None
     assert overlay["PYTHONUNBUFFERED"] is None
+
+
+def test_every_pinned_service_command_inherits_safe_default(
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    from mimir import access_control
+
+    monkeypatch.setenv("SERVICE_ENV_SENTINEL", "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+
+    assert set(_shell_env._CREDENTIAL_ENV_BY_EXECUTABLE) == {"gh"}
+    for command in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS:
+        if command == "gh":
+            continue
+        argv = [str(maintenance_pinned_executables[command])]
+        env = direct_exec_env(argv)
+        expected = _shell_env._minimal_direct_exec_env()
+        if command == "git":
+            expected.update({
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_PAGER": "cat",
+                "GIT_OPTIONAL_LOCKS": "0",
+            })
+        assert "SERVICE_ENV_SENTINEL" not in env, command
+        assert "GITHUB_TOKEN" not in env, command
+        assert env == expected, (command, env)
+
+
+def _run_admitted_proc_reader(command: str) -> bytes:
+    """Fork so ``{pid}`` can name the process that will exec the reader."""
+    from mimir.access_control import parse_service_shell_argv
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            os.dup2(write_fd, 1)
+            os.close(write_fd)
+            argv = parse_service_shell_argv(
+                command.format(pid=os.getpid()), "maintenance",
+            )
+            if argv is None:
+                os._exit(120)
+            os.execve(argv[0], argv, direct_exec_env(argv))
+        except BaseException:
+            os._exit(121)
+
+    os.close(write_fd)
+    chunks = []
+    while chunk := os.read(read_fd, 65536):
+        chunks.append(chunk)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    return b"".join(chunks)
+
+
+@pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="Linux /proc required")
+@pytest.mark.parametrize("reader", ["cat", "head -c 65536", "tail -c 65536"])
+@pytest.mark.parametrize(
+    "operand", ["/proc/self/environ", "/proc/self/../self/environ", "/proc/{pid}/environ"],
+)
+def test_admitted_file_readers_cannot_disclose_child_environment(
+    reader: str,
+    operand: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+
+    for command in ("cat", "head", "tail"):
+        executable = Path(shutil.which(command) or "").resolve(strict=True)
+        monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, command, executable)
+    sentinel = b"SERVICE_PROC_ENV_SENTINEL=super-secret-value"
+    monkeypatch.setenv("SERVICE_PROC_ENV_SENTINEL", "super-secret-value")
+
+    output = _run_admitted_proc_reader(f"{reader} {operand}")
+
+    assert sentinel not in output
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [("cat", "alpha\nbeta\n"), ("head -c 5", "alpha"), ("tail -c 5", "beta\n")],
+)
+def test_admitted_file_readers_still_read_repository_files(
+    command: str,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from mimir.access_control import parse_service_shell_argv
+
+    executable_name = command.split()[0]
+    executable = Path(shutil.which(executable_name) or "").resolve(strict=True)
+    monkeypatch.setitem(
+        access_control._MAINTENANCE_PINNED_EXECUTABLES, executable_name, executable,
+    )
+    sample = tmp_path / "sample.txt"
+    sample.write_text("alpha\nbeta\n", encoding="utf-8")
+    argv = parse_service_shell_argv(
+        f"{command} {shlex.quote(str(sample))}", "maintenance",
+    )
+
+    assert argv is not None
+    completed = subprocess.run(
+        argv, capture_output=True, check=True, env=direct_exec_env(argv), text=True,
+    )
+    assert completed.stdout == expected
 
 
 def test_real_jq_cannot_read_parent_credentials_and_still_filters_json(

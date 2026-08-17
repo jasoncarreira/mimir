@@ -250,7 +250,17 @@ def stop_worklink(
     run = runner or _runner(home, chainlink_bin)
     with _claim_mutex(home):
         state = load_run_state(home, issue_id)
-        if state is None or state.phase != "spawned" or not process_is_alive(state):
+        if state is None:
+            return WorklinkStopResult(issue_id, False, reason="no live run")
+        if not process_is_alive(state):
+            clear_run_state(home, issue_id)
+            return WorklinkStopResult(
+                issue_id,
+                False,
+                state_cleared=load_run_state(home, issue_id) is None,
+                reason="no live run",
+            )
+        if state.phase != "spawned":
             return WorklinkStopResult(issue_id, False, reason="no live run")
         if not process_identity_verified(state):
             return WorklinkStopResult(
@@ -303,9 +313,6 @@ def reconcile_run_states(
                     reason="unparseable run state",
                 )
     for state in known_paths.values():
-        if state.shim_pid is not None:
-            alive.append(state)
-            continue
         if state.compute_name != "local_subprocess" or process_is_alive(state):
             alive.append(state)
             continue

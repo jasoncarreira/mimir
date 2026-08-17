@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import mimir.skill_defs as skill_defs
+
 from mimir.skill_defs import (
     _bundled_skill_names,
     installed_skill_names,
@@ -167,6 +169,75 @@ def test_refresh_overwrites_existing_content(tmp_path: Path):
     # Content was replaced with the canonical bundle.
     body = (target / "SKILL.md").read_text()
     assert "stale content from before refresh" not in body
+
+
+@pytest.mark.skipif(
+    not skill_defs.sys.platform.startswith("linux")
+    and skill_defs.sys.platform != "darwin",
+    reason="atomic directory exchange is supported on Linux and Darwin",
+)
+def test_refresh_atomically_exchanges_existing_directory(tmp_path: Path, monkeypatch):
+    target = tmp_path / ".mimir_builtin_skills" / "memory"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("# old\n")
+    real_exchange = skill_defs._atomic_exchange_directories
+    exchanges = 0
+
+    def observing_exchange(staged: Path, destination: Path) -> None:
+        nonlocal exchanges
+        exchanges += 1
+        assert destination.is_dir()
+        assert (destination / "SKILL.md").read_text() == "# old\n"
+        real_exchange(staged, destination)
+        assert destination.is_dir()
+
+    monkeypatch.setattr(
+        skill_defs, "_atomic_exchange_directories", observing_exchange,
+    )
+    out = seed_skills(tmp_path)
+
+    assert out["memory"] == "refreshed"
+    assert exchanges >= 1
+    assert "# old" not in (target / "SKILL.md").read_text()
+
+
+def test_atomic_exchange_uses_darwin_rename_swap(tmp_path: Path, monkeypatch):
+    staged = tmp_path / "staged"
+    destination = tmp_path / "destination"
+    staged.mkdir()
+    destination.mkdir()
+    calls: list[tuple[bytes, bytes, int]] = []
+
+    class FakeRename:
+        argtypes = None
+        restype = None
+
+        def __call__(self, source: bytes, target: bytes, flags: int) -> int:
+            calls.append((source, target, flags))
+            return 0
+
+    class FakeLibC:
+        renamex_np = FakeRename()
+
+    monkeypatch.setattr(skill_defs.sys, "platform", "darwin")
+    monkeypatch.setattr(skill_defs.ctypes, "CDLL", lambda *args, **kwargs: FakeLibC())
+
+    skill_defs._atomic_exchange_directories(staged, destination)
+
+    assert calls == [
+        (skill_defs.os.fsencode(staged), skill_defs.os.fsencode(destination), 2),
+    ]
+
+
+def test_atomic_exchange_rejects_unsupported_platform(tmp_path: Path, monkeypatch):
+    staged = tmp_path / "staged"
+    destination = tmp_path / "destination"
+    staged.mkdir()
+    destination.mkdir()
+    monkeypatch.setattr(skill_defs.sys, "platform", "win32")
+
+    with pytest.raises(OSError, match="unsupported on win32"):
+        skill_defs._atomic_exchange_directories(staged, destination)
 
 
 def test_memory_skill_no_brand_leaks(tmp_path: Path):

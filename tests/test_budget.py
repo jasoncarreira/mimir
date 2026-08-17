@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -167,7 +168,7 @@ def test_plan_window_saturation_suppresses(tmp_path: Path):
     # reset out beyond real wall-clock so the entry survives.
     future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
-        "7d_opus": {
+        "seven_day_opus": {
             "status": "allowed_warning",
             "utilization": 0.92,
             "resets_at": future,
@@ -177,7 +178,7 @@ def test_plan_window_saturation_suppresses(tmp_path: Path):
     low = arb.should_fire(priority="low", now=NOW)
     assert low.fire is False
     assert "plan_window_saturated" in low.reason
-    assert "7d_opus" in low.reason
+    assert "seven_day_opus" in low.reason
     assert low.severity.name == "TIGHT"
     # TIGHT sheds low + normal; high rides through a raw wall.
     assert arb.should_fire(priority="normal", now=NOW).fire is False
@@ -193,7 +194,7 @@ def test_quota_mode_raw_wall_backstop_with_empty_provider(tmp_path: Path):
     arb = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA, quota_providers=[])
     future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
-        "7d_opus": {
+        "seven_day_opus": {
             "status": "allowed_warning",
             "utilization": 0.92,
             "resets_at": future,
@@ -246,32 +247,33 @@ def test_quota_mode_preserves_coasting_demotion_from_provider(tmp_path: Path):
 
 
 def test_quota_backstop_ignores_stale_no_reset_window(tmp_path: Path):
-    """#692 review: the QUOTA raw-wall backstop (#483) must not trust a
-    ``resets_at=None`` reading older than its own window. ``current()`` keeps
-    no-reset entries forever, so a rolled 5h window would otherwise pin TIGHT
-    with nothing left under suppression to refresh the store. Mirror the
-    provider path's staleness guard. Uses real-now-relative ``observed_at``
-    because ``_is_stale_observation`` reads real wall-clock."""
+    """Unknown no-reset entries cannot wall healthy declared windows forever."""
     from mimir.billing import BillingMode
 
     real_now = datetime.now(tz=timezone.utc)
-    stale = (real_now - timedelta(hours=6)).isoformat()  # older than the 5h window
+    stale = (real_now - timedelta(days=30)).isoformat()
+    future = int((real_now + timedelta(days=6)).timestamp())
 
     arb = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA, quota_providers=[])
-    arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
-        "openai_five_hour": {
-            "status": "allowed_warning",
-            "utilization": 0.95,
-            "resets_at": None,
-            "observed_at": stale,
-        },
-    }
-    # Stale no-reset window is no-signal → backstop stays CLEAR, work fires.
-    low = arb.should_fire(priority="low", now=real_now)
-    assert low.fire is True
-    assert low.severity.name == "CLEAR"
+    arb.rate_limit_store.record_sync(
+        "five_hour",
+        RateLimitSnapshot("allowed", 0.10, future, observed_at=real_now.isoformat()),
+    )
+    arb.rate_limit_store.record_sync(
+        "seven_day",
+        RateLimitSnapshot("allowed", 0.30, future, observed_at=real_now.isoformat()),
+    )
+    arb.rate_limit_store.record_sync(
+        "seven_day_omelette",
+        RateLimitSnapshot("allowed_warning", 0.95, None, observed_at=stale),
+    )
 
-    # Control: a FRESH reading of the same no-reset window still walls to TIGHT.
+    assessment = arb.assess(now=real_now)
+    assert assessment.severity.name == "CLEAR"
+    assert arb.should_fire(priority="normal", now=real_now).fire is True
+    assert arb.snapshot(now=real_now).plan_window_worst_key == "seven_day"
+
+    # Control: a fresh, declared no-reset window still walls to TIGHT.
     arb2 = _arbiter(tmp_path, billing_mode=BillingMode.QUOTA, quota_providers=[])
     arb2.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
         "openai_five_hour": {
@@ -287,11 +289,116 @@ def test_quota_backstop_ignores_stale_no_reset_window(tmp_path: Path):
     assert "plan_window_saturated:openai_five_hour" in hot.reason
 
 
+def test_live_overage_does_not_suppress_scheduled_work(tmp_path: Path):
+    """Paid, open-ended overage capacity is not a finite plan wall."""
+    from mimir.billing import BillingMode
+
+    real_now = datetime.now(tz=timezone.utc)
+    arb = _arbiter(
+        tmp_path,
+        billing_mode=BillingMode.QUOTA,
+        quota_providers=[],
+        active_quota_providers=("anthropic",),
+    )
+    arb.rate_limit_store.record_sync(
+        "overage",
+        RateLimitSnapshot(
+            "allowed_warning", 0.95, None, observed_at=real_now.isoformat(),
+        ),
+    )
+
+    decision = arb.should_fire(priority="normal", now=real_now)
+    assert decision.fire is True
+    assert decision.severity.name == "CLEAR"
+    assert arb.snapshot(now=real_now).plan_window_max_utilization is None
+
+
+def test_provider_cutover_display_and_arbiter_use_same_filtered_view(tmp_path: Path):
+    """A stale Anthropic window is invisible and non-enforcing on Codex."""
+    from mimir.billing import BillingMode
+    from mimir.stats_block import assemble_stats_block
+
+    real_now = datetime.now(tz=timezone.utc)
+    future = int((real_now + timedelta(days=6)).timestamp())
+    store = RateLimitStore(tmp_path / "rate_limits.json")
+    store.record_sync(
+        "seven_day",
+        RateLimitSnapshot("allowed_warning", 0.94, future, observed_at=real_now.isoformat()),
+    )
+    store.record_sync(
+        "openai_seven_day",
+        RateLimitSnapshot("allowed", 0.30, future, observed_at=real_now.isoformat()),
+    )
+    arb = HomeostaticArbiter(
+        home=tmp_path,
+        rate_limit_store=store,
+        turns_log=tmp_path / "turns.jsonl",
+        billing_mode=BillingMode.QUOTA,
+        quota_providers=[],
+        active_quota_providers=("openai",),
+    )
+    _write_turn(
+        arb.turns_log,
+        ts=real_now - timedelta(minutes=10),
+        trigger="user_message",
+    )
+    cfg = SimpleNamespace(
+        turns_log=arb.turns_log,
+        events_log=tmp_path / "events.jsonl",
+        model="gpt-5",
+        model_spec="codex-plus:gpt-5",
+        anthropic_base_url="",
+        cost_hourly_limit_usd=0.0,
+        cost_rate_spike_ratio=0.0,
+        cost_rate_spike_floor_usd=0.0,
+        usage_5h_limit_usd=0.0,
+        usage_weekly_limit_usd=0.0,
+        context_1m=False,
+    )
+
+    stats = assemble_stats_block(cfg, store)
+    snap = arb.snapshot(now=real_now)
+    decision = arb.should_fire(priority="normal", now=real_now)
+
+    assert stats.body is not None
+    assert "Codex Plus 7-day" in stats.body
+    assert "Claude Code Max 7-day" not in stats.body
+    assert snap.plan_window_worst_key == "openai_seven_day"
+    assert snap.plan_window_max_utilization == pytest.approx(0.30)
+    assert decision.fire is True
+    assert decision.severity.name == "CLEAR"
+
+
+def test_provider_overlap_keeps_saturated_window_from_each_active_provider(
+    tmp_path: Path,
+):
+    """Explicit overlap uses the union, rather than hiding either provider."""
+    real_now = datetime.now(tz=timezone.utc)
+    future = int((real_now + timedelta(hours=4)).timestamp())
+    arb = _arbiter(
+        tmp_path,
+        active_quota_providers=("anthropic", "openai"),
+    )
+    arb.rate_limit_store.record_sync(
+        "five_hour",
+        RateLimitSnapshot("allowed", 0.10, future, observed_at=real_now.isoformat()),
+    )
+    arb.rate_limit_store.record_sync(
+        "openai_five_hour",
+        RateLimitSnapshot("allowed_warning", 0.95, future, observed_at=real_now.isoformat()),
+    )
+
+    decision = arb.should_fire(priority="normal", now=real_now)
+    assert decision.fire is False
+    assert decision.severity.name == "TIGHT"
+    assert "plan_window_saturated:openai_five_hour@0.95" == decision.reason
+
+
 def test_plan_window_below_threshold_does_not_suppress(tmp_path: Path):
     arb = _arbiter(tmp_path, plan_window_suppress_threshold=0.80)
     future = int((datetime.now(tz=timezone.utc) + timedelta(days=14)).timestamp())
     arb.rate_limit_store._load = lambda: {  # type: ignore[method-assign]
-        "7d": {
+        "seven_day": {
             "status": "allowed",
             "utilization": 0.50,
             "resets_at": future,

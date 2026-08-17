@@ -63,7 +63,11 @@ from .billing import (
 )
 from .feedback import pending_forget_candidates_count
 from .quota_windows import store_window_hours
-from .rate_limits import RateLimitSnapshot, RateLimitStore
+from .rate_limits import (
+    RateLimitSnapshot,
+    RateLimitStore,
+    filter_to_active_provider,
+)
 from .usage_stats import (
     CostRateAlert,
     UsageReport,
@@ -177,6 +181,7 @@ class HomeostaticArbiter:
     turns_log: Path
     billing_mode: BillingMode = BillingMode.PAY_AS_YOU_GO
     quota_providers: list[QuotaProvider] = field(default_factory=list)
+    active_quota_providers: tuple[str, ...] = ()
     plan_window_suppress_threshold: float = 0.90
     cost_hourly_limit_usd: float | None = None
     cost_spike_ratio: float | None = None
@@ -188,12 +193,27 @@ class HomeostaticArbiter:
     def snapshot(self, *, now: datetime | None = None) -> BudgetSnapshot:
         now = now or datetime.now(tz=timezone.utc)
 
-        # Plan window: pick the worst-utilized live entry.
+        # Plan window: pick the worst-utilized live entry from the same
+        # provider-scoped view shown in the Resource usage block. Multiple
+        # providers may be active briefly during a deliberate cutover.
         worst_key: str | None = None
         worst_util: float | None = None
         worst_resets_at: int | None = None
-        for key, snap in self.rate_limit_store.current().items():
+        current = self.rate_limit_store.current()
+        if self.active_quota_providers:
+            visible: dict[str, RateLimitSnapshot] = {}
+            for provider in self.active_quota_providers:
+                visible.update(filter_to_active_provider(current, provider))
+            current = visible
+        for key, snap in current.items():
             if snap.utilization is None:
+                continue
+            # Only finite, declared quota windows can be a hard plan wall.
+            # Unknown payload keys have no refresh/expiry contract, while
+            # open-ended entries such as Anthropic's paid ``overage`` bucket
+            # are capacity rather than a consumable subscription window.
+            window_hours = _STORE_WINDOW_HOURS.get(key)
+            if window_hours is None:
                 continue
             # Staleness guard, mirroring _StorageBackedQuotaProvider.get_windows
             # (chainlink #424): current() keeps resets_at=None entries forever,
@@ -202,10 +222,8 @@ class HomeostaticArbiter:
             # backstop (#483) and the PAYG sanity wall read — at a saturated
             # value with nothing left under suppression to refresh the store.
             # Entries WITH a resets_at keep the store's own expiry.
-            window_hours = _STORE_WINDOW_HOURS.get(key)
             if (
                 snap.resets_at is None
-                and window_hours is not None
                 and _is_stale_observation(snap.observed_at, window_hours)
             ):
                 continue

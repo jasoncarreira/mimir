@@ -314,19 +314,6 @@ def test_recall_score_includes_encoding_confidence_delta(saga_store):
     assert (c_b.total - c_a.total) == pytest.approx(expected_delta, abs=1e-6)
 
 
-def test_solo_atom_at_baseline_contributes_zero_boost():
-    """An atom at exactly baseline encoding_confidence adds exactly
-    zero to its composite score. Verified algebraically:
-    weight * (baseline - baseline) = weight * 0 = 0. The default-
-    of-0.7 atoms (the vast majority of stored facts at any moment)
-    therefore don't see any score change from this feature — only
-    dedup absorption moves them off baseline."""
-    boost = ENCODING_CONFIDENCE_WEIGHT * (
-        BASELINE_ENCODING_CONFIDENCE - BASELINE_ENCODING_CONFIDENCE
-    )
-    assert boost == 0.0
-
-
 def test_max_possible_boost_stays_below_dominant_terms():
     """The maximum boost (encoding_confidence saturated at 1.0) must
     stay smaller than the dominant RRF term so that

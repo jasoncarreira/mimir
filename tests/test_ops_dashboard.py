@@ -175,18 +175,16 @@ def test_compute_stats_summary_counts(tmp_path: Path):
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "user_message", "channel_id": "c1"},
         {"timestamp": _ts(0.1), "type": "event_queued", "trigger": "scheduled_tick", "channel_id": "c1"},
         {"timestamp": _ts(0.1), "type": "send_message_sent"},
-        {"timestamp": _ts(0.1), "type": "subagent_started", "task_id": "t1"},
-        {"timestamp": _ts(0.1), "type": "subagent_notification", "task_id": "t1"},
         {"timestamp": _ts(0.1), "type": "client_pool_drained"},
         {"timestamp": _ts(0.1), "type": "event_queue_high_water"},
     ])
     payload = build_dashboard_payload(log, days=1)
     s = payload["summary"]
-    assert s["total_events"] == 7
+    assert s["total_events"] == 5
     assert s["events_queued"] == 2
     assert s["messages_sent"] == 1
-    assert s["subagents_started"] == 1
-    assert s["subagents_completed"] == 1
+    assert "subagents_started" not in s
+    assert "subagents_completed" not in s
     assert s["client_pool_drains"] == 1
     assert s["high_water_events"] == 1
 
@@ -472,6 +470,73 @@ def test_ops_dashboard_html_file_bundled() -> None:
     # Auth bootstrap shape.
     assert "getApiKey" in body
     assert "X-API-Key" in body
+
+
+def test_legacy_dashboards_resolve_shared_auth_helpers() -> None:
+    """Bare MimirAuth helper calls must have a page-scope alias."""
+    import re
+
+    import mimir
+
+    root = Path(mimir.__file__).parent
+    auth_source = (root / "web_auth.js").read_text(encoding="utf-8")
+    exported = set(re.findall(r"^    (\w+): \1,$", auth_source, re.MULTILINE))
+    expected_exports = {"getApiKey", "promptApiKey", "authedFetch"}
+    assert expected_exports <= exported, (
+        f"failed to parse MimirAuth exports from web_auth.js: {exported}"
+    )
+
+    pages = {
+        page: page.read_text(encoding="utf-8")
+        for page in root.glob("*.html")
+        if "/app/auth.js" in page.read_text(encoding="utf-8")
+    }
+    assert pages, "failed to find legacy dashboards loading /app/auth.js"
+
+    for page, html in pages.items():
+        for helper in exported:
+            bare_call = re.search(rf"(?<![.\w]){helper}\s*\(", html)
+            if not bare_call:
+                continue
+            alias = re.search(
+                rf"\b(?:const|let|var)\s+{helper}\s*=\s*"
+                rf"window\.MimirAuth\.(\w+)\s*;",
+                html,
+            )
+            assert alias, f"{page.name} calls unscoped MimirAuth helper {helper}"
+            assert alias.group(1) in exported, (
+                f"{page.name} aliases {helper} to unknown MimirAuth member "
+                f"{alias.group(1)}"
+            )
+
+
+def test_first_visit_prompts_before_turns_and_ops_load() -> None:
+    """An empty getApiKey result reaches the prompt, then the initial request."""
+    import mimir
+
+    root = Path(mimir.__file__).parent
+    pages = {
+        "turn_viewer.html": "loadInitial();",
+        "ops_dashboard.html": "authedFetch('/api/ops'",
+    }
+    for filename, load_call in pages.items():
+        body = (root / filename).read_text(encoding="utf-8")
+        alias = "promptApiKey = window.MimirAuth.promptApiKey;"
+        prompt = "if (!getApiKey()) promptApiKey('first visit');"
+        prompt_pos = body.index(prompt)
+        assert body.index(alias) < prompt_pos
+        assert body.index(load_call, prompt_pos) > prompt_pos
+
+
+def test_ops_tabs_are_bound_before_data_fetch_or_render() -> None:
+    """Tab navigation remains live when the /api/ops request fails."""
+    from mimir import ops_dashboard
+
+    body = (Path(ops_dashboard.__file__).parent / "ops_dashboard.html").read_text()
+    binding = "document.querySelectorAll('.tab').forEach(t => t.addEventListener"
+    assert body.count(binding) == 1
+    assert body.index(binding) < body.index("function render(D)")
+    assert body.index(binding) < body.index("authedFetch('/api/ops'")
 
 
 def test_ops_dashboard_loader_caches() -> None:

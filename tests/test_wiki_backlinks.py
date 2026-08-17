@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -386,6 +387,29 @@ def test_build_wiki_payload_surfaces_slug_collisions(wiki: Path):
     ]
 
 
+def test_build_wiki_payload_reads_each_page_once(wiki: Path, monkeypatch):
+    _write(wiki, "concepts/a.md", "# A\n\n[[b]]")
+    _write(wiki, "topics/b.md", "# B")
+    real_read_text = Path.read_text
+    reads: dict[Path, int] = {}
+
+    def counting_read_text(path: Path, *args, **kwargs):
+        if path.suffix == ".md" and path.name not in {
+            "orphans.md", "dangling-links.md", "backlinks-index.md",
+        }:
+            reads[path] = reads.get(path, 0) + 1
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+    payload = build_wiki_payload(wiki)
+
+    assert payload["page_count"] == 2
+    assert reads == {
+        wiki / "concepts" / "a.md": 1,
+        wiki / "topics" / "b.md": 1,
+    }
+
+
 # ─── Renderers ───────────────────────────────────────────────────────
 
 
@@ -466,6 +490,30 @@ async def test_run_writes_three_files_and_emits_event(home: Path):
     assert unhealthy[0]["orphan_count"] == 1
     assert unhealthy[0]["dangling_count"] == 1
     assert unhealthy[0]["page_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_atomically_replaces_reports(home: Path, monkeypatch):
+    wiki = home / "state" / "wiki"
+    _write(wiki, "concepts/a.md", "[[b]]")
+    _write(wiki, "concepts/b.md", "[[a]]")
+    report_names = {"orphans.md", "dangling-links.md", "backlinks-index.md"}
+    for name in report_names:
+        _write(wiki, name, "old report\n")
+    real_replace = os.replace
+    replaced: set[str] = set()
+
+    def observing_replace(source, destination):
+        destination = Path(destination)
+        if destination.name in report_names:
+            assert destination.read_text() == "old report\n"
+            replaced.add(destination.name)
+        real_replace(source, destination)
+
+    monkeypatch.setattr("mimir.wiki_backlinks.os.replace", observing_replace)
+    await run(home)
+
+    assert replaced == report_names
 
 
 @pytest.mark.asyncio

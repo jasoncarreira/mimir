@@ -623,6 +623,8 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
       Mixed owners → legacy_admin.
     - origin_domain: all sources must have the same domain.
       Mixed domains → None (becomes legacy_admin).
+    - origin_channel: all sources must have the same channel.
+      Mixed channels → None (becomes legacy_admin).
     - visibility: most restrictive wins (public < private < service < legacy_admin).
     - provenance: union of all source provenances; if any source lacks
       provenance (empty dict), result has empty provenance (becomes legacy_admin).
@@ -631,7 +633,7 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
     - Its owner_principal is legacy_admin (pre-v7 data)
     - Its visibility is legacy_admin
     - Its provenance is empty or missing
-    - It has mixed owner/domain with other sources
+    - It has mixed owner/domain/channel with other sources
 
     Args:
         acls: List of Ownership objects to intersect.
@@ -646,6 +648,8 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
     first = acls[0]
 
     owner_principal = first.owner_principal
+    origin_channel = first.origin_channel
+    channel_mismatch = False
     origin_domain = first.origin_domain
     provenance = dict(first.provenance)
     vis_order = [
@@ -670,6 +674,9 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
         if acl.origin_domain != origin_domain:
             origin_domain = None
 
+        if acl.origin_channel != origin_channel:
+            channel_mismatch = True
+
         visibility = vis_order[
             max(_visibility_rank(visibility), _visibility_rank(acl.visibility))
         ]
@@ -681,6 +688,7 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
 
     if (
         owner_principal == OwnerPrincipal.LEGACY_ADMIN
+        or channel_mismatch
         or origin_domain is None
         or not provenance
         or visibility == Visibility.LEGACY_ADMIN
@@ -695,7 +703,7 @@ def intersect_acl(acls: list[Ownership]) -> Ownership:
 
     return Ownership(
         owner_principal=owner_principal,
-        origin_channel=first.origin_channel,
+        origin_channel=origin_channel,
         origin_domain=origin_domain,
         visibility=visibility,
         provenance=provenance,

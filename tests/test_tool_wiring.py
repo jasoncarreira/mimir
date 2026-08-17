@@ -4,9 +4,6 @@ Specifically:
 * ``_channel_from_config_or_state`` precedence (LangGraph configurable
   vs module-global _STATE vs explicit arg).
 * ``Agent.__init__`` accepts and stores ``commitments_store``.
-* ``set_commitments_store`` / ``set_spawn_config`` actually populate
-  the module-global _STATE so the four commitment_* tools + the spawn
-  tool can resolve their dependencies.
 """
 
 from __future__ import annotations
@@ -24,9 +21,7 @@ from mimir.tools.registry import (
     reset_current_channel_id,
     send_message,
     set_channel_registry,
-    set_commitments_store,
     set_current_channel_id,
-    set_spawn_config,
 )
 
 
@@ -173,21 +168,6 @@ def test_agent_saga_store_none_when_no_sagastore(tmp_path: Path) -> None:
     the skill-memory injection cleanly no-ops."""
     agent = _minimal_agent(tmp_path, saga_client=object())
     assert agent._saga_store is None
-
-
-# ─── set_commitments_store / set_spawn_config populate _STATE ──────
-
-
-def test_set_commitments_store_populates_state() -> None:
-    fake = object()
-    set_commitments_store(fake)
-    assert _STATE["commitments_store"] is fake
-
-
-def test_set_spawn_config_populates_state(tmp_path: Path) -> None:
-    cfg = {"default_cwd": tmp_path}
-    set_spawn_config(cfg)
-    assert _STATE["spawn_config"] is cfg
 
 
 # ─── InjectedToolArg schema fix (chainlink #147) ───────────────────

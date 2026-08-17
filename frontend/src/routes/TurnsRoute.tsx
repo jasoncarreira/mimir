@@ -367,7 +367,7 @@ export function TurnsRoute() {
   const [hidePollers, setHidePollers] = React.useState(false);
   const [query, setQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
   const [sessionChannel, setSessionChannel] = React.useState(searchParams.get("channel") || "");
-  const [sessionTrigger, setSessionTrigger] = React.useState(searchParams.get("trigger") || "");
+  const [sessionTrigger, setSessionTrigger] = React.useState(searchParams.get("session_trigger") || "");
   const [sessionFrom, setSessionFrom] = React.useState(searchParams.get("from") || "");
   const [sessionTo, setSessionTo] = React.useState(searchParams.get("to") || "");
   const [sessionQuery, setSessionQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
@@ -420,14 +420,12 @@ export function TurnsRoute() {
     : null;
 
   React.useEffect(() => {
-    setQuery(searchParams.get("q") || searchParams.get("filter") || "");
     const nextTrigger = (searchParams.get("trigger") as TriggerFilter) || "all";
     setTrigger(triggerFilters.some((item) => item.id === nextTrigger) ? nextTrigger : "all");
     setSessionChannel(searchParams.get("channel") || "");
-    setSessionTrigger(searchParams.get("trigger") || "");
+    setSessionTrigger(searchParams.get("session_trigger") || "");
     setSessionFrom(searchParams.get("from") || "");
     setSessionTo(searchParams.get("to") || "");
-    setSessionQuery(searchParams.get("q") || searchParams.get("filter") || "");
   }, [searchParams]);
 
   React.useEffect(() => {
@@ -584,7 +582,7 @@ export function TurnsRoute() {
                 className="ui-input"
                 onChange={(event) => {
                   setSessionTrigger(event.currentTarget.value);
-                  setRouteValue("trigger", event.currentTarget.value);
+                  setRouteValue("session_trigger", event.currentTarget.value);
                 }}
                 value={sessionTrigger}
               >

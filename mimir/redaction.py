@@ -12,6 +12,21 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+import yaml
+
+
+_CREDENTIAL_KEY = re.compile(
+    r"[A-Za-z0-9_.:-]*(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
+)
+_BLOCK_HEADER = re.compile(
+    r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]+)*"
+    r"(?P<style>[|>])(?P<mods>(?:[1-9][+-]?|[+-][1-9]?)?)"
+    r"[ \t]*(?:#.*)?"
+)
+_NODE_PROPERTIES = re.compile(
+    r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]*)+(?:#.*)?"
+)
+
 # Token-shape redaction for subprocess / event output (pre-OSS hardening,
 # review item #8, extended by chainlink #370). Anything a subprocess or event
 # payload emits can land in durable JSONL logs, so broad masking is preferable
@@ -36,6 +51,70 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # env var dumps, JSON pretty-prints with bareword keys). The value alphabet
     # stops at common delimiters so the regex doesn't eat the rest of the line.
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
+    # Credential fields in header, YAML, JSON, and Python-repr colon forms.
+    # Requiring a credential-like key and a non-path boundary keeps ordinary
+    # prose, timestamps, unrelated mappings, and URL userinfo intact.
+    #
+    # Quoted values run to the CLOSING QUOTE, not to the first space. A
+    # passphrase is a credential and contains whitespace, so stopping at the
+    # space masks one word and persists the rest. There is one pattern per
+    # quote style because a backreference for the quote character would push
+    # the group count past two, which ``redact_text`` uses to decide whether
+    # the prefix is preserved.
+    # Double quotes: JSON and YAML both escape with a backslash, and YAML also
+    # allows a backslash before a physical newline as a line continuation, so an
+    # escape consumes ANY next character.
+    #
+    # Two guards keep an UNTERMINATED quote from consuming the rest of the log,
+    # and they are deliberately redundant: the excluded raw newline bounds a
+    # match to its own line, and the lookahead additionally requires a real
+    # closing delimiter. Removing either alone changes nothing; removing both
+    # lets ``password: "abc`` swallow every following line.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
+    ),
+    # Single quotes carry two INCOMPATIBLE grammars and a backslash is exactly
+    # where they disagree:
+    #
+    #   Python-repr — ``\`` escapes the next character, so ``'has \' and "'``
+    #                 continues past that apostrophe.
+    #   YAML        — ``\`` is literal and ``''`` is the only escape, so
+    #                 ``'ends in \'`` genuinely ends at that apostrophe.
+    #
+    # The same bytes are a different value under each, and nothing local to the
+    # match resolves it: deciding by what follows the quote is wrong for a repr
+    # whose credential contains ``',``, and preferring either reading in turn
+    # produced five successive defects — a leaked tail one way, an erased
+    # delimiter or following line the other.
+    #
+    # So this rule DECLINES the ambiguity instead of guessing. A value holding
+    # no backslash is unambiguous under both grammars and is masked; a value
+    # containing one is left alone. That is an honest miss, and it can neither
+    # leak half a credential nor corrupt the surrounding record. Full
+    # arbitration needs a parser rather than a pattern and is tracked with the
+    # block-scalar work.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
+    ),
+    # Multiline YAML block scalars are handled by the grammar-aware pass below,
+    # not by this tuple. The bare-value rule must still DECLINE their indicator
+    # and any preceding node properties. Otherwise a parser miss could print
+    # ``password: [REDACTED]`` above an untouched body, which is worse for an
+    # audit trail than an honest miss.
+    #
+    # Bare (unquoted) values. The alphabet stops at common delimiters so the
+    # regex doesn't eat the rest of the line, and a block-scalar indicator is
+    # excluded so it can never be reported as a redacted value.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*)"
+        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
+    ),
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
     # chars are a high-confidence shape; mask the whole value.
@@ -55,17 +134,283 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+def _credential_key(value: object) -> bool:
+    return isinstance(value, str) and _CREDENTIAL_KEY.fullmatch(value) is not None
+
+
+def _yaml_block_scalar_lines(text: str) -> list[int] | None:
+    """Return credential block-scalar body lines for a valid YAML document.
+
+    ``None`` asks the caller to use the log-text scanner. A scalar-only YAML
+    parse is not considered a document here: arbitrary log text commonly
+    parses as one plain scalar while still containing YAML snippets.
+    """
+    try:
+        documents = list(yaml.compose_all(text))
+    except Exception:
+        return None
+
+    roots = [node for node in documents if node is not None]
+    if not roots or not any(
+        isinstance(node, (yaml.MappingNode, yaml.SequenceNode)) for node in roots
+    ):
+        return None
+
+    body_lines: set[int] = set()
+    seen: set[int] = set()
+    lines = text.splitlines(keepends=True)
+
+    def header_line(node: yaml.ScalarNode) -> int | None:
+        for line_number in range(node.start_mark.line, node.end_mark.line + 1):
+            if line_number >= len(lines):
+                break
+            content = _line_content(lines[line_number])
+            if line_number == node.start_mark.line:
+                content = content[node.start_mark.column :]
+            if _BLOCK_HEADER.fullmatch(content.strip()) is not None:
+                return line_number
+        return None
+
+    def walk(node: yaml.Node) -> None:
+        node_id = id(node)
+        if node_id in seen:
+            return
+        seen.add(node_id)
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                if (
+                    isinstance(key, yaml.ScalarNode)
+                    and _credential_key(key.value)
+                    and isinstance(value, yaml.ScalarNode)
+                    and value.style in {"|", ">"}
+                ):
+                    start = header_line(value)
+                    if start is not None:
+                        stop = value.end_mark.line + (value.end_mark.column > 0)
+                        body_lines.update(range(start + 1, stop))
+                walk(key)
+                walk(value)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item)
+
+    for root in roots:
+        walk(root)
+    return sorted(body_lines)
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _line_content(line: str) -> str:
+    return line.rstrip("\r\n")
+
+
+def _sequence_prefix_end(line: str) -> int:
+    pos = _line_indent(line)
+    while line[pos : pos + 1] == "-" and line[pos + 1 : pos + 2] in {" ", "\t"}:
+        pos += 1
+        while line[pos : pos + 1] in {" ", "\t"}:
+            pos += 1
+    return pos
+
+
+def _mapping_colons(line: str, start: int) -> list[int]:
+    """Find mapping separators while ignoring colons inside quoted keys."""
+    colons: list[int] = []
+    quote: str | None = None
+    escaped = False
+    pos = start
+    while pos < len(line):
+        char = line[pos]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == "'" and line[pos + 1 : pos + 2] == "'":
+                pos += 1
+            elif char == "'":
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "#":
+            break
+        elif char == ":":
+            colons.append(pos)
+        pos += 1
+    return colons
+
+
+def _scanner_key(raw: str) -> str:
+    key = raw.strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1]
+    return key
+
+
+def _header_indent(header: re.Match[str], base: int) -> int | None:
+    digits = "".join(char for char in header.group("mods") if char.isdigit())
+    return base + int(digits) if digits else None
+
+
+def _awaits_node(value: str) -> bool:
+    return (
+        not value
+        or value.startswith("#")
+        or _NODE_PROPERTIES.fullmatch(value) is not None
+    )
+
+
+def _scanned_block_scalar_lines(text: str) -> list[int]:
+    """Recognize block headers in non-document log text and bound their bodies."""
+    lines = text.splitlines(keepends=True)
+    body_lines: set[int] = set()
+    pending_explicit: int | None = None
+    pending_value: int | None = None
+    index = 0
+
+    while index < len(lines):
+        content = _line_content(lines[index])
+        stripped = content.strip()
+        if not stripped or stripped.startswith("#"):
+            index += 1
+            continue
+
+        start = _sequence_prefix_end(content)
+        header: re.Match[str] | None = None
+        base: int | None = None
+        deferred_here = False
+
+        if pending_explicit is not None and start == pending_explicit:
+            explicit_value = content[start:]
+            if explicit_value.startswith(":"):
+                value = explicit_value[1:].strip()
+                header = _BLOCK_HEADER.fullmatch(value)
+                if header is not None:
+                    base = pending_explicit
+                elif _awaits_node(value):
+                    pending_value = pending_explicit
+                    deferred_here = True
+            pending_explicit = None
+
+        if header is None and pending_value is not None and not deferred_here:
+            candidate = content.strip()
+            if _line_indent(content) > pending_value:
+                header = _BLOCK_HEADER.fullmatch(candidate)
+                if header is not None:
+                    base = pending_value
+                    pending_value = None
+                elif _NODE_PROPERTIES.fullmatch(candidate) is not None:
+                    index += 1
+                    continue
+                else:
+                    pending_value = None
+            else:
+                pending_value = None
+
+        if header is None and content[start : start + 1] == "?":
+            key = _scanner_key(content[start + 1 :])
+            pending_explicit = start if _credential_key(key) else None
+            index += 1
+            continue
+
+        if header is None:
+            for colon in _mapping_colons(content, start):
+                if _credential_key(_scanner_key(content[start:colon])):
+                    value = content[colon + 1 :].strip()
+                    candidate = _BLOCK_HEADER.fullmatch(value)
+                    if candidate is not None:
+                        header = candidate
+                        base = start
+                        break
+                    if _awaits_node(value):
+                        pending_value = start
+                        break
+            else:
+                pending_explicit = None
+
+        if header is None or base is None:
+            index += 1
+            continue
+
+        required_indent = _header_indent(header, base)
+        first = index + 1
+        while first < len(lines) and not _line_content(lines[first]).strip():
+            first += 1
+        if first >= len(lines):
+            break
+
+        content_indent = _line_indent(_line_content(lines[first]))
+        if required_indent is not None:
+            content_indent = required_indent
+        elif content_indent <= base:
+            index += 1
+            continue
+        if _line_indent(_line_content(lines[first])) < content_indent:
+            index += 1
+            continue
+
+        end = first
+        while end < len(lines):
+            body = _line_content(lines[end])
+            if body.strip() and _line_indent(body) < content_indent:
+                break
+            if body.strip():
+                body_lines.add(end)
+            end += 1
+        index = end
+
+    return sorted(body_lines)
+
+
+def _mask_block_scalar_lines(text: str) -> str:
+    # A YAML block scalar must contain one of its two style indicators. Keep
+    # parser construction off the common durable-log path, where almost every
+    # string is ordinary prose, JSON, or a single-line diagnostic.
+    if "|" not in text and ">" not in text:
+        return text
+
+    try:
+        line_numbers = _yaml_block_scalar_lines(text)
+        if line_numbers is None:
+            line_numbers = _scanned_block_scalar_lines(text)
+        if not line_numbers:
+            return text
+        lines = text.splitlines(keepends=True)
+        for line_number in line_numbers:
+            if line_number >= len(lines):
+                continue
+            line = lines[line_number]
+            content = _line_content(line)
+            if not content.strip():
+                continue
+            ending = line[len(content) :]
+            indent = content[: len(content) - len(content.lstrip(" \t"))]
+            lines[line_number] = f"{indent}[REDACTED]{ending}"
+        return "".join(lines)
+    except Exception:
+        # Durable logging must remain best-effort and non-raising for arbitrary
+        # subprocess output, even if the parser encounters an unforeseen shape.
+        return text
+
+
 def redact_text(text: str) -> str:
     """Strip token-shaped secrets out of text before it lands in logs.
 
     Replacement is ``[REDACTED]`` so logs still indicate "something matched a
-    token shape here" without exposing the value. For the ``bearer …`` and
-    ``token=…`` patterns, the prefix is preserved so surrounding context stays
-    readable.
+    token shape here" without exposing the value. YAML credential block bodies
+    are handled first with parser marks (or an indentation-aware fallback for
+    non-document log text). For the ``bearer …`` and ``token=…`` patterns, the
+    prefix is preserved so surrounding context stays readable.
     """
     if not text:
         return text
-    out = text
+    out = _mask_block_scalar_lines(text)
     for pat in _TOKEN_PATTERNS:
         # Patterns with capture groups preserve the prefix; the others mask the
         # whole match. We detect by group count.

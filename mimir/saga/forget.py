@@ -93,8 +93,10 @@ def forget(
     # mutation. Authorization is preflighted by SagaStore before entering this
     # function; committing a partial dependency refresh would violate the same
     # all-or-nothing boundary even if no unauthorized row were touched.
+    began = False
     try:
         conn.execute("BEGIN IMMEDIATE")
+        began = True
         conn.executemany(
             "UPDATE atoms SET tombstoned = 1, tombstoned_at = ?, "
             "tombstoned_reason = ? WHERE id = ? AND tombstoned = 0",
@@ -116,7 +118,8 @@ def forget(
             )
         conn.commit()
     except Exception:
-        conn.rollback()
+        if began:
+            conn.rollback()
         raise
 
     return ForgetResult(

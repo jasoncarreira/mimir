@@ -1,9 +1,8 @@
 """Command-line entrypoint for mimir.
 
 Subcommands:
-- ``mimir setup [--home DIR]`` — scaffold an agent home (dirs, .env template,
-  scheduler.yaml stub, skills, subagents). Idempotent — never overwrites
-  existing files.
+- ``mimir setup [--home DIR]`` — scaffold or refresh an agent home (dirs, .env
+  template, scheduler, skills, subagents, and managed git defaults).
 - ``mimir run [--home DIR]``   — run the server (default if no subcommand).
 - ``mimir identities {list,add,remove,resolve}`` — manage identity
   reconciliation entries (FUTURE_WORK §6.1).
@@ -421,8 +420,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "setup":
+        home = (args.home or Path.cwd()).resolve()
+        if args.home is None and (home / ".git").exists() and not (home / ".mimir").is_dir():
+            print(
+                f"error: refusing bare `mimir setup` in unrelated git repository {home}; "
+                "pass `--home DIR` to explicitly name the intended mimir home",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         status = setup_home(
-            args.home,
+            home,
             embedding=args.embedding,
             model=args.model,
             subscription=args.subscription,
@@ -530,7 +537,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        new_key = regenerate_api_key(home)
+        try:
+            new_key = regenerate_api_key(home)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
         print(new_key)
         print(
             f"\nWrote to {env_path}. Restart `mimir run` for the new key to take effect.",

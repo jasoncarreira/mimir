@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
@@ -97,18 +98,18 @@ def _is_success_text(result: Any) -> bool:
 
 def _compute_augmented(
     file_path: str, content: Any, client: Any,
-) -> tuple[str | None, list[str]]:
-    """Return ``(augmented_content_or_None, injected_atom_ids)``.
+) -> tuple[str | None, list[str], list[dict[str, str | None]]]:
+    """Return ``(augmented_content_or_None, injected_atom_ids, ifc_sources)``.
 
     ``None`` for the content leaves the read unchanged. The atom IDs are
-    the injected learnings, recorded onto the turn (slice 6) so the
-    session-boundary synthesis turn can curate feedback on them. Sync
+    recorded onto the turn for synthesis feedback, while ``ifc_sources``
+    carries the same selected atoms into the turn's IFC carrier. Sync
     so the async path can offload it to a thread; the SQL runs inside
     ``client.run_locked_read`` so the shared connection is never touched
     cross-thread without the store's lock (chainlink #411)."""
     skill = _skill_from_path(file_path)
     if skill is None or client is None or not isinstance(content, str):
-        return None, []
+        return None, [], []
     try:
         from .._context import get_current_turn
 
@@ -118,22 +119,22 @@ def _compute_augmented(
         auth_context = None
     try:
         from .. import skill_memory
-        augmented, ids = client.run_locked_read(
+        augmented, ids, ifc_sources = client.run_locked_read(
             lambda conn: skill_memory.augment_skill_body(
                 conn, skill, content, auth_context=auth_context
             )
         )
     except Exception:  # noqa: BLE001 — never break a file read
-        return None, []
+        return None, [], []
     if augmented == content:
-        return None, []
-    return augmented, ids
+        return None, [], []
+    return augmented, ids, ifc_sources
 
 
-def _record_injected_ids(ids: list[str]) -> None:
-    """Best-effort: append injected skill-learning atom IDs to the active
-    turn's ``injected_skill_atom_ids`` so run_turn folds them into the
-    TurnRecord for the synthesis turn to vote on. No-op off-turn."""
+def _record_injected_memory(
+    ids: list[str], ifc_sources: list[dict[str, str | None]],
+) -> None:
+    """Best-effort: record injected atom IDs and merge their IFC provenance."""
     if not ids:
         return
     try:
@@ -145,6 +146,17 @@ def _record_injected_ids(ids: list[str]) -> None:
         for aid in ids:
             if aid not in bucket:
                 bucket.append(aid)
+        auth_context = getattr(ctx, "auth_context", None)
+        if auth_context is None or not ifc_sources:
+            return
+        from ..agent import _auto_recall_source_labels, _merge_ifc_labels
+
+        added = _auto_recall_source_labels(
+            auth_context, {"_ifc_sources": ifc_sources},
+        )
+        merged = auth_context.ifc_state.merge(added, fallback=ctx.ifc_labels)
+        ctx.ifc_labels = merged
+        ctx.auth_context = replace(auth_context, ifc_labels=merged)
     except Exception:  # noqa: BLE001 — injection bookkeeping is best-effort
         pass
 
@@ -165,12 +177,12 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented, ids = _compute_augmented(
+        augmented, ids, ifc_sources = _compute_augmented(
             _file_path_arg(request), result.content, _resolve_client(),
         )
         if augmented is not None:
             result.content = augmented
-            _record_injected_ids(ids)
+            _record_injected_memory(ids, ifc_sources)
         return result
 
     async def awrap_tool_call(
@@ -181,11 +193,11 @@ class SkillMemoryInjectionMiddleware(AgentMiddleware):
         result = await handler(request)
         if _tool_name(request) != _READ_FILE_TOOL or not _is_success_text(result):
             return result
-        augmented, ids = await asyncio.to_thread(
+        augmented, ids, ifc_sources = await asyncio.to_thread(
             _compute_augmented,
             _file_path_arg(request), result.content, _resolve_client(),
         )
         if augmented is not None:
             result.content = augmented
-            _record_injected_ids(ids)
+            _record_injected_memory(ids, ifc_sources)
         return result

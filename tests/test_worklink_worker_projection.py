@@ -78,6 +78,10 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     assert spec.env == {
         "OPENCODE_PERMISSION": spec.env["OPENCODE_PERMISSION"],
     }
+    assert spec.local_argv is not None
+    dir_index = spec.local_argv.index("--dir")
+    assert spec.local_argv[dir_index + 1] == "."
+    assert str(order.checkout) not in spec.local_argv
 
 
 def test_disabled_opencode_spec_preserves_direct_environment(
@@ -112,6 +116,9 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     assert "worker_projections" not in spec.backend_config
     assert spec.env["PROXY_TOKEN"] == "direct"
     assert spec.env["MIMIR_HOME"] == str(tmp_path)
+    assert spec.local_argv is not None
+    dir_index = spec.local_argv.index("--dir")
+    assert spec.local_argv[dir_index + 1] == str(order.checkout)
 
 
 def test_enabled_opencode_projects_conventional_ambient_key(
