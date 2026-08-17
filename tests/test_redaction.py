@@ -150,25 +150,37 @@ def test_unterminated_or_literal_backslash_quote_does_not_eat_context(
     assert "next: must-survive" in out
 
 
-def test_single_quoted_values_follow_yaml_escaping_not_python_repr() -> None:
-    """Documents a deliberate trade-off, so it is visible rather than latent.
+# Single quotes carry two incompatible grammars. Reading only one of them
+# either leaves the tail of a credential in the log (YAML-only, against a
+# Python-repr value) or consumes the real closing quote and erases the
+# following lines (Python-only, against a YAML value). Both must be masked
+# WHOLE — asserting a prefix would codify partial masking as acceptable.
+@pytest.mark.parametrize(
+    ("text", "fragments"),
+    [
+        # Python-repr picks this form when a value holds both quote styles.
+        ("password: 'has \\' and \" both'", ["has", "both"]),
+        ("{'password': 'has \\' and \" both'}", ["has", "both"]),
+        # Valid YAML whose value ends in a literal backslash.
+        ("password: 'ends in \\'", ["ends in"]),
+        ("password: 'can''t share this'", ["share", "this"]),
+    ],
+)
+def test_single_quoted_values_are_masked_under_both_grammars(
+    text: str, fragments: list[str]
+) -> None:
+    out = redact_text(text)
 
-    A backslash is literal inside a YAML single-quoted scalar and ``''`` is the
-    only escape. Reading ``\\'`` as a Python-repr escape instead made
-    ``password: 'ends in \\'`` swallow the true closing quote and every
-    following line. Python only emits ``\\'`` for a value containing BOTH quote
-    styles — it switches to double quotes otherwise — so the YAML reading costs
-    a rare corner case and buys back the erasure.
-    """
-    both_styles = redact_text("password: 'has \\' and \" both'")
+    for fragment in fragments:
+        assert fragment not in out
+    assert "[REDACTED]" in out
 
-    # The corner case is masked only up to the backslash — a known, bounded gap.
-    assert both_styles.startswith("password: '[REDACTED]'")
-    # The shape Python actually produces for an apostrophe is double-quoted,
-    # and that is masked completely.
-    assert redact_text('{"password": "can\'t share this"}') == (
-        '{"password": "[REDACTED]"}'
-    )
+
+def test_single_quoted_grammar_choice_never_eats_following_lines() -> None:
+    out = redact_text("password: 'ends in \\'\nnext: must-survive\n")
+
+    assert "ends in" not in out
+    assert "next: must-survive" in out
 
 
 # The block indicator is NOT a value. Masking it would print

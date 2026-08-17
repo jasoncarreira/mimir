@@ -60,17 +60,25 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(\"?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
         r"\"?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
     ),
-    # Single quotes follow YAML: a backslash is LITERAL and ``''`` is the only
-    # escape. That choice is what prevents erasure here — with a ``\.`` escape
-    # in the value class, ``password: 'ends in \'`` consumed the real closing
-    # quote and then every following line. Nothing can now skip past a quote, so
-    # a match always ends at one. Python only emits ``\'`` for a value holding
-    # both quote styles (it switches to double quotes otherwise), so the YAML
-    # reading costs a rare corner case and buys back the erasure.
+    # Single quotes carry two incompatible grammars, so the value form is an
+    # ORDERED alternation and the engine takes whichever reading actually
+    # reaches a closing quote:
+    #
+    #   1. Python-repr — a backslash escapes the next character. ``repr`` picks
+    #      this form for a value holding both quote styles:
+    #      ``'has \' and " both'``.
+    #   2. YAML — a backslash is LITERAL and ``''`` is the only escape, so
+    #      ``password: 'ends in \'`` genuinely ends at that quote.
+    #
+    # Trying only YAML left the tail of a Python-repr credential in the log;
+    # trying only Python-repr made the YAML form consume its real closing quote
+    # and erase every following line. Neither alternative may cross a newline,
+    # which is what bounds an unterminated quote to its own line.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"'?[ \t]*:[ \t]*')((?:''|[^'\n])*)(?=')"
+        r"'?[ \t]*:[ \t]*')"
+        r"((?:''|\\[^\n]|[^'\\\n])*|(?:''|[^'\n])*)(?=')"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
     # block scalar's body is delimited by indentation relative to its own
