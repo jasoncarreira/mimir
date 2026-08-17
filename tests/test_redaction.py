@@ -6,9 +6,17 @@ logs. #499 closed the drift where AWS keys and JSON OAuth-token value forms
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from mimir.redaction import redact_payload, redact_text
+from mimir.redaction import (
+    _COLON_CREDENTIAL_PATTERNS,
+    _TOKEN_PATTERNS,
+    _mask_block_scalar_lines,
+    redact_payload,
+    redact_text,
+)
 from mimir.turn_event_redaction import scrub_text
 from tests.redaction_corpus import FAKE_SECRET, SECRET_TEXT_CORPUS
 
@@ -226,6 +234,100 @@ def test_key_and_value_quote_styles_are_independent(text: str) -> None:
     for fragment in ("correct", "horse", "battery", "staple"):
         assert fragment not in out
     assert "[REDACTED]" in out
+
+
+_LEGACY_COLON_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*)"
+        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
+    ),
+)
+
+
+def _legacy_redact_text(text: str) -> str:
+    if not text:
+        return text
+    out = _mask_block_scalar_lines(text)
+    for pattern in _TOKEN_PATTERNS:
+        if pattern is _COLON_CREDENTIAL_PATTERNS[0]:
+            for legacy_pattern in _LEGACY_COLON_PATTERNS:
+                out = legacy_pattern.sub(r"\1[REDACTED]", out)
+        elif (
+            pattern is _COLON_CREDENTIAL_PATTERNS[1]
+            or pattern is _COLON_CREDENTIAL_PATTERNS[2]
+        ):
+            continue
+        elif pattern.groups == 2:
+            out = pattern.sub(r"\1[REDACTED]", out)
+        else:
+            out = pattern.sub("[REDACTED]", out)
+    return out
+
+
+# This corpus deliberately crosses the productions above rather than merely
+# asserting that representative secrets disappeared. It pins byte-identical
+# output against the three scans replaced by the optimized rule.
+COLON_RULE_EQUIVALENCE_CORPUS = (
+    "> X-API-Key: " + FAKE_SECRET,
+    "MIMIR_API_KEY: " + FAKE_SECRET,
+    '{"VOYAGE_API_KEY": "pa-' + FAKE_SECRET + '"}',
+    "password: 'my secret pass phrase'",
+    'API_KEY: "abc def ghi"',
+    '{"password":"correct \\"horse\\" battery staple"}',
+    "password: 'can''t share this'",
+    '{"api_key":"ends with \\\\"}',
+    'password: "first-part\\\n  second-part"',
+    'password: "abc\nnext: must-survive\n',
+    "password: 'abc\nnext: must-survive\n",
+    "password: 'has \\' and \" both'",
+    "{'password': 'ends in \\', 'next': 'must-survive'}",
+    "password: 'alpha\\''omega-tail'\nnext: must-survive\n",
+    "password: bare-value, api_key: second-value",
+    '{"password": "first", "api_key": \'second\', "token": third}',
+    'token:xtoken:"second-secret"',
+    'prefixx"token":"second-secret"',
+    "ſpassword: second-secret",
+    "pa\u017f\u017fword: second-secret",
+    "ap\u0131_key: second-secret",
+    "\u017fecret: second-secret",
+    "prefix password: # retained\n  !!str\n  |\n    secret-body\n",
+    "password: |\n  secret-body\nfollowing: keep\n",
+    *FALSE_POSITIVE_CORPUS,
+)
+
+
+@pytest.mark.parametrize("text", COLON_RULE_EQUIVALENCE_CORPUS)
+def test_anchored_colon_rules_are_byte_identical_to_legacy_rules(text: str) -> None:
+    assert redact_text(text) == _legacy_redact_text(text)
+
+
+def test_anchored_colon_rules_preserve_two_capture_dispatch() -> None:
+    assert all(
+        _TOKEN_PATTERNS.count(pattern) == 1
+        for pattern in _COLON_CREDENTIAL_PATTERNS
+    )
+    assert all(pattern.groups == 2 for pattern in _COLON_CREDENTIAL_PATTERNS)
+    assert all(pattern.groups in {0, 2} for pattern in _TOKEN_PATTERNS)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\ud800", "before \udfff after", "password: \ud800value", 'api_key: "\ud800"'],
+)
+def test_redact_text_is_total_on_surrogate_input(text: str) -> None:
+    assert redact_text(text) == _legacy_redact_text(text)
 
 
 def _wrapped_block(
