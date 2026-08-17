@@ -57,8 +57,8 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # lets ``password: "abc`` swallow every following line.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(\"?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"\"?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
     ),
     # Single quotes carry two incompatible grammars, so the value form is an
     # ORDERED alternation and the engine takes whichever reading actually
@@ -76,8 +76,8 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # which is what bounds an unterminated quote to its own line.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
-        r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"'?[ \t]*:[ \t]*')"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*')"
         r"((?:''|\\[^\n]|[^'\\\n])*|(?:''|[^'\n])*)(?=')"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A

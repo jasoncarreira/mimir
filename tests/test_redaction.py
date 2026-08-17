@@ -176,6 +176,29 @@ def test_single_quoted_values_are_masked_under_both_grammars(
     assert "[REDACTED]" in out
 
 
+# Key quoting and value quoting are independent grammar choices. Coupling them
+# left the standard Python dict repr — a single-quoted key with a double-quoted
+# value — entirely unmasked, which is among the most common shapes in a durable
+# log because it is what ``repr`` produces for a mapping.
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{\'password\': "correct horse battery staple"}',
+        '"password": \'correct horse battery staple\'',
+        '{"password": "correct horse battery staple"}',
+        "{'password': 'correct horse battery staple'}",
+        'password: "correct horse battery staple"',
+        "password: 'correct horse battery staple'",
+    ],
+)
+def test_key_and_value_quote_styles_are_independent(text: str) -> None:
+    out = redact_text(text)
+
+    for fragment in ("correct", "horse", "battery", "staple"):
+        assert fragment not in out
+    assert "[REDACTED]" in out
+
+
 def test_single_quoted_grammar_choice_never_eats_following_lines() -> None:
     out = redact_text("password: 'ends in \\'\nnext: must-survive\n")
 
