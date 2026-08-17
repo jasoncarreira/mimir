@@ -442,6 +442,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
         str(maintenance_pinned_executables["git"]), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={home.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", "status", "--short",
     ]

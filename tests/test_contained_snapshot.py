@@ -37,6 +37,10 @@ def repository(tmp_path: Path) -> Path:
     (root / "tracked.txt").write_text("original\n")
     git(root, "add", ".")
     git(root, "commit", "-qm", "seed")
+    subprocess.run(
+        ["git", "-C", str(root), "config", "maintenance.auto", "false"],
+        check=True,
+    )
     return root
 
 

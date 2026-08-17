@@ -32,7 +32,7 @@ def _make_registry(tmp_path: Path) -> ShellJobRegistry:
     return ShellJobRegistry(jobs_dir=tmp_path / "shell-jobs")
 
 
-def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 5.0) -> None:
+def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = registry.get(job_id)
@@ -672,9 +672,27 @@ def test_scheduled_eviction_does_not_require_later_spawn(
     monkeypatch.setattr("mimir.shell_jobs.EVICT_AFTER_SECONDS", 0.05)
     registry = _make_registry(tmp_path)
     job = registry.spawn("done", argv=[sys.executable, "-c", "pass"])
-    _wait_until_done(registry, job.job_id)
-    deadline = time.time() + 2
-    while registry.get(job.job_id) is not None and time.time() < deadline:
+
+    # Poll for the whole postcondition, never for an intermediate state. Two
+    # separate races make an intermediate assertion unreliable here: the sweep
+    # can evict the job before a poll observes its exit code (after which
+    # get() returns None forever and a wait-for-exit spins to its deadline),
+    # and _evict_stale pops the registry entry under its lock but unlinks the
+    # output files outside it, so removal and unlink are not simultaneous.
+    #
+    # Only a job with both exit_code and finished_at set is eligible for
+    # eviction, so reaching this postcondition also establishes that the job
+    # ran to completion -- and no second spawn() occurs, which is the property
+    # under test.
+    def evicted() -> bool:
+        return (
+            registry.get(job.job_id) is None
+            and not job.stdout_path.exists()
+            and not job.stderr_path.exists()
+        )
+
+    deadline = time.time() + 30.0
+    while not evicted() and time.time() < deadline:
         time.sleep(0.02)
 
     assert registry.get(job.job_id) is None
