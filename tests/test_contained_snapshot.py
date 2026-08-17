@@ -37,6 +37,10 @@ def repository(tmp_path: Path) -> Path:
     (root / "tracked.txt").write_text("original\n")
     git(root, "add", ".")
     git(root, "commit", "-qm", "seed")
+    subprocess.run(
+        ["git", "-C", str(root), "config", "maintenance.auto", "false"],
+        check=True,
+    )
     return root
 
 
@@ -44,9 +48,6 @@ def source_state(root: Path) -> dict[bytes, tuple[int, int, int, int, int]]:
     result = {}
     root_bytes = os.fsencode(root)
     for directory, names, files in os.walk(root_bytes):
-        # Git may update internal metadata asynchronously via auto-maintenance.
-        if directory == root_bytes:
-            names[:] = [name for name in names if name != b".git"]
         for name in [*names, *files]:
             path = os.path.join(directory, name)
             value = os.lstat(path)
