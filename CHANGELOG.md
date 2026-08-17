@@ -142,7 +142,17 @@ sampled once instead of polling.
 - A **non-blocking macOS CI leg** across Python 3.11 and 3.12, as a separate job
   so the required `pytest (3.11)` / `pytest (3.12)` check names are unchanged.
   It immediately surfaced two latent environment assumptions that had been
-  misfiring on Linux and being dismissed as flakes. (#1277)
+  misfiring on Linux and being dismissed as flakes, and both are now fixed
+  (#1277, #1278). One test snapshotted a repository tree that git's background
+  auto-maintenance was concurrently writing into; it now disables
+  `maintenance.auto` for its fixture rather than excluding `.git` from the
+  comparison, which would have stopped detecting source mutations the snapshot
+  exists to catch. The other raced the shell-job eviction sweep two ways — the
+  sweep can evict a job before a poll observes its exit code, and `_evict_stale`
+  pops the registry entry under its lock but unlinks output files outside it —
+  so it now waits on the whole postcondition instead of on either intermediate
+  state. Neither was a Darwin defect; macOS surfaced them because its runners
+  are slower.
 - **Remediation on CI failure** for Mimir-owned pull requests, with durable
   delivery receipts written only after enqueue succeeds, so a rejected handoff
   retries instead of being silently consumed. (#1270)
