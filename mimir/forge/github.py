@@ -8,6 +8,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping
+from enum import StrEnum
 from typing import Any
 
 import requests
@@ -40,6 +41,19 @@ _identity_lock = threading.Lock()
 _verified_identity: tuple[str, str] | None = None
 
 
+class GitHubIdentityFailureKind(StrEnum):
+    """Typed provenance for deciding whether identity verification may retry."""
+
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+
+
+class _GitHubRequestError(ForgeError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class GitHubIdentityVerificationError(ForgeError):
     """A safe, pre-effect failure to bind credentials to a declared login."""
 
@@ -49,10 +63,12 @@ class GitHubIdentityVerificationError(ForgeError):
         *,
         declared_login: str = "",
         authenticated_login: str = "",
+        failure_kind: GitHubIdentityFailureKind = GitHubIdentityFailureKind.PERMANENT,
     ) -> None:
         super().__init__(message)
         self.declared_login = declared_login
         self.authenticated_login = authenticated_login
+        self.failure_kind = failure_kind
 
 
 def _credential_fingerprint(token: str) -> str:
@@ -135,7 +151,18 @@ class GitHubForgeClient:
                         authenticated_login=login,
                     )
                 return login
-            data = self._request("GET", "/user")
+            try:
+                data = self._request("GET", "/user")
+            except _GitHubRequestError as exc:
+                raise GitHubIdentityVerificationError(
+                    str(exc),
+                    declared_login=expected,
+                    failure_kind=(
+                        GitHubIdentityFailureKind.TRANSIENT
+                        if exc.retryable
+                        else GitHubIdentityFailureKind.PERMANENT
+                    ),
+                ) from exc
             login = str(data.get("login", "")).strip() if isinstance(data, Mapping) else ""
             if _REVIEWER.fullmatch(login) is None:
                 raise GitHubIdentityVerificationError(
@@ -191,7 +218,9 @@ class GitHubForgeClient:
                 timeout=self._timeout,
             )
         except requests.RequestException as exc:
-            raise ForgeError(f"forge transport failed: {type(exc).__name__}") from exc
+            raise _GitHubRequestError(
+                f"forge transport failed: {type(exc).__name__}", retryable=True,
+            ) from exc
         raw = response.content
         if len(raw) > max_bytes:
             raise ForgeResponseTooLarge("forge response exceeded size limit")
@@ -204,7 +233,10 @@ class GitHubForgeClient:
                 422: "operation rejected",
                 429: "rate limited",
             }
-            raise ForgeError(reasons.get(response.status_code, "forge request failed"))
+            raise _GitHubRequestError(
+                reasons.get(response.status_code, "forge request failed"),
+                retryable=response.status_code == 429 or response.status_code >= 500,
+            )
         if not raw:
             return None
         if "application/json" not in response.headers.get("Content-Type", ""):

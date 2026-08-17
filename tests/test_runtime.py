@@ -660,8 +660,150 @@ async def test_agent_collaborator_parity_and_final_commit(
         "agent",
     ]
     assert events[-1][0] == "run_turn"
-    assert adapters.dispatcher._run_turn == bundle.agent.run_turn
+    assert adapters.dispatcher._run_turn != bundle.agent.run_turn
 
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_preflight_recovers_after_bounded_transient_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger
+    from mimir.forge.github import (
+        GitHubIdentityFailureKind,
+        GitHubIdentityVerificationError,
+    )
+    from mimir.tools import forge as forge_tools
+
+    events: list[tuple[str, Any]] = []
+    original_initialize = forge_tools.initialize_github_forge_identity
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setattr(
+        forge_tools, "initialize_github_forge_identity", original_initialize,
+    )
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(forge_tools, "_default_client", None)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    attempts: list[int] = []
+
+    class Client:
+        def verify_identity(self, declared_login: str) -> str:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) <= 3:
+                raise GitHubIdentityVerificationError(
+                    f"unrelated provider message {len(attempts)}",
+                    declared_login=declared_login,
+                    failure_kind=GitHubIdentityFailureKind.TRANSIENT,
+                )
+            return declared_login
+
+    monkeypatch.setattr("mimir.forge.github.GitHubForgeClient", Client)
+    now = [0.0]
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
+    logged: list[str] = []
+    monkeypatch.setattr(
+        mimir.event_logger,
+        "log_event_sync",
+        lambda name, **kwargs: logged.append(name),
+    )
+
+    async def log_event(name: str, **kwargs: Any) -> None:
+        logged.append(name)
+
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+
+    sent: list[str] = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id: str, text: str, **kwargs: Any) -> None:
+            sent.append(channel_id)
+
+    adapters = _adapters(events)
+    adapters = runtime.RuntimeAdapters(
+        dispatcher=adapters.dispatcher,
+        scheduler=adapters.scheduler,
+        channels=Channels(),
+        pairing_notifier=adapters.pairing_notifier,
+        spawn_background_task=adapters.spawn_background_task,
+    )
+    config = _config(tmp_path)
+    config.coding_enabled = True
+    config.operator_alert_channel = "ops"
+    bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
+
+    assert attempts == [1]
+    assert forge_tools.github_identity_recovery_pending() is True
+    assert sent == []
+    await adapters.dispatcher._run_turn(object())
+    assert attempts == [1]
+
+    now[0] = 60.0
+    await adapters.dispatcher._run_turn(object())
+    assert attempts == [1, 2]
+    assert sent == []
+    now[0] = 120.0
+    await adapters.dispatcher._run_turn(object())
+    await asyncio.sleep(0)
+    assert attempts == [1, 2, 3]
+    assert sent == ["ops"]
+
+    now[0] = 180.0
+    await adapters.dispatcher._run_turn(object())
+
+    assert attempts == [1, 2, 3, 4]
+    assert forge_tools.github_identity_is_degraded() is False
+    assert isinstance(forge_tools._default_client, Client)
+    assert logged.count("github_identity_degraded") == 1
+    assert logged.count("github_identity_recovered") == 1
+    await bundle.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_preflight_never_retries_permanent_identity_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.event_logger
+    from mimir.forge.github import GitHubIdentityVerificationError
+    from mimir.tools import forge as forge_tools
+
+    events: list[tuple[str, Any]] = []
+    original_initialize = forge_tools.initialize_github_forge_identity
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setattr(
+        forge_tools, "initialize_github_forge_identity", original_initialize,
+    )
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    attempts: list[str] = []
+
+    class Client:
+        def verify_identity(self, declared_login: str) -> str:
+            attempts.append(declared_login)
+            raise GitHubIdentityVerificationError(
+                "changed mismatch wording",
+                declared_login=declared_login,
+                authenticated_login="other-bot",
+            )
+
+    monkeypatch.setattr("mimir.forge.github.GitHubForgeClient", Client)
+    monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *a, **kw: None)
+    config = _config(tmp_path)
+    config.coding_enabled = True
+    bundle = await runtime.create_agent_runtime(
+        config, _core(tmp_path), _adapters(events),
+    )
+
+    await bundle.adapters.dispatcher._run_turn(object())
+    await bundle.adapters.dispatcher._run_turn(object())
+
+    assert attempts == ["reviewer"]
+    assert forge_tools.github_identity_is_degraded() is True
+    assert forge_tools.github_identity_recovery_pending() is False
     await bundle.aclose()
 
 
@@ -801,7 +943,8 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         "session_idle",
         "session_busy",
     ]
-    assert events[-1] == ("run_turn", bundle.agent.run_turn)
+    assert events[-1][0] == "run_turn"
+    assert events[-1][1] != bundle.agent.run_turn
 
     assert dispatcher._on_channel_idle("channel-1") is True
     injected_event = object()
@@ -1569,7 +1712,7 @@ async def test_non_web_entrypoint_builds_and_closes_real_agent_graph(
     server_was_loaded = "mimir.server" in sys.modules
     bundle = await runtime.create_agent_runtime(config, core, adapters)
     assert bundle.agent.__class__.__name__ == "Agent"
-    assert dispatcher._run_turn == bundle.agent.run_turn
+    assert dispatcher._run_turn != bundle.agent.run_turn
     assert ("mimir.server" in sys.modules) is server_was_loaded
 
     await bundle.aclose()
