@@ -989,6 +989,7 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     passphrase = "correct horse battery staple"
     escaped_phrase = "quoted inner words here"
     mixed_quote_phrase = "cross style value words"
+    flow_secret = "inline mapping datum"
     record = TurnRecord(
         ts="2026-05-15T12:00:00Z",
         turn_id="0123456789abcdef",         # make_turn_id() shape (16 hex)
@@ -1008,6 +1009,7 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
                 # rule that stops at the first space persists most of it.
                 f'{{"password": "{passphrase}"}}\n'
                 f'{{\'password\': "{mixed_quote_phrase}"}}\n'
+                "{'password': '" + flow_secret + " \\', 'next': 'survivor-entry'}\n"
                 # Embedded ESCAPED quotes: the value runs past them to the
                 # true closing quote, so no fragment may survive.
                 '{"password": "a \\"' + escaped_phrase + '\\" z"}\n'
@@ -1034,6 +1036,9 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
         assert fragment not in line
     for fragment in mixed_quote_phrase.split():
         assert fragment not in line
+    for fragment in flow_secret.split():
+        assert fragment not in line
+    assert "survivor-entry" in line
     assert "[REDACTED]" in rec["input"]
     assert "[REDACTED]" in rec["output"]
     assert "[REDACTED]" in rec["events"][0]["content"]

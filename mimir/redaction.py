@@ -74,11 +74,21 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # trying only Python-repr made the YAML form consume its real closing quote
     # and erase every following line. Neither alternative may cross a newline,
     # which is what bounds an unterminated quote to its own line.
+    #
+    # The Python branch additionally may NOT escape a quote that is followed by
+    # structural context — a comma, closing brace/bracket, colon, or end of
+    # line. There the quote is the real YAML delimiter, and consuming it eats
+    # the separator and the next key: the flow mapping
+    # ``{'password': 'ends in \', 'next': 'must-survive'}`` (which PyYAML reads
+    # as two entries) became ``{'password': '[REDACTED]'next': 'must-survive'}``.
+    # Bounding the value to its own line is not sufficient; same-line
+    # delimiters have to survive too.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
         r"['\"]?[ \t]*:[ \t]*')"
-        r"((?:''|\\[^\n]|[^'\\\n])*|(?:''|[^'\n])*)(?=')"
+        r"((?:''|\\(?!'(?:[ \t]*[,}\]:#]|[ \t]*$))[^\n]|[^'\\\n])*"
+        r"|(?:''|[^'\n])*)(?=')"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
     # block scalar's body is delimited by indentation relative to its own

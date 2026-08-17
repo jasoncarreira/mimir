@@ -199,6 +199,31 @@ def test_key_and_value_quote_styles_are_independent(text: str) -> None:
     assert "[REDACTED]" in out
 
 
+# Bounding a match to its own line is not enough: SAME-LINE structure has to
+# survive too. A YAML value ending in a literal backslash is closed by the very
+# next quote, so reading that quote as a Python escape consumes the separator
+# and the following key. PyYAML parses the flow mapping below as two entries.
+@pytest.mark.parametrize(
+    ("text", "must_survive"),
+    [
+        (
+            "{'password': 'ends in \\', 'next': 'must-survive'}",
+            ", 'next': 'must-survive'}",
+        ),
+        ("{'password': 'ends in \\'}", "}"),
+        ("password: 'ends in \\' # note 'quoted'\n", "# note 'quoted'"),
+        ("password: 'ends in \\' # plain note\n", "# plain note"),
+    ],
+)
+def test_single_quote_arbitration_preserves_same_line_context(
+    text: str, must_survive: str
+) -> None:
+    out = redact_text(text)
+
+    assert "ends in" not in out
+    assert must_survive in out
+
+
 def test_single_quoted_grammar_choice_never_eats_following_lines() -> None:
     out = redact_text("password: 'ends in \\'\nnext: must-survive\n")
 
