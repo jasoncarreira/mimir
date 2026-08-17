@@ -556,6 +556,56 @@ def _advance_pr_head(repo: Path, scope: RepoPRActionScope) -> RepoPRActionScope:
     return replace(scope, observed_head_sha=head, provenance="server_discovered")
 
 
+def _rebased_superseded_lease(
+    tmp_path: Path,
+    *,
+    dangling_source_commit: bool = False,
+) -> tuple[Path, PRCheckoutLease, RepoPRActionScope, str | None]:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    dangling = None
+    if dangling_source_commit:
+        _git(repo, "checkout", "-q", "-b", "discarded", "main")
+        (repo / "discarded.txt").write_text("source-only object\n", encoding="utf-8")
+        _git(repo, "add", "discarded.txt")
+        _git(repo, "commit", "-q", "-m", "discarded source commit")
+        dangling = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "-q", "worklink/7")
+        _git(repo, "branch", "-D", "discarded")
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (lease.path / "authored.txt").write_text("published fix\n", encoding="utf-8")
+    _git(lease.path, "add", "authored.txt")
+    _git(lease.path, "commit", "-q", "-m", "published fix")
+    published = _git(lease.path, "rev-parse", "HEAD")
+    _git(lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
+    _git(lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
+
+    _git(repo, "checkout", "-q", "main")
+    (repo / ".gitattributes").write_text("*.bin -diff\n", encoding="utf-8")
+    (repo / "base.bin").write_bytes(b"\x00\xffbase branch\n")
+    _git(repo, "add", ".gitattributes", "base.bin")
+    _git(repo, "commit", "-q", "-m", "advance base with binary content")
+    advanced_base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "-q", "origin", "HEAD:main")
+    _git(lease.path, "fetch", "-q", "origin", "main")
+    _git(lease.path, "rebase", "origin/main")
+    assert _git(lease.path, "rev-parse", "HEAD") != published
+    assert _git(lease.path, "rev-parse", "HEAD:base.bin") == _git(
+        lease.path, "rev-parse", "origin/main:base.bin",
+    )
+    fresh_scope = replace(
+        old_scope,
+        observed_head_sha=published,
+        observed_base_sha=advanced_base,
+        provenance="server_discovered",
+    )
+    return lease_root, lease, fresh_scope, dangling
+
+
 def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -607,6 +657,113 @@ def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
             "acquisition": "fresh",
         },
     )]
+
+
+def test_acquire_releases_published_head_after_metadata_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (old_lease.path / "published.txt").write_text("published\n", encoding="utf-8")
+    _git(old_lease.path, "add", "published.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "published commit")
+    published = _git(old_lease.path, "rev-parse", "HEAD")
+    _git(old_lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
+    _git(old_lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
+    fresh_scope = replace(
+        old_scope, observed_head_sha=published, provenance="server_discovered",
+    )
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+
+
+def test_acquire_releases_rebased_published_work_by_blob_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, dangling = _rebased_superseded_lease(
+        tmp_path, dangling_source_commit=True,
+    )
+    assert dangling is not None
+    source_object = old_lease.source_root / ".git" / "objects" / dangling[:2] / dangling[2:]
+    lease_object = old_lease.path / ".git" / "objects" / dangling[:2] / dangling[2:]
+    assert source_object.stat().st_ino == lease_object.stat().st_ino
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+
+
+def test_acquire_names_unexplained_rebased_path_and_preserves_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, _dangling = _rebased_superseded_lease(tmp_path)
+    (old_lease.path / "unpublished.bin").write_bytes(b"\x00unpublished\xff")
+    _git(old_lease.path, "add", "unpublished.bin")
+    _git(old_lease.path, "commit", "-q", "-m", "unpublished binary")
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="retained work; refusing release") as refusal:
+        acquire_pr_checkout_lease(
+            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+        )
+
+    assert "unpublished.bin" in str(refusal.value)
+    assert old_lease.path.is_dir()
+
+
+def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root, old_lease, fresh_scope, _dangling = _rebased_superseded_lease(tmp_path)
+    branch = fresh_scope.head_ref
+    _git(old_lease.path, "checkout", "-q", "--orphan", "unrelated-base")
+    _git(old_lease.path, "rm", "-q", "-rf", ".")
+    (old_lease.path / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    _git(old_lease.path, "add", "unrelated.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "unrelated base")
+    unrelated = _git(old_lease.path, "rev-parse", "HEAD")
+    _git(old_lease.path, "checkout", "-q", branch)
+    _git(old_lease.path, "update-ref", "refs/remotes/origin/main", unrelated)
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    with pytest.raises(RuntimeError, match="no verifiable tracked base"):
+        acquire_pr_checkout_lease(
+            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+        )
+
+    assert old_lease.path.is_dir()
 
 
 def test_acquire_refuses_second_live_scope_for_same_target(
@@ -692,9 +849,11 @@ def test_acquire_does_not_trust_new_scope_sha_to_release_matching_live_head(
     assert old_lease.path.is_dir()
 
 
+@pytest.mark.parametrize("dirty_kind", ["tracked", "untracked"])
 def test_acquire_refuses_to_release_superseded_lease_with_uncommitted_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    dirty_kind: str,
 ) -> None:
     repo, old_scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
@@ -702,7 +861,7 @@ def test_acquire_refuses_to_release_superseded_lease_with_uncommitted_work(
     old_lease = create_pr_checkout_lease(
         old_scope, owner=old_scope.principal, lease_root=lease_root,
     )
-    retained = old_lease.path / "retained.txt"
+    retained = old_lease.path / ("file.txt" if dirty_kind == "tracked" else "retained.txt")
     retained.write_text("unfinished fix\n", encoding="utf-8")
     fresh_scope = _advance_pr_head(repo, old_scope)
     events: list[tuple[str, dict[str, object]]] = []
