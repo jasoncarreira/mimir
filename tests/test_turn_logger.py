@@ -985,6 +985,10 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     path = tmp_path / "turns.jsonl"
     log = TurnLogger(path)
     secret = "ghp_" + "A" * 36
+    unprefixed_secret = "0123456789abcdef0123456789abcdef"
+    passphrase = "correct horse battery staple"
+    escaped_phrase = "quoted inner words here"
+    mixed_quote_phrase = "cross style value words"
     record = TurnRecord(
         ts="2026-05-15T12:00:00Z",
         turn_id="0123456789abcdef",         # make_turn_id() shape (16 hex)
@@ -994,7 +998,23 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
         channel_id="web-alice",
         input=f"my key is {secret}",
         output=f"saved token={secret}",
-        events=[{"type": "tool_result", "content": f"export API_KEY={secret}"}],
+        events=[{
+            "type": "tool_result",
+            "content": (
+                f"> X-API-Key: {unprefixed_secret}\n"
+                f"MIMIR_API_KEY: {unprefixed_secret}\n"
+                f'{{"VOYAGE_API_KEY": "pa-{unprefixed_secret}"}}\n'
+                # A passphrase is a credential and holds whitespace; a value
+                # rule that stops at the first space persists most of it.
+                f'{{"password": "{passphrase}"}}\n'
+                f'{{\'password\': "{mixed_quote_phrase}"}}\n'
+                # Embedded ESCAPED quotes: the value runs past them to the
+                # true closing quote, so no fragment may survive.
+                '{"password": "a \\"' + escaped_phrase + '\\" z"}\n'
+                # A block scalar with an internal blank line and a header
+                # comment: every fragment must go, not just the first.
+            ),
+        }],
         total_cost_usd=0.0123,
         duration_ms=42,
     )
@@ -1004,6 +1024,16 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
 
     # The secret is masked everywhere it appeared (input, output, tool args).
     assert secret not in line
+    assert unprefixed_secret not in line
+    assert "pa-" + unprefixed_secret not in line
+    # Not just the first word of the passphrase, and not just the block
+    # indicator: no fragment of either may survive into the durable line.
+    for fragment in passphrase.split():
+        assert fragment not in line
+    for fragment in escaped_phrase.split():
+        assert fragment not in line
+    for fragment in mixed_quote_phrase.split():
+        assert fragment not in line
     assert "[REDACTED]" in rec["input"]
     assert "[REDACTED]" in rec["output"]
     assert "[REDACTED]" in rec["events"][0]["content"]

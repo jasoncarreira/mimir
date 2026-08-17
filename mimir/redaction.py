@@ -36,6 +36,74 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # env var dumps, JSON pretty-prints with bareword keys). The value alphabet
     # stops at common delimiters so the regex doesn't eat the rest of the line.
     re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
+    # Credential fields in header, YAML, JSON, and Python-repr colon forms.
+    # Requiring a credential-like key and a non-path boundary keeps ordinary
+    # prose, timestamps, unrelated mappings, and URL userinfo intact.
+    #
+    # Quoted values run to the CLOSING QUOTE, not to the first space. A
+    # passphrase is a credential and contains whitespace, so stopping at the
+    # space masks one word and persists the rest. There is one pattern per
+    # quote style because a backreference for the quote character would push
+    # the group count past two, which ``redact_text`` uses to decide whether
+    # the prefix is preserved.
+    # Double quotes: JSON and YAML both escape with a backslash, and YAML also
+    # allows a backslash before a physical newline as a line continuation, so an
+    # escape consumes ANY next character.
+    #
+    # Two guards keep an UNTERMINATED quote from consuming the rest of the log,
+    # and they are deliberately redundant: the excluded raw newline bounds a
+    # match to its own line, and the lookahead additionally requires a real
+    # closing delimiter. Removing either alone changes nothing; removing both
+    # lets ``password: "abc`` swallow every following line.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
+    ),
+    # Single quotes carry two INCOMPATIBLE grammars and a backslash is exactly
+    # where they disagree:
+    #
+    #   Python-repr — ``\`` escapes the next character, so ``'has \' and "'``
+    #                 continues past that apostrophe.
+    #   YAML        — ``\`` is literal and ``''`` is the only escape, so
+    #                 ``'ends in \'`` genuinely ends at that apostrophe.
+    #
+    # The same bytes are a different value under each, and nothing local to the
+    # match resolves it: deciding by what follows the quote is wrong for a repr
+    # whose credential contains ``',``, and preferring either reading in turn
+    # produced five successive defects — a leaked tail one way, an erased
+    # delimiter or following line the other.
+    #
+    # So this rule DECLINES the ambiguity instead of guessing. A value holding
+    # no backslash is unambiguous under both grammars and is masked; a value
+    # containing one is left alone. That is an honest miss, and it can neither
+    # leak half a credential nor corrupt the surrounding record. Full
+    # arbitration needs a parser rather than a pattern and is tracked with the
+    # block-scalar work.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
+    ),
+    # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
+    # block scalar's body is delimited by indentation relative to its own
+    # header, which these single-line patterns cannot express; six review
+    # rounds of trying produced a rule that still missed legal productions
+    # (explicit mapping keys among them). That work is tracked separately.
+    #
+    # The bare-value rule below therefore DECLINES a block indicator instead of
+    # masking it. Printing ``password: [REDACTED]`` above an untouched body
+    # would present an unredacted credential as though it had been scrubbed,
+    # which is worse for an audit trail than an honest miss.
+    #
+    # Bare (unquoted) values. The alphabet stops at common delimiters so the
+    # regex doesn't eat the rest of the line, and a block-scalar indicator is
+    # excluded so it can never be reported as a redacted value.
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?\s*:\s*)(?![|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
+    ),
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
     # chars are a high-confidence shape; mask the whole value.
