@@ -16,7 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.access_control import create_auth_context
-from mimir.agent import Agent
+from mimir.agent import Agent, _initialize_ifc_labels
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
     ChatSkillDescriptor,
@@ -196,7 +196,11 @@ async def test_authenticated_web_and_discord_continuity_both_directions(tmp_path
         _INBOUND_SKIP_TRIGGERS=frozenset(),
         _kind_for_trigger=Agent._kind_for_trigger,
     )
-    await Agent._append_inbound_to_buffer(agent, web_event)
+    await Agent._append_inbound_to_buffer(
+        agent,
+        web_event,
+        _initialize_ifc_labels(web_event, resolver=resolver),
+    )
     await buf.append(
         buf.make_message(
             channel_id="web-jason",
