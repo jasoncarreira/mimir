@@ -1440,8 +1440,16 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert "GITHUB_TOKEN" not in env
     assert "MIMIR_HOME" not in env
     assert env["CI"] == "1"
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "*"
     assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 64 * 1024
     assert kwargs["timeout_s"] == 300.0
+    assert result.git_context == (
+        "contained Git context: runner=worklink uid=42002 gid=42003; "
+        "checkout_owner=mimir uid=42001 gid=42003; global_config=/dev/null; "
+        "system_config=disabled; safe.directory=*"
+    )
 
 
 @pytest.mark.asyncio

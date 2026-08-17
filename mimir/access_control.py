@@ -2489,6 +2489,7 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     execution_argv = [
         str(git), "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
         *credential_overrides,
         *transport_overrides,
         *identity_overrides,
@@ -2967,10 +2968,16 @@ def _maintenance_git_filter_overrides(
     side. Enumerate the effective command-bearing keys with the same hardened
     binary/config/environment contract as execution, validate the NUL-delimited
     names, then shadow each command with an empty command in the final argv.
+
+    Repo-test snapshots are owned by the controller's ``mimir_uid`` while the
+    suite runs as ``worklink_uid``. Git otherwise rejects this local-config read
+    as dubious ownership. The profile has already bound and authorized ``root``,
+    so trust that exact directory rather than inheriting caller identity.
     """
     command = [
         git_executable, "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
         "--no-pager", "config", "--local", "--null", "--name-only",
         "--get-regexp", r"^filter\..*\.(clean|smudge|process)$",
     ]
@@ -3171,6 +3178,7 @@ def _maintenance_git_execution_argv(argv: list[str]) -> list[str] | None:
     execution_argv = [
         pinned_git[0], "-C", str(root),
         *_MAINTENANCE_GIT_BASE_OVERRIDES,
+        "-c", f"safe.directory={root}",
         "-c", "credential.helper=",
         *filter_overrides, "--no-pager", "--no-optional-locks",
         subcommand, *subcommand_arguments,
