@@ -113,10 +113,7 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
         r"['\"]?[ \t]*:[ \t]*)"
-        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$)|"
-        r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]+)+"
-        r"[|>](?:[1-9][+-]?|[+-][1-9]?)?[ \t]*(?:#[^\r\n]*)?(?=\r?$|\r?\n))"
-        r"([^\s\"',&}]+)"
+        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
     ),
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
@@ -372,6 +369,12 @@ def _scanned_block_scalar_lines(text: str) -> list[int]:
 
 
 def _mask_block_scalar_lines(text: str) -> str:
+    # A YAML block scalar must contain one of its two style indicators. Keep
+    # parser construction off the common durable-log path, where almost every
+    # string is ordinary prose, JSON, or a single-line diagnostic.
+    if "|" not in text and ">" not in text:
+        return text
+
     try:
         line_numbers = _yaml_block_scalar_lines(text)
         if line_numbers is None:
