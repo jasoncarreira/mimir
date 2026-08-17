@@ -29,10 +29,11 @@ Safety properties:
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from ._rmtree import rmtree_missing_ok
 
 __all__ = [
     "DEFAULT_SCRATCH_TTL_DAYS",
@@ -296,7 +297,7 @@ def sweep_scratch_roots(
                 if entry.is_symlink() or not entry.is_dir():
                     entry.unlink(missing_ok=True)
                 else:
-                    shutil.rmtree(entry)
+                    rmtree_missing_ok(entry)
                 removed.append(str(entry.relative_to(home)))
                 reclaimed += size
             except OSError as exc:

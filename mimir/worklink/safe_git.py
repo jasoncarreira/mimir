@@ -14,6 +14,8 @@ import sys
 import tempfile
 import threading
 
+from .._rmtree import rmtree_missing_ok
+
 
 _MAX_FILE_BYTES = 1024 * 1024
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -222,7 +224,7 @@ class ControllerGitPublication:
             except FileNotFoundError:
                 value = None
             if value is not None and GitDirectoryIdentity(value.st_dev, value.st_ino) == self._metadata_identity:
-                shutil.rmtree(self.metadata_path)
+                rmtree_missing_ok(self.metadata_path)
             self._closed = True
 
     def __enter__(self) -> ControllerGitPublication:

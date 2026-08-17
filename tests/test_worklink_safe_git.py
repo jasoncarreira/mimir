@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+import mimir._rmtree as rmtree_module
 import mimir.worklink.safe_git as safe_git_module
 from mimir.worklink.safe_git import ControllerGitPublication, SafeGitError
 
@@ -53,6 +54,69 @@ def _capture(repo: Path, branch: str, tmp_path: Path) -> tuple[ControllerGitPubl
 def _close(publication: ControllerGitPublication, checkout_fd: int) -> None:
     publication.close()
     os.close(checkout_fd)
+
+
+def test_new_test_repository_disables_auto_maintenance(tmp_path: Path) -> None:
+    repo = tmp_path / "repository"
+    _git(tmp_path, "init", "-q", str(repo))
+
+    assert _git(repo, "config", "--get", "maintenance.auto").stdout.strip() == "false"
+
+
+def test_publication_close_tolerates_entry_removed_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, branch = _repository(tmp_path)
+    publication, checkout_fd = _capture(repo, branch, tmp_path)
+    race = publication.metadata_path / "race"
+    race.mkdir()
+    first = race / "first"
+    second = race / "maintenance.lock"
+    first.write_text("first\n")
+    second.write_text("lock\n")
+    real_unlink = os.unlink
+    raced = False
+
+    def unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal raced
+        name = os.fsdecode(path)
+        if not raced and name in {first.name, second.name}:
+            raced = True
+            other = second if name == first.name else first
+            real_unlink(other)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(safe_git_module.os, "unlink", unlink)
+    try:
+        publication.close()
+    finally:
+        os.close(checkout_fd)
+
+    assert raced
+    assert not publication.metadata_path.exists()
+
+
+def test_publication_close_does_not_swallow_other_rmtree_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, branch = _repository(tmp_path)
+    publication, checkout_fd = _capture(repo, branch, tmp_path)
+    real_rmtree = rmtree_module.shutil.rmtree
+    failure = PermissionError("permission denied")
+
+    def rmtree(_path: object, *, onerror: object) -> None:
+        onerror(os.unlink, str(publication.metadata_path), (PermissionError, failure, None))
+
+    monkeypatch.setattr(rmtree_module.shutil, "rmtree", rmtree)
+    try:
+        with pytest.raises(PermissionError, match="permission denied"):
+            publication.close()
+    finally:
+        monkeypatch.undo()
+        real_rmtree(publication.metadata_path)
+        os.close(checkout_fd)
+
+    assert not publication._closed
 
 
 def test_publication_uses_private_index_refs_and_objects(tmp_path: Path) -> None:
