@@ -100,162 +100,19 @@ def test_quoted_credential_is_masked_through_the_closing_quote(
     assert redact_text(text) == expected
 
 
-# The block-scalar indicator is not the value. Masking it prints a redacted
-# line directly above an untouched secret, so the log reads as safe when it
-# is not — the failure mode this pins is worse than a plain miss.
+# The block indicator is NOT a value. Masking it would print
+# ``password: [REDACTED]`` directly above an untouched body, presenting an
+# unredacted credential as though it had been scrubbed. Multiline block scalars
+# are out of scope here; declining the indicator keeps the miss honest.
 @pytest.mark.parametrize("indicator", ["|", ">", "|-", ">-", "|+", "|2"])
-def test_yaml_block_scalar_body_is_masked_not_the_indicator(indicator: str) -> None:
-    secret = "s3cr3t" + "-value-here"
-    out = redact_text(f"password: {indicator}\n  {secret}\n")
+def test_block_scalar_indicator_is_not_reported_as_redacted(indicator: str) -> None:
+    secret = "hh" + "-secret-body"
+    text = f"password: {indicator}\n  {secret}\n"
 
-    assert secret not in out
-    assert "[REDACTED]" in out
-    # The indicator survives so the structure stays readable.
-    assert out.startswith(f"password: {indicator}")
+    out = redact_text(text)
 
-
-# Blank lines are part of a block scalar, and a header may carry a comment.
-# Ending the body at the first blank line masks the opening fragment and leaves
-# the rest — the log then reads as scrubbed while holding half the credential.
-@pytest.mark.parametrize(
-    "header",
-    ["password: |", "password: >-", "password: | # supplied externally"],
-)
-@pytest.mark.parametrize("gap", ["\n", "\n\n", "\n   \n"])
-def test_yaml_block_scalar_masks_every_fragment_across_blank_lines(
-    header: str, gap: str
-) -> None:
-    first = "aa" + "-secret-fragment"
-    second = "bb" + "-secret-fragment"
-    out = redact_text(f"{header}\n  {first}\n{gap}  {second}\n")
-
-    assert first not in out
-    assert second not in out
-
-
-# The body may also BEGIN after blank lines. Requiring the first body line to
-# be indented and non-blank misses such a scalar entirely — the block rule does
-# not fire and the bare-value guard correctly declines the indicator, so the
-# credential is left wholly unredacted.
-@pytest.mark.parametrize("lead", ["\n", "\n\n", "   \n", "\t\n"])
-def test_yaml_block_scalar_body_may_begin_after_blank_lines(lead: str) -> None:
-    secret = "dd" + "-secret-fragment"
-    out = redact_text(f"password: |\n{lead}  {secret}\n")
-
-    assert secret not in out
-    assert "[REDACTED]" in out
-
-
-# Sweep the block-scalar grammar rather than adding one case per report: three
-# rounds of review found three separate holes in this one pattern, each a legal
-# YAML shape the previous fix had not considered.
-@pytest.mark.parametrize(
-    "header",
-    [
-        "password: |", "password: >", "password: |-", "password: >+",
-        "password: |2", "password: | # supplied externally",
-        "PASSWORD: |", '"api_key": |',
-    ],
-)
-@pytest.mark.parametrize("lead", ["", "\n", "\n\n", "   \n"])
-@pytest.mark.parametrize("gap", ["", "\n", "  \n"])
-@pytest.mark.parametrize("key_indent", ["", "  ", "    ", "  - ", "  - - "])
-def test_yaml_block_scalar_grammar_sweep_leaks_no_fragment(
-    header: str, lead: str, gap: str, key_indent: str
-) -> None:
-    """Sweep both directions: the secret must go AND the record must survive.
-
-    A redactor that erases surrounding configuration is a different defect from
-    one that leaks, and asserting only the first hid it through three rounds of
-    review. Body membership is relative to the scalar header's own indentation,
-    so a same-indent sibling and every ancestor key must be untouched.
-    """
-    first = "ee" + "-frag-one"
-    second = "ff" + "-frag-two"
-    # A sequence entry's ``- `` counts toward the nested mapping's indentation,
-    # so the key's COLUMN — not the leading whitespace — bounds the body.
-    body = " " * (len(key_indent) + 4)
-    sibling = " " * len(key_indent) + "sibling: must-survive"
-    ancestor = "root: must-survive"
-    out = redact_text(
-        f"{key_indent}{header}\n{lead}{body}{first}\n{gap}{body}{second}\n"
-        f"{sibling}\n{ancestor}\n"
-    )
-
-    assert first not in out
-    assert second not in out
-    assert sibling in out
-    assert ancestor in out
-
-
-def test_nested_block_scalar_preserves_same_indent_sibling() -> None:
-    """A nested scalar must not swallow keys up to the next column-zero line."""
-    out = redact_text(
-        "a:\n  b:\n    password: |\n      s3cret-here\n"
-        "    peer: keep-me\n  c: keep-c\nd: keep-d\n"
-    )
-
-    assert "s3cret-here" not in out
-    assert "peer: keep-me" in out
-    assert "c: keep-c" in out
-    assert "d: keep-d" in out
-
-
-def test_explicit_indentation_indicator_bounds_the_body() -> None:
-    out = redact_text("config:\n  password: |2\n    deep-secret\n  sibling: keep\n")
-
-    assert "deep-secret" not in out
-    assert "sibling: keep" in out
-
-
-# A quoted key may hold characters a bare key cannot, and YAML allows node
-# properties between the colon and the indicator. Either shape going unmatched
-# leaves the whole body in the durable log.
-@pytest.mark.parametrize(
-    "key",
-    ['"a:password"', "'x:secret'", "password", '"api_key"'],
-)
-@pytest.mark.parametrize("prop", ["", "&anchor ", "!!str ", "!!str &a ", "*alias "])
-def test_block_scalar_header_accepts_quoted_keys_and_node_properties(
-    key: str, prop: str
-) -> None:
-    secret = "gg" + "-secret-fragment"
-    out = redact_text(f"{key}: {prop}|\n  {secret}\nnextkey: keep\n")
-
-    assert secret not in out
-    assert "nextkey: keep" in out
-
-
-def test_block_scalar_in_a_sequence_entry_is_masked() -> None:
-    """``- password: |`` is a legal mapping-in-sequence and common config shape."""
-    out = redact_text(
-        "credentials:\n  - password: |\n      secret-body\n"
-        "  - name: keep-me\nroot: keep-root\n"
-    )
-
-    assert "secret-body" not in out
-    assert "name: keep-me" in out
-    assert "keep-root" in out
-
-
-def test_block_scalar_in_a_nested_sequence_entry_is_masked() -> None:
-    out = redact_text(
-        "a:\n  - - password: |\n        deep-secret\n    - name: keep-inner\n"
-        "  - top: keep-top\nz: keep-z\n"
-    )
-
-    assert "deep-secret" not in out
-    assert "name: keep-inner" in out
-    assert "top: keep-top" in out
-    assert "keep-z" in out
-
-
-def test_yaml_block_scalar_leaves_the_following_key_intact() -> None:
-    secret = "cc" + "-secret-fragment"
-    out = redact_text(f"password: |\n  {secret}\n\nnextkey: plain\n")
-
-    assert secret not in out
-    assert out.endswith("\nnextkey: plain\n")
+    assert out == text, "the indicator must not be masked as if it were a value"
+    assert "[REDACTED]" not in out
 
 
 def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:

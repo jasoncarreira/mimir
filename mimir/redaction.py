@@ -56,11 +56,17 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
         r"'?[ \t]*:[ \t]*')([^']*)"
     ),
-    # YAML block scalars are handled by ``_mask_yaml_block_scalars`` rather
-    # than a pattern here: body membership is defined by indentation relative
-    # to the scalar's own header, which a regex cannot express without a
-    # backreference — and a third capture group would change how
-    # ``redact_text`` substitutes (it keys off ``pat.groups == 2``).
+    # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
+    # block scalar's body is delimited by indentation relative to its own
+    # header, which these single-line patterns cannot express; six review
+    # rounds of trying produced a rule that still missed legal productions
+    # (explicit mapping keys among them). That work is tracked separately.
+    #
+    # The bare-value rule below therefore DECLINES a block indicator instead of
+    # masking it. Printing ``password: [REDACTED]`` above an untouched body
+    # would present an unredacted credential as though it had been scrubbed,
+    # which is worse for an audit trail than an honest miss.
+    #
     # Bare (unquoted) values. The alphabet stops at common delimiters so the
     # regex doesn't eat the rest of the line, and a block-scalar indicator is
     # excluded so it can never be reported as a redacted value.
@@ -88,86 +94,6 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-# ``indent`` spans everything left of the key, including any sequence-entry
-# dashes: in ``  - password: |`` the key's column is what bounds the body, and
-# YAML counts the ``- `` as part of the nested mapping's indentation. Nested
-# sequences (``- - password: |``) repeat the prefix.
-_CREDENTIAL_WORD = r"(?:token|api[_-]?key|password|passwd|secret)"
-
-# A QUOTED key may contain characters a bare key cannot -- notably a colon, as
-# in ``"a:password": |``. Matching quoted and bare keys with one alphabet either
-# rejects the quoted form or lets a bare key swallow the separator, so they are
-# separate alternatives. This pattern is used by ``_mask_yaml_block_scalars``
-# rather than living in ``_TOKEN_PATTERNS``, so its group count is free.
-#
-# Between the colon and the indicator YAML permits node properties: an anchor
-# (``&name``), an alias (``*name``), or a tag (``!tag`` / ``!!str``), in either
-# order. Skipping them is required or the header is not recognised at all and
-# the whole body survives.
-_BLOCK_SCALAR_HEADER = re.compile(
-    r"(?i)^(?P<indent>[ \t]*(?:-[ \t]+)*)"
-    rf"(?:\"[^\"]*{_CREDENTIAL_WORD}[^\"]*\""
-    rf"|'[^']*{_CREDENTIAL_WORD}[^']*'"
-    rf"|[A-Za-z0-9_.-]*{_CREDENTIAL_WORD})"
-    r"[ \t]*:[ \t]*(?:[&*!][^\s]*[ \t]+)*"
-    r"[|>](?P<mods>[-+0-9]*)[ \t]*(?:\#.*)?$"
-)
-
-
-def _indent_width(line: str) -> int:
-    """Leading-whitespace width, tabs counted as one column (YAML forbids them)."""
-    return len(line) - len(line.lstrip(" \t"))
-
-
-def _mask_yaml_block_scalars(text: str) -> str:
-    """Replace YAML block-scalar bodies holding credentials with ``[REDACTED]``.
-
-    A block scalar's body is defined by indentation *relative to its own
-    header*, so this cannot be a pattern in ``_TOKEN_PATTERNS``: matching
-    "indented further than the key" needs a backreference, and the extra
-    capture group would change how ``redact_text`` substitutes.
-
-    Treating any leading whitespace as body membership is not a safe
-    approximation. For a nested scalar it swallows same-indent sibling keys and
-    every following line up to column zero, destroying unrelated configuration
-    or log evidence — a redactor that erases the surrounding record is a
-    different bug from one that leaks, and worse for an audit trail.
-    """
-    if "|" not in text and ">" not in text:
-        return text
-    lines = text.splitlines(keepends=True)
-    out: list[str] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        header = _BLOCK_SCALAR_HEADER.match(line.rstrip("\r\n"))
-        out.append(line)
-        index += 1
-        if header is None:
-            continue
-        header_indent = len(header.group("indent"))
-        digits = "".join(ch for ch in header.group("mods") if ch.isdigit())
-        # An explicit indentation indicator fixes the body column; otherwise any
-        # deeper indentation than the header belongs to the scalar.
-        minimum = header_indent + (int(digits) if digits else 1)
-        body_end = index
-        cursor = index
-        while cursor < len(lines):
-            candidate = lines[cursor]
-            if not candidate.strip():
-                cursor += 1          # blank lines belong to the scalar…
-                continue
-            if _indent_width(candidate) < minimum:
-                break                # …but a line at or above the header ends it
-            cursor += 1
-            body_end = cursor         # only non-blank lines extend the body,
-        if body_end == index:         # so trailing blanks are never consumed
-            continue
-        out.append("[REDACTED]\n" if lines[body_end - 1].endswith("\n") else "[REDACTED]")
-        index = body_end
-    return "".join(out)
-
-
 def redact_text(text: str) -> str:
     """Strip token-shaped secrets out of text before it lands in logs.
 
@@ -178,10 +104,7 @@ def redact_text(text: str) -> str:
     """
     if not text:
         return text
-    # Block scalars first: their bodies are indentation-delimited, and masking
-    # them before the value patterns run keeps a body line from being partly
-    # rewritten by a rule that has no notion of the enclosing scalar.
-    out = _mask_yaml_block_scalars(text)
+    out = text
     for pat in _TOKEN_PATTERNS:
         # Patterns with capture groups preserve the prefix; the others mask the
         # whole match. We detect by group count.
