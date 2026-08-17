@@ -113,7 +113,10 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert state.checkout_lease is None
 
 
-def test_second_attempt_resumes_unpushed_commit(tmp_path: Path) -> None:
+def test_second_attempt_resumes_unpushed_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
@@ -123,6 +126,11 @@ def test_second_attempt_resumes_unpushed_commit(tmp_path: Path) -> None:
     _git(first.path, "commit", "-q", "-m", "retained fix")
     fix_head = _git(first.path, "rev-parse", "HEAD")
     state = RepoReviewState(scope)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
 
     resumed, candidates = acquire_pr_checkout_lease(
         scope, owner=scope.principal, lease_root=lease_root, review_state=state,
@@ -134,6 +142,72 @@ def test_second_attempt_resumes_unpushed_commit(tmp_path: Path) -> None:
     assert state.checkout_lease is resumed
     assert state.git_expected_head == fix_head
     assert len([path for path in lease_root.iterdir() if path.is_dir()]) == 1
+    assert events[-1] == (
+        "pr_checkout_lease_acquired",
+        {
+            "repository": scope.canonical_repo,
+            "pull_request": scope.pr_number,
+            "scope_id": scope.scope_id,
+            "head_sha": _git(resumed.path, "rev-parse", "HEAD"),
+            "path": str(resumed.path),
+            "owner": scope.principal,
+            "acquisition": "resume",
+        },
+    )
+
+
+def test_fresh_acquisition_records_actual_checkout_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+
+    lease, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert events == [(
+        "pr_checkout_lease_acquired",
+        {
+            "repository": scope.canonical_repo,
+            "pull_request": scope.pr_number,
+            "scope_id": scope.scope_id,
+            "head_sha": _git(lease.path, "rev-parse", "HEAD"),
+            "path": str(lease.path),
+            "owner": scope.principal,
+            "acquisition": "fresh",
+        },
+    )]
+
+
+def test_acquisition_succeeds_when_event_logger_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+
+    def raise_from_logger(_kind: str, **_fields: object) -> None:
+        raise RuntimeError("event log unavailable")
+
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", raise_from_logger)
+
+    lease, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root,
+    )
+
+    assert candidates == ()
+    assert lease.path.is_dir()
+    assert _git(lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
 
 
 def test_expired_lease_with_unpushed_work_is_named_and_renewed(tmp_path: Path) -> None:
@@ -520,6 +594,17 @@ def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
             "superseded_head": old_scope.observed_head_sha,
             "observed_head": fresh_scope.observed_head_sha,
             "path": str(old_lease.path),
+        },
+    ), (
+        "pr_checkout_lease_acquired",
+        {
+            "repository": fresh_scope.canonical_repo,
+            "pull_request": fresh_scope.pr_number,
+            "scope_id": fresh_scope.scope_id,
+            "head_sha": _git(fresh_lease.path, "rev-parse", "HEAD"),
+            "path": str(fresh_lease.path),
+            "owner": fresh_scope.principal,
+            "acquisition": "fresh",
         },
     )]
 
