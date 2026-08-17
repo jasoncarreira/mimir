@@ -668,6 +668,46 @@ async def test_operator_user_turn_submits_review_from_only_forge_discovered_fact
 
 
 @pytest.mark.asyncio
+async def test_operator_review_refuses_caller_repo_that_differs_from_forge_canonical_repo(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    client.snapshot_repo = "owner/renamed"
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            ("/server/repo", "git@github.com:owner/repo.git"),
+            ("/server/repo",), 1,
+        ),
+    )
+    context = _user_turn_context(tmp_path, role="admin", content="Review owner/repo#17")
+    request = ToolCallRequest(
+        tool_call={
+            "name": "pr_submit_review",
+            "args": {
+                "repository": "owner/repo", "pull_request": 17,
+                "verdict": "approve", "body": "Looks good",
+            },
+            "id": "renamed-repo-review", "type": "tool_call",
+        },
+        tool=pr_submit_review, state={}, runtime=Runtime(context=context),
+    )
+
+    async def handler(_request):
+        pytest.fail("caller-directed repository reached the typed tool")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+
+    assert result.status == "error"
+    assert "live pull request is closed or invalid" in str(result.content)
+    assert client.calls == [("snapshot", "owner/repo", 17)]
+
+
+@pytest.mark.asyncio
 async def test_non_operator_user_turn_review_is_refused_before_forge_resolution(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
