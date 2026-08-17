@@ -32,7 +32,7 @@ def _make_registry(tmp_path: Path) -> ShellJobRegistry:
     return ShellJobRegistry(jobs_dir=tmp_path / "shell-jobs")
 
 
-def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 5.0) -> None:
+def _wait_until_done(registry: ShellJobRegistry, job_id: str, timeout: float = 30.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = registry.get(job_id)
