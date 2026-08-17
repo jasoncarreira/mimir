@@ -39,7 +39,13 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
-from ..models import AuthContext, InformationFlowLabels, PromptBlock, SourceLabel
+from ..models import (
+    AuthContext,
+    InformationFlowLabels,
+    Integrity,
+    PromptBlock,
+    SourceLabel,
+)
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -698,6 +704,39 @@ class FeedbackLog:
                     sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
+                    # Integrity from persisted server provenance, never from
+                    # record text. Trust requires POSITIVE agent-self
+                    # provenance — the same explicit kind allowlist
+                    # `_record_authorized` uses — not merely the absence of an
+                    # owning principal. Absent ownership is missing metadata,
+                    # not evidence of framework authorship: as
+                    # `_is_agent_self_record` documents, user-owned events such
+                    # as `commitment_due` are principal-less in legacy logs,
+                    # and their renderers embed LLM-extracted `text`
+                    # (renderers.py, chainlink #312). Non-privileged callers
+                    # never see those — `_record_authorized` drops them — but a
+                    # privileged or service context short-circuits to
+                    # `return True`, so an ownerless non-agent record reaches
+                    # this label and, keyed on absence alone, would carry
+                    # conversation-derived text as a TRUSTED source.
+                    #
+                    # A record attributable to a user may embed that user's own
+                    # input (turn records persist `input`), so it stays
+                    # untrusted either way.
+                    #
+                    # Omitting this entirely let SourceLabel's UNTRUSTED
+                    # default apply to the agent's own telemetry. Because
+                    # `resource_id` is the record's ORIGINATING channel, one
+                    # recalled signal from any other channel then failed the
+                    # all-or-nothing SAME_CHANNEL check and silenced the reply
+                    # — including, self-perpetuatingly, the
+                    # `interactive_turn_no_send_message` signal that a silenced
+                    # turn files itself.
+                    integrity=(
+                        Integrity.TRUSTED
+                        if not record_owner and _is_agent_self_record(record)
+                        else Integrity.UNTRUSTED
+                    ),
                     integrity_effect="informational",
                 ))
         return PromptBlock(content=content, labels=labels)
