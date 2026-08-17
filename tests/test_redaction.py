@@ -150,23 +150,17 @@ def test_unterminated_or_literal_backslash_quote_does_not_eat_context(
     assert "next: must-survive" in out
 
 
-# Single quotes carry two incompatible grammars. Reading only one of them
-# either leaves the tail of a credential in the log (YAML-only, against a
-# Python-repr value) or consumes the real closing quote and erases the
-# following lines (Python-only, against a YAML value). Both must be masked
-# WHOLE — asserting a prefix would codify partial masking as acceptable.
+# A single-quoted value holding no backslash reads the same under both
+# grammars, so it is masked. ``''`` is YAML's escape and is unambiguous too.
 @pytest.mark.parametrize(
     ("text", "fragments"),
     [
-        # Python-repr picks this form when a value holds both quote styles.
-        ("password: 'has \\' and \" both'", ["has", "both"]),
-        ("{'password': 'has \\' and \" both'}", ["has", "both"]),
-        # Valid YAML whose value ends in a literal backslash.
-        ("password: 'ends in \\'", ["ends in"]),
+        ("password: 'my secret pass phrase'", ["secret", "phrase"]),
         ("password: 'can''t share this'", ["share", "this"]),
+        ("{'password': 'correct horse battery staple'}", ["horse", "staple"]),
     ],
 )
-def test_single_quoted_values_are_masked_under_both_grammars(
+def test_unambiguous_single_quoted_values_are_masked(
     text: str, fragments: list[str]
 ) -> None:
     out = redact_text(text)
@@ -174,6 +168,32 @@ def test_single_quoted_values_are_masked_under_both_grammars(
     for fragment in fragments:
         assert fragment not in out
     assert "[REDACTED]" in out
+
+
+# A backslash is exactly where the two grammars disagree, so the value is left
+# ALONE rather than guessed at. This is an honest miss: it must never mask part
+# of the credential, and must never disturb the surrounding record. Preferring
+# either reading produced five successive defects, in both directions.
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Python-repr: the apostrophe is escaped and the value continues.
+        "password: 'has \\' and \" both'",
+        "{'password': 'has \\' and \" both'}",
+        # YAML: the backslash is literal and the value ends at that apostrophe.
+        "password: 'ends in \\'",
+        "{'password': 'ends in \\', 'next': 'must-survive'}",
+        "password: 'ends in \\' # note 'quoted'",
+        "password: 'ends in \\'\nnext: must-survive\n",
+        # A literal backslash immediately before YAML's doubled-quote escape.
+        "password: 'alpha\\''omega-tail'\nnext: must-survive\n",
+    ],
+)
+def test_ambiguous_single_quoted_values_are_declined_untouched(text: str) -> None:
+    out = redact_text(text)
+
+    assert out == text, "an ambiguous value must be left exactly as it was"
+    assert "[REDACTED]" not in out
 
 
 # Key quoting and value quoting are independent grammar choices. Coupling them
@@ -197,38 +217,6 @@ def test_key_and_value_quote_styles_are_independent(text: str) -> None:
     for fragment in ("correct", "horse", "battery", "staple"):
         assert fragment not in out
     assert "[REDACTED]" in out
-
-
-# Bounding a match to its own line is not enough: SAME-LINE structure has to
-# survive too. A YAML value ending in a literal backslash is closed by the very
-# next quote, so reading that quote as a Python escape consumes the separator
-# and the following key. PyYAML parses the flow mapping below as two entries.
-@pytest.mark.parametrize(
-    ("text", "must_survive"),
-    [
-        (
-            "{'password': 'ends in \\', 'next': 'must-survive'}",
-            ", 'next': 'must-survive'}",
-        ),
-        ("{'password': 'ends in \\'}", "}"),
-        ("password: 'ends in \\' # note 'quoted'\n", "# note 'quoted'"),
-        ("password: 'ends in \\' # plain note\n", "# plain note"),
-    ],
-)
-def test_single_quote_arbitration_preserves_same_line_context(
-    text: str, must_survive: str
-) -> None:
-    out = redact_text(text)
-
-    assert "ends in" not in out
-    assert must_survive in out
-
-
-def test_single_quoted_grammar_choice_never_eats_following_lines() -> None:
-    out = redact_text("password: 'ends in \\'\nnext: must-survive\n")
-
-    assert "ends in" not in out
-    assert "next: must-survive" in out
 
 
 # The block indicator is NOT a value. Masking it would print

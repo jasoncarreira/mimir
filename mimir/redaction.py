@@ -60,35 +60,30 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
         r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
     ),
-    # Single quotes carry two incompatible grammars, so the value form is an
-    # ORDERED alternation and the engine takes whichever reading actually
-    # reaches a closing quote:
+    # Single quotes carry two INCOMPATIBLE grammars and a backslash is exactly
+    # where they disagree:
     #
-    #   1. Python-repr — a backslash escapes the next character. ``repr`` picks
-    #      this form for a value holding both quote styles:
-    #      ``'has \' and " both'``.
-    #   2. YAML — a backslash is LITERAL and ``''`` is the only escape, so
-    #      ``password: 'ends in \'`` genuinely ends at that quote.
+    #   Python-repr — ``\`` escapes the next character, so ``'has \' and "'``
+    #                 continues past that apostrophe.
+    #   YAML        — ``\`` is literal and ``''`` is the only escape, so
+    #                 ``'ends in \'`` genuinely ends at that apostrophe.
     #
-    # Trying only YAML left the tail of a Python-repr credential in the log;
-    # trying only Python-repr made the YAML form consume its real closing quote
-    # and erase every following line. Neither alternative may cross a newline,
-    # which is what bounds an unterminated quote to its own line.
+    # The same bytes are a different value under each, and nothing local to the
+    # match resolves it: deciding by what follows the quote is wrong for a repr
+    # whose credential contains ``',``, and preferring either reading in turn
+    # produced five successive defects — a leaked tail one way, an erased
+    # delimiter or following line the other.
     #
-    # The Python branch additionally may NOT escape a quote that is followed by
-    # structural context — a comma, closing brace/bracket, colon, or end of
-    # line. There the quote is the real YAML delimiter, and consuming it eats
-    # the separator and the next key: the flow mapping
-    # ``{'password': 'ends in \', 'next': 'must-survive'}`` (which PyYAML reads
-    # as two entries) became ``{'password': '[REDACTED]'next': 'must-survive'}``.
-    # Bounding the value to its own line is not sufficient; same-line
-    # delimiters have to survive too.
+    # So this rule DECLINES the ambiguity instead of guessing. A value holding
+    # no backslash is unambiguous under both grammars and is masked; a value
+    # containing one is left alone. That is an honest miss, and it can neither
+    # leak half a credential nor corrupt the surrounding record. Full
+    # arbitration needs a parser rather than a pattern and is tracked with the
+    # block-scalar work.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?[ \t]*:[ \t]*')"
-        r"((?:''|\\(?!'(?:[ \t]*[,}\]:#]|[ \t]*$))[^\n]|[^'\\\n])*"
-        r"|(?:''|[^'\n])*)(?=')"
+        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
     # block scalar's body is delimited by indentation relative to its own
