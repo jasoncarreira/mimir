@@ -39,7 +39,13 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
-from ..models import AuthContext, InformationFlowLabels, PromptBlock, SourceLabel
+from ..models import (
+    AuthContext,
+    InformationFlowLabels,
+    Integrity,
+    PromptBlock,
+    SourceLabel,
+)
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -695,6 +701,25 @@ class FeedbackLog:
                     sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
+                    # Integrity from persisted server provenance, never from
+                    # record text. A record with no owning principal was
+                    # written by the framework itself (tool denials, no-reply
+                    # signals, quota notices) and cannot carry foreign
+                    # content; one attributable to a user may embed that
+                    # user's own input (turn records persist `input`), so it
+                    # stays untrusted.
+                    #
+                    # Omitting this let SourceLabel's UNTRUSTED default apply
+                    # to the agent's own telemetry. Because `resource_id` is
+                    # the record's ORIGINATING channel, one recalled signal
+                    # from any other channel then failed the all-or-nothing
+                    # SAME_CHANNEL check and silenced the reply — including,
+                    # self-perpetuatingly, the `interactive_turn_no_send_message`
+                    # signal that a silenced turn files itself.
+                    integrity=(
+                        Integrity.UNTRUSTED if record_owner
+                        else Integrity.TRUSTED
+                    ),
                     integrity_effect="informational",
                 ))
         return PromptBlock(content=content, labels=labels)
