@@ -173,6 +173,18 @@ _CHANGES_REQUESTED_TURN_EVENT_TYPES = frozenset({"pr_changes_requested_stale"})
 CHANGES_REQUESTED_REMINDER_INTERVAL = timedelta(minutes=60)
 CHANGES_REQUESTED_REMINDER_SLACK = timedelta(minutes=1)
 CHANGES_REQUESTED_GAVE_UP_BACKSTOP = timedelta(hours=24)
+# These fragments come from the checkout controller's ToolPolicyRefusal text.
+# Only refusals whose blockers are removed by lease expiry/reconciliation belong
+# here; unknown reasons must retain the permanent-fault backoff.
+_SELF_CLEARING_REFUSAL_REASON_FRAGMENTS = (
+    "superseded PR checkout lease has retained work; refusing release:",
+    "unpublished PR checkout lease candidates include another scope; refusing reuse:",
+    "divergent unpublished PR checkout lease candidates; refusing implicit selection:",
+    "PR checkout lease collision",
+    "PR checkout lease recovery scope mismatch at",
+)
+_REFUSAL_SELF_CLEARING = "self_clearing"
+_REFUSAL_OPERATOR_GATED = "operator_gated"
 MERGEABILITY_RETRY_INTERVAL = timedelta(hours=1)
 CI_DELIVERY_RETRY_INTERVAL = timedelta(minutes=5)
 CI_FAILURE_CONCLUSIONS = frozenset({
@@ -184,6 +196,16 @@ _DELIVERY_CLAIMS_DIR = ".delivery-claims"
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _classify_refusal_reasons(reasons: list[str]) -> str:
+    """Classify known lease contention as transient, failing closed otherwise."""
+    if reasons and all(
+        any(fragment in reason for fragment in _SELF_CLEARING_REFUSAL_REASON_FRAGMENTS)
+        for reason in reasons
+    ):
+        return _REFUSAL_SELF_CLEARING
+    return _REFUSAL_OPERATOR_GATED
 
 
 def _load_cursor() -> dict:
@@ -305,7 +327,7 @@ def _review_recovery_state(
     after: str = "",
     head_sha: str = "",
     pending_before: str = "",
-) -> tuple[int, bool, bool, bool, list[str], str, list[str]] | None:
+) -> tuple[int, bool, bool, bool, list[str], str, list[str], int] | None:
     """Return charged/pending/refusal details from framework recovery state.
 
     ``None`` means recovery state is unavailable, for example when this script is
@@ -331,6 +353,7 @@ def _review_recovery_state(
     attempt_reasons: list[str] = []
     latest_refusal_at = ""
     refusal_reasons: list[str] = []
+    self_clearing_refusals = 0
     for entry in inflight.values():
         if not isinstance(entry, dict):
             continue
@@ -365,12 +388,15 @@ def _review_recovery_state(
         )
         if outcome_at:
             if entry.get("outcome_disposition") == "exempt_hard_refusal":
+                raw_reason = entry.get("outcome_reason")
+                reason = (
+                    raw_reason if isinstance(raw_reason, str) else "hard_boundary_refusal"
+                )
+                if _classify_refusal_reasons([reason]) == _REFUSAL_SELF_CLEARING:
+                    self_clearing_refusals += 1
                 if isinstance(outcome_at, str) and outcome_at >= latest_refusal_at:
                     latest_refusal_at = outcome_at
-                    raw_reason = entry.get("outcome_reason")
-                    refusal_reasons = [
-                        raw_reason if isinstance(raw_reason, str) else "hard_boundary_refusal"
-                    ]
+                    refusal_reasons = [reason]
                 continue
             # Pre-fix persisted failures may still say attempts=0. The durable
             # outcome proves that turn started even when the old counter did not.
@@ -389,7 +415,7 @@ def _review_recovery_state(
             )
     return (
         started, pending, found, canonical, attempt_reasons,
-        latest_refusal_at, refusal_reasons,
+        latest_refusal_at, refusal_reasons, self_clearing_refusals,
     )
 
 
@@ -1264,7 +1290,7 @@ def _check_pr_pushes(
                     recovery_available = recovery is not None
                     if recovery is not None:
                         (
-                            started, pending, found, canonical, _, _, _,
+                            started, pending, found, canonical, _, _, _, _,
                         ) = recovery
                         if found:
                             prior_attempts = max(
@@ -1755,10 +1781,12 @@ def _check_own_changes_requested(
         recovery_available = recovery is not None
         latest_refusal_at = ""
         refusal_reasons: list[str] = []
+        self_clearing_refusals = 0
+        refusal_classification = ""
         if recovery is not None:
             (
                 charged, pending, found, _, attempt_reasons,
-                latest_refusal_at, refusal_reasons,
+                latest_refusal_at, refusal_reasons, self_clearing_refusals,
             ) = recovery
             if found and prior_attempts <= REVIEW_REQUEST_MAX_ATTEMPTS:
                 # Recovery is authoritative over legacy emission-count cursors.
@@ -1774,13 +1802,20 @@ def _check_own_changes_requested(
 
         if latest_refusal_at:
             refused_at = _parse_utc_datetime(latest_refusal_at)
-            if (
-                refused_at is not None
-                and observed_at - refused_at < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
+            refusal_classification = _classify_refusal_reasons(refusal_reasons)
+            refusal_series_gave_up = (
+                refusal_classification == _REFUSAL_SELF_CLEARING
+                and self_clearing_refusals >= REVIEW_REQUEST_MAX_ATTEMPTS
+            )
+            suppress_until_backstop = (
+                refusal_classification == _REFUSAL_OPERATOR_GATED
+                or refusal_series_gave_up
+            )
+            if refused_at is not None and suppress_until_backstop and (
+                observed_at - refused_at < CHANGES_REQUESTED_GAVE_UP_BACKSTOP
             ):
-                # A deterministic boundary refusal is operator-visible in the
-                # terminal outcome. Do not hammer it every poll/hour; the 24h
-                # backstop is the time-based ceiling for permanent config faults.
+                # Permanent faults stay quiet. Self-clearing refusals get the
+                # normal cadence, but a repeatedly refused series is bounded too.
                 new[key] = {
                     "head_sha": head_sha,
                     "last_reminded_at": last_reminded_at or observed_at_iso,
@@ -1788,6 +1823,10 @@ def _check_own_changes_requested(
                     **({"rearmed_at": recovery_after} if recovery_after else {}),
                 }
                 continue
+            if refused_at is not None and refusal_series_gave_up:
+                # Exclude the exhausted refusal series after its daily re-arm;
+                # refusal outcomes remain uncharged from the attempt budget.
+                recovery_after = observed_at_iso
 
         eligible_after = max(
             timedelta(0),
@@ -1870,6 +1909,8 @@ def _check_own_changes_requested(
             attempt=attempt,
             max_attempts=REVIEW_REQUEST_MAX_ATTEMPTS,
             prior_refusal_reasons=refusal_reasons,
+            prior_refusal_classification=(refusal_classification or None),
+            prior_self_clearing_refusals=self_clearing_refusals,
         )
         count += 1
         new[key] = {
