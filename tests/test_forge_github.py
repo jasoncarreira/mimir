@@ -91,7 +91,10 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
 def test_live_snapshot_normalizes_all_authority_facts() -> None:
     session = Session([Response({
         "number": 17, "state": "open", "user": {"login": "author"},
-        "base": {"ref": "main", "sha": "b" * 40},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
         "head": {
             "ref": "feature", "sha": "a" * 40,
             "repo": {"full_name": "contributor/fork"},
@@ -102,6 +105,7 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
         "owner/repo", 17,
     )
 
+    assert snapshot.repo == "owner/repo"
     assert snapshot.state == "open"
     assert snapshot.number == 17
     assert snapshot.author == "author"
@@ -117,7 +121,10 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
 def test_live_snapshot_uses_origin_for_same_repository_head() -> None:
     session = Session([Response({
         "number": 17, "state": "open", "user": {"login": "author"},
-        "base": {"ref": "main", "sha": "b" * 40},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
         "head": {
             "ref": "feature", "sha": "a" * 40,
             "repo": {"full_name": "owner/repo"},

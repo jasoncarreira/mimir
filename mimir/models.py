@@ -54,6 +54,7 @@ class NormalizedPullRequestSnapshot:
     request payload.
     """
 
+    repo: str
     state: str
     number: int
     author: str
