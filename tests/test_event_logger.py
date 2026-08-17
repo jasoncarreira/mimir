@@ -196,6 +196,43 @@ async def test_log_redacts_token_shaped_values_recursively(tmp_path: Path):
     assert record["args"]["nested"][4] == "safe context"
 
 
+@pytest.mark.asyncio
+async def test_event_logger_redacts_yaml_block_scalars_without_erasing_context(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    secret = "s3cr3t" + "-event-block"
+    content = (
+        "ancestor:\n"
+        "  items:\n"
+        "    - password: &event_value !!str | # retained\n"
+        f"        {secret}-implicit\n"
+        "      sibling: keep-implicit-sibling\n"
+        "    - ? password\n"
+        "      : >-\n"
+        f"        {secret}-explicit\n"
+        "      sibling: keep-explicit-sibling\n"
+        "    - keep-following-item\n"
+        "  ancestor_sibling: keep-ancestor\n"
+    )
+
+    await EventLogger(path, session_id="proc-block").log("tool_result", content=content)
+
+    persisted = json.loads(path.read_text())["content"]
+    assert secret not in persisted
+    for context in (
+        "password: &event_value !!str | # retained",
+        "? password",
+        ": >-",
+        "sibling: keep-implicit-sibling",
+        "sibling: keep-explicit-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in persisted
+
+
 def test_log_sync_redacts_token_shaped_values(tmp_path: Path):
     path = tmp_path / "events.jsonl"
     logger = EventLogger(path, session_id="proc-1")

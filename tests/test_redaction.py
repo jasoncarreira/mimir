@@ -219,10 +219,243 @@ def test_key_and_value_quote_styles_are_independent(text: str) -> None:
     assert "[REDACTED]" in out
 
 
-# The block indicator is NOT a value. Masking it would print
-# ``password: [REDACTED]`` directly above an untouched body, presenting an
-# unredacted credential as though it had been scrubbed. Multiline block scalars
-# are out of scope here; declining the indicator keeps the miss honest.
+def _wrapped_block(
+    header: str,
+    secret: str,
+    *,
+    leading_blank: bool = False,
+    internal_blank: bool = False,
+    explicit_key: bool = False,
+) -> str:
+    lines = ["ancestor:", "  items:"]
+    if explicit_key:
+        lines.extend(["    - ? password", f"      : {header}"])
+    else:
+        lines.append(f"    - {header}")
+    if leading_blank:
+        lines.append("")
+    lines.append(f"        {secret}-first")
+    if internal_blank:
+        lines.append("")
+    lines.extend(
+        [
+            f"        {secret}-second",
+            "      sibling: keep-sibling",
+            "    - keep-following-item",
+            "  ancestor_sibling: keep-ancestor",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+BLOCK_SCALAR_PRODUCTIONS = (
+    pytest.param("password: |", {}, id="plain-literal"),
+    pytest.param("password: >", {}, id="plain-folded"),
+    pytest.param("password: |-", {}, id="strip-chomping"),
+    pytest.param("password: |+", {}, id="keep-chomping"),
+    pytest.param("password: |2", {}, id="explicit-indentation"),
+    pytest.param("password: | # operator note", {}, id="header-comment"),
+    pytest.param("password: |", {"leading_blank": True}, id="leading-blank"),
+    pytest.param("password: >", {"internal_blank": True}, id="internal-blank"),
+    pytest.param('"a:password": |', {}, id="quoted-key-with-colon"),
+    pytest.param("password: &value_anchor !!str |", {}, id="anchor-then-tag"),
+    pytest.param("password: !!str &value_anchor >", {}, id="tag-then-anchor"),
+    # Alias-plus-properties is not valid YAML, but it occurs in arbitrary log
+    # text and pins the non-document scanner rather than the parser path.
+    pytest.param("password: *value_alias !!str |", {}, id="alias-then-tag-fallback"),
+    pytest.param("|", {"explicit_key": True}, id="explicit-mapping-key"),
+    pytest.param(
+        "&explicit_anchor !!str >+ # note",
+        {"explicit_key": True},
+        id="explicit-key-with-properties",
+    ),
+)
+
+
+@pytest.mark.parametrize(("header", "options"), BLOCK_SCALAR_PRODUCTIONS)
+def test_block_scalar_productions_mask_body_and_preserve_structure(
+    header: str, options: dict[str, bool]
+) -> None:
+    secret = "s3cr3t" + "-value"
+    text = _wrapped_block(header, secret, **options)
+
+    out = redact_text(text)
+
+    for fragment in (secret, secret + "-first", secret + "-second"):
+        assert fragment not in out
+    assert "sibling: keep-sibling" in out
+    assert "- keep-following-item" in out
+    assert "ancestor:" in out
+    assert "items:" in out
+    assert "ancestor_sibling: keep-ancestor" in out
+    assert header in out
+    assert "[REDACTED]" in out
+
+
+@pytest.mark.parametrize("style", ["|", ">"])
+@pytest.mark.parametrize("modifier", ["", "-", "+", "2", "2-"])
+@pytest.mark.parametrize("key", ["password", "service_token", '"a:api_key"'])
+def test_block_scalar_grammar_sweep_masks_without_overconsuming(
+    style: str, modifier: str, key: str
+) -> None:
+    """Cross productions instead of testing only previously reported inputs."""
+    secret = "s3cr3t" + "-sweep-value"
+    header = f"{key}: !!str &sweep {style}{modifier} # retained"
+    text = _wrapped_block(header, secret, internal_blank=True)
+
+    out = redact_text(text)
+
+    assert secret not in out
+    assert header in out
+    for context in (
+        "sibling: keep-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "items:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in out
+
+
+def test_nested_mapping_and_sequence_boundaries_survive_redaction() -> None:
+    secret = "s3cr3t" + "-nested-value"
+    text = (
+        "ancestor:\n"
+        "  items:\n"
+        "    - config:\n"
+        "        layer:\n"
+        "          password: |\n"
+        f"            {secret}\n"
+        "          sibling: keep-deep-sibling\n"
+        "      outer_sibling: keep-outer-sibling\n"
+        "    - - password: >\n"
+        f"          {secret}\n"
+        "        sibling: keep-sequence-sibling\n"
+        "      - keep-next-inner-item\n"
+        "    - keep-next-outer-item\n"
+        "  ancestor_sibling: keep-ancestor\n"
+    )
+
+    out = redact_text(text)
+
+    assert secret not in out
+    for context in (
+        "ancestor:",
+        "items:",
+        "config:",
+        "layer:",
+        "sibling: keep-deep-sibling",
+        "outer_sibling: keep-outer-sibling",
+        "sibling: keep-sequence-sibling",
+        "- keep-next-inner-item",
+        "- keep-next-outer-item",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in out
+
+
+def test_log_text_scanner_associates_explicit_key_with_later_indicator() -> None:
+    secret = "s3cr3t" + "-explicit-log-value"
+    yaml_fragment = _wrapped_block("!!str |", secret, explicit_key=True)
+    text = "subprocess output follows (not YAML)\n" + yaml_fragment
+
+    out = redact_text(text)
+
+    assert secret not in out
+    for context in (
+        "subprocess output follows (not YAML)",
+        "? password",
+        ": !!str |",
+        "sibling: keep-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in out
+
+
+@pytest.mark.parametrize("log_prefix", ["", "subprocess output (not YAML)\n"])
+def test_block_indicator_and_properties_may_start_on_later_lines(
+    log_prefix: str,
+) -> None:
+    secret = "s3cr3t" + "-multiline-node-value"
+    text = log_prefix + (
+        "ancestor:\n"
+        "  password: !!str\n"
+        "    &value_anchor\n"
+        "    | # retained\n"
+        f"      {secret}\n"
+        "  sibling: keep-sibling\n"
+        "following: keep-following\n"
+    )
+
+    out = redact_text(text)
+
+    assert secret not in out
+    assert "password: !!str" in out
+    assert "&value_anchor" in out
+    assert "| # retained" in out
+    assert "password: [REDACTED]" not in out
+    assert "sibling: keep-sibling" in out
+    assert "following: keep-following" in out
+    assert "ancestor:" in out
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "password: # retained\n  !!str\n  |\n    {secret}\n",
+        "? password\n: # retained\n  !!str\n  &value_anchor\n  >-\n    {secret}\n",
+    ],
+    ids=["implicit-comment", "explicit-comment-and-properties"],
+)
+def test_fallback_tracks_deferred_value_after_separator_comment(fragment: str) -> None:
+    secret = "s3cr3t" + "-deferred-value"
+    text = (
+        "subprocess output (not YAML)\n"
+        "ancestor:\n"
+        + fragment.format(secret=secret)
+        + "sibling: keep-sibling\n"
+        "- keep-following-item\n"
+        "ancestor_sibling: keep-ancestor\n"
+    )
+
+    out = redact_text(text)
+
+    assert secret not in out
+    assert "# retained" in out
+    assert "password: [REDACTED]" not in out
+    assert "sibling: keep-sibling" in out
+    assert "- keep-following-item" in out
+    assert "ancestor:" in out
+    assert "ancestor_sibling: keep-ancestor" in out
+
+
+def test_trailing_blank_line_and_following_key_keep_their_lines() -> None:
+    secret = "s3cr3t" + "-trailing-value"
+    text = f"password: |\n  {secret}\n\nfollowing: own-line\n"
+
+    out = redact_text(text)
+
+    assert secret not in out
+    assert out == "password: |\n  [REDACTED]\n\nfollowing: own-line\n"
+
+
+def test_block_scalar_redaction_preserves_crlf() -> None:
+    secret = "s3cr3t" + "-crlf-value"
+    text = _wrapped_block("password: >+ # note", secret, internal_blank=True)
+    text = text.replace("\n", "\r\n")
+
+    out = redact_text(text)
+
+    assert secret not in out
+    assert "\r\n" in out
+    assert out.replace("\r\n", "").find("\n") == -1
+    assert "sibling: keep-sibling\r\n" in out
+    assert "- keep-following-item\r\n" in out
+    assert "ancestor_sibling: keep-ancestor\r\n" in out
+
+
 @pytest.mark.parametrize("indicator", ["|", ">", "|-", ">-", "|+", "|2"])
 def test_block_scalar_indicator_is_not_reported_as_redacted(indicator: str) -> None:
     secret = "hh" + "-secret-body"
@@ -230,8 +463,22 @@ def test_block_scalar_indicator_is_not_reported_as_redacted(indicator: str) -> N
 
     out = redact_text(text)
 
-    assert out == text, "the indicator must not be masked as if it were a value"
-    assert "[REDACTED]" not in out
+    assert secret not in out
+    assert f"password: {indicator}" in out
+    assert f"password: [REDACTED]" not in out
+    assert "  [REDACTED]" in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "prose uses | as a separator and > as an arrow",
+        "comparison: x > y | fallback",
+        "password: | is discussed inline, not followed by an indented body",
+    ],
+)
+def test_prose_containing_block_indicator_characters_is_untouched(text: str) -> None:
+    assert redact_text(text) == text
 
 
 def test_existing_anthropic_and_bearer_patterns_unbroken() -> None:
