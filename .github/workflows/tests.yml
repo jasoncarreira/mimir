@@ -207,6 +207,52 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+  pytest-macos:
+    # Keep this separate from the required pytest matrix so its existing
+    # ``pytest (3.11)`` and ``pytest (3.12)`` check names remain unchanged.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies (with dev and bench extras)
+        run: uv sync --extra dev --extra bench
+
+      - name: Run mimir test suite
+        run: uv run pytest -q --tb=short
+
+      - name: Run optional-skills tests (per-skill, isolated)
+        run: |
+          set -e
+          ran=0
+          for tdir in mimir/optional-skills/*/tests; do
+            if [ -d "$tdir" ]; then
+              echo "== $tdir =="
+              uv run pytest -q "$tdir"
+              ran=$((ran + 1))
+            fi
+          done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no optional-skills test dirs matched mimir/optional-skills/*/tests"
+            exit 1
+          fi
+          echo "ran optional-skills tests for $ran skill(s)"
+
   pytest-enforced:
     # The same suite with MIMIR_ACCESS_CONTROL_ENFORCED=1.
     #
