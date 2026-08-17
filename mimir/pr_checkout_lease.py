@@ -563,6 +563,84 @@ def _origin_contains_head(lease: PRCheckoutLease, head: str, runner: Runner) -> 
     return bool(refs.stdout.strip())
 
 
+def _tree_blob(
+    path: Path,
+    revision: str,
+    name: str,
+    runner: Runner,
+) -> str | None:
+    """Return one path's blob object id, with absence represented explicitly."""
+    result = runner([
+        "git", "-C", str(path), "ls-tree", "-z", revision, "--", f":(literal){name}",
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout).strip()
+            or f"PR checkout lease blob inspection failed for {name!r}"
+        )
+    if not result.stdout:
+        return None
+    entries = [entry for entry in result.stdout.split("\0") if entry]
+    if len(entries) != 1 or "\t" not in entries[0]:
+        raise RuntimeError(f"PR checkout lease blob inspection was ambiguous for {name!r}")
+    metadata, observed_name = entries[0].split("\t", 1)
+    fields = metadata.split()
+    if observed_name != name or len(fields) != 3 or fields[1] != "blob":
+        raise RuntimeError(f"PR checkout lease blob inspection was ambiguous for {name!r}")
+    return fields[2].lower()
+
+
+def _unexplained_publication_paths(
+    lease: PRCheckoutLease,
+    *,
+    head: str,
+    published_head: str,
+    base_ref: str,
+    runner: Runner,
+) -> tuple[str, ...]:
+    """Name HEAD paths whose content is in neither publication nor tracked base."""
+    base_name = base_ref.removeprefix("refs/heads/")
+    valid_base = runner(["git", "check-ref-format", "--branch", base_name])
+    if valid_base.returncode != 0:
+        raise RuntimeError("PR checkout lease tracked base ref is invalid")
+    tracked_base = _run(
+        runner,
+        [
+            "git", "-C", str(lease.path), "rev-parse", "--verify",
+            f"refs/remotes/origin/{base_name}^{{commit}}",
+        ],
+        "PR checkout lease tracked base is unavailable",
+    ).lower()
+    bases = _run(
+        runner,
+        ["git", "-C", str(lease.path), "merge-base", "--all", head, tracked_base],
+        "PR checkout lease HEAD has no verifiable tracked base",
+    ).splitlines()
+    if len(bases) != 1:
+        raise RuntimeError("PR checkout lease HEAD has no unique tracked base")
+    # A merge base computed against tracked_base is its ancestor by construction;
+    # _run above and the uniqueness check are the fail-closed verification gates.
+    base = bases[0].lower()
+    changed = runner([
+        "git", "-C", str(lease.path), "diff", "--name-only", "-z",
+        published_head, head, "--",
+    ])
+    if changed.returncode != 0:
+        raise RuntimeError(
+            (changed.stderr or changed.stdout).strip()
+            or "PR checkout lease changed-path inspection failed"
+        )
+    names = tuple(name for name in changed.stdout.split("\0") if name)
+    unexplained = []
+    for name in names:
+        head_blob = _tree_blob(lease.path, head, name, runner)
+        published_blob = _tree_blob(lease.path, published_head, name, runner)
+        base_blob = _tree_blob(lease.path, base, name, runner)
+        if head_blob not in {published_blob, base_blob}:
+            unexplained.append(name)
+    return tuple(unexplained)
+
+
 def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -> Path:
     """Atomically preserve the complete history reachable from a lease HEAD."""
     recovery_root = lease.lease_root / _RECOVERY_DIRECTORY
@@ -574,7 +652,9 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
         raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
     bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
     if bundle.exists():
-        verified = runner(["git", "bundle", "verify", str(bundle)])
+        verified = runner([
+            "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
+        ])
         if verified.returncode != 0:
             raise RuntimeError("existing PR checkout lease recovery bundle is invalid")
         return bundle
@@ -587,7 +667,7 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
         )
         _run(
             runner,
-            ["git", "bundle", "verify", str(staging)],
+            ["git", "-C", str(lease.path), "bundle", "verify", str(staging)],
             "PR checkout lease recovery bundle verification failed",
         )
         os.replace(staging, bundle)
@@ -855,6 +935,7 @@ def acquire_pr_checkout_lease(
                 if observed_head is not None and lease.head_sha.lower() != observed_head
             ]
             retained: list[tuple[Path, str]] = []
+            retained_details: list[str] = []
             for lease in stale:
                 head = _run(
                     runner,
@@ -867,19 +948,57 @@ def acquire_pr_checkout_lease(
                      "--untracked-files=all"],
                     "retained PR checkout status inspection failed",
                 )
-                if head != lease.head_sha.lower() or status:
+                if status:
                     retained.append((lease.path, head))
+                    retained_details.append(f"dirty worktree ({lease.path})")
+                    continue
+                if head != lease.head_sha.lower():
+                    published_head = _run(
+                        runner,
+                        [
+                            "git", "-C", str(lease.path), "rev-parse", "--verify",
+                            f"{PUBLISHED_HEAD_REF}^{{commit}}",
+                        ],
+                        "PR checkout lease cleanup found no publication proof",
+                    ).lower()
+                    ancestor = runner([
+                        "git", "-C", str(lease.path), "merge-base", "--is-ancestor",
+                        head, published_head,
+                    ])
+                    if ancestor.returncode not in {0, 1}:
+                        raise RuntimeError(
+                            (ancestor.stderr or ancestor.stdout).strip()
+                            or "PR checkout lease publication ancestry inspection failed"
+                        )
+                    unexplained = () if ancestor.returncode == 0 else (
+                        _unexplained_publication_paths(
+                            lease,
+                            head=head,
+                            published_head=published_head,
+                            base_ref=scope.base_ref,
+                            runner=runner,
+                        )
+                    )
+                    if unexplained:
+                        retained.append((lease.path, head))
+                        retained_details.append(
+                            f"unexplained paths {', '.join(repr(name) for name in unexplained)} "
+                            f"({lease.path})"
+                        )
 
             if retained:
                 _report_retained_candidates("pr_checkout_lease_retained", scope, retained)
                 named = ", ".join(f"{head} ({path})" for path, head in retained)
+                detail = "; ".join(retained_details)
                 raise RuntimeError(
                     "superseded PR checkout lease has retained work; refusing release: "
-                    f"{named}"
+                    f"{named}; {detail}"
                 )
 
             for lease in stale:
-                cleanup_pr_checkout_lease(lease, runner=runner)
+                cleanup_pr_checkout_lease(
+                    lease, base_ref=scope.base_ref, runner=runner,
+                )
                 _report_superseded_lease(scope, lease, observed_head)
             foreign_leases = [lease for lease in foreign_leases if lease not in stale]
             for lease in foreign_leases:
@@ -950,6 +1069,7 @@ def acquire_pr_checkout_lease(
 def cleanup_pr_checkout_lease(
     lease: PRCheckoutLease,
     *,
+    base_ref: str | None = None,
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
 ) -> bool:
@@ -1020,10 +1140,29 @@ def cleanup_pr_checkout_lease(
         "git", "-C", str(lease.path), "merge-base", "--is-ancestor", head,
         published_head,
     ])
-    if ancestor.returncode != 0:
+    if ancestor.returncode not in {0, 1}:
+        raise RuntimeError(
+            (ancestor.stderr or ancestor.stdout).strip()
+            or "PR checkout lease publication ancestry inspection failed"
+        )
+    unexplained: tuple[str, ...] = ()
+    if ancestor.returncode == 1 and base_ref is not None:
+        unexplained = _unexplained_publication_paths(
+            lease,
+            head=head,
+            published_head=published_head,
+            base_ref=base_ref,
+            runner=runner,
+        )
+    if ancestor.returncode == 1 and (base_ref is None or unexplained):
+        detail = (
+            f"; unexplained paths: {', '.join(repr(name) for name in unexplained)}"
+            if unexplained else ""
+        )
         raise RuntimeError(
             "PR checkout lease cleanup publication mismatch: "
             f"HEAD {head!r} is not contained in published commit {published_head!r}"
+            f"{detail}"
         )
     shutil.rmtree(lease.path)
     return True
