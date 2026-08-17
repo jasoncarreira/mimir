@@ -1048,6 +1048,52 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
     assert rec["seq"] == 1
 
 
+async def test_turn_logger_redacts_yaml_block_scalars_without_erasing_context(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "turns.jsonl"
+    secret = "s3cr3t" + "-turn-block"
+    content = (
+        "ancestor:\n"
+        "  items:\n"
+        "    - password: &turn_value !!str | # retained\n"
+        f"        {secret}-implicit\n"
+        "      sibling: keep-implicit-sibling\n"
+        "    - ? password\n"
+        "      : >-\n"
+        f"        {secret}-explicit\n"
+        "      sibling: keep-explicit-sibling\n"
+        "    - keep-following-item\n"
+        "  ancestor_sibling: keep-ancestor\n"
+    )
+    record = TurnRecord(
+        ts="2026-05-15T12:00:00Z",
+        turn_id="block-scalar-turn",
+        session_id="block-scalar-session",
+        saga_session_id=None,
+        trigger="user_message",
+        channel_id="test",
+        input="safe input",
+        events=[{"type": "tool_result", "content": content}],
+    )
+
+    await TurnLogger(path).write(record)
+
+    persisted = json.loads(path.read_text())["events"][0]["content"]
+    assert secret not in persisted
+    for context in (
+        "password: &turn_value !!str | # retained",
+        "? password",
+        ": >-",
+        "sibling: keep-implicit-sibling",
+        "sibling: keep-explicit-sibling",
+        "- keep-following-item",
+        "ancestor:",
+        "ancestor_sibling: keep-ancestor",
+    ):
+        assert context in persisted
+
+
 def _seq_record(turn_id: str) -> TurnRecord:
     return TurnRecord(
         ts="2026-05-15T12:00:00Z",
