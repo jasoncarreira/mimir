@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 
 from mimir.redaction import redact_payload, redact_text
+from mimir.turn_event_redaction import scrub_text
+from tests.redaction_corpus import FAKE_SECRET, SECRET_TEXT_CORPUS
 
 
 # ─── #499: AWS keys + JSON OAuth-token forms ───────────────────────────
@@ -50,7 +52,14 @@ def test_redact_payload_masks_nested_aws_key() -> None:
 # ─── existing patterns still hold (no regression) ──────────────────────
 
 
-FAKE_SECRET = "0123456789abcdef0123456789abcdef"
+def test_durable_redaction_is_superset_of_ephemeral_redaction() -> None:
+    for text in SECRET_TEXT_CORPUS:
+        ephemeral_masked = scrub_text(text) != text
+        durable_masked = redact_text(text) != text
+
+        assert not ephemeral_masked or durable_masked, (
+            f"ephemeral path masked {text!r}, but durable path did not"
+        )
 
 
 @pytest.mark.parametrize(
