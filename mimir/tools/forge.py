@@ -181,6 +181,18 @@ def resolve_review_state_for_context(
         raise ToolPolicyRefusal(
             "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
         )
+    if (
+        context is None
+        or context.trigger != "user_message"
+        or context.is_service
+        or context.event_ingress is not None
+        or not context.canonical_principal
+        or "admin" not in context.roles
+    ):
+        raise ToolPolicyRefusal(
+            "pull-request operation rejected: live scope discovery requires an "
+            "authenticated operator user turn"
+        )
     cached = cache.resolve(repository, pull_request) if cache is not None else None
     if cached is not None:
         return cached
@@ -207,15 +219,46 @@ def resolve_review_state_for_context(
             if "CHANGES_REQUESTED" in latest.values():
                 review_state = "CHANGES_REQUESTED"
     resolution = resolve_server_discovered_review_scope(
-        repository, snapshot, review_state=review_state,
+        snapshot.repo, snapshot, review_state=review_state,
     )
     scope = resolution.scope
-    if scope is None or scope.pr_number != pull_request:
+    if (
+        scope is None
+        or scope.canonical_repo != repository.lower()
+        or scope.pr_number != pull_request
+    ):
         raise ToolPolicyRefusal(resolution.refusal_reason or (
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
     return cache.remember(state) if cache is not None else state
+
+
+def revalidate_review_head_for_context(
+    context: AuthContext | None,
+    repository: str,
+    pull_request: int,
+) -> None:
+    """Refuse a typed review effect if the forge no longer reports its scoped head."""
+    state = resolve_review_state_for_context(context, repository, pull_request)
+    scope = state.action_scope
+    client = _client_for_repository(scope.canonical_repo)
+    try:
+        snapshot = client.get_pull_request_snapshot(
+            scope.canonical_repo, scope.pr_number,
+        )
+    except ForgeError as exc:
+        raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    if (
+        not isinstance(snapshot.repo, str)
+        or snapshot.repo.lower() != scope.canonical_repo
+        or snapshot.number != scope.pr_number
+        or snapshot.state != "open"
+        or snapshot.head_sha.lower() != scope.observed_head_sha
+    ):
+        raise ToolPolicyRefusal(
+            "pull-request operation rejected: pull request head advanced after scope issuance"
+        )
 
 
 def remediation_checkout_preflight(

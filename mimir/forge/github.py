@@ -288,9 +288,12 @@ class GitHubForgeClient:
             raise ForgeError("forge returned invalid pull-request metadata")
         base = data.get("base") if isinstance(data.get("base"), Mapping) else {}
         head = data.get("head") if isinstance(data.get("head"), Mapping) else {}
+        base_repo = base.get("repo") if isinstance(base.get("repo"), Mapping) else {}
+        normalized_repo = str(base_repo.get("full_name", ""))
         head_repo = head.get("repo") if isinstance(head.get("repo"), Mapping) else {}
         normalized_head_repo = str(head_repo.get("full_name", ""))
         return NormalizedPullRequestSnapshot(
+            repo=normalized_repo,
             state=str(data.get("state", "")),
             number=observed_number,
             author=self._user(data),
