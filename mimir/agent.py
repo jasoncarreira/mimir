@@ -1646,8 +1646,9 @@ class Agent:
                     rate_limit_callback=codex_plus_callback,
                 )
 
-            if self._agent_tools is None or (
-                self._config.coding_enabled and not coding_enabled
+            if (
+                self._agent_tools is None
+                or coding_enabled != self._cached_coding_enabled
             ):
                 self._agent_tools = all_mimir_tools(coding_enabled=coding_enabled)
 

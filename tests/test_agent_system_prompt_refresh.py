@@ -106,6 +106,47 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
 
 
 @pytest.mark.asyncio
+async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    agent._config.coding_enabled = True
+    capture = _stub_deepagent_build(monkeypatch)
+    from mimir.tools import forge as forge_tools
+    from mimir.tools import registry
+    from mimir.tools import repo as repo_tools
+
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
+    monkeypatch.setattr(
+        "mimir.tools.all_mimir_tools",
+        lambda **kwargs: registry.all_mimir_tools(
+            **kwargs, require_coding_available=False,
+        ),
+    )
+
+    first = await agent._build_agent_if_needed()
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    second = await agent._build_agent_if_needed()
+
+    assert first is not second
+    restored = {tool.name: tool for tool in capture.kwargs[-1]["tools"]}
+    assert "repo_status" in restored
+    executed: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        repo_tools,
+        "_execute",
+        lambda runtime, repository, pull_request, operation: (
+            executed.append((repository, pull_request)) or {"status": "clean"}
+        ),
+    )
+    assert restored["repo_status"].invoke({
+        "repository": "owner/repo",
+        "pull_request": 17,
+    }) == {"status": "clean"}
+    assert executed == [("owner/repo", 17)]
+
+
+@pytest.mark.asyncio
 async def test_build_agent_registers_structured_subagents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
