@@ -676,6 +676,7 @@ async def test_operator_review_refuses_caller_repo_that_differs_from_forge_canon
     client.snapshot_repo = "owner/renamed"
     set_forge_client(client)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(
         access_control, "_canonical_repo_binding_resolution",
