@@ -589,17 +589,9 @@ def _unexplained_publication_paths(
     ).splitlines()
     if len(bases) != 1:
         raise RuntimeError("PR checkout lease HEAD has no unique tracked base")
+    # A merge base computed against tracked_base is its ancestor by construction;
+    # _run above and the uniqueness check are the fail-closed verification gates.
     base = bases[0].lower()
-    contained = runner([
-        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", base, tracked_base,
-    ])
-    if contained.returncode == 1:
-        raise RuntimeError("PR checkout lease HEAD base is unrelated to tracked base branch")
-    if contained.returncode != 0:
-        raise RuntimeError(
-            (contained.stderr or contained.stdout).strip()
-            or "PR checkout lease tracked base ancestry inspection failed"
-        )
     changed = runner([
         "git", "-C", str(lease.path), "diff", "--name-only", "-z",
         published_head, head, "--",
@@ -631,7 +623,9 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
         raise RuntimeError("PR checkout lease recovery directory escapes its lease root")
     bundle = recovery_root / f"{lease.path.name}-{lease.recovery_id}.bundle"
     if bundle.exists():
-        verified = runner(["git", "bundle", "verify", str(bundle)])
+        verified = runner([
+            "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
+        ])
         if verified.returncode != 0:
             raise RuntimeError("existing PR checkout lease recovery bundle is invalid")
         return bundle
@@ -644,7 +638,7 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
         )
         _run(
             runner,
-            ["git", "bundle", "verify", str(staging)],
+            ["git", "-C", str(lease.path), "bundle", "verify", str(staging)],
             "PR checkout lease recovery bundle verification failed",
         )
         os.replace(staging, bundle)
