@@ -6,6 +6,162 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-08-17
+
+A large patch release: 66 pull requests, almost all of them acting on a
+whole-codebase review rather than on new feature work.
+
+**Operator action is required for any deployment that runs the contained
+worklink executor.** `_LAUNCH_FIELDS` — the controller-to-executor launch
+protocol — gained `executor_identity`, and it is validated as an exact key set.
+The executor is image-resident while the controller runs from the source
+checkout, so a `git pull` and restart advances only one half and every contained
+launch (`repo_test`, `spawn_open_code`) is refused. **Rebuild the image**:
+
+```
+docker compose -p <project> -f <compose.yml> up -d --build
+```
+
+Passing `-p <project>` is not optional; without it the default project name can
+orphan the named workspace volume. The refusal is now diagnostic rather than
+generic — it names the drift and tells you to rebuild — but it still fails
+closed. Deployments that do not use contained execution need only the package.
+
+One dependency was added since 0.8.4 (`packaging>=24.0`), so a source
+deployment also needs `uv sync`. The `Dockerfile` changed too, in the s6-overlay
+download layer.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+**Credentials reaching durable logs.** `redact_text` — the redactor behind
+`turns.jsonl` and `events.jsonl` — masked only `=`-delimited assignments, so a
+credential written in a header, YAML or JSON colon form reached disk in
+cleartext, and a quoted value was masked only to its first space. All colon
+forms are now masked across every combination of key and value quote style,
+with escapes and YAML line continuations consumed to the true closing
+delimiter. Multiline block scalars are parsed properly, including sequence
+entries and explicit mapping keys. A single-quoted value containing a backslash
+is *declined untouched* rather than half-masked, because the Python-repr and
+YAML readings of those bytes genuinely disagree and a partial mask reads as
+scrubbed. A conformance test now asserts the durable path can never again mask
+less than the ephemeral one. (#1214, #1261, #1262, #1274)
+
+**Authorization gates that failed open or disclosed.** Every service shell
+profile admitted an unconstrained `jq` filter, and a jq program can read the
+whole process environment through `env`/`$ENV` (#1208). The maintenance profile
+admitted `cat`/`head`/`tail` on `/proc/self/environ`, disclosing every
+credential — the same class. Three policies were enforced in two places that
+disagreed (#1226). A model-supplied `mimir_direct_argv` survived on non-shell
+tools and hijacked the next nested shell (#1212). The GitHub review guard probed
+a different working directory than `shell_exec` ran in (#1220) and failed open on
+newline-separated commands and `gh` short flags. State-changing server routes had
+no `Origin`/`Sec-Fetch-Site` check, and keyless loopback was documented as safe.
+
+**The staged-secret gate.** It scanned only the diff and only line-wise, so any
+file git treats as binary bypassed it (#1209), and it missed credential shapes the
+redactor already recognised (#1210). It then scanned *whole blobs*, which locked
+the factory out of the eight files that legitimately carry credential fixtures —
+including every redaction test. It now refuses only a secret that is **new**
+relative to the base blob, verified per path, and still fails closed on an
+unreadable base. (#1271)
+
+**PR checkout leases.** A superseded lease was refused as retaining unpublished
+work when its head was already published, and a *rebased* head defeated
+publication-ancestry proof entirely — the common case, since base reconciliation
+rebases routinely. Release now also accepts per-path content equivalence against
+a verified base. Successful acquisition is audited for the first time, recording
+the bound head that the typed tools never carry in their arguments. Operator-invoked
+runs died on `EACCES` against their own checkout (#1259), a claim reset restarted
+attempt numbering and collided with retained checkouts, and run termination never
+escalated to `SIGKILL` while an orphan worker live-locked its leaf. (#1272, #1273)
+
+**Contained execution.** The layer hardcoded the published image's uids, so it
+failed closed on any deployment numbering its users differently; identities now
+resolve by account name through one cached accessor shared by the executor and
+the agent-side handoff (#1269). The bound runner resolved an absolute path across
+the `0700` boundary, discarding local test evidence (#1263). Stale root-executor
+protocol drift is now detected before launch and named (#1266). `repo_test` also
+ran git under a different identity than the host, so authorization tests passed
+on a developer machine and failed in the runner — which produced a false
+changes-request on a correct branch. (#1279)
+
+**Shell jobs and tools.** Two file descriptors leaked per finished job, the log
+directory grew without bound with unreachable restart residue, and the working
+directory was process-global and sticky. A drainer write failure wedged the child
+forever and permanently burned a live-job slot (#1219). `bash_async`'s
+`session_id` was model-controlled, routing job output to another channel and
+nulling auth. A schema-invalid `pr_*`/`repo_*` call raised `AttributeError` out
+of the middleware and killed the whole turn.
+
+**Saga.** `reasoning_effort` was hardcoded to none on the `codex_plus` path, so
+the `saga.toml` setting was silently ignored (#1207). Migration v5 permanently
+deleted session-boundary atoms whose v2 backfill was skipped (#1242). Write-side
+boundary violations let thematic consolidation cross owners and `intersect_acl`
+ignore its argument (#1248). An empty-built vector index was permanently dead and
+re-asserted facts never resurfaced (#1249). The evidence-count sweep was
+tombstone-blind, and its test was circular (#1255).
+
+**Credentials and budget.** `not_implemented` probes made every Type B/C rotation
+roll back to the revoked secret (#1211). The probe validated a stripped value,
+OAuth refresh-token loss was invisible, and backups retained material (#1236).
+Budget severity latched TIGHT forever on an undeclared store key (#1244).
+
+**Scheduler, pollers and remediation.** An override cron was validated by the
+wrong parser, background tasks were never drained, and the quota recheck missed
+the misfire grace window. A poller manifest name was unvalidated as a path
+component, escaping `state/pollers` (#1224). Four unbounded parses ran
+synchronously on the event loop (#1225). Every hard refusal received the 24-hour
+permanent-fault backoff, so a pull request whose transient blocker had cleared sat
+idle for a day; self-clearing refusals now retry on the normal hourly cadence
+while operator-gated faults keep the backstop (#1275).
+
+**Frontend and dashboards.** Both non-chat SSE clients retried a terminal
+401/403 forever at one second — the bug already fixed in `chat.ts`. Search boxes
+were wiped on any URL change, a trigger parameter was shared, the skin query
+pinned the picker, a `pr_url` href was unsanitized, and there was no error
+boundary. Three `--mimir-*` tokens were defined by no skin, and a hardcoded neon
+palette was applied to all skins (#1230). The file-memory dashboard's `esc()` did
+not escape quotes but was used in an attribute (#1227). Legacy turns/ops
+dashboards were dead on first visit, saga atom rows were unclickable, and ops
+tabs were inert on fetch failure.
+
+**Configuration and CLI.** An empty environment value was read as an explicit
+value, so `GITHUB_REPOS=` crash-looped boot (#1251). `regenerate-api-key` was a
+silent no-op in Docker, leaving the old key valid (#1247). The `scaffold-docker`
+opencode block rendered an unparseable `Dockerfile` (#1250). Usage ceilings were
+decorative and a pre-release never saw its stable release (#1254).
+
+**Tests that could not fail.** Fourteen tests across unrelated subsystems named a
+property they could not fail on (#1257). The poller process-group teardown check
+sampled once instead of polling.
+
+### Added
+
+- A **non-blocking macOS CI leg** across Python 3.11 and 3.12, as a separate job
+  so the required `pytest (3.11)` / `pytest (3.12)` check names are unchanged.
+  It immediately surfaced two latent environment assumptions that had been
+  misfiring on Linux and being dismissed as flakes. (#1277)
+- **Remediation on CI failure** for Mimir-owned pull requests, with durable
+  delivery receipts written only after enqueue succeeds, so a rejected handoff
+  retries instead of being silently consumed. (#1270)
+- A committed **redaction hot-path benchmark** (`benchmarks/redaction_hot_path.py`),
+  so the next change to the pattern tuple is measured rather than argued about.
+- `repo_test` now reports the **Git execution context** it ran under, making a
+  containment-attributable failure recognisable from its output alone.
+
+### Changed
+
+- The full test suite was audited and pruned (#1267) and then profiled and sped
+  up (#1268); one file alone went from 91.7s to 0.6s.
+- Redaction's hot path was restored after a regression introduced during this
+  same release cycle: three credential-key rules each rescanned the whole
+  string, taking `redact_text` from 66 to 185 microseconds per call. It now runs
+  at 53 microseconds — faster than before the regression — by anchoring on
+  credential-word offsets, with byte-identical masking verified across 14,040
+  input combinations. (#1276)
+
 ## [0.8.4] — 2026-08-15
 
 A patch release. **No operator action is required** — no dependency changed and
