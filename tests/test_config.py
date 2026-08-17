@@ -264,6 +264,58 @@ class TestConfigFromEnv:
         cfg = Config.from_env()
         assert cfg.web_port == 9090
 
+    def test_empty_web_host_uses_loopback_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_WEB_HOST", "")
+        from mimir.config import Config
+
+        assert Config.from_env().web_host == "127.0.0.1"
+
+    def test_web_host_and_chat_stream_cap_unset_defaults(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.delenv("MIMIR_WEB_HOST", raising=False)
+        monkeypatch.delenv("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", raising=False)
+        from mimir.config import Config
+
+        config = Config.from_env()
+
+        assert config.web_host == "127.0.0.1"
+        assert config.chat_stream_max_subscribers == 8
+
+    def test_empty_chat_stream_subscriber_cap_warns_and_uses_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", "")
+        from mimir.config import Config
+
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            config = Config.from_env()
+
+        assert config.chat_stream_max_subscribers == 8
+        assert "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS" in caplog.text
+
+    def test_explicit_empty_values_with_distinct_semantics_are_preserved(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._base(monkeypatch)
+        monkeypatch.setenv("MIMIR_RECENT_SOURCES", "")
+        monkeypatch.setenv("MIMIR_COMMITMENTS_DUE_CHECK_CRON", "")
+        monkeypatch.setenv("MIMIR_HEALTH_PROBE_CRON", "")
+        from mimir.config import Config
+
+        config = Config.from_env()
+
+        assert config.recent_sources == frozenset()
+        assert config.commitments_due_check_cron == ""
+        assert config.health_probe_cron == ""
+
     def test_attachments_max_bytes_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """#495: a sane 25MiB inbound-attachment cap by default, so the bridge
         size gate is armed (it's a no-op when None)."""

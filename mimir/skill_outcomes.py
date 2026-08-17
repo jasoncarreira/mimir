@@ -57,31 +57,22 @@ per-skill telemetry — success/failure counts surfaced into the
 from __future__ import annotations
 
 import fnmatch
-import json
 import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
 
+from ._jsonl_tail import tail_jsonl_records
+
 log = logging.getLogger(__name__)
 
-# ``skills/<name>/SKILL.md`` (post-2026-05-22 relocation) or the
-# legacy ``.claude/skills/<name>/SKILL.md``, either with any prefix
-# (``/mimir-home/...``, ``./...``, bare relative). Also matches the
-# read-only bundled location ``.mimir_builtin_skills/<name>/SKILL.md``.
-# The capture group is the skill name — exactly one path segment.
-#
-# The legacy ``.claude/skills/`` alternative stays matched indefinitely
-# because old turns.jsonl records (from before the relocation) carry
-# the pre-migration path; dropping it would lose historical telemetry.
-_SKILL_READ_RE = re.compile(
-    r"(?:^|/)(?:\.claude/skills|\.mimir_builtin_skills|skills)/([^/]+)/SKILL\.md$",
-)
+_SKILL_READ_RE = re.compile(r"^([^/]+)/SKILL\.md$")
 
 
 # ─── inline-skill success criteria ───────────────────────────────────────
@@ -198,6 +189,7 @@ def _pattern_matches_event(pattern: dict[str, Any], event: dict) -> bool:
     return True
 
 
+@lru_cache(maxsize=32)
 def load_skill_success_criteria(home: Path) -> dict[str, SkillSuccessCriteria]:
     """Scan ``<home>/.mimir_builtin_skills/`` and ``<home>/skills/`` for
     skills that declare ``success_criteria`` in frontmatter.
@@ -228,6 +220,41 @@ def load_skill_success_criteria(home: Path) -> dict[str, SkillSuccessCriteria]:
             if criteria is not None:
                 out[skill_md.parent.name] = criteria
     return out
+
+
+def _skill_roots(home: Path) -> tuple[Path, ...]:
+    """Return the only roots whose SKILL.md reads count as skill loads.
+
+    The legacy root remains for historical turns written before migration;
+    current middleware uses the operator and bundled roots.
+    """
+    from .skill_defs import home_builtin_skills_dir, home_skills_dir
+
+    return (
+        home_skills_dir(home).resolve(strict=False),
+        home_builtin_skills_dir(home).resolve(strict=False),
+        (home / ".claude" / "skills").resolve(strict=False),
+    )
+
+
+def _skill_from_read_path(
+    file_path: str,
+    roots: tuple[Path, ...],
+) -> str | None:
+    path = Path(file_path)
+    if not path.is_absolute():
+        # File-tool relative paths are rooted at the deployment home.
+        path = roots[0].parent / path
+    resolved = path.resolve(strict=False)
+    for root in roots:
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError:
+            continue
+        match = _SKILL_READ_RE.fullmatch(relative.as_posix())
+        if match:
+            return match.group(1)
+    return None
 
 
 def _parse_criteria_from_skill_md(path: Path) -> SkillSuccessCriteria | None:
@@ -364,27 +391,12 @@ class SkillOutcome:
         return self.load_success / self.load_total
 
 
-def _iter_turns(path: Path) -> Iterable[dict]:
-    """Yield turn records from ``turns.jsonl``. Best effort — skips
-    malformed lines."""
-    if not path.is_file():
-        return
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
 def _classify_skill_calls(
     events: list[dict], turn_ts: datetime,
     *,
     turn_succeeded: bool | None = None,
     skill_criteria: dict[str, SkillSuccessCriteria] | None = None,
+    skill_roots: tuple[Path, ...] | None = None,
 ) -> Iterable[tuple[str, str, datetime, str]]:
     """Walk a single turn's events list, recognize skill invocations,
     pair their tool_call ↔ tool_result by id, yield
@@ -481,9 +493,9 @@ def _classify_skill_calls(
                 # the skill into parent context, then improvises.
                 file_path = args.get("file_path") or ""
                 if isinstance(file_path, str):
-                    m = _SKILL_READ_RE.search(file_path)
-                    if m:
-                        skill = m.group(1)
+                    if skill_roots is not None:
+                        skill = _skill_from_read_path(file_path, skill_roots)
+                    if skill:
                         kind = "load"
             if skill:
                 tool_id = ev.get("id")
@@ -594,6 +606,7 @@ def aggregate(
     window_hours: int = 24 * 7,   # 7d default
     now: datetime | None = None,
     skill_criteria: dict[str, SkillSuccessCriteria] | None = None,
+    home: Path | None = None,
 ) -> dict[str, SkillOutcome]:
     """Walk turns.jsonl, accumulate per-skill outcome counts within
     the window.
@@ -609,7 +622,8 @@ def aggregate(
     cutoff = now - timedelta(hours=window_hours)
     out: dict[str, SkillOutcome] = defaultdict(lambda: SkillOutcome(skill="?"))
 
-    for record in _iter_turns(turns_log):
+    roots = _skill_roots(home or turns_log.parent.parent)
+    for record in tail_jsonl_records(turns_log):
         ts_raw = record.get("ts")
         if not isinstance(ts_raw, str):
             continue
@@ -622,7 +636,7 @@ def aggregate(
         else:
             ts = ts.astimezone(timezone.utc)
         if ts < cutoff:
-            continue
+            break
         events = record.get("events") or []
         if not isinstance(events, list):
             continue
@@ -638,6 +652,7 @@ def aggregate(
             events, ts,
             turn_succeeded=turn_succeeded,
             skill_criteria=skill_criteria,
+            skill_roots=roots,
         ):
             entry = out[skill]
             entry.skill = skill

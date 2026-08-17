@@ -174,6 +174,11 @@ def _is_secret_name(name: str) -> bool:
     return any(marker in upper for marker in SECRET_MARKERS)
 
 
+def _is_secret_env_name(name: str) -> bool:
+    config_name = name.removeprefix("MIMIR_").lower()
+    return _is_secret_name(name) or config_name in RAW_CONFIG_SECRET_FIELDS
+
+
 def _redact_public_value(value: str) -> str:
     """Mask credential material in otherwise-public diagnostic strings."""
 
@@ -190,12 +195,13 @@ def _redacted_value(name: str, value: str | None) -> str | None:
 
 def _env_row(category: str, name: str) -> dict[str, Any]:
     value = os.environ.get(name)
+    secret = _is_secret_env_name(name)
     return {
         "name": name,
         "category": category,
         "present": value is not None and value != "",
-        "secret": _is_secret_name(name),
-        "value": _redacted_value(name, value),
+        "secret": secret,
+        "value": "[REDACTED]" if secret and value is not None else _redacted_value(name, value),
         "mutable": False,
     }
 

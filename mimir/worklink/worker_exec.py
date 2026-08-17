@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 from pathlib import Path, PurePosixPath
+import math
 import re
 import shutil
 import signal
@@ -17,6 +18,7 @@ import time
 from typing import Any
 
 from .checkout import _normalize_checkout_fd
+from .identities import get_identities
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -26,13 +28,18 @@ from .worker_client import (
     _validate_identifier,
 )
 
-MIMIR_UID = 1001
-WORKLINK_UID = 1002
-WORKLINK_GID = 1002
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 MAX_FDS = 3
+# Deliberately not imported from worker_client: this value must describe the
+# immutable executor installed in the root-owned image, not mutable controller code.
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v2-repo-copy-timeout"
+_STALE_EXECUTOR_DIAGNOSTIC = (
+    "stale root executor image: controller and mimir.worklink.worker_exec protocol "
+    "identities do not match; rebuild the image and restart the container"
+)
+_CONTROLLER_CANCELLATION_GRACE_S = 10.0
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_CAPBSET_DROP = 24
 _PR_CAP_AMBIENT = 47
@@ -44,9 +51,12 @@ _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _LINUX_CAPABILITY_U32S_3 = 2
 _LAUNCH_FIELDS = frozenset({
     "version", "op", "id", "issue", "attempt", "device", "inode",
-    "argv", "env", "projections",
+    "argv", "env", "projections", "timeout_s", "executor_identity",
 })
+_CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
+_IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _jobs: dict[str, subprocess.Popen[bytes]] = {}
+_launching: set[str] = set()
 _jobs_lock = threading.Lock()
 
 
@@ -103,8 +113,8 @@ def _drop_worker(checkout_fd: int) -> None:
             raise OSError(error, os.strerror(error))
     _set_capabilities({_CAP_SETUID, _CAP_SETGID})
     os.setgroups([])
-    os.setresgid(WORKLINK_GID, WORKLINK_GID, WORKLINK_GID)
-    os.setresuid(WORKLINK_UID, WORKLINK_UID, WORKLINK_UID)
+    os.setresgid(get_identities().worklink_gid, get_identities().worklink_gid, get_identities().worklink_gid)
+    os.setresuid(get_identities().worklink_uid, get_identities().worklink_uid, get_identities().worklink_uid)
     _set_capabilities(set())
     os.umask(0o002)
     os.setsid()
@@ -122,7 +132,7 @@ def _status_fields() -> dict[str, str]:
 
 
 def _verify_worker_identity() -> None:
-    if os.getresuid() != (WORKLINK_UID,) * 3 or os.getresgid() != (WORKLINK_GID,) * 3:
+    if os.getresuid() != (get_identities().worklink_uid,) * 3 or os.getresgid() != (get_identities().worklink_gid,) * 3:
         raise RuntimeError("worker identity drop failed")
     if os.getgroups():
         raise RuntimeError("worker supplementary groups were not cleared")
@@ -171,7 +181,7 @@ def _issued_checkout_relative(resolved: Path) -> tuple[Path, Path]:
     return matches[0]
 
 
-def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
+def _validate_checkout(fd: int, request: dict[str, Any]) -> Path:
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
     device = _identity_integer(request, "device")
@@ -194,15 +204,16 @@ def _validate_checkout(fd: int, request: dict[str, Any]) -> None:
     boundary = resolved.parent.stat(follow_symlinks=False)
     if (
         not stat.S_ISDIR(boundary.st_mode)
-        or boundary.st_uid != MIMIR_UID
-        or boundary.st_gid != WORKLINK_GID
+        or boundary.st_uid != get_identities().mimir_uid
+        or boundary.st_gid != get_identities().worklink_gid
         or stat.S_IMODE(boundary.st_mode) != 0o700
     ):
         raise RuntimeError("issued checkout isolation boundary is invalid")
-    if observed.st_uid != MIMIR_UID or observed.st_gid != WORKLINK_GID:
+    if observed.st_uid != get_identities().mimir_uid or observed.st_gid != get_identities().worklink_gid:
         raise RuntimeError("issued checkout ownership is invalid")
     if stat.S_IMODE(observed.st_mode) != 0o2770:
         raise RuntimeError("issued checkout mode is invalid")
+    return root
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -216,8 +227,10 @@ def _validate_command(request: dict[str, Any]) -> list[str]:
     return argv
 
 
-def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> int:
-    if Path(command[0]).name != "uv":
+def _execution_checkout_fd(
+    command: list[str], checkout_fd: int, home: Path, *, checkout_root: Path | None = None
+) -> int:
+    if checkout_root != REPO_TEST_CHECKOUT_ROOT and Path(command[0]).name != "uv":
         return os.dup(checkout_fd)
     project = home / "project"
     shutil.copytree(f"/proc/self/fd/{checkout_fd}", project, symlinks=True)
@@ -227,7 +240,7 @@ def _execution_checkout_fd(command: list[str], checkout_fd: int, home: Path) -> 
     )
     try:
         _normalize_checkout_fd(
-            project_fd, owner_uid=MIMIR_UID, group_gid=WORKLINK_GID
+            project_fd, owner_uid=get_identities().mimir_uid, group_gid=get_identities().worklink_gid
         )
     except Exception:
         os.close(project_fd)
@@ -291,10 +304,10 @@ def _project_home(home: Path, projections: object) -> None:
             os.close(fd)
     for root, directories, files in os.walk(home):
         for name in directories:
-            os.chown(Path(root) / name, WORKLINK_UID, WORKLINK_GID, follow_symlinks=False)
+            os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
             os.chmod(Path(root) / name, 0o700, follow_symlinks=False)
         for name in files:
-            os.chown(Path(root) / name, WORKLINK_UID, WORKLINK_GID, follow_symlinks=False)
+            os.chown(Path(root) / name, get_identities().worklink_uid, get_identities().worklink_gid, follow_symlinks=False)
             os.chmod(Path(root) / name, 0o600, follow_symlinks=False)
 
 
@@ -314,7 +327,7 @@ def _process_group_has_live_members(process_group: int) -> bool:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 if int(fields[2]) == process_group and fields[0] not in {"Z", "X"}:
                     return True
-            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+            except (OSError, IndexError, ValueError):
                 continue
         return False
     observed = subprocess.run(
@@ -347,18 +360,22 @@ def _wait_process_group(process_group: int, deadline: float | None) -> None:
         time.sleep(0.01)
 
 
-def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+def _terminate_process_group_pid(process_group: int, timeout_s: float = 5.0) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    _wait_process_group(proc.pid, time.monotonic() + timeout_s)
-    if _process_group_has_live_members(proc.pid):
+    _wait_process_group(process_group, time.monotonic() + timeout_s)
+    if _process_group_has_live_members(process_group):
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        _wait_process_group(proc.pid, None)
+        _wait_process_group(process_group, None)
+
+
+def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5.0) -> None:
+    _terminate_process_group_pid(proc.pid, timeout_s)
     proc.wait()
 
 
@@ -374,9 +391,25 @@ def _send(connection: socket.socket, response: dict[str, object]) -> None:
     connection.send(json.dumps(response, separators=(",", ":")).encode())
 
 
+def _validate_executor_identity(request: dict[str, Any]) -> None:
+    if request.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY:
+        raise RuntimeError(_STALE_EXECUTOR_DIAGNOSTIC)
+
+
+def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
+    if fds or set(request) != _IDENTITY_FIELDS:
+        raise RuntimeError("invalid executor identity request")
+    _validate_executor_identity(request)
+    _send(connection, {
+        "status": "identity",
+        "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+    })
+
+
 def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
-    if fds or set(request) != {"version", "op", "id"}:
+    if fds or set(request) != _CANCEL_FIELDS:
         raise RuntimeError("invalid cancel request")
+    _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
@@ -388,28 +421,49 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
 def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list[int]) -> None:
     if set(request) != _LAUNCH_FIELDS or len(fds) != MAX_FDS:
         raise RuntimeError("launch request must carry the exact contract and three FDs")
+    _validate_executor_identity(request)
     identifier = request.get("id")
     if not isinstance(identifier, str):
         raise RuntimeError("invalid worker id")
     _validate_identifier(identifier)
-    _validate_checkout(fds[0], request)
+    checkout_root = _validate_checkout(fds[0], request)
     command = _validate_command(request)
     environment = _validate_environment(request["env"])
-    anchored_fd = os.open(
-        ".",
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=fds[0],
-    )
-    os.close(fds[0])
-    fds[0] = anchored_fd
-    home = HOME_ROOT / identifier
-    home.mkdir(mode=0o700)
+    timeout_s = request["timeout_s"]
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+    ):
+        raise RuntimeError("worker timeout must be a positive finite number")
+    with _jobs_lock:
+        if identifier in _jobs or identifier in _launching:
+            raise RuntimeError("worker id is already active")
+        _launching.add(identifier)
+    home = Path()
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        anchored_fd = os.open(
+            ".",
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=fds[0],
+        )
+        os.close(fds[0])
+        fds[0] = anchored_fd
+        candidate_home = HOME_ROOT / identifier
+        candidate_home.mkdir(mode=0o700)
+        home = candidate_home
         _project_home(home, request["projections"])
-        os.chown(home, WORKLINK_UID, WORKLINK_GID)
+        os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
         environment["HOME"] = str(home)
-        execution_fd = _execution_checkout_fd(command, anchored_fd, home)
+        execution_fd = _execution_checkout_fd(
+            command,
+            anchored_fd,
+            home,
+            checkout_root=checkout_root,
+        )
         os.close(anchored_fd)
         anchored_fd = execution_fd
         fds[0] = anchored_fd
@@ -424,25 +478,35 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             pass_fds=(fds[0],),
         )
         with _jobs_lock:
-            if identifier in _jobs:
-                _terminate_process_group(proc, 0)
-                raise RuntimeError("worker id is already active")
             _jobs[identifier] = proc
+            _launching.remove(identifier)
         os.close(fds[1])
         fds[1] = -1
         os.close(fds[2])
         fds[2] = -1
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
-        exit_code = proc.wait()
-        _terminate_process_group(proc, 0)
+        timed_out = False
+        try:
+            exit_code = proc.wait(timeout=timeout_s + _CONTROLLER_CANCELLATION_GRACE_S)
+            _terminate_process_group(proc, 0)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process_group(proc)
+            exit_code = proc.returncode
         with _jobs_lock:
             _jobs.pop(identifier, None)
         _cleanup_home(home)
         home = Path()
-        _send(connection, {"id": identifier, "status": "terminal", "exit_code": exit_code})
+        _send(connection, {
+            "id": identifier,
+            "status": "terminal",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+        })
     finally:
         with _jobs_lock:
-            active = _jobs.pop(identifier, None)
+            _launching.discard(identifier)
+            active = _jobs.pop(identifier, None) if _jobs.get(identifier) is proc else None
         if active is not None and active.poll() is None:
             _terminate_process_group(active)
         if home != Path():
@@ -469,6 +533,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_launch(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
+        elif request.get("op") == "identity":
+            _handle_identity(connection, request, fds)
         else:
             raise RuntimeError("unsupported worker operation")
     except Exception as exc:
@@ -489,7 +555,7 @@ def handle_connection(connection: socket.socket) -> None:
 def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
     socket_path.parent.mkdir(mode=0o710, parents=True, exist_ok=True)
     HOME_ROOT.mkdir(mode=0o710, parents=True, exist_ok=True)
-    os.chown(HOME_ROOT, 0, WORKLINK_GID)
+    os.chown(HOME_ROOT, 0, get_identities().worklink_gid)
     os.chmod(HOME_ROOT, 0o710)
     try:
         socket_path.unlink()
@@ -497,7 +563,7 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
         pass
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     listener.bind(str(socket_path))
-    os.chown(socket_path, 0, MIMIR_UID)
+    os.chown(socket_path, 0, get_identities().mimir_uid)
     os.chmod(socket_path, 0o660)
     listener.listen(16)
     while True:
@@ -510,7 +576,17 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
                 struct.calcsize("3i"),
             ),
         )
-        if uid != MIMIR_UID:
+        if uid != get_identities().mimir_uid:
+            try:
+                _send(connection, {
+                    "id": None,
+                    "error": (
+                        f"worker executor refused peer uid {uid}; "
+                        f"required mimir uid is {get_identities().mimir_uid}"
+                    ),
+                })
+            except OSError:
+                pass
             connection.close()
             continue
         threading.Thread(target=handle_connection, args=(connection,), daemon=True).start()

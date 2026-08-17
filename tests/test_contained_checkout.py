@@ -81,6 +81,82 @@ def test_repo_test_checkout_snapshots_without_mutating_source(
     assert list(root.iterdir()) == []
 
 
+def test_prepare_boundary_refuses_collision_without_deleting_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = _roots(tmp_path, monkeypatch)
+    scope = "scope"
+    boundary = root / scope / "41-7"
+    checkout_path = boundary / "checkout"
+    checkout_path.mkdir(parents=True)
+    canary = checkout_path / "live-worker"
+    canary.write_text("running\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        contained_checkout._prepare_boundary(root, scope, "41-7")
+
+    assert canary.read_text(encoding="utf-8") == "running\n"
+
+
+def test_prepare_boundary_remains_controller_owned_0700(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_worklink_identities,
+) -> None:
+    root = tmp_path / "checkouts"
+    root.mkdir(mode=0o771)
+    ownership: list[tuple[Path, int, int]] = []
+
+    def record_chown(path: Path, uid: int, gid: int, **_kwargs: object) -> None:
+        ownership.append((path, uid, gid))
+
+    monkeypatch.setattr(contained_checkout.os, "chown", record_chown)
+
+    boundary, checkout_path = contained_checkout._prepare_boundary(
+        root, "scope", "1259-1"
+    )
+
+    assert checkout_path == boundary / "checkout"
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+    assert ownership[-1] == (
+        boundary,
+        synthetic_worklink_identities.mimir_uid,
+        synthetic_worklink_identities.worklink_gid,
+    )
+
+
+def test_repo_test_checkout_normalizes_venv_without_widening_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _roots(tmp_path, monkeypatch)
+    source = _repo(tmp_path)
+    venv = source / ".venv" / "bin"
+    venv.mkdir(parents=True, mode=0o700)
+    runner = venv / "pytest"
+    runner.write_text("#!/bin/sh\n", encoding="utf-8")
+    data = venv / "metadata"
+    data.write_text("data\n", encoding="utf-8")
+    (source / ".venv").chmod(0o700)
+    venv.chmod(0o700)
+    runner.chmod(0o700)
+    data.chmod(0o600)
+
+    issued = create_repo_test_checkout(source, scope_id="owner/repo", pr_number=44)
+
+    copied_venv = issued.path / ".venv"
+    copied_runner = copied_venv / "bin" / "pytest"
+    copied_data = copied_venv / "bin" / "metadata"
+    boundary = issued.path.parent
+    assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
+    assert stat.S_IMODE(boundary.stat().st_mode) & stat.S_IXGRP == 0
+    assert stat.S_IMODE(copied_venv.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(copied_runner.stat().st_mode) == 0o770
+    assert stat.S_IMODE(copied_data.stat().st_mode) == 0o660
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) & 0o007 == 0
+        for path in (copied_venv, copied_runner, copied_data)
+    )
+    issued.close()
+
+
 def test_repo_test_checkout_allows_tracked_credential_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -176,7 +252,10 @@ def test_opencode_checkout_refuses_seed_outside_default_tree(
 
 @pytest.mark.parametrize("surface", ["repo_test", "opencode"])
 def test_checkout_provisioning_mutates_only_its_admitted_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    synthetic_worklink_identities,
 ) -> None:
     repo_test_root, opencode_root = _roots(tmp_path, monkeypatch)
     default = tmp_path / "projects"
@@ -239,12 +318,19 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     assert stat.S_IMODE(scope.stat().st_mode) == 0o700
     assert stat.S_IMODE(boundary.stat().st_mode) == 0o700
     assert stat.S_IMODE(issued.path.stat().st_mode) == 0o2770
+    identities = synthetic_worklink_identities
     scope_identity = _identity(scope)
     boundary_identity = _identity(boundary)
     checkout_identity = _identity(issued.path)
-    assert ("chown", scope_identity, (1001, 1001)) in mutations
-    assert ("chown", boundary_identity, (1001, 1002)) in mutations
-    assert ("fchown", checkout_identity, (1001, 1002)) in mutations
+    assert (
+        "chown", scope_identity, (identities.mimir_uid, identities.mimir_uid)
+    ) in mutations
+    assert (
+        "chown", boundary_identity, (identities.mimir_uid, identities.worklink_gid)
+    ) in mutations
+    assert (
+        "fchown", checkout_identity, (identities.mimir_uid, identities.worklink_gid)
+    ) in mutations
     assert ("fchmod", checkout_identity, 0o2770) in mutations
     issued.close()
 

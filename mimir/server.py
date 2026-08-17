@@ -80,6 +80,8 @@ async def _start_mcp_servers(
             log.warning("MCP shutdown after startup failure failed: %s", shutdown_exc)
             return mcp_manager, []
         return None, []
+    for failure in getattr(mcp_manager, "startup_failures", []):
+        await log_event("mcp_server_start_failed", **failure)
     if mcp_tools:
         await log_event(
             "mcp_servers_ready",
@@ -360,7 +362,6 @@ _RUNTIME_APP_FIELDS = (
     "indexer",
     "saga_client",
     "sessions",
-    "subagent_inbox",
     "agent_runtime",
     "replayed_messages",
 )
@@ -411,7 +412,6 @@ def _publish_runtime(
     app["indexer"] = bundle.indexer
     app["saga_client"] = bundle.saga_client
     app["sessions"] = bundle.sessions
-    app["subagent_inbox"] = bundle.subagent_inbox
     app["replayed_messages"] = bundle.replayed_messages
     app["agent_runtime"] = bundle
     app["agent"] = bundle.agent
@@ -444,6 +444,8 @@ async def _handle_event(request: web.Request) -> web.Response:
     channel_id = body.get("channel_id")
     if not channel_id:
         return web.json_response({"error": "channel_id required"}, status=400)
+    if not isinstance(channel_id, str):
+        return web.json_response({"error": "channel_id must be a string"}, status=400)
 
     # #487: type-check structured fields, don't coerce. A truthy non-dict
     # ``extra`` (or non-list ``attachment_names``) survives ``or {}``/``or []``
@@ -774,6 +776,13 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 
 
 async def _handle_health(request: web.Request) -> web.Response:
+    from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
+
+    if request.app.get("check_worker_executor_health") and DEFAULT_EXECUTOR_SOCKET.exists():
+        try:
+            await verify_executor_identity()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=503)
     return web.json_response({"ok": True})
 
 
@@ -1070,6 +1079,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         chat_skill_registry=core.chat_skill_registry,
     )
+    web_chat.max_subscribers = config.chat_stream_max_subscribers
     channels.register(web_chat)
 
     # Inbound attachments land here; the agent reads files by path. The
@@ -1166,6 +1176,7 @@ def build_app(config: Config) -> web.Application:
     app["runtime_adapters"] = runtime_adapters
     app["startup_background_tasks"] = startup_background_tasks
     app["startup_state"] = startup_state
+    app["check_worker_executor_health"] = True
     for field in _RUNTIME_APP_FIELDS:
         app[field] = None
     # chainlink #233: single-flight guard for POST /api/memory/consolidate.
@@ -2005,7 +2016,7 @@ def build_app(config: Config) -> web.Application:
 
             attempt_sync(lambda: mark_clean_shutdown(config.home))
         if startup_state.scheduler_start_attempted:
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
         if acp_stopped and startup_state.mcp_manager is not None:
             await attempt(startup_state.mcp_manager.shutdown)
         if acp_stopped and startup_state.bridges_connect_attempted:
@@ -2114,7 +2125,7 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
             else:
                 errors.extend(_cleanup_exception(error) for error in task_errors)
-            attempt_sync(scheduler.stop)
+            await attempt(scheduler.stop)
             acp_stopped = True
             if startup_state.acp_daemon is not None:
                 acp_stopped = await attempt(startup_state.acp_daemon.stop)

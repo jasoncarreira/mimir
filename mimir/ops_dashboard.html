@@ -240,6 +240,7 @@
     <script>
       const authedFetch = window.MimirAuth.authedFetch;
       const getApiKey = window.MimirAuth.getApiKey;
+      const promptApiKey = window.MimirAuth.promptApiKey;
       window.__mimir_resetApiKey = function() {
         window.MimirAuth.reset('manual rotation');
         window.location.reload();
@@ -261,6 +262,13 @@
       Chart.defaults.color = '#e2e6f0';
       Chart.defaults.borderColor = 'rgba(226, 230, 240, 0.12)';
 
+      document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        document.getElementById(t.dataset.panel).classList.add('active');
+      }));
+
       // ── Render: pulled into a function so the AJAX bootstrap below
       // can call it once data arrives. Previously the data was injected
       // server-side via a __DATA__ placeholder; that path leaked the
@@ -271,20 +279,11 @@
       document.getElementById('meta').textContent =
         'Window: ' + D.window_days + ' days · Generated ' + D.generated_at + ' · Live read of logs/events.jsonl';
 
-      document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-        document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
-        t.classList.add('active');
-        document.getElementById(t.dataset.panel).classList.add('active');
-      }));
-
       const summaryEl = document.getElementById('summary');
       const labels = {
         total_events: 'Total events',
         events_queued: 'Events queued',
         messages_sent: 'Messages sent',
-        subagents_started: 'Subagents started',
-        subagents_completed: 'Subagents completed',
         shell_jobs_spawned: 'Shell jobs spawned',
         shell_jobs_routed: 'Shell jobs routed',
         failures: 'Failures',

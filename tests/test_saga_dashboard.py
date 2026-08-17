@@ -40,6 +40,19 @@ from mimir.saga_dashboard import (
 )
 
 
+def test_atom_rows_use_bound_data_attributes() -> None:
+    """Recent and search rows bind safely even when atom IDs contain quotes."""
+    import mimir
+
+    body = (Path(mimir.__file__).parent / "saga_dashboard.html").read_text()
+    assert body.count('data-atom-id="\' + escAttr(a.id) + \'"') == 2
+    assert 'onclick="loadAtom(' not in body
+    assert 'replace(/"/g, "&quot;")' in body
+    assert 'replace(/\'/g, "&#39;")' in body
+    assert body.count("bindAtomRows(") == 3  # declaration plus Recent and Search
+    assert "loadAtom(row.dataset.atomId, row)" in body
+
+
 # ─── helpers ──────────────────────────────────────────────────────
 
 

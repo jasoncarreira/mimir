@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -270,6 +272,18 @@ def format_reflection_digest(
     return "\n".join(lines)
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace *path* atomically without changing its permission bits."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    with tmp.open("w", encoding="utf-8") as f:
+        os.chmod(tmp, mode)
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def mark_applied(
     proposed_changes_path: Path,
     applied_log_path: Path,
@@ -277,8 +291,8 @@ def mark_applied(
     *,
     now: datetime | None = None,
 ) -> AppliedProposal:
-    """Find a proposal in ``## Pending`` whose heading contains
-    ``id_match`` (case-insensitive substring), move it to ``## Applied``,
+    """Find a proposal in ``## Pending`` whose heading equals
+    ``id_match`` (case-insensitive), move it to ``## Applied``,
     and append a record to ``applied-proposals.jsonl``.
 
     Returns the matched proposal. Raises ``LookupError`` when no
@@ -321,12 +335,12 @@ def mark_applied(
     match_pos: int | None = None
     needle = id_match.lower()
     for j in range(pending_idx + 1, end_idx):
-        if needle in sections[j][0].lower():
+        if needle == sections[j][0].lower():
             match_pos = j
             break
     if match_pos is None:
         raise LookupError(
-            f"no pending proposal heading contains {id_match!r}"
+            f"no pending proposal heading equals {id_match!r}"
         )
 
     head, body = sections[match_pos]
@@ -373,12 +387,16 @@ def mark_applied(
         for h, b in new_sections
     ).rstrip() + "\n"
 
-    proposed_changes_path.write_text(rebuilt, encoding="utf-8")
-
-    # Append the JSONL record.
+    # Record first so an append failure cannot move a proposal out of Pending
+    # without making it measurable. A later atomic-replace failure may leave an
+    # orphan record, which is preferable to silently losing audit coverage.
     applied_log_path.parent.mkdir(parents=True, exist_ok=True)
     with applied_log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(asdict(proposal), ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    _atomic_write_text(proposed_changes_path, rebuilt)
 
     return proposal
 
@@ -393,8 +411,8 @@ def mark_reject(
     *,
     now: datetime | None = None,
 ) -> str:
-    """Find a proposal in ``## Pending`` whose heading contains
-    ``id_match`` (case-insensitive substring), move it to ``## Rejected``,
+    """Find a proposal in ``## Pending`` whose heading equals
+    ``id_match`` (case-insensitive), move it to ``## Rejected``,
     and annotate it with a rejection timestamp + reason.
 
     Returns the matched heading text. Raises ``LookupError`` when no
@@ -431,12 +449,12 @@ def mark_reject(
     match_pos: int | None = None
     needle = id_match.lower()
     for j in range(pending_idx + 1, end_idx):
-        if needle in sections[j][0].lower():
+        if needle == sections[j][0].lower():
             match_pos = j
             break
     if match_pos is None:
         raise LookupError(
-            f"no pending proposal heading contains {id_match!r}"
+            f"no pending proposal heading equals {id_match!r}"
         )
 
     head, body = sections[match_pos]
@@ -478,7 +496,7 @@ def mark_reject(
         for h, b in new_sections
     ).rstrip() + "\n"
 
-    proposed_changes_path.write_text(rebuilt, encoding="utf-8")
+    _atomic_write_text(proposed_changes_path, rebuilt)
     return head
 
 

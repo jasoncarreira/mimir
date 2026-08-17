@@ -235,6 +235,18 @@ async def test_send_returns_message_id(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_whitespace_only_message(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+
+    result = await bridge.send("discord-1", "  \n ")
+
+    assert result.sent is False
+    assert result.error == "empty message"
+    assert result.chunks == 0
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_send_closes_attachment_files_when_discord_send_fails(
     bridge_with_fake_client, tmp_path: Path,
 ):
@@ -491,26 +503,46 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
-async def test_on_message_dedupes_resume_protocol_redelivery(
-    bridge_with_fake_client,
+async def test_on_message_dedupes_completed_resume_protocol_redelivery(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch,
 ):
-    """chainlink #232: Discord's resume protocol can redeliver around
-    disconnects. The bridge must enqueue exactly once for the same
-    message id, no matter how many times it arrives."""
+    """Completed Discord messages are cached against later redelivery."""
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client
+    bridge.attachments_dir = tmp_path / "attachments"
+    download_calls = 0
+
+    async def fake_download(*args, **kwargs):
+        nonlocal download_calls
+        del args, kwargs
+        download_calls += 1
+        await asyncio.sleep(0)
+        return True
+
+    from mimir.bridges import _attachments as attachments_module
+
+    monkeypatch.setattr(attachments_module, "download_to_path", fake_download)
     channel = SimpleNamespace(
         id=1, type=getattr(discord.ChannelType, "text", None), name="g"
     )
     author = SimpleNamespace(id=99, bot=False, display_name="Alice")
     msg = SimpleNamespace(
-        id=12345, author=author, channel=channel, content="hello", mentions=[]
+        id=12345,
+        author=author,
+        channel=channel,
+        content="hello",
+        mentions=[],
+        attachments=[SimpleNamespace(
+            url="https://cdn.discordapp.com/file.txt",
+            filename="file.txt",
+            size=10,
+        )],
     )
-    await bridge._on_message(msg)
-    await bridge._on_message(msg)  # simulated resume redelivery
-    await bridge._on_message(msg)  # and again
+    await asyncio.gather(bridge._on_message(msg), bridge._on_message(msg))
+
     assert len(enqueued) == 1
+    assert download_calls == 1
 
 
 @pytest.mark.asyncio

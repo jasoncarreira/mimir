@@ -129,6 +129,21 @@ For each repo in `GITHUB_REPOS`:
   are bounded per PR/head/reason, and end in the named
   `pr_mergeability_rebase_gave_up` signal. At most one such attempt is emitted
   across all repositories in a poll cycle. This path never merges a PR.
+- **Completed check failures on open PRs** (`pr_ci_failure`) — a newly failed
+  check set on a PR authored by `MIMIR_GITHUB_SELF_LOGIN` starts one remediation
+  turn bound to the repository, PR number, immutable head SHA, failed check IDs,
+  names, conclusions, and log URLs. The repository checkout preflight re-fetches
+  the PR and checks and stops before mutation when the PR closed, the head was
+  superseded, or a rerun is green. Failures on external contributors' PRs emit a
+  `pr_ci_failure_external` notification signal only and never receive repository
+  mutation authority. CI remediation retains `pr_comment` authority so blocked
+  or failed repairs can leave an operator-visible trace, but excludes `pr_edit`
+  and `pr_rerequest`. Stable delivery keys and framework receipts dedupe
+  overlapping polls while allowing a rejected handoff to retry safely. On
+  rollout, a head whose failures predate the first observation is deliberately
+  baselined and remains quiet until its head or failure set changes. Open-PR
+  discovery is intentionally bounded to the 100 most recently updated PRs; a
+  newly completed check normally refreshes the affected PR into that window.
 
 Issue / PR / comment / review detection is filtered by `created_at > cursor`
 and (when set) `user.login != MIMIR_GITHUB_SELF_LOGIN`. Push + review-request
@@ -139,7 +154,8 @@ not `created_at`-windowed.
 
 - **Commits** — already handled by `git pull`. No GitHub-API path for "new commit" wakes today.
 - **Issue/PR state changes** (close, reopen, merge, label) — adds noise; revisit if it becomes useful.
-- **Workflow runs / check failures** — separate concern; would warrant its own poller.
+- **Main-branch workflow failures** — remain the separate `github-ci-watch`
+  responsibility; this poller only handles checks attached to open PR heads.
 - **Notifications API** (`/notifications`) — an alternative path that's higher-noise; this poller takes the targeted-endpoint approach instead.
 
 ## Why login-based, not email-based
@@ -163,6 +179,13 @@ The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
 
 The `pr_mergeability` key maps `{repo: {pr_number: {head_sha, reason, last_attempt_at, attempts}}}`. A new head or changed failure reason starts a fresh bounded series; current and closed PRs drop out during snapshot rebuild.
+
+The `pr_ci_failures` key maps each live red PR to its immutable head, stable
+failure-set delivery key, and last emit time. Framework acknowledgements live in
+`<home>/state/pollers/github-activity/.delivery-receipts/`; a receipt is created
+only after enqueue or external-signal logging succeeds. A missing receipt makes
+the same claim retry-eligible after five minutes, while atomic files under
+`.delivery-claims/` suppress concurrent poll overlap.
 
 ## Disabling temporarily
 

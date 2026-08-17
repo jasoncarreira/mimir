@@ -1328,6 +1328,11 @@ async def test_retry_success_emits_git_push_ok(
     push_count = [0]
 
     async def conditional_git(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "fetch":
+            # The retry path treats a transient fetch failure as a reason to
+            # continue to push. Do not make this unit test's timing depend on a
+            # real subprocess against the deliberately nonexistent remote.
+            raise git_tracking.GitError(1, "network error", args)
         if args and args[0] == "push":
             push_count[0] += 1
             if push_count[0] == 1:

@@ -196,6 +196,18 @@ def test_topic_diversity_calculated_correctly(tmp_path: Path):
     assert metrics.topic_diversity_ratio == pytest.approx(0.75)
 
 
+def test_silent_turns_are_excluded_from_topic_diversity(tmp_path: Path):
+    now = datetime.now(tz=timezone.utc)
+    for topic in ("alpha", "bravo", "charlie", "delta", "echoes"):
+        _write_turn(tmp_path, output=f"{topic} {topic} response", ts=now)
+    for _ in range(100):
+        _write_turn(tmp_path, output="", trigger="heartbeat", ts=now)
+    metrics = vm.compute_collapse_metrics(tmp_path, window_days=7, now=now)
+    assert metrics.window_turns == 5
+    assert metrics.distinct_topics == 5
+    assert metrics.topic_diversity_ratio == pytest.approx(1.0)
+
+
 def test_collapse_metrics_handles_no_embedder_gracefully(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

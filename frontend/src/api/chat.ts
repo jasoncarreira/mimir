@@ -8,6 +8,7 @@ import type {
   ChatSkillsData,
   LiveEvent
 } from "./generated/contracts";
+import { runReconnectingSse, SseResponseError } from "./sse-reconnect";
 
 export interface ChatPostRequest {
   content: string;
@@ -76,6 +77,7 @@ export interface ChatStreamOptions {
   apiKey?: string;
   fetchImpl?: typeof fetch;
   reconnectDelayMs?: number;
+  maxReconnectDelayMs?: number;
   onOpen?: () => void;
   onError?: (error: unknown) => void;
 }
@@ -90,13 +92,11 @@ export interface ChatStreamHandle {
  * or ``"chat_login_required"``), so the UI can show an actionable message
  * instead of a generic "stream unavailable".
  */
-export class ChatStreamError extends Error {
-  readonly status: number;
+export class ChatStreamError extends SseResponseError {
   readonly code?: string;
   constructor(status: number, code?: string) {
-    super(code ? `chat stream error ${status} (${code})` : `chat stream error ${status}`);
+    super(status, code ? `chat stream error ${status} (${code})` : `chat stream error ${status}`);
     this.name = "ChatStreamError";
-    this.status = status;
     this.code = code;
   }
 }
@@ -149,66 +149,56 @@ export function createChatStream(
     apiKey,
     fetchImpl = fetch,
     reconnectDelayMs = 1000,
+    maxReconnectDelayMs = 30_000,
     onOpen,
     onError
   } = options;
   const controller = new AbortController();
 
-  void (async () => {
-    while (!controller.signal.aborted) {
+  void runReconnectingSse({
+    signal: controller.signal,
+    reconnectDelayMs,
+    maxReconnectDelayMs,
+    onError,
+    connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
       const key = apiKey ?? getStoredApiKey();
       if (key) headers.set("X-API-Key", key);
-      try {
-        const response = await fetchImpl(`${baseUrl}/chat/stream`, {
-          headers,
-          signal: controller.signal
-        });
-        if (!response.ok) {
-          let code: string | undefined;
-          try {
-            const body = (await response.json()) as { error?: unknown };
-            if (typeof body?.error === "string") code = body.error;
-          } catch {
-            // non-JSON / empty error body — leave code undefined
-          }
-          throw new ChatStreamError(response.status, code);
+      const response = await fetchImpl(`${baseUrl}/chat/stream`, {
+        headers,
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        let code: string | undefined;
+        try {
+          const body = (await response.json()) as { error?: unknown };
+          if (typeof body?.error === "string") code = body.error;
+        } catch {
+          // non-JSON / empty error body — leave code undefined
         }
-        if (!response.body) throw new ChatStreamError(0, "no_response_body");
-        onOpen?.();
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (!controller.signal.aborted) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          buffer += decoder.decode(chunk.value, { stream: true });
-          const parts = buffer.split(/\r?\n\r?\n/);
-          buffer = parts.pop() ?? "";
-          for (const part of parts) dispatchSseBlock(part, onPayload);
-        }
-
-        buffer += decoder.decode();
-        if (buffer && !controller.signal.aborted) dispatchSseBlock(buffer, onPayload);
-      } catch (error) {
-        if (!controller.signal.aborted) onError?.(error);
-        // 401/403 are terminal: the credential can't open the chat stream, so
-        // retrying just re-sends the same rejection every reconnect tick (the
-        // per-second 403 spam an admin/master-key session produced before).
-        if (
-          error instanceof ChatStreamError &&
-          (error.status === 401 || error.status === 403)
-        ) {
-          return;
-        }
+        throw new ChatStreamError(response.status, code);
       }
-      if (!controller.signal.aborted) {
-        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs));
+      if (!response.body) throw new ChatStreamError(0, "no_response_body");
+      markConnected();
+      onOpen?.();
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (!controller.signal.aborted) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const parts = buffer.split(/\r?\n\r?\n/);
+        buffer = parts.pop() ?? "";
+        for (const part of parts) dispatchSseBlock(part, onPayload);
       }
+
+      buffer += decoder.decode();
+      if (buffer && !controller.signal.aborted) dispatchSseBlock(buffer, onPayload);
     }
-  })();
+  });
 
   return {
     close() {

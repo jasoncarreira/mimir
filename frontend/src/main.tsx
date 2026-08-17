@@ -46,6 +46,40 @@ import "./styles.css";
 
 
 const queryClient = new QueryClient();
+
+interface AppErrorBoundaryProps {
+  children: React.ReactNode;
+  title: string;
+}
+
+interface AppErrorBoundaryState {
+  error: Error | null;
+}
+
+export class AppErrorBoundary extends React.Component<AppErrorBoundaryProps, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("Dashboard render failed", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="ui-state ui-state--error" role="alert">
+          <h1>{this.props.title}</h1>
+          <p>{this.state.error.message || "An unexpected render error occurred."}</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const LazyWikiRoute = React.lazy(async () => {
   const module = await import("./routes/WikiRoute");
   return { default: module.WikiRoute };
@@ -433,15 +467,16 @@ function RoutePlaceholder({ surface }: { surface: DashboardSurface }) {
 }
 
 function SurfaceRoute({ surface }: { surface: DashboardSurface }) {
+  const { activeTab } = useRouteState(surface);
+  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
+  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
+
   if (surface.id === "state-memory") {
     return <StateMemoryRoute surface={surface} />;
   }
   if (surface.id === "chat") return <ChatRoute surface={surface} />;
 
-  const { activeTab } = useRouteState(surface);
   const normalizedTab = surface.tabs.includes(activeTab) ? activeTab : surface.tabs[0];
-  const detailsPanelOpen = useUiState((state) => state.detailsPanelOpen);
-  const setDetailsPanelOpen = useUiState((state) => state.setDetailsPanelOpen);
 
   if (surface.id === "saga") {
     return <SagaDashboard />;
@@ -506,11 +541,12 @@ function AppStatus() {
   );
 }
 
-function LoginScreen({ bootstrap, error, isError, isLoading }: {
+function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = false }: {
   bootstrap?: WebBootstrapData;
   error: Error | null;
   isError: boolean;
   isLoading: boolean;
+  reauthenticate?: boolean;
 }) {
   const [entry, setEntry] = React.useState("");
   const setApiKey = useSetApiKey();
@@ -529,7 +565,9 @@ function LoginScreen({ bootstrap, error, isError, isLoading }: {
         ) : (
           <>
             <p className="login-screen__subtitle">
-              Protected server on {host}. Enter your API key to continue.
+              {reauthenticate
+                ? "Your API key was rejected or revoked. Enter a valid key to re-authenticate."
+                : `Protected server on ${host}. Enter your API key to continue.`}
             </p>
             <form
               className="login-screen__form"
@@ -581,6 +619,33 @@ interface ShellProps {
 }
 
 // Routed surfaces — identical across shells; only the surrounding chrome differs.
+function DashboardRouteElement({ surface }: { surface: DashboardSurface }) {
+  const content = surface.id === "saga"
+    ? <SagaDashboard />
+    : surface.id === "usage"
+      ? <UsageRoute />
+      : surface.id === "ops"
+        ? <OpsRoute />
+        : surface.id === "chainlink-board"
+          ? <ChainlinkBoardRoute />
+          : surface.id === "factory-runs"
+            ? <FactoryRunsRoute surface={surface} />
+            : surface.id === "turns"
+              ? <TurnsRoute />
+              : surface.id === "admin-config"
+                ? <AdminRoute />
+                : surface.id === "scheduler"
+                  ? <SchedulerRoute />
+                  : surface.id === "wiki"
+                    ? (
+                      <Suspense fallback={<LoadingState label="Loading wiki" />}>
+                        <LazyWikiRoute surface={surface} />
+                      </Suspense>
+                    )
+                    : <SurfaceRoute surface={surface} />;
+  return <AppErrorBoundary title={`${surface.label} could not be rendered`}>{content}</AppErrorBoundary>;
+}
+
 function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[]; firstRoute: string }) {
   return (
     <Routes>
@@ -596,31 +661,7 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
       <Route element={<Navigate replace to="/admin?tab=mcp" />} path="/admin/mcp" />
       {surfaces.map((surface) => (
         <Route
-          element={
-            surface.id === "saga"
-              ? <SagaDashboard />
-              : surface.id === "usage"
-                ? <UsageRoute />
-                : surface.id === "ops"
-                  ? <OpsRoute />
-                  : surface.id === "chainlink-board"
-                  ? <ChainlinkBoardRoute />
-                  : surface.id === "factory-runs"
-                    ? <FactoryRunsRoute surface={surface} />
-                    : surface.id === "turns"
-                    ? <TurnsRoute />
-                    : surface.id === "admin-config"
-                      ? <AdminRoute />
-                        : surface.id === "scheduler"
-                          ? <SchedulerRoute />
-                          : surface.id === "wiki"
-                            ? (
-                              <Suspense fallback={<LoadingState label="Loading wiki" />}>
-                                <LazyWikiRoute surface={surface} />
-                              </Suspense>
-                            )
-                            : <SurfaceRoute surface={surface} />
-          }
+          element={<DashboardRouteElement surface={surface} />}
           key={surface.id}
           path={surface.path}
         />
@@ -711,10 +752,11 @@ function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isEr
   );
 }
 
-export function AppFrame() {
+function AppFrameContent() {
   const liveEvents = useLiveEvents();
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
+  const apiKeyRejected = useUiState((state) => state.apiKeyRejected);
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
   // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
   const { data: whoami } = useWhoami(signedIn);
@@ -743,9 +785,15 @@ export function AppFrame() {
 
   // Protected + not signed in (or still resolving the policy): show a focused
   // login screen instead of a dashboard full of 401 error panels.
-  if (isLoading || isError || !signedIn) {
+  if (isLoading || isError || !signedIn || apiKeyRejected) {
     return (
-      <LoginScreen bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
+      <LoginScreen
+        bootstrap={bootstrap}
+        error={error}
+        isError={isError}
+        isLoading={isLoading}
+        reauthenticate={apiKeyRejected}
+      />
     );
   }
 
@@ -762,6 +810,14 @@ export function AppFrame() {
     <SidebarShell {...shellProps} />
   ) : (
     <TopNavShell {...shellProps} />
+  );
+}
+
+export function AppFrame() {
+  return (
+    <AppErrorBoundary title="The dashboard could not be rendered">
+      <AppFrameContent />
+    </AppErrorBoundary>
   );
 }
 
@@ -806,15 +862,17 @@ const root = document.getElementById("root");
 if (root) {
   createRoot(root).render(
     <React.StrictMode>
-      <QueryClientProvider client={queryClient}>
-        <SkinProvider>
-          <BrowserRouter basename={appBasename()}>
-            <RoutedLiveEventsProvider>
-              <AppFrame />
-            </RoutedLiveEventsProvider>
-          </BrowserRouter>
-        </SkinProvider>
-      </QueryClientProvider>
+      <AppErrorBoundary title="The dashboard could not be started">
+        <QueryClientProvider client={queryClient}>
+          <SkinProvider>
+            <BrowserRouter basename={appBasename()}>
+              <RoutedLiveEventsProvider>
+                <AppFrame />
+              </RoutedLiveEventsProvider>
+            </BrowserRouter>
+          </SkinProvider>
+        </QueryClientProvider>
+      </AppErrorBoundary>
     </React.StrictMode>
   );
 }

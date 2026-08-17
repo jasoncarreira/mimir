@@ -20,6 +20,7 @@ from mimir._context import (
     active_turn_snapshots,
     get_only_active_turn,
     get_turn_by_saga_session_id,
+    resolve_active_ctx,
     reset_current_turn,
     set_current_turn,
 )
@@ -90,6 +91,25 @@ def test_get_turn_by_saga_session_id_finds_among_multiple():
         # Reset in reverse order so the contextvar token chain unwinds
         # cleanly (set_current_turn returns Tokens that must be reset
         # in stack order).
+        reset_current_turn(token_b)
+        reset_current_turn(token_a)
+
+
+def test_resolve_active_ctx_refuses_session_from_another_caller_channel():
+    ctx_a = _make_ctx("t-a", "saga-channel-a-100")
+    ctx_a.channel_id = "channel-a"
+    ctx_b = _make_ctx("t-b", "saga-channel-b-200")
+    ctx_b.channel_id = "channel-b"
+    token_a = set_current_turn(ctx_a)
+    token_b = set_current_turn(ctx_b)
+    try:
+        found, resolution = resolve_active_ctx(
+            {"session_id": ctx_b.saga_session_id},
+            caller_channel_id=ctx_a.channel_id,
+        )
+        assert found is None
+        assert resolution == "channel_mismatch"
+    finally:
         reset_current_turn(token_b)
         reset_current_turn(token_a)
 

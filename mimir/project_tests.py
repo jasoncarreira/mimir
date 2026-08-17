@@ -30,7 +30,8 @@ from .redaction import redact_text
 from .repo_tools import GitRefusal, RepoGitTools
 from .repository_config import RepositoryInventory
 from .worklink.backends.registry import WorklinkConfig
-from .worklink.worker_exec import WORKLINK_GID, WORKLINK_UID
+from .worklink.identities import get_identities
+from .worklink.worker_client import StaleWorkerExecutorError
 
 
 _TIMEOUT_SECONDS = 300.0
@@ -224,15 +225,17 @@ def _safe_output(
 
 
 def _worker_can_search(metadata: os.stat_result) -> bool:
+    identities = get_identities()
     mode = metadata.st_mode
-    if metadata.st_uid == WORKLINK_UID:
+    if metadata.st_uid == identities.worklink_uid:
         return bool(mode & stat.S_IXUSR)
-    if metadata.st_gid == WORKLINK_GID:
+    if metadata.st_gid == identities.worklink_gid:
         return bool(mode & stat.S_IXGRP)
     return bool(mode & stat.S_IXOTH)
 
 
 def _permission_diagnostic(path: Path) -> dict[str, object] | None:
+    identities = get_identities()
     absolute = Path(os.path.abspath(path))
     current = Path(absolute.anchor)
     diagnostic: dict[str, object] | None = None
@@ -248,8 +251,8 @@ def _permission_diagnostic(path: Path) -> dict[str, object] | None:
                 "path_mode": f"0o{stat.S_IMODE(metadata.st_mode):03o}",
                 "path_uid": metadata.st_uid,
                 "path_gid": metadata.st_gid,
-                "runner_effective_uid": WORKLINK_UID,
-                "runner_effective_gid": WORKLINK_GID,
+                "runner_effective_uid": identities.worklink_uid,
+                "runner_effective_gid": identities.worklink_gid,
                 "traversal_failed": redact_text(str(current)),
             }
     return diagnostic
@@ -395,6 +398,17 @@ class RepoProjectTests:
                     stderr_limit=self._output_limit,
                     scrubber=scrubber,
                 )
+            except StaleWorkerExecutorError as exc:
+                await safe_log_event(
+                    "repo_test_containment_refused",
+                    reason_code="stale_root_executor",
+                    repository=scope.canonical_repo,
+                    pull_request=scope.pr_number,
+                )
+                raise ProjectTestRefusal(
+                    "test_stale_root_executor",
+                    str(exc),
+                ) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 diagnostic = _permission_diagnostic_from_error(exc)
                 if diagnostic is not None:

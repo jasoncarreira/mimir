@@ -710,7 +710,6 @@ export function UsageRoute() {
           <Button disabled={query.isFetching} onClick={() => void query.refetch()} type="button">
             {query.isFetching ? "Refreshing" : "Refresh"}
           </Button>
-          <a className="ui-button ui-button--secondary ops-json-link" href={`/api/v1/ops?days=${validDays}`}>JSON</a>
         </form>
       </div>
       {query.isLoading ? <LoadingState label="Loading usage dashboard" /> : null}
@@ -763,7 +762,6 @@ export function OpsRoute() {
           <Button disabled={query.isFetching} onClick={() => void query.refetch()} type="button">
             {query.isFetching ? "Refreshing" : "Refresh"}
           </Button>
-          <a className="ui-button ui-button--secondary ops-json-link" href={`/api/v1/ops?days=${validDays}`}>JSON</a>
         </form>
       </div>
       {query.isLoading ? <LoadingState label="Loading ops dashboard" /> : null}

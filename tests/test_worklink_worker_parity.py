@@ -141,7 +141,7 @@ def spec(
 
 
 @pytest.mark.asyncio
-async def test_enabled_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
+async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_absolute(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     checkout = tmp_path / "checkouts" / ("a" * 64) / "1-1" / "checkout"
@@ -189,6 +189,12 @@ def test_fd_anchored_opencode_argv_passes_through_non_checkout_commands() -> Non
     command = ("python", "-c", "print('ok')")
 
     assert compute._fd_anchored_opencode_argv(command, checkout) == command
+
+
+def test_fd_anchored_opencode_argv_accepts_relative_issued_checkout() -> None:
+    command = ("opencode", "run", "--dir", ".", "--", "prompt")
+
+    assert compute._fd_anchored_opencode_argv(command, Path("/authorized")) == command
 
 
 def test_fd_anchored_opencode_argv_rejects_a_different_checkout() -> None:
@@ -276,6 +282,51 @@ async def run_direct(
     result = await backend.wait(handle, timeout)
     await backend.cleanup(handle)
     return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["timeout", "overflow"])
+async def test_direct_termination_kills_pipe_holding_grandchild(
+    monkeypatch: pytest.MonkeyPatch, trigger: str
+) -> None:
+    original_terminate = worker_exec._terminate_process_group_pid
+    signals: list[int] = []
+    original_killpg = os.killpg
+
+    def expedited_terminate(process_group: int, timeout_s: float = 5.0) -> None:
+        original_terminate(process_group, 0.05)
+
+    def observed_killpg(process_group: int, sig: int) -> None:
+        signals.append(sig)
+        original_killpg(process_group, sig)
+
+    monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", expedited_terminate)
+    monkeypatch.setattr(worker_exec.os, "killpg", observed_killpg)
+    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    if trigger == "overflow":
+        monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
+    output = "overflow" if trigger == "overflow" else "ready"
+    source = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)']); "
+        "time.sleep(.1); "
+        f"print({output!r},flush=True); "
+        "time.sleep(30)"
+    )
+    backend = LocalSubprocessComputeBackend()
+    handle = await backend.launch(direct_spec(source))
+
+    result = await asyncio.wait_for(
+        # Let the source pass its 100ms startup delay so the grandchild owns
+        # the SIGTERM-ignore state this assertion is intended to exercise.
+        backend.wait(handle, 0.2 if trigger == "timeout" else 2), timeout=3
+    )
+    await backend.cleanup(handle)
+
+    assert result.timed_out is (trigger == "timeout")
+    assert result.output_overflow is (trigger == "overflow")
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
 
 
 @pytest.mark.asyncio
@@ -474,7 +525,12 @@ async def test_closed_worker_direct_parity_inventory(
         worker_exec._jobs.pop(handle.identifier, None)
         assert authorization.verifications == 1
         assert sent == [
-            {"version": 1, "op": "cancel", "id": handle.identifier}
+            {
+                "version": 1,
+                "op": "cancel",
+                "id": handle.identifier,
+                "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+            }
         ]
         assert socket_events == [
             "socket",
@@ -588,8 +644,12 @@ async def test_closed_worker_direct_parity_inventory(
 
         monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
         direct_backend = LocalSubprocessComputeBackend()
+        direct_ready = tmp_path / "direct-one-ready"
         direct_first = await direct_backend.launch(
-            direct_spec("import time; print('direct one',flush=True); time.sleep(30)")
+            direct_spec(
+                "import pathlib,time; print('direct one',flush=True); "
+                f"pathlib.Path({str(direct_ready)!r}).touch(); time.sleep(30)"
+            )
         )
         direct_second = await direct_backend.launch(direct_spec("print('direct two')"))
         assert direct_first.identifier != direct_second.identifier
@@ -608,6 +668,11 @@ async def test_closed_worker_direct_parity_inventory(
         assert direct_first.identifier in direct_backend._jobs
         assert direct_second.identifier in direct_backend._jobs
         direct_second_result = await direct_backend.wait(direct_second, 2)
+        for _ in range(200):
+            if direct_ready.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert direct_ready.exists()
         await direct_backend.cancel(direct_first)
         direct_first_result = await direct_backend.wait(direct_first, 2)
         await direct_backend.cleanup(direct_first)

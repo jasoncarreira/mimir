@@ -15,6 +15,7 @@ Tools already covered in other files and NOT re-tested here:
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ from typing import Any, Optional
 
 from langchain.tools import ToolRuntime
 import pytest
+
+import mimir.tools.registry as registry
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.commitments.models import (
@@ -994,6 +997,41 @@ class TestReloadPollers:
 
 
 class TestSetPollerOverrides:
+    def test_atomic_write_does_not_close_fd_after_fdopen_owns_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        created_fd: list[int] = []
+        explicit_closes: list[int] = []
+        real_mkstemp = registry.tempfile.mkstemp
+        real_close = registry.os.close
+
+        def tracked_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
+            fd, name = real_mkstemp(*args, **kwargs)
+            created_fd.append(fd)
+            return fd, name
+
+        def tracked_close(fd: int) -> None:
+            explicit_closes.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(registry.tempfile, "mkstemp", tracked_mkstemp)
+        monkeypatch.setattr(registry.os, "close", tracked_close)
+        monkeypatch.setattr(
+            registry.os,
+            "fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")),
+        )
+
+        destination = tmp_path / "config.txt"
+        with pytest.raises(OSError, match="fsync failed"):
+            registry._atomic_write_text(destination, "value")
+
+        assert created_fd[0] not in explicit_closes
+        with pytest.raises(OSError):
+            os.fstat(created_fd[0])
+        assert not destination.exists()
+        assert list(tmp_path.iterdir()) == []
+
     @pytest.mark.asyncio
     async def test_no_scheduler_returns_error(self) -> None:
         _STATE["scheduler"] = None

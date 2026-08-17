@@ -306,6 +306,8 @@ class SessionManager:
                 self._fire_idle(session.saga_session_id, session.channel_id)
             )
             session.idle_handle = task
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
 
         return loop.call_later(self._idle_seconds, _on_timer_fired)
 

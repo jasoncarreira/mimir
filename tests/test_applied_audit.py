@@ -65,7 +65,7 @@ def test_mark_applied_moves_section_and_appends_log(tmp_path: Path):
     """)
     log = tmp_path / "state" / "applied-proposals.jsonl"
 
-    proposal = mark_applied(pc, log, "split persona", now=NOW)
+    proposal = mark_applied(pc, log, "2026-04-12 — split persona block", now=NOW)
 
     assert "split persona" in proposal.id
     assert proposal.applied_at == NOW.isoformat()
@@ -122,7 +122,7 @@ def test_inner_heading_in_proposal_body_not_split(tmp_path: Path):
     assert len(pending) == 1
     assert "split persona block" in pending[0][1]
 
-    mark_applied(pc, log, "split persona", now=NOW)
+    mark_applied(pc, log, "2026-04-12 — split persona block", now=NOW)
     new_body = pc.read_text()
     pending_idx = new_body.find("## Pending")
     applied_idx = new_body.find("## Applied")
@@ -194,7 +194,9 @@ def test_mark_applied_fence_aware_ignores_inner_headings(tmp_path: Path):
     """)
     log = tmp_path / "state" / "applied-proposals.jsonl"
 
-    proposal = mark_applied(pc, log, "source-frame uncritical", now=NOW)
+    proposal = mark_applied(
+        pc, log, "2026-05-09 — add non-goal: source-frame uncritical", now=NOW
+    )
 
     # The matched id must be the outer entry's full heading, not the
     # inner fenced-block heading.
@@ -234,9 +236,83 @@ def test_mark_applied_creates_applied_section_when_missing(tmp_path: Path):
         Proposal: y
     """)
     log = tmp_path / "state" / "applied-proposals.jsonl"
-    mark_applied(pc, log, "split persona", now=NOW)
+    mark_applied(pc, log, "2026-04-12 — split persona block", now=NOW)
     body = pc.read_text()
     assert "## Applied" in body
+
+
+def test_mark_applied_audit_append_failure_leaves_proposal_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+# Proposed Changes
+
+## Pending
+
+## 2026-05-01 — proposal alpha
+Proposal: Alpha change.
+
+## Applied
+
+## Rejected
+""")
+    original = pc.read_text()
+    log = tmp_path / "state" / "applied-proposals.jsonl"
+    real_open = Path.open
+
+    def fail_log_append(path: Path, mode: str = "r", *args, **kwargs):
+        if path == log and mode == "a":
+            raise OSError("audit log is read-only")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_log_append)
+
+    with pytest.raises(OSError, match="read-only"):
+        mark_applied(pc, log, "2026-05-01 — proposal alpha", now=NOW)
+
+    assert pc.read_text() == original
+    assert _list_pending_proposals(pc)[0][1] == "2026-05-01 — proposal alpha"
+
+
+def test_proposal_rewrite_is_atomic_and_preserves_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import os
+    import stat
+
+    from mimir.reflection import applied_audit
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+# Proposed Changes
+
+## Pending
+
+## 2026-05-02 — proposal beta
+Proposal: Beta change.
+
+## Applied
+
+## Rejected
+""")
+    os.chmod(pc, 0o640)
+    original = pc.read_text()
+    real_replace = os.replace
+
+    def fail_replace(src: Path, dst: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(applied_audit.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failure"):
+        mark_reject(pc, "2026-05-02 — proposal beta", "not now", now=NOW)
+
+    assert pc.read_text() == original
+    assert pc.with_suffix(".md.tmp").is_file()
+
+    monkeypatch.setattr(applied_audit.os, "replace", real_replace)
+    mark_reject(pc, "2026-05-02 — proposal beta", "not now", now=NOW)
+    assert stat.S_IMODE(pc.stat().st_mode) == 0o640
 
 
 # ─── load_applied_proposals ─────────────────────────────────────────────
@@ -929,7 +1005,9 @@ def test_mark_reject_moves_to_rejected_with_reason(tmp_path: Path):
     pc = tmp_path / "state" / "proposed-changes.md"
     _seed_proposed_changes(pc, _FOUR_PROPOSAL_DOC)
 
-    heading = mark_reject(pc, "proposal beta", "not a priority", now=NOW)
+    heading = mark_reject(
+        pc, "2026-05-02 — proposal beta", "not a priority", now=NOW
+    )
 
     assert "beta" in heading
     body = pc.read_text()
@@ -960,7 +1038,7 @@ Proposal: Alpha.
 ## Applied
 """)
 
-    mark_reject(pc, "alpha", "no thanks", now=NOW)
+    mark_reject(pc, "2026-05-01 — alpha proposal", "no thanks", now=NOW)
 
     body = pc.read_text()
     assert "## Rejected" in body
@@ -982,7 +1060,7 @@ Proposal: Gamma.
 ## Rejected
 """)
 
-    mark_reject(pc, "gamma", "", now=NOW)
+    mark_reject(pc, "2026-05-01 — gamma proposal", "", now=NOW)
 
     body = pc.read_text()
     assert "operator declined" in body
@@ -1020,6 +1098,79 @@ def test_parse_resolve_string_mixed_accept_reject():
 
 
 # ─── resolve CLI integration ────────────────────────────────────────────
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_resolve_cli_uses_exact_snapshot_heading_for_prefixes(
+    tmp_path: Path, capsys, action: str
+):
+    from mimir.cli import main as _main
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, """\
+# Proposed Changes
+
+## Pending
+
+## 2026-08-01 -- split persona block into two
+Proposal: First.
+Predicted effect: First effect.
+
+## 2026-08-01 -- split persona block
+Proposal: Second.
+Predicted effect: Second effect.
+
+## Applied
+
+## Rejected
+""")
+    decision = "accept 2" if action == "accept" else "reject 2 'not now'"
+
+    with pytest.raises(SystemExit) as exc_info:
+        _main(["reflection", "resolve", "--home", str(tmp_path), decision])
+
+    assert exc_info.value.code == 0
+    assert _list_pending_proposals(pc) == [
+        (1, "2026-08-01 -- split persona block into two", "Proposal: First.")
+    ]
+    if action == "accept":
+        records = load_applied_proposals(
+            tmp_path / "state" / "applied-proposals.jsonl"
+        )
+        assert [record.id for record in records] == [
+            "2026-08-01 -- split persona block"
+        ]
+    else:
+        assert "not now" in pc.read_text()
+    result_label = "Applied" if action == "accept" else "Rejected"
+    assert f"{result_label}: 2" in capsys.readouterr().out
+
+
+def test_resolve_cli_handles_oserror_and_continues_batch(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+):
+    from mimir.cli import main as _main
+    from mimir.reflection import applied_audit
+
+    pc = tmp_path / "state" / "proposed-changes.md"
+    _seed_proposed_changes(pc, _FOUR_PROPOSAL_DOC)
+    def fail_first_apply(*args, **kwargs):
+        raise OSError("audit append failed")
+
+    monkeypatch.setattr(applied_audit, "mark_applied", fail_first_apply)
+    with pytest.raises(SystemExit) as exc_info:
+        _main([
+            "reflection", "resolve", "--home", str(tmp_path),
+            "accept 1 / reject 2 'not now'",
+        ])
+    assert exc_info.value.code == 0
+    assert [heading for _, heading, _ in _list_pending_proposals(pc)] == [
+        "2026-05-01 — proposal alpha",
+        "2026-05-03 — proposal gamma",
+        "2026-05-04 — proposal delta",
+    ]
+    output = capsys.readouterr().out
+    assert "Rejected: 2 ('not now')." in output
+    assert "1 ('2026-05-01 — proposal alpha'): audit append failed" in output
 
 def test_resolve_cli_mixed_apply_and_reject(tmp_path: Path, capsys):
     """resolve: pure accept 1 3 + reject 2 on a 4-proposal file."""

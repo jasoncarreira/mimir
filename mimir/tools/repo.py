@@ -186,7 +186,8 @@ def repo_checkout(
             review_state=state,
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ToolPolicyRefusal(f"repository checkout rejected: {exc}") from exc
+        detail = _redact_git_output(str(exc))
+        raise ToolPolicyRefusal(f"repository checkout rejected: {detail}") from exc
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),
@@ -210,7 +211,8 @@ def repo_cleanup(
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ToolPolicyRefusal(f"repository cleanup rejected: {exc}") from exc
+        detail = _redact_git_output(str(exc))
+        raise ToolPolicyRefusal(f"repository cleanup rejected: {detail}") from exc
     return {"status": "cleaned", "removed": removed, "scope_id": state.action_scope.scope_id}
 
 

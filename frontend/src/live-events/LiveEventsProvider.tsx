@@ -1,6 +1,8 @@
 import React from "react";
 import { createLiveEventStream, type LiveEventStreamItem } from "../api/live-events";
 import type { TurnRecord } from "../api/generated/contracts";
+import { isAuthenticationSseError } from "../api/sse-reconnect";
+import { useUiState } from "../uiState";
 
 type QueryKey = readonly unknown[];
 
@@ -17,7 +19,7 @@ export interface LiveEventsCachePolicy {
 }
 
 export interface LiveEventsContextValue {
-  status: "connecting" | "open" | "error" | "closed";
+  status: "connecting" | "open" | "error" | "reauthenticate" | "closed";
   cursor: string;
   lastEvent: LiveEventStreamItem | null;
   error: unknown;
@@ -85,6 +87,7 @@ export function LiveEventsProvider({
       setValue((current) => ({ ...current, status: "closed" }));
       return;
     }
+    setValue((current) => ({ ...current, status: "connecting", error: null }));
 
     const flushAggregateInvalidations = () => {
       invalidateTimer.current = null;
@@ -133,7 +136,15 @@ export function LiveEventsProvider({
         initialCursor,
         onOpen: () => setValue((current) => ({ ...current, status: "open", error: null })),
         onCursor: (cursor) => setValue((current) => ({ ...current, cursor })),
-        onError: (error) => setValue((current) => ({ ...current, status: "error", error }))
+        onError: (error) => {
+          const reauthenticate = isAuthenticationSseError(error);
+          if (reauthenticate) useUiState.getState().setApiKeyRejected(true);
+          setValue((current) => ({
+            ...current,
+            status: reauthenticate ? "reauthenticate" : "error",
+            error
+          }));
+        }
       }
     );
 
@@ -156,4 +167,3 @@ export function useLiveEvents(): LiveEventsContextValue {
   if (!value) throw new Error("LiveEventsProvider missing");
   return value;
 }
-

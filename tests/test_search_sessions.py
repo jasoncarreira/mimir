@@ -383,8 +383,8 @@ async def test_migration_v5_clears_atom_topics_before_deleting_boundaries(
     now = "2026-05-19T00:00:00+00:00"
     conn.executescript(f"""
         BEGIN;
-        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
-            VALUES ('boundary-1', 'session ended', 'h1', 'session_boundary', 'default', '{now}');
+        INSERT INTO atoms (id, content, content_hash, source_type, agent_id, session_id, created_at)
+            VALUES ('boundary-1', 'session ended', 'h1', 'session_boundary', 'default', 'sess-1', '{now}');
         INSERT INTO atoms (id, content, content_hash, source_type, agent_id, created_at)
             VALUES ('raw-1',      'normal atom',  'h2', 'conversation',     'default', '{now}');
         INSERT INTO sessions (id, channel_id, started_at, ended_at, summary, reflected_at)

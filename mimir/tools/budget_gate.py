@@ -571,6 +571,24 @@ def _duplicate_review_result(request: ToolCallRequest, claim: Any) -> ToolMessag
     )
 
 
+async def _claim_review_submission_async(claim: Callable[[], Any]) -> Any:
+    """Keep ownership of a thread-acquired claim when the caller is cancelled."""
+    task = asyncio.create_task(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def release_late_claim(completed: asyncio.Task[Any]) -> None:
+            try:
+                late_claim = completed.result()
+            except BaseException:
+                return
+            if late_claim is not None:
+                late_claim.release()
+
+        task.add_done_callback(release_late_claim)
+        raise
+
+
 def _record_repo_review_checkout(
     request: ToolCallRequest, auth_context: AuthContext | None, *, failed: bool,
 ) -> None:
@@ -602,7 +620,9 @@ def _resolve_service_shell_cwd(raw_cwd: object) -> tuple[str | None, str | None]
     from ..read_policy import configured_non_admin_read_roots
 
     if raw_cwd is None:
-        # Preserve the existing ambient/sticky cwd when the caller omits cwd.
+        # Keep cwd omitted. Direct service execution deliberately bypasses
+        # interactive per-session cwd; configured project/Chainlink commands
+        # are assigned their server-authorized cwd by their branches below.
         return None, None
     if not isinstance(raw_cwd, str) or not raw_cwd.strip() or "\x00" in raw_cwd:
         return None, "working directory must be a non-empty absolute path"
@@ -1693,8 +1713,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
+        authorization = None
         for target_channel in target_channels:
-            authorization, admin_denial = _authorize_tool_call(
+            target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
                 target_channel,
@@ -1702,6 +1723,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 getattr(request, "tool", None),
                 validated_arguments,
             )
+            if authorization is None:
+                # The first target is the operation target; later targets are
+                # additional writable destinations that must also be admitted.
+                authorization = target_authorization
             if admin_denial is not None:
                 break
         if admin_denial is not None:
@@ -1858,31 +1883,35 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        if (
-            tool_name in {"shell_exec", "bash_async"}
-            and isinstance(direct_argv, list)
-        ):
-            from ._shell_env import bind_direct_exec_argv
-
-            direct_argv_token = bind_direct_exec_argv(direct_argv)
-        from ..access_control import (
-            begin_protected_result_capture,
-            end_protected_result_capture,
-        )
-
-        capture_token = begin_protected_result_capture()
+        capture_token = None
+        provenance = None
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-            tool_name, auth_context, _extract_sink_target(request, auth_context),
-        )
-        if authorized_fetch_urls is not None:
-            from .web import begin_authorized_fetch
-
-            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
+            if (
+                tool_name in {"shell_exec", "bash_async"}
+                and isinstance(direct_argv, list)
+            ):
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(direct_argv)
+            from ..access_control import (
+                begin_protected_result_capture,
+                end_protected_result_capture,
+            )
+
+            capture_token = begin_protected_result_capture()
+            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, _extract_sink_target(request, auth_context),
+            )
+            if authorized_fetch_urls is not None:
+                from .web import begin_authorized_fetch
+
+                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
             result = handler(execution_request)
         except ToolException as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -1905,7 +1934,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -1933,7 +1964,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
-        provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)
@@ -1997,8 +2029,9 @@ class BudgetGateMiddleware(AgentMiddleware):
         target_channels = _extract_sink_targets(request, auth_context)
         ifc_labels = _current_ifc_labels(auth_context)
 
+        authorization = None
         for target_channel in target_channels:
-            authorization, admin_denial = _authorize_tool_call(
+            target_authorization, admin_denial = _authorize_tool_call(
                 tool_name,
                 auth_context,
                 target_channel,
@@ -2006,6 +2039,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 getattr(request, "tool", None),
                 validated_arguments,
             )
+            if authorization is None:
+                # The first target is the operation target; later targets are
+                # additional writable destinations that must also be admitted.
+                authorization = target_authorization
             if admin_denial is not None:
                 break
         if admin_denial is not None:
@@ -2143,7 +2180,9 @@ class BudgetGateMiddleware(AgentMiddleware):
 
         review_spec = review_submission_from_request(execution_request)
         review_claim = (
-            await asyncio.to_thread(claim_review_submission, review_spec)
+            await _claim_review_submission_async(
+                lambda: claim_review_submission(review_spec)
+            )
             if review_spec is not None
             else None
         )
@@ -2168,31 +2207,35 @@ class BudgetGateMiddleware(AgentMiddleware):
                 name=tool_name,
                 status="error",
             )
-        if (
-            tool_name in {"shell_exec", "bash_async"}
-            and isinstance(direct_argv, list)
-        ):
-            from ._shell_env import bind_direct_exec_argv
-
-            direct_argv_token = bind_direct_exec_argv(direct_argv)
-        from ..access_control import (
-            begin_protected_result_capture,
-            end_protected_result_capture,
-        )
-
-        capture_token = begin_protected_result_capture()
+        capture_token = None
+        provenance = None
         fetch_token = None
-        authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-            tool_name, auth_context, _extract_sink_target(request, auth_context),
-        )
-        if authorized_fetch_urls is not None:
-            from .web import begin_authorized_fetch
-
-            fetch_token = begin_authorized_fetch(authorized_fetch_urls)
         try:
+            if (
+                tool_name in {"shell_exec", "bash_async"}
+                and isinstance(direct_argv, list)
+            ):
+                from ._shell_env import bind_direct_exec_argv
+
+                direct_argv_token = bind_direct_exec_argv(direct_argv)
+            from ..access_control import (
+                begin_protected_result_capture,
+                end_protected_result_capture,
+            )
+
+            capture_token = begin_protected_result_capture()
+            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, _extract_sink_target(request, auth_context),
+            )
+            if authorized_fetch_urls is not None:
+                from .web import begin_authorized_fetch
+
+                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
             result = await handler(execution_request)
         except ToolException as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             if isinstance(exc, ToolPolicyRefusal):
                 _record_tool_outcome(tool_name, refused_reason=str(exc))
             else:
@@ -2215,7 +2258,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             )
             return _tool_refusal_message(request, tool_name, exc)
         except Exception as exc:
-            provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
+                capture_token = None
             result_labels = _result_labels_for_call(
                 tool_name,
                 request,
@@ -2243,7 +2288,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
-        provenance = end_protected_result_capture(capture_token)
+            if capture_token is not None:
+                provenance = end_protected_result_capture(capture_token)
         is_error = _result_is_error(result)
         if not is_error:
             _record_tool_outcome(tool_name)

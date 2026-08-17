@@ -68,17 +68,18 @@ def create_request(
     tool_name: str,
     target: str,
     requesting_principal: str | None,
+    sink_category: str | None = None,
     now: float | None = None,
     turn_id: str | None = None,
-    sink_category: str | None = None,
     request_carrier: "InformationFlowLabels | None" = None,
     ifc_state: "InformationFlowState | None" = None,
     request_source_arrival_ordinal: int | None = None,
 ) -> tuple[ApprovalRequest | None, str]:
-    """Create one pending request for an active operator channel."""
+    """Create one category-bound request for an active operator channel."""
     now = time.monotonic() if now is None else now
-    if sink_category is not None and (
-        not turn_id
+    if (
+        not sink_category
+        or not turn_id
         or not requesting_principal
         or request_carrier is None
         or ifc_state is None
@@ -124,22 +125,6 @@ def pending_request(channel_id: str, *, now: float | None = None) -> ApprovalReq
         return _PENDING.get(channel_id)
 
 
-def recorded_grant(
-    channel_id: str, tool_name: str, target: str, *, now: float | None = None,
-) -> ApprovalGrant | None:
-    """Return the exact unconsumed grant, if one exists."""
-    now = time.monotonic() if now is None else now
-    with _LOCK:
-        _discard_expired_locked(now)
-        return next((
-            grant
-            for grant in _GRANTS.values()
-            if grant.channel_id == channel_id
-            and grant.tool_name == tool_name
-            and grant.target == target
-        ), None)
-
-
 def consume_grant(
     channel_id: str,
     tool_name: str,
@@ -171,8 +156,6 @@ def consume_grant(
         if grant_id is None:
             return None
         taken = _GRANTS.pop(grant_id)
-        if taken.sink_category is None:
-            return taken
         matches = (
             channel_id == taken.channel_id
             and tool_name == taken.tool_name
@@ -221,7 +204,7 @@ def record_authenticated_response(
         canonical = resolver.resolve(event.author) if resolver is not None else None
         if not canonical:
             return "unauthenticated_operator"
-        if request.sink_category is not None and reply_source is None:
+        if reply_source is None:
             return "invalid_category_response_binding"
         _GRANTS[request.request_id] = ApprovalGrant(
             request_id=request.request_id,
@@ -272,3 +255,6 @@ def _discard_expired_locked(now: float) -> None:
     for channel_id, request in tuple(_PENDING.items()):
         if request.expires_at <= now:
             _PENDING.pop(channel_id, None)
+    for request_id, grant in tuple(_GRANTS.items()):
+        if grant.request_expires_at is not None and grant.request_expires_at <= now:
+            _GRANTS.pop(request_id, None)

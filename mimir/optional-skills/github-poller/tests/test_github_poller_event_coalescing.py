@@ -479,6 +479,11 @@ def test_main_threads_one_per_repo_coalescing_set_and_persists_retry(
         "_check_own_mergeability",
         lambda *args, **kwargs: (0, {}),
     )
+    monkeypatch.setattr(
+        poller,
+        "_check_pr_ci_failures",
+        lambda *args, **kwargs: (0, {}),
+    )
     monkeypatch.setattr(poller, "_emit", lambda prompt, **extras: emitted.append(extras))
 
     def fake_api(endpoint: str, token: str):

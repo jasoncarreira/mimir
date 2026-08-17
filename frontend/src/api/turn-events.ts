@@ -1,5 +1,6 @@
 import { buildQuery, getStoredApiKey } from "./http";
 import type { TurnStreamEvent } from "./generated/contracts";
+import { runReconnectingSse, SseResponseError } from "./sse-reconnect";
 
 export type { TurnStreamEvent };
 
@@ -14,6 +15,7 @@ export interface TurnEventStreamOptions {
   /** Subscribe to one channel (e.g. "web-default"); omit for all channels. */
   channel?: string;
   reconnectDelayMs?: number;
+  maxReconnectDelayMs?: number;
   onOpen?: () => void;
   onError?: (error: unknown) => void;
 }
@@ -68,32 +70,32 @@ export function createTurnEventStream(
     fetchImpl = fetch,
     channel,
     reconnectDelayMs = 1000,
+    maxReconnectDelayMs = 30_000,
     onOpen,
     onError
   } = options;
   const controller = new AbortController();
 
-  void (async () => {
-    while (!controller.signal.aborted) {
+  void runReconnectingSse({
+    signal: controller.signal,
+    reconnectDelayMs,
+    maxReconnectDelayMs,
+    onError,
+    connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
       const key = apiKey ?? getStoredApiKey();
       if (key) headers.set("X-API-Key", key);
-      try {
-        const response = await fetchImpl(
-          `${baseUrl}/api/v1/turn-events${buildQuery({ channel })}`,
-          { headers, signal: controller.signal }
-        );
-        if (!response.ok) throw response;
-        onOpen?.();
-        await readSse(response, controller.signal, onEvent);
-      } catch (error) {
-        if (!controller.signal.aborted) onError?.(error);
-      }
-      if (!controller.signal.aborted) {
-        await new Promise((resolve) => setTimeout(resolve, reconnectDelayMs));
-      }
+      const response = await fetchImpl(
+        `${baseUrl}/api/v1/turn-events${buildQuery({ channel })}`,
+        { headers, signal: controller.signal }
+      );
+      if (!response.ok) throw new SseResponseError(response.status);
+      if (!response.body) throw new Error("turn-events response body missing");
+      markConnected();
+      onOpen?.();
+      await readSse(response, controller.signal, onEvent);
     }
-  })();
+  });
 
   return {
     close() {
