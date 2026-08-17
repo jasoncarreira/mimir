@@ -46,22 +46,31 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # quote style because a backreference for the quote character would push
     # the group count past two, which ``redact_text`` uses to decide whether
     # the prefix is preserved.
-    # The value runs to the TRUE closing delimiter, so an embedded quote does
-    # not end it early. ``{"password": "correct \"horse\" battery staple"}``
-    # stopped at the first escape and persisted the rest, which reads as
-    # redacted. Escapes are consumed as units; the alternations are
-    # non-capturing so the group count stays at two.
+    # Double quotes: JSON and YAML both escape with a backslash, and YAML also
+    # allows a backslash before a physical newline as a line continuation, so an
+    # escape consumes ANY next character.
+    #
+    # Two guards keep an UNTERMINATED quote from consuming the rest of the log,
+    # and they are deliberately redundant: the excluded raw newline bounds a
+    # match to its own line, and the lookahead additionally requires a real
+    # closing delimiter. Removing either alone changes nothing; removing both
+    # lets ``password: "abc`` swallow every following line.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(\"?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"\"?[ \t]*:[ \t]*\")((?:\\.|[^\"\\])*)"
+        r"\"?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
     ),
-    # Single quotes carry two escape conventions: Python-repr ``\'`` and YAML's
-    # doubled ``''``. Both must be consumed or the value ends at the first one.
+    # Single quotes follow YAML: a backslash is LITERAL and ``''`` is the only
+    # escape. That choice is what prevents erasure here — with a ``\.`` escape
+    # in the value class, ``password: 'ends in \'`` consumed the real closing
+    # quote and then every following line. Nothing can now skip past a quote, so
+    # a match always ends at one. Python only emits ``\'`` for a value holding
+    # both quote styles (it switches to double quotes otherwise), so the YAML
+    # reading costs a rare corner case and buys back the erasure.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"'?[ \t]*:[ \t]*')((?:''|\\.|[^'\\])*)"
+        r"'?[ \t]*:[ \t]*')((?:''|[^'\n])*)(?=')"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
     # block scalar's body is delimited by indentation relative to its own

@@ -111,15 +111,64 @@ def test_quoted_credential_is_masked_through_the_closing_quote(
             '{"password":"correct \\"horse\\" battery staple"}',
             '{"password":"[REDACTED]"}',
         ),
-        ("password: 'can\\'t share this'", "password: '[REDACTED]'"),
         ("password: 'can''t share this'", "password: '[REDACTED]'"),
         ('{"api_key":"ends with \\\\"}', '{"api_key":"[REDACTED]"}'),
+        # YAML escapes a physical line break with a backslash; the value
+        # continues onto the next line and must be masked whole.
+        (
+            'password: "first-part\\\n  second-part"',
+            'password: "[REDACTED]"',
+        ),
     ],
 )
 def test_quoted_credential_survives_embedded_quote_escapes(
     text: str, expected: str
 ) -> None:
     assert redact_text(text) == expected
+
+
+# A match must reach a real closing delimiter. Without that requirement an
+# unterminated quote consumes the rest of the input, erasing durable context —
+# a worse outcome than not matching, because the record of what happened is
+# what disappears.
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password: "abc\nnext: must-survive\n',
+        "password: 'abc\nnext: must-survive\n",
+        # Valid YAML whose value ends in a LITERAL backslash: a backslash is not
+        # an escape inside a single-quoted scalar, so the quote that follows is
+        # the real closing delimiter and the next line is not part of the value.
+        "password: 'ends in \\'\nnext: must-survive\n",
+    ],
+)
+def test_unterminated_or_literal_backslash_quote_does_not_eat_context(
+    text: str,
+) -> None:
+    out = redact_text(text)
+
+    assert "next: must-survive" in out
+
+
+def test_single_quoted_values_follow_yaml_escaping_not_python_repr() -> None:
+    """Documents a deliberate trade-off, so it is visible rather than latent.
+
+    A backslash is literal inside a YAML single-quoted scalar and ``''`` is the
+    only escape. Reading ``\\'`` as a Python-repr escape instead made
+    ``password: 'ends in \\'`` swallow the true closing quote and every
+    following line. Python only emits ``\\'`` for a value containing BOTH quote
+    styles — it switches to double quotes otherwise — so the YAML reading costs
+    a rare corner case and buys back the erasure.
+    """
+    both_styles = redact_text("password: 'has \\' and \" both'")
+
+    # The corner case is masked only up to the backslash — a known, bounded gap.
+    assert both_styles.startswith("password: '[REDACTED]'")
+    # The shape Python actually produces for an apostrophe is double-quoted,
+    # and that is masked completely.
+    assert redact_text('{"password": "can\'t share this"}') == (
+        '{"password": "[REDACTED]"}'
+    )
 
 
 # The block indicator is NOT a value. Masking it would print
