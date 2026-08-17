@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS = 10.0
+GITHUB_IDENTITY_RETRY_INTERVAL_SECONDS = 60.0
+GITHUB_IDENTITY_TRANSIENT_ALERT_ATTEMPTS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,25 +159,39 @@ async def create_agent_runtime(
 
         from .tools import all_mimir_tools
         from .tools.forge import (
+            github_identity_recovery_pending,
             initialize_github_forge_identity,
             set_github_identity_degraded_callback,
         )
 
         degradation_recorded = False
         degradation_alert_scheduled = False
+        transient_failures = 0
+        next_identity_retry_at = 0.0
+        runtime_loop = asyncio.get_running_loop()
 
         def github_identity_degraded(exc: Exception) -> None:
             nonlocal degradation_recorded, degradation_alert_scheduled
+            nonlocal transient_failures, next_identity_retry_at
             from .event_logger import log_event, log_event_sync
+            from .forge.github import GitHubIdentityFailureKind
 
             declared_login = getattr(exc, "declared_login", "")
             authenticated_login = getattr(exc, "authenticated_login", "")
+            transient = (
+                getattr(exc, "failure_kind", None)
+                == GitHubIdentityFailureKind.TRANSIENT
+            )
+            if transient:
+                transient_failures += 1
+                next_identity_retry_at = time.monotonic() + GITHUB_IDENTITY_RETRY_INTERVAL_SECONDS
             if not degradation_recorded:
                 degradation_recorded = True
                 log.warning(
-                    "github_identity_degraded: authenticated=%r declared=%r — coding disabled until restart",
+                    "github_identity_degraded: authenticated=%r declared=%r; coding disabled%s",
                     authenticated_login or "unknown",
                     declared_login or "unknown",
+                    " pending forge recovery" if transient else " until restart",
                 )
                 log_event_sync(
                     "github_identity_degraded",
@@ -183,13 +200,21 @@ async def create_agent_runtime(
                     reason=str(exc),
                 )
             alert_channel = (config.operator_alert_channel or "").strip()
-            if not alert_channel or degradation_alert_scheduled:
+            if (
+                not alert_channel
+                or degradation_alert_scheduled
+                or (transient and transient_failures < GITHUB_IDENTITY_TRANSIENT_ALERT_ATTEMPTS)
+            ):
                 return
             degradation_alert_scheduled = True
             text = (
-                "GitHub identity verification failed; coding capability is disabled until "
-                "the process is restarted with corrected credentials. "
-                f"Authenticated login: {authenticated_login or 'unknown'}; "
+                "GitHub identity verification failed; coding capability is disabled"
+                + (
+                    " while the forge remains unavailable. "
+                    if transient
+                    else " until the process is restarted with corrected credentials. "
+                )
+                + f"Authenticated login: {authenticated_login or 'unknown'}; "
                 f"declared login: {declared_login or 'unknown'}."
             )
 
@@ -208,17 +233,27 @@ async def create_agent_runtime(
                         error=str(alert_exc)[:500],
                     )
 
-            alert_coroutine = alert()
+            def schedule_alert() -> None:
+                alert_coroutine = alert()
+                try:
+                    task = adapters.spawn_background_task(
+                        alert_coroutine,
+                        "github-identity-degraded-alert",
+                    )
+                except BaseException:
+                    alert_coroutine.close()
+                    raise
+                runtime_background_tasks.add(task)
+                task.add_done_callback(runtime_background_tasks.discard)
+
             try:
-                task = adapters.spawn_background_task(
-                    alert_coroutine,
-                    "github-identity-degraded-alert",
-                )
-            except BaseException:
-                alert_coroutine.close()
-                raise
-            runtime_background_tasks.add(task)
-            task.add_done_callback(runtime_background_tasks.discard)
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is runtime_loop:
+                schedule_alert()
+            else:
+                runtime_loop.call_soon_threadsafe(schedule_alert)
 
         set_github_identity_degraded_callback(
             github_identity_degraded,
@@ -488,7 +523,33 @@ async def create_agent_runtime(
             original_exception.add_note(_cleanup_note(cleanup_errors))
         raise
 
-    adapters.dispatcher.set_run_turn(agent.run_turn)
+    identity_retry_lock = asyncio.Lock()
+
+    async def run_turn_with_identity_preflight(event: Any) -> Any:
+        nonlocal next_identity_retry_at
+        if (
+            getattr(config, "coding_enabled", False)
+            and github_identity_recovery_pending()
+            and time.monotonic() >= next_identity_retry_at
+        ):
+            async with identity_retry_lock:
+                if (
+                    github_identity_recovery_pending()
+                    and time.monotonic() >= next_identity_retry_at
+                ):
+                    recovered = await asyncio.to_thread(
+                        initialize_github_forge_identity
+                    )
+                    if recovered:
+                        from .event_logger import log_event
+
+                        await log_event(
+                            "github_identity_recovered",
+                            attempts=transient_failures,
+                        )
+        return await agent.run_turn(event)
+
+    adapters.dispatcher.set_run_turn(run_turn_with_identity_preflight)
     return bundle
 
 

@@ -38,6 +38,7 @@ from mimir.chat_skills import (
 )
 from mimir.channel_registry import ChannelRegistry
 from mimir.config import Config
+from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
@@ -45,6 +46,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    Integrity,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
@@ -2604,6 +2606,76 @@ async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     )
     assert no_reply[0].get("channel_id") == "ch-1"
     assert no_reply[0].get("output_chars", 0) > 0
+
+
+async def test_framework_no_reply_signal_is_visible_as_trusted_feedback(
+    tmp_path: Path,
+):
+    """The agent can recall its own framework-filed no-reply telemetry."""
+    first_agent = _FakeAgent(response_messages=[
+        AIMessage(content="I reasoned about this but did not send it"),
+    ])
+    agent = _build_agent(tmp_path, fake_agent=first_agent, fake_saga=_FakeSaga())
+    channels = ChannelRegistry()
+    channels.register(_BridgeStub())  # type: ignore[arg-type]
+    agent._channels = channels
+    agent._config.auto_deliver_final_text_channels = ()
+
+    first = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id="ch-old",
+        content="first request",
+        author="stub-U1",
+        source="stub",
+    ))
+
+    assert first.error is None
+    events = [
+        json.loads(line)
+        for line in agent._config.events_log.read_text().splitlines()
+        if line.strip()
+    ]
+    [filed] = [
+        event
+        for event in events
+        if event.get("type") == "interactive_turn_no_send_message"
+    ]
+    assert filed["channel_id"] == "ch-old"
+
+    second_auth = AuthContext(
+        principal="stub-U1",
+        canonical_principal="admin",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-new",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="ch-new",
+        bridge_instance="stub",
+    )
+    recalled = FeedbackLog(
+        events_path=agent._config.events_log,
+        turns_path=agent._config.turns_log,
+    ).recent_prompt_block(second_auth)
+
+    assert recalled is not None
+    assert "no_reply [ch-old]" in recalled.content
+    trusted_no_reply_sources = [
+        source
+        for source in recalled.labels.sources
+        if source.domain == "feedback"
+        and source.resource_id == "ch-old"
+        and source.principal == "admin"
+        and source.integrity == Integrity.TRUSTED
+    ]
+    assert trusted_no_reply_sources
+    assert all(source.is_complete for source in trusted_no_reply_sources)
+    assert all(
+        source.authorized_principals == frozenset({"admin"})
+        for source in trusted_no_reply_sources
+    )
 
 
 async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):

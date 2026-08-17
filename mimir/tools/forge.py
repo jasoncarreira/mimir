@@ -59,10 +59,28 @@ def github_identity_is_degraded() -> bool:
         return _github_identity_degraded
 
 
+def github_identity_recovery_pending() -> bool:
+    """Return whether coding is disabled by an unverified transient failure."""
+    from ..forge.github import GitHubIdentityFailureKind
+
+    with _github_identity_degraded_lock:
+        current = _github_identity_degraded_error
+    return (
+        current is not None
+        and getattr(current, "failure_kind", None) == GitHubIdentityFailureKind.TRANSIENT
+    )
+
+
 def _latch_github_identity_degraded(exc: ForgeError) -> None:
     global _github_identity_degraded, _github_identity_degraded_error
+    from ..forge.github import GitHubIdentityFailureKind
+
     with _github_identity_degraded_lock:
-        if _github_identity_degraded:
+        if (
+            _github_identity_degraded
+            and getattr(_github_identity_degraded_error, "failure_kind", None)
+            != GitHubIdentityFailureKind.TRANSIENT
+        ):
             return
         _github_identity_degraded = True
         _github_identity_degraded_error = exc
@@ -88,11 +106,17 @@ def set_forge_client(client: ForgeClient | None) -> None:
 
 def initialize_github_forge_identity() -> bool:
     """Bind the declared GitHub identity, degrading coding on any mismatch."""
-    if github_identity_is_degraded():
+    global _github_identity_degraded, _github_identity_degraded_error
+    if github_identity_is_degraded() and not github_identity_recovery_pending():
         return False
     declared_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     if not declared_login:
-        return True
+        from ..forge.github import GitHubIdentityVerificationError
+
+        _latch_github_identity_degraded(
+            GitHubIdentityVerificationError("github declared identity is empty")
+        )
+        return False
     from ..forge.github import GitHubForgeClient
 
     client = GitHubForgeClient()
@@ -102,6 +126,9 @@ def initialize_github_forge_identity() -> bool:
         _latch_github_identity_degraded(exc)
         return False
     set_forge_client(client)
+    with _github_identity_degraded_lock:
+        _github_identity_degraded = False
+        _github_identity_degraded_error = None
     return True
 
 
