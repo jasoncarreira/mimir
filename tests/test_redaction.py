@@ -100,6 +100,28 @@ def test_quoted_credential_is_masked_through_the_closing_quote(
     assert redact_text(text) == expected
 
 
+# An embedded quote is part of the credential, not the end of it. Stopping at
+# the first quote character masks the opening fragment and persists the rest,
+# which reads as redacted. JSON and Python-repr escape with a backslash; YAML
+# doubles the single quote.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '{"password":"correct \\"horse\\" battery staple"}',
+            '{"password":"[REDACTED]"}',
+        ),
+        ("password: 'can\\'t share this'", "password: '[REDACTED]'"),
+        ("password: 'can''t share this'", "password: '[REDACTED]'"),
+        ('{"api_key":"ends with \\\\"}', '{"api_key":"[REDACTED]"}'),
+    ],
+)
+def test_quoted_credential_survives_embedded_quote_escapes(
+    text: str, expected: str
+) -> None:
+    assert redact_text(text) == expected
+
+
 # The block indicator is NOT a value. Masking it would print
 # ``password: [REDACTED]`` directly above an untouched body, presenting an
 # unredacted credential as though it had been scrubbed. Multiline block scalars

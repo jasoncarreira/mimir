@@ -46,15 +46,22 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # quote style because a backreference for the quote character would push
     # the group count past two, which ``redact_text`` uses to decide whether
     # the prefix is preserved.
+    # The value runs to the TRUE closing delimiter, so an embedded quote does
+    # not end it early. ``{"password": "correct \"horse\" battery staple"}``
+    # stopped at the first escape and persisted the rest, which reads as
+    # redacted. Escapes are consumed as units; the alternations are
+    # non-capturing so the group count stays at two.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"(\"?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"\"?[ \t]*:[ \t]*\")([^\"]*)"
+        r"\"?[ \t]*:[ \t]*\")((?:\\.|[^\"\\])*)"
     ),
+    # Single quotes carry two escape conventions: Python-repr ``\'`` and YAML's
+    # doubled ``''``. Both must be consumed or the value ends at the first one.
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
         r"('?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"'?[ \t]*:[ \t]*')([^']*)"
+        r"'?[ \t]*:[ \t]*')((?:''|\\.|[^'\\])*)"
     ),
     # NOTE: multiline YAML block scalars (``password: |``) are NOT masked. A
     # block scalar's body is delimited by indentation relative to its own
