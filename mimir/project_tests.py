@@ -81,6 +81,7 @@ class ProjectTestResult:
     output_limited: bool = False
     stdout_dropped_bytes: int = 0
     stderr_dropped_bytes: int = 0
+    git_context: str = ""
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -278,6 +279,17 @@ def _permission_refusal_message(diagnostic: dict[str, object]) -> str:
     return f"contained project test path permission denied: {fields}"
 
 
+def _git_execution_context() -> str:
+    identities = get_identities()
+    return (
+        "contained Git context: runner=worklink "
+        f"uid={identities.worklink_uid} gid={identities.worklink_gid}; "
+        f"checkout_owner=mimir uid={identities.mimir_uid} "
+        f"gid={identities.worklink_gid}; global_config=/dev/null; "
+        "system_config=disabled; safe.directory=*"
+    )
+
+
 class RepoProjectTests:
     """Execute the fixed project test command in a disposable contained checkout."""
 
@@ -362,6 +374,11 @@ class RepoProjectTests:
         environment = base_worker_environment(identifier)
         environment.update(configured_env)
         environment.pop("HOME", None)
+        environment.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": "*",
+        })
         if Path(command[0]).name == "uv":
             # uv otherwise searches above the fd-entered checkout for uv.toml.
             # The snapshot's 0700 isolation boundary deliberately cannot be
@@ -466,6 +483,7 @@ class RepoProjectTests:
             return ProjectTestResult(
                 False, "test_timeout", None,
                 command=command, command_source=command_source,
+                git_context=_git_execution_context(),
             )
         stdout = _safe_output(
             result.stdout,
@@ -488,6 +506,7 @@ class RepoProjectTests:
             return ProjectTestResult(
                 False, "tests_failed", result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
+                git_context=_git_execution_context(),
             )
         if not selectors:
             head = self._state.git_expected_head
@@ -496,5 +515,5 @@ class RepoProjectTests:
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
-            **truncation,
+            **truncation, git_context=_git_execution_context(),
         )

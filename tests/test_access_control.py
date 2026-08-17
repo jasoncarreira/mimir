@@ -2901,6 +2901,7 @@ async def test_service_shell_executes_the_exact_authorized_argv(
         str(maintenance_pinned_executables["git"]), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={home.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks",
         "log", "--oneline", "--no-ext-diff", "--no-textconv",
@@ -4440,6 +4441,8 @@ def test_non_admin_human_cannot_run_code_tools(tmp_path: Path) -> None:
 def _service_auth(
     service: ServicePrincipal,
     labels: InformationFlowLabels,
+    *,
+    repo_review_state: RepoReviewState | None = None,
 ) -> AuthContext:
     return AuthContext(
         principal=f"service:{service.canonical}",
@@ -4453,6 +4456,7 @@ def _service_auth(
         service_authority=service,
         enforcement_enabled=True,
         ifc_labels=labels,
+        repo_review_state=repo_review_state,
     )
 
 
@@ -5649,7 +5653,13 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
         "npm ci --ignore-scripts --no-audit --no-fund",
     ],
 )
-def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
+def test_repo_review_shell_profile_admits_review_commands(
+    command: str,
+    repo_review_git_root: Path,
+) -> None:
+    review_state = _review_state(
+        "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
+    )
     service = build_trigger_service_principal(
         canonical="poller:github-activity",
         trigger="poller",
@@ -5659,8 +5669,12 @@ def test_repo_review_shell_profile_admits_review_commands(command: str) -> None:
         creation_path="test",
     )
     decision = ToolRegistry().authorize_tool(
-        "shell_exec", _service_auth(service, InformationFlowLabels()),
-        enforce=True, target_channel=command,
+        "shell_exec",
+        _service_auth(
+            service, InformationFlowLabels(), repo_review_state=review_state,
+        ),
+        enforce=True,
+        target_channel=command,
     )
 
     assert service.sink_policy_for("shell_exec") == ServiceSinkPolicy(
@@ -5683,20 +5697,77 @@ def test_repo_review_git_admits_named_inspection_shapes_with_hardened_argv(
     subcommand: str,
     safety_options: list[str],
     maintenance_pinned_executables: dict[str, Path],
+    repo_review_git_root: Path,
 ) -> None:
-    argv = parse_service_shell_argv(command, "repo_review")
+    review_state = _review_state(
+        "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
+    )
+    argv = parse_service_shell_argv(
+        command, "repo_review", review_state=review_state,
+    )
 
     assert argv is not None
     assert argv[:3] == [
-        str(maintenance_pinned_executables["git"]), "-C", str(Path.cwd().resolve()),
+        str(maintenance_pinned_executables["git"]),
+        "-C",
+        str(repo_review_git_root),
     ]
     assert ["-c", "core.hooksPath=/dev/null"] == argv[5:7]
     assert "credential.helper=" in argv
     assert "protocol.allow=never" in argv
+    assert f"safe.directory={repo_review_git_root}" in argv
     assert "--no-pager" in argv
     assert "--no-optional-locks" in argv
     subcommand_index = argv.index(subcommand)
     assert argv[subcommand_index + 1:subcommand_index + 1 + len(safety_options)] == safety_options
+
+
+def test_repo_review_commands_agree_for_host_and_contained_git_identity(
+    repo_review_git_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model Git's foreign-owner check without requiring containment or root."""
+    identity = "host"
+    real_run = access_control.subprocess.run
+
+    def ownership_check(command, *args, **kwargs):
+        safe_root = f"safe.directory={repo_review_git_root}"
+        if identity == "contained" and safe_root not in command:
+            return subprocess.CompletedProcess(
+                command, 128, b"", b"fatal: detected dubious ownership\n",
+            )
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(access_control.subprocess, "run", ownership_check)
+    state = _review_state(
+        "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
+    )
+    commands = (
+        "gh pr view 979 --json number,title,headRefOid",
+        "gh pr diff 979 --patch",
+        "gh pr checks 979 --required",
+        "git status --short",
+        "git log --oneline --max-count=10",
+        "git diff --stat HEAD~1",
+        "git fetch origin pull/979/head",
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "git grep -n pattern -- tests/x.py",
+        "git blame mimir/agent.py",
+        "git merge-base main HEAD",
+        "git rev-list --count HEAD",
+    )
+    observations = {}
+    for execution_identity in ("host", "contained"):
+        identity = execution_identity
+        observations[execution_identity] = tuple(
+            parse_service_shell_argv(
+                command, "repo_review", review_state=state,
+            ) is not None
+            for command in commands
+        )
+
+    assert observations["contained"] == observations["host"]
+    assert all(observations["host"])
 
 
 @pytest.mark.parametrize("global_option", ["--no-ext-diff", "--no-pager"])
@@ -7260,6 +7331,7 @@ def test_heartbeat_scope_rejects_raw_provider_payload(
 
 def test_every_service_shell_profile_returns_absolute_executables(
     maintenance_git_home: Path,
+    repo_review_git_root: Path,
 ) -> None:
     upgrade_worktree = (
         maintenance_git_home / "scratch" / "proposals" / "upgrade" / "upgrade_defaults"
@@ -7291,10 +7363,17 @@ def test_every_service_shell_profile_returns_absolute_executables(
             f"git -C {upgrade_worktree} status --short", "uv lock",
         ),
     }
+    review_state = _review_state(
+        "owner/repo", 1279, "worklink/1279", str(repo_review_git_root),
+    )
 
     for profile, commands in samples.items():
         for command in commands:
-            argv = parse_service_shell_argv(command, profile)
+            argv = parse_service_shell_argv(
+                command,
+                profile,
+                review_state=review_state if profile == "repo_review" else None,
+            )
             assert argv is not None, (profile, command)
             assert Path(argv[0]).is_absolute(), (profile, command, argv)
 
@@ -7319,6 +7398,7 @@ def test_upgrade_workspace_git_c_scratch_is_hardened_and_authorized(
         "-C", str(worktree.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={worktree.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", "diff", "--cached",
         "--no-ext-diff", "--no-textconv",
@@ -8663,6 +8743,7 @@ def test_maintenance_git_returns_hardened_execution_argv(
         str(pinned_git), "-C", str(home.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={home.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", subcommand, *arguments,
         *(
@@ -8694,6 +8775,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
         str(maintenance_pinned_executables["git"]), "-C", str(nested.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={nested.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks",
         "log", "--oneline", "-5", "--no-ext-diff", "--no-textconv",
@@ -8706,6 +8788,7 @@ def test_maintenance_git_resolves_c_within_configured_roots(
         str(maintenance_pinned_executables["git"]), "-C", str(state.resolve()),
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
         "-c", "diff.external=", "-c", "protocol.allow=never",
+        "-c", f"safe.directory={state.resolve()}",
         "-c", "credential.helper=",
         "--no-pager", "--no-optional-locks", "status", "--short",
     ]
