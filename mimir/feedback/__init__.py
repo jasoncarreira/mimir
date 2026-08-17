@@ -678,15 +678,18 @@ class FeedbackLog:
                 record_owner = _record_source_principal(record, auth_context)
                 principal = record_owner or service or requester
                 bridge = record.get("bridge") or record.get("source")
-                # The label ACL is an independent guard: user-owned records are
-                # readable by their owner, agent-self records by this requester's
-                # effective identity, and service turns by the prefixed service
-                # identity SinkGate uses.
+                # The label ACL is an independent guard.  An owning principal
+                # establishes the record ACL; privileged readers may relay those
+                # records under their effective service identity.  Principal-less
+                # records only gain that identity after the positive, server-side
+                # agent-self classification above.  Do not let an arbitrary
+                # ownerless record authorize its requester by construction.
                 acl_principals = {record_owner} if record_owner else set()
                 effective_requester = service or requester
-                if _is_privileged(auth_context) and effective_requester:
-                    acl_principals.add(effective_requester)
-                elif not record_owner and effective_requester:
+                if effective_requester and (
+                    (_is_privileged(auth_context) and bool(record_owner))
+                    or (not record_owner and _is_agent_self_record(record))
+                ):
                     acl_principals.add(effective_requester)
                 labels = labels.with_source(SourceLabel(
                     principal=principal,

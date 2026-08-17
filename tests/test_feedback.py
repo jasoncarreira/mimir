@@ -191,6 +191,31 @@ def test_non_admin_sees_principal_less_agent_self_but_not_user_event(tmp_path: P
     }
 
 
+def test_ownerless_non_self_feedback_cannot_self_authorize_its_requester(
+    tmp_path: Path,
+):
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1), "type": "commitment_due",
+        "channel_id": "shared", "text": "OWNERLESS-USER-SECRET",
+        "commitment_id": "legacy-ownerless",
+    }])
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "OWNERLESS-USER-SECRET" in block.content
+    assert len(block.labels.sources) == 1
+    source = block.labels.sources[0]
+    assert source.principal == "bob"
+    assert source.authorized_principals == frozenset()
+    assert source.is_complete is False
+
+
 def test_privileged_view_of_ownerless_non_agent_record_stays_untrusted(tmp_path: Path):
     """Trust requires positive agent-self provenance, not absent ownership.
 

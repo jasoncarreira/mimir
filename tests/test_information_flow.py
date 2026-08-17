@@ -762,7 +762,7 @@ def test_non_user_trigger_does_not_gain_originating_channel_carveout(trigger: st
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources():
+def test_cross_channel_recent_activity_uses_requester_acl_for_same_channel_sinks():
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="reply to me",
@@ -792,7 +792,7 @@ def test_cross_channel_recent_activity_only_allows_trusted_self_authored_sources
             tool, event.channel_id, untrusted_labels, auth, enforce=True,
         )
         assert trusted.allowed is True, (tool, trusted.reason)
-        assert untrusted.allowed is (tool == "send_message"), (tool, untrusted.reason)
+        assert untrusted.allowed is True, (tool, untrusted.reason)
 
 
 def test_protected_prompt_sources_are_informational():
@@ -2375,28 +2375,172 @@ def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-@pytest.mark.parametrize(
-    ("source_resource", "expected_allowed"),
-    [
-        ("slack-C-other", False),
-        ("slack-C1", True),
-    ],
-)
-def test_protected_prompt_source_is_bound_to_triggering_channel(
-    source_resource: str,
-    expected_allowed: bool,
-):
+def test_acl_authorized_untrusted_foreign_channel_protected_prompt_can_reply():
     labels = InformationFlowLabels(
         labels=frozenset({"private"}),
         sources=frozenset({SourceLabel(
             principal="user-2",
             domain="recent_activity",
-            resource_id=source_resource,
+            resource_id="slack-C-other",
             bridge_instance="slack",
             sensitivity="private",
             authorized_principals=frozenset({"user-1"}),
             source_kind="protected_prompt",
+            integrity="untrusted",
+            integrity_effect="informational",
         )}),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    ["channel", "service", "protected_prompt", "protected_tool"],
+)
+def test_incomplete_source_kind_still_blocks_triggering_channel(source_kind: str):
+    source = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance=None,
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind=source_kind,
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert source.is_complete is False
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_protected_prompt_acl_still_blocks_cross_principal_reply():
+    source = SourceLabel(
+        principal="user-2",
+        domain="recent_activity",
+        resource_id="slack-C2",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-2"}),
+        source_kind="protected_prompt",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert source.is_complete is True
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_ownerless_protected_prompt_without_independent_acl_is_refused():
+    source = SourceLabel(
+        principal="user-1",
+        domain="feedback",
+        resource_id="slack-C-other",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset(),
+        source_kind="protected_prompt",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert source.is_complete is False
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["principal", "domain", "bridge_instance", "resource_id"],
+)
+def test_channel_source_still_requires_exact_triggering_provenance(mismatch: str):
+    source = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+    )
+    mismatched = replace(source, **{mismatch: {
+        "principal": "user-2",
+        "domain": "other",
+        "bridge_instance": "discord",
+        "resource_id": "slack-C2",
+    }[mismatch]})
+
+    matching = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1",
+        InformationFlowLabels(labels=frozenset({"private"}), sources=(source,)),
+        _auth(), enforce=True,
+    )
+    blocked = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1",
+        InformationFlowLabels(labels=frozenset({"private"}), sources=(mismatched,)),
+        _auth(), enforce=True,
+    )
+
+    assert matching.allowed is True
+    assert blocked.allowed is False
+    assert blocked.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.parametrize(
+    ("bridge_instance", "resource_id", "expected_allowed"),
+    [
+        ("slack", "slack-C1", True),
+        ("discord", "slack-C1", False),
+        ("slack", "slack-C2", False),
+    ],
+)
+def test_service_channel_source_still_requires_matching_channel_provenance(
+    bridge_instance: str,
+    resource_id: str,
+    expected_allowed: bool,
+):
+    source = SourceLabel(
+        principal="service:context",
+        domain="channel:private",
+        resource_id=resource_id,
+        bridge_instance=bridge_instance,
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="service",
+        integrity="trusted",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
     )
 
     decision = SinkGate.check_sink_flow(
@@ -2407,6 +2551,76 @@ def test_protected_prompt_source_is_bound_to_triggering_channel(
     assert decision.reason == (
         "ifc_allowed" if expected_allowed else "ifc_label_blocked:same_channel"
     )
+
+
+@pytest.mark.parametrize("disqualification", ["incomplete", "acl"])
+def test_one_disqualified_source_blocks_the_entire_turn(disqualification: str):
+    admitted = SourceLabel(
+        principal="user-2",
+        domain="recent_activity",
+        resource_id="slack-C2",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_prompt",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    blocked = SourceLabel(
+        principal="protected-reader",
+        domain="filesystem",
+        resource_id="private-record",
+        bridge_instance=None if disqualification == "incomplete" else "filesystem",
+        sensitivity="private",
+        authorized_principals=(
+            frozenset({"user-1"})
+            if disqualification == "incomplete"
+            else frozenset({"user-2"})
+        ),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(admitted, blocked),
+    )
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+
+    assert admitted.is_complete is True
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_protected_prompt_relaxation_does_not_widen_cross_channel_sinks():
+    source = SourceLabel(
+        principal="user-2",
+        domain="recent_activity",
+        resource_id="slack-C2",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_prompt",
+        integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), sources=(source,),
+    )
+
+    same_channel = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    )
+    cross_channel = SinkGate.check_sink_flow(
+        "post_message", "slack-C2", labels, _auth(), enforce=True,
+        sink_category=SinkCategory.CROSS_CHANNEL,
+    )
+
+    assert same_channel.allowed is True
+    assert cross_channel.allowed is False
+    assert cross_channel.reason == "ifc_label_blocked:cross_channel"
 
 
 @pytest.mark.parametrize(
