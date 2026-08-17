@@ -344,6 +344,16 @@ def _merge_ifc_labels(
     return merged
 
 
+def _persisted_integrity(ifc_labels: InformationFlowLabels) -> Integrity:
+    return (
+        Integrity.TRUSTED
+        if ifc_labels.sources and all(
+            source.integrity == Integrity.TRUSTED for source in ifc_labels.sources
+        )
+        else Integrity.UNTRUSTED
+    )
+
+
 def _initialize_ifc_labels(
     event: AgentEvent,
     attachments: list[str] | None = None,
@@ -1398,7 +1408,11 @@ class Agent:
         # what woke it up. Pre-#181 logged them as system_note.
         return "system_note"
 
-    async def _append_inbound_to_buffer(self, event: AgentEvent) -> None:
+    async def _append_inbound_to_buffer(
+        self,
+        event: AgentEvent,
+        ifc_labels: InformationFlowLabels,
+    ) -> None:
         """Append an inbound event to the ``MessageBuffer`` so future
         ``assemble_recent_activity`` calls see it. Skip rules match
         pre-#181's ``_record_inbound``: drop empty-content events
@@ -1417,16 +1431,6 @@ class Agent:
         if event.extra.get("_buffer_recorded"):
             return
         try:
-            persisted_integrity = Integrity.UNTRUSTED
-            if (
-                event.ifc_labels is not None
-                and event.ifc_labels.sources
-                and all(
-                    source.integrity == Integrity.TRUSTED
-                    for source in event.ifc_labels.sources
-                )
-            ):
-                persisted_integrity = Integrity.TRUSTED
             msg = self._buffer.make_message(
                 channel_id=event.channel_id,
                 kind=self._kind_for_trigger(event.trigger),
@@ -1437,7 +1441,7 @@ class Agent:
                 author_display=event.author_display or event.author,
                 msg_id=event.source_id,
                 source=event.source,
-                integrity=persisted_integrity,
+                integrity=_persisted_integrity(ifc_labels),
             )
             await self._buffer.append(msg)
             event.extra["_buffer_recorded"] = True
@@ -1452,7 +1456,12 @@ class Agent:
         message was just folded into a running turn. Record it in chat history
         now, at its true arrival time, so Recent activity threads it ahead of the
         turn's later replies. Wired in server.py via ``set_on_inject``."""
-        await self._append_inbound_to_buffer(event)
+        ifc_labels = _initialize_ifc_labels(
+            event,
+            event.attachment_names,
+            resolver=getattr(self, "_identity_resolver", None),
+        )
+        await self._append_inbound_to_buffer(event, ifc_labels)
 
     def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
         """Render the system prompt for the current turn.
@@ -2438,14 +2447,7 @@ class Agent:
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
                     source=getattr(bridge, "name", None),
-                    integrity=(
-                        Integrity.TRUSTED
-                        if ctx.ifc_labels.sources and all(
-                            source.integrity == Integrity.TRUSTED
-                            for source in ctx.ifc_labels.sources
-                        )
-                        else Integrity.UNTRUSTED
-                    ),
+                    integrity=_persisted_integrity(ctx.ifc_labels),
                 )
                 await self._buffer.append(msg)
             except Exception:  # noqa: BLE001
@@ -2490,7 +2492,7 @@ class Agent:
         # in ``_build_turn_prompt`` sees this turn's own trigger as
         # context. No-op for triggers that don't represent conversation
         # (scheduled_tick / saga_session_end / shell_job_complete).
-        await self._append_inbound_to_buffer(event)
+        await self._append_inbound_to_buffer(event, ctx.ifc_labels)
 
         # chainlink #383 facet 1: mop up same-channel user messages that
         # queued behind an interactive user turn before the dispatcher/registry
