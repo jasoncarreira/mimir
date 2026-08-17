@@ -18,6 +18,19 @@ import yaml
 _CREDENTIAL_KEY = re.compile(
     r"[A-Za-z0-9_.:-]*(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
 )
+_CREDENTIAL_WORD = re.compile(
+    r"(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
+)
+_CREDENTIAL_WORD_LITERALS = (
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "password",
+    "passwd",
+    "secret",
+)
+_IGNORECASE_LITERAL_TRANSLATION = {0x017F: "s", 0x0131: "i"}
 _BLOCK_HEADER = re.compile(
     r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]+)*"
     r"(?P<style>[|>])(?P<mods>(?:[1-9][+-]?|[+-][1-9]?)?)"
@@ -26,6 +39,92 @@ _BLOCK_HEADER = re.compile(
 _NODE_PROPERTIES = re.compile(
     r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]*)+(?:#.*)?"
 )
+
+_COLON_KEY_CHAR = re.compile(r"[A-Za-z0-9_.-]", re.IGNORECASE)
+_COLON_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
+    ),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9_./-])"
+        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"['\"]?[ \t]*:[ \t]*)"
+        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
+    ),
+)
+
+
+def _credential_word_starts(text: str, lowered: str) -> list[int]:
+    # A few Unicode characters expand when lowercased. Use the regex in that
+    # uncommon case so offsets and Unicode IGNORECASE behavior remain exact.
+    if len(lowered) != len(text):
+        return [match.start() for match in _CREDENTIAL_WORD.finditer(text)]
+
+    starts: set[int] = set()
+    for word in _CREDENTIAL_WORD_LITERALS:
+        start = lowered.find(word)
+        while start != -1:
+            starts.add(start)
+            start = lowered.find(word, start + 1)
+    return sorted(starts)
+
+
+def _sub_colon_credentials(
+    text: str, pattern: re.Pattern[str], lowered: str
+) -> str:
+    parts: list[str] = []
+    copied_to = 0
+    for word_start in _credential_word_starts(text, lowered):
+        if word_start < copied_to:
+            continue
+
+        key_start = word_start
+        while key_start and _COLON_KEY_CHAR.fullmatch(text[key_start - 1]) is not None:
+            key_start -= 1
+        starts = [key_start]
+        if key_start and text[key_start - 1] in {'"', "'"}:
+            starts.insert(0, key_start - 1)
+
+        match = next(
+            (candidate for start in starts if (candidate := pattern.match(text, start))),
+            None,
+        )
+        if match is None or match.end() <= copied_to:
+            continue
+        parts.append(text[copied_to : match.start()])
+        parts.append(match.expand(r"\1[REDACTED]"))
+        copied_to = match.end()
+
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
+
+
+def _mask_colon_credentials(text: str) -> str:
+    """Run the three colon grammars locally, in their original order."""
+    lowered = text.lower()
+    if len(lowered) != len(text):
+        if _CREDENTIAL_WORD.search(text) is None:
+            return text
+    else:
+        lowered = lowered.translate(_IGNORECASE_LITERAL_TRANSLATION)
+        if not any(word in lowered for word in _CREDENTIAL_WORD_LITERALS):
+            return text
+    for pattern in _COLON_CREDENTIAL_PATTERNS:
+        lowered = text.lower()
+        if len(lowered) == len(text):
+            lowered = lowered.translate(_IGNORECASE_LITERAL_TRANSLATION)
+        text = _sub_colon_credentials(text, pattern, lowered)
+    return text
+
 
 # Token-shape redaction for subprocess / event output (pre-OSS hardening,
 # review item #8, extended by chainlink #370). Anything a subprocess or event
@@ -57,10 +156,8 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     #
     # Quoted values run to the CLOSING QUOTE, not to the first space. A
     # passphrase is a credential and contains whitespace, so stopping at the
-    # space masks one word and persists the rest. There is one pattern per
-    # quote style because a backreference for the quote character would push
-    # the group count past two, which ``redact_text`` uses to decide whether
-    # the prefix is preserved.
+    # space masks one word and persists the rest. Candidate positions are found
+    # cheaply, then each original grammar is checked only at local keys.
     # Double quotes: JSON and YAML both escape with a backslash, and YAML also
     # allows a backslash before a physical newline as a line continuation, so an
     # escape consumes ANY next character.
@@ -70,11 +167,6 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # match to its own line, and the lookahead additionally requires a real
     # closing delimiter. Removing either alone changes nothing; removing both
     # lets ``password: "abc`` swallow every following line.
-    re.compile(
-        r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
-    ),
     # Single quotes carry two INCOMPATIBLE grammars and a backslash is exactly
     # where they disagree:
     #
@@ -95,11 +187,6 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # leak half a credential nor corrupt the surrounding record. Full
     # arbitration needs a parser rather than a pattern and is tracked with the
     # block-scalar work.
-    re.compile(
-        r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
-    ),
     # Multiline YAML block scalars are handled by the grammar-aware pass below,
     # not by this tuple. The bare-value rule must still DECLINE their indicator
     # and any preceding node properties. Otherwise a parser miss could print
@@ -109,12 +196,7 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Bare (unquoted) values. The alphabet stops at common delimiters so the
     # regex doesn't eat the rest of the line, and a block-scalar indicator is
     # excluded so it can never be reported as a redacted value.
-    re.compile(
-        r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?[ \t]*:[ \t]*)"
-        r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
-    ),
+    *_COLON_CREDENTIAL_PATTERNS,
     # AWS access-key IDs (chainlink #499 — sync with templates/git/pre-commit).
     # The long-lived ``AKIA`` and STS-temp ``ASIA`` prefixes + 16 upper/digit
     # chars are a high-confidence shape; mask the whole value.
@@ -412,8 +494,17 @@ def redact_text(text: str) -> str:
         return text
     out = _mask_block_scalar_lines(text)
     for pat in _TOKEN_PATTERNS:
+        if pat is _COLON_CREDENTIAL_PATTERNS[0]:
+            out = _mask_colon_credentials(out)
+            continue
+        if (
+            pat is _COLON_CREDENTIAL_PATTERNS[1]
+            or pat is _COLON_CREDENTIAL_PATTERNS[2]
+        ):
+            continue
         # Patterns with capture groups preserve the prefix; the others mask the
-        # whole match. We detect by group count.
+        # whole match. The locally anchored colon rules above keep this same
+        # two-capture contract.
         if pat.groups == 2:
             out = pat.sub(r"\1[REDACTED]", out)
         else:
