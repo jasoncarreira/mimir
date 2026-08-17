@@ -92,10 +92,25 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 # dashes: in ``  - password: |`` the key's column is what bounds the body, and
 # YAML counts the ``- `` as part of the nested mapping's indentation. Nested
 # sequences (``- - password: |``) repeat the prefix.
+_CREDENTIAL_WORD = r"(?:token|api[_-]?key|password|passwd|secret)"
+
+# A QUOTED key may contain characters a bare key cannot -- notably a colon, as
+# in ``"a:password": |``. Matching quoted and bare keys with one alphabet either
+# rejects the quoted form or lets a bare key swallow the separator, so they are
+# separate alternatives. This pattern is used by ``_mask_yaml_block_scalars``
+# rather than living in ``_TOKEN_PATTERNS``, so its group count is free.
+#
+# Between the colon and the indicator YAML permits node properties: an anchor
+# (``&name``), an alias (``*name``), or a tag (``!tag`` / ``!!str``), in either
+# order. Skipping them is required or the header is not recognised at all and
+# the whole body survives.
 _BLOCK_SCALAR_HEADER = re.compile(
     r"(?i)^(?P<indent>[ \t]*(?:-[ \t]+)*)"
-    r"[\"']?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)[\"']?"
-    r"[ \t]*:[ \t]*[|>](?P<mods>[-+0-9]*)[ \t]*(?:\#.*)?$"
+    rf"(?:\"[^\"]*{_CREDENTIAL_WORD}[^\"]*\""
+    rf"|'[^']*{_CREDENTIAL_WORD}[^']*'"
+    rf"|[A-Za-z0-9_.-]*{_CREDENTIAL_WORD})"
+    r"[ \t]*:[ \t]*(?:[&*!][^\s]*[ \t]+)*"
+    r"[|>](?P<mods>[-+0-9]*)[ \t]*(?:\#.*)?$"
 )
 
 

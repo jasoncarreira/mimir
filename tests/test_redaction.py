@@ -208,6 +208,24 @@ def test_explicit_indentation_indicator_bounds_the_body() -> None:
     assert "sibling: keep" in out
 
 
+# A quoted key may hold characters a bare key cannot, and YAML allows node
+# properties between the colon and the indicator. Either shape going unmatched
+# leaves the whole body in the durable log.
+@pytest.mark.parametrize(
+    "key",
+    ['"a:password"', "'x:secret'", "password", '"api_key"'],
+)
+@pytest.mark.parametrize("prop", ["", "&anchor ", "!!str ", "!!str &a ", "*alias "])
+def test_block_scalar_header_accepts_quoted_keys_and_node_properties(
+    key: str, prop: str
+) -> None:
+    secret = "gg" + "-secret-fragment"
+    out = redact_text(f"{key}: {prop}|\n  {secret}\nnextkey: keep\n")
+
+    assert secret not in out
+    assert "nextkey: keep" in out
+
+
 def test_block_scalar_in_a_sequence_entry_is_masked() -> None:
     """``- password: |`` is a legal mapping-in-sequence and common config shape."""
     out = redact_text(
