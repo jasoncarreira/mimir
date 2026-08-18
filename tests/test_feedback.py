@@ -27,7 +27,13 @@ from mimir.feedback import (
     render_feedback_block,
 )
 from mimir.jsonl_snapshot import JsonlSnapshot
-from mimir.models import AuthContext, InformationFlowState, Integrity
+from mimir.models import (
+    AuthContext,
+    InformationFlowState,
+    Integrity,
+    IntegrityEffect,
+    SourceLabel,
+)
 
 
 def _ts(hours_ago: float = 0) -> str:
@@ -506,6 +512,127 @@ def test_feedback_and_agent_labels_use_shared_prompt_source_constructor(
 
     assert block is not None
     assert domains == ["saga", "feedback"]
+
+
+def test_unclassified_telemetry_does_not_label_or_veto_feedback_reply(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    signal_ts = _ts(0.4)
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "tool_call", "id": "tool-1"},
+        {
+            "timestamp": signal_ts,
+            "type": "commitment_due",
+            "id": "feedback-1",
+            "channel_id": "shared",
+            "owner_principal": "jason",
+            "bridge": "acp-primary",
+            "text": "Review the rollout",
+            "commitment_id": "commitment-1",
+        },
+        {
+            "timestamp": _ts(0.3),
+            "type": "codex_plus_usage_ok",
+            "id": "usage-1",
+        },
+        {"timestamp": _ts(0.2), "type": "api_started", "id": "boot-1"},
+    ])
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="shared", bridge_instance="acp-primary",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert block.content == log.recent_block(auth_context=auth)
+    assert block.labels.sources == (SourceLabel(
+        principal="jason",
+        domain="feedback",
+        resource_id="shared",
+        bridge_instance="acp-primary",
+        sensitivity="private",
+        authorized_principals=frozenset({"jason"}),
+        source_kind="protected_prompt",
+        integrity=Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.INFORMATIONAL,
+    ),)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "send_message", "shared", block.labels, sink_auth, enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_feedback_records_beyond_polarity_cap_produce_no_label(tmp_path: Path):
+    events = [
+        {
+            "timestamp": _ts(0.4 - index * 0.1),
+            "type": "tool_call_denied",
+            "id": f"denial-{index}",
+            "channel_id": f"channel-{index}",
+            "owner_principal": "jason",
+            "tool": f"tool-{index}",
+            "reason": "denied",
+        }
+        for index in range(4)
+    ]
+    log = _make_log(tmp_path, events=events)
+    log.default_limit_per_polarity = 2
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert len(block.labels.sources) == 2
+    assert {source.resource_id for source in block.labels.sources} == {
+        "channel-2", "channel-3",
+    }
+
+
+def test_duplicate_feedback_content_uses_newest_record_label(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "id": "older",
+            "channel_id": "older-channel",
+            "owner_principal": "jason",
+            "tool": "Read",
+            "reason": "denied",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "id": "newer",
+            "channel_id": "newer-channel",
+            "owner_principal": "jason",
+            "tool": "Read",
+            "reason": "denied",
+        },
+    ])
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "(×2 in 24h)" in block.content
+    assert [source.resource_id for source in block.labels.sources] == [
+        "newer-channel"
+    ]
 
 
 def test_feedback_imports_first_in_fresh_interpreter():
