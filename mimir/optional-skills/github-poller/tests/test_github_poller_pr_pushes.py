@@ -429,12 +429,17 @@ def _patch_api_with_reviews(monkeypatch, response, reviews_response):
     monkeypatch.setattr(poller, "_gh_api", fake_api)
 
 
-def _review(login: str, commit_id: str, state: str = "APPROVED") -> dict:
+def _review(
+    login: str,
+    commit_id: str,
+    state: str = "APPROVED",
+    submitted_at: str = "2026-06-24T02:10:00Z",
+) -> dict:
     return {
         "user": {"login": login},
         "commit_id": commit_id,
         "state": state,
-        "submitted_at": "2026-06-24T02:10:00Z",
+        "submitted_at": submitted_at,
     }
 
 
@@ -556,6 +561,112 @@ def test_review_requested_current_head_review_suppresses_rerequest(
     )
     assert count == 0
     assert [e for e in captured_emits if e.get("event_type") == "pr_review_requested"] == []
+    assert new_rr == {}
+
+
+@pytest.mark.parametrize("state", ["CHANGES_REQUESTED", "APPROVED"])
+def test_review_rerequest_after_current_head_review_emits(
+    captured_emits, monkeypatch, state,
+):
+    """A newer explicit re-request makes an unchanged reviewed head actionable."""
+    pr = _pr(
+        42, "sha", login="alice", requested_reviewers=["mimir-carreira"],
+    )
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return [pr]
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [_review(
+                "mimir-carreira",
+                "sha",
+                state=state,
+                submitted_at="2026-08-18T13:42:31Z",
+            )]
+        if endpoint == "repos/o/r/issues/42/timeline?per_page=100":
+            return [{
+                "event": "review_requested",
+                "created_at": "2026-08-18T15:46:43Z",
+                "requested_reviewer": {"login": "mimir-carreira"},
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests={},
+    )
+
+    assert count == 1
+    [event] = [
+        item for item in captured_emits
+        if item.get("event_type") == "pr_review_requested"
+    ]
+    assert event["attempt"] == 1
+    assert "head is unchanged" in event["prompt"]
+    assert f"prior {state} review" in event["prompt"]
+    assert "2026-08-18T13:42:31Z" in event["prompt"]
+    assert new_rr == {"42": 1}
+
+
+def test_review_rerequest_predating_current_head_review_is_suppressed(
+    captured_emits, monkeypatch,
+):
+    pr = _pr(
+        42, "sha", login="alice", requested_reviewers=["mimir-carreira"],
+    )
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return [pr]
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [_review(
+                "mimir-carreira", "sha", submitted_at="2026-08-18T15:00:00Z",
+            )]
+        if endpoint == "repos/o/r/issues/42/timeline?per_page=100":
+            return [{
+                "event": "review_requested",
+                "created_at": "2026-08-18T14:00:00Z",
+                "requested_reviewer": {"login": "mimir-carreira"},
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests={},
+    )
+
+    assert count == 0
+    assert captured_emits == []
+    assert new_rr == {}
+
+
+def test_review_rerequest_timeline_failure_is_suppressed(
+    captured_emits, monkeypatch,
+):
+    """Failure to establish that a request is newer must not start a loop."""
+    pr = _pr(
+        42, "sha", login="alice", requested_reviewers=["mimir-carreira"],
+    )
+
+    def fake_api(endpoint: str, token: str):
+        if endpoint.startswith("repos/o/r/pulls?state=open"):
+            return [pr]
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [_review("mimir-carreira", "sha")]
+        if endpoint == "repos/o/r/issues/42/timeline?per_page=100":
+            return None
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+    count, _, new_rr = poller._check_pr_pushes(
+        "o/r", token="t", me="mimir-carreira",
+        pr_heads={"42": "sha"}, pr_review_requests={},
+    )
+
+    assert count == 0
+    assert captured_emits == []
     assert new_rr == {}
 
 

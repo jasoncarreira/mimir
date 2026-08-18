@@ -1056,6 +1056,7 @@ def _check_issue_comments(
                 prompt,
                 token=token,
                 reviewer=me,
+                activity_at=comment.get("created_at"),
                 event_type="issue_comment",
                 repo=repo,
                 number=issue_num,
@@ -1103,6 +1104,7 @@ def _check_pr_review_comments(repo: str, since: str, token: str, me: str) -> int
             prompt,
             token=token,
             reviewer=me,
+            activity_at=comment.get("created_at"),
             event_type="pr_review_comment",
             repo=repo,
             number=pr_num,
@@ -1265,10 +1267,19 @@ def _check_pr_pushes(
                 # operator can re-request the reviewer after a completed
                 # review at the current head; in that case the request is
                 # already satisfied, so drop it from the retry cursor.
-                if current_sha and _has_current_head_review(
-                    repo, number, current_sha, me, token
-                ):
-                    continue
+                prior_review = None
+                if current_sha:
+                    prior_review = _latest_current_head_review(
+                        repo, number, current_sha, me, token,
+                    )
+                    if prior_review:
+                        requested_at = _latest_review_request_at(
+                            repo, number, me, token,
+                        )
+                        if not _activity_postdates_review(
+                            requested_at, prior_review,
+                        ):
+                            continue
 
                 # Recovery state separates turns that failed from turns still
                 # queued/running. Only real failures spend retry budget.
@@ -1314,6 +1325,20 @@ def _check_pr_pushes(
                                 f" — a prior review request produced no submitted "
                                 f"review; the turn may have failed). Submit the "
                                 f"review this time."
+                            )
+                        if prior_review:
+                            prior_state = str(
+                                prior_review.get("state") or "substantive"
+                            ).upper()
+                            prior_submitted_at = str(
+                                prior_review.get("submitted_at") or "unknown time"
+                            )
+                            status_line += (
+                                f" The head is unchanged since your prior "
+                                f"{prior_state} review submitted at "
+                                f"{prior_submitted_at}; re-evaluate that review "
+                                f"and the author's response rather than treating "
+                                f"this as a new code revision."
                             )
                         prompt = (
                             f"Review requested on {repo} PR #{number}: "
@@ -1388,22 +1413,41 @@ def _has_current_head_review(
     head_sha: str,
     reviewer: str,
     token: str,
+    *,
+    activity_at: object = None,
 ) -> bool:
-    """Return whether ``reviewer`` has submitted a review at ``head_sha``.
+    """Return whether a current-head review still satisfies this activity.
 
     GitHub normally clears a reviewer from ``requested_reviewers`` when they
     submit a review, but an operator can re-request the same reviewer after a
     completed current-head review. Treat APPROVED, CHANGES_REQUESTED, and
     COMMENTED as substantive submitted reviews so the review-request retry
-    loop does not page on an already-completed review. API failures return
-    False so the existing retry path still recovers genuinely missed reviews.
+    loop does not page on an already-completed review. Activity after the latest
+    such review is new information and no longer counts as satisfied.
     """
-    if not head_sha or not reviewer:
+    review = _latest_current_head_review(
+        repo, number, head_sha, reviewer, token,
+    )
+    if not review:
         return False
+    return not _activity_postdates_review(activity_at, review)
+
+
+def _latest_current_head_review(
+    repo: str,
+    number: int,
+    head_sha: str,
+    reviewer: str,
+    token: str,
+) -> dict | None:
+    """Return the reviewer's latest substantive review at ``head_sha``."""
+    if not head_sha or not reviewer:
+        return None
     data = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
     if not isinstance(data, list):
-        return False
+        return None
     substantive = {"APPROVED", "CHANGES_REQUESTED", "COMMENTED"}
+    matching: list[dict] = []
     for review in data:
         if not isinstance(review, dict):
             continue
@@ -1411,8 +1455,49 @@ def _has_current_head_review(
         state = str(review.get("state") or "").upper()
         commit_id = review.get("commit_id")
         if login == reviewer and commit_id == head_sha and state in substantive:
-            return True
-    return False
+            matching.append(review)
+    if not matching:
+        return None
+    return max(
+        matching,
+        key=lambda review: _parse_utc_datetime(
+            str(review.get("submitted_at") or "")
+        ) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+
+
+def _latest_review_request_at(
+    repo: str,
+    number: int,
+    reviewer: str,
+    token: str,
+) -> str | None:
+    """Return the latest timeline request timestamp for ``reviewer``."""
+    data = _gh_api(
+        f"repos/{repo}/issues/{number}/timeline?per_page=100", token,
+    )
+    if not isinstance(data, list):
+        return None
+    timestamps = [
+        str(event.get("created_at") or "")
+        for event in data
+        if isinstance(event, dict)
+        and event.get("event") == "review_requested"
+        and (event.get("requested_reviewer") or {}).get("login") == reviewer
+        and _parse_utc_datetime(str(event.get("created_at") or "")) is not None
+    ]
+    if not timestamps:
+        return None
+    return max(timestamps, key=lambda value: _parse_utc_datetime(value))
+
+
+def _activity_postdates_review(activity_at: object, review: dict) -> bool:
+    """Return whether a request or comment is newer than ``review``."""
+    if not isinstance(activity_at, str):
+        return False
+    activity_time = _parse_utc_datetime(activity_at)
+    review_time = _parse_utc_datetime(str(review.get("submitted_at") or ""))
+    return bool(activity_time and review_time and activity_time > review_time)
 
 
 def _emit_pr_review_needed(
@@ -1421,6 +1506,7 @@ def _emit_pr_review_needed(
     token: str,
     reviewer: str,
     current_head_reviewed: bool | None = None,
+    activity_at: object = None,
     **extras: object,
 ) -> bool:
     """Emit a PR work event unless ``reviewer`` reviewed its current head.
@@ -1428,7 +1514,10 @@ def _emit_pr_review_needed(
     All passes that can start a PR review turn flow through this choke point.
     Passes with a PR snapshot supply ``head_sha``; comment passes resolve the
     live PR so an old comment cannot make an already-reviewed head actionable.
-    API failures fail open, preserving review-request recovery semantics.
+    A comment after the latest current-head review is new information and may
+    start another turn. API failures fail open, preserving first-request
+    recovery semantics; missing or invalid activity timestamps fail closed once
+    a current-head review is known.
     """
     reviewed = current_head_reviewed
     if reviewed is None and reviewer:
@@ -1444,7 +1533,12 @@ def _emit_pr_review_needed(
             and number is not None
             and isinstance(head_sha, str)
             and _has_current_head_review(
-                repo, number, head_sha, reviewer, token
+                repo,
+                number,
+                head_sha,
+                reviewer,
+                token,
+                activity_at=activity_at,
             )
         )
     if reviewed:

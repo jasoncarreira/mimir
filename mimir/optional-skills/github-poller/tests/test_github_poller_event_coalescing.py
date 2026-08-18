@@ -238,6 +238,50 @@ def test_current_head_review_suppresses_a_later_poll_from_another_pass(
     assert [event["event_type"] for event in captured_emits] == ["pr_synchronize"]
 
 
+@pytest.mark.parametrize(
+    ("comment_created_at", "expected_count"),
+    [
+        ("2026-06-28T15:55:30Z", 1),
+        ("2026-06-28T15:47:00Z", 0),
+    ],
+)
+def test_pr_comment_is_actionable_only_after_current_head_review(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_emits: list[dict],
+    comment_created_at: str,
+    expected_count: int,
+) -> None:
+    comment = _comment(42)
+    comment["created_at"] = comment_created_at
+    comment["user"] = {"login": "alice"}
+
+    def fake_api(endpoint: str, token: str):
+        if "/issues/comments?" in endpoint:
+            return [comment]
+        if endpoint == "repos/o/r/issues/42":
+            return {"state": "open", "pull_request": {"url": "api/pr/42"}}
+        if endpoint == "repos/o/r/pulls/42":
+            return _pr(42, "head-sha")
+        if endpoint == "repos/o/r/pulls/42/reviews":
+            return [{
+                "user": {"login": "mimir-carreira"},
+                "commit_id": "head-sha",
+                "state": "CHANGES_REQUESTED",
+                "submitted_at": "2026-06-28T15:50:00Z",
+            }]
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(poller, "_gh_api", fake_api)
+    count = poller._check_issue_comments(
+        "o/r", SINCE, "t", "mimir-carreira",
+    )
+
+    assert count == expected_count
+    assert len(captured_emits) == expected_count
+    if expected_count:
+        assert captured_emits[0]["event_type"] == "issue_comment"
+
+
 def test_review_on_previous_head_does_not_suppress_updated_pr(
     monkeypatch: pytest.MonkeyPatch,
     captured_emits: list[dict],
