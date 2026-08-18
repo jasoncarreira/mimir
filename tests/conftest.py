@@ -31,6 +31,27 @@ SYNTHETIC_WORKLINK_UID = 42002
 SYNTHETIC_WORKLINK_GID = 42003
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _disable_git_auto_maintenance():
+    """Keep every test-created repository free of background maintenance."""
+    count = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+    names = (
+        "GIT_CONFIG_COUNT",
+        f"GIT_CONFIG_KEY_{count}",
+        f"GIT_CONFIG_VALUE_{count}",
+    )
+    saved = {name: os.environ[name] for name in names if name in os.environ}
+    os.environ["GIT_CONFIG_COUNT"] = str(count + 1)
+    os.environ[f"GIT_CONFIG_KEY_{count}"] = "maintenance.auto"
+    os.environ[f"GIT_CONFIG_VALUE_{count}"] = "false"
+    try:
+        yield
+    finally:
+        for name in names:
+            os.environ.pop(name, None)
+        os.environ.update(saved)
+
+
 @pytest.fixture(autouse=True)
 def synthetic_worklink_identities(monkeypatch):
     """Keep containment tests independent of deployment-local accounts.

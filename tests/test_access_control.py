@@ -7224,6 +7224,7 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
 ) -> None:
     root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
     pr = NormalizedPullRequestSnapshot(
+        repo="o/r",
         state="open",
         number=42,
         author="mimir-bot",
@@ -7275,6 +7276,7 @@ def test_server_discovered_changes_requested_review_mints_remediation_authority(
 ) -> None:
     _root, _authority, _item = _github_scope_test_setup(tmp_path, monkeypatch)
     pr = NormalizedPullRequestSnapshot(
+        repo="o/r",
         state="open", number=42, author="mimir-bot",
         head_repo="o/r", head_remote="origin", head_ref="worklink/42",
         head_sha="a" * 40, base_ref="main", base_sha="b" * 40,

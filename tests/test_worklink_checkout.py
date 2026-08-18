@@ -684,6 +684,53 @@ def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
     assert calls == [["git", "-C", str(repo), "branch", "-D", "issue/517-a1"]]
 
 
+@pytest.mark.parametrize("worker_authorized", [False, True])
+def test_isolated_cleanup_tolerates_checkout_removed_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_authorized: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    attempt = repo / ".worklink" / "517-1" / "checkout"
+    attempt.mkdir(parents=True)
+    victim = attempt / "maintenance.lock"
+    victim.write_text("lock\n")
+    real_unlink = os.unlink
+    raced = False
+
+    def unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal raced
+        if not raced and os.fsdecode(path) == victim.name:
+            raced = True
+            real_unlink(path, dir_fd=dir_fd)
+        real_unlink(path, dir_fd=dir_fd)
+
+    class SafeGit:
+        def run(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(checkout_module.os, "unlink", unlink)
+    lease = CheckoutLease(
+        517,
+        1,
+        repo,
+        attempt,
+        "issue/517-a1",
+        "main",
+        isolated_checkout=True,
+        worker_authorized=worker_authorized,
+    )
+
+    assert cleanup_checkout(
+        lease,
+        outcome="completed",
+        runner=lambda args: completed(args, returncode=1),
+        safe_git=SafeGit() if worker_authorized else None,
+    ) is True
+    assert raced
+    assert not (attempt.parent if worker_authorized else attempt).exists()
+
+
 def test_isolated_checkout_branch_pushes_from_checkout_not_parent(tmp_path: Path) -> None:
     # #518: the attempt branch + its commit live ONLY inside the isolated checkout
     # (own .git, origin already set). The PR push must run from the checkout, not
@@ -1093,7 +1140,7 @@ def test_normalization_preflight_leaves_valid_entries_unchanged_on_special_file(
 def test_authorized_cleanup_git_sink_inventory_is_closed() -> None:
     source = inspect.getsource(cleanup_checkout)
     authorized = source.split("if lease.worker_authorized:", 1)[1].split(
-        "shutil.rmtree(lease.path.parent)", 1
+        "rmtree_missing_ok(lease.path.parent)", 1
     )[0]
 
     assert 'safe_git.run("update-ref"' in authorized

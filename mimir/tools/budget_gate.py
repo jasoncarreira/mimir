@@ -113,12 +113,21 @@ def _resolve_standing_review(
         or not isinstance(arguments, Mapping)
     ):
         return None
-    from .forge import resolve_review_state_for_context
+    from .forge import (
+        revalidate_review_head_for_context,
+        resolve_review_state_for_context,
+    )
 
     try:
         resolve_review_state_for_context(
             auth_context, arguments.get("repository"), arguments.get("pull_request"),
         )
+        if tool_name == "pr_submit_review":
+            revalidate_review_head_for_context(
+                auth_context,
+                arguments.get("repository"),
+                arguments.get("pull_request"),
+            )
     except ToolException as exc:
         return str(exc)
     return None

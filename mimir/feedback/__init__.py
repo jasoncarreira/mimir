@@ -39,7 +39,12 @@ from ..jsonl_snapshot import (
     iter_snapshot_or_tail,
     iter_window_records,
 )
-from ..models import AuthContext, InformationFlowLabels, PromptBlock, SourceLabel
+from ..models import (
+    AuthContext,
+    InformationFlowLabels,
+    PromptBlock,
+)
+from .. import prompt_sources
 
 # --- Sub-module imports + backward-compat re-exports ---
 from ._models import (  # noqa: F401
@@ -93,6 +98,7 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "cross_turn_loop",
     "cross_turn_send_duplicate",
     "error",
+    "interactive_turn_no_send_message",
     "loop_stop",
     "loop_warn",
     "send_message_loop_hard_stop",
@@ -672,30 +678,60 @@ class FeedbackLog:
                 record_owner = _record_source_principal(record, auth_context)
                 principal = record_owner or service or requester
                 bridge = record.get("bridge") or record.get("source")
-                # The label ACL is an independent guard: user-owned records are
-                # readable by their owner, agent-self records by this requester's
-                # effective identity, and service turns by the prefixed service
-                # identity SinkGate uses.
+                # The label ACL is an independent guard.  An owning principal
+                # establishes the record ACL; privileged readers may relay those
+                # records under their effective service identity.  Principal-less
+                # records only gain that identity after the positive, server-side
+                # agent-self classification above.  Do not let an arbitrary
+                # ownerless record authorize its requester by construction.
                 acl_principals = {record_owner} if record_owner else set()
                 effective_requester = service or requester
-                if _is_privileged(auth_context) and effective_requester:
+                if effective_requester and (
+                    (_is_privileged(auth_context) and bool(record_owner))
+                    or (not record_owner and _is_agent_self_record(record))
+                ):
                     acl_principals.add(effective_requester)
-                elif not record_owner and effective_requester:
-                    acl_principals.add(effective_requester)
-                labels = labels.with_source(SourceLabel(
+                labels = labels.with_source(prompt_sources.prompt_source_label(
+                    auth_context,
                     principal=principal,
                     domain="feedback",
-                    resource_id=(
-                        record.get("channel_id")
-                        or auth_context.resource_id
-                        or auth_context.channel_id
-                        or f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}"
-                    ),
+                    resource=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+                    channel_id=record.get("channel_id"),
                     bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
-                    sensitivity="private",
                     authorized_principals=frozenset(acl_principals),
                     source_kind="protected_prompt",
-                    integrity_effect="informational",
+                    # Integrity from persisted server provenance, never from
+                    # record text. Trust requires POSITIVE agent-self
+                    # provenance — the same explicit kind allowlist
+                    # `_record_authorized` uses — not merely the absence of an
+                    # owning principal. Absent ownership is missing metadata,
+                    # not evidence of framework authorship: as
+                    # `_is_agent_self_record` documents, user-owned events such
+                    # as `commitment_due` are principal-less in legacy logs,
+                    # and their renderers embed LLM-extracted `text`
+                    # (renderers.py, chainlink #312). Non-privileged callers
+                    # never see those — `_record_authorized` drops them — but a
+                    # privileged or service context short-circuits to
+                    # `return True`, so an ownerless non-agent record reaches
+                    # this label and, keyed on absence alone, would carry
+                    # conversation-derived text as a TRUSTED source.
+                    #
+                    # A record attributable to a user may embed that user's own
+                    # input (turn records persist `input`), so it stays
+                    # untrusted either way.
+                    #
+                    # Omitting this entirely let SourceLabel's UNTRUSTED
+                    # default apply to the agent's own telemetry. The explicit
+                    # kind allowlist therefore controls both visibility to a
+                    # non-privileged agent and trusted provenance once the
+                    # record is admitted. In particular,
+                    # `interactive_turn_no_send_message` is framework-written
+                    # self-regulation data; without its allowlist entry the
+                    # agent silently loses that feedback rather than receiving
+                    # a complete trusted source.
+                    self_authored=(
+                        not record_owner and _is_agent_self_record(record)
+                    ),
                 ))
         return PromptBlock(content=content, labels=labels)
 

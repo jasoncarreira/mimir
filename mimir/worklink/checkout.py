@@ -16,6 +16,7 @@ import subprocess
 import sys
 from typing import Any, Callable, Sequence
 
+from .._rmtree import rmtree_missing_ok
 from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -1070,9 +1071,9 @@ def cleanup_checkout(
             safe_git.run("update-ref", "-d", f"refs/heads/{lease.branch}", check=True)
             if lease.authorization is not None:
                 lease.authorization.close()
-            shutil.rmtree(lease.path.parent)
+            rmtree_missing_ok(lease.path.parent)
             return True
-        shutil.rmtree(lease.path)
+        rmtree_missing_ok(lease.path)
         delete = runner(["git", "-C", str(lease.repo), "branch", "-D", lease.branch])
         # Isolated-checkout branches usually exist only inside the clone that was
         # just removed; deleting the same name from the parent repo is a tolerated
