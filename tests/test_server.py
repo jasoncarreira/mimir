@@ -45,7 +45,34 @@ from mimir.server import (
     _handle_event,
     _handle_root,
     build_app,
+    reattach_inflight_worklink_runs,
 )
+
+
+def test_server_startup_routes_factory_recovery_to_run_epic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+
+    record = SimpleNamespace(
+        issue_id=700,
+        controller_phase="running",
+        status=SimpleNamespace(is_terminal=False),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
+    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+    spawned: list[list[str]] = []
+
+    dispatched = reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+    )
+
+    assert dispatched == [700]
+    assert spawned[0][:4] == ["mimir", "worklink", "run-epic", "700"]
 
 
 def _production_call_sites(call_name: str) -> set[str]:

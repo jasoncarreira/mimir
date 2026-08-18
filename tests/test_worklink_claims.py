@@ -532,6 +532,27 @@ def test_duplicate_vs_live_final_attempt_never_labels_blocked():
     assert not any(call[1:3] == ["issue", "label"] for call in calls)
 
 
+def test_active_lock_count_supports_separate_epic_and_leaf_scopes() -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        args = list(args)
+        if args[1:4] == ["locks", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='{"locks":{"1":{"issue_id":1},"2":{"issue_id":2}}}',
+                stderr="",
+            )
+        if args[1:5] == ["issue", "list", "--label", "worklink:epic"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout='[{"id":2}]', stderr=""
+            )
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+    assert claims.active_worklink_lock_count(label="worklink:epic") == 1
+    assert claims.active_worklink_lock_count(exclude_label="worklink:epic") == 1
+
+
 def test_claim_issue_refuses_worklink_review_label() -> None:
     calls: list[list[str]] = []
 

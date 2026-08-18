@@ -1,376 +1,558 @@
-"""Feature-factory Worklink backend for worklink:epic issues (chainlink #833).
-
-A thin adapter that connects Chainlink epic issues to the external opencode
-feature-factory's **autonomous mode**. The factory self-drives every gate
-(story/brief self-approved when unambiguous; pre_pr decided by its own
-implementation-validator + security-reviewer panel), runs bounded remediation,
-never auto-merges, opens a PR, and writes ``run.json.terminal_result`` at a
-terminal state.
-
-The adapter's job is therefore thin: **launch ``factory start --autonomous
---detached`` once, poll ``run.json`` (the factory's own live control plane) to a
-terminal state, and mirror the outcome to Chainlink.** ``--detached`` backgrounds
-opencode and returns the launcher immediately, so the orchestrator does NOT hold
-the subprocess for the whole run — it launches, then polls ``run.json`` (a
-re-dispatch can resume polling a detached factory left running by a prior
-interrupted dispatch). There is no resume/gate-answer step — the factory
-self-drives one long run to a terminal state. This module owns the factory
-contract: the CLI argv and the ``run.json`` shape (incl. ``terminal_result``).
-The launch+poll+mirror loop lives in the orchestrator.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
-import shlex
-from typing import ClassVar
+import re
+import signal
+import subprocess
+import tempfile
+import threading
+from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
-FACTORY_DIR = ".opencode/factory"
-RUN_JSON = "run.json"
-GATES_DIR = "gates"
-QUESTION_SUFFIX = ".question.md"
-ANSWER_SUFFIX = ".answer"
+FACTORY_VERSION = "0.7.0"
+DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
+FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("init", ("init",)),
+    ("status", ("status",)),
+    ("amend-paths", ("amend-paths",)),
+    ("resume", ("resume",)),
+    ("lock", ("lock", "probe-run")),
+    ("heartbeat", ("heartbeat",)),
+    ("gate", ("gate",)),
+    ("step", ("step",)),
+    ("terminal", ("terminal",)),
+    ("slices-seed", ("slices-seed",)),
+    ("slice", ("slice",)),
+    ("observe", ("observe",)),
+    ("validator", ("validator",)),
+    ("pr", ("pr",)),
+    ("reverify-repair", ("reverify-repair",)),
+    ("effective-push", ("effective-push",)),
+)
+_UNKNOWN_PROBE = "__mimir_unknown_command_probe__"
+_MAX_DIAGNOSTIC_BYTES = 64 * 1024
+_MAX_STATUS_BYTES = 1024 * 1024
+_MAX_LIST_ITEMS = 1000
+_MAX_TEXT_BYTES = 16 * 1024
+_MAX_JSON_DEPTH = 32
+_ARGUMENT_STRUCTURE = re.compile(
+    r"(?im)(?:^\s*usage\s*:|\b(?:argument|option|operand|required|requires|missing|expected)\b)"
+)
+_UNKNOWN_STRUCTURE = re.compile(r"(?im)\b(?:unknown|unrecognized)\b[^\n]*\bcommand\b")
 
-# Heartbeat staleness threshold (seconds). A run.json whose ``heartbeat_at`` is
-# older than this — or unparseable/absent — is treated as a stuck factory.
-STALE_THRESHOLD_S = 300
+Runner = Callable[..., subprocess.CompletedProcess[Any]]
 
 
-@dataclass(frozen=True)
-class FactoryTerminalResult:
-    """Parsed view of ``run.json.terminal_result`` — the factory's authoritative
-    outcome, written once the autonomous run reaches a terminal state.
-
-    ``status`` mirrors the run status at termination (``completed`` |
-    ``blocked`` | ``partial`` | ``needs-human``). ``pr_url`` is the draft PR the
-    factory opened (present on a shippable ``completed``). ``reason``/``summary``
-    are the human-readable outcome the adapter surfaces on a non-shippable
-    terminal transition.
-    """
-
-    status: str
-    pr_url: str | None = None
-    reason: str | None = None
-    summary: str | None = None
-
-
-@dataclass(frozen=True)
-class FactoryCostSummary:
-    """Fail-soft public summary of ``run.json.cost_attribution``.
-
-    The 0.2.1 package treats cost attribution as diagnostic metadata rather
-    than billing authority.  Keep the normalized surface small and preserve
-    missing values as ``None`` rather than inventing zeroes.
-    """
-
-    status: str
-    updated_at: str | None = None
-    entry_count: int | None = None
-    request_count: int | None = None
-    total_tokens: int | None = None
-    cost_total: float | None = None
-    cost_currency: str | None = None
-    mixed_currency: bool = False
-    missing: tuple[str, ...] = ()
+class FactoryContractError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
-class FactoryDebugSummary:
-    """Fail-soft summary of optional ``run.json.debug_snapshot`` metadata."""
-
-    created_at: str | None = None
-    resumed_at: str | None = None
-    resume_count: int | None = None
-
-
-@dataclass(frozen=True)
-class FactoryRunState:
-    """Parsed view of the factory's ``run.json`` control plane.
-
-    Matches the REAL factory contract (there is no ``schema_version`` and no
-    top-level ``gates_needed``): gates live under ``gates.<name>.status``, the
-    panel verdicts under ``validator.verdict`` / ``security_review.verdict``,
-    work progress under ``steps[].{agent,status}`` and
-    ``slices[].{id,status}``, diagnostic metadata under ``cost_attribution`` /
-    ``debug_snapshot``, and — at a terminal state — the authoritative outcome
-    under ``terminal_result``.
-    """
-
+class FactoryStatus:
     run_id: str
+    issue_key: str
+    valid: bool
+    sandbox_path: str
     status: str
-    heartbeat_at: str
-    pr_url: str | None = None
-    # (gate-name, status) pairs, order-preserving, as read from run.json ``gates``.
-    gate_statuses: tuple[tuple[str, str], ...] = ()
-    # (step-agent, status) pairs, order-preserving, from run.json ``steps``.
-    steps: tuple[tuple[str, str], ...] = ()
-    # (slice-id, status) pairs, order-preserving, from run.json ``slices``.
-    slices: tuple[tuple[str, str], ...] = ()
-    validator_verdict: str | None = None
-    security_verdict: str | None = None
-    error: str | None = None
-    # Optional display/diagnostic metadata. Malformed values degrade to None or
-    # an empty tuple; they never participate in completion authority.
-    cost: FactoryCostSummary | None = None
-    debug: FactoryDebugSummary | None = None
-    # Present only at a terminal state (agent-written; may be absent even then —
-    # the adapter falls back to status/pr_url/gates when it is None).
-    terminal_result: FactoryTerminalResult | None = None
+    mode: str
+    branch: str
+    pr_base: str
+    pr_draft: bool
+    lock: str
+    dead_lock: bool
+    lock_session: str | None
+    gates: dict[str, Any]
+    steps: tuple[str, ...]
+    slices: tuple[str, ...]
+    validator: dict[str, Any] | None
+    pr_url: str | None
+    terminal_result: dict[str, Any] | None
+    next: str | None = None
+    next_present: bool = False
 
-    # Gate order the factory presents them in (story -> brief -> pre_pr).
-    GATE_ORDER: ClassVar[tuple[str, ...]] = ("story", "brief", "pre_pr")
-    # Statuses that mean "no more gates will open on their own". ``running`` is
-    # the only non-terminal status; ``blocked``/``partial``/``needs-human`` are
-    # terminal-needs-human, ``completed`` is the success terminal.
     TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset(
-        {"completed", "blocked", "partial", "needs-human"}
+        {"completed", "blocked", "partial"}
     )
-
-    @property
-    def pending_gate(self) -> str | None:
-        """The first pending gate in canonical order, or the first pending gate
-        the factory added beyond the known set."""
-        statuses = {name: status for name, status in self.gate_statuses}
-        for name in self.GATE_ORDER:
-            if (statuses.get(name) or "").strip().lower() == "pending":
-                return name
-        for name, status in self.gate_statuses:
-            if (status or "").strip().lower() == "pending":
-                return name
-        return None
 
     @property
     def is_terminal(self) -> bool:
-        return self.status.strip().lower() in self.TERMINAL_STATUSES
+        return self.status in self.TERMINAL_STATUSES
 
     @property
-    def is_stale(self) -> bool:
+    def is_parked(self) -> bool:
+        return self.status == "needs-human"
+
+    def require_recovery_next(self) -> str:
+        if not self.next_present or self.next is None:
+            raise FactoryContractError("factory status recovery requires a nonblank next action")
+        return self.next
+
+    def to_json(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "run_id": self.run_id,
+            "issue_key": self.issue_key,
+            "valid": self.valid,
+            "sandbox_path": self.sandbox_path,
+            "status": self.status,
+            "mode": self.mode,
+            "branch": self.branch,
+            "pr_base": self.pr_base,
+            "pr_draft": self.pr_draft,
+            "lock": self.lock,
+            "dead_lock": self.dead_lock,
+            "lock_session": self.lock_session,
+            "gates": self.gates,
+            "steps": list(self.steps),
+            "slices": list(self.slices),
+            "validator": self.validator,
+            "pr_url": self.pr_url,
+            "terminal_result": self.terminal_result,
+        }
+        if self.next_present:
+            payload["next"] = self.next
+        return payload
+
+
+_REQUIRED_STATUS_FIELDS = frozenset(
+    {
+        "run_id",
+        "issue_key",
+        "valid",
+        "sandbox_path",
+        "status",
+        "mode",
+        "branch",
+        "pr_base",
+        "pr_draft",
+        "lock",
+        "dead_lock",
+        "lock_session",
+        "gates",
+        "steps",
+        "slices",
+        "validator",
+        "pr_url",
+        "terminal_result",
+    }
+)
+_STATUS_FIELDS = _REQUIRED_STATUS_FIELDS | {"next"}
+
+
+def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise FactoryContractError(f"factory status {name} must be a nonblank string")
+    text = value.strip()
+    if len(text.encode("utf-8")) > _MAX_TEXT_BYTES or "\x00" in text:
+        raise FactoryContractError(f"factory status {name} is invalid")
+    return text
+
+
+def _bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise FactoryContractError(f"factory status {name} must be a boolean")
+    return value
+
+
+def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[str, Any] | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, dict):
+        raise FactoryContractError(f"factory status {name} must be an object")
+    _validate_json_value(value, name=name)
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise FactoryContractError(f"factory status {name} is not valid JSON") from exc
+    if len(encoded) > _MAX_STATUS_BYTES:
+        raise FactoryContractError(f"factory status {name} exceeds size limit")
+    return dict(value)
+
+
+def _compact_strings(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
+        raise FactoryContractError(f"factory status {name} must be a bounded string list")
+    result: list[str] = []
+    for item in value:
+        text = _bounded_text(item, name)
+        assert text is not None
+        result.append(text)
+    return tuple(result)
+
+
+def _validate_json_value(value: object, *, name: str, depth: int = 0) -> None:
+    if depth > _MAX_JSON_DEPTH:
+        raise FactoryContractError(f"factory status {name} exceeds nesting limit")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise FactoryContractError(f"factory status {name} is not finite JSON")
+    if isinstance(value, dict):
+        if len(value) > _MAX_LIST_ITEMS or not all(isinstance(key, str) for key in value):
+            raise FactoryContractError(f"factory status {name} exceeds cardinality limit")
+        for item in value.values():
+            _validate_json_value(item, name=name, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > _MAX_LIST_ITEMS:
+            raise FactoryContractError(f"factory status {name} exceeds cardinality limit")
+        for item in value:
+            _validate_json_value(item, name=name, depth=depth + 1)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON value: {value}")
+
+
+def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactoryStatus:
+    if isinstance(payload, bytes):
+        if len(payload) > _MAX_STATUS_BYTES or b"\x00" in payload:
+            raise FactoryContractError("factory status output exceeds bounds")
         try:
-            heartbeat = datetime.fromisoformat(self.heartbeat_at.replace("Z", "+00:00"))
-        except (ValueError, TypeError, AttributeError):
-            return True
-        if heartbeat.tzinfo is None:
-            heartbeat = heartbeat.replace(tzinfo=UTC)
-        return (datetime.now(UTC) - heartbeat).total_seconds() > STALE_THRESHOLD_S
-
-
-def _parse_gate_statuses(gates: object) -> tuple[tuple[str, str], ...]:
-    if not isinstance(gates, dict):
-        return ()
-    parsed: list[tuple[str, str]] = []
-    for name, spec in gates.items():
-        if isinstance(spec, dict):
-            status = str(spec.get("status") or "")
-        elif isinstance(spec, str):
-            status = spec
-        else:
-            status = ""
-        parsed.append((str(name), status))
-    return tuple(parsed)
-
-
-def _parse_items(
-    items: object,
-    *,
-    identity_key: str,
-) -> tuple[tuple[str, str], ...]:
-    if not isinstance(items, list):
-        return ()
-    parsed: list[tuple[str, str]] = []
-    for item in items:
-        if isinstance(item, dict):
-            parsed.append(
-                (str(item.get(identity_key) or ""), str(item.get("status") or ""))
-            )
-    return tuple(parsed)
-
-
-def _optional_text(value: object) -> str | None:
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _optional_nonnegative_int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-
-
-def _optional_number(value: object) -> float | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-        return float(value)
-    return None
-
-
-def _parse_cost_summary(cost: object) -> FactoryCostSummary | None:
-    """Normalize the package's optional diagnostic ``cost_attribution`` block."""
-    if not isinstance(cost, dict):
-        return None
-    totals = cost.get("totals")
-    if not isinstance(totals, dict):
-        totals = {}
-    missing = totals.get("missing", cost.get("missing"))
-    return FactoryCostSummary(
-        status=_optional_text(cost.get("status") or totals.get("status")) or "unavailable",
-        updated_at=_optional_text(cost.get("updated_at")),
-        entry_count=_optional_nonnegative_int(totals.get("entry_count")),
-        request_count=_optional_nonnegative_int(totals.get("request_count")),
-        total_tokens=_optional_nonnegative_int(totals.get("total_tokens")),
-        cost_total=_optional_number(totals.get("cost_total")),
-        cost_currency=_optional_text(totals.get("cost_currency")),
-        mixed_currency=totals.get("mixed_currency") is True,
-        missing=tuple(str(item) for item in missing) if isinstance(missing, list) else (),
-    )
-
-
-def _snapshot_time(snapshot: object) -> str | None:
-    return _optional_text(snapshot.get("collected_at")) if isinstance(snapshot, dict) else None
-
-
-def _parse_debug_summary(debug: object) -> FactoryDebugSummary | None:
-    """Normalize optional creation/resume diagnostics without retaining env data."""
-    if not isinstance(debug, dict):
-        return None
-    return FactoryDebugSummary(
-        created_at=_snapshot_time(debug.get("created_with")),
-        resumed_at=_snapshot_time(debug.get("last_resumed_with")),
-        resume_count=_optional_nonnegative_int(debug.get("resume_count")),
-    )
-
-
-def _parse_terminal_result(data: dict) -> FactoryTerminalResult | None:
-    """Parse ``run.json.terminal_result`` — None when absent or malformed.
-
-    Absent is normal for a still-running run and tolerated even at a terminal
-    state (it is agent-written): the adapter falls back to status/pr_url/gates.
-    """
-    tr = data.get("terminal_result")
-    if not isinstance(tr, dict):
-        return None
-    status = str(tr.get("status") or "").strip()
-    if not status:
-        return None
-
-    def _clean(key: str) -> str | None:
-        value = tr.get(key)
-        return value.strip() if isinstance(value, str) and value.strip() else None
-
-    return FactoryTerminalResult(
-        status=status,
-        pr_url=_clean("pr_url"),
-        reason=_clean("reason"),
-        summary=_clean("summary"),
-    )
-
-
-def _panel_verdict(panel: object) -> str | None:
-    if isinstance(panel, dict):
-        verdict = panel.get("verdict")
-        if isinstance(verdict, str) and verdict.strip():
-            return verdict.strip().upper()
-    return None
-
-
-def _blocked_reason(data: dict) -> str | None:
-    for key in ("blocked_reason", "reason", "error"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _is_valid_pr_url(pr_url: str | None) -> bool:
-    """Validate a canonical PR URL per the 0.2.1 contract.
-
-    A valid PR URL must be a non-empty string matching the pattern
-    ``https://github.com/<owner>/<repo>/pull/<number>``.
-    """
-    if not pr_url or not isinstance(pr_url, str):
-        return False
-    pr_url = pr_url.strip()
-    if not pr_url:
-        return False
-    if not pr_url.startswith("https://github.com/"):
-        return False
-    if "/pull/" not in pr_url:
-        return False
-    return True
-
-
-def _parse_run_state(data: object) -> FactoryRunState | None:
-    """Parse a decoded ``run.json`` payload into a FactoryRunState.
-
-    Returns None only when the payload is not a JSON object — a missing/empty
-    ``heartbeat_at`` is preserved (``is_stale`` handles it) rather than dropped,
-    so a stuck factory surfaces as stale instead of vanishing.
-    """
-    if not isinstance(data, dict):
-        return None
-    pr_url = data.get("pr_url")
-    if not isinstance(pr_url, str) or not pr_url.strip():
-        pr_url = None
+            payload = payload.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise FactoryContractError("factory status output is not UTF-8") from exc
+    if isinstance(payload, str):
+        if len(payload.encode("utf-8")) > _MAX_STATUS_BYTES or "\x00" in payload:
+            raise FactoryContractError("factory status output exceeds bounds")
+        try:
+            decoded = json.loads(payload, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise FactoryContractError("factory status output is not one JSON object") from exc
     else:
-        pr_url = pr_url.strip()
-    return FactoryRunState(
-        run_id=str(data.get("run_id") or ""),
-        status=str(data.get("status") or "unknown"),
-        heartbeat_at=str(data.get("heartbeat_at") or ""),
-        pr_url=pr_url,
-        gate_statuses=_parse_gate_statuses(data.get("gates")),
-        steps=_parse_items(data.get("steps"), identity_key="agent"),
-        slices=_parse_items(data.get("slices"), identity_key="id"),
-        validator_verdict=_panel_verdict(data.get("validator")),
-        security_verdict=_panel_verdict(data.get("security_review")),
-        error=_blocked_reason(data),
-        cost=_parse_cost_summary(data.get("cost_attribution")),
-        debug=_parse_debug_summary(data.get("debug_snapshot")),
-        terminal_result=_parse_terminal_result(data),
+        decoded = payload
+    if not isinstance(decoded, Mapping):
+        raise FactoryContractError("factory status must be a JSON object")
+    _validate_json_value(decoded, name="payload")
+    try:
+        encoded = json.dumps(
+            decoded,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise FactoryContractError("factory status output is not one JSON object") from exc
+    if len(encoded) > _MAX_STATUS_BYTES:
+        raise FactoryContractError("factory status output exceeds bounds")
+    keys = set(decoded)
+    missing = _REQUIRED_STATUS_FIELDS - keys
+    unknown = keys - _STATUS_FIELDS
+    if missing:
+        raise FactoryContractError(f"factory status missing field: {sorted(missing)[0]}")
+    if unknown:
+        raise FactoryContractError(f"factory status contains unknown field: {sorted(unknown)[0]}")
+    lock = _bounded_text(decoded["lock"], "lock")
+    if lock not in {"fresh", "stale", "absent"}:
+        raise FactoryContractError("factory status lock must be fresh, stale, or absent")
+    next_present = "next" in decoded
+    next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
+    return FactoryStatus(
+        run_id=_bounded_text(decoded["run_id"], "run_id") or "",
+        issue_key=_bounded_text(decoded["issue_key"], "issue_key") or "",
+        valid=_bool(decoded["valid"], "valid"),
+        sandbox_path=_bounded_text(decoded["sandbox_path"], "sandbox_path") or "",
+        status=_bounded_text(decoded["status"], "status") or "",
+        mode=_bounded_text(decoded["mode"], "mode") or "",
+        branch=_bounded_text(decoded["branch"], "branch") or "",
+        pr_base=_bounded_text(decoded["pr_base"], "pr_base") or "",
+        pr_draft=_bool(decoded["pr_draft"], "pr_draft"),
+        lock=lock,
+        dead_lock=_bool(decoded["dead_lock"], "dead_lock"),
+        lock_session=_bounded_text(decoded["lock_session"], "lock_session", nullable=True),
+        gates=_opaque_dict(decoded["gates"], "gates") or {},
+        steps=_compact_strings(decoded["steps"], "steps"),
+        slices=_compact_strings(decoded["slices"], "slices"),
+        validator=_opaque_dict(decoded["validator"], "validator", nullable=True),
+        pr_url=_bounded_text(decoded["pr_url"], "pr_url", nullable=True),
+        terminal_result=_opaque_dict(
+            decoded["terminal_result"], "terminal_result", nullable=True
+        ),
+        next=next_value,
+        next_present=next_present,
     )
+
+
+def _read_manifest(path: Path, expected_name: str) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise FactoryContractError(f"cannot read {expected_name} package manifest") from exc
+    if len(raw) > _MAX_STATUS_BYTES or b"\x00" in raw:
+        raise FactoryContractError(f"invalid {expected_name} package manifest")
+    try:
+        data = json.loads(
+            raw.decode("utf-8", "strict"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise FactoryContractError(f"invalid {expected_name} package manifest") from exc
+    if not isinstance(data, dict):
+        raise FactoryContractError(f"invalid {expected_name} package manifest")
+    if data.get("name") != expected_name or data.get("version") != FACTORY_VERSION:
+        raise FactoryContractError(
+            f"requires {expected_name}@{FACTORY_VERSION}"
+        )
+    return data
+
+
+def resolve_factory_entrypoint(configured: str | Path) -> Path:
+    raw = Path(configured)
+    if not raw.is_absolute():
+        raise FactoryContractError("feature_factory.entrypoint must be an absolute path")
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise FactoryContractError("feature_factory entrypoint does not exist") from exc
+    if not resolved.is_file() or resolved.name != "factory.js" or resolved.parent.name != "bin":
+        raise FactoryContractError("feature_factory entrypoint must name bin/factory.js")
+    package_root = resolved.parent.parent
+    if package_root.name != "feature-factory":
+        raise FactoryContractError("feature_factory entrypoint is not package-bound")
+    _read_manifest(package_root / "package.json", "feature-factory")
+    _read_manifest(package_root.parent / "opencode-feature-factory" / "package.json", "opencode-feature-factory")
+    return resolved
+
+
+def _tree_manifest(root: Path) -> tuple[tuple[str, str, str], ...]:
+    rows: list[tuple[str, str, str]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            rows.append((relative, "symlink", os.readlink(path)))
+        elif path.is_dir():
+            rows.append((relative, "dir", ""))
+        elif path.is_file():
+            rows.append((relative, "file", hashlib.sha256(path.read_bytes()).hexdigest()))
+        else:
+            rows.append((relative, "other", ""))
+    return tuple(rows)
+
+
+def _strict_diagnostic(result: subprocess.CompletedProcess[Any]) -> str:
+    chunks: list[bytes] = []
+    for value in (result.stdout, result.stderr):
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.encode("utf-8", "strict")
+        if not isinstance(value, bytes):
+            raise FactoryContractError("factory capability probe returned invalid output")
+        chunks.append(value)
+    raw = b"\n".join(chunks)
+    if len(raw) > _MAX_DIAGNOSTIC_BYTES or b"\x00" in raw:
+        raise FactoryContractError("factory capability probe output exceeds bounds")
+    try:
+        return raw.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise FactoryContractError("factory capability probe output is not UTF-8") from exc
+
+
+def _terminate_bounded_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _run_bounded(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    output_limit: int,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        start_new_session=True,
+    )
+    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    lock = threading.Lock()
+    overflow = threading.Event()
+
+    def drain(name: str, stream: Any) -> None:
+        nonlocal total
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            with lock:
+                remaining = output_limit - total
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    retained[name].extend(kept)
+                    total += len(kept)
+                if len(chunk) > max(remaining, 0) and not overflow.is_set():
+                    overflow.set()
+                    _terminate_bounded_process(process)
+
+    threads = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_bounded_process(process)
+        process.wait()
+        for thread in threads:
+            thread.join(timeout=1)
+        raise
+    for thread in threads:
+        thread.join(timeout=1)
+    if any(thread.is_alive() for thread in threads):
+        _terminate_bounded_process(process)
+        for thread in threads:
+            thread.join(timeout=1)
+    if any(thread.is_alive() for thread in threads):
+        raise FactoryContractError("factory command output could not be drained")
+    if overflow.is_set():
+        raise FactoryContractError("factory command output exceeds bounds")
+    return subprocess.CompletedProcess(
+        list(args),
+        process.returncode,
+        stdout=bytes(retained["stdout"]),
+        stderr=bytes(retained["stderr"]),
+    )
+
+
+def _invoke_bounded_or_injected(
+    runner: Runner,
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    output_limit: int,
+) -> subprocess.CompletedProcess[Any]:
+    if runner is subprocess.run:
+        return _run_bounded(
+            args,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            output_limit=output_limit,
+        )
+    return runner(
+        list(args),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+        shell=False,
+        start_new_session=True,
+    )
+
+
+def _probe_environment(root: Path) -> dict[str, str]:
+    path = os.environ.get("PATH", "")
+    return {
+        "PATH": path,
+        "HOME": str(root / "home"),
+        "XDG_CONFIG_HOME": str(root / "xdg-config"),
+        "XDG_DATA_HOME": str(root / "xdg-data"),
+        "XDG_CACHE_HOME": str(root / "xdg-cache"),
+        "TMPDIR": str(root / "tmp"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def probe_factory_capabilities(entrypoint: Path, *, runner: Runner = subprocess.run) -> None:
+    with tempfile.TemporaryDirectory(prefix="mimir-factory-probe-") as temporary:
+        root = Path(temporary)
+        repo = root / "repo"
+        repo.mkdir()
+        for name in ("home", "xdg-config", "xdg-data", "xdg-cache", "tmp"):
+            (root / name).mkdir()
+        baseline = _tree_manifest(repo)
+
+        def invoke(args: Sequence[str]) -> tuple[subprocess.CompletedProcess[Any], str]:
+            try:
+                result = _invoke_bounded_or_injected(
+                    runner,
+                    ["node", str(entrypoint), *args],
+                    cwd=repo,
+                    env=_probe_environment(root),
+                    timeout=5,
+                    output_limit=_MAX_DIAGNOSTIC_BYTES,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise FactoryContractError("factory capability probe timed out") from exc
+            if _tree_manifest(repo) != baseline:
+                raise FactoryContractError("factory capability probe mutated its scratch repository")
+            if result.returncode <= 0:
+                raise FactoryContractError("factory capability probe did not fail normally")
+            return result, _strict_diagnostic(result)
+
+        _, unknown = invoke((_UNKNOWN_PROBE,))
+        if _UNKNOWN_PROBE not in unknown or _UNKNOWN_STRUCTURE.search(unknown) is None:
+            raise FactoryContractError("factory unknown-command control was not structural")
+        unknown_form = unknown.replace(_UNKNOWN_PROBE, "{command}")
+        for command, argv in FACTORY_COMMANDS:
+            _, diagnostic = invoke(argv)
+            token = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(command)}(?![A-Za-z0-9_-])")
+            if token.search(diagnostic) is None or _ARGUMENT_STRUCTURE.search(diagnostic) is None:
+                raise FactoryContractError(f"factory capability probe failed for {command}")
+            if _UNKNOWN_STRUCTURE.search(diagnostic) is not None:
+                raise FactoryContractError(f"factory capability probe treated {command} as unknown")
+            normalized = token.sub("{command}", diagnostic)
+            if normalized == unknown_form or normalized.startswith(unknown_form):
+                raise FactoryContractError(f"factory capability probe matched unknown form for {command}")
 
 
 @dataclass(frozen=True)
 class FeatureFactoryBackend:
-    """Adapter for opencode feature-factory Worklink jobs (autonomous mode).
-
-    Builds the factory's autonomous CLI invocation for a worklink:epic issue.
-    The factory self-drives every gate and writes ``run.json``; the orchestrator
-    launches once, observes, and mirrors the outcome. This backend only shapes
-    the argv and reads the factory's run.json.
-
-    ``bin`` may be multi-token (e.g. ``"node /path/to/src/cli.js"``): the
-    feature-factory CLI is not necessarily on PATH, so it is shlex-split when the
-    command is assembled.
-
-    ``ready_for_review`` (default on) adds ``--ready`` so the factory opens a
-    ready-for-review PR rather than a draft — the mimir flow wants review-ready.
-    ``reviewer`` (default from ``MIMIR_FACTORY_REVIEWER``) adds ``--reviewer
-    <name>`` so the factory requests review itself; empty omits the flag.
-    """
-
-    bin: str = "feature-factory"
-    extra_args: tuple[str, ...] = field(default_factory=tuple)
+    entrypoint: str = field(
+        default_factory=lambda: os.environ.get(
+            "MIMIR_FACTORY_ENTRYPOINT", DEFAULT_FACTORY_ENTRYPOINT
+        )
+    )
     name: str = "feature_factory"
     checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
-    heartbeat_interval_s: int = 60
     poll_interval_s: int = 10
-    ready_for_review: bool = True
-    reviewer: str = field(
-        default_factory=lambda: os.environ.get("MIMIR_FACTORY_REVIEWER", "mimir-carreira")
-    )
+    runner: Runner = field(default=subprocess.run, compare=False, repr=False)
 
     def capabilities(self) -> Caps:
         return Caps(
             tool_category="feature-factory",
             persistent_sessions=True,
-            json_output=False,
-            native_pr_creation=False,
+            json_output=True,
+            native_pr_creation=True,
             quota_pool=None,
         )
+
+    def admit(self) -> Path:
+        resolved = resolve_factory_entrypoint(self.entrypoint)
+        probe_factory_capabilities(resolved, runner=self.runner)
+        return resolved
 
     def work_spec(
         self,
@@ -382,10 +564,7 @@ class FeatureFactoryBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
-        factory_path = order.checkout / FACTORY_DIR
-        run_json_path = factory_path / RUN_JSON
-        command = self._factory_command(order.checkout, order.prompt, order.issue_id)
-
+        command = self.opencode_argv(order.checkout, order.issue_id)
         return WorkSpec(
             issue_id=order.issue_id,
             attempt=attempt,
@@ -398,202 +577,143 @@ class FeatureFactoryBackend:
             backend=self.name,
             timeout_s=order.timeout_s,
             env=order.env,
-            backend_config={
-                "bin": self.bin,
-                "args": list(self.extra_args),
-                "factory_path": str(factory_path),
-                "run_json_path": str(run_json_path),
-            },
+            backend_config={"entrypoint": str(self.entrypoint)},
             local_checkout=order.checkout,
             local_argv=command,
         )
 
-    def _bin_tokens(self) -> tuple[str, ...]:
-        return tuple(shlex.split(self.bin)) if self.bin.strip() else ()
+    @staticmethod
+    def opencode_argv(operator_checkout: Path, issue_number: int) -> tuple[str, ...]:
+        return (
+            "opencode",
+            "run",
+            "--log-level",
+            "DEBUG",
+            "--print-logs",
+            "--dir",
+            str(operator_checkout),
+            "--command",
+            "feature",
+            f" --autonomous {issue_number}",
+        )
 
-    def _factory_command(self, checkout: Path, prompt: str, issue_id: int) -> tuple[str, ...]:
-        """Autonomous DETACHED factory START argv.
+    def _control(
+        self,
+        launcher: str | Path,
+        args: Sequence[str],
+        *,
+        sandbox: Path,
+    ) -> subprocess.CompletedProcess[Any]:
+        entrypoint = resolve_factory_entrypoint(launcher)
+        try:
+            result = _invoke_bounded_or_injected(
+                self.runner,
+                ["node", str(entrypoint), *args],
+                cwd=sandbox,
+                env=_control_environment(),
+                timeout=30,
+                output_limit=_MAX_STATUS_BYTES,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise FactoryContractError("factory control command timed out") from exc
+        _strict_diagnostic(result)
+        if result.returncode != 0:
+            detail = _strict_diagnostic(result)
+            raise FactoryContractError(detail or f"factory control exited {result.returncode}")
+        return result
 
-        ``<bin...> factory start --autonomous --detached --repo <checkout>
-        --run-id chainlink-<issue> [extra_args] [--ready] [--reviewer <name>]
-        <prompt>``. ``--run-id`` is an argv boundary (not prompt text) so the factory
-        namespaces its control plane under the expected ``.opencode/factory/<run-id>/``
-        directory that the adapter then observes. ``--detached`` makes the CLI spawn
-        opencode BACKGROUNDED (``detached``/``unref``'d, logging to
-        ``.opencode/factory/processes/<ts>.log``) and RETURN IMMEDIATELY — the launcher
-        exits while the autonomous run keeps going, so the orchestrator polls
-        ``run.json`` to a terminal state rather than holding the subprocess for the
-        whole run (and a re-dispatch can resume polling a still-running detached
-        factory). There is no resume/gate-answer step: the factory self-drives every
-        gate and writes ``run.json.terminal_result`` at a terminal state. The
-        factory's opencode PREFERS the codex OAuth subscription when available
-        (codex-auth plugin) and falls back to ``OPENAI_API_KEY`` only if that OAuth
-        is absent.
-        """
-        run_id = epic_run_id(issue_id)
-        argv: list[str] = [
-            *self._bin_tokens(),
-            "factory",
-            "start",
-            "--autonomous",
-            "--detached",
-            "--repo",
-            str(checkout),
-            "--run-id",
-            run_id,
-            *self.extra_args,
-        ]
-        if self.ready_for_review:
-            argv.append("--ready")
-        if self.reviewer.strip():
-            argv.extend(["--reviewer", self.reviewer.strip()])
-        argv.append(prompt)
-        return tuple(argv)
+    def status(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> FactoryStatus:
+        result = self._control(
+            launcher,
+            ("status", run_id, "--repo", str(sandbox), "--json"),
+            sandbox=sandbox,
+        )
+        stdout = result.stdout if result.stdout is not None else b""
+        return parse_factory_status(stdout)
 
-    def _read_run_json(self, checkout: Path, run_id: str) -> FactoryRunState | None:
-        return read_factory_run_state(checkout, run_id)
+    def resume(
+        self,
+        run_id: str,
+        *,
+        session: str,
+        sandbox: Path,
+        launcher: str | Path,
+    ) -> FactoryStatus:
+        self._control(
+            launcher,
+            ("resume", run_id, "--session", session, "--repo", str(sandbox)),
+            sandbox=sandbox,
+        )
+        return self.status(run_id, sandbox=sandbox, launcher=launcher)
+
+    def heartbeat(
+        self,
+        run_id: str,
+        *,
+        session: str,
+        sandbox: Path,
+        launcher: str | Path,
+    ) -> None:
+        self._control(
+            launcher,
+            ("heartbeat", run_id, "--session", session, "--repo", str(sandbox)),
+            sandbox=sandbox,
+        )
+
+    def lock(
+        self,
+        run_id: str,
+        action: str,
+        *,
+        session: str,
+        sandbox: Path,
+        launcher: str | Path,
+    ) -> None:
+        if action not in {"claim", "steal", "release"}:
+            raise ValueError("factory lock action must be claim, steal, or release")
+        self._control(
+            launcher,
+            ("lock", run_id, action, "--session", session, "--repo", str(sandbox)),
+            sandbox=sandbox,
+        )
 
     async def interpret(self, order: WorkOrder, result: object) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("FeatureFactoryBackend.interpret expects ComputeResult")
-
         if result.launch_error:
             return RawResult(-1, None, "backend_error", result.launch_error)
+        if result.timed_out:
+            return RawResult(-1, None, "failed", "OpenCode process timed out")
+        if result.exit_code != 0:
+            return RawResult(result.exit_code, None, "failed", result.stderr or None)
+        return RawResult(0, None, "interrupted", None)
 
-        expected_run_id = epic_run_id(order.issue_id)
-        state = self._read_run_json(order.checkout, expected_run_id)
-        if state is None:
-            return RawResult(-1, None, "failed", "factory run.json not found")
-        if state.is_stale:
-            return RawResult(-1, None, "stale_heartbeat", f"factory heartbeat stale: {state.heartbeat_at}")
 
-        if state.run_id != expected_run_id:
-            return RawResult(
-                -1,
-                None,
-                "failed",
-                f"run-id mismatch: expected {expected_run_id}, got {state.run_id}",
-            )
-
-        status = state.status.strip().lower()
-        if status == "completed":
-            if not _is_valid_pr_url(state.pr_url):
-                return RawResult(
-                    -1,
-                    None,
-                    "failed",
-                    "completed state requires valid PR URL",
-                )
-            return RawResult(0, None, "completed", None)
-        if status in ("blocked", "partial", "needs-human"):
-            return RawResult(0, None, "blocked", state.error or f"factory status: {status}")
-        if state.pending_gate:
-            return RawResult(0, None, "blocked", f"gate required: {state.pending_gate}")
-        return RawResult(0, None, "in_progress", None)
+def _control_environment() -> dict[str, str]:
+    allowed = {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TERM",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TZ",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in allowed or key.startswith(("LC_", "XDG_"))
+    }
 
 
 def epic_run_id(issue_id: int) -> str:
-    """Factory run-id the adapter assigns a worklink:epic. The factory namespaces
-    each run's control plane under ``.opencode/factory/<run-id>/``, so the START
-    prompt tells the factory to use this id and the adapter reads/writes the same
-    run dir."""
-    return f"chainlink-{issue_id}"
-
-
-def factory_run_dir(repo_path: Path, run_id: str) -> Path:
-    """The factory's per-run control-plane dir: ``.opencode/factory/<run-id>/``."""
-    return repo_path / FACTORY_DIR / run_id
-
-
-def read_factory_run_state(repo_path: Path, run_id: str) -> FactoryRunState | None:
-    """Read the factory run state for ``run_id`` from a repository checkout.
-
-    Standalone so the orchestrator/poller can inspect factory state without
-    launching a backend. Returns None if run.json is absent or unreadable.
-    """
-    run_json_path = factory_run_dir(repo_path, run_id) / RUN_JSON
-    if not run_json_path.exists():
-        return None
-    try:
-        data = json.loads(run_json_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
-    return _parse_run_state(data)
-
-
-def gate_answer_path(repo_path: Path, run_id: str, gate: str) -> Path:
-    """Path to a gate answer file (the factory's answer file protocol)."""
-    return factory_run_dir(repo_path, run_id) / GATES_DIR / f"{gate}{ANSWER_SUFFIX}"
-
-
-def gate_question_path(repo_path: Path, run_id: str, gate: str) -> Path:
-    """Path to a gate question file the factory writes when it stops at a gate."""
-    return factory_run_dir(repo_path, run_id) / GATES_DIR / f"{gate}{QUESTION_SUFFIX}"
-
-
-def question_mtime(repo_path: Path, run_id: str, gate: str) -> int:
-    """Nanosecond mtime of a gate's question file (0 if absent).
-
-    Nanosecond resolution so a fast re-opened gate (the pre_pr ``changes`` loop)
-    never collides with the prior instance within the same wall-clock second.
-    """
-    try:
-        return gate_question_path(repo_path, run_id, gate).stat().st_mtime_ns
-    except OSError:
-        return 0
-
-
-def read_gate_answer(repo_path: Path, run_id: str, gate: str) -> str | None:
-    """Read a gate answer from the factory's file protocol."""
-    answer_path = gate_answer_path(repo_path, run_id, gate)
-    if not answer_path.exists():
-        return None
-    try:
-        return answer_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-
-
-def write_gate_answer(repo_path: Path, run_id: str, gate: str, answer: str) -> None:
-    """Write a gate answer to the factory's file protocol."""
-    answer_path = gate_answer_path(repo_path, run_id, gate)
-    answer_path.parent.mkdir(parents=True, exist_ok=True)
-    answer_path.write_text(answer, encoding="utf-8")
-
-
-def has_concurrent_factory_session(
-    repo_path: Path, *, exclude_run_id: str | None = None
-) -> bool:
-    """True if any OTHER factory run is non-terminal and non-stale.
-
-    Detached runs live in per-attempt checkouts
-    (``<repo>/.worklink/<issue>-<attempt>/.opencode/factory/<run-id>/run.json``),
-    not under the repo root, so scan the repo-root control plane AND every
-    ``.worklink`` attempt checkout — otherwise the "one factory session at a time"
-    guard never sees the sessions the detached adapter actually creates.
-    ``exclude_run_id`` skips the caller's own run so a resume/re-dispatch of the
-    same epic is not counted as a concurrent session.
-    """
-    roots = [repo_path / FACTORY_DIR]
-    worklink_root = repo_path / ".worklink"
-    if worklink_root.is_dir():
-        roots.extend(
-            attempt / FACTORY_DIR
-            for attempt in worklink_root.iterdir()
-            if attempt.is_dir()
-        )
-    for factory_root in roots:
-        if not factory_root.is_dir():
-            continue
-        for run_json in factory_root.glob(f"*/{RUN_JSON}"):
-            try:
-                data = json.loads(run_json.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, ValueError):
-                continue
-            state = _parse_run_state(data)
-            if state is None or state.is_terminal or state.is_stale:
-                continue
-            if exclude_run_id is not None and state.run_id == exclude_run_id:
-                continue
-            return True
-    return False
+    if isinstance(issue_id, bool) or issue_id <= 0:
+        raise ValueError("factory issue id must be positive")
+    return str(issue_id)

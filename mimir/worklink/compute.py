@@ -392,6 +392,7 @@ class LocalSubprocessComputeBackend:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(spec.local_checkout),

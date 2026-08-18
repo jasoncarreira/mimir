@@ -80,6 +80,32 @@ Restart `mimir run` after changing these files or installing the skill. A
 running agent can instead activate a newly installed poller through its
 `reload_pollers` tool. The ready queue runs every ten minutes by default.
 
+### Factory epics
+
+Factory epics use the same repository declaration and isolated-checkout allocator,
+but have separate admission and concurrency. The image installs
+`feature-factory@0.7.0` and `opencode-feature-factory@0.7.0` under
+`/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
+`feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
+poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
+to `1`, independently of the leaf default `2`.
+
+Worklink supervises OpenCode while `/feature` owns factory transitions. The
+12-hour `MIMIR_FACTORY_RUN_TIMEOUT_S` default is only a process liveness
+backstop. The 900-second `MIMIR_FACTORY_STALE_HEARTBEAT_S` threshold produces
+diagnostics and never authorizes duplicate dispatch or takeover. A
+`needs-human` result remains parked in the retained sandbox. Resume performs
+status, justified run-ID-first lock acquisition, status, explicit resume,
+authoritative status, reconciliation, and exact OpenCode relaunch.
+
+A factory `completed` status does not by itself move the issue to review.
+Worklink independently runs the configured repository test command, requires a
+clean stable checkout HEAD, and verifies the canonical GitHub PR is open,
+non-draft, in the declared repository, based on the expected base, and points
+the expected head branch at that same tested SHA. Any mismatch retains the
+sandbox and fails closed. `mimir worklink stop` cancels the verified OpenCode
+process group; there is no factory cancel command.
+
 ## 3. File a strict leaf
 
 The executor checks a new non-epic leaf before acquiring a claim. Its

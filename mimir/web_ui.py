@@ -58,11 +58,11 @@ from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
 )
-from .worklink.backends.feature_factory import (
-    FACTORY_DIR,
-    FactoryRunState,
-    _parse_run_state,
-    factory_run_dir,
+from .worklink.factory_state import (
+    FactoryRunRecord,
+    FactoryRecordError,
+    list_factory_records,
+    load_factory_record,
 )
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
@@ -104,7 +104,7 @@ from .wiki_backlinks import (
 
 log = logging.getLogger(__name__)
 
-_SAFE_FACTORY_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}")
+_SAFE_FACTORY_RUN_ID_RE = re.compile(r"[1-9][0-9]{0,18}")
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -1446,113 +1446,49 @@ def register_routes(
         )
         return json_success(payload)
 
-    def _get_worklink_repo() -> Path | None:
-        """Get the worklink repo path from environment or home."""
-        if home is None:
-            return None
-        repo_env = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
-        if repo_env:
-            return Path(repo_env)
-        return home
-
     def _list_factory_runs() -> list[dict[str, Any]]:
-        """Enumerate factory runs from the configured worklink repository."""
-        repo = _get_worklink_repo()
-        if repo is None:
+        if home is None:
             return []
-        factory_root = repo / FACTORY_DIR
-        if not factory_root.is_dir():
-            return []
-
-        runs: list[dict[str, Any]] = []
-        max_runs = 1000
         try:
-            for run_dir in sorted(factory_root.iterdir())[:max_runs]:
-                if not run_dir.is_dir():
-                    continue
-                run_json = run_dir / "run.json"
-                if not run_json.exists():
-                    continue
-                try:
-                    data = json.loads(run_json.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError, ValueError):
-                    runs.append({
-                        "run_id": run_dir.name,
-                        "status": "invalid",
-                        "error": "malformed run.json",
-                        "diagnostic": True,
-                    })
-                    continue
-                state = _parse_run_state(data)
-                if state is None:
-                    runs.append({
-                        "run_id": run_dir.name,
-                        "status": "invalid",
-                        "error": "unparseable run.json",
-                        "diagnostic": True,
-                    })
-                    continue
-                runs.append(_serialize_factory_run_summary(state))
-        except OSError:
-            pass
-        return runs
+            records = list_factory_records(home)
+        except FactoryRecordError:
+            return []
+        return [_serialize_factory_run_summary(record) for record in records[:1000]]
 
-    def _serialize_factory_run_summary(state: FactoryRunState) -> dict[str, Any]:
-        """Serialize a FactoryRunState to a summary dict for the API."""
+    def _serialize_factory_run_summary(record: FactoryRunRecord) -> dict[str, Any]:
+        state = record.status
         result: dict[str, Any] = {
-            "run_id": state.run_id,
-            "status": state.status,
-            "heartbeat_at": state.heartbeat_at,
-            "is_terminal": state.is_terminal,
-            "is_stale": state.is_stale,
-            "pending_gate": state.pending_gate,
-            "gate_statuses": list(state.gate_statuses),
-            "validator_verdict": state.validator_verdict,
-            "security_verdict": state.security_verdict,
+            "run_id": record.run_id,
+            "issue_key": state.issue_key if state is not None else str(record.issue_id),
+            "valid": state.valid if state is not None else False,
+            "sandbox_path": record.sandbox,
+            "status": state.status if state is not None else "pending",
+            "mode": state.mode if state is not None else "autonomous",
+            "branch": record.branch,
+            "pr_base": record.base_ref,
+            "pr_draft": state.pr_draft if state is not None else True,
+            "lock": state.lock if state is not None else "absent",
+            "dead_lock": state.dead_lock if state is not None else False,
+            "lock_session": state.lock_session if state is not None else record.session,
+            "pr_url": state.pr_url if state is not None else None,
+            "controller_phase": record.controller_phase,
+            "observed_at": record.observed_at,
+            "controller_error": record.controller_error,
         }
-        if state.pr_url:
-            result["pr_url"] = state.pr_url
-        if state.error:
-            result["error"] = state.error
-        if state.cost:
-            result["cost"] = {
-                "status": state.cost.status,
-                "total_tokens": state.cost.total_tokens,
-                "cost_total": state.cost.cost_total,
-                "cost_currency": state.cost.cost_currency,
-            }
-        if state.terminal_result:
-            result["terminal_result"] = {
-                "status": state.terminal_result.status,
-                "pr_url": state.terminal_result.pr_url,
-                "reason": state.terminal_result.reason,
-                "summary": state.terminal_result.summary,
-            }
+        if state is not None and state.next_present:
+            result["next"] = state.next
         return result
 
-    def _serialize_factory_run_detail(state: FactoryRunState) -> dict[str, Any]:
-        """Serialize a FactoryRunState to a detailed dict for the API."""
-        result = _serialize_factory_run_summary(state)
-        result["steps"] = list(state.steps)
-        result["slices"] = list(state.slices)
-        if state.debug:
-            result["debug"] = {
-                "created_at": state.debug.created_at,
-                "resumed_at": state.debug.resumed_at,
-                "resume_count": state.debug.resume_count,
-            }
-        if state.cost:
-            result["cost"] = {
-                "status": state.cost.status,
-                "updated_at": state.cost.updated_at,
-                "entry_count": state.cost.entry_count,
-                "request_count": state.cost.request_count,
-                "total_tokens": state.cost.total_tokens,
-                "cost_total": state.cost.cost_total,
-                "cost_currency": state.cost.cost_currency,
-                "mixed_currency": state.cost.mixed_currency,
-                "missing": list(state.cost.missing),
-            }
+    def _serialize_factory_run_detail(record: FactoryRunRecord) -> dict[str, Any]:
+        result = _serialize_factory_run_summary(record)
+        state = record.status
+        result["gates"] = state.gates if state is not None else {}
+        result["steps"] = list(state.steps) if state is not None else []
+        result["slices"] = list(state.slices) if state is not None else []
+        result["validator"] = state.validator if state is not None else None
+        result["terminal_result"] = (
+            state.terminal_result if state is not None else None
+        )
         return result
 
     async def factory_runs_list_v1(_request: web.Request) -> web.Response:
@@ -1571,32 +1507,15 @@ def register_routes(
         if not _SAFE_FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
             return json_error("invalid_run_id", "run_id is invalid", status=400)
 
-        repo = _get_worklink_repo()
-        if repo is None:
+        if home is None:
             return json_error("home_not_configured", "home path not configured", status=503)
-
-        factory_root = (repo / FACTORY_DIR).resolve()
-        run_dir = factory_run_dir(repo, run_id).resolve()
-        if not run_dir.is_relative_to(factory_root):
-            return json_error("invalid_run_id", "run_id is outside the factory root", status=400)
-        run_json = run_dir / "run.json"
-
-        if not run_dir.exists():
-            return json_error("run_not_found", f"run directory not found: {run_id}", status=404)
-
-        if not run_json.exists():
-            return json_error("run_not_found", f"run.json not found for: {run_id}", status=404)
-
         try:
-            data = json.loads(run_json.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
-            return json_error("run_invalid", "run.json is malformed", status=400)
-
-        state = _parse_run_state(data)
-        if state is None:
-            return json_error("run_invalid", "run.json is unparseable", status=400)
-
-        return json_success(_serialize_factory_run_detail(state))
+            record = load_factory_record(home, run_id)
+        except FactoryRecordError:
+            return json_error("run_invalid", "factory run record is malformed", status=400)
+        if record is None:
+            return json_error("run_not_found", f"factory run not found: {run_id}", status=404)
+        return json_success(_serialize_factory_run_detail(record))
 
     async def chainlink_board_data_v1(_request: web.Request) -> web.Response:
         payload = await build_chainlink_board_payload(home)

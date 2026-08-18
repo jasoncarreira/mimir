@@ -34,6 +34,8 @@ from mimir.web_contracts import (
     validate_live_event,
     validate_list_meta,
 )
+from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
 
 
 @pytest.fixture
@@ -355,25 +357,35 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    factory_dir = tmp_path / ".opencode" / "factory"
-    run_dir = factory_dir / "chainlink-834"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": "chainlink-834",
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    status = parse_factory_status({
+        "run_id": "834",
+        "issue_key": "834",
+        "valid": True,
+        "sandbox_path": str(sandbox),
         "status": "running",
-        "heartbeat_at": "2026-07-13T10:00:00Z",
+        "mode": "autonomous",
+        "branch": "epic/834",
+        "pr_base": "main",
+        "pr_draft": False,
+        "lock": "fresh",
+        "dead_lock": False,
+        "lock_session": "session-1",
         "pr_url": None,
-        "gates": {
-            "story": {"status": "approved"},
-            "brief": {"status": "pending"},
-        },
-        "steps": [
-            {"agent": "spec-writer", "status": "accepted"},
-        ],
-        "slices": [
-            {"id": "s1", "status": "merged"},
-        ],
-    }), encoding="utf-8")
+        "gates": {"story": "approved", "brief": "pending"},
+        "steps": ["spec-writer:accepted"],
+        "slices": ["s1:merged"],
+        "validator": None,
+        "terminal_result": None,
+        "next": "brief",
+    })
+    save_factory_record(home, FactoryRunRecord(
+        run_id="834", issue_id=834, attempt=1, repository="owner/repo",
+        base_ref="main", branch="epic/834", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=status,
+        observed_at="2026-07-13T10:00:00Z", controller_phase="running",
+    ))
 
     app = web.Application()
     web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
@@ -386,9 +398,10 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
         assert data["ok"] is True
         assert len(data["data"]["runs"]) == 1
         run = data["data"]["runs"][0]
-        assert run["run_id"] == "chainlink-834"
+        assert run["run_id"] == "834"
         assert run["status"] == "running"
-        assert run["is_terminal"] is False
+        assert run["lock"] == "fresh"
+        assert run["next"] == "brief"
 
 
 @pytest.mark.asyncio
@@ -398,51 +411,52 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    factory_dir = tmp_path / ".opencode" / "factory"
-    run_dir = factory_dir / "chainlink-834"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": "chainlink-834",
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    status = parse_factory_status({
+        "run_id": "834",
+        "issue_key": "834",
+        "valid": True,
+        "sandbox_path": str(sandbox),
         "status": "completed",
-        "heartbeat_at": "2026-07-13T10:00:00Z",
+        "mode": "autonomous",
+        "branch": "epic/834",
+        "pr_base": "main",
+        "pr_draft": False,
+        "lock": "absent",
+        "dead_lock": False,
+        "lock_session": None,
         "pr_url": "https://github.com/owner/repo/pull/42",
-        "gates": {
-            "story": {"status": "approved"},
-            "brief": {"status": "approved"},
-            "pre_pr": {"status": "approved"},
-        },
-        "steps": [
-            {"agent": "spec-writer", "status": "accepted"},
-            {"agent": "work-decomposer", "status": "completed"},
-        ],
-        "slices": [
-            {"id": "s1", "status": "merged"},
-        ],
+        "gates": {"story": "approved", "brief": "approved"},
+        "steps": ["spec-writer:accepted", "work-decomposer:completed"],
+        "slices": ["s1:merged"],
         "validator": {"verdict": "GO"},
-        "security_review": {"verdict": "PASS"},
         "terminal_result": {
             "status": "completed",
-            "pr_url": "https://github.com/owner/repo/pull/42",
             "summary": "Successfully completed",
         },
-    }), encoding="utf-8")
+    })
+    save_factory_record(home, FactoryRunRecord(
+        run_id="834", issue_id=834, attempt=1, repository="owner/repo",
+        base_ref="main", branch="epic/834", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox), session="session-1", handle=None, status=status,
+        observed_at="2026-07-13T10:00:00Z", controller_phase="terminal",
+    ))
 
     app = web.Application()
     web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/chainlink-834")
+        resp = await cli.get("/api/v1/factory-runs/834")
         assert resp.status == 200
         data = await resp.json()
         assert data["ok"] is True
         run = data["data"]
-        assert run["run_id"] == "chainlink-834"
+        assert run["run_id"] == "834"
         assert run["status"] == "completed"
-        assert run["is_terminal"] is True
         assert run["pr_url"] == "https://github.com/owner/repo/pull/42"
-        assert run["validator_verdict"] == "GO"
-        assert run["security_verdict"] == "PASS"
+        assert run["validator"]["verdict"] == "GO"
         assert len(run["steps"]) == 2
         assert len(run["slices"]) == 1
         assert run["terminal_result"]["status"] == "completed"
@@ -492,15 +506,11 @@ async def test_factory_runs_detail_rejects_symlink_outside_factory_root(
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    factory_dir = tmp_path / ".opencode" / "factory"
+    factory_dir = home / "state" / "worklink" / "factory-runs"
     factory_dir.mkdir(parents=True)
-    outside_dir = tmp_path / "outside"
-    outside_dir.mkdir()
-    (outside_dir / "run.json").write_text(
-        json.dumps({"run_id": "outside", "status": "completed"}),
-        encoding="utf-8",
-    )
-    (factory_dir / "escaped").symlink_to(outside_dir, target_is_directory=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (factory_dir / "834.json").symlink_to(outside)
 
     app = web.Application()
     web_ui.register_routes(
@@ -512,11 +522,41 @@ async def test_factory_runs_detail_rejects_symlink_outside_factory_root(
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/escaped")
+        resp = await cli.get("/api/v1/factory-runs/834")
         assert resp.status == 400
         data = await resp.json()
         assert data["ok"] is False
-        assert data["error"]["code"] == "invalid_run_id"
+        assert data["error"]["code"] == "run_invalid"
+
+
+@pytest.mark.asyncio
+async def test_factory_runs_detail_rejects_symlinked_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    factory_dir = outside / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    (factory_dir / "834.json").write_text("{}", encoding="utf-8")
+    (home / "state").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/834")
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"]["code"] == "run_invalid"
 
 
 @pytest.mark.asyncio
@@ -531,7 +571,7 @@ async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest
 
     client = TestClient(TestServer(app))
     async with client as cli:
-        resp = await cli.get("/api/v1/factory-runs/nonexistent")
+        resp = await cli.get("/api/v1/factory-runs/999")
         assert resp.status == 404
         data = await resp.json()
         assert data["ok"] is False
@@ -544,10 +584,9 @@ async def test_factory_runs_malformed_json(tmp_path: Path, monkeypatch: pytest.M
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    factory_dir = tmp_path / ".opencode" / "factory"
-    run_dir = factory_dir / "chainlink-834"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text("not valid json", encoding="utf-8")
+    factory_dir = home / "state" / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    (factory_dir / "834.json").write_text("not valid json", encoding="utf-8")
 
     app = web.Application()
     web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=home)
@@ -558,10 +597,7 @@ async def test_factory_runs_malformed_json(tmp_path: Path, monkeypatch: pytest.M
         assert resp.status == 200
         data = await resp.json()
         assert data["ok"] is True
-        assert len(data["data"]["runs"]) == 1
-        run = data["data"]["runs"][0]
-        assert run["run_id"] == "chainlink-834"
-        assert run["status"] == "invalid"
+        assert data["data"]["runs"] == []
 
 
 def test_dashboard_extension_route_path_allows_app_prefix_words_only():

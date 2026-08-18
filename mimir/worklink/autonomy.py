@@ -38,11 +38,13 @@ from .backends import WorklinkConfig
 from .backends.registry import WorklinkDefaults
 from .claims import ChainlinkClaims, ClaimRecord
 from .checkout import prune_attempt_checkouts
+from .factory_state import factory_process_is_alive, list_factory_records
 
 #: Chainlink agent identity the executor + reaper claim under. Mirrors
 #: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
 DEFAULT_AGENT_ID = "mimir-worklink"
 WORKLINK_AGENT_ID_ENV = "MIMIR_WORKLINK_AGENT_ID"
+FACTORY_MAX_CONCURRENT_DEFAULT = 1
 
 
 def chainlink_bin() -> str:
@@ -69,6 +71,17 @@ def worklink_defaults(home: Path) -> WorklinkDefaults:
 def worklink_priority(home: Path) -> str:
     """Autonomous-dispatch arbiter priority from worklink.yaml (default normal)."""
     return worklink_defaults(home).priority
+
+
+def factory_max_concurrent() -> int:
+    raw = os.environ.get("MIMIR_FACTORY_MAX_CONCURRENT")
+    if raw is None:
+        return FACTORY_MAX_CONCURRENT_DEFAULT
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return FACTORY_MAX_CONCURRENT_DEFAULT
+    return parsed if parsed > 0 else FACTORY_MAX_CONCURRENT_DEFAULT
 
 
 def worklink_repo() -> str:
@@ -168,38 +181,17 @@ def check_concurrency(
 
 
 
-def _attempt_is_active(child: Path) -> bool:
-    """True if a stale-by-mtime attempt checkout is actually still live and must
-    NOT be reaped: a non-terminal factory ``run.json`` OR a detached factory
-    process still working in the checkout.
-
-    A long-running detached factory does its work in deep subdirs
-    (``.opencode/factory/<run-id>/``, ``.opencode/worktrees/...``), so the
-    attempt's top-level mtime freezes at setup and the reaper's mtime-only TTL
-    would otherwise reap a live run mid-flight (removing its ``run.json`` and
-    checkout). Errs toward keeping (returns True) when activity cannot be
-    determined, so the reaper never nukes a possibly-live run.
-
-    Deliberate tradeoff: treating ANY non-terminal ``run.json`` as active means a
-    factory that CRASHED while leaving ``status: running`` is not auto-reaped by
-    the TTL prune — it must be retired explicitly (``feature-factory factory
-    cleanup --force`` or manual removal). This prioritizes never deleting live
-    work over reclaiming disk from a rare leaked run; a heartbeat-freshness or
-    process-liveness gate here could misfire during a legitimately quiet phase
-    (the pre_pr review panel) and reintroduce the very mid-flight reap this
-    guards against.
-    """
-    from .backends.feature_factory import epic_run_id, read_factory_run_state
-    from .orchestrator import _detached_factory_alive
-
-    try:
-        issue_id = int(child.name.split("-", 1)[0])
-        state = read_factory_run_state(child, epic_run_id(issue_id))
-        if state is not None and not state.is_terminal:
-            return True
-        return _detached_factory_alive(child) is True
-    except Exception:  # noqa: BLE001 - undeterminable activity must not cause a reap
-        return True
+def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
+    resolved = child.resolve()
+    for candidate in records:
+        sandbox = getattr(candidate, "sandbox", None)
+        if not isinstance(sandbox, str) or Path(sandbox).resolve() != resolved:
+            continue
+        status = getattr(candidate, "status", None)
+        if status is not None and (status.is_terminal or status.is_parked):
+            return status.is_parked
+        return factory_process_is_alive(candidate)
+    return False
 
 
 def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | None = None) -> list[Path]:
@@ -211,21 +203,22 @@ def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | Non
     without bound.  If no Worklink repo is configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
 
-    Passes ``is_active`` so an attempt with a live detached factory (or a
-    non-terminal ``run.json``) is skipped rather than reaped: a detached epic can
-    run for longer than the TTL, and its top-level attempt-dir mtime freezes
-    while it works in subdirs, so the mtime-only staleness test alone would
-    delete a live run's checkout out from under it.
+    Worklink factory records and verified process handles keep active retained
+    sandboxes out of the TTL prune path.
     """
     defaults = worklink_defaults(home)
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     if not repo_raw:
         return []
+    try:
+        factory_records = list_factory_records(home)
+    except Exception:
+        return []
     return prune_attempt_checkouts(
         Path(repo_raw),
         older_than=timedelta(seconds=defaults.reaper_ttl_s),
         now=datetime.now(timezone.utc),
-        is_active=_attempt_is_active,
+        is_active=lambda child: _attempt_is_active(child, factory_records),
     )
 
 

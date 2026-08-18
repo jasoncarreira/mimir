@@ -14,6 +14,9 @@ import pytest
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
 from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 from mimir.worklink.run_state import WorklinkRunState, load_run_state, process_start_ticks, save_run_state
 
 
@@ -150,6 +153,51 @@ def test_worklink_run_cli_autonomous_refused_exits_1(
     assert exc.value.code == 1
     captured = capsys.readouterr()
     assert "refused" in captured.err and "unsafe compute" in captured.err
+
+
+@pytest.mark.parametrize("autonomous", [False, True])
+def test_worklink_run_epic_cli_routes_manual_and_autonomous_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    autonomous: bool,
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+
+    calls: list[dict[str, object]] = []
+
+    def run_epic(**kwargs: object) -> WorklinkRunResult:
+        calls.append(kwargs)
+        return WorklinkRunResult(700, 1, "needs-human")
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink_epic", run_epic)
+    argv = [
+        "worklink",
+        "run-epic",
+        "700",
+        "--home",
+        str(tmp_path / "home"),
+        "--repo",
+        str(tmp_path / "repo"),
+    ]
+    if autonomous:
+        argv.append("--autonomous")
+
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+
+    assert exc.value.code == 1
+    assert calls[0]["autonomous"] is autonomous
+
+
+def test_worklink_cli_has_no_factory_cancel_transition() -> None:
+    import mimir.commands.worklink as worklink_cmd
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    worklink_cmd.add_argparse(sub)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worklink", "factory-cancel", "700"])
 
 
 def test_worklink_cli_rejects_unknown_subcommand(
@@ -483,3 +531,161 @@ def test_reconcile_reaps_orphan_and_leaves_live_state(tmp_path: Path) -> None:
             {"issue_id": 12, "attempt": 2, "elapsed_s": 60.0, "reaped": True},
         ),
     ]
+
+
+def test_factory_stop_cancels_verified_handle_without_factory_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.control as control
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    status = parse_factory_status(
+        {
+            "run_id": "700",
+            "issue_key": "700",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": "running",
+            "mode": "autonomous",
+            "branch": "epic/700",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": "fresh",
+            "dead_lock": False,
+            "lock_session": "session-1",
+            "gates": {},
+            "steps": ["implementation"],
+            "slices": ["factory-070-migration"],
+            "validator": None,
+            "pr_url": None,
+            "terminal_result": None,
+            "next": "implementation",
+        }
+    )
+    handle = LaunchHandle("local_subprocess", "4321", 99)
+    save_factory_record(
+        tmp_path,
+        FactoryRunRecord(
+            run_id="700",
+            issue_id=700,
+            attempt=1,
+            repository="owner/repo",
+            base_ref="main",
+            branch="epic/700",
+            launcher="/opt/factory/bin/factory.js",
+            sandbox=str(sandbox),
+            session="session-1",
+            handle=handle,
+            status=status,
+            observed_at="2026-08-18T12:00:00+00:00",
+            controller_phase="running",
+        ),
+    )
+    cancelled: list[LaunchHandle] = []
+    commands: list[list[str]] = []
+
+    async def cancel(self: object, selected: LaunchHandle) -> None:
+        cancelled.append(selected)
+
+    monkeypatch.setattr(control, "factory_process_is_alive", lambda record: True)
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    result = stop_worklink(
+        tmp_path,
+        700,
+        runner=lambda args: commands.append(list(args))
+        or subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    )
+
+    assert result.stopped
+    assert cancelled == [handle]
+    assert load_factory_record(tmp_path, "700").controller_phase == "stopped"
+    assert all("factory" not in command for command in commands)
+
+
+def test_factory_stop_refuses_unverified_or_reused_process_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.control as control
+
+    monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
+    monkeypatch.setattr(control, "load_factory_record", lambda home, run_id: object())
+    monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
+    monkeypatch.setattr(
+        control.LocalSubprocessComputeBackend,
+        "cancel",
+        lambda *args: (_ for _ in ()).throw(AssertionError("unverified process signalled")),
+    )
+
+    result = stop_worklink(tmp_path, 700, runner=lambda args: subprocess.CompletedProcess(args, 0))
+
+    assert not result.stopped
+    assert result.reason == "no live run"
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="requires procfs")
+def test_factory_stop_cancels_verified_process_group(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    try:
+        ticks = process_start_ticks(process.pid)
+        assert ticks is not None
+        status = parse_factory_status(
+            {
+                "run_id": "700",
+                "issue_key": "700",
+                "valid": True,
+                "sandbox_path": str(sandbox),
+                "status": "running",
+                "mode": "autonomous",
+                "branch": "epic/700",
+                "pr_base": "main",
+                "pr_draft": False,
+                "lock": "fresh",
+                "dead_lock": False,
+                "lock_session": "session-1",
+                "gates": {},
+                "steps": ["implementation"],
+                "slices": ["factory-070-migration"],
+                "validator": None,
+                "pr_url": None,
+                "terminal_result": None,
+                "next": "implementation",
+            }
+        )
+        save_factory_record(
+            tmp_path,
+            FactoryRunRecord(
+                run_id="700",
+                issue_id=700,
+                attempt=1,
+                repository="owner/repo",
+                base_ref="main",
+                branch="epic/700",
+                launcher="/opt/factory/bin/factory.js",
+                sandbox=str(sandbox),
+                session="session-1",
+                handle=LaunchHandle("local_subprocess", str(process.pid), ticks),
+                status=status,
+                observed_at="2026-08-18T12:00:00+00:00",
+                controller_phase="running",
+            ),
+        )
+
+        result = stop_worklink(
+            tmp_path,
+            700,
+            runner=lambda args: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+        )
+
+        assert result.stopped
+        assert process.wait(timeout=5) != 0
+        assert load_factory_record(tmp_path, "700").controller_phase == "stopped"
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()

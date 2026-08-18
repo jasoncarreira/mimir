@@ -110,27 +110,6 @@ def _init_repo(
     return repo
 
 
-def _write_factory_run(
-    repo: Path,
-    *,
-    run_id: str,
-    issue_id: int,
-    branch: str,
-    worktree: Path,
-    pr_url: str | None = None,
-) -> None:
-    run_dir = repo / ".opencode" / "factory" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "run_id": run_id,
-        "external_ref": f"chainlink #{issue_id}",
-        "branch": branch,
-        "worktree": str(worktree),
-        "pr_url": pr_url,
-    }
-    (run_dir / "run.json").write_text(json.dumps(payload), encoding="utf-8")
-
-
 def _save_run_state(home: Path, *, issue_id: int, branch: str, test_command: str) -> None:
     save_run_state(
         home,
@@ -262,13 +241,6 @@ def test_continuation_payload_captures_required_context(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     repo = _init_repo(tmp_path, branch="chainlink-740-budget-continuation--be-continuation-core")
-    _write_factory_run(
-        repo,
-        run_id="chainlink-740",
-        issue_id=740,
-        branch="chainlink-740-budget-continuation",
-        worktree=repo,
-    )
     _save_run_state(
         home,
         issue_id=740,
@@ -365,17 +337,48 @@ def test_generic_high_priority_fallback_when_issue_pr_unknown(tmp_path: Path) ->
     assert runner.issue_comments == []
 
 
+def test_generic_continuation_never_reads_legacy_factory_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _init_repo(tmp_path, branch="feature/worklink-recovery")
+    legacy = repo / ".opencode" / "factory" / "chainlink-740"
+    legacy.mkdir(parents=True)
+    (legacy / "run.json").write_text('{"issue_id": 999}', encoding="utf-8")
+    original = Path.read_text
+
+    def guarded(path: Path, *args: object, **kwargs: object) -> str:
+        if ".opencode/factory" in path.as_posix():
+            raise AssertionError(f"legacy factory state read: {path}")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    event = _make_event(content="generic worklink follow-up", source_id="legacy-guard")
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event, turn_id="legacy-guard"),
+        record=_make_record(
+            event,
+            turn_id="legacy-guard",
+            input_text="generic worklink follow-up",
+        ),
+        repo=repo,
+        current_worktree=repo,
+        current_labels=["worklink:review"],
+        runner=SpyRunner(),
+    )
+
+    assert result is not None
+    assert result.payload["association"]["issue_id"] is None
+    assert result.payload["priority"] == "high"
+
+
 def test_idempotent_same_work_item_updates_existing_artifact(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     repo = _init_repo(tmp_path, branch="chainlink-740-budget-continuation--be-continuation-core")
-    _write_factory_run(
-        repo,
-        run_id="chainlink-740",
-        issue_id=740,
-        branch="chainlink-740-budget-continuation",
-        worktree=repo,
-    )
     _save_run_state(
         home,
         issue_id=740,

@@ -1107,12 +1107,7 @@ def prune_attempt_checkouts(
     TTL prune path (#613).
 
     ``is_active`` (optional) is consulted for each over-TTL attempt; when it
-    returns True the attempt is skipped and never reaped.  This guards a live
-    detached-factory run — whose top-level attempt-dir mtime freezes while its
-    real work happens in deep subdirs — from being misclassified as abandoned by
-    the mtime-only staleness test and having its checkout (and factory
-    ``run.json``) removed mid-flight.  Defaults to ``None`` (legacy: no liveness
-    check), so this stays import-light and callers opt in.
+    returns True the attempt is skipped and never reaped.
     """
     pruned: list[Path] = []
     for root, isolated in _attempt_roots(repo, worklink_dir):

@@ -314,10 +314,10 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
-| `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `14400` (4h) | Wall-clock timeout for a feature-factory run before the orchestrator treats it as failed. |
-| `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Heartbeat age at which a factory run is considered stalled. |
-| `MIMIR_FACTORY_PROBE_WINDOW_S` | float | `300` (floor 1) | Interval the orchestrator re-probes a running factory job's state. |
-| `MIMIR_FACTORY_REVIEWER` | str | `mimir-carreira` | Reviewer the factory requests on the PR it opens (`--reviewer <name>`); empty omits the flag. |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.7 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
+| `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
+| `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
 | `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
@@ -467,10 +467,9 @@ for an unreferenced backend are warned and dropped.
 | `backends.opencode.bin` | str | `opencode` | Executable used for `opencode run`. | `bin: /usr/local/bin/opencode` |
 | `backends.opencode.args` | list[str] | `[]` | Adds arguments not owned by Worklink. `-m`/`--model`, `--dir`, and `--` are rejected because Worklink supplies them. | `args: ["--format", "json"]` |
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
-| `backends.feature_factory.bin` | command string | `feature-factory` | Factory executable; unlike the OpenCode binary, this may contain multiple shell-split tokens. | `bin: "node /opt/factory/cli.js"` |
-| `backends.feature_factory.args` | list[str] | `[]` | Extra arguments appended to the factory invocation. | `args: ["--verbose"]` |
-| `backends.feature_factory.ready` | bool | `true` | Adds `--ready` when true. Use a YAML boolean; quoted `"false"` is truthy to the current parser. | `ready: false` |
-| `backends.feature_factory.reviewer` | str | `MIMIR_FACTORY_REVIEWER` or `mimir-carreira` | Adds `--reviewer`; an empty string omits it. | `reviewer: release-team` |
+| `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
+
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.7.0` and `opencode-feature-factory@0.7.0` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
 
 `compute_backends` defaults to `{}`. The sole shipping block is
 `compute_backends.local_subprocess` (hyphenated `local-subprocess` is normalized

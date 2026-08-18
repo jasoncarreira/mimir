@@ -320,6 +320,8 @@ class ChainlinkClaims:
         labels: Iterable[str] | None = None,
         home_path: str | Path | None = None,
         max_active_locks: int | None = None,
+        active_label: str | None = None,
+        exclude_active_label: str | None = None,
         before_claim: Callable[[], None] | None = None,
     ) -> ClaimResult:
         """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
@@ -406,7 +408,10 @@ class ChainlinkClaims:
 
         if max_active_locks is not None:
             try:
-                active = self.active_worklink_lock_count()
+                active = self.active_worklink_lock_count(
+                    label=active_label,
+                    exclude_label=exclude_active_label,
+                )
             except Exception:
                 self.release_issue(issue_id)
                 raise
@@ -885,7 +890,12 @@ class ChainlinkClaims:
         """
         return len(self._list_issue_ids("worklink:in-progress"))
 
-    def active_worklink_lock_count(self) -> int:
+    def active_worklink_lock_count(
+        self,
+        *,
+        label: str | None = None,
+        exclude_label: str | None = None,
+    ) -> int:
         """Number of active Chainlink locks — the autonomous hard-cap surface.
 
         RAISES if the lock table can't be read or parsed, so the cap fails
@@ -893,6 +903,20 @@ class ChainlinkClaims:
         them avoids the label-based check-then-act window where a worker has
         been admitted but has not yet applied ``worklink:in-progress``.
         """
+        if label is not None and exclude_label is not None:
+            raise ValueError("active lock scope accepts label or exclude_label, not both")
+        active_ids = self._active_worklink_lock_ids(
+            require_identity=label is not None or exclude_label is not None
+        )
+        if label is not None:
+            scoped_ids = set(self._list_issue_ids(label))
+            return len(active_ids & scoped_ids)
+        if exclude_label is not None:
+            excluded_ids = set(self._list_issue_ids(exclude_label))
+            return len(active_ids - excluded_ids)
+        return len(active_ids)
+
+    def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
         result = self._run("locks", "list", "--json", check=False)
         if result.returncode != 0:
             raise RuntimeError(
@@ -904,11 +928,24 @@ class ChainlinkClaims:
         except json.JSONDecodeError as exc:
             raise RuntimeError("chainlink locks list --json returned invalid JSON") from exc
         locks = data.get("locks", data if isinstance(data, list) else {})
+        ids: set[int] = set()
         if isinstance(locks, dict):
-            return len(locks)
-        if isinstance(locks, list):
-            return len(locks)
-        raise RuntimeError("chainlink locks list --json returned unexpected shape")
+            iterable = locks.items()
+        elif isinstance(locks, list):
+            iterable = enumerate(locks)
+        else:
+            raise RuntimeError("chainlink locks list --json returned unexpected shape")
+        for index, (key, value) in enumerate(iterable):
+            raw = _lock_issue_id(value) if isinstance(value, dict) else None
+            if raw is None:
+                try:
+                    raw = int(key)
+                except (TypeError, ValueError):
+                    if require_identity:
+                        raise RuntimeError("chainlink locks list --json omitted issue identity")
+                    raw = -(index + 1)
+            ids.add(raw)
+        return ids
 
     def _issue_comments(self, issue_id: int) -> list[str]:
         result = self._run("issue", "show", str(issue_id), "--json", check=False)

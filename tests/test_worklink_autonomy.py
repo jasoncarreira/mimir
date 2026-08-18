@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -23,6 +24,7 @@ import pytest
 
 from mimir.worklink import autonomy
 from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimRecord
+from mimir.worklink.backends.registry import WorklinkDefaults
 from mimir.worklink.dispatch_failures import (
     failure_state_transaction,
     load_failure_state,
@@ -491,6 +493,23 @@ def test_prune_stale_attempt_checkouts_for_home_silent_without_repo_env(
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path) == []
 
 
+@pytest.mark.parametrize("value", [None, "", "0", "-1", "invalid"])
+def test_factory_cap_defaults_and_falls_back_to_one(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_CONCURRENT", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", value)
+    assert autonomy.factory_max_concurrent() == 1
+    assert WorklinkDefaults.max_concurrent == 2
+
+
+def test_factory_cap_accepts_positive_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "3")
+    assert autonomy.factory_max_concurrent() == 3
+
+
 def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
     run_dir = child / ".opencode" / "factory" / f"chainlink-{issue_id}"
     run_dir.mkdir(parents=True)
@@ -509,22 +528,28 @@ def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:
     )
 
 
-def test_attempt_is_active_true_for_nonterminal_run(tmp_path: Path) -> None:
-    # A non-terminal factory run.json marks the attempt live → must not be reaped.
+def test_attempt_is_active_true_for_nonterminal_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     child = tmp_path / ".worklink" / "840-1"
     child.mkdir(parents=True)
-    _seed_factory_run(child, 840, "running")
-    assert autonomy._attempt_is_active(child) is True
+    record = SimpleNamespace(
+        sandbox=str(child),
+        status=SimpleNamespace(is_terminal=False, is_parked=False),
+    )
+    monkeypatch.setattr(autonomy, "factory_process_is_alive", lambda candidate: candidate is record)
+    assert autonomy._attempt_is_active(child, [record]) is True
 
 
 def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
-    # Terminal run.json (and no live process) → reapable.
     done = tmp_path / ".worklink" / "841-1"
     done.mkdir(parents=True)
-    _seed_factory_run(done, 841, "completed")
-    assert autonomy._attempt_is_active(done) is False
+    record = SimpleNamespace(
+        sandbox=str(done),
+        status=SimpleNamespace(is_terminal=True, is_parked=False),
+    )
+    assert autonomy._attempt_is_active(done, [record]) is False
 
-    # No run.json (and no live process) → also reapable.
     bare = tmp_path / ".worklink" / "842-1"
     bare.mkdir(parents=True)
     assert autonomy._attempt_is_active(bare) is False
@@ -996,9 +1021,39 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
         tmp_path,
         sum(1 for record in records if record.get("signal") == "worklink_dispatched"),
     )
+    # 10 holds an active lock, so it is not a candidate; the cap of 3 still yields two slots
+    # and the two unlocked ready issues fill them.
     assert [
         r.get("issue_id") for r in records if r.get("signal") == "worklink_dispatched"
-    ] == [10, 11]
+    ] == [11, 12]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -> None:
+    """A locked issue must not consume the slot its own worker already holds.
+
+    Slots are computed as cap minus active locks, so an actively locked issue left in the
+    sorted candidate list eats a slot by id order: the poller launches a second worker that
+    loses the atomic claim and exits, and the unlocked issue waits another cycle. `ready` and
+    `actionable` both remain true while a claim label transitions, so 100 below is a realistic
+    state rather than a contrived one. Without the exclusion this dispatches [100].
+    """
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text("defaults:\n  max_concurrent: 2\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[100, 200], active_locks=[100])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    dispatched = [e.get("issue_id") for e in events if e.get("signal") == "worklink_dispatched"]
+    assert dispatched == [200]
+    assert 100 not in dispatched
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
@@ -1017,10 +1072,11 @@ def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> 
         "STATE_DIR": str(tmp_path / "state"),
     })
     # WorklinkConfig parses flow-style YAML and takes precedence over the legacy
-    # env cap: cap 3, 1 active lock → 2 free slots.
+    # env cap: cap 3, 1 active lock → 2 free slots, and the locked issue 10 is not a
+    # candidate for either of them.
     assert [
         r.get("issue_id") for r in events if r.get("signal") == "worklink_dispatched"
-    ] == [10, 11]
+    ] == [11, 12]
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
