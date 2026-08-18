@@ -11,6 +11,7 @@ a non-zero exit cleanly), and the drift-detection logic
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+import os
 from pathlib import Path
 
 import pytest
@@ -363,6 +364,38 @@ def test_install_force_overwrites_existing(
     # User's edit should be gone — that's the documented behavior.
     assert not (dest / "user-edit.md").exists()
     # Original SKILL.md should still be present.
+    assert (dest / "SKILL.md").is_file()
+
+
+def test_install_force_tolerates_destination_entry_removed_concurrently(
+    fake_optional_root: Path,
+    fake_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
+    dest = fake_home / "skills" / "fake-skill"
+    victim = dest / "maintenance.lock"
+    victim.write_text("lock\n")
+    real_unlink = os.unlink
+    raced = False
+
+    def unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal raced
+        if not raced and os.fsdecode(path) == victim.name:
+            raced = True
+            real_unlink(path, dir_fd=dir_fd)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    result = install(
+        "fake-skill",
+        fake_home,
+        force=True,
+        optional_skills_root=fake_optional_root,
+    )
+
+    assert raced
+    assert result.overwrote is True
     assert (dest / "SKILL.md").is_file()
 
 

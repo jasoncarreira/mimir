@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Any
 
+from .._rmtree import rmtree_missing_ok
 from .checkout import _normalize_checkout_fd
 from .identities import get_identities
 from .worker_client import (
@@ -314,7 +315,7 @@ def _project_home(home: Path, projections: object) -> None:
 def _cleanup_home(home: Path) -> None:
     if not home.exists():
         return
-    shutil.rmtree(home)
+    rmtree_missing_ok(home)
 
 
 def _process_group_has_live_members(process_group: int) -> bool:

@@ -6,11 +6,11 @@ import hashlib
 import os
 from pathlib import Path
 import secrets
-import shutil
 import stat
 import subprocess
 from typing import Callable, Iterable
 
+from ._rmtree import rmtree_missing_ok
 from .contained_snapshot import SnapshotResult, create_git_snapshot, preflight_git_snapshot
 from .worklink.checkout import (
     CheckoutAuthorization,
@@ -49,7 +49,7 @@ class ContainedCheckout:
 
 def _remove_boundary(boundary: Path) -> None:
     if boundary.exists():
-        shutil.rmtree(boundary)
+        rmtree_missing_ok(boundary)
     try:
         boundary.parent.rmdir()
     except OSError as exc:

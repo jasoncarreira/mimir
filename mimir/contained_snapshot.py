@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
+from ._rmtree import rmtree_missing_ok
+
 
 class ContainedSnapshotError(RuntimeError):
     reason_code = "snapshot_unavailable"
@@ -421,7 +423,7 @@ def _remove_destination_entry(path: bytes) -> None:
     except FileNotFoundError:
         return
     if stat.S_ISDIR(observed.st_mode) and not stat.S_ISLNK(observed.st_mode):
-        shutil.rmtree(path)
+        rmtree_missing_ok(path)
     else:
         os.unlink(path)
 

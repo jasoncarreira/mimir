@@ -22,6 +22,7 @@ import unicodedata
 import warnings
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from .._rmtree import rmtree_missing_ok
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -1983,7 +1984,7 @@ def _close_attempt_capabilities(
                 authorization.close()
         finally:
             if delete_checkout and checkout is not None:
-                shutil.rmtree(checkout.parent)
+                rmtree_missing_ok(checkout.parent)
 
 
 def _cleanup_checkout_after_transition(
