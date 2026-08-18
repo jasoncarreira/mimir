@@ -4,8 +4,14 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import type React from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+  ApiSuccessEnvelope,
+  FactoryRunDetail,
+  FactoryRunsData,
+  FactoryRunSummary,
+  ListMeta
+} from "../api/generated/contracts";
 import type { DashboardSurface } from "../dashboardExtensions";
-import { factoryRunDetailFixture, factoryRunsListFixture } from "../fixtures/api";
 
 const { factoryApi } = vi.hoisted(() => ({
   factoryApi: { getFactoryRun: vi.fn(), getFactoryRuns: vi.fn() }
@@ -35,6 +41,99 @@ const surface: DashboardSurface = {
   trusted_first_party: true,
   tabs: ["list", "detail"],
   filterLabel: "status"
+};
+
+const baseFactoryRun = {
+  run_id: "834",
+  issue_key: "834",
+  valid: true,
+  sandbox_path: "/srv/mimir/factory/834",
+  status: "running",
+  mode: "autonomous",
+  branch: "slice/834-factory-run",
+  pr_base: "main",
+  pr_draft: true,
+  lock: "fresh",
+  dead_lock: false,
+  lock_session: "session-834",
+  pr_url: null,
+  next: "build",
+  controller_phase: "monitoring",
+  observed_at: "2026-07-13T10:00:00Z",
+  controller_error: null
+} satisfies FactoryRunSummary;
+
+const factoryRunsListFixture: ApiSuccessEnvelope<FactoryRunsData, ListMeta> = {
+  ok: true,
+  version: "v1",
+  data: {
+    runs: [
+      baseFactoryRun,
+      {
+        ...baseFactoryRun,
+        run_id: "833",
+        issue_key: "833",
+        sandbox_path: "/srv/mimir/factory/833",
+        status: "completed",
+        branch: "slice/833-factory-run",
+        pr_draft: false,
+        lock: "absent",
+        lock_session: null,
+        pr_url: "https://github.com/owner/repo/pull/42",
+        next: null,
+        controller_phase: "completed",
+        observed_at: "2026-07-12T15:30:00Z"
+      },
+      {
+        ...baseFactoryRun,
+        run_id: "832",
+        issue_key: "832",
+        sandbox_path: "/srv/mimir/factory/832",
+        status: "needs-human",
+        branch: "slice/832-factory-run",
+        lock: "stale",
+        dead_lock: true,
+        lock_session: "session-832",
+        next: "resume",
+        controller_phase: "parked",
+        observed_at: "2026-07-11T09:00:00Z",
+        controller_error: "Operator input required"
+      },
+      {
+        ...baseFactoryRun,
+        run_id: "831",
+        issue_key: "831",
+        valid: false,
+        sandbox_path: "/srv/mimir/factory/831",
+        branch: "slice/831-factory-run",
+        lock: "absent",
+        lock_session: null,
+        next: null,
+        controller_phase: "failed",
+        observed_at: null,
+        controller_error: "Factory status validation failed"
+      }
+    ]
+  },
+  meta: {
+    cursor: null,
+    limit: null,
+    total: 4,
+    truncated: false
+  }
+};
+
+const factoryRunDetailFixture: ApiSuccessEnvelope<FactoryRunDetail> = {
+  ok: true,
+  version: "v1",
+  data: {
+    ...baseFactoryRun,
+    gates: { story: "approved", brief: "approved" },
+    steps: ["spec-writer:accepted", "work-decomposer:running"],
+    slices: ["s1:merged", "s2:building"],
+    validator: { status: "pending" },
+    terminal_result: null
+  }
 };
 
 function renderRoute(node: React.ReactNode) {
