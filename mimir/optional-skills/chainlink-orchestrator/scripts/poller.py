@@ -218,7 +218,6 @@ def _actionable_issue_ids(home: Path) -> list[int] | None:
 def _worklink_dispatch_plan(
     home: Path, *, active_lock_ids: set[int]
 ) -> tuple[list[DispatchItem], int, int, int] | None:
-    del active_lock_ids
     ready_records = _issue_records_with_label(home, READY_LABEL)
     epic_records = _issue_records_with_label(home, EPIC_LABEL)
     actionable_ids = _actionable_issue_ids(home)
@@ -227,15 +226,23 @@ def _worklink_dispatch_plan(
     labeled = {record.issue_id for record in ready_records}
     epics = {record.issue_id for record in epic_records}
     actionable = set(actionable_ids)
+    # An issue holding an active lock is not a dispatch candidate. Slots are reduced by the
+    # active count, so leaving it in the sorted candidates lets a low id consume the slot its
+    # own worker already holds: the new worker loses the atomic claim and exits, and an
+    # unlocked issue waits another cycle. Ready and actionable both stay true across claim
+    # label transitions, so this is reachable rather than theoretical.
     leaves = sorted(
         record.issue_id
         for record in ready_records
         if record.issue_id in actionable
         and record.issue_id not in epics
         and record.parent_id not in epics
+        and record.issue_id not in active_lock_ids
     )
     factory_epics = sorted(
-        record.issue_id for record in epic_records if record.issue_id in actionable
+        record.issue_id
+        for record in epic_records
+        if record.issue_id in actionable and record.issue_id not in active_lock_ids
     )
     plan = [DispatchItem(issue_id, "leaf") for issue_id in leaves]
     if _factory_epics_enabled():

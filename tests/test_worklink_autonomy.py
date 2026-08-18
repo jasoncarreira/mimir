@@ -1021,9 +1021,39 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
         tmp_path,
         sum(1 for record in records if record.get("signal") == "worklink_dispatched"),
     )
+    # 10 holds an active lock, so it is not a candidate; the cap of 3 still yields two slots
+    # and the two unlocked ready issues fill them.
     assert [
         r.get("issue_id") for r in records if r.get("signal") == "worklink_dispatched"
-    ] == [10, 11]
+    ] == [11, 12]
+
+
+@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -> None:
+    """A locked issue must not consume the slot its own worker already holds.
+
+    Slots are computed as cap minus active locks, so an actively locked issue left in the
+    sorted candidate list eats a slot by id order: the poller launches a second worker that
+    loses the atomic claim and exits, and the unlocked issue waits another cycle. `ready` and
+    `actionable` both remain true while a claim label transitions, so 100 below is a realistic
+    state rather than a contrived one. Without the exclusion this dispatches [100].
+    """
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "worklink.yaml").write_text("defaults:\n  max_concurrent: 2\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    events = _run_poller(tmp_path, {
+        "MIMIR_HOME": str(home),
+        "CHAINLINK_BIN": str(_fake_chainlink_script(tmp_path, ready=[100, 200], active_locks=[100])),
+        "WORKLINK_RUN_BIN": sys.executable + " " + str(_fake_run_bin(tmp_path)),
+        "WORKLINK_REPO": str(repo),
+        "STATE_DIR": str(tmp_path / "state"),
+    })
+    dispatched = [e.get("issue_id") for e in events if e.get("signal") == "worklink_dispatched"]
+    assert dispatched == [200]
+    assert 100 not in dispatched
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
@@ -1042,10 +1072,11 @@ def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> 
         "STATE_DIR": str(tmp_path / "state"),
     })
     # WorklinkConfig parses flow-style YAML and takes precedence over the legacy
-    # env cap: cap 3, 1 active lock → 2 free slots.
+    # env cap: cap 3, 1 active lock → 2 free slots, and the locked issue 10 is not a
+    # candidate for either of them.
     assert [
         r.get("issue_id") for r in events if r.get("signal") == "worklink_dispatched"
-    ] == [10, 11]
+    ] == [11, 12]
 
 
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
