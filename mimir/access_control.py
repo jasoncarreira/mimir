@@ -7564,7 +7564,7 @@ def _filesystem_result_integrity(
     auth_context: "AuthContext | None",
     resource_id: str,
 ) -> tuple[str, str]:
-    """Derive file trust only from resolved framework-owned paths and metadata."""
+    """Trust successful reads only from resolved first-party home paths."""
     home_value = os.environ.get("MIMIR_HOME", "").strip()
     if not home_value:
         return "untrusted", "active_ingest"
@@ -7575,16 +7575,10 @@ def _filesystem_result_integrity(
     except (OSError, RuntimeError, ValueError):
         return "untrusted", "active_ingest"
 
-    if relative.parts and relative.parts[0] in {"memory", "state"}:
-        # Poller subprocesses write this tree directly, outside the protected
-        # tool boundary, and may persist attacker-derived cursor/event fields.
-        # A path under state/pollers is therefore not proof of self-authorship.
-        if relative.parts[0:2] == ("state", "pollers"):
-            return "untrusted", "active_ingest"
-        persisted = _persisted_file_integrity(home, relative)
-        return persisted, (
-            "informational" if persisted == "trusted" else "active_ingest"
-        )
+    if relative.parts and relative.parts[0] in {
+        ".mimir_builtin_skills", "skills", "memory", "state",
+    }:
+        return "trusted", "informational"
 
     cache_root = home / "attachments" / "fetch-cache"
     try:
@@ -7613,23 +7607,6 @@ def _filesystem_result_integrity(
     # URL approval authorizes GET egress only. It never vouches for returned
     # bytes, including redirects or cached copies (#1139).
     return "untrusted", "active_ingest"
-
-
-def _persisted_file_integrity(home: Path, relative: Path) -> str:
-    """Return server-recorded integrity for a mutable self-authored file."""
-    metadata_path = home / ".mimir" / "file-integrity.json"
-    if not metadata_path.exists():
-        return "trusted"
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "untrusted"
-    if not isinstance(payload, dict):
-        return "untrusted"
-    value = payload.get(relative.as_posix())
-    if value is None:
-        return "trusted"
-    return "trusted" if value == "trusted" else "untrusted"
 
 
 def record_file_write_integrity(
@@ -7894,6 +7871,26 @@ def classify_protected_result(
         for source in provenance.sources:
             labels = labels.with_source(source)
         return labels
+
+    if domain == "filesystem":
+        resource = next(
+            (
+                args.get(key)
+                for key in ("path", "file_path")
+                if isinstance(args.get(key), str) and args.get(key)
+            ),
+            None,
+        )
+        if resource is not None:
+            source = protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=str(Path(resource).resolve(strict=False)),
+                bridge_instance="filesystem",
+            )
+            if source.integrity == "trusted":
+                return InformationFlowLabels().with_source(source)
 
     return _incomplete_protected_result(domain, args)
 
