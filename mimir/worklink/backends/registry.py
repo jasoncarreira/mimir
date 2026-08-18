@@ -673,9 +673,9 @@ class BackendRegistry:
         retired = sorted(set(settings) & {"bin", "args", "ready", "reviewer"})
         if retired:
             raise ValueError(
-                "worklink backends.feature_factory retired setting "
-                f"'{retired[0]}'; configure one absolute 'entrypoint' ending in "
-                "feature-factory/bin/factory.js"
+                "worklink backends.feature_factory retired settings "
+                f"{', '.join(repr(key) for key in retired)}; configure one "
+                "absolute 'entrypoint' ending in feature-factory/bin/factory.js"
             )
         unknown = sorted(set(settings) - {"entrypoint"})
         if unknown:

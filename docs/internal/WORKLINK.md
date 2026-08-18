@@ -781,6 +781,30 @@ Current slice-1 recovery is manual:
 
 ## 8. Configuration (`<home>/worklink.yaml`)
 
+### Deploying the 0.7 migration to an existing home
+
+`backends.feature_factory` changed shape. The retired `bin`, `args`, `ready` and
+`reviewer` keys are now **rejected at config load**, which raises before any dispatch
+runs. Worklink crashes emit no events, so an unmigrated `<home>/worklink.yaml` fails
+*silently*: nothing appears in `events.jsonl` and the only trace is `run-<id>.log`.
+Stale config of exactly this shape has already caused one full dispatch outage — the
+retired `codex` backend block, 2026-07-30.
+
+Edit `<home>/worklink.yaml` **before or with** the image rebuild:
+
+```yaml
+backends:
+  feature_factory:
+    # remove:  bin: node /workspace/feature-factory/src/cli.js
+    # remove:  args: []
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
+```
+
+`entrypoint` may be omitted entirely when `MIMIR_FACTORY_ENTRYPOINT` is set; the image
+sets it to the path above. This is an image-layer change, so redeploy with
+`docker compose -p <project> up -d --build` — a plain restart does not pick it up.
+
+
 ```yaml
 defaults:
   backend: opencode

@@ -118,6 +118,24 @@ def test_feature_factory_rejects_retired_settings(retired: str) -> None:
         BackendRegistry(config)
 
 
+def test_feature_factory_retired_settings_error_names_every_key() -> None:
+    """A config carrying several retired keys must name them all in one error.
+
+    The live ``<home>/worklink.yaml`` carried both ``bin`` and ``args``. Naming
+    only the first means the operator fixes it, redeploys, and hits the second —
+    and each cycle is a silent dispatch outage, because Worklink crashes emit no
+    events (the failure is visible only in ``run-<id>.log``).
+    """
+    config = WorklinkConfig(
+        backend_settings={"feature_factory": {"bin": "legacy", "args": []}}
+    )
+    with pytest.raises(ValueError) as excinfo:
+        BackendRegistry(config)
+    message = str(excinfo.value)
+    assert "'args'" in message
+    assert "'bin'" in message
+
+
 def test_feature_factory_requires_absolute_entrypoint() -> None:
     config = WorklinkConfig(
         backend_settings={"feature_factory": {"entrypoint": "feature-factory/bin/factory.js"}}
