@@ -4655,7 +4655,17 @@ def _source_is_triggering_channel_compatible(
             and ChannelResourceAdapter._resolve_channel(source.resource_id)
             == resolved_triggering
         )
-    return source_kind in {"protected_prompt", "protected_tool"}
+    if source_kind == "protected_prompt":
+        # Trusted framework-written records may be surfaced across channels.
+        # Untrusted prompt records remain bound to their originating channel
+        # even when upstream authorization added the current requester to the
+        # ACL; the ACL alone must not declassify foreign-channel content.
+        return (
+            source.integrity == "trusted"
+            or ChannelResourceAdapter._resolve_channel(source.resource_id)
+            == resolved_triggering
+        )
+    return source_kind == "protected_tool"
 
 
 def _ifc_blocking_source(

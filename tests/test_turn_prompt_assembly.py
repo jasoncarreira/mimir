@@ -20,6 +20,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -875,6 +876,43 @@ async def test_feedback_block_renders_off_event_loop(
 
     assert "FEEDBACK_SENTINEL" in turn_prompt
     assert "recent_block_stub" in calls
+
+
+@pytest.mark.asyncio
+async def test_ownerless_non_self_feedback_does_not_abort_prompt_assembly(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.turns_log.write_text(json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "turn_id": "scheduled-turn",
+        "channel_id": "scheduler:heartbeat",
+        "result_is_error": True,
+    }) + "\n")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-feedback",
+        content="hello",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=True,
+        bridge_instance="test",
+    )
+
+    turn_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
+    )
+
+    assert "turn error: (no detail)" in turn_prompt
 
 
 @pytest.mark.asyncio
