@@ -6,10 +6,16 @@
     "pinned_version": "1.18.9"
   },
   {
+    "name": "feature-factory",
+    "source": "npm",
+    "package": "feature-factory",
+    "pinned_version": "0.7.0"
+  },
+  {
     "name": "opencode-feature-factory",
     "source": "npm",
     "package": "opencode-feature-factory",
-    "pinned_version": "0.2.1"
+    "pinned_version": "0.7.0"
   },
   {
     "name": "opencode-project-memory",

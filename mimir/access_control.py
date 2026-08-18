@@ -7711,7 +7711,9 @@ def _filesystem_result_integrity(
     except (OSError, RuntimeError, ValueError):
         return "untrusted", "active_ingest"
 
-    if relative.parts and relative.parts[0] in {"memory", "state"}:
+    if relative.parts and relative.parts[0] in {
+        ".mimir_builtin_skills", "skills", "memory", "state",
+    }:
         # Poller subprocesses write this tree directly, outside the protected
         # tool boundary, and may persist attacker-derived cursor/event fields.
         # A path under state/pollers is therefore not proof of self-authorship.
@@ -8030,6 +8032,26 @@ def classify_protected_result(
         for source in provenance.sources:
             labels = labels.with_source(source)
         return labels
+
+    if domain == "filesystem":
+        resource = next(
+            (
+                args.get(key)
+                for key in ("path", "file_path")
+                if isinstance(args.get(key), str) and args.get(key)
+            ),
+            None,
+        )
+        if resource is not None:
+            source = protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=str(Path(resource).resolve(strict=False)),
+                bridge_instance="filesystem",
+            )
+            if source.integrity == "trusted":
+                return InformationFlowLabels().with_source(source)
 
     return _incomplete_protected_result(domain, args)
 

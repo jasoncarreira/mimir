@@ -58,6 +58,7 @@ from mimir.models import (
     InformationFlowLabels,
     InformationFlowState,
     IntegrityEffect,
+    RepoPRActionScope,
     SourceLabel,
     TurnInteractivity,
 )
@@ -2267,6 +2268,221 @@ def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() 
         result="",
         provenance=ProtectedResultProvenance(()),
     ) is None
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        ".mimir_builtin_skills/review/SKILL.md",
+        "skills/review/SKILL.md",
+        "memory/notes.md",
+        "state/session.json",
+    ],
+)
+def test_first_party_file_read_without_provenance_is_trusted_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("first party", encoding="utf-8")
+
+    labels = classify_protected_result(
+        "read_file",
+        {"file_path": str(target)},
+        _auth(roles=("admin",)),
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted", "informational",
+    )
+
+
+@pytest.mark.parametrize("location", ["outside", "memory-scratch", "attachments"])
+def test_non_first_party_file_read_keeps_incomplete_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = (
+        tmp_path / "repo" / "body.md"
+        if location == "outside"
+        else home / location / "body.md"
+    )
+    target.parent.mkdir(parents=True)
+    target.write_text("ingested", encoding="utf-8")
+
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, _auth(),
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
+    assert source.principal is None
+    assert source.authorized_principals == frozenset()
+
+
+def test_first_party_file_read_resolves_symlink_before_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    memory = home / "memory"
+    memory.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    outside = tmp_path / "attachment.txt"
+    outside.write_text("external", encoding="utf-8")
+    link = memory / "recalled.txt"
+    link.symlink_to(outside)
+
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(link)}, _auth(),
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert source.principal is None
+    assert source.authorized_principals == frozenset()
+
+
+def test_failed_first_party_file_read_keeps_incomplete_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / "state" / "session.json"
+    target.parent.mkdir()
+    target.write_text("state", encoding="utf-8")
+
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, _auth(),
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+        failed=True,
+    )
+
+    assert labels is not None
+    source = next(iter(labels.sources))
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert source.principal is None
+    assert source.authorized_principals == frozenset()
+
+
+def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    skill = tmp_path / ".mimir_builtin_skills" / "review" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("review instructions", encoding="utf-8")
+    ingress = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="channel",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_channel("slack-C1").with_source(ingress)
+    state = InformationFlowState(labels=labels)
+    auth = replace(
+        _auth(roles=("admin",)),
+        ifc_labels=labels,
+        ifc_state=state,
+    )
+    read_labels = classify_protected_result(
+        "read_file", {"file_path": str(skill)}, auth,
+        ToolAuthorization(
+            tool_name="read_file",
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True,
+        ),
+    )
+    assert read_labels is not None
+    labels = state.merge(read_labels)
+    scope = RepoPRActionScope(
+        provenance="server_discovered",
+        canonical_repo="acme/widget",
+        canonical_root=str(tmp_path / "repo"),
+        canonical_origin="https://github.com/acme/widget.git",
+        principal="user-1",
+        event_type="operator_review",
+        allowed_operations=frozenset({"repo.checkout", "repo.test"}),
+        pr_number=7,
+        head_repo="acme/widget",
+        head_remote="origin",
+        destination_ref="refs/heads/review-7",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    target = f"acme/widget#pull/7@{'a' * 40}:{scope.scope_id}"
+    request_carrier, ordinal = state.source_snapshot()
+    grant_event = object()
+    grant_source = replace(ingress, source_kind="operator_review_grant")
+    labels, receipt = state.merge_with_receipt(
+        InformationFlowLabels(sources=(grant_source,)),
+        event_identity=grant_event,
+    )
+    assert state.install_sink_category_capability(
+        sink_category="forge",
+        turn_id="operator-review-7",
+        canonical_principal="user-1",
+        request_carrier=request_carrier,
+        request_source_arrival_ordinal=ordinal,
+        approval_event=grant_event,
+        reply_source=grant_source,
+        fold_receipt=receipt,
+    )
+    auth = replace(auth, ifc_labels=labels)
+
+    for tool_name in ("repo_checkout", "repo_test"):
+        decision = SinkGate.check_sink_flow(
+            tool_name,
+            target,
+            labels,
+            auth,
+            enforce=True,
+            repo_pr_action_scope=scope,
+        )
+        assert decision.allowed is True, (tool_name, decision.reason)
 
 
 def test_worklink_run_is_blocked_after_shell_result_taints_live_turn(

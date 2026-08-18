@@ -50,13 +50,11 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by the external **opencode feature-factory**
-(`~/projects/odin/opencode-feature-factory`): a session-driven `/feature`
-workflow that owns its own decomposition (`.opencode/factory/<run>/plan/
-slices.json`), human/scripted approval gates, genuine Git worktrees created by
-the external factory, and one draft PR — and
-knows nothing about Chainlink. The **feature-factory adapter** (#833) connects
-the two:
+Epics are built by `feature-factory@0.7.0` through the lockstep
+`opencode-feature-factory@0.7.0` adapter. OpenCode's `/feature` workflow owns
+factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
+checkout, OpenCode process, restart record, status observation, repository tests,
+and final PR identity verification.
 
 - **Poller routing** (opt-in via `MIMIR_FACTORY_EPICS_ENABLED`, default off):
   when the flag is set, the ready-queue poller dispatches `worklink:epic` issues
@@ -65,17 +63,21 @@ the two:
   starts or resumes the opencode feature-factory in the target repo. Until the
   flag is set, epics are only excluded from leaf dispatch and are never
   dispatched (no dispatch-then-refuse churn).
-- **State mirroring**: The adapter reads the factory's `run.json` atomically,
-  normalizes the published 0.2.1 heartbeat, steps/slices, gates, panel verdicts,
-  terminal state, PR URL, and optional cost/debug metadata, then mirrors progress
-  into the Chainlink issue without creating leaf issues.
-- **Gate protocol**: Gate answers flow through the factory's file protocol
-  (`gates/<gate>.answer`) so manual and mimir-driven runs are identical. Review
-  is **owned by the factory**: its in-package multi-agent pre_pr panel
-  (`implementation-validator` + adversarial `security-reviewer`,
-  strictest-verdict-wins) resolves the pre_pr gate and drives the changes loop
-  to convergence; the adapter **relays** that outcome by mirroring the terminal
-  state + PR rather than running its own reviewer.
+- **Launch**: Worklink supervises exactly `opencode run --log-level DEBUG
+  --print-logs --dir <checkout> --command feature " --autonomous <issue>"`.
+  Cancellation is verified process-group cancellation through `mimir worklink
+  stop`; feature-factory has no cancel transition.
+- **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
+  Worklink admits the launcher only after package/adapter 0.7.0 verification and
+  all 16 nonmutating structural command probes. Status is read with `status
+  <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
+  session; lock actions use `lock <run-id> <claim|steal|release> --session
+  <session> --repo <sandbox>`.
+- **State**: Worklink records live under
+  `<MIMIR_HOME>/state/worklink/factory-runs/<numeric-run-id>.json`. They preserve
+  the exact launcher, sandbox, session, process handle, strict latest status,
+  observation time, and controller phase. Old repository `run.json` files are
+  not read as Worklink authority. Cost is unknown and no cost schema is exposed.
 - **Autonomy** (second, hard opt-in): autonomous dispatch is gated by the
   capability-based `autonomous_compute_allowed` policy. The factory runs as a
   local subprocess (shared filesystem, no network isolation), so an
@@ -94,55 +96,23 @@ the two:
   (poller dispatches it) and `defaults.allow_autonomous_local_subprocess: true`
   (run-epic accepts the local-subprocess compute); with either missing the epic
   is safely not built.
-- **Failure handling**: Stale heartbeat or failed factory run produces an actionable
-  Chainlink comment/label and prevents duplicate concurrent factory sessions.
-
-The factory's `run.json` contract (0.2.1):
-
-```json
-{
-  "run_id": "chainlink-<issue>",
-  "status": "running|completed|blocked|partial|needs-human",
-  "heartbeat_at": "2026-01-01T00:00:00+00:00",
-  "pr_url": "https://github.com/owner/repo/pull/123",
-  "gates": {
-    "story": {"status": "approved|pending"},
-    "brief": {"status": "approved|pending"},
-    "pre_pr": {"status": "approved|pending"}
-  },
-  "steps": [{"agent": "spec-writer", "status": "accepted|running|..."}],
-  "slices": [{"id": "s1", "status": "merged|running|..."}],
-  "validator": {"verdict": "GO|NO_GO"},
-  "security_review": {"verdict": "PASS|FAIL"},
-  "cost_attribution": {
-    "status": "available|partial|unavailable",
-    "totals": {"entry_count": 2, "total_tokens": 12900, "cost_total": 1.23}
-  },
-  "debug_snapshot": {
-    "created_with": {"collected_at": "..."},
-    "last_resumed_with": null,
-    "resume_count": 0
-  },
-  "terminal_result": {
-    "status": "completed|blocked|partial|needs-human",
-    "pr_url": "https://github.com/...",
-    "reason": "...",
-    "summary": "..."
-  }
-}
-```
-
-- `run_id` must match the `--run-id` argv boundary (`chainlink-<issue>`)
-- `heartbeat_at` must be updated periodically by the factory; if it's stale
-  (>5min old), the adapter marks the epic as failed with a stale heartbeat error.
-- Gate statuses are under `gates.<name>.status`; pending gates block with the first
-  pending gate name in the reason. `steps[].{agent,status}` and
-  `slices[].{id,status}` are distinct progress collections and both are normalized.
-- `cost_attribution` and `debug_snapshot` are optional, fail-soft diagnostic/display
-  metadata; they never authorize completion, PR linkage, or billing decisions.
-- `terminal_result` is the authoritative outcome at a terminal state; absent is
-  tolerated (the adapter falls back to status/pr_url/gates).
-- Terminal success requires validated `completed` status AND canonical PR URL.
+- **Concurrency and liveness**: Same-issue exclusivity comes only from the atomic
+  Worklink claim. `MIMIR_FACTORY_MAX_CONCURRENT` is a separate factory cap with
+  default/fallback `1`; leaf concurrency remains `2`. The 12-hour timeout is a
+  process liveness backstop. The 900-second stale threshold emits diagnostics
+  only and never dispatches, steals, cancels, or deletes work.
+- **Recovery**: A parked or interrupted run retains its sandbox. Recovery binds
+  the retained identities, reads status, obtains a run-ID-first lock only when
+  justified, rereads owner/history, resumes, rereads a running status with a real
+  `next`, reconciles the checkout and claim, then relaunches the exact OpenCode
+  command. `terminal_result` is opaque context; its `reason` never selects an
+  action. `needs-human` is parked and resumable, not terminal.
+- **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
+  `completed` can ship. Before `worklink:review`, Worklink runs the configured
+  repository test command, requires observed non-skipped exit-zero evidence and
+  a clean stable HEAD, then verifies the canonical open/non-draft GitHub PR's
+  repository, base ref, head repository/ref, and head SHA. Worklink does not
+  push, ready, review, remediate, or merge the PR.
 
 Per-leaf worklink (the rest of this document) is unaffected: file a
 `worklink:ready` leaf that satisfies the strict template (§2.5) and the poller
@@ -459,7 +429,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `feature-factory start ...` | Epic adapter that launches the external opencode feature-factory. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.7 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -710,7 +680,7 @@ backends:
     bash_allowlist: ["git *", "uv *"]
     args: []                 # Worklink injects the configured model and --dir
   feature_factory:
-    bin: feature-factory
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 ```
 
 The `compute_backends:` stanza is not needed in normal configs — it is only
@@ -811,6 +781,30 @@ Current slice-1 recovery is manual:
 
 ## 8. Configuration (`<home>/worklink.yaml`)
 
+### Deploying the 0.7 migration to an existing home
+
+`backends.feature_factory` changed shape. The retired `bin`, `args`, `ready` and
+`reviewer` keys are now **rejected at config load**, which raises before any dispatch
+runs. Worklink crashes emit no events, so an unmigrated `<home>/worklink.yaml` fails
+*silently*: nothing appears in `events.jsonl` and the only trace is `run-<id>.log`.
+Stale config of exactly this shape has already caused one full dispatch outage — the
+retired `codex` backend block, 2026-07-30.
+
+Edit `<home>/worklink.yaml` **before or with** the image rebuild:
+
+```yaml
+backends:
+  feature_factory:
+    # remove:  bin: node /workspace/feature-factory/src/cli.js
+    # remove:  args: []
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
+```
+
+`entrypoint` may be omitted entirely when `MIMIR_FACTORY_ENTRYPOINT` is set; the image
+sets it to the path above. This is an image-layer change, so redeploy with
+`docker compose -p <project> up -d --build` — a plain restart does not pick it up.
+
+
 ```yaml
 defaults:
   backend: opencode
@@ -865,7 +859,7 @@ backends:                   # ToolBackend adapters — WHAT builds
     bin: opencode
     args: []                 # -m/--model, --dir, and -- are backend-owned
   feature_factory:
-    bin: feature-factory
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 
 # Backend blocked path: coding CLIs can deliberately route planner/human issues
 # back to Chainlink by printing `WORKLINK_BLOCKED: <one-line reason>`. This is

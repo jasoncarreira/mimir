@@ -1,104 +1,108 @@
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { getFactoryRun, getFactoryRuns, type FactoryRunSummary, type FactoryRunDetail } from "../api/factory-runs";
+import {
+  getFactoryRun,
+  getFactoryRuns,
+  type FactoryRunDetail,
+  type FactoryRunSummary
+} from "../api/factory-runs";
 import type { DashboardSurface } from "../dashboardExtensions";
+import { sanitizeHref } from "../routeState";
 import {
   Badge,
-  Button,
+  CodeBlock,
   EmptyState,
   ErrorState,
   LoadingState,
   Panel
 } from "../ui";
-import type { ApiError } from "../api/http";
-import { sanitizeHref } from "../routeState";
 
 interface FactoryRunsRouteProps {
   surface: DashboardSurface;
 }
 
-const statusTone: Record<string, React.ComponentProps<typeof Badge>["tone"]> = {
+type BadgeTone = React.ComponentProps<typeof Badge>["tone"];
+
+const statusTone: Record<string, BadgeTone> = {
   running: "info",
   completed: "success",
   blocked: "danger",
   partial: "warning",
   "needs-human": "warning",
+  interrupted: "warning",
   invalid: "danger",
-  unknown: "neutral",
+  pending: "neutral",
+  unknown: "neutral"
 };
 
-function formatTime(iso: string): string {
-  if (!iso) return "never";
-  try {
-    const date = new Date(iso);
-    return date.toLocaleString();
-  } catch {
-    return iso;
-  }
+const lockTone: Record<FactoryRunSummary["lock"], BadgeTone> = {
+  fresh: "success",
+  stale: "warning",
+  absent: "neutral"
+};
+
+function isTerminalStatus(status: string): boolean {
+  return status === "completed" || status === "blocked" || status === "partial";
 }
 
-function RunCard({
-  run,
-  onClick
-}: {
-  run: FactoryRunSummary;
-  onClick: () => void;
-}) {
-  const status = run.status || "unknown";
-  const isStale = run.is_stale;
-  const isTerminal = run.is_terminal;
-  const hasError = run.error || (run.diagnostic && status === "invalid");
+function formatTime(iso: string | null): string {
+  if (!iso) return "not observed";
+  const timestamp = Date.parse(iso);
+  return Number.isNaN(timestamp) ? iso : new Date(timestamp).toLocaleString();
+}
 
+function OpaqueContext({ value }: { value: Record<string, unknown> }) {
+  return <CodeBlock code={JSON.stringify(value, null, 2)} language="json" />;
+}
+
+function CompactList({ items, className }: { items: string[]; className: string }) {
+  if (items.length === 0) return <p className="app-copy">None reported.</p>;
   return (
-    <button className="factory-run-card" onClick={onClick} type="button">
-      <span className="factory-run-card__id">{run.run_id}</span>
-      <span className="factory-run-card__badges">
-        <Badge tone={statusTone[status] ?? "neutral"}>{status}</Badge>
-        {isStale && <Badge tone="danger">stale</Badge>}
-        {run.is_stale && run.status === "running" && <Badge tone="warning">stale heartbeat</Badge>}
-        {run.pending_gate && <Badge tone="warning">gate: {run.pending_gate}</Badge>}
-        {run.validator_verdict && <Badge tone={run.validator_verdict === "GO" ? "success" : "danger"}>validator: {run.validator_verdict}</Badge>}
-        {run.security_verdict && <Badge tone={run.security_verdict === "PASS" ? "success" : "danger"}>security: {run.security_verdict}</Badge>}
-      </span>
-      <span className="factory-run-card__meta">
-        <span>Heartbeat: {formatTime(run.heartbeat_at)}</span>
-        {run.pr_url && <span>PR: {run.pr_url}</span>}
-        {run.error && <span className="factory-run-card__error">{run.error}</span>}
-      </span>
-      {run.terminal_result && (
-        <span className="factory-run-card__terminal">
-          Terminal: {run.terminal_result.status}
-          {run.terminal_result.reason && ` - ${run.terminal_result.reason}`}
-        </span>
-      )}
-    </button>
+    <div className={className}>
+      {items.map((item, index) => (
+        <Badge key={`${index}-${item}`}>{item}</Badge>
+      ))}
+    </div>
   );
 }
 
-function GateStatus({ statuses }: { statuses: Array<[string, string]> }) {
-  if (!statuses || statuses.length === 0) return null;
+function RunCard({ run, onClick }: { run: FactoryRunSummary; onClick: () => void }) {
+  const status = run.status || "unknown";
+  const terminal = isTerminalStatus(status);
+
   return (
-    <div className="factory-gates">
-      <dt>Gates</dt>
-      <dd>
-        {statuses.map(([name, status]) => (
-          <Badge key={name} tone={status === "approved" ? "success" : status === "pending" ? "warning" : "neutral"}>
-            {name}: {status}
-          </Badge>
-        ))}
-      </dd>
-    </div>
+    <button
+      className="factory-run-card"
+      data-testid={`factory-run-${run.run_id}`}
+      onClick={onClick}
+      type="button"
+    >
+      <span className="factory-run-card__id">{run.run_id} · {run.issue_key}</span>
+      <span className="factory-run-card__badges">
+        <Badge tone={statusTone[status] ?? "neutral"}>{status}</Badge>
+        <Badge tone={run.valid ? "success" : "danger"}>{run.valid ? "valid" : "invalid projection"}</Badge>
+        <Badge tone={lockTone[run.lock]}>lock {run.lock}</Badge>
+        {run.dead_lock ? <Badge tone="danger">dead lock</Badge> : null}
+        {status === "needs-human" ? <Badge tone="warning">parked/resumable</Badge> : null}
+        {run.pr_draft ? <Badge tone="warning">draft PR</Badge> : null}
+      </span>
+      <span className="factory-run-card__meta">
+        <span>{run.mode} · {run.branch} → {run.pr_base}</span>
+        <span>Controller: {run.controller_phase || "unknown"}</span>
+        <span>Observed: {formatTime(run.observed_at)}</span>
+        {run.pr_url ? <span>PR: {run.pr_url}</span> : null}
+        {run.controller_error ? <span className="factory-run-card__error">{run.controller_error}</span> : null}
+      </span>
+      {terminal ? <span className="factory-run-card__terminal">Terminal: {status}</span> : null}
+    </button>
   );
 }
 
 export function RunDetail({ runId }: { runId: string }) {
   const { data, isLoading, error } = useQuery({
     queryKey: ["factory-run", runId],
-    queryFn: async () => {
-      const response = await getFactoryRun(runId);
-      return response.data;
-    },
+    queryFn: async () => (await getFactoryRun(runId)).data
   });
 
   if (isLoading) return <LoadingState label="Loading run details" />;
@@ -107,95 +111,77 @@ export function RunDetail({ runId }: { runId: string }) {
 
   const run = data as FactoryRunDetail;
   const status = run.status || "unknown";
+  const terminal = isTerminalStatus(status);
+  const parked = status === "needs-human";
   const prHref = sanitizeHref(run.pr_url);
-  const terminalPrHref = sanitizeHref(run.terminal_result?.pr_url);
+  const hasNext = Object.prototype.hasOwnProperty.call(run, "next");
 
   return (
-    <div className="factory-run-detail">
+    <div className="factory-run-detail" data-testid="factory-run-detail">
       <Panel
+        actions={<Link className="ui-button ui-button--secondary" to="/factory-runs">Back to list</Link>}
         title={`Run: ${run.run_id}`}
-        actions={
-          <Link to="/factory-runs">
-            <Button variant="secondary">Back to List</Button>
-          </Link>
-        }
       >
         <dl className="facts-grid">
+          <div><dt>Issue</dt><dd>{run.issue_key}</dd></div>
           <div><dt>Status</dt><dd><Badge tone={statusTone[status] ?? "neutral"}>{status}</Badge></dd></div>
-          <div><dt>Terminal</dt><dd>{run.is_terminal ? "Yes" : "No"}</dd></div>
-          <div><dt>Stale</dt><dd>{run.is_stale ? "Yes" : "No"}</dd></div>
-          <div><dt>Heartbeat</dt><dd>{formatTime(run.heartbeat_at)}</dd></div>
-          {run.pr_url && <div><dt>PR URL</dt><dd>{prHref ? <a href={prHref} target="_blank" rel="noopener noreferrer">{run.pr_url}</a> : run.pr_url}</dd></div>}
-          {run.error && <div><dt>Error</dt><dd>{run.error}</dd></div>}
-          {run.pending_gate && <div><dt>Pending Gate</dt><dd>{run.pending_gate}</dd></div>}
-          {run.validator_verdict && <div><dt>Validator</dt><dd><Badge tone={run.validator_verdict === "GO" ? "success" : "danger"}>{run.validator_verdict}</Badge></dd></div>}
-          {run.security_verdict && <div><dt>Security</dt><dd><Badge tone={run.security_verdict === "PASS" ? "success" : "danger"}>{run.security_verdict}</Badge></dd></div>}
+          <div><dt>Lifecycle</dt><dd>{parked ? "Parked/resumable" : terminal ? "Terminal" : "Active"}</dd></div>
+          <div><dt>Valid projection</dt><dd>{run.valid ? "Yes" : "No"}</dd></div>
+          <div><dt>Mode</dt><dd>{run.mode}</dd></div>
+          <div><dt>Branch</dt><dd>{run.branch}</dd></div>
+          <div><dt>Base</dt><dd>{run.pr_base}</dd></div>
+          <div><dt>Draft PR</dt><dd>{run.pr_draft ? "Yes" : "No"}</dd></div>
+          <div><dt>Controller phase</dt><dd>{run.controller_phase || "unknown"}</dd></div>
+          <div><dt>Observed</dt><dd>{formatTime(run.observed_at)}</dd></div>
+          <div><dt>Sandbox</dt><dd>{run.sandbox_path}</dd></div>
+          {hasNext ? <div><dt>Next action</dt><dd>{run.next || "none"}</dd></div> : null}
+          {run.pr_url ? (
+            <div>
+              <dt>PR URL</dt>
+              <dd>{prHref ? <a href={prHref} rel="noopener noreferrer" target="_blank">{run.pr_url}</a> : run.pr_url}</dd>
+            </div>
+          ) : null}
+          {run.controller_error ? <div><dt>Controller error</dt><dd>{run.controller_error}</dd></div> : null}
+        </dl>
+      </Panel>
+
+      <Panel title="Lock and session">
+        <dl className="facts-grid">
+          <div><dt>Lock</dt><dd><Badge tone={lockTone[run.lock]}>{run.lock}</Badge></dd></div>
+          <div><dt>Dead lock</dt><dd>{run.dead_lock ? "Yes" : "No"}</dd></div>
+          <div><dt>Session</dt><dd>{run.lock_session || "none"}</dd></div>
         </dl>
       </Panel>
 
       <Panel title="Gates">
-        <GateStatus statuses={run.gate_statuses} />
+        {Object.keys(run.gates).length > 0
+          ? <OpaqueContext value={run.gates} />
+          : <p className="app-copy">No gate context reported.</p>}
       </Panel>
 
-      {run.steps && run.steps.length > 0 && (
-        <Panel title="Steps">
-          <div className="factory-steps">
-            {run.steps.map(([agent, status]) => (
-              <div key={agent} className="factory-step">
-                <Badge tone={status === "accepted" || status === "completed" ? "success" : status === "running" ? "warning" : "neutral"}>
-                  {agent}: {status}
-                </Badge>
-              </div>
-            ))}
-          </div>
-        </Panel>
-      )}
+      <Panel title="Steps">
+        <CompactList className="factory-steps" items={run.steps} />
+      </Panel>
 
-      {run.slices && run.slices.length > 0 && (
-        <Panel title="Slices">
-          <div className="factory-slices">
-            {run.slices.map(([id, status]) => (
-              <div key={id} className="factory-slice">
-                <Badge tone={status === "merged" ? "success" : status === "building" || status === "running" ? "warning" : "neutral"}>
-                  {id}: {status}
-                </Badge>
-              </div>
-            ))}
-          </div>
-        </Panel>
-      )}
+      <Panel title="Slices">
+        <CompactList className="factory-slices" items={run.slices} />
+      </Panel>
 
-      {run.terminal_result && (
-        <Panel title="Terminal Result">
-          <dl className="facts-grid">
-            <div><dt>Status</dt><dd>{run.terminal_result.status}</dd></div>
-            {run.terminal_result.pr_url && <div><dt>PR URL</dt><dd>{terminalPrHref ? <a href={terminalPrHref} target="_blank" rel="noopener noreferrer">{run.terminal_result.pr_url}</a> : run.terminal_result.pr_url}</dd></div>}
-            {run.terminal_result.reason && <div><dt>Reason</dt><dd>{run.terminal_result.reason}</dd></div>}
-            {run.terminal_result.summary && <div><dt>Summary</dt><dd>{run.terminal_result.summary}</dd></div>}
-          </dl>
-        </Panel>
-      )}
+      <Panel title="Validator">
+        {run.validator
+          ? <OpaqueContext value={run.validator} />
+          : <p className="app-copy">No validator context reported.</p>}
+      </Panel>
 
-      {run.cost && (
-        <Panel title="Cost Attribution">
-          <dl className="facts-grid">
-            <div><dt>Status</dt><dd>{run.cost.status}</dd></div>
-            {run.cost.total_tokens !== null && <div><dt>Total Tokens</dt><dd>{run.cost.total_tokens.toLocaleString()}</dd></div>}
-            {run.cost.cost_total !== null && <div><dt>Cost Total</dt><dd>{run.cost.cost_total.toFixed(6)} {run.cost.cost_currency}</dd></div>}
-            {run.cost.request_count !== null && <div><dt>Requests</dt><dd>{run.cost.request_count}</dd></div>}
-          </dl>
-        </Panel>
-      )}
+      <Panel title="Terminal context">
+        {run.terminal_result
+          ? <div data-testid="factory-terminal-context"><OpaqueContext value={run.terminal_result} /></div>
+          : <p className="app-copy">No terminal context reported.</p>}
+      </Panel>
 
-      {run.debug && (
-        <Panel title="Debug Info">
-          <dl className="facts-grid">
-            {run.debug.created_at && <div><dt>Created</dt><dd>{formatTime(run.debug.created_at)}</dd></div>}
-            {run.debug.resumed_at && <div><dt>Resumed</dt><dd>{formatTime(run.debug.resumed_at)}</dd></div>}
-            {run.debug.resume_count !== null && <div><dt>Resume Count</dt><dd>{run.debug.resume_count}</dd></div>}
-          </dl>
-        </Panel>
-      )}
+      <Panel title="Cost">
+        <p className="app-copy">Cost attribution is unavailable for this factory projection.</p>
+      </Panel>
     </div>
   );
 }
@@ -203,19 +189,12 @@ export function RunDetail({ runId }: { runId: string }) {
 export function FactoryRunsRoute({ surface }: FactoryRunsRouteProps) {
   const [searchParams, setSearchParams] = useSearchParams();
   const runId = searchParams.get("run");
-
   const { data, isLoading, error } = useQuery({
     queryKey: ["factory-runs"],
-    queryFn: async () => {
-      const response = await getFactoryRuns();
-      return response.data;
-    },
+    queryFn: async () => (await getFactoryRuns()).data
   });
 
-  if (runId) {
-    return <RunDetail runId={runId} />;
-  }
-
+  if (runId) return <RunDetail runId={runId} />;
   if (isLoading) return <LoadingState label="Loading factory runs" />;
   if (error) return <ErrorState title="Failed to load factory runs">{String(error)}</ErrorState>;
 
@@ -237,12 +216,12 @@ export function FactoryRunsRoute({ surface }: FactoryRunsRouteProps) {
         {runs.map((run) => (
           <RunCard
             key={run.run_id}
-            run={run}
             onClick={() => {
               const params = new URLSearchParams(searchParams);
               params.set("run", run.run_id);
               setSearchParams(params);
             }}
+            run={run}
           />
         ))}
       </div>

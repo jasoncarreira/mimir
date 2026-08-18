@@ -45,7 +45,6 @@ _ISSUE_PATTERNS = (
     re.compile(r"\bissue\s*#(\d+)\b", re.IGNORECASE),
     re.compile(r"\bissue[_\s-]?id\s*[:=]\s*['\"]?(\d+)\b", re.IGNORECASE),
 )
-_SAFE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -97,16 +96,6 @@ def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str,
     stamped = strip_http_event_ingress_extra(extra)
     stamped[HTTP_EVENT_INGRESS_EXTRA_KEY] = HTTP_EVENT_INGRESS_EXTRA_VALUE
     return stamped
-
-
-@dataclass(frozen=True)
-class FactoryRunMetadata:
-    run_id: str
-    issue_id: int | None
-    branch: str | None
-    worktree: Path | None
-    run_dir: Path
-    pr_url: str | None
 
 
 @dataclass(frozen=True)
@@ -175,7 +164,6 @@ def maybe_create_worklink_budget_continuation(
     now = _utc_now_iso()
     configured_repo = _resolve_existing_dir(repo)
     validated_worktree = _resolve_existing_dir(current_worktree) or configured_repo
-    repo_for_metadata = configured_repo or validated_worktree
     repo_slug = _repo_slug(configured_repo or validated_worktree, runner=runner)
 
     current_branch = _git_current_branch(validated_worktree, runner=runner)
@@ -198,17 +186,9 @@ def maybe_create_worklink_budget_continuation(
         [match.group(0) for text in hint_strings for match in _PR_URL_RE.finditer(text)]
     )
 
-    factory_runs = [
-        run_meta
-        for candidate in candidate_run_ids
-        if (run_meta := _load_factory_run(repo_for_metadata, candidate)) is not None
-    ]
-    primary_factory = factory_runs[0] if factory_runs else None
-
     trusted_labels = _normalize_labels(current_labels)
     worklink_related = _has_worklink_context(
         hint_strings=hint_strings,
-        factory_runs=factory_runs,
         labels=trusted_labels,
         branch=current_branch,
         issue_candidates=candidate_issue_ids,
@@ -217,9 +197,8 @@ def maybe_create_worklink_budget_continuation(
     if not worklink_related:
         return None
 
-    validated_issue_id, validated_repo, _factory_source = _validate_issue_from_factory(
-        primary_factory, current_repo=repo_slug,
-    )
+    validated_issue_id: int | None = None
+    validated_repo = repo_slug
 
     run_state = None
     run_state_file: Path | None = None
@@ -271,9 +250,6 @@ def maybe_create_worklink_budget_continuation(
             validated_repo = repo_from_evidence
             validated_pr_url = pr_from_evidence
 
-    if validated_pr_url is None and primary_factory is not None:
-        validated_pr_url = _validate_factory_pr(primary_factory, repo=validated_repo or repo_slug)
-
     if validated_repo is None:
         validated_repo = repo_slug
 
@@ -294,8 +270,6 @@ def maybe_create_worklink_budget_continuation(
         "worktree": str(validated_worktree) if validated_worktree is not None else None,
         "branch": current_branch,
         "run_state_path": str(run_state_file) if run_state_file is not None else None,
-        "factory_run_id": primary_factory.run_id if primary_factory is not None else None,
-        "factory_run_dir": str(primary_factory.run_dir) if primary_factory is not None else None,
         "current_labels": trusted_labels or None,
     }
 
@@ -368,7 +342,7 @@ def maybe_create_worklink_budget_continuation(
                 _mapping_str(event.extra, "poller_name") if isinstance(event.extra, Mapping) else None,
                 80,
             ),
-            "factory_run_id_hint": _truncate_str(candidate_run_ids[0], 120) if candidate_run_ids else None,
+            "run_id_hint": _truncate_str(candidate_run_ids[0], 120) if candidate_run_ids else None,
         },
         "association": association,
         "partial_work_state": partial_work_state,
@@ -416,7 +390,6 @@ def maybe_create_worklink_budget_continuation(
         external_comment_posted=bool(comment_state.get("posted")),
         occurrences=occurrences,
         source_id=event.source_id,
-        factory_run_id=primary_factory.run_id if primary_factory is not None else None,
     )
     return WorklinkContinuationResult(sidecar_path=path, idempotency_key=idempotency_key, payload=payload)
 
@@ -779,13 +752,12 @@ def _collect_hint_strings(
 def _has_worklink_context(
     *,
     hint_strings: Sequence[str],
-    factory_runs: Sequence[FactoryRunMetadata],
     labels: Sequence[str],
     branch: str | None,
     issue_candidates: Sequence[int],
     pr_candidates: Sequence[str],
 ) -> bool:
-    if factory_runs or labels or issue_candidates or pr_candidates:
+    if labels or issue_candidates or pr_candidates:
         return True
     if branch and ("worklink" in branch.lower() or "chainlink-" in branch.lower()):
         return True
@@ -793,44 +765,6 @@ def _has_worklink_context(
         "worklink" in text.lower() or "chainlink" in text.lower()
         for text in hint_strings
     )
-
-
-def _load_factory_run(repo_root: Path | None, run_id: str) -> FactoryRunMetadata | None:
-    if repo_root is None:
-        return None
-    run_id = run_id.strip()
-    if not _SAFE_RUN_ID_RE.fullmatch(run_id):
-        return None
-    root = (repo_root / ".opencode" / "factory").resolve()
-    candidate_dir = (root / run_id).resolve(strict=False)
-    if not _is_within(candidate_dir, root):
-        return None
-    run_json = candidate_dir / "run.json"
-    data = _load_json_dict(run_json)
-    if not data:
-        return None
-    return FactoryRunMetadata(
-        run_id=run_id,
-        issue_id=_parse_issue_from_text(_truncate_str(data.get("external_ref"), 200)),
-        branch=_truncate_str(data.get("branch"), 200),
-        worktree=_resolve_existing_dir(Path(str(data.get("worktree"))))
-        if data.get("worktree")
-        else None,
-        run_dir=candidate_dir,
-        pr_url=_normalize_pr_url(_truncate_str(data.get("pr_url"), 400)),
-    )
-
-
-def _validate_issue_from_factory(
-    factory_run: FactoryRunMetadata | None,
-    *,
-    current_repo: str | None,
-) -> tuple[int | None, str | None, FactoryRunMetadata | None]:
-    if factory_run is None or factory_run.issue_id is None:
-        return None, current_repo, None
-    if current_repo is None:
-        return None, None, None
-    return factory_run.issue_id, current_repo, factory_run
 
 
 def _validate_issue_from_run_state(
@@ -932,12 +866,6 @@ def _validate_pr_from_evidence(
             continue
         return record.pr_url, record.test_command
     return None, None
-
-
-def _validate_factory_pr(factory_run: FactoryRunMetadata, *, repo: str | None) -> str | None:
-    if factory_run.pr_url is None or repo is None:
-        return None
-    return factory_run.pr_url if _repo_from_pr_url(factory_run.pr_url) == repo else None
 
 
 def _repo_slug(repo: Path | None, *, runner: Runner) -> str | None:

@@ -176,20 +176,23 @@ Two **independent** inputs decide what a turn may do:
     - **Fetched page content** → untrusted active ingest, including content from
        an operator-approved URL. `approved_fetch_urls()` authorizes exact-URL GET
        egress and redirects; it is not a trust grant for returned bytes (#1139).
-   - **Mimir's own context** (`<home>/memory/**`, `<home>/state/**`, and
-      framework-preloaded self-authored prompt blocks) → trusted informational,
-       except `<home>/state/pollers/**`, which poller subprocesses can populate
-       from external events and which remains untrusted active ingest. Successful
-       model writes to memory/state are stamped in protected `.mimir` metadata
-       with the least trust of the live server-owned carrier. A later read of an
-       untrusted-derived file therefore remains untrusted active ingest instead
-       of laundering taint through a self-authored-looking path. Prior assistant
-       history stores the same server-derived integrity at send time and reloads
-       as informational; clean self-authored history is trusted, while output
-       produced from untrusted input remains untrusted informational. Framework-
-       preloaded identities, prompts, session state, and other context assembled
-       from server-owned state are trusted informational. Resolved paths and
-       framework constructors are the evidence; caller metadata, model output,
+    - **Mimir's own context** (`<home>/.mimir_builtin_skills/**`,
+       `<home>/skills/**`, `<home>/memory/**`, `<home>/state/**`, and framework-
+       preloaded self-authored prompt blocks) → trusted informational, except
+       `<home>/state/pollers/**`, which poller subprocesses can populate from
+       external events and which remains untrusted active ingest. Filesystem
+       classification resolves both the server-configured home and requested path
+       before checking containment; prefix lookalikes and symlink escapes are not
+       trusted. Successful model writes to memory/state are stamped in protected
+       `.mimir` metadata with the least trust of the live server-owned carrier. A
+       later read of an untrusted-derived file therefore remains untrusted active
+       ingest instead of laundering taint through a self-authored-looking path.
+       Prior assistant history stores the same server-derived integrity at send
+       time and reloads as informational; clean self-authored history is trusted,
+       while output produced from untrusted input remains untrusted informational.
+       Framework-preloaded identities, prompts, session state, and other context
+       assembled from server-owned state are trusted informational. Resolved paths
+       and framework constructors are the evidence; caller metadata, model output,
        and model-supplied parameters cannot choose these labels.
    - **An operator-configured MCP tool** → use that exact tool policy's explicit
      `result_integrity` grant. `trusted` vouches for successful returned content;
