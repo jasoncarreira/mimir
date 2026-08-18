@@ -199,18 +199,21 @@ def test_non_admin_sees_principal_less_agent_self_but_not_user_event(tmp_path: P
 
 @pytest.mark.parametrize(
     ("record_channel", "expected_allowed"),
-    [("shared", True), ("another-channel", False)],
+    [(None, False), ("shared", True), ("another-channel", False)],
 )
 def test_ownerless_non_self_feedback_is_complete_untrusted_and_channel_bound(
     tmp_path: Path,
-    record_channel: str,
+    record_channel: str | None,
     expected_allowed: bool,
 ):
-    log = _make_log(tmp_path, events=[{
+    record = {
         "timestamp": _ts(0.1), "type": "commitment_due",
-        "channel_id": record_channel, "text": "OWNERLESS-USER-SECRET",
+        "text": "OWNERLESS-USER-SECRET",
         "commitment_id": "legacy-ownerless",
-    }])
+    }
+    if record_channel is not None:
+        record["channel_id"] = record_channel
+    log = _make_log(tmp_path, events=[record])
     auth = AuthContext(
         principal="bob", canonical_principal="bob", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="shared",
