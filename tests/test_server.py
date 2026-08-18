@@ -2578,7 +2578,10 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         assert app["runtime_slot"].bundle is bundle
         assert bundle.adapters is app["runtime_adapters"]
         assert bundle.adapters.channels is app["channels"]
-        assert dispatcher._run_turn.__self__ is bundle.agent
+        # The dispatcher's runner is the identity-preflight wrapper rather
+        # than the bare bound method, so reach through __wrapped__ to prove
+        # it still belongs to THIS bundle's agent.
+        assert dispatcher._run_turn.__wrapped__.__self__ is bundle.agent
 
         reader, writer = await asyncio.open_unix_connection(str(daemon.socket_path))
         for request in (
@@ -2648,7 +2651,10 @@ async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_h
         assert bundle.adapters.dispatcher is dispatcher
         assert bundle.adapters.channels is app["channels"]
         assert bundle.adapters.scheduler is app["scheduler"]
-        assert dispatcher._run_turn.__self__ is bundle.agent
+        # The dispatcher's runner is the identity-preflight wrapper rather
+        # than the bare bound method, so reach through __wrapped__ to prove
+        # it still belongs to THIS bundle's agent.
+        assert dispatcher._run_turn.__wrapped__.__self__ is bundle.agent
     finally:
         await _run_cleanup(app)
         shutil.rmtree(home)
