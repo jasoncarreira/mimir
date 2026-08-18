@@ -763,7 +763,7 @@ def test_non_user_trigger_does_not_gain_originating_channel_carveout(trigger: st
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_cross_channel_recent_activity_uses_requester_acl_for_same_channel_sinks():
+def test_cross_channel_recent_activity_requires_trust_for_same_channel_sinks():
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
         source="slack", content="reply to me",
@@ -786,14 +786,26 @@ def test_cross_channel_recent_activity_uses_requester_acl_for_same_channel_sinks
         untrusted_labels = untrusted_labels.with_source(source)
 
     for tool in ("send_message", "react"):
+        trusted_auth = replace(
+            auth, ifc_state=InformationFlowState(labels=trusted_labels),
+        )
+        untrusted_auth = replace(
+            auth, ifc_state=InformationFlowState(labels=untrusted_labels),
+        )
         trusted = SinkGate.check_sink_flow(
-            tool, event.channel_id, trusted_labels, auth, enforce=True,
+            tool, event.channel_id, trusted_labels, trusted_auth, enforce=True,
         )
         untrusted = SinkGate.check_sink_flow(
-            tool, event.channel_id, untrusted_labels, auth, enforce=True,
+            tool, event.channel_id, untrusted_labels, untrusted_auth, enforce=True,
         )
         assert trusted.allowed is True, (tool, trusted.reason)
-        assert untrusted.allowed is True, (tool, untrusted.reason)
+        if tool == "send_message":
+            # Authenticated interactive ingress retains its explicit-reply
+            # carveout; harness delivery and other same-channel sinks do not.
+            assert untrusted.allowed is True, (tool, untrusted.reason)
+        else:
+            assert untrusted.allowed is False, (tool, untrusted.reason)
+            assert untrusted.reason == "ifc_label_blocked:same_channel"
 
 
 def test_prompt_source_labels_preserve_full_trusted_label():
@@ -2419,28 +2431,37 @@ def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_acl_authorized_untrusted_foreign_channel_protected_prompt_can_reply():
-    labels = InformationFlowLabels(
-        labels=frozenset({"private"}),
-        sources=frozenset({SourceLabel(
-            principal="user-2",
-            domain="recent_activity",
-            resource_id="slack-C-other",
-            bridge_instance="slack",
-            sensitivity="private",
-            authorized_principals=frozenset({"user-1"}),
-            source_kind="protected_prompt",
-            integrity="untrusted",
-            integrity_effect="informational",
-        )}),
+def test_acl_authorized_untrusted_protected_prompt_is_channel_bound():
+    source = SourceLabel(
+        principal="user-2",
+        domain="recent_activity",
+        resource_id="slack-C1",
+        bridge_instance="slack",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_prompt",
+        integrity="untrusted",
+        integrity_effect="informational",
     )
 
-    decision = SinkGate.check_sink_flow(
-        "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
+    same_channel = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1",
+        InformationFlowLabels(labels=frozenset({"private"}), sources=(source,)),
+        _auth(), enforce=True,
+    )
+    foreign_channel = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1",
+        InformationFlowLabels(
+            labels=frozenset({"private"}),
+            sources=(replace(source, resource_id="slack-C-other"),),
+        ),
+        _auth(), enforce=True,
     )
 
-    assert decision.allowed is True
-    assert decision.reason == "ifc_allowed"
+    assert same_channel.allowed is True
+    assert same_channel.reason == "ifc_allowed"
+    assert foreign_channel.allowed is False
+    assert foreign_channel.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.parametrize(
@@ -2638,7 +2659,7 @@ def test_one_disqualified_source_blocks_the_entire_turn(disqualification: str):
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-def test_protected_prompt_relaxation_does_not_widen_cross_channel_sinks():
+def test_protected_prompt_channel_binding_does_not_widen_cross_channel_sinks():
     source = SourceLabel(
         principal="user-2",
         domain="recent_activity",
@@ -2654,7 +2675,7 @@ def test_protected_prompt_relaxation_does_not_widen_cross_channel_sinks():
         labels=frozenset({"private"}), sources=(source,),
     )
 
-    same_channel = SinkGate.check_sink_flow(
+    triggering_channel = SinkGate.check_sink_flow(
         "harness_auto_deliver", "slack-C1", labels, _auth(), enforce=True,
     )
     cross_channel = SinkGate.check_sink_flow(
@@ -2662,7 +2683,8 @@ def test_protected_prompt_relaxation_does_not_widen_cross_channel_sinks():
         sink_category=SinkCategory.CROSS_CHANNEL,
     )
 
-    assert same_channel.allowed is True
+    assert triggering_channel.allowed is False
+    assert triggering_channel.reason == "ifc_label_blocked:same_channel"
     assert cross_channel.allowed is False
     assert cross_channel.reason == "ifc_label_blocked:cross_channel"
 
