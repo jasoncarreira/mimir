@@ -16,6 +16,12 @@ import type {
   SagaStatsResponse,
   TurnsResponse
 } from "../api";
+import type {
+  ApiSuccessEnvelope,
+  FactoryRunDetail,
+  FactoryRunsData,
+  ListMeta
+} from "../api/generated/contracts";
 
 export const turnsFixture: TurnsResponse = {
   turns: [
@@ -359,70 +365,84 @@ export const chatReactionFixture: ChatReactionEvent = {
   emoji: "thumbs_up"
 };
 
-export const factoryRunsListFixture = {
+export const factoryRunsListFixture: ApiSuccessEnvelope<FactoryRunsData, ListMeta> = {
   ok: true,
-  version: "v1" as const,
+  version: "v1",
   data: {
     runs: [
       {
-        run_id: "chainlink-834",
+        run_id: "834",
+        issue_key: "834",
+        valid: true,
+        sandbox_path: "/srv/mimir/factory/834",
         status: "running",
-        heartbeat_at: "2026-07-13T10:00:00Z",
-        is_terminal: false,
-        is_stale: false,
-        pending_gate: "brief",
-        gate_statuses: [["story", "approved"], ["brief", "pending"], ["pre_pr", "pending"]],
-        validator_verdict: null,
-        security_verdict: null,
-        cost: {
-          status: "partial",
-          total_tokens: 150000,
-          cost_total: 0.45,
-          cost_currency: "USD"
-        }
+        mode: "autonomous",
+        branch: "slice/834-factory-run",
+        pr_base: "main",
+        pr_draft: true,
+        lock: "fresh",
+        dead_lock: false,
+        lock_session: "session-834",
+        pr_url: null,
+        next: "build",
+        controller_phase: "monitoring",
+        observed_at: "2026-07-13T10:00:00Z",
+        controller_error: null
       },
       {
-        run_id: "chainlink-833",
+        run_id: "833",
+        issue_key: "833",
+        valid: true,
+        sandbox_path: "/srv/mimir/factory/833",
         status: "completed",
-        heartbeat_at: "2026-07-12T15:30:00Z",
-        is_terminal: true,
-        is_stale: false,
-        pending_gate: null,
-        gate_statuses: [["story", "approved"], ["brief", "approved"], ["pre_pr", "approved"]],
-        validator_verdict: "GO",
-        security_verdict: "PASS",
+        mode: "autonomous",
+        branch: "slice/833-factory-run",
+        pr_base: "main",
+        pr_draft: false,
+        lock: "absent",
+        dead_lock: false,
+        lock_session: null,
         pr_url: "https://github.com/owner/repo/pull/42",
-        terminal_result: {
-          status: "completed",
-          pr_url: "https://github.com/owner/repo/pull/42",
-          reason: null,
-          summary: "Successfully completed"
-        }
+        controller_phase: "completed",
+        observed_at: "2026-07-12T15:30:00Z",
+        controller_error: null
       },
       {
-        run_id: "chainlink-832",
-        status: "blocked",
-        heartbeat_at: "2026-07-11T09:00:00Z",
-        is_terminal: true,
-        is_stale: true,
-        pending_gate: null,
-        gate_statuses: [["story", "approved"], ["brief", "approved"], ["pre_pr", "pending"]],
-        validator_verdict: null,
-        security_verdict: null,
-        error: "Gate pre_pr requires human approval"
+        run_id: "832",
+        issue_key: "832",
+        valid: true,
+        sandbox_path: "/srv/mimir/factory/832",
+        status: "needs-human",
+        mode: "autonomous",
+        branch: "slice/832-factory-run",
+        pr_base: "main",
+        pr_draft: true,
+        lock: "stale",
+        dead_lock: true,
+        lock_session: "session-832",
+        pr_url: null,
+        next: "resume",
+        controller_phase: "parked",
+        observed_at: "2026-07-11T09:00:00Z",
+        controller_error: "Operator input required"
       },
       {
-        run_id: "chainlink-831",
-        status: "invalid",
-        heartbeat_at: "",
-        is_terminal: false,
-        is_stale: true,
-        pending_gate: null,
-        gate_statuses: [],
-        validator_verdict: null,
-        security_verdict: null,
-        error: "malformed run.json",
-        diagnostic: true
+        run_id: "831",
+        issue_key: "831",
+        valid: false,
+        sandbox_path: "/srv/mimir/factory/831",
+        status: "running",
+        mode: "autonomous",
+        branch: "slice/831-factory-run",
+        pr_base: "main",
+        pr_draft: true,
+        lock: "absent",
+        dead_lock: false,
+        lock_session: null,
+        pr_url: null,
+        controller_phase: "failed",
+        observed_at: null,
+        controller_error: "Factory status validation failed"
       }
     ]
   },
@@ -434,36 +454,31 @@ export const factoryRunsListFixture = {
   }
 };
 
-export const factoryRunDetailFixture = {
+export const factoryRunDetailFixture: ApiSuccessEnvelope<FactoryRunDetail> = {
   ok: true,
-  version: "v1" as const,
+  version: "v1",
   data: {
-    run_id: "chainlink-834",
+    run_id: "834",
+    issue_key: "834",
+    valid: true,
+    sandbox_path: "/srv/mimir/factory/834",
     status: "running",
-    heartbeat_at: "2026-07-13T10:00:00Z",
-    is_terminal: false,
-    is_stale: false,
-    pending_gate: "brief",
-    gate_statuses: [["story", "approved"], ["brief", "pending"], ["pre_pr", "pending"]],
-    validator_verdict: null,
-    security_verdict: null,
-    steps: [["spec-writer", "accepted"], ["work-decomposer", "running"]],
-    slices: [["s1", "merged"], ["s2", "building"]],
-    cost: {
-      status: "partial",
-      updated_at: "2026-07-13T09:00:00Z",
-      entry_count: 5,
-      request_count: 120,
-      total_tokens: 150000,
-      cost_total: 0.45,
-      cost_currency: "USD",
-      mixed_currency: false,
-      missing: []
-    },
-    debug: {
-      created_at: "2026-07-13T08:00:00Z",
-      resumed_at: null,
-      resume_count: 0
-    }
+    mode: "autonomous",
+    branch: "slice/834-factory-run",
+    pr_base: "main",
+    pr_draft: true,
+    lock: "fresh",
+    dead_lock: false,
+    lock_session: "session-834",
+    pr_url: null,
+    next: "build",
+    controller_phase: "monitoring",
+    observed_at: "2026-07-13T10:00:00Z",
+    controller_error: null,
+    gates: { story: "approved", brief: "approved" },
+    steps: ["spec-writer:accepted", "work-decomposer:running"],
+    slices: ["s1:merged", "s2:building"],
+    validator: { status: "pending" },
+    terminal_result: null
   }
 };
