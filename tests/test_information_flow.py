@@ -922,7 +922,7 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
 
 
 @pytest.mark.parametrize("name", [".recovery.json", "cursor.json"])
-def test_poller_managed_state_uses_accepted_first_party_carveout(
+def test_poller_managed_state_is_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -937,8 +937,8 @@ def test_poller_managed_state_uses_accepted_first_party_carveout(
         resource_id=str(recovery.resolve()), bridge_instance="filesystem",
     )
 
-    assert source.integrity == "trusted"
-    assert source.integrity_effect == "informational"
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == "active_ingest"
 
 
 @pytest.mark.parametrize("approved", [True, False])
@@ -975,7 +975,7 @@ def test_fetch_approval_never_confers_integrity(
     assert source.integrity_effect == "active_ingest"
 
 
-def test_untrusted_model_write_uses_accepted_first_party_state_carveout(
+def test_untrusted_model_write_cannot_launder_through_self_authored_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -997,7 +997,7 @@ def test_untrusted_model_write_uses_accepted_first_party_state_carveout(
     )
 
     assert (source.integrity, source.integrity_effect) == (
-        "trusted", "informational",
+        "untrusted", "active_ingest",
     )
     assert json.loads(
         (tmp_path / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
