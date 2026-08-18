@@ -18,7 +18,9 @@ def prompt_source_label(
     self_authored: bool,
 ) -> SourceLabel:
     """Create a private, informational prompt source with explicit provenance."""
-    target_channel = channel_id or auth_context.resource_id or auth_context.channel_id
+    target_channel = channel_id
+    if self_authored and not target_channel:
+        target_channel = auth_context.resource_id or auth_context.channel_id
     return SourceLabel(
         principal=principal,
         domain=domain,
