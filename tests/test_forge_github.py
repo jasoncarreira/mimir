@@ -3,9 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+import requests
 
 from mimir.forge import ForgeError, ForgeResponseTooLarge, ReviewVerdict
-from mimir.forge.github import GitHubForgeClient
+from mimir.forge.github import (
+    GitHubForgeClient,
+    GitHubIdentityFailureKind,
+    GitHubIdentityVerificationError,
+)
 from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
 from mimir.tools.forge import initialize_github_forge_identity
@@ -91,7 +96,10 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
 def test_live_snapshot_normalizes_all_authority_facts() -> None:
     session = Session([Response({
         "number": 17, "state": "open", "user": {"login": "author"},
-        "base": {"ref": "main", "sha": "b" * 40},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
         "head": {
             "ref": "feature", "sha": "a" * 40,
             "repo": {"full_name": "contributor/fork"},
@@ -102,6 +110,7 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
         "owner/repo", 17,
     )
 
+    assert snapshot.repo == "owner/repo"
     assert snapshot.state == "open"
     assert snapshot.number == 17
     assert snapshot.author == "author"
@@ -117,7 +126,10 @@ def test_live_snapshot_normalizes_all_authority_facts() -> None:
 def test_live_snapshot_uses_origin_for_same_repository_head() -> None:
     session = Session([Response({
         "number": 17, "state": "open", "user": {"login": "author"},
-        "base": {"ref": "main", "sha": "b" * 40},
+        "base": {
+            "ref": "main", "sha": "b" * 40,
+            "repo": {"full_name": "owner/repo"},
+        },
         "head": {
             "ref": "feature", "sha": "a" * 40,
             "repo": {"full_name": "owner/repo"},
@@ -212,8 +224,10 @@ def test_startup_identity_verification_degrades_coding_on_mismatch(monkeypatch) 
 
     class MismatchedClient:
         def verify_identity(self, declared_login):
-            raise ForgeError(
-                f"github identity mismatch: authenticated as other-bot, declared as {declared_login}"
+            raise GitHubIdentityVerificationError(
+                "provider wording may change",
+                declared_login=declared_login,
+                authenticated_login="other-bot",
             )
 
     observed: list[str] = []
@@ -225,7 +239,40 @@ def test_startup_identity_verification_degrades_coding_on_mismatch(monkeypatch) 
 
     assert initialize_github_forge_identity() is False
     assert forge_tools.github_identity_is_degraded() is True
-    assert observed == ["github identity mismatch: authenticated as other-bot, declared as reviewer"]
+    assert observed == ["provider wording may change"]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_identity_http_outage_has_typed_transient_provenance(status: int) -> None:
+    client = GitHubForgeClient(session=Session([Response({}, status=status)]))
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+
+
+def test_identity_transport_failure_has_typed_transient_provenance() -> None:
+    class FailingSession:
+        def request(self, *args, **kwargs):
+            raise requests.ConnectionError("wording is not part of policy")
+
+    client = GitHubForgeClient(session=FailingSession())
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_invalid_github_credential_is_permanent(status: int) -> None:
+    client = GitHubForgeClient(session=Session([Response({}, status=status)]))
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity("reviewer")
+
+    assert caught.value.failure_kind == GitHubIdentityFailureKind.PERMANENT
 
 
 def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:

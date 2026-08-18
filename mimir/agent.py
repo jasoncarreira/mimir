@@ -92,6 +92,7 @@ from .access_control import (
     get_trusted_service_from_auth_context,
 )
 from .prompts import ENFORCEMENT_GUIDANCE, build_system_prompt, build_turn_prompt
+from . import prompt_sources
 from .rate_limits import RateLimitStore
 from .saga_client import SagaClient
 from .session_boundary_log import (
@@ -229,7 +230,7 @@ def _prompt_source_labels(
     bridge: str | None = None,
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
-    self_authored: bool = False,
+    self_authored: bool,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -237,23 +238,20 @@ def _prompt_source_labels(
         f"service:{requester}" if auth_context.is_service and requester else requester
     )
     owner = principal or effective_requester
-    target_channel = channel_id or auth_context.resource_id or auth_context.channel_id
     bridge_instance = bridge or auth_context.bridge_instance or "mimir"
     acl = authorized_principals
     if acl is None:
         acl = frozenset({effective_requester}) if effective_requester else frozenset()
-    return InformationFlowLabels().with_source(SourceLabel(
+    return InformationFlowLabels().with_source(prompt_sources.prompt_source_label(
+        auth_context,
         principal=owner,
         domain=domain,
-        resource_id=target_channel or resource,
+        resource=resource,
+        channel_id=channel_id,
         bridge_instance=bridge_instance,
-        sensitivity="private",
         authorized_principals=acl,
         source_kind=source_kind,
-        # These blocks are loaded by the framework from its own memory/state by
-        # default. Callers injecting externally authored history opt out below.
-        integrity=Integrity.TRUSTED if self_authored else Integrity.UNTRUSTED,
-        integrity_effect=IntegrityEffect.INFORMATIONAL,
+        self_authored=self_authored,
     ))
 
 
@@ -342,6 +340,16 @@ def _merge_ifc_labels(
     if source_channel:
         merged = merged.with_channel(source_channel)
     return merged
+
+
+def _persisted_integrity(ifc_labels: InformationFlowLabels) -> Integrity:
+    return (
+        Integrity.TRUSTED
+        if ifc_labels.sources and all(
+            source.integrity == Integrity.TRUSTED for source in ifc_labels.sources
+        )
+        else Integrity.UNTRUSTED
+    )
 
 
 def _initialize_ifc_labels(
@@ -1421,7 +1429,11 @@ class Agent:
         # what woke it up. Pre-#181 logged them as system_note.
         return "system_note"
 
-    async def _append_inbound_to_buffer(self, event: AgentEvent) -> None:
+    async def _append_inbound_to_buffer(
+        self,
+        event: AgentEvent,
+        ifc_labels: InformationFlowLabels,
+    ) -> None:
         """Append an inbound event to the ``MessageBuffer`` so future
         ``assemble_recent_activity`` calls see it. Skip rules match
         pre-#181's ``_record_inbound``: drop empty-content events
@@ -1440,16 +1452,6 @@ class Agent:
         if event.extra.get("_buffer_recorded"):
             return
         try:
-            persisted_integrity = Integrity.UNTRUSTED
-            if (
-                event.ifc_labels is not None
-                and event.ifc_labels.sources
-                and all(
-                    source.integrity == Integrity.TRUSTED
-                    for source in event.ifc_labels.sources
-                )
-            ):
-                persisted_integrity = Integrity.TRUSTED
             msg = self._buffer.make_message(
                 channel_id=event.channel_id,
                 kind=self._kind_for_trigger(event.trigger),
@@ -1460,7 +1462,7 @@ class Agent:
                 author_display=event.author_display or event.author,
                 msg_id=event.source_id,
                 source=event.source,
-                integrity=persisted_integrity,
+                integrity=_persisted_integrity(ifc_labels),
             )
             await self._buffer.append(msg)
             event.extra["_buffer_recorded"] = True
@@ -1475,7 +1477,12 @@ class Agent:
         message was just folded into a running turn. Record it in chat history
         now, at its true arrival time, so Recent activity threads it ahead of the
         turn's later replies. Wired in server.py via ``set_on_inject``."""
-        await self._append_inbound_to_buffer(event)
+        ifc_labels = _initialize_ifc_labels(
+            event,
+            event.attachment_names,
+            resolver=getattr(self, "_identity_resolver", None),
+        )
+        await self._append_inbound_to_buffer(event, ifc_labels)
 
     def _current_system_prompt(self, *, emit_health_events: bool = False) -> str:
         """Render the system prompt for the current turn.
@@ -1660,8 +1667,9 @@ class Agent:
                     rate_limit_callback=codex_plus_callback,
                 )
 
-            if self._agent_tools is None or (
-                self._config.coding_enabled and not coding_enabled
+            if (
+                self._agent_tools is None
+                or coding_enabled != self._cached_coding_enabled
             ):
                 self._agent_tools = all_mimir_tools(coding_enabled=coding_enabled)
 
@@ -2501,14 +2509,7 @@ class Agent:
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
                     source=getattr(bridge, "name", None),
-                    integrity=(
-                        Integrity.TRUSTED
-                        if ctx.ifc_labels.sources and all(
-                            source.integrity == Integrity.TRUSTED
-                            for source in ctx.ifc_labels.sources
-                        )
-                        else Integrity.UNTRUSTED
-                    ),
+                    integrity=_persisted_integrity(ctx.ifc_labels),
                 )
                 await self._buffer.append(msg)
             except Exception:  # noqa: BLE001
@@ -2553,7 +2554,7 @@ class Agent:
         # in ``_build_turn_prompt`` sees this turn's own trigger as
         # context. No-op for triggers that don't represent conversation
         # (scheduled_tick / saga_session_end / shell_job_complete).
-        await self._append_inbound_to_buffer(event)
+        await self._append_inbound_to_buffer(event, ctx.ifc_labels)
 
         # chainlink #383 facet 1: mop up same-channel user messages that
         # queued behind an interactive user turn before the dispatcher/registry

@@ -13,6 +13,7 @@ import subprocess
 from typing import Callable, Sequence
 import uuid
 
+from ._rmtree import rmtree_missing_ok
 from .models import (
     NormalizedPullRequestSnapshot,
     RepoPRAction,
@@ -764,7 +765,7 @@ def reclaim_expired_pr_checkout_leases(
                             lease, head, runner,
                         )
                         recovery_bundle = _preserve_checkout_head(lease, head, runner)
-                        shutil.rmtree(path)
+                        rmtree_missing_ok(path)
                         reclaimed = True
                         error = None
                     except (OSError, RuntimeError) as preservation_exc:
@@ -1164,5 +1165,5 @@ def cleanup_pr_checkout_lease(
             f"HEAD {head!r} is not contained in published commit {published_head!r}"
             f"{detail}"
         )
-    shutil.rmtree(lease.path)
+    rmtree_missing_ok(lease.path)
     return True

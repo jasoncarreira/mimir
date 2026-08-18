@@ -208,6 +208,7 @@ def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
 
     labels = _prompt_source_labels(
         auth, domain="usage", resource="global:usage", principal="service:mimir",
+        self_authored=False,
     )
 
     assert {source.authorized_principals for source in labels.sources} == {

@@ -245,6 +245,7 @@ class _RemediationForge:
 
 def _snapshot(head_sha: str, *, state: str = "open") -> NormalizedPullRequestSnapshot:
     return NormalizedPullRequestSnapshot(
+        repo="owner/repo",
         state=state,
         number=7,
         author="mimir-bot",

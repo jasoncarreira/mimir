@@ -29,7 +29,8 @@ from langgraph.runtime import Runtime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
-from mimir.agent import Agent
+from mimir.access_control import ServicePrincipal
+from mimir.agent import Agent, _initialize_ifc_labels
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
     ChatSkillInvocation,
@@ -37,6 +38,7 @@ from mimir.chat_skills import (
 )
 from mimir.channel_registry import ChannelRegistry
 from mimir.config import Config
+from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver
 from mimir.index import IndexGenerator
@@ -44,6 +46,8 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    Integrity,
+    SourceLabel,
     TurnContext,
     TurnInteractivity,
 )
@@ -1643,7 +1647,9 @@ async def test_append_inbound_to_buffer_is_idempotent(tmp_path: Path):
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hello")
     await agent.on_message_injected(event)   # inject-time record
     assert agent._buffer.channel_count("ch-1") == 1
-    await agent._append_inbound_to_buffer(event)  # leftover re-route → no-op
+    await agent._append_inbound_to_buffer(
+        event, _initialize_ifc_labels(event),
+    )  # leftover re-route → no-op
     assert agent._buffer.channel_count("ch-1") == 1
 
 
@@ -2474,6 +2480,95 @@ async def test_run_turn_appends_inbound_to_message_buffer(tmp_path: Path):
     )
 
 
+async def test_run_turn_persists_computed_operator_integrity(tmp_path: Path):
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
+        fake_saga=_FakeSaga(),
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp-session-1",
+        content="operator request",
+        author="operator",
+        source="acp",
+    )
+    computed_labels = _initialize_ifc_labels(event)
+
+    await agent.run_turn(event)
+
+    [inbound] = [m for m in agent._buffer._all if m.kind == "user_message"]
+    assert all(source.integrity == "trusted" for source in computed_labels.sources)
+    assert inbound.integrity == "trusted"
+    assert event.ifc_labels is None
+    assert _initialize_ifc_labels(event) == computed_labels
+
+
+async def test_run_turn_does_not_trust_event_supplied_integrity(tmp_path: Path):
+    supplied = InformationFlowLabels().with_source(SourceLabel(
+        principal="attacker",
+        domain="channel",
+        resource_id="web-1",
+        bridge_instance="web",
+        sensitivity="private",
+        integrity="trusted",
+    ))
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
+        fake_saga=_FakeSaga(),
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="web-1",
+        content="public request",
+        author="visitor",
+        source="web",
+        ifc_labels=supplied,
+    )
+
+    await agent.run_turn(event)
+
+    [inbound] = [m for m in agent._buffer._all if m.kind == "user_message"]
+    assert inbound.integrity == "untrusted"
+
+
+async def test_run_turn_preserves_server_classified_poller_integrity(tmp_path: Path):
+    service = ServicePrincipal(
+        canonical="poller:trusted",
+        trigger="poller",
+        capabilities=(),
+        readable_domains=("poller_payload",),
+    )
+    classified = InformationFlowLabels().with_source(SourceLabel(
+        principal="service:poller:trusted",
+        domain="poller_payload",
+        resource_id="classified-payload",
+        bridge_instance="poller",
+        sensitivity="internal",
+        integrity="trusted",
+    ))
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="ok")]),
+        fake_saga=_FakeSaga(),
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id="poller:trusted",
+        content="classified update",
+        source="poller",
+        service_principal=service.canonical,
+        service_authority=service,
+        ifc_labels=classified,
+    )
+
+    await agent.run_turn(event)
+
+    [inbound] = [m for m in agent._buffer._all if m.kind == "system_note"]
+    assert inbound.integrity == "trusted"
+
+
 async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     tmp_path: Path,
 ):
@@ -2515,6 +2610,76 @@ async def test_run_turn_interactive_no_send_message_emits_no_reply_signal(
     assert no_reply[0].get("output_chars", 0) > 0
 
 
+async def test_framework_no_reply_signal_is_visible_as_trusted_feedback(
+    tmp_path: Path,
+):
+    """The agent can recall its own framework-filed no-reply telemetry."""
+    first_agent = _FakeAgent(response_messages=[
+        AIMessage(content="I reasoned about this but did not send it"),
+    ])
+    agent = _build_agent(tmp_path, fake_agent=first_agent, fake_saga=_FakeSaga())
+    channels = ChannelRegistry()
+    channels.register(_BridgeStub())  # type: ignore[arg-type]
+    agent._channels = channels
+    agent._config.auto_deliver_final_text_channels = ()
+
+    first = await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id="ch-old",
+        content="first request",
+        author="stub-U1",
+        source="stub",
+    ))
+
+    assert first.error is None
+    events = [
+        json.loads(line)
+        for line in agent._config.events_log.read_text().splitlines()
+        if line.strip()
+    ]
+    [filed] = [
+        event
+        for event in events
+        if event.get("type") == "interactive_turn_no_send_message"
+    ]
+    assert filed["channel_id"] == "ch-old"
+
+    second_auth = AuthContext(
+        principal="stub-U1",
+        canonical_principal="admin",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="ch-new",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="ch-new",
+        bridge_instance="stub",
+    )
+    recalled = FeedbackLog(
+        events_path=agent._config.events_log,
+        turns_path=agent._config.turns_log,
+    ).recent_prompt_block(second_auth)
+
+    assert recalled is not None
+    assert "no_reply [ch-old]" in recalled.content
+    trusted_no_reply_sources = [
+        source
+        for source in recalled.labels.sources
+        if source.domain == "feedback"
+        and source.resource_id == "ch-old"
+        and source.principal == "admin"
+        and source.integrity == Integrity.TRUSTED
+    ]
+    assert trusted_no_reply_sources
+    assert all(source.is_complete for source in trusted_no_reply_sources)
+    assert all(
+        source.authorized_principals == frozenset({"admin"})
+        for source in trusted_no_reply_sources
+    )
+
+
 async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     import json
     from mimir.channel_registry import ChannelRegistry
@@ -2539,6 +2704,8 @@ async def test_run_turn_auto_delivers_final_text_when_enabled(tmp_path: Path):
     assert bridge.sends == [("ch-1", final_text, False)]
     outbound = [m for m in agent._buffer._all if m.kind == "assistant_message"]
     assert [m.content for m in outbound] == [final_text]
+    inbound = [m for m in agent._buffer._all if m.kind == "user_message"]
+    assert [m.integrity for m in inbound + outbound] == ["trusted", "trusted"]
 
     events_log = tmp_path / "home" / "logs" / "events.jsonl"
     evs = [json.loads(ln) for ln in events_log.read_text().splitlines() if ln.strip()]
@@ -2819,9 +2986,10 @@ async def test_inbound_buffer_append_skips_internal_wake_triggers(tmp_path: Path
     )
 
     for trig in ("saga_session_end", "shell_job_complete"):
-        await agent._append_inbound_to_buffer(AgentEvent(
+        event = AgentEvent(
             trigger=trig, channel_id="ch-1", content="ignore me",
-        ))
+        )
+        await agent._append_inbound_to_buffer(event, _initialize_ifc_labels(event))
     assert agent._buffer.total_count() == 0
 
 
@@ -2836,11 +3004,12 @@ async def test_inbound_buffer_append_logs_scheduled_tick_as_system_note(
     agent = _build_agent(
         tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
     )
-    await agent._append_inbound_to_buffer(AgentEvent(
+    event = AgentEvent(
         trigger="scheduled_tick",
         channel_id="scheduler:heartbeat",
         content="Heartbeat — check for new commitments due.",
-    ))
+    )
+    await agent._append_inbound_to_buffer(event, _initialize_ifc_labels(event))
     msgs = list(agent._buffer._all)
     assert len(msgs) == 1
     assert msgs[0].kind == "system_note"
@@ -2857,11 +3026,12 @@ async def test_inbound_buffer_append_falls_back_to_author_for_display(
     agent = _build_agent(
         tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga(),
     )
-    await agent._append_inbound_to_buffer(AgentEvent(
+    event = AgentEvent(
         trigger="user_message", channel_id="ch-1",
         content="hi", author="discord-99",
         author_display=None,  # bridge didn't supply one
-    ))
+    )
+    await agent._append_inbound_to_buffer(event, _initialize_ifc_labels(event))
     msgs = list(agent._buffer._all)
     assert len(msgs) == 1
     assert msgs[0].author == "discord-99"

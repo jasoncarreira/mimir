@@ -2326,6 +2326,33 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
         assert (checkout / "output.txt").read_text() == "worker output\n"
 
 
+def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    boundary = tmp_path / "attempt"
+    checkout = boundary / "checkout"
+    checkout.mkdir(parents=True)
+    victim = checkout / "maintenance.lock"
+    victim.write_text("lock\n")
+    real_unlink = os.unlink
+    raced = False
+
+    def unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal raced
+        if not raced and os.fsdecode(path) == victim.name:
+            raced = True
+            real_unlink(path, dir_fd=dir_fd)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(orchestrator.os, "unlink", unlink)
+    orchestrator._close_attempt_capabilities(None, None, checkout, delete_checkout=True)
+
+    assert raced
+    assert not boundary.exists()
+
+
 @pytest.mark.parametrize(
     "scenario",
     [

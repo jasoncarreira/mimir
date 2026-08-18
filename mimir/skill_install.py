@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mimir._atomic import atomic_write_json
+from mimir._rmtree import rmtree_missing_ok
 from mimir.redaction import redact_text
 from mimir.skill_defs import (
     home_builtin_skills_dir,
@@ -302,7 +303,7 @@ def install(
     try:
         shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
         if dest.exists():
-            shutil.rmtree(dest)
+            rmtree_missing_ok(dest)
         tmp.rename(dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)

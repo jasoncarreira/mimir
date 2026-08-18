@@ -397,6 +397,30 @@ def test_uv_execution_copy_normalizes_for_runner_without_relaxing_source(
     assert not home.exists()
 
 
+def test_cleanup_home_tolerates_entry_removed_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    victim = home / "worker.lock"
+    victim.write_text("lock\n")
+    real_unlink = os.unlink
+    raced = False
+
+    def unlink(path: str | bytes, *, dir_fd: int | None = None) -> None:
+        nonlocal raced
+        if not raced and os.fsdecode(path) == victim.name:
+            raced = True
+            real_unlink(path, dir_fd=dir_fd)
+        real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(worker_exec.os, "unlink", unlink)
+    worker_exec._cleanup_home(home)
+
+    assert raced
+    assert not home.exists()
+
+
 def test_repo_test_local_runner_selects_fd_sourced_execution_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

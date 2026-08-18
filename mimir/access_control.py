@@ -4729,15 +4729,7 @@ def _source_is_triggering_channel_compatible(
             and ChannelResourceAdapter._resolve_channel(source.resource_id)
             == resolved_triggering
         )
-    if source_kind == "protected_prompt":
-        # Framework-authored prompt blocks are trusted at their server-side
-        # loader; other prompt provenance must belong to this channel.
-        return (
-            source.integrity == "trusted"
-            or ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
-        )
-    return source_kind == "protected_tool"
+    return source_kind in {"protected_prompt", "protected_tool"}
 
 
 def _ifc_blocking_source(
