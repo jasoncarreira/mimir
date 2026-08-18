@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import fcntl
 import json
@@ -14,6 +14,11 @@ import subprocess
 from typing import Any, Callable, Iterator, Sequence
 
 from .compute import LaunchHandle, LocalSubprocessComputeBackend
+from .factory_state import (
+    factory_process_is_alive,
+    load_factory_record,
+    save_factory_record,
+)
 from .run_state import (
     WorklinkRunState,
     clear_run_state,
@@ -251,7 +256,28 @@ def stop_worklink(
     with _claim_mutex(home):
         state = load_run_state(home, issue_id)
         if state is None:
-            return WorklinkStopResult(issue_id, False, reason="no live run")
+            factory = load_factory_record(home, str(issue_id))
+            if factory is None or not factory_process_is_alive(factory) or factory.handle is None:
+                return WorklinkStopResult(issue_id, False, reason="no live run")
+            try:
+                asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))
+            except (KeyError, RuntimeError, OSError) as exc:
+                return WorklinkStopResult(issue_id, False, reason=str(exc))
+            save_factory_record(
+                home,
+                replace(factory, controller_phase="stopped", controller_error=None),
+            )
+            release = run([chainlink_bin, "locks", "release", str(issue_id)])
+            unlabel = run(
+                [chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"]
+            )
+            return WorklinkStopResult(
+                issue_id,
+                True,
+                state_cleared=False,
+                claim_released=release.returncode == 0,
+                label_cleared=unlabel.returncode == 0,
+            )
         if not process_is_alive(state):
             clear_run_state(home, issue_id)
             return WorklinkStopResult(

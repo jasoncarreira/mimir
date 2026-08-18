@@ -481,16 +481,21 @@ def _opencode_install_block(install_opencode: bool) -> str:
         return "# (OpenCode runtime not installed — MIMIR_ENABLE_OPENCODE not set)"
     return (
         "# OpenCode runtime — opt-in via MIMIR_ENABLE_OPENCODE=1.\n"
-        "# Pins: opencode-ai@1.18.9, opencode-feature-factory@0.2.1,\n"
+        "# Pins: opencode-ai@1.18.9, feature-factory@0.7.0,\n"
+        "# opencode-feature-factory@0.7.0,\n"
         "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
         "# opencode-anthropic-auth@0.0.13.\n"
+        "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
+        "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
         "ARG MIMIR_ENABLE_OPENCODE=0\n"
         "RUN if [ \"$MIMIR_ENABLE_OPENCODE\" = \"1\" ]; then \\\n"
-        "        npm install -g opencode-ai@1.18.9 ; \\\n"
-        "        npm install -g opencode-feature-factory@0.2.1 ; \\\n"
-        "        npm install -g opencode-project-memory@0.1.0 ; \\\n"
-        "        npm install -g opencode-openai-codex-auth@4.4.0 ; \\\n"
-        "        npm install -g opencode-anthropic-auth@0.0.13 ; \\\n"
+        "        npm install --global --prefix /opt/mimir-opencode \\\n"
+        "            opencode-ai@1.18.9 \\\n"
+        "            feature-factory@0.7.0 \\\n"
+        "            opencode-feature-factory@0.7.0 \\\n"
+        "            opencode-project-memory@0.1.0 \\\n"
+        "            opencode-openai-codex-auth@4.4.0 \\\n"
+        "            opencode-anthropic-auth@0.0.13 ; \\\n"
         "    fi"
     )
 
@@ -1054,7 +1059,7 @@ def _existing_scaffold_settings(
 
     install_opencode: bool | None = None
     if docker_text:
-        install_opencode = "npm install -g opencode-ai@" in docker_text
+        install_opencode = "opencode-ai@1.18.9" in docker_text
     return mode, web_port, service_name, install_opencode
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from ..compute import (
     LocalSubprocessComputeBackend,
 )
 from .base import ToolBackend
-from .feature_factory import FeatureFactoryBackend
+from .feature_factory import DEFAULT_FACTORY_ENTRYPOINT, FeatureFactoryBackend
 from .opencode import (
     DERIVABLE_TEST_RUNNERS,
     OpenCodeBackend,
@@ -669,18 +670,26 @@ class BackendRegistry:
 
     @staticmethod
     def _build_feature_factory(settings: Mapping[str, Any]) -> FeatureFactoryBackend:
-        bin_name = str(settings.get("bin", "feature-factory"))
-        args = settings.get("args", [])
-        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
-            raise ValueError("worklink feature_factory args must be a list of strings")
-        # ``ready``/``reviewer`` are optional overrides; when unset the backend
-        # defaults apply (ready=True; reviewer from MIMIR_FACTORY_REVIEWER).
-        kwargs: dict[str, Any] = {"bin": bin_name, "extra_args": tuple(args)}
-        if "ready" in settings:
-            kwargs["ready_for_review"] = bool(settings["ready"])
-        if "reviewer" in settings:
-            kwargs["reviewer"] = str(settings["reviewer"] or "")
-        return FeatureFactoryBackend(**kwargs)
+        retired = sorted(set(settings) & {"bin", "args", "ready", "reviewer"})
+        if retired:
+            raise ValueError(
+                "worklink backends.feature_factory retired setting "
+                f"'{retired[0]}'; configure one absolute 'entrypoint' ending in "
+                "feature-factory/bin/factory.js"
+            )
+        unknown = sorted(set(settings) - {"entrypoint"})
+        if unknown:
+            raise ValueError(
+                f"unknown worklink feature_factory setting: {unknown[0]}"
+            )
+        entrypoint = str(
+            settings.get("entrypoint")
+            or os.environ.get("MIMIR_FACTORY_ENTRYPOINT")
+            or DEFAULT_FACTORY_ENTRYPOINT
+        )
+        if not Path(entrypoint).is_absolute():
+            raise ValueError("worklink feature_factory entrypoint must be an absolute path")
+        return FeatureFactoryBackend(entrypoint=entrypoint)
 
 
 def _derive_bash_allowlist(test_command: str) -> tuple[str, ...]:

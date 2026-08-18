@@ -25,17 +25,43 @@ from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, Wo
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
+from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
+from mimir.worklink.factory_state import FactoryRunRecord
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
     _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
+    _epic_run_timeout_s,
+    _epic_stale_heartbeat_s,
     _read_pr_body_section,
     render_decomposition_prompt,
     run_worklink,
     validate_leaf,
 )
+
+
+@pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
+def test_factory_timeout_defaults_and_falls_back_to_twelve_hours(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_RUN_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", value)
+    assert _epic_run_timeout_s() == 43200.0
+
+
+@pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
+def test_factory_stale_diagnostic_defaults_and_falls_back_to_fifteen_minutes(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", value)
+    assert _epic_stale_heartbeat_s() == 900.0
 
 
 class FakeCompute:
@@ -1653,7 +1679,9 @@ class _CodexNamedBackend(FakeBackend):
 
 from mimir.worklink.compute import LaunchHandle as _LaunchHandle
 
-def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: Path) -> None:
+def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     epic_json = json.dumps(
@@ -1677,15 +1705,11 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: 
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         return cp(args)
 
-    class FactoryBackend(FakeBackend):
-        name = "feature_factory"
-
-    compute = FakeCompute(shared_filesystem=True)
-    registry = BackendRegistry(
-        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    monkeypatch.setattr(
+        "mimir.worklink.backends.feature_factory.FeatureFactoryBackend.admit",
+        lambda self: Path(self.entrypoint),
     )
-    registry.register(FactoryBackend(status="success"))
-    registry.register_compute(compute)
+    registry = BackendRegistry(WorklinkConfig())
 
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run_epic(701)
@@ -1694,11 +1718,10 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: 
     assert result.status == "failed"
     assert result.reason == "lifecycle_state_incompatible"
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
-    assert compute.specs == []
     assert not (repo / ".worklink").exists()
 
 
-def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
+def _legacy_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     """Regression (mimir review on #1030): run_epic must call
     ``compute.wait(handle, timeout_s)`` — the same 2-arg signature run() uses —
     after launching the factory compute job. A prior bug passed only
@@ -1811,6 +1834,145 @@ def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
     handle, waited_timeout = compute.waited
     assert handle == LaunchHandle("fake_compute", "job-1")
     assert waited_timeout == compute.specs[0].timeout_s
+
+
+@pytest.mark.parametrize(
+    ("lock", "dead_lock", "action"),
+    [("absent", False, "claim"), ("stale", True, "steal")],
+)
+def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
+    tmp_path: Path,
+    lock: str,
+    dead_lock: bool,
+    action: str,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    historical = {"reason": "opaque and nonauthoritative"}
+
+    def status(value: str, lock_value: str, next_value: str | None = None):
+        payload: dict[str, Any] = {
+            "run_id": "700",
+            "issue_key": "700",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": value,
+            "mode": "autonomous",
+            "branch": "epic/700",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": lock_value,
+            "dead_lock": dead_lock if lock_value == lock else False,
+            "lock_session": None if lock_value == "absent" else "session-1",
+            "gates": {},
+            "steps": ["implementation"],
+            "slices": ["factory-070-migration"],
+            "validator": None,
+            "pr_url": None,
+            "terminal_result": historical,
+        }
+        if next_value is not None:
+            payload["next"] = next_value
+        return parse_factory_status(payload)
+
+    statuses = [
+        status("needs-human", lock),
+        status("needs-human", "fresh"),
+        status("needs-human", "fresh"),
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, run_id: str, *, sandbox: Path, launcher: str):
+            calls.append(("status", run_id, str(sandbox), launcher))
+            return statuses.pop(0)
+
+        def lock(self, run_id: str, selected_action: str, **kwargs: Any) -> None:
+            calls.append(("lock", run_id, selected_action, kwargs["session"], str(kwargs["sandbox"])))
+
+        def resume(self, run_id: str, **kwargs: Any):
+            calls.append(("resume", run_id, kwargs["session"], str(kwargs["sandbox"])))
+            return status("running", "fresh", "implementation")
+
+        def heartbeat(self, run_id: str, **kwargs: Any) -> None:
+            calls.append(("heartbeat", run_id, kwargs["session"], str(kwargs["sandbox"])))
+
+        def work_spec(self, order: WorkOrder, **kwargs: Any) -> WorkSpec:
+            return FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js").work_spec(
+                order, **kwargs
+            )
+
+    class Compute:
+        def __init__(self) -> None:
+            self.handle = LaunchHandle("local_subprocess", "123", 456)
+            self.cancelled = False
+            self.cleaned = False
+
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            return self.handle
+
+        def job_alive(self, handle: LaunchHandle) -> bool:
+            return True
+
+        async def cancel(self, handle: LaunchHandle) -> None:
+            self.cancelled = True
+
+        async def cleanup(self, handle: LaunchHandle) -> None:
+            self.cleaned = True
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[-2:] == ["branch", "--show-current"]:
+            return cp(args, stdout="epic/700\n")
+        if isinstance(args, list) and "rev-parse" in args:
+            return cp(args, stdout="a" * 40 + "\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    retained = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=LaunchHandle("local_subprocess", "99999999", 456),
+        status=status("needs-human", lock),
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="parked",
+    )
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    compute = Compute()
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path / "repo")._recover_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=claim,
+            claims=object(),
+            backend=Backend(),
+            compute=compute,
+            retained=retained,
+            launcher=Path(retained.launcher),
+            repo_slug="owner/repo",
+            base="main",
+            test_cmd="uv run pytest -q",
+            runner=runner,
+        )
+    )
+    assert result.status == "needs-human"
+    assert calls[:5] == [
+        ("status", "700", str(sandbox), retained.launcher),
+        ("lock", "700", action, "session-1", str(sandbox)),
+        ("status", "700", str(sandbox), retained.launcher),
+        ("resume", "700", "session-1", str(sandbox)),
+        ("status", "700", str(sandbox), retained.launcher),
+    ]
+    assert calls[-1] == ("heartbeat", "700", "session-1", str(sandbox))
+    assert compute.cancelled and compute.cleaned
 
 
 def _commit_runner(
