@@ -195,7 +195,7 @@ def test_non_admin_sees_principal_less_agent_self_but_not_user_event(tmp_path: P
     }
 
 
-def test_ownerless_non_self_feedback_cannot_self_authorize_its_requester(
+def test_ownerless_non_self_feedback_is_complete_but_untrusted(
     tmp_path: Path,
 ):
     log = _make_log(tmp_path, events=[{
@@ -206,7 +206,7 @@ def test_ownerless_non_self_feedback_cannot_self_authorize_its_requester(
     auth = AuthContext(
         principal="bob", canonical_principal="bob", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="shared",
-        interactivity=None, enforcement_enabled=True,
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
     )
 
     block = log.recent_prompt_block(auth)
@@ -216,8 +216,74 @@ def test_ownerless_non_self_feedback_cannot_self_authorize_its_requester(
     assert len(block.labels.sources) == 1
     source = block.labels.sources[0]
     assert source.principal == "bob"
-    assert source.authorized_principals == frozenset()
-    assert source.is_complete is False
+    assert source.authorized_principals == frozenset({"bob"})
+    assert source.is_complete is True
+    assert source.integrity == Integrity.UNTRUSTED
+
+
+@pytest.mark.parametrize(
+    ("principal", "roles", "expected_acl"),
+    [
+        ("alice", ("user",), frozenset({"alice"})),
+        ("root", ("admin",), frozenset({"alice", "root"})),
+    ],
+)
+def test_owned_feedback_keeps_owner_acl_and_untrusted_integrity(
+    tmp_path: Path,
+    principal: str,
+    roles: tuple[str, ...],
+    expected_acl: frozenset[str],
+):
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1), "type": "commitment_due",
+        "channel_id": "shared", "owner_principal": "alice",
+        "text": "ALICE-OWN", "commitment_id": "c-alice",
+    }])
+    auth = AuthContext(
+        principal=principal, canonical_principal=principal, roles=roles,
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert len(block.labels.sources) == 1
+    source = block.labels.sources[0]
+    assert source.principal == "alice"
+    assert source.authorized_principals == expected_acl
+    assert source.integrity == Integrity.UNTRUSTED
+    assert source.is_complete is True
+
+
+def test_foreign_owned_feedback_does_not_gain_requester_acl(tmp_path: Path):
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "alice",
+            "text": "ALICE-SECRET", "commitment_id": "c-alice",
+        },
+        {
+            "timestamp": _ts(0.1), "type": "commitment_due",
+            "channel_id": "shared", "owner_principal": "bob",
+            "text": "BOB-OWN", "commitment_id": "c-bob",
+        },
+    ])
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True,
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "ALICE-SECRET" not in block.content
+    assert "BOB-OWN" in block.content
+    assert {source.principal for source in block.labels.sources} == {"bob"}
+    assert {source.authorized_principals for source in block.labels.sources} == {
+        frozenset({"bob"})
+    }
 
 
 def test_privileged_view_of_ownerless_non_agent_record_stays_untrusted(tmp_path: Path):

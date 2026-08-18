@@ -678,17 +678,15 @@ class FeedbackLog:
                 record_owner = _record_source_principal(record, auth_context)
                 principal = record_owner or service or requester
                 bridge = record.get("bridge") or record.get("source")
-                # The label ACL is an independent guard.  An owning principal
-                # establishes the record ACL; privileged readers may relay those
-                # records under their effective service identity.  Principal-less
-                # records only gain that identity after the positive, server-side
-                # agent-self classification above.  Do not let an arbitrary
-                # ownerless record authorize its requester by construction.
+                # The label ACL reflects the upstream authorization decision;
+                # trust remains independently derived from agent-self provenance.
+                # Ownerless records admitted for this requester must still have a
+                # structurally complete ACL even when they remain untrusted.
                 acl_principals = {record_owner} if record_owner else set()
                 effective_requester = service or requester
                 if effective_requester and (
                     (_is_privileged(auth_context) and bool(record_owner))
-                    or (not record_owner and _is_agent_self_record(record))
+                    or not record_owner
                 ):
                     acl_principals.add(effective_requester)
                 labels = labels.with_source(prompt_sources.prompt_source_label(
