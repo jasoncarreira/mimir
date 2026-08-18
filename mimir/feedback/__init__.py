@@ -302,6 +302,26 @@ class FeedbackLog:
         """Return (negative, positive), each reverse-chronological and
         capped at ``limit_per_polarity``. Records older than
         ``window_hours`` are dropped."""
+        negatives, positives, _ = self._recent(
+            window_hours=window_hours,
+            limit_per_polarity=limit_per_polarity,
+            auth_context=auth_context,
+            collect_labels=False,
+        )
+        return negatives, positives
+
+    def _recent(
+        self,
+        *,
+        window_hours: int | None,
+        limit_per_polarity: int | None,
+        auth_context: AuthContext | None,
+        collect_labels: bool,
+    ) -> tuple[
+        list[FeedbackSignal],
+        list[FeedbackSignal],
+        InformationFlowLabels,
+    ]:
         if auth_context is not None and not isinstance(auth_context, AuthContext):
             raise TypeError("feedback authorization requires the exact AuthContext")
         event_snapshot = self.events_snapshot
@@ -395,6 +415,7 @@ class FeedbackLog:
 
         negatives: list[FeedbackSignal] = []
         positives: list[FeedbackSignal] = []
+        labels = InformationFlowLabels()
         # Kinds whose first occurrence (most recent, since we walk
         # tail-first) we've already added — subsequent occurrences are
         # skipped. Stops weekly cron events from re-appearing on every
@@ -497,6 +518,10 @@ class FeedbackLog:
                     count=kind_counts.get(kind, 1),
                 )
             )
+            if collect_labels:
+                labels = self._with_record_source(
+                    labels, ev, "events", auth_context,
+                )
             # Early exit when both sides full.
             if len(negatives) >= limit and len(positives) >= limit:
                 break
@@ -570,9 +595,17 @@ class FeedbackLog:
                         content=content,
                     )
                 )
+                if collect_labels:
+                    labels = self._with_record_source(
+                        labels, rec, "turns", auth_context,
+                    )
                 bounded_negative_count += 1
 
-        return _collapse_feedback_signals(negatives), _collapse_feedback_signals(positives)
+        return (
+            _collapse_feedback_signals(negatives),
+            _collapse_feedback_signals(positives),
+            labels,
+        )
 
     @staticmethod
     def _record_authorized(record: dict, auth_context: AuthContext) -> bool:
@@ -628,6 +661,51 @@ class FeedbackLog:
             window_records=stream_filtered if saturated else None,
         )
 
+    @staticmethod
+    def _with_record_source(
+        labels: InformationFlowLabels,
+        record: dict,
+        resource: Literal["events", "turns"],
+        auth_context: AuthContext | None,
+    ) -> InformationFlowLabels:
+        if auth_context is None:
+            raise TypeError("feedback label collection requires AuthContext")
+        requester = auth_context.canonical_principal or auth_context.principal
+        service = (
+            f"service:{requester}"
+            if auth_context.is_service and requester
+            else None
+        )
+        record_owner = _record_source_principal(record, auth_context)
+        principal = record_owner or service or requester
+        bridge = record.get("bridge") or record.get("source")
+        # The label ACL reflects the upstream authorization decision; trust
+        # remains independently derived from agent-self provenance.
+        acl_principals = {record_owner} if record_owner else set()
+        effective_requester = service or requester
+        if effective_requester and (
+            (_is_privileged(auth_context) and bool(record_owner))
+            or not record_owner
+        ):
+            acl_principals.add(effective_requester)
+        return labels.with_source(prompt_sources.prompt_source_label(
+            auth_context,
+            principal=principal,
+            domain="feedback",
+            resource=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
+            channel_id=record.get("channel_id"),
+            bridge_instance=(
+                bridge
+                if isinstance(bridge, str) and bridge
+                else auth_context.bridge_instance
+            ),
+            authorized_principals=frozenset(acl_principals),
+            source_kind="protected_prompt",
+            # Trust requires positive agent-self provenance, not merely absent
+            # ownership. User-owned legacy records may be principal-less.
+            self_authored=not record_owner and _is_agent_self_record(record),
+        ))
+
     def recent_block(
         self,
         *,
@@ -656,81 +734,19 @@ class FeedbackLog:
         """Load authorized feedback and return content with record provenance."""
         if not isinstance(auth_context, AuthContext):
             raise TypeError("feedback prompt loading requires the exact AuthContext")
-        events = self._authorized_records(
-            self.events_snapshot, self.events_path, auth_context,
+        negatives, positives, labels = self._recent(
+            window_hours=None,
+            limit_per_polarity=None,
+            auth_context=auth_context,
+            collect_labels=True,
         )
-        turns = self._authorized_records(
-            self.turns_snapshot, self.turns_path, auth_context,
+        content = render_feedback_block(
+            negatives,
+            positives,
+            window_hours=self.default_window_hours,
         )
-        content = self.recent_block(auth_context=auth_context)
         if not content:
             return None
-        labels = InformationFlowLabels()
-        requester = auth_context.canonical_principal or auth_context.principal
-        service = (
-            f"service:{auth_context.canonical_principal or auth_context.principal}"
-            if auth_context.is_service
-            and (auth_context.canonical_principal or auth_context.principal)
-            else None
-        )
-        for resource, records in (("events", events), ("turns", turns)):
-            for record in records:
-                record_owner = _record_source_principal(record, auth_context)
-                principal = record_owner or service or requester
-                bridge = record.get("bridge") or record.get("source")
-                # The label ACL reflects the upstream authorization decision;
-                # trust remains independently derived from agent-self provenance.
-                # Ownerless records admitted for this requester must still have a
-                # structurally complete ACL even when they remain untrusted.
-                acl_principals = {record_owner} if record_owner else set()
-                effective_requester = service or requester
-                if effective_requester and (
-                    (_is_privileged(auth_context) and bool(record_owner))
-                    or not record_owner
-                ):
-                    acl_principals.add(effective_requester)
-                labels = labels.with_source(prompt_sources.prompt_source_label(
-                    auth_context,
-                    principal=principal,
-                    domain="feedback",
-                    resource=f"{resource}:{record.get('id') or record.get('turn_id') or record.get('timestamp') or record.get('ts')}",
-                    channel_id=record.get("channel_id"),
-                    bridge_instance=(bridge if isinstance(bridge, str) and bridge else auth_context.bridge_instance),
-                    authorized_principals=frozenset(acl_principals),
-                    source_kind="protected_prompt",
-                    # Integrity from persisted server provenance, never from
-                    # record text. Trust requires POSITIVE agent-self
-                    # provenance — the same explicit kind allowlist
-                    # `_record_authorized` uses — not merely the absence of an
-                    # owning principal. Absent ownership is missing metadata,
-                    # not evidence of framework authorship: as
-                    # `_is_agent_self_record` documents, user-owned events such
-                    # as `commitment_due` are principal-less in legacy logs,
-                    # and their renderers embed LLM-extracted `text`
-                    # (renderers.py, chainlink #312). Non-privileged callers
-                    # never see those — `_record_authorized` drops them — but a
-                    # privileged or service context short-circuits to
-                    # `return True`, so an ownerless non-agent record reaches
-                    # this label and, keyed on absence alone, would carry
-                    # conversation-derived text as a TRUSTED source.
-                    #
-                    # A record attributable to a user may embed that user's own
-                    # input (turn records persist `input`), so it stays
-                    # untrusted either way.
-                    #
-                    # Omitting this entirely let SourceLabel's UNTRUSTED
-                    # default apply to the agent's own telemetry. The explicit
-                    # kind allowlist therefore controls both visibility to a
-                    # non-privileged agent and trusted provenance once the
-                    # record is admitted. In particular,
-                    # `interactive_turn_no_send_message` is framework-written
-                    # self-regulation data; without its allowlist entry the
-                    # agent silently loses that feedback rather than receiving
-                    # a complete trusted source.
-                    self_authored=(
-                        not record_owner and _is_agent_self_record(record)
-                    ),
-                ))
         return PromptBlock(content=content, labels=labels)
 
 
