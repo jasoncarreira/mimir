@@ -203,11 +203,8 @@ def prune_stale_attempt_checkouts_for_home(home: Path, *, repo: Path | str | Non
     without bound.  If no Worklink repo is configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
 
-    Passes ``is_active`` so an attempt with a live detached factory (or a
-    non-terminal ``run.json``) is skipped rather than reaped: a detached epic can
-    run for longer than the TTL, and its top-level attempt-dir mtime freezes
-    while it works in subdirs, so the mtime-only staleness test alone would
-    delete a live run's checkout out from under it.
+    Worklink factory records and verified process handles keep active retained
+    sandboxes out of the TTL prune path.
     """
     defaults = worklink_defaults(home)
     repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
