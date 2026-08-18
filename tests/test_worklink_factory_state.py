@@ -101,3 +101,24 @@ def test_clear_factory_record_refuses_symlink(tmp_path: Path) -> None:
     with pytest.raises(FactoryRecordError, match="non-regular"):
         clear_factory_record(tmp_path, "1551")
     assert target.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("operation", ["load", "list", "save", "clear"])
+def test_factory_record_rejects_symlink_in_complete_parent_chain(
+    tmp_path: Path, operation: str
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "worklink" / "factory-runs").mkdir(parents=True)
+    (home / "state").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(FactoryRecordError, match="not contained"):
+        if operation == "load":
+            load_factory_record(home, "1551")
+        elif operation == "list":
+            list_factory_records(home)
+        elif operation == "save":
+            save_factory_record(home, replace(record(tmp_path), sandbox=str(tmp_path / "sandbox")))
+        else:
+            clear_factory_record(home, "1551")

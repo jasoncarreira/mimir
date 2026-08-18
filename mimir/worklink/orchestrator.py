@@ -12,6 +12,7 @@ import asyncio
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -72,6 +73,8 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
+_FACTORY_STARTUP_STATUS_TIMEOUT_S = 30.0
+
 
 def _epic_run_timeout_s() -> float:
     try:
@@ -1197,6 +1200,8 @@ class WorklinkRunner:
             raise WorklinkError("feature_factory backend has an invalid implementation")
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
+        if repo_slug is None:
+            raise WorklinkError("factory repository must have a canonical GitHub origin")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         if compute.name != "local_subprocess":
             raise WorklinkError("factory runs require local_subprocess supervision")
@@ -1231,7 +1236,7 @@ class WorklinkRunner:
             issue_id,
             issue.comments,
             labels=issue.labels,
-            max_active_locks=factory_max_concurrent() if autonomous else None,
+            max_active_locks=factory_max_concurrent(),
             active_label="worklink:epic",
         )
         if claim.attempts_exhausted:
@@ -1301,7 +1306,11 @@ class WorklinkRunner:
                 observed_at=None,
                 controller_phase="running",
             )
-            save_factory_record(self.home, factory_record)
+            try:
+                save_factory_record(self.home, factory_record)
+            except BaseException:
+                await _cancel_and_cleanup_factory_handle(compute, handle)
+                raise
             return await self._supervise_factory_070(
                 issue=issue,
                 claim_record=claim_record,
@@ -1314,7 +1323,10 @@ class WorklinkRunner:
                 started_at=datetime.now(UTC),
             )
         except Exception as exc:
-            current = load_factory_record(self.home, str(issue_id))
+            try:
+                current = load_factory_record(self.home, str(issue_id))
+            except Exception:
+                current = None
             if current is not None:
                 save_factory_record(
                     self.home,
@@ -1357,21 +1369,36 @@ class WorklinkRunner:
         test_cmd: str,
         runner: Runner,
     ) -> WorklinkRunResult:
-        if (
-            retained.issue_id != issue.issue_id
-            or retained.run_id != str(issue.issue_id)
-            or retained.repository != repo_slug
-            or retained.base_ref != base
-            or retained.launcher != str(launcher)
-        ):
-            raise WorklinkError("retained factory identity does not match recovery request")
-        sandbox = Path(retained.sandbox)
-        if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
-            raise WorklinkError("retained factory sandbox is unavailable")
+        sandbox = _verify_factory_recovery_binding(
+            runner=self,
+            issue=issue,
+            claim_record=claim_record,
+            claims=claims,
+            retained=retained,
+            launcher=launcher,
+            repo_slug=repo_slug,
+            base=base,
+            command_runner=runner,
+        )
         pre = backend.status(retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(pre, retained)
-        historical_result = pre.terminal_result
+        historical_result = _opaque_json_bytes(pre.terminal_result)
+        if retained.controller_phase == "terminal" and not pre.is_terminal:
+            raise WorklinkError("factory recovery terminal lifecycle regressed")
+        if pre.lock_session not in {None, retained.session}:
+            raise WorklinkError("factory recovery lock owner changed")
+        if pre.lock == "absent" and pre.lock_session is not None:
+            raise WorklinkError("factory recovery absent lock has an owner")
+        if pre.lock == "stale" and pre.lock_session != retained.session:
+            raise WorklinkError("factory recovery lock owner does not match retained session")
+        if pre.lock == "fresh" and pre.lock_session != retained.session:
+            raise WorklinkError("factory recovery found a fresh foreign lock owner")
         if pre.is_terminal:
+            if retained.handle is not None:
+                if factory_process_is_alive(retained):
+                    await _cancel_and_cleanup_factory_handle(compute, retained.handle)
+                elif not factory_process_is_verified_dead(retained):
+                    raise WorklinkError("factory terminal process identity cannot be verified")
             retained = retained.observed(pre, datetime.now(UTC).isoformat())
             save_factory_record(self.home, retained)
             return await self._finish_factory_070(
@@ -1385,24 +1412,14 @@ class WorklinkRunner:
                 runner=runner,
                 started_at=datetime.now(UTC),
             )
+        if pre.status not in {"running", "needs-human"}:
+            raise WorklinkError("factory recovery status is not resumable")
         if factory_process_is_alive(retained):
             raise WorklinkError("factory recovery refuses a live retained process")
         if not factory_process_is_verified_dead(retained):
             raise WorklinkError("factory recovery cannot verify the retained process is dead")
         session = retained.session
-        if not session:
-            raise WorklinkError("retained factory session is missing")
-        if pre.lock == "absent":
-            backend.lock(
-                retained.run_id,
-                "claim",
-                session=session,
-                sandbox=sandbox,
-                launcher=retained.launcher,
-            )
-        elif pre.lock == "fresh" and pre.lock_session != session:
-            raise WorklinkError("factory recovery found a fresh foreign lock owner")
-        elif pre.lock == "stale" or pre.dead_lock:
+        if pre.lock == "stale" or pre.dead_lock:
             backend.lock(
                 retained.run_id,
                 "steal",
@@ -1410,14 +1427,28 @@ class WorklinkRunner:
                 sandbox=sandbox,
                 launcher=retained.launcher,
             )
-        locked = backend.status(
-            retained.run_id, sandbox=sandbox, launcher=retained.launcher
-        )
+            locked = backend.status(
+                retained.run_id, sandbox=sandbox, launcher=retained.launcher
+            )
+        elif pre.lock == "absent":
+            backend.lock(
+                retained.run_id,
+                "claim",
+                session=session,
+                sandbox=sandbox,
+                launcher=retained.launcher,
+            )
+            locked = backend.status(
+                retained.run_id, sandbox=sandbox, launcher=retained.launcher
+            )
+        else:
+            locked = pre
         _require_factory_status(locked, retained)
         if (
             locked.lock != "fresh"
+            or locked.dead_lock
             or locked.lock_session != session
-            or locked.terminal_result != historical_result
+            or _opaque_json_bytes(locked.terminal_result) != historical_result
         ):
             raise WorklinkError("factory recovery lock reconciliation failed")
         resumed = backend.resume(
@@ -1430,12 +1461,23 @@ class WorklinkRunner:
         if (
             resumed.status != "running"
             or resumed.lock != "fresh"
+            or resumed.dead_lock
             or resumed.lock_session != session
-            or resumed.terminal_result != historical_result
+            or _opaque_json_bytes(resumed.terminal_result) != historical_result
         ):
             raise WorklinkError("factory resume did not return an owned running status")
         resumed.require_recovery_next()
-        _verify_factory_checkout(sandbox, retained.branch, retained.base_ref, runner)
+        _verify_factory_recovery_binding(
+            runner=self,
+            issue=issue,
+            claim_record=claim_record,
+            claims=claims,
+            retained=retained,
+            launcher=launcher,
+            repo_slug=repo_slug,
+            base=base,
+            command_runner=runner,
+        )
         order = WorkOrder(
             issue_id=issue.issue_id,
             checkout=sandbox,
@@ -1445,10 +1487,13 @@ class WorklinkRunner:
             env={"MIMIR_HOME": str(self.home)},
             transcript_root=self.home / "state" / "worklink" / "transcripts",
         )
+        recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
+        if (_repo_slug_from_url(recovery_repo_url) or "").lower() != retained.repository.lower():
+            raise WorklinkError("factory recovery sandbox repository changed before launch")
         spec = backend.work_spec(
             order,
             attempt=retained.attempt,
-            repo_url=_repo_remote_url(self.repo, runner=runner),
+            repo_url=recovery_repo_url,
             base_ref=retained.base_ref,
             branch=retained.branch,
             test_command=test_cmd,
@@ -1459,7 +1504,11 @@ class WorklinkRunner:
             handle=handle,
             controller_phase="running",
         )
-        save_factory_record(self.home, relaunched)
+        try:
+            save_factory_record(self.home, relaunched)
+        except BaseException:
+            await _cancel_and_cleanup_factory_handle(compute, handle)
+            raise
         return await self._supervise_factory_070(
             issue=issue,
             claim_record=claim_record,
@@ -1470,6 +1519,7 @@ class WorklinkRunner:
             test_cmd=test_cmd,
             runner=runner,
             started_at=datetime.now(UTC),
+            initial_status=resumed,
         )
 
     async def _supervise_factory_070(
@@ -1484,52 +1534,95 @@ class WorklinkRunner:
         test_cmd: str,
         runner: Runner,
         started_at: datetime,
+        initial_status: FactoryStatus | None = None,
     ) -> WorklinkRunResult:
-        deadline = asyncio.get_running_loop().time() + _epic_run_timeout_s()
+        handle = factory_record.handle
+        if handle is None:
+            raise WorklinkError("factory supervision requires a launch handle")
+        loop = asyncio.get_running_loop()
+        run_timeout = _epic_run_timeout_s()
+        deadline = loop.time() + run_timeout
+        startup_deadline = min(deadline, loop.time() + _FACTORY_STARTUP_STATUS_TIMEOUT_S)
         stale_after = _epic_stale_heartbeat_s()
         last_status: FactoryStatus | None = None
-        last_change = asyncio.get_running_loop().time()
-        while True:
-            status = backend.status(
-                factory_record.run_id,
-                sandbox=Path(factory_record.sandbox),
-                launcher=factory_record.launcher,
+        last_change = loop.time()
+        try:
+            wait_task = asyncio.create_task(
+                compute.wait(
+                    handle,
+                    max(1, math.ceil(run_timeout + _FACTORY_STARTUP_STATUS_TIMEOUT_S)),
+                )
             )
-            _require_factory_status(status, factory_record)
-            if status != last_status:
-                last_status = status
-                last_change = asyncio.get_running_loop().time()
-            if factory_record.session is not None and status.lock_session not in {
-                None,
-                factory_record.session,
-            }:
-                raise WorklinkError("factory lock owner changed")
-            factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
-            phase = "parked" if status.is_parked else "terminal" if status.is_terminal else "running"
-            factory_record = replace(factory_record, controller_phase=phase)
-            save_factory_record(self.home, factory_record)
-            if status.lock == "fresh" and factory_record.session == status.lock_session:
-                backend.heartbeat(
-                    factory_record.run_id,
-                    session=factory_record.session,
-                    sandbox=Path(factory_record.sandbox),
-                    launcher=factory_record.launcher,
-                )
-            if asyncio.get_running_loop().time() - last_change >= stale_after:
-                _log_event(
-                    "worklink_factory_stale_status",
-                    issue_id=issue.issue_id,
-                    diagnostic_after_s=stale_after,
-                    lock=status.lock,
-                    process_alive=(
-                        factory_record.handle is not None
-                        and compute.job_alive(factory_record.handle)
-                    ),
-                )
-            if status.is_terminal or status.is_parked:
-                if factory_record.handle is not None and compute.job_alive(factory_record.handle):
-                    await compute.cancel(factory_record.handle)
-                try:
+        except BaseException:
+            await _cancel_and_cleanup_factory_handle(compute, handle)
+            raise
+        status = initial_status
+        failed = True
+        cancel_attempted = False
+
+        async def cancel_once() -> None:
+            nonlocal cancel_attempted
+            if cancel_attempted:
+                return
+            cancel_attempted = True
+            await compute.cancel(handle)
+
+        try:
+            while True:
+                if status is None:
+                    remaining = startup_deadline - loop.time() if last_status is None else deadline - loop.time()
+                    if remaining <= 0:
+                        if last_status is None:
+                            raise WorklinkError("factory startup status handshake timed out")
+                        raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
+                    try:
+                        status = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                backend.status,
+                                factory_record.run_id,
+                                sandbox=Path(factory_record.sandbox),
+                                launcher=factory_record.launcher,
+                            ),
+                            timeout=remaining,
+                        )
+                    except TimeoutError as exc:
+                        if last_status is None:
+                            raise WorklinkError("factory startup status handshake timed out") from exc
+                        raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)") from exc
+                _require_factory_status(status, factory_record)
+                if status != last_status:
+                    last_status = status
+                    last_change = loop.time()
+                if factory_record.session is not None and status.lock_session not in {
+                    None,
+                    factory_record.session,
+                }:
+                    raise WorklinkError("factory lock owner changed")
+                factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
+                phase = "parked" if status.is_parked else "terminal" if status.is_terminal else "running"
+                factory_record = replace(factory_record, controller_phase=phase)
+                save_factory_record(self.home, factory_record)
+                if status.lock == "fresh" and factory_record.session == status.lock_session:
+                    await asyncio.to_thread(
+                        backend.heartbeat,
+                        factory_record.run_id,
+                        session=factory_record.session,
+                        sandbox=Path(factory_record.sandbox),
+                        launcher=factory_record.launcher,
+                    )
+                if loop.time() - last_change >= stale_after:
+                    _log_event(
+                        "worklink_factory_stale_status",
+                        issue_id=issue.issue_id,
+                        diagnostic_after_s=stale_after,
+                        lock=status.lock,
+                        process_alive=compute.job_alive(handle),
+                    )
+                if status.is_terminal or status.is_parked:
+                    if not wait_task.done():
+                        await cancel_once()
+                        await _finish_factory_wait_task(wait_task)
+                    failed = False
                     return await self._finish_factory_070(
                         issue=issue,
                         claim_record=claim_record,
@@ -1541,18 +1634,32 @@ class WorklinkRunner:
                         runner=runner,
                         started_at=started_at,
                     )
+                if wait_task.done() or not compute.job_alive(handle):
+                    try:
+                        result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
+                    except TimeoutError as exc:
+                        raise WorklinkError(
+                            "OpenCode process stopped without a drainable supervision result"
+                        ) from exc
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    suffix = f": {detail[:300]}" if detail else ""
+                    raise WorklinkError(
+                        f"OpenCode process exited while factory status was running{suffix}"
+                    )
+                if loop.time() >= deadline:
+                    raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
+                _heartbeat_claim_best_effort(claims, claim_record)
+                await asyncio.sleep(max(0.01, float(backend.poll_interval_s)))
+                status = None
+        finally:
+            if failed and not wait_task.done():
+                try:
+                    await cancel_once()
                 finally:
-                    if factory_record.handle is not None:
-                        await compute.cleanup(factory_record.handle)
-            if factory_record.handle is None or not compute.job_alive(factory_record.handle):
-                raise WorklinkError("OpenCode process exited while factory status was running")
-            if asyncio.get_running_loop().time() >= deadline:
-                await compute.cancel(factory_record.handle)
-                raise WorklinkError(
-                    f"factory exceeded run timeout ({_epic_run_timeout_s():.0f}s)"
-                )
-            _heartbeat_claim_best_effort(claims, claim_record)
-            await asyncio.sleep(max(0.01, float(backend.poll_interval_s)))
+                    await _finish_factory_wait_task(wait_task)
+            elif wait_task.done():
+                await asyncio.gather(wait_task, return_exceptions=True)
+            await compute.cleanup(handle)
 
     async def _finish_factory_070(
         self,
@@ -1621,17 +1728,93 @@ class WorklinkRunner:
             branch=factory_record.branch,
         )
 
+async def _finish_factory_wait_task(task: asyncio.Task[ComputeResult]) -> None:
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except TimeoutError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _cancel_and_cleanup_factory_handle(compute: Any, handle: LaunchHandle) -> None:
+    try:
+        await compute.cancel(handle)
+    finally:
+        await compute.cleanup(handle)
+
+
+def _opaque_json_bytes(value: dict[str, Any] | None) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _verify_factory_recovery_binding(
+    *,
+    runner: WorklinkRunner,
+    issue: IssueContext,
+    claim_record: ClaimRecord,
+    claims: ChainlinkClaims,
+    retained: FactoryRunRecord,
+    launcher: Path,
+    repo_slug: str,
+    base: str,
+    command_runner: Runner,
+) -> Path:
+    if retained.issue_id != issue.issue_id or retained.run_id != str(issue.issue_id):
+        raise WorklinkError("retained factory issue identity does not match recovery request")
+    if retained.repository.lower() != repo_slug.lower():
+        raise WorklinkError("retained factory repository does not match recovery request")
+    current_repo_slug = _repo_slug_from_url(
+        _repo_remote_url(runner.repo, runner=command_runner)
+    )
+    if current_repo_slug is None or current_repo_slug.lower() != retained.repository.lower():
+        raise WorklinkError("factory recovery controller repository changed")
+    if retained.base_ref != base:
+        raise WorklinkError("retained factory base does not match recovery request")
+    if retained.launcher != str(launcher):
+        raise WorklinkError("retained factory launcher does not match recovery request")
+    if retained.controller_phase not in {"running", "parked", "failed", "terminal"}:
+        raise WorklinkError("retained factory lifecycle is not recoverable")
+    if not retained.session:
+        raise WorklinkError("retained factory session is missing")
+    if claim_record.issue_id != issue.issue_id:
+        raise WorklinkError("factory recovery claim issue does not match")
+    if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
+        raise WorklinkError("factory recovery claim owner does not match")
+    if not getattr(claims, "_lock_still_held_by")(claim_record):
+        raise WorklinkError("factory recovery claim is not retained")
+    sandbox = Path(retained.sandbox)
+    if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
+        raise WorklinkError("retained factory sandbox is unavailable")
+    _verify_factory_checkout(
+        sandbox,
+        retained.branch,
+        retained.base_ref,
+        command_runner,
+        repository=retained.repository,
+    )
+    return sandbox
+
+
 def _require_factory_status(status: FactoryStatus, record: FactoryRunRecord) -> None:
     if not status.valid:
         raise WorklinkError("factory status is invalid")
-    if status.run_id != record.run_id or status.issue_key != str(record.issue_id):
-        raise WorklinkError("factory status identity mismatch")
+    if status.run_id != record.run_id:
+        raise WorklinkError("factory status run id mismatch")
+    if status.issue_key != str(record.issue_id):
+        raise WorklinkError("factory status issue key mismatch")
     if status.sandbox_path != record.sandbox:
         raise WorklinkError("factory status sandbox mismatch")
     if status.mode != "autonomous":
         raise WorklinkError("factory status mode mismatch")
-    if status.branch != record.branch or status.pr_base != record.base_ref:
-        raise WorklinkError("factory status branch or base mismatch")
+    if status.branch != record.branch:
+        raise WorklinkError("factory status branch mismatch")
+    if status.pr_base != record.base_ref:
+        raise WorklinkError("factory status base mismatch")
 
 
 def _fixed_command(
@@ -1652,7 +1835,37 @@ def _verify_factory_checkout(
     branch: str,
     base_ref: str,
     runner: Runner,
+    *,
+    repository: str | None = None,
 ) -> str:
+    top = _fixed_command(
+        runner,
+        ["git", "-C", str(sandbox), "rev-parse", "--show-toplevel"],
+        error="cannot read factory checkout root",
+    ).stdout.strip()
+    try:
+        if Path(top).resolve(strict=True) != sandbox.resolve(strict=True):
+            raise WorklinkError("factory checkout root mismatch")
+    except OSError as exc:
+        raise WorklinkError("factory checkout root is unavailable") from exc
+    git_dir = _fixed_command(
+        runner,
+        ["git", "-C", str(sandbox), "rev-parse", "--absolute-git-dir"],
+        error="cannot read factory checkout git directory",
+    ).stdout.strip()
+    try:
+        if not Path(git_dir).resolve(strict=False).is_relative_to(sandbox.resolve(strict=True)):
+            raise WorklinkError("factory checkout is not isolated")
+    except OSError as exc:
+        raise WorklinkError("factory checkout git directory is unavailable") from exc
+    if repository is not None:
+        remote = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "config", "--get", "remote.origin.url"],
+            error="cannot read factory checkout repository",
+        ).stdout.strip()
+        if (_repo_slug_from_url(remote) or "").lower() != repository.lower():
+            raise WorklinkError("factory checkout repository mismatch")
     observed_branch = _fixed_command(
         runner,
         ["git", "-C", str(sandbox), "branch", "--show-current"],
@@ -1692,113 +1905,203 @@ async def _verify_factory_completion(
     runner: Runner,
 ) -> tuple[Path, str]:
     status = record.status
-    if status is None or status.status != "completed" or not status.is_terminal:
-        raise WorklinkError("factory completion status is not authoritative")
-    _require_factory_status(status, record)
-    if status.pr_draft:
-        raise WorklinkError("factory completed with a draft PR")
-    if status.pr_url is None:
-        raise WorklinkError("factory completed without a PR URL")
-    match = _CANONICAL_PR_URL.fullmatch(status.pr_url)
-    if match is None:
-        raise WorklinkError("factory completed with a noncanonical PR URL")
-    expected_repo = f"{match.group(1)}/{match.group(2)}".lower()
-    if expected_repo != record.repository.lower():
-        raise WorklinkError("factory PR repository mismatch")
-    sandbox = Path(record.sandbox)
-    before_head = _verify_factory_checkout(
-        sandbox, record.branch, record.base_ref, runner
-    )
-    validation = await observe_evidence(
+    evidence = WorklinkEvidence(
         issue=issue.issue_id,
         attempt=record.attempt,
         backend="feature_factory",
         branch=record.branch,
-        checkout=sandbox,
-        started_at=started_at,
-        base_ref=record.base_ref,
-        backend_status="completed",
-        test_command=test_command,
-        pr_url=status.pr_url,
-        runner=runner,
+        checkout=record.sandbox,
+        started_at=started_at.astimezone(UTC).isoformat(),
+        finished_at=datetime.now(UTC).isoformat(),
+        files_changed=[],
+        diff_stat="",
+        commands=[],
+        tests=None,
+        pr_url=status.pr_url if status is not None else None,
+        status="failed",
+        diff_observed=False,
     )
-    tests = validation.evidence.tests
-    if (
-        not validation.review_ready
-        or tests is None
-        or not tests.observed
-        or tests.skipped_reason is not None
-        or tests.exit_code != 0
-        or not validation.evidence.files_changed
-    ):
+    try:
+        if status is None:
+            raise WorklinkError("factory completion status is missing")
+        if status.status != "completed" or not status.is_terminal:
+            raise WorklinkError("factory completion status is not authoritative")
+        _require_factory_status(status, record)
+        if status.pr_draft:
+            raise WorklinkError("factory completed with a draft PR")
+        if status.pr_url is None:
+            raise WorklinkError("factory completed without a PR URL")
+        match = _CANONICAL_PR_URL.fullmatch(status.pr_url)
+        if match is None:
+            raise WorklinkError("factory completed with a noncanonical PR URL")
+        expected_repo = f"{match.group(1)}/{match.group(2)}".lower()
+        if expected_repo != record.repository.lower():
+            raise WorklinkError("factory PR repository mismatch")
+        sandbox = Path(record.sandbox)
+        before_head = _verify_factory_checkout(
+            sandbox,
+            record.branch,
+            record.base_ref,
+            runner,
+            repository=record.repository,
+        )
+        validation = await observe_evidence(
+            issue=issue.issue_id,
+            attempt=record.attempt,
+            backend="feature_factory",
+            branch=record.branch,
+            checkout=sandbox,
+            started_at=started_at,
+            base_ref=record.base_ref,
+            backend_status="completed",
+            test_command=test_command,
+            pr_url=status.pr_url,
+            runner=runner,
+        )
+        evidence = validation.evidence
+        if evidence.issue != issue.issue_id:
+            raise WorklinkError("factory evidence issue mismatch")
+        if evidence.branch != record.branch:
+            raise WorklinkError("factory evidence branch mismatch")
+        if evidence.checkout != record.sandbox:
+            raise WorklinkError("factory evidence sandbox mismatch")
+        if evidence.pr_url != status.pr_url:
+            raise WorklinkError("factory evidence PR URL mismatch")
+        if not evidence.diff_observed:
+            raise WorklinkError("factory completion diff was not observed")
+        if not evidence.files_changed:
+            raise WorklinkError("factory completion diff is empty")
+        tests = evidence.tests
+        if tests is None:
+            raise WorklinkError("factory completion test evidence is missing")
+        if not tests.observed:
+            raise WorklinkError("factory completion tests were not observed")
+        if tests.skipped_reason is not None:
+            raise WorklinkError("factory completion tests were skipped")
+        if tests.exit_code != 0:
+            raise WorklinkError("factory completion tests did not pass")
+        if not validation.review_ready:
+            raise WorklinkError("factory completion evidence was rejected")
+        clean = _fixed_command(
+            runner,
+            [
+                "git",
+                "-C",
+                str(sandbox),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            error="cannot verify factory checkout cleanliness",
+        )
+        if clean.stdout.strip():
+            raise WorklinkError("factory checkout is not clean")
+        after_head = _verify_factory_checkout(
+            sandbox,
+            record.branch,
+            record.base_ref,
+            runner,
+            repository=record.repository,
+        )
+        if before_head != after_head:
+            raise WorklinkError("factory checkout HEAD moved during evidence collection")
+        evidence = replace(evidence, head_sha=after_head)
+        api = _fixed_command(
+            runner,
+            ["gh", "api", f"repos/{record.repository}/pulls/{match.group(3)}"],
+            error="GitHub PR verification failed",
+        )
+        try:
+            payload = json.loads(
+                api.stdout,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON value: {value}")
+                ),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise WorklinkError("GitHub PR verification returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise WorklinkError("GitHub PR verification returned invalid data")
+        html_url = _require_pr_string(payload, "html_url")
+        state = _require_pr_string(payload, "state")
+        draft = payload.get("draft")
+        if not isinstance(draft, bool):
+            raise WorklinkError("GitHub PR verification omitted draft")
+        base_data = _require_pr_object(payload, "base")
+        head_data = _require_pr_object(payload, "head")
+        base_repo = _require_pr_object(base_data, "repo")
+        head_repo = _require_pr_object(head_data, "repo")
+        base_name = _require_pr_string(base_repo, "full_name")
+        head_name = _require_pr_string(head_repo, "full_name")
+        base_ref = _require_pr_string(base_data, "ref")
+        head_ref = _require_pr_string(head_data, "ref")
+        head_sha = _require_pr_string(head_data, "sha")
+        if html_url != status.pr_url:
+            raise WorklinkError("GitHub PR URL mismatch")
+        if state != "open":
+            raise WorklinkError("GitHub PR is not open")
+        if draft:
+            raise WorklinkError("GitHub PR is draft")
+        if base_name.lower() != record.repository.lower():
+            raise WorklinkError("GitHub PR base repository mismatch")
+        if base_ref != record.base_ref:
+            raise WorklinkError("GitHub PR base ref mismatch")
+        if head_name.lower() != record.repository.lower():
+            raise WorklinkError("GitHub PR head repository mismatch")
+        if head_ref != record.branch:
+            raise WorklinkError("GitHub PR head ref mismatch")
+        if head_sha != after_head or evidence.head_sha != after_head:
+            raise WorklinkError("GitHub PR head SHA mismatch")
+        final_clean = _fixed_command(
+            runner,
+            [
+                "git",
+                "-C",
+                str(sandbox),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            error="cannot reverify factory checkout cleanliness",
+        )
+        if final_clean.stdout.strip():
+            raise WorklinkError("factory checkout became dirty during publication verification")
+        final_head = _verify_factory_checkout(
+            sandbox,
+            record.branch,
+            record.base_ref,
+            runner,
+            repository=record.repository,
+        )
+        if final_head != after_head:
+            raise WorklinkError("factory checkout HEAD moved during publication verification")
+        evidence_path = _write_evidence(home, evidence)
+        return evidence_path, status.pr_url
+    except Exception as exc:
         _write_evidence(
             home,
             replace(
-                validation.evidence,
+                evidence,
                 status="failed",
-                failure_reason="factory completion lacks passing repository test evidence",
+                failure_reason=str(exc),
+                finished_at=datetime.now(UTC).isoformat(),
             ),
         )
-        raise WorklinkError("factory completion lacks passing repository test evidence")
-    clean = _fixed_command(
-        runner,
-        [
-            "git",
-            "-C",
-            str(sandbox),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        error="cannot verify factory checkout cleanliness",
-    )
-    if clean.stdout.strip():
-        raise WorklinkError("factory checkout is not clean")
-    after_head = _verify_factory_checkout(
-        sandbox, record.branch, record.base_ref, runner
-    )
-    if before_head != after_head:
-        raise WorklinkError("factory checkout HEAD moved during evidence collection")
-    evidence = replace(validation.evidence, head_sha=after_head)
-    api = _fixed_command(
-        runner,
-        ["gh", "api", f"repos/{record.repository}/pulls/{match.group(3)}"],
-        error="GitHub PR verification failed",
-    )
-    try:
-        payload = json.loads(api.stdout)
-    except json.JSONDecodeError as exc:
-        raise WorklinkError("GitHub PR verification returned invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise WorklinkError("GitHub PR verification returned invalid data")
-    base = payload.get("base")
-    head = payload.get("head")
-    if not isinstance(base, dict) or not isinstance(head, dict):
-        raise WorklinkError("GitHub PR verification omitted refs")
-    base_repo = base.get("repo")
-    head_repo = head.get("repo")
-    if not isinstance(base_repo, dict) or not isinstance(head_repo, dict):
-        raise WorklinkError("GitHub PR verification omitted repositories")
-    checks = (
-        payload.get("html_url") == status.pr_url,
-        payload.get("state") == "open",
-        payload.get("draft") is False,
-        str(base_repo.get("full_name") or "").lower() == record.repository.lower(),
-        base.get("ref") == record.base_ref,
-        str(head_repo.get("full_name") or "").lower() == record.repository.lower(),
-        head.get("ref") == record.branch,
-        head.get("sha") == after_head,
-        evidence.head_sha == after_head,
-    )
-    if not all(checks):
-        raise WorklinkError("GitHub PR identity verification failed")
-    final_head = _verify_factory_checkout(
-        sandbox, record.branch, record.base_ref, runner
-    )
-    if final_head != after_head:
-        raise WorklinkError("factory checkout HEAD moved during publication verification")
-    evidence_path = _write_evidence(home, evidence)
-    return evidence_path, status.pr_url
+        raise
+
+
+def _require_pr_object(payload: Mapping[str, Any], field: str) -> dict[str, Any]:
+    value = payload.get(field)
+    if not isinstance(value, dict):
+        raise WorklinkError(f"GitHub PR verification omitted {field}")
+    return value
+
+
+def _require_pr_string(payload: Mapping[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value:
+        raise WorklinkError(f"GitHub PR verification omitted {field}")
+    return value
 
 
 def _close_attempt_capabilities(

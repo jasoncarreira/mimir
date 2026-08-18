@@ -530,6 +530,36 @@ async def test_factory_runs_detail_rejects_symlink_outside_factory_root(
 
 
 @pytest.mark.asyncio
+async def test_factory_runs_detail_rejects_symlinked_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    factory_dir = outside / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    (factory_dir / "834.json").write_text("{}", encoding="utf-8")
+    (home / "state").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+
+    app = web.Application()
+    web_ui.register_routes(
+        app,
+        turns_log=tmp_path / "turns",
+        events_log=tmp_path / "events",
+        home=home,
+    )
+
+    client = TestClient(TestServer(app))
+    async with client as cli:
+        resp = await cli.get("/api/v1/factory-runs/834")
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"]["code"] == "run_invalid"
+
+
+@pytest.mark.asyncio
 async def test_factory_runs_detail_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     home = tmp_path / "home"

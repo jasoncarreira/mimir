@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Sequence
 
 from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
+from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import LaunchHandle, WorkSpec
+from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
 from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
     WorklinkRunState,
@@ -733,6 +735,93 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     )
     assert dispatched == []
     assert spawned == []
+
+
+def _factory_restart_record(home: Path, *, status: str, ticks: int | None) -> FactoryRunRecord:
+    sandbox = home / "sandbox"
+    sandbox.mkdir(exist_ok=True)
+    factory_status = parse_factory_status(
+        {
+            "run_id": "700",
+            "issue_key": "700",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": status,
+            "mode": "autonomous",
+            "branch": "epic/700",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": "stale",
+            "dead_lock": True,
+            "lock_session": "session-1",
+            "gates": {},
+            "steps": ["implementation"],
+            "slices": ["factory-070-migration"],
+            "validator": None,
+            "pr_url": None,
+            "terminal_result": {"reason": "opaque"},
+        }
+    )
+    record = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=LaunchHandle("local_subprocess", "999999999", ticks),
+        status=factory_status,
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="parked" if status == "needs-human" else "running",
+    )
+    save_factory_record(home, record)
+    return record
+
+
+@pytest.mark.parametrize(
+    ("status", "ticks", "expected"),
+    [
+        ("running", 1, [700]),
+        ("needs-human", 1, []),
+        ("running", None, []),
+    ],
+)
+def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    ticks: int | None,
+    expected: list[int],
+) -> None:
+    from mimir import server
+
+    _factory_restart_record(tmp_path, status=status, ticks=ticks)
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    spawned: list[list[str]] = []
+
+    dispatched = server.reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+    )
+
+    assert dispatched == expected
+    if expected:
+        assert spawned == [[
+            "mimir",
+            "worklink",
+            "run-epic",
+            "700",
+            "--autonomous",
+            "--home",
+            str(tmp_path),
+            "--repo",
+            "/workspace/mimir",
+        ]]
+    else:
+        assert spawned == []
 
 
 @pytest.mark.parametrize(

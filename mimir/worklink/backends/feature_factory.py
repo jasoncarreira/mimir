@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
+import threading
 from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from ..compute import ComputeResult, WorkSpec
@@ -39,6 +42,7 @@ _MAX_DIAGNOSTIC_BYTES = 64 * 1024
 _MAX_STATUS_BYTES = 1024 * 1024
 _MAX_LIST_ITEMS = 1000
 _MAX_TEXT_BYTES = 16 * 1024
+_MAX_JSON_DEPTH = 32
 _ARGUMENT_STRUCTURE = re.compile(
     r"(?im)(?:^\s*usage\s*:|\b(?:argument|option|operand|required|requires|missing|expected)\b)"
 )
@@ -164,8 +168,14 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
         return None
     if not isinstance(value, dict):
         raise FactoryContractError(f"factory status {name} must be an object")
+    _validate_json_value(value, name=name)
     try:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise FactoryContractError(f"factory status {name} is not valid JSON") from exc
     if len(encoded) > _MAX_STATUS_BYTES:
@@ -184,6 +194,27 @@ def _compact_strings(value: object, name: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _validate_json_value(value: object, *, name: str, depth: int = 0) -> None:
+    if depth > _MAX_JSON_DEPTH:
+        raise FactoryContractError(f"factory status {name} exceeds nesting limit")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise FactoryContractError(f"factory status {name} is not finite JSON")
+    if isinstance(value, dict):
+        if len(value) > _MAX_LIST_ITEMS or not all(isinstance(key, str) for key in value):
+            raise FactoryContractError(f"factory status {name} exceeds cardinality limit")
+        for item in value.values():
+            _validate_json_value(item, name=name, depth=depth + 1)
+    elif isinstance(value, list):
+        if len(value) > _MAX_LIST_ITEMS:
+            raise FactoryContractError(f"factory status {name} exceeds cardinality limit")
+        for item in value:
+            _validate_json_value(item, name=name, depth=depth + 1)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON value: {value}")
+
+
 def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactoryStatus:
     if isinstance(payload, bytes):
         if len(payload) > _MAX_STATUS_BYTES or b"\x00" in payload:
@@ -196,13 +227,25 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         if len(payload.encode("utf-8")) > _MAX_STATUS_BYTES or "\x00" in payload:
             raise FactoryContractError("factory status output exceeds bounds")
         try:
-            decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
+            decoded = json.loads(payload, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise FactoryContractError("factory status output is not one JSON object") from exc
     else:
         decoded = payload
     if not isinstance(decoded, Mapping):
         raise FactoryContractError("factory status must be a JSON object")
+    _validate_json_value(decoded, name="payload")
+    try:
+        encoded = json.dumps(
+            decoded,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise FactoryContractError("factory status output is not one JSON object") from exc
+    if len(encoded) > _MAX_STATUS_BYTES:
+        raise FactoryContractError("factory status output exceeds bounds")
     keys = set(decoded)
     missing = _REQUIRED_STATUS_FIELDS - keys
     unknown = keys - _STATUS_FIELDS
@@ -249,8 +292,11 @@ def _read_manifest(path: Path, expected_name: str) -> dict[str, Any]:
     if len(raw) > _MAX_STATUS_BYTES or b"\x00" in raw:
         raise FactoryContractError(f"invalid {expected_name} package manifest")
     try:
-        data = json.loads(raw.decode("utf-8", "strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        data = json.loads(
+            raw.decode("utf-8", "strict"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise FactoryContractError(f"invalid {expected_name} package manifest") from exc
     if not isinstance(data, dict):
         raise FactoryContractError(f"invalid {expected_name} package manifest")
@@ -313,6 +359,118 @@ def _strict_diagnostic(result: subprocess.CompletedProcess[Any]) -> str:
         raise FactoryContractError("factory capability probe output is not UTF-8") from exc
 
 
+def _terminate_bounded_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _run_bounded(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    output_limit: int,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        start_new_session=True,
+    )
+    retained = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    lock = threading.Lock()
+    overflow = threading.Event()
+
+    def drain(name: str, stream: Any) -> None:
+        nonlocal total
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                return
+            with lock:
+                remaining = output_limit - total
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    retained[name].extend(kept)
+                    total += len(kept)
+                if len(chunk) > max(remaining, 0) and not overflow.is_set():
+                    overflow.set()
+                    _terminate_bounded_process(process)
+
+    threads = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_bounded_process(process)
+        process.wait()
+        for thread in threads:
+            thread.join(timeout=1)
+        raise
+    for thread in threads:
+        thread.join(timeout=1)
+    if any(thread.is_alive() for thread in threads):
+        _terminate_bounded_process(process)
+        for thread in threads:
+            thread.join(timeout=1)
+    if any(thread.is_alive() for thread in threads):
+        raise FactoryContractError("factory command output could not be drained")
+    if overflow.is_set():
+        raise FactoryContractError("factory command output exceeds bounds")
+    return subprocess.CompletedProcess(
+        list(args),
+        process.returncode,
+        stdout=bytes(retained["stdout"]),
+        stderr=bytes(retained["stderr"]),
+    )
+
+
+def _invoke_bounded_or_injected(
+    runner: Runner,
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+    output_limit: int,
+) -> subprocess.CompletedProcess[Any]:
+    if runner is subprocess.run:
+        return _run_bounded(
+            args,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            output_limit=output_limit,
+        )
+    return runner(
+        list(args),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+        shell=False,
+        start_new_session=True,
+    )
+
+
 def _probe_environment(root: Path) -> dict[str, str]:
     path = os.environ.get("PATH", "")
     return {
@@ -338,17 +496,13 @@ def probe_factory_capabilities(entrypoint: Path, *, runner: Runner = subprocess.
 
         def invoke(args: Sequence[str]) -> tuple[subprocess.CompletedProcess[Any], str]:
             try:
-                result = runner(
+                result = _invoke_bounded_or_injected(
+                    runner,
                     ["node", str(entrypoint), *args],
                     cwd=repo,
                     env=_probe_environment(root),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
                     timeout=5,
-                    check=False,
-                    shell=False,
-                    start_new_session=True,
+                    output_limit=_MAX_DIAGNOSTIC_BYTES,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise FactoryContractError("factory capability probe timed out") from exc
@@ -452,17 +606,13 @@ class FeatureFactoryBackend:
     ) -> subprocess.CompletedProcess[Any]:
         entrypoint = resolve_factory_entrypoint(launcher)
         try:
-            result = self.runner(
+            result = _invoke_bounded_or_injected(
+                self.runner,
                 ["node", str(entrypoint), *args],
                 cwd=sandbox,
                 env=_control_environment(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 timeout=30,
-                check=False,
-                shell=False,
-                start_new_session=True,
+                output_limit=_MAX_STATUS_BYTES,
             )
         except subprocess.TimeoutExpired as exc:
             raise FactoryContractError("factory control command timed out") from exc

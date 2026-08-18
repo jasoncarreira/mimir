@@ -178,20 +178,27 @@ def factory_record_path(home: Path, run_id: str) -> Path:
     return factory_records_dir(home) / f"{run_id}.json"
 
 
-def _require_safe_directory(path: Path, *, create: bool) -> None:
-    if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    current = path
-    while True:
+def _require_safe_directory(path: Path, *, create: bool) -> bool:
+    absolute = path.absolute()
+    chain = tuple(reversed((absolute, *absolute.parents)))
+    available = True
+    for current in chain:
         try:
             value = current.lstat()
+        except FileNotFoundError:
+            available = False
+            if not create:
+                continue
+            try:
+                current.mkdir(mode=0o700)
+                value = current.lstat()
+            except OSError as exc:
+                raise FactoryRecordError("factory record directory is unavailable") from exc
         except OSError as exc:
             raise FactoryRecordError("factory record directory is unavailable") from exc
         if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode):
             raise FactoryRecordError("factory record directory is not contained")
-        if current == current.parent or current.name == "state":
-            break
-        current = current.parent
+    return available
 
 
 def save_factory_record(home: Path, record: FactoryRunRecord) -> Path:
@@ -211,6 +218,8 @@ def save_factory_record(home: Path, record: FactoryRunRecord) -> Path:
 
 
 def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
+    if not _require_safe_directory(factory_records_dir(home), create=False):
+        return None
     path = factory_record_path(home, run_id)
     try:
         value = path.lstat()
@@ -240,9 +249,8 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
 
 def list_factory_records(home: Path) -> list[FactoryRunRecord]:
     directory = factory_records_dir(home)
-    if not directory.exists():
+    if not _require_safe_directory(directory, create=False):
         return []
-    _require_safe_directory(directory, create=False)
     records: list[FactoryRunRecord] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         if not path.name.endswith(".json") or not path.stem.isdecimal():
@@ -252,6 +260,8 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
 
 
 def clear_factory_record(home: Path, run_id: str) -> None:
+    if not _require_safe_directory(factory_records_dir(home), create=False):
+        return
     path = factory_record_path(home, run_id)
     try:
         value = path.lstat()

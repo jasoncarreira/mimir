@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -16,6 +18,7 @@ from mimir.worklink.backends.feature_factory import (
     parse_factory_status,
     probe_factory_capabilities,
     resolve_factory_entrypoint,
+    _run_bounded,
 )
 
 
@@ -114,6 +117,38 @@ def test_status_rejects_missing_unknown_trailing_and_nul() -> None:
         parse_factory_status(json.dumps(status_payload()) + "\x00")
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_status_rejects_nonfinite_json_constants(constant: str) -> None:
+    payload = json.dumps(status_payload()).replace(
+        '"gates": {"brief": "approved"}',
+        f'"gates": {{"value": {constant}}}',
+    )
+    with pytest.raises(FactoryContractError, match="one JSON object"):
+        parse_factory_status(payload)
+
+
+def test_status_rejects_nonfinite_mapping_and_cardinality() -> None:
+    with pytest.raises(FactoryContractError, match="finite JSON"):
+        parse_factory_status(status_payload(gates={"value": float("nan")}))
+    with pytest.raises(FactoryContractError, match="cardinality"):
+        parse_factory_status(status_payload(gates={str(index): index for index in range(1001)}))
+    with pytest.raises(FactoryContractError, match="cardinality"):
+        parse_factory_status(status_payload(steps=["step"] * 1001))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff",
+        b"{}\x00",
+        b"{" + b" " * (1024 * 1024) + b"}",
+    ],
+)
+def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(payload)
+
+
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
@@ -149,7 +184,82 @@ def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
     assert calls[0][2:] == ("__mimir_unknown_command_probe__",)
 
 
-@pytest.mark.parametrize("mode", ["zero", "signal", "unknown", "nonspecific", "nul"])
+def test_capability_probe_isolated_execution_contract(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    observed: list[dict[str, Any]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        observed.append({"args": tuple(args), **kwargs})
+        command = args[2]
+        diagnostic = (
+            f"unknown command {command}"
+            if command == "__mimir_unknown_command_probe__"
+            else f"usage: factory {command}\nmissing required argument"
+        )
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
+
+    probe_factory_capabilities(entrypoint, runner=runner)
+    forbidden = {"--version", "--help", "help", "cancel", "factory", "feature-factory"}
+    assert len(observed) == 17
+    for call in observed:
+        assert call["args"][:2] == ("node", str(entrypoint))
+        assert not forbidden.intersection(call["args"][2:])
+        assert call["stdin"] is subprocess.DEVNULL
+        assert call["shell"] is False
+        assert call["start_new_session"] is True
+        assert call["timeout"] == 5
+        assert call["cwd"].name == "repo"
+        assert set(call["env"]) == {
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+        }
+
+
+@pytest.mark.parametrize("mode", ["timeout", "oversize", "invalid_utf8", "mutation"])
+def test_capability_probe_rejects_execution_hazards(tmp_path: Path, mode: str) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(args, 5)
+        if mode == "mutation":
+            (Path(kwargs["cwd"]) / "mutated").write_text("bad", encoding="utf-8")
+        command = args[2]
+        if command == "__mimir_unknown_command_probe__":
+            diagnostic = f"unknown command {command}".encode()
+        elif mode == "oversize":
+            diagnostic = b"usage: " + command.encode() + b"\n" + b"x" * (64 * 1024)
+        elif mode == "invalid_utf8":
+            diagnostic = f"usage: {command} missing argument".encode() + b"\xff"
+        else:
+            diagnostic = f"usage: {command} missing argument".encode()
+        return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic)
+
+    with pytest.raises(FactoryContractError):
+        probe_factory_capabilities(entrypoint, runner=runner)
+
+
+def test_bounded_runner_stops_oversize_output_during_execution(tmp_path: Path) -> None:
+    with pytest.raises(FactoryContractError, match="output exceeds bounds"):
+        _run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")},
+            timeout=5,
+            output_limit=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["zero", "signal", "unknown", "nonspecific", "nul", "unknown_prefix"],
+)
 def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
     entrypoint = package_entrypoint(tmp_path)
 
@@ -169,6 +279,8 @@ def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
             detail = f"failed {command}".encode()
         elif mode == "nul":
             detail = f"usage: {command}\x00".encode()
+        elif mode == "unknown_prefix":
+            detail = f"unknown command {command}\nusage: {command} missing argument".encode()
         else:
             raise AssertionError(mode)
         return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=detail)
@@ -253,3 +365,55 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
     ]
     assert all(call[:2] == ("node", str(entrypoint.resolve())) for call in calls)
+
+
+def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+
+    for output in (
+        b"not-json",
+        json.dumps(status_payload(sandbox_path=str(sandbox))).encode() + b"{}",
+        json.dumps(status_payload(sandbox_path=str(sandbox))).replace(
+            '"gates": {"brief": "approved"}',
+            '"gates": {"value": NaN}',
+        ).encode(),
+    ):
+        backend = FeatureFactoryBackend(
+            entrypoint=str(entrypoint),
+            runner=lambda args, _output=output, **kwargs: subprocess.CompletedProcess(
+                args, 0, stdout=_output, stderr=b""
+            ),
+        )
+        with pytest.raises(FactoryContractError):
+            backend.status("1551", sandbox=sandbox, launcher=entrypoint)
+
+
+def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
+    root = Path(__file__).parent.parent
+    consumers = (
+        "mimir/worklink/orchestrator.py",
+        "mimir/worklink/autonomy.py",
+        "mimir/worklink/continuation.py",
+        "mimir/worklink/control.py",
+        "mimir/worklink/run_state.py",
+        "mimir/worklink/factory_state.py",
+        "mimir/worklink/checkout.py",
+        "mimir/worklink/backends/feature_factory.py",
+        "mimir/commands/worklink.py",
+        "mimir/server.py",
+        "mimir/web_ui.py",
+        "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py",
+    )
+    forbidden = (
+        '".opencode" / "factory"',
+        "run.json",
+        "FactoryRunMetadata",
+        "primary_factory",
+        "has_concurrent_factory_session",
+    )
+    assert len(consumers) == 12
+    for relative in consumers:
+        source = (root / relative).read_text(encoding="utf-8")
+        assert all(token not in source for token in forbidden), relative

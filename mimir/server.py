@@ -904,7 +904,7 @@ def reattach_inflight_worklink_runs(
 
     from .event_logger import log_event_sync
     from .worklink.control import reconcile_run_states
-    from .worklink.factory_state import factory_process_is_alive, list_factory_records
+    from .worklink.factory_state import factory_process_is_verified_dead, list_factory_records
     from .worklink.run_state import reattach_dispatch_argv
 
     spawn = popen or subprocess.Popen
@@ -916,7 +916,7 @@ def reattach_inflight_worklink_runs(
         factory_records = [
             record
             for record in list_factory_records(home)
-            if not factory_process_is_alive(record)
+            if factory_process_is_verified_dead(record)
             and record.controller_phase not in {"parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
         ]
