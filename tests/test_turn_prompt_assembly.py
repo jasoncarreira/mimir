@@ -20,11 +20,13 @@ import json
 import os
 import sqlite3
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from mimir.access_control import build_scheduled_tick_service_principal
+from mimir.access_control import SinkGate, build_scheduled_tick_service_principal
 from mimir.agent import (
     Agent,
     _REFLECTION_CHANNEL_ID,
@@ -38,6 +40,8 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
+    Integrity,
     PromptBlock,
     SourceLabel,
     TurnContext,
@@ -214,6 +218,130 @@ def test_service_prompt_labels_use_sink_gate_effective_principal() -> None:
     assert {source.authorized_principals for source in labels.sources} == {
         frozenset({"service:scheduler"})
     }
+
+
+@pytest.mark.asyncio
+async def test_channel_less_untrusted_recent_activity_is_refused_at_sink(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-current", content="now",
+        author="alice", source="discord",
+    )
+    legacy = agent._buffer.make_message(
+        channel_id="", kind="user_message", content="legacy unbound message",
+        author="alice", msg_id="legacy-message", source="discord",
+        integrity=Integrity.UNTRUSTED,
+    )
+    await agent._buffer.append(legacy)
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-current",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="ch-current", bridge_instance="discord",
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+
+    prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+
+    assert "legacy unbound message" in prompt
+    assert legacy in recent
+    source = next(
+        item for item in ctx.ifc_labels.sources
+        if item.resource_id == "message:legacy-message"
+    )
+    assert source.integrity == Integrity.UNTRUSTED
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", event.channel_id, ctx.ifc_labels, sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.asyncio
+async def test_self_authored_framework_prompt_sources_remain_sink_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.identities import Identity
+
+    agent = _make_agent(tmp_path)
+    core_dir = tmp_path / "memory" / "core"
+    core_dir.mkdir(parents=True)
+    (core_dir / "00-identity.md").write_text("CORE IDENTITY SENTINEL")
+    channel_dir = tmp_path / "memory" / "channels" / "ch-current"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("CHANNEL MEMORY SENTINEL")
+
+    class _Resolver:
+        def resolve(self, author):
+            return "alice" if author == "alice-alias" else author
+
+        def all_identities(self):
+            return [Identity(
+                canonical="alice", display_name="Alice",
+                aliases=["alice-alias"],
+            )]
+
+        def display_name(self, author):
+            return "Alice" if self.resolve(author) == "alice" else None
+
+        def resolve_channel(self, channel_id):
+            return None
+
+    agent._buffer.resolver = _Resolver()
+    recent_message = agent._buffer.make_message(
+        channel_id="ch-current", kind="user_message",
+        content="trusted recent reply", author="alice-alias",
+        msg_id="trusted-message", source="discord", integrity=Integrity.TRUSTED,
+    )
+    await agent._buffer.append(recent_message)
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda channel_id, skills_dirs: ("framework-skill", "SKILL SENTINEL"),
+    )
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-current", content="now",
+        author="alice", source="discord",
+    )
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="ch-current",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="ch-current", bridge_instance="discord",
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+
+    system_prompt = agent._build_system_prompt(emit_health_events=False)
+    turn_prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block="SAGA SENTINEL", initial_auth_context=auth,
+    )
+
+    assert "CORE IDENTITY SENTINEL" in system_prompt
+    for sentinel in (
+        "CHANNEL MEMORY SENTINEL", "SKILL SENTINEL", "SAGA SENTINEL",
+    ):
+        assert sentinel in turn_prompt
+    framework_domains = {"channel_memory", "identities", "saga", "skills"}
+    framework_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain in framework_domains
+    ]
+    assert {source.domain for source in framework_sources} == framework_domains
+    assert all(source.integrity == Integrity.TRUSTED for source in framework_sources)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", event.channel_id, ctx.ifc_labels, sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
 
 
 def test_agent_system_prompt_guidance_tracks_enforcement_flag(tmp_path: Path) -> None:
@@ -875,6 +1003,43 @@ async def test_feedback_block_renders_off_event_loop(
 
     assert "FEEDBACK_SENTINEL" in turn_prompt
     assert "recent_block_stub" in calls
+
+
+@pytest.mark.asyncio
+async def test_ownerless_non_self_feedback_does_not_abort_prompt_assembly(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.turns_log.write_text(json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "turn_id": "scheduled-turn",
+        "channel_id": "scheduler:heartbeat",
+        "result_is_error": True,
+    }) + "\n")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="ch-feedback",
+        content="hello",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        interactivity=None,
+        enforcement_enabled=True,
+        bridge_instance="test",
+    )
+
+    turn_prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
+    )
+
+    assert "turn error: (no detail)" in turn_prompt
 
 
 @pytest.mark.asyncio
