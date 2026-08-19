@@ -7284,6 +7284,26 @@ class ToolRegistry:
                     )
                 return write_auth
             if tool_name in READ_RESOURCE_OPERATIONS:
+                target_in_active_lease = False
+                if (
+                    auth_context is not None
+                    and service_principal is not None
+                    and service_principal.authority_profile == "github"
+                ):
+                    requested_read_target = requested_read_target_from_arguments(
+                        tool_name, arguments,
+                    )
+                    if isinstance(requested_read_target, str):
+                        read_review_state, _read_state_refusal = (
+                            resolve_repository_review_state(
+                                auth_context, path=requested_read_target,
+                            )
+                        )
+                        target_in_active_lease = (
+                            _target_within_active_pr_checkout_lease(
+                                requested_read_target, read_review_state,
+                            )
+                        )
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                     allowed = True
                 elif (
@@ -7339,6 +7359,7 @@ class ToolRegistry:
                         auth_context is not None
                         and read_target_from_arguments(tool_name, arguments) is not None
                     )
+                allowed = allowed or target_in_active_lease
                 required_tier = AccessTier.USER if allowed else AccessTier.ADMIN
                 if not allowed:
                     reason = "read_scope"
