@@ -48,7 +48,7 @@ from mimir.agent import (
     _propagate_ifc_labels,
     _recent_message_is_self_authored,
 )
-from mimir.history import Message
+from mimir.history import Message, MessageBuffer
 from mimir.bridges._activity_panel import ActivityPanel
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.channel_registry import ChannelRegistry
@@ -4136,6 +4136,84 @@ def test_real_sink_applies_destination_audience_subset_in_the_safe_direction() -
 
     assert decision_for("source-wide-sentinel") is True
     assert decision_for("source-narrow-sentinel") is False
+
+
+def test_unknown_canonical_looking_recent_author_is_omitted_without_silencing_reply(
+    tmp_path: Path,
+) -> None:
+    class StrictResolver:
+        def identity(self, author):
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("protected selection must not call resolve")
+
+    class ExplodingProvider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("unknown authors must fail before audience lookup")
+
+    resolver = StrictResolver()
+    buffer = MessageBuffer(
+        history_path=tmp_path / "chat_history.jsonl",
+        resolver=resolver,
+    )
+    buffer._append_in_memory(buffer.make_message(
+        channel_id="foreign-unknown-author-sentinel",
+        kind="user_message",
+        content="UNKNOWN-CANONICAL-LOOKING-SECRET",
+        author="canonical-looking-alice",
+        source="discord",
+    ))
+    agent = object.__new__(Agent)
+    agent._buffer = buffer
+    agent._identity_resolver = resolver
+    agent._config = SimpleNamespace(
+        recent_per_channel=10,
+        recent_author_cross=10,
+        recent_cross_hours=24,
+        recent_sources=None,
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="reply-destination-sentinel",
+        author="canonical-looking-alice",
+        source="acp",
+    )
+    ingress_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice",
+        domain="channel",
+        resource_id="reply-destination-sentinel",
+        bridge_instance="acp",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+    ))
+    auth = AuthContext(
+        principal="canonical-looking-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="reply-destination-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="reply-destination-sentinel",
+        bridge_instance="acp",
+        audience_provider=ExplodingProvider(),
+        ifc_state=InformationFlowState(labels=ingress_labels),
+    )
+
+    selected, blocks = agent._select_recent_activity(event, auth)
+    assert selected == []
+    assert blocks == ()
+    reply = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "reply-destination-sentinel",
+        ingress_labels,
+        auth,
+        enforce=True,
+    )
+    assert reply.allowed is True
 
 
 @pytest.mark.parametrize(
