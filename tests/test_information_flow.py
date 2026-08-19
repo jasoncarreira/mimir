@@ -17,6 +17,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
+    _same_channel_authority,
     CapabilityTier,
     ServicePrincipal,
     ServiceSinkPolicy,
@@ -180,23 +181,50 @@ def test_same_normalized_channel_from_other_bridge_authority_is_not_admitted():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
-@pytest.mark.parametrize("absent", ["source", "trigger"])
-def test_absent_bridge_authority_does_not_take_the_same_channel_shortcut(absent: str):
+def test_absent_triggering_bridge_does_not_take_the_same_channel_shortcut():
     """Unknown authority is not proof of the same authority.
 
-    The same-channel shortcut skips the audience lookup entirely, so it must
-    fire only on a proven authority match. A missing bridge on either side
-    leaves that unproven and declines the shortcut.
+    The same-channel shortcut skips the audience lookup entirely, so it fires
+    only on a proven authority match.
     """
-    labels = _labels(bridge_instance="" if absent == "source" else "slack")
-    auth = _auth() if absent == "source" else replace(_auth(), bridge_instance=None)
-
     decision = SinkGate.check_sink_flow(
-        "harness_auto_deliver", "slack-C1", labels, auth, enforce=True,
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack"),
+        replace(_auth(), bridge_instance=None),
+        enforce=True,
     )
 
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+@pytest.mark.parametrize(
+    ("source_bridge", "triggering_bridge"),
+    [("", "slack"), ("slack", None), ("", None)],
+)
+def test_same_channel_authority_declines_on_absent_bridge(
+    source_bridge: str,
+    triggering_bridge: str | None,
+):
+    """Both missing sides decline, asserted against the predicate itself.
+
+    A source with no bridge cannot reach this predicate through the sink gate:
+    an empty bridge_instance makes the label incomplete, and incomplete
+    provenance already fails closed upstream. Driving the predicate directly
+    keeps that branch covered rather than asserting an outcome the
+    incomplete-provenance path would produce anyway.
+    """
+    source = SourceLabel(
+        principal="user-1",
+        domain="channel",
+        resource_id="slack-C1",
+        bridge_instance=source_bridge,
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+    )
+
+    assert _same_channel_authority(source, triggering_bridge) is False
 
 
 def test_labels_without_source_provenance_fail_closed():
