@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -4384,9 +4385,26 @@ def _target_matches_operator_alert(target: str, destination: str) -> bool:
 
 
 def _target_matches_approved_url(target: str, destination: str) -> bool:
-    """Match one exact URL from an operator-fixed URL or JSON list."""
+    """Match an exact or explicitly scoped operator-configured URL."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
-    return normalized is not None and normalized in _configured_exact_urls(destination)
+    if normalized is None:
+        return False
+    exact_urls, scopes = _configured_url_approvals(destination)
+    if normalized in exact_urls:
+        return True
+    parsed = urlsplit(normalized)
+    if (
+        "%" in parsed.path
+        or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+    ):
+        return False
+    return any(
+        parsed.scheme == scope.scheme
+        and parsed.netloc == scope.netloc
+        and parsed.path.startswith(scope.path_prefix)
+        for scope in scopes
+    )
 
 
 _GITHUB_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -4435,18 +4453,41 @@ def _target_matches_github_pr_api(target: str, destination: str) -> bool:
     return (match[1].lower(), match[2].lower()) in _configured_github_repos(destination)
 
 
-def _configured_exact_urls(variable: str) -> frozenset[str]:
-    """Read one exact URL or a JSON array of exact URLs from an environment variable."""
+@dataclass(frozen=True)
+class _ApprovedURLScope:
+    scheme: str
+    netloc: str
+    path_prefix: str
+
+
+def _url_approval_host_is_bounded(hostname: str | None) -> bool:
+    """Reject empty and public-suffix-shaped hosts while retaining IP literals."""
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.rstrip(".").split(".")
+        return len(labels) >= 2 and all(labels)
+    return True
+
+
+def _configured_url_approvals(
+    variable: str,
+) -> tuple[frozenset[str], frozenset[_ApprovedURLScope]]:
+    """Read exact URLs and explicit ``/*`` URL scopes from operator config."""
     configured = os.environ.get(variable, "").strip()
     if not configured:
-        return frozenset()
+        return frozenset(), frozenset()
     if configured.startswith("["):
         try:
             parsed = json.loads(configured)
         except json.JSONDecodeError:
-            return frozenset()
+            log.warning("%s contains malformed JSON; no URLs will be approved", variable)
+            return frozenset(), frozenset()
         if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-            return frozenset()
+            log.warning("%s must be a URL or a JSON array of URLs; no URLs will be approved", variable)
+            return frozenset(), frozenset()
         items = parsed
     else:
         if "," in configured:
@@ -4458,11 +4499,40 @@ def _configured_exact_urls(variable: str) -> frozenset[str]:
         items = [configured]
 
     urls: set[str] = set()
+    scopes: set[_ApprovedURLScope] = set()
     for item in items:
-        normalized = normalize_sink_destination(SinkCategory.NETWORK, item.strip())
-        if normalized is not None:
-            urls.add(normalized)
-    return frozenset(urls)
+        value = item.strip()
+        if value.endswith("/*"):
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, value[:-1])
+            parsed_scope = urlsplit(normalized) if normalized is not None else None
+            if (
+                parsed_scope is None
+                or parsed_scope.query
+                or not _url_approval_host_is_bounded(parsed_scope.hostname)
+                or "%" in parsed_scope.path
+                or "\\" in parsed_scope.path
+                or any(segment in {".", ".."} for segment in parsed_scope.path.split("/"))
+            ):
+                log.warning("%s rejects malformed or overly broad URL scope %r", variable, item)
+                continue
+            scopes.add(_ApprovedURLScope(
+                scheme=parsed_scope.scheme,
+                netloc=parsed_scope.netloc,
+                path_prefix=parsed_scope.path,
+            ))
+            continue
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, value)
+        normalized_host = urlsplit(normalized).hostname if normalized is not None else None
+        if normalized is None or not _url_approval_host_is_bounded(normalized_host):
+            log.warning("%s rejects malformed URL approval %r", variable, item)
+            continue
+        urls.add(normalized)
+    return frozenset(urls), frozenset(scopes)
+
+
+def _configured_exact_urls(variable: str) -> frozenset[str]:
+    """Return only exact URLs, excluding explicitly host-scoped entries."""
+    return _configured_url_approvals(variable)[0]
 
 
 def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
@@ -4514,7 +4584,10 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
-    if normalized in approved_fetch_urls(auth_context):
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
+    ):
         return True
     if _target_matches_configured_github_repo_fetch(target):
         return True
@@ -5117,7 +5190,7 @@ class SinkGate:
             )
         if tool_name in {"webhook", "http_request"} and (
             normalized_target is None
-            or normalized_target not in _configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS")
+            or not _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
         ):
             return ToolAuthorization(
                 tool_name=tool_name,
