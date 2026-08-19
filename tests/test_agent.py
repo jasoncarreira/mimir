@@ -178,6 +178,25 @@ class _FakeAgent:
         yield {"messages": list(state.get("messages") or []) + self._response_messages}
 
 
+class _ContextCaptureAgent(_FakeAgent):
+    """Fake model that retains the real per-turn auth carrier it received."""
+
+    def __init__(self, response_messages: list[Any]) -> None:
+        super().__init__(response_messages)
+        self.contexts: list[AuthContext] = []
+
+    async def astream(
+        self, state: dict[str, Any], *, config: dict[str, Any], context=None,
+        stream_mode: str = "values",
+    ):
+        assert isinstance(context, AuthContext)
+        self.contexts.append(context)
+        async for chunk in super().astream(
+            state, config=config, context=context, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
 class _BudgetExhaustingAgent(_FakeAgent):
     """Simulate a turn that exhausted the tool-call budget."""
 
@@ -5530,6 +5549,254 @@ def test_unknown_cross_history_is_omitted_and_reply_is_delivered(
         enforce=True,
     )
     assert reply.allowed is True
+
+
+async def test_unknown_audience_and_unknown_author_history_do_not_silence_real_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection, final sink, and ACP-style delivery share one real turn."""
+    _acp_turn(monkeypatch)
+    reply = "UNKNOWN-AUDIENCE-REAL-DELIVERY-REPLY"
+    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    bridge = _BridgeStub()
+    channels = ChannelRegistry()
+    channels.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=graph, fake_saga=_FakeSaga())
+    agent._channels = channels  # type: ignore[attr-defined]
+    agent._config.access_control_enforced = True
+    resolver = _resolver(
+        agent._config.home,
+        """
+people:
+  - canonical: alice
+    aliases: [alice]
+    dm_channels: {discord: discord-D-alice}
+    access: {roles: [user]}
+""",
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._feedback.identity_resolver = resolver
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id="discord-D-alice",
+        kind="user_message",
+        content="UNKNOWN-AUDIENCE-HISTORY-SENTINEL",
+        author="alice",
+        msg_id="unknown-audience-history",
+        source="discord",
+    ))
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id="discord-D-canonical-looking",
+        kind="user_message",
+        content="UNKNOWN-CANONICAL-LOOKING-HISTORY-SENTINEL",
+        author="canonical-looking-alice",
+        msg_id="unknown-canonical-looking-history",
+        source="discord",
+    ))
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id="ch-unknown-audience-destination",
+        content="continue",
+        author="alice",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert "UNKNOWN-AUDIENCE-HISTORY-SENTINEL" not in prompt
+    assert "UNKNOWN-CANONICAL-LOOKING-HISTORY-SENTINEL" not in prompt
+    labels = graph.contexts[0].ifc_state.current()
+    assert all(
+        source.resource_id not in {
+            "discord-D-alice", "discord-D-canonical-looking",
+        }
+        for source in labels.sources
+    )
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+@pytest.mark.parametrize("mode", ["empty", "missing", "raising"])
+async def test_unavailable_cross_channel_audience_fails_closed_without_silencing_real_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Empty, absent, and throwing audience authority cannot enter a turn."""
+    class EmptyAudience:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def audience_for(self, channel_id, *, principal):
+            self.calls.append((channel_id, principal))
+            return frozenset()
+
+    class RaisingAudience:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str | None]] = []
+
+        def audience_for(self, channel_id, *, principal):
+            self.calls.append((channel_id, principal))
+            raise RuntimeError("audience provider unavailable")
+
+    _acp_turn(monkeypatch)
+    destination = f"ch-audience-{mode}-destination"
+    exact = f"EXACT-CHANNEL-{mode}-SENTINEL"
+    cross = f"CROSS-CHANNEL-{mode}-SENTINEL"
+    assistant = f"CROSS-ASSISTANT-{mode}-SENTINEL"
+    reply = f"VALID-REPLY-{mode}-SENTINEL"
+    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    bridge = _BridgeStub()
+    channels = ChannelRegistry()
+    channels.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=graph, fake_saga=_FakeSaga())
+    agent._channels = channels  # type: ignore[attr-defined]
+    agent._config.access_control_enforced = True
+    resolver = _resolver(
+        agent._config.home,
+        """
+people:
+  - canonical: alice
+    aliases: [alice]
+    dm_channels: {discord: discord-D-alice}
+    access: {roles: [user]}
+""",
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._feedback.identity_resolver = resolver
+    provider: EmptyAudience | RaisingAudience | None
+    if mode == "empty":
+        provider = EmptyAudience()
+    elif mode == "raising":
+        provider = RaisingAudience()
+    else:
+        provider = None
+    agent._audience_provider = provider
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id=destination,
+        kind="user_message",
+        content=exact,
+        author="alice",
+        msg_id=f"exact-{mode}",
+        source="acp",
+    ))
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id="discord-D-alice",
+        kind="user_message",
+        content=cross,
+        author="alice",
+        msg_id=f"cross-{mode}",
+        source="discord",
+    ))
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id="discord-D-alice",
+        kind="assistant_message",
+        content=assistant,
+        msg_id=f"assistant-{mode}",
+        source="discord",
+    ))
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="continue",
+        author="alice",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert exact in prompt
+    assert cross not in prompt
+    assert assistant not in prompt
+    labels = graph.contexts[0].ifc_state.current()
+    assert any(source.resource_id == destination for source in labels.sources)
+    assert all(source.resource_id != "discord-D-alice" for source in labels.sources)
+    assert [sent[1] for sent in bridge.sends] == [reply]
+    if provider is not None:
+        assert provider.calls
+
+
+@pytest.mark.parametrize(
+    ("ingress_path", "extra", "history_sentinel"),
+    [
+        (
+            "model",
+            {"model": {"audience": ["alice"], "channel_visibility": "private"}},
+            "HOSTILE-MODEL-AUDIENCE-SENTINEL",
+        ),
+        (
+            "tool",
+            {"tool_arguments": {"audience": ["alice"], "channel_visibility": "private"}},
+            "HOSTILE-TOOL-AUDIENCE-SENTINEL",
+        ),
+        (
+            "request",
+            {"audience": ["alice"], "channel_visibility": "private"},
+            "HOSTILE-REQUEST-AUDIENCE-SENTINEL",
+        ),
+    ],
+)
+async def test_hostile_audience_values_cannot_widen_real_turn_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ingress_path: str,
+    extra: dict[str, object],
+    history_sentinel: str,
+) -> None:
+    """Raw model/tool/request fields traverse ingress but never grant audience."""
+    _acp_turn(monkeypatch)
+    destination = f"ch-hostile-{ingress_path}-destination"
+    reply = f"HOSTILE-{ingress_path.upper()}-VALID-REPLY"
+    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    bridge = _BridgeStub()
+    channels = ChannelRegistry()
+    channels.register(bridge)  # type: ignore[arg-type]
+    agent = _build_agent(tmp_path, fake_agent=graph, fake_saga=_FakeSaga())
+    agent._channels = channels  # type: ignore[attr-defined]
+    agent._config.access_control_enforced = True
+    resolver = _resolver(
+        agent._config.home,
+        """
+people:
+  - canonical: alice
+    aliases: [alice]
+    dm_channels: {discord: discord-D-alice}
+    access: {roles: [user]}
+""",
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._feedback.identity_resolver = resolver
+    agent._buffer._append_in_memory(agent._buffer.make_message(
+        channel_id="discord-D-alice",
+        kind="user_message",
+        content=history_sentinel,
+        author="alice",
+        msg_id=f"hostile-{ingress_path}",
+        source="discord",
+    ))
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="continue",
+        author="alice",
+        source="acp",
+        extra=extra,
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert history_sentinel not in prompt
+    context = graph.contexts[0]
+    assert context.audience_provider.audience_for(
+        destination, principal="alice",
+    ) is None
+    assert all(
+        source.resource_id != "discord-D-alice"
+        for source in context.ifc_state.current().sources
+    )
+    assert [sent[1] for sent in bridge.sends] == [reply]
 
 
 async def test_audience_excluded_feedback_adds_no_label_and_does_not_block_reply(

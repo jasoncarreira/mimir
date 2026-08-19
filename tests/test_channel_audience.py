@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +103,19 @@ def test_group_slack_and_guild_channels_are_unknown_without_visibility_reads(
     provider = ServerChannelAudienceProvider(tmp_path)
     for channel in ("slack-C1", "discord-guild-1", "public", "group-private"):
         assert provider.audience_for(channel, principal="alice") is None
+    derivation = inspect.getsource(ServerChannelAudienceProvider.audience_for)
+    tree = ast.parse(dedent(derivation))
+    assert all(
+        not (
+            isinstance(node, ast.Constant)
+            and node.value == "channel_visibility"
+        )
+        and not (
+            isinstance(node, ast.Attribute)
+            and node.attr == "channel_visibility"
+        )
+        for node in ast.walk(tree)
+    )
 
 
 def test_hostile_event_model_and_request_audience_values_are_ignored(
