@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
+from .access_control import ChannelResourceAdapter
 from .pollers import POLLER_CHANNEL_PREFIX
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
@@ -548,7 +549,10 @@ class MessageBuffer:
         sources participate. Mirrors open-strix's hard-coded
         ``{"discord","web","stdin"}`` filter (``app.py:734``).
         """
-        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+        if (
+            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+            or recent_per_channel <= 0
+        ):
             # Synthetic scheduler:* or poller:* channel — no useful
             # prior context. See docstring above for rationale.
             within: list[Message] = []
@@ -596,14 +600,27 @@ class MessageBuffer:
         cross_hours: int,
         source_allowlist: frozenset[str] | None = None,
     ) -> list[Message]:
+        resolved_channel = ChannelResourceAdapter._resolve_channel(channel_id)
+
+        def same_channel(candidate: str) -> bool:
+            return (
+                ChannelResourceAdapter._resolve_channel(candidate)
+                == resolved_channel
+            )
+
         if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
             within: list[Message] = []
         else:
-            within = self.recent_for_channel(
-                channel_id,
-                recent_per_channel,
-                source_allowlist=source_allowlist,
-            )
+            same_channel_messages = [
+                message
+                for buffered_channel, messages in self._by_channel.items()
+                if same_channel(buffered_channel)
+                for message in messages
+                if source_allowlist is None or message.source in source_allowlist
+            ]
+            within = sorted(
+                same_channel_messages, key=lambda message: message.ts,
+            )[-recent_per_channel:]
 
         anchors: list[Message] = []
         if author and recent_author_cross > 0:
@@ -613,7 +630,7 @@ class MessageBuffer:
             for message in reversed(self._all):
                 if len(anchors) >= recent_author_cross:
                     break
-                if message.channel_id == channel_id or not message.author:
+                if same_channel(message.channel_id) or not message.author:
                     continue
                 if source_allowlist is not None and message.source not in source_allowlist:
                     continue
@@ -648,7 +665,7 @@ class MessageBuffer:
         cross: list[Message] = []
         include_replies_by_channel: dict[str, bool] = {}
         for message in self._all:
-            if message.channel_id == channel_id:
+            if same_channel(message.channel_id):
                 continue
             if id(message) in anchor_ids:
                 cross.append(message)

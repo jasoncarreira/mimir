@@ -150,7 +150,15 @@ _RedactedAudienceProvider = Annotated[
 
 
 class _SourceLabelAuthoritySlot:
-    __slots__ = ("_owner_attestation",)
+    __slots__ = (
+        "_authorized_principals",
+        "_owner_attestation",
+        "_principal",
+        "_resource_id",
+    )
+
+
+_MISSING_SOURCE_VALUE: Any = object()
 
 
 @dataclass(frozen=True, eq=False)
@@ -162,29 +170,62 @@ class SourceLabel(_SourceLabelAuthoritySlot):
     not public. All identity fields are required for ordinary channel egress.
     """
 
-    principal: str | None
-    domain: str | None
-    resource_id: str | None
-    bridge_instance: str | None
-    sensitivity: str
-    authorized_principals: frozenset[str] = frozenset()
+    principal: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    domain: str | None = _MISSING_SOURCE_VALUE
+    resource_id: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    bridge_instance: str | None = _MISSING_SOURCE_VALUE
+    sensitivity: str = _MISSING_SOURCE_VALUE
+    authorized_principals: InitVar[frozenset[str]] = frozenset()
     source_kind: str = "channel"
     integrity: str = Integrity.UNTRUSTED
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
     owner_attestation: InitVar[_RedactedOwnerAttestation] = None
 
-    def __post_init__(self, owner_attestation: OwnerAttestation | None) -> None:
+    def __post_init__(
+        self,
+        principal: str | None,
+        resource_id: str | None,
+        authorized_principals: frozenset[str],
+        owner_attestation: OwnerAttestation | None,
+    ) -> None:
+        if any(
+            value is _MISSING_SOURCE_VALUE
+            for value in (
+                principal, self.domain, resource_id,
+                self.bridge_instance, self.sensitivity,
+            )
+        ):
+            raise TypeError("missing required source label field")
         if self.integrity not in Integrity._value2member_map_:
             raise ValueError(f"invalid source integrity: {self.integrity!r}")
         if self.integrity_effect not in IntegrityEffect._value2member_map_:
             raise ValueError(
                 f"invalid source integrity effect: {self.integrity_effect!r}"
             )
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_resource_id", resource_id)
+        object.__setattr__(self, "_authorized_principals", authorized_principals)
         object.__setattr__(self, "_owner_attestation", owner_attestation)
 
     def __getattribute__(self, name: str) -> Any:
-        if name == "owner_attestation":
-            return object.__getattribute__(self, "_owner_attestation")
+        hidden = {
+            "authorized_principals": "_authorized_principals",
+            "owner_attestation": "_owner_attestation",
+            "principal": "_principal",
+            "resource_id": "_resource_id",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
+                authorized_principals=object.__getattribute__(
+                    self, "_authorized_principals",
+                ),
+            )
+            return values
         return object.__getattribute__(self, name)
 
     def _identity(self) -> tuple[Any, ...]:

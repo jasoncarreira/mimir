@@ -3363,7 +3363,7 @@ def test_feedback_content_and_labels_cover_chain_loop_commitment_and_turn_error(
     assert "COMMITMENT-PROVENANCE" in block.content
     assert "TURN-ERROR-PROVENANCE" in block.content
     assert {source.source_kind for source in block.labels.sources} >= {
-        "agent_self",
+        "feedback_chain",
         "channel_bound_unowned_feedback",
         "channel_scoped_feedback",
         "protected_prompt",
@@ -3371,15 +3371,10 @@ def test_feedback_content_and_labels_cover_chain_loop_commitment_and_turn_error(
     assert all(source.is_complete for source in block.labels.sources)
 
 
-def test_dedupe_and_arousal_dropped_records_keep_admission_labels(
+def test_content_dedupe_keeps_both_admission_labels_and_sink_compatibility(
     tmp_path: Path,
 ) -> None:
     log = _make_log(tmp_path, events=[
-        {
-            "timestamp": _ts(0.3),
-            "type": "interactive_turn_no_send_message",
-            "turn_id": "visible",
-        },
         {
             "timestamp": _ts(0.2),
             "type": "tool_call_denied",
@@ -3399,7 +3394,6 @@ def test_dedupe_and_arousal_dropped_records_keep_admission_labels(
             "source": "dedupe-two",
         },
     ])
-    log.arousal_thresholds = {"tool_denied": 3}
     auth = AuthContext(
         principal="alice",
         canonical_principal="alice",
@@ -3414,13 +3408,62 @@ def test_dedupe_and_arousal_dropped_records_keep_admission_labels(
     )
     block = log.recent_prompt_block(auth)
     assert block is not None
-    assert "tool_denied" not in block.content
-    assert len(block.labels.sources) == 3
+    assert block.content.count("tool_denied same: same") == 1
+    assert len(block.labels.sources) == 2
     sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
     )
     assert decision.allowed is True
+
+
+def test_arousal_dropped_records_keep_all_admission_labels(
+    tmp_path: Path,
+) -> None:
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.3),
+            "type": "interactive_turn_no_send_message",
+            "turn_id": "visible",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "tool": "arousal-one",
+            "reason": "quiet",
+            "source": "arousal-one-source",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "tool": "arousal-two",
+            "reason": "quiet",
+            "source": "arousal-two-source",
+        },
+    ])
+    log.arousal_thresholds = {"tool_denied": 3}
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "arousal-one" not in block.content
+    assert "arousal-two" not in block.content
+    assert len(block.labels.sources) == 3
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

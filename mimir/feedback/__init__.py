@@ -706,6 +706,7 @@ class FeedbackLog:
 
         admitted_events: list[dict] = []
         admitted_turns: list[dict] = []
+        chain_inputs: list[tuple[dict, str]] = []
 
         def admit(record: dict, stream: str) -> dict | None:
             nonlocal labels
@@ -714,16 +715,7 @@ class FeedbackLog:
             if not isinstance(channel, str) or not channel:
                 channel = None
             classified = classify(record.get("type"))
-            valence_chain_input = bool(
-                raw_owner is None
-                and channel is None
-                and classified is not None
-                and classified[1] in _VALENCE_CHAIN_INPUT_KINDS
-            )
-            agent_self = (
-                raw_owner is None
-                and (_is_agent_self_record(record) or valence_chain_input)
-            )
+            agent_self = raw_owner is None and _is_agent_self_record(record)
             same_channel = bool(
                 channel
                 and auth_context.channel_id
@@ -819,6 +811,19 @@ class FeedbackLog:
                 "cross_turn_send_duplicate",
             }:
                 continue
+            classified = classify(event_type)
+            if (
+                _record_principal(record) is None
+                and not record.get("channel_id")
+                and not _is_agent_self_record(record)
+                and classified is not None
+                and classified[1] in _VALENCE_CHAIN_INPUT_KINDS
+            ):
+                chain_inputs.append(({
+                    "timestamp": timestamp,
+                    "type": event_type,
+                }, f"events:{timestamp}"))
+                continue
             selected = admit(record, "events")
             if selected is not None:
                 admitted_events.append(selected)
@@ -841,6 +846,55 @@ class FeedbackLog:
             turns_snapshot=_RecordSnapshot(admitted_turns),
         )
         negatives, positives = selected_log.recent(auth_context=None)
+        if chain_inputs:
+            chain_snapshot = _RecordSnapshot([record for record, _ in chain_inputs])
+            group_runs = _compute_group_runs(
+                chain_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS,
+            )
+            chain_signals, _ = _synthesize_chain_signals(
+                group_runs, _VALENCE_GROUPS,
+            )
+            for signal in chain_signals:
+                group_key = signal.kind.removesuffix("_chain")
+                group = _VALENCE_GROUPS[group_key]
+                group_kinds = group.positive_kinds | group.negative_kinds
+                sources = InformationFlowLabels()
+                for record, resource_key in chain_inputs:
+                    classified = classify(record.get("type"))
+                    if classified is None or classified[1] not in group_kinds:
+                        continue
+                    source = prompt_sources.prompt_source_label(
+                        auth_context,
+                        principal=effective_requester,
+                        domain="feedback",
+                        resource=resource_key,
+                        channel_id=auth_context.channel_id,
+                        bridge_instance=f"mimir-chain:{resource_key}",
+                        authorized_principals=frozenset({effective_requester}),
+                        source_kind="feedback_chain",
+                        self_authored=False,
+                    )
+                    if not _source_is_triggering_channel_compatible(
+                        source,
+                        effective_principal=effective_requester,
+                        triggering_principal=auth_context.principal,
+                        resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                            auth_context.channel_id,
+                        ),
+                        audience_provider=auth_context.audience_provider,
+                        cross_platform_pull=auth_context.cross_platform_pull,
+                    ):
+                        sources = InformationFlowLabels()
+                        break
+                    sources = sources.with_source(source)
+                if not sources.sources:
+                    continue
+                for source in sources.sources:
+                    labels = labels.with_source(source)
+                target = negatives if signal.polarity == "negative" else positives
+                target.append(signal)
+            negatives.sort(key=lambda signal: signal.ts, reverse=True)
+            positives.sort(key=lambda signal: signal.ts, reverse=True)
         return _FeedbackSelection(negatives, positives, labels)
 
 

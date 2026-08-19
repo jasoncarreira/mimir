@@ -301,3 +301,75 @@ def test_compatibility_preconditions_and_early_arms_do_not_query_provider() -> N
     assert _source_is_triggering_channel_compatible(
         _source(resource_id="destination"), **kwargs,
     ) is True
+
+
+def test_recent_user_requires_bound_minted_attestation_and_singleton_destination() -> None:
+    class Resolver:
+        def __init__(self, canonical: str) -> None:
+            self.canonical = canonical
+
+        def identity(self, author: str | None) -> Identity | None:
+            if author == "raw-alice":
+                return Identity(canonical=self.canonical)
+            return None
+
+    class Provider:
+        def __init__(self, audience: frozenset[str]) -> None:
+            self.audience = audience
+
+        def audience_for(self, channel_id, *, principal):
+            assert channel_id == "destination"
+            assert principal == "alice"
+            return self.audience
+
+    attestation = attest_owner(Resolver("alice"), "raw-alice", "source")
+    assert attestation is not None
+    kwargs = {
+        "effective_principal": "alice",
+        "triggering_principal": "alice",
+        "resolved_triggering": "destination",
+        "audience_provider": Provider(frozenset({"alice"})),
+        "cross_platform_pull": True,
+    }
+    unattested = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="recent_activity_user",
+    )
+    hand_built = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="recent_activity_user",
+        owner_attestation=SimpleNamespace(
+            canonical_principal="alice",
+            raw_author="raw-alice",
+            source_channel="source",
+        ),
+    )
+    forged_attestation = attest_owner(
+        Resolver("mallory"), "raw-alice", "source",
+    )
+    forged = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="recent_activity_user",
+        owner_attestation=forged_attestation,
+    )
+    bound = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="recent_activity_user",
+        owner_attestation=attestation,
+    )
+
+    assert _source_is_triggering_channel_compatible(unattested, **kwargs) is False
+    assert _source_is_triggering_channel_compatible(hand_built, **kwargs) is False
+    assert _source_is_triggering_channel_compatible(forged, **kwargs) is False
+    assert _source_is_triggering_channel_compatible(bound, **kwargs) is True
+    assert _source_is_triggering_channel_compatible(
+        bound,
+        **{
+            **kwargs,
+            "audience_provider": Provider(frozenset({"alice", "bob"})),
+        },
+    ) is False

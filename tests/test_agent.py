@@ -21,6 +21,7 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from textwrap import dedent
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +31,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
 from mimir.access_control import ServicePrincipal, SinkGate
+from mimir.acp import sdk as acp_sdk
+from mimir.acp.agent import MimirAcpAgent
 from mimir.acp.session_store import SessionStore
 from mimir.agent import Agent, _initialize_ifc_labels
 from mimir.chat_skills import (
@@ -41,7 +44,7 @@ from mimir.channel_registry import ChannelRegistry
 from mimir.config import Config
 from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
-from mimir.identities import IdentityResolver
+from mimir.identities import IdentityResolver, hash_web_key
 from mimir.index import IndexGenerator
 from mimir.models import (
     AgentEvent,
@@ -56,6 +59,7 @@ from mimir.models import (
 from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
+from mimir.turn_event_bus import TurnEventBus
 from mimir.worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
@@ -744,7 +748,9 @@ def _build_agent(tmp_path: Path, *,
                  fake_agent: _FakeAgent,
                  fake_saga: _FakeSaga | None = None,
                  session_manager=None,
-                 chat_skill_registry: ChatSkillRegistry | None = None) -> Agent:
+                 chat_skill_registry: ChatSkillRegistry | None = None,
+                 channel_registry: ChannelRegistry | None = None,
+                 turn_event_bus: TurnEventBus | None = None) -> Agent:
     from mimir.event_logger import init_logger
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True, exist_ok=True)
@@ -757,6 +763,8 @@ def _build_agent(tmp_path: Path, *,
         index_generator=IndexGenerator(home),
         saga_client=fake_saga,  # type: ignore[arg-type]
         session_manager=session_manager,  # type: ignore[arg-type]
+        channel_registry=channel_registry,
+        turn_event_bus=turn_event_bus,
         chat_skill_registry=chat_skill_registry,
     )
     # Skip the real deepagents.create_deep_agent — return our fake
@@ -5117,7 +5125,7 @@ def _audience_auth(
     )
 
 
-async def test_owned_acp_sessions_share_recent_activity_concurrent_reopen_and_restart(
+async def test_owned_acp_and_dm_recent_activity_matrix_survives_restart(
     tmp_path: Path,
 ) -> None:
     fake = _FakeAgent(response_messages=[AIMessage(content="unused")])
@@ -5300,6 +5308,124 @@ async def test_owned_acp_sessions_share_recent_activity_concurrent_reopen_and_re
     assert restarted_source.owner_attestation is not None
     assert restarted_source.owner_attestation is not authored_source.owner_attestation
     assert "owner_attestation" not in messages[0].to_dict()
+
+
+async def test_acp_lifecycle_reloads_owned_session_and_delivers_bound_reply(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.updates: list[Any] = []
+
+        async def session_update(self, session_id: str, update: Any) -> None:
+            self.updates.append(update)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    resolver = _resolver(
+        home,
+        f"""
+        people:
+          - canonical: operator
+            aliases: [{hash_web_key("operator-key")}]
+            access: {{roles: [admin], is_service: false}}
+          - canonical: foreign
+            aliases: [{hash_web_key("foreign-key")}]
+            access: {{roles: [admin], is_service: false}}
+        """,
+    )
+
+    def process(response: str) -> tuple[MimirAcpAgent, Agent, _FakeAgent, Client, int]:
+        channels = ChannelRegistry()
+        bus = TurnEventBus()
+        graph = _FakeAgent(response_messages=[AIMessage(content=response)])
+        core = _build_agent(
+            tmp_path,
+            fake_agent=graph,
+            channel_registry=channels,
+            turn_event_bus=bus,
+        )
+        core._identity_resolver = resolver
+        core._buffer.resolver = resolver
+        core._feedback.identity_resolver = resolver
+        bundle = SimpleNamespace(
+            core=SimpleNamespace(identity_resolver=resolver),
+            config=core._config,
+            adapters=SimpleNamespace(channels=channels),
+            turn_event_bus=bus,
+            agent=core,
+        )
+        acp = MimirAcpAgent(bundle)
+        client = Client()
+        generation = acp.on_connect(client)
+        return acp, core, graph, client, generation
+
+    acp, core, graph, client, generation = process("FIRST-PROCESS-REPLY")
+    await acp.authenticate("mimir-web-key", **{"mimir.webKey": "operator-key"})
+    first_response, second_response = await asyncio.gather(
+        acp.new_session("/workspace/one"),
+        acp.new_session("/workspace/two"),
+    )
+    first_id = first_response.session_id
+    second_id = second_response.session_id
+    first_thread = f"acp:{first_id}"
+    first_message = core._buffer.make_message(
+        channel_id=first_thread,
+        kind="user_message",
+        content="PERSISTED-FIRST-SESSION-CONTEXT",
+        author="operator",
+        source="acp",
+    )
+    await core._buffer.append(first_message)
+
+    response = await acp.prompt(
+        second_id,
+        [acp_sdk.TextContentBlock(type="text", text="use prior context")],
+    )
+    assert response.stop_reason == "end_turn"
+    assert "PERSISTED-FIRST-SESSION-CONTEXT" in graph.invocations[0]["state"][
+        "messages"
+    ][0].content
+    assert any(
+        update.session_update == "agent_message_chunk"
+        and update.content.text == "FIRST-PROCESS-REPLY"
+        for update in client.updates
+    )
+    assert SessionStore(home).load_owned(second_id, "operator").owner_principal == "operator"
+
+    await acp.on_transport_closed(generation)
+    restarted, restarted_core, restarted_graph, restarted_client, _ = process(
+        "RESTARTED-ACP-REPLY",
+    )
+    assert restarted_core._buffer.replay() >= 3
+    await restarted.authenticate(
+        "mimir-web-key", **{"mimir.webKey": "operator-key"},
+    )
+    await restarted.load_session("/workspace/reloaded", second_id)
+    restarted_client.updates.clear()
+
+    response = await restarted.prompt(
+        second_id,
+        [acp_sdk.TextContentBlock(type="text", text="reply after reload")],
+    )
+    assert response.stop_reason == "end_turn"
+    assert "PERSISTED-FIRST-SESSION-CONTEXT" in restarted_graph.invocations[0][
+        "state"
+    ]["messages"][0].content
+    assert any(
+        update.session_update == "agent_message_chunk"
+        and update.content.text == "RESTARTED-ACP-REPLY"
+        for update in restarted_client.updates
+    )
+
+    foreign, _foreign_core, _foreign_graph, _foreign_client, _ = process(
+        "FOREIGN-MUST-NOT-RUN",
+    )
+    await foreign.authenticate(
+        "mimir-web-key", **{"mimir.webKey": "foreign-key"},
+    )
+    with pytest.raises(acp_sdk.RequestError):
+        await foreign.load_session("/workspace/foreign", second_id)
 
 
 def test_agent_prompt_respects_cross_platform_pull_false(tmp_path: Path) -> None:

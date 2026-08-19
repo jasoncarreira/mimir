@@ -3636,9 +3636,15 @@ def test_ifc_sources_is_append_only_deduped_tuple():
         InformationFlowLabels(sources=("not-a-source-label",))
 
 
-def _service_turn_auth_context() -> AuthContext:
+def _service_turn_auth_context(tmp_path: Path) -> AuthContext:
     from mimir.channel_audience import ServerChannelAudienceProvider, attest_owner
     from mimir.identities import Identity
+    from mimir.acp.session_store import SessionStore
+
+    home = tmp_path / "authority-secret-home"
+    destination = SessionStore(home).create_owned_session(
+        "attested-secret-principal",
+    )
 
     class Resolver:
         def identity(self, author):
@@ -3648,24 +3654,29 @@ def _service_turn_auth_context() -> AuthContext:
         Resolver(), "raw-secret-author", "attested-secret-channel",
     )
     src = SourceLabel(
-        principal="service:github", domain="channel",
-        resource_id="poller:github-activity", bridge_instance="poller",
+        principal="attested-secret-principal", domain="channel",
+        resource_id="attested-secret-channel", bridge_instance="acp",
         sensitivity="internal",
-        authorized_principals=frozenset({"service:github"}),
+        authorized_principals=frozenset({"attested-secret-principal"}),
         source_kind="recent_activity_user",
         owner_attestation=attestation,
     )
     return AuthContext(
-        principal="service:github", canonical_principal="service:github", roles=(),
-        event_ingress=None, trigger="saga_session_end",
-        channel_id="poller:github-activity",
-        interactivity=TurnInteractivity.NON_INTERACTIVE, is_service=True,
+        principal="runtime-operator",
+        canonical_principal="runtime-operator",
+        roles=("user",),
+        event_ingress=None, trigger="user_message",
+        channel_id=destination.thread_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
         ifc_labels=InformationFlowLabels().with_source(src),
-        audience_provider=ServerChannelAudienceProvider(Path("/authority-secret")),
+        domain="channel",
+        resource_id=destination.thread_id,
+        bridge_instance="acp",
+        audience_provider=ServerChannelAudienceProvider(home),
     )
 
 
-def test_tool_parse_input_survives_pregel_runtime_in_config():
+def test_tool_parse_input_survives_pregel_runtime_in_config(tmp_path: Path):
     """Regression for the exact #971 turn-crash carrier (verified on the live box).
 
     mimir tools use postponed annotations, so ``_injected_args_keys`` is empty
@@ -3685,7 +3696,7 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
 
     from mimir.tools.store import memory_store
 
-    ctx = _service_turn_auth_context()
+    ctx = _service_turn_auth_context(tmp_path)
 
     def _parse(auth_context: AuthContext) -> dict:
         runtime = ToolRuntime(
@@ -3717,7 +3728,9 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
         _parse(replace(ctx, ifc_labels=bad))
 
 
-async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority():
+async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority(
+    tmp_path: Path,
+):
     from deepagents import create_deep_agent
     from langchain.tools import ToolRuntime
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -3730,12 +3743,29 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     @tool
     def inspect_audience_authority(runtime: ToolRuntime[AuthContext]) -> str:
         """Inspect server-provided audience authority."""
+        from mimir.access_control import (
+            ChannelResourceAdapter,
+            _source_is_triggering_channel_compatible,
+        )
+
         context = runtime.context
+        source = context.ifc_labels.sources[0]
         captured["context"] = context
         captured["provider"] = context.audience_provider
-        captured["attestation"] = context.ifc_labels.sources[0].owner_attestation
+        captured["attestation"] = source.owner_attestation
         captured["provider_result"] = context.audience_provider.audience_for(
-            None, principal="service:github",
+            context.channel_id,
+            principal=source.principal,
+        )
+        captured["predicate_result"] = _source_is_triggering_channel_compatible(
+            source,
+            effective_principal=source.principal,
+            triggering_principal=context.principal,
+            resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                context.channel_id,
+            ),
+            audience_provider=context.audience_provider,
+            cross_platform_pull=context.cross_platform_pull,
         )
         captured["duck_dump"] = TypeAdapter(dict[str, Any]).dump_python(
             runtime.config,
@@ -3761,7 +3791,8 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
         system_prompt="test",
         context_schema=AuthContext,
     )
-    context = _service_turn_auth_context()
+    context = _service_turn_auth_context(tmp_path)
+    authority_path = str(context.audience_provider.home)
     typed_source = TypeAdapter(SourceLabel).dump_python(
         context.ifc_labels.sources[0],
     )
@@ -3782,10 +3813,11 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     assert captured["context"] is context
     assert captured["provider"] is context.audience_provider
     assert captured["attestation"] is context.ifc_labels.sources[0].owner_attestation
-    assert captured["provider_result"] is None
+    assert captured["provider_result"] == frozenset({"attested-secret-principal"})
+    assert captured["predicate_result"] is True
     serialized = repr(captured["duck_dump"])
     for secret in (
-        "/authority-secret",
+        authority_path,
         "attested-secret-principal",
         "raw-secret-author",
         "attested-secret-channel",
@@ -3800,7 +3832,9 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     )
 
 
-async def test_agent_graph_tool_call_survives_populated_auth_context():
+async def test_agent_graph_tool_call_survives_populated_auth_context(
+    tmp_path: Path,
+):
     """End-to-end #971 regression through the production assembly.
 
     Builds the real ``create_deep_agent`` graph with a production mimir tool and
@@ -3840,7 +3874,7 @@ async def test_agent_graph_tool_call_survives_populated_auth_context():
     final_state: dict = {}
     async for item in agent.astream(
         {"messages": [HumanMessage(content="go")]},
-        context=_service_turn_auth_context(),
+        context=_service_turn_auth_context(tmp_path),
         stream_mode=["values"],
     ):
         if isinstance(item, tuple) and len(item) == 2 and item[0] == "values":

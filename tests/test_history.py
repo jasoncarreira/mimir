@@ -1062,46 +1062,76 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
             return f"{parent}.{node.attr}" if parent else None
         return None
 
-    observed: set[tuple[str, str]] = set()
+    observed: set[tuple[str, str, str]] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            call = dotted(node.func)
+            if call is not None and self.stack:
+                terminal = call.rsplit(".", 1)[-1]
+                if terminal in read_methods | producer_methods or call in {
+                    "self._append_in_memory",
+                    "self._buffer.make_message",
+                    "self._buffer.append",
+                    "_buf.make_message",
+                    "_buf.append",
+                    "get_global_buffer",
+                    "set_global_buffer",
+                }:
+                    observed.add((
+                        self.relative,
+                        ".".join(self.stack),
+                        call,
+                    ))
+            self.generic_visit(node)
+
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            call = dotted(node.func)
-            if call is None:
-                continue
-            terminal = call.rsplit(".", 1)[-1]
-            if terminal in read_methods | producer_methods:
-                observed.add((str(path.relative_to(root.parent)), call))
-            elif call in {
-                "self._append_in_memory",
-                "self._buffer.make_message",
-                "self._buffer.append",
-                "_buf.make_message",
-                "_buf.append",
-                "get_global_buffer",
-                "set_global_buffer",
-            }:
-                observed.add((str(path.relative_to(root.parent)), call))
+        Visitor(str(path.relative_to(root.parent))).visit(tree)
     assert observed == {
-        ("mimir/agent.py", "buffer.recent_for_channel"),
-        ("mimir/agent.py", "self._append_inbound_to_buffer"),
-        ("mimir/agent.py", "self._buffer.append"),
-        ("mimir/agent.py", "self._buffer.assemble_recent_activity_candidates"),
-        ("mimir/agent.py", "self._buffer.make_message"),
-        ("mimir/agent.py", "self.on_message_injected"),
-        ("mimir/bridges/web_chat.py", "buffer.recent_in_channel"),
-        ("mimir/bridges/web_chat.py", "get_global_buffer"),
-        ("mimir/history.py", "self._append_in_memory"),
-        ("mimir/history.py", "self.cross_author_context"),
-        ("mimir/history.py", "self.cross_author_messages"),
-        ("mimir/history.py", "self.recent_for_channel"),
-        ("mimir/runtime.py", "message_buffer.evict_channel"),
-        ("mimir/runtime.py", "message_buffer.replay"),
-        ("mimir/runtime.py", "set_global_buffer"),
-        ("mimir/tools/registry.py", "_buf.append"),
-        ("mimir/tools/registry.py", "_buf.make_message"),
-        ("mimir/tools/registry.py", "buf.recent_for_channel"),
-        ("mimir/tools/registry.py", "get_global_buffer"),
+        ("mimir/agent.py", "_rewrite_context_from_buffer", "buffer.recent_for_channel"),
+        ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.append"),
+        ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.make_message"),
+        ("mimir/agent.py", "Agent._maybe_auto_deliver_final_text", "self._buffer.append"),
+        ("mimir/agent.py", "Agent._maybe_auto_deliver_final_text", "self._buffer.make_message"),
+        ("mimir/agent.py", "Agent._run_turn_body", "self._append_inbound_to_buffer"),
+        ("mimir/agent.py", "Agent._run_turn_body", "self.on_message_injected"),
+        ("mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"),
+        ("mimir/agent.py", "Agent.on_message_injected", "self._append_inbound_to_buffer"),
+        ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "buffer.recent_in_channel"),
+        ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "get_global_buffer"),
+        ("mimir/history.py", "MessageBuffer.append", "self._append_in_memory"),
+        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.cross_author_context"),
+        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.recent_for_channel"),
+        ("mimir/history.py", "MessageBuffer.cross_author_context", "self.cross_author_messages"),
+        ("mimir/history.py", "MessageBuffer.replay", "self._append_in_memory"),
+        ("mimir/runtime.py", "_clear_runtime_globals", "set_global_buffer"),
+        ("mimir/runtime.py", "_install_runtime_globals", "set_global_buffer"),
+        ("mimir/runtime.py", "create_agent_runtime", "message_buffer.replay"),
+        ("mimir/runtime.py", "create_agent_runtime.on_channel_idle", "message_buffer.evict_channel"),
+        ("mimir/tools/registry.py", "_resolve_recent_message_id", "buf.recent_for_channel"),
+        ("mimir/tools/registry.py", "_resolve_recent_message_id", "get_global_buffer"),
+        ("mimir/tools/registry.py", "send_message", "_buf.append"),
+        ("mimir/tools/registry.py", "send_message", "_buf.make_message"),
+        ("mimir/tools/registry.py", "send_message", "get_global_buffer"),
     }

@@ -4060,11 +4060,17 @@ class Agent:
             effective_principal = f"service:{effective_principal}"
         if not effective_principal:
             return [], ()
+        resolved_triggering = ChannelResourceAdapter._resolve_channel(
+            event.channel_id,
+        )
 
         admitted: list[Message] = []
         blocks: list[PromptBlock] = []
         for message in candidates:
-            same_channel = message.channel_id == (event.channel_id or "")
+            same_channel = (
+                ChannelResourceAdapter._resolve_channel(message.channel_id)
+                == resolved_triggering
+            )
             owner_attestation = None
             source_kind = (
                 "recent_activity_assistant"
@@ -4100,9 +4106,7 @@ class Agent:
                 source,
                 effective_principal=effective_principal,
                 triggering_principal=auth_context.principal,
-                resolved_triggering=ChannelResourceAdapter._resolve_channel(
-                    event.channel_id,
-                ),
+                resolved_triggering=resolved_triggering,
                 audience_provider=auth_context.audience_provider,
                 cross_platform_pull=auth_context.cross_platform_pull,
             ):
