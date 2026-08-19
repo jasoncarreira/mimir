@@ -28,6 +28,7 @@ def test_image_provisions_protected_worklink_roots() -> None:
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" in text
+    assert '/opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16"' in text
     assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
