@@ -608,7 +608,10 @@ class MessageBuffer:
                 == resolved_channel
             )
 
-        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+        if (
+            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+            or recent_per_channel <= 0
+        ):
             within: list[Message] = []
         else:
             same_channel_messages = [

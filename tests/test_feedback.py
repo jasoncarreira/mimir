@@ -3464,6 +3464,11 @@ def test_arousal_dropped_records_keep_all_admission_labels(
     assert "arousal-one" not in block.content
     assert "arousal-two" not in block.content
     assert len(block.labels.sources) == 3
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
+    )
+    assert decision.allowed is True
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

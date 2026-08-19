@@ -1231,11 +1231,19 @@ def test_selection_and_sink_share_normalized_channel_alias(
     )
     assert decision.allowed is True
 
+    agent._config.recent_per_channel = 0
+    disabled_recent, disabled_blocks = agent._select_recent_activity(event, auth)
+    assert disabled_recent == []
+    assert disabled_blocks == ()
+
 
 def test_channel_bearing_source_inventory_is_closed() -> None:
     root = Path(__file__).parents[1] / "mimir"
     categories = {
+        "AuthContext": "context_factory",
+        "OwnerAttestation": "attestation_factory",
         "SourceLabel": "producer",
+        "derived": "producer",
         "_prompt_source_labels": "producer",
         "prompt_source_label": "producer",
         "PromptBlock": "direct_block",
@@ -1244,6 +1252,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         "admit": "feedback_stream",
         "assemble_recent_activity_candidates": "recent_loader",
         "attest_owner": "attestation",
+        "_mint_owner_attestation": "attestation",
         "_source_is_triggering_channel_compatible": "sink_predicate",
         "create_auth_context": "context_boundary",
         "ServerChannelAudienceProvider": "context_boundary",
@@ -1278,9 +1287,18 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
 
         def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             self.stack.append(node.name)
-            if node.name in {"_event_to_stash", "_event_from_stash"}:
+            if node.name in {
+                "_event_to_stash",
+                "_event_from_stash",
+                "_mint_owner_attestation",
+            }:
+                category = (
+                    "attestation_definition"
+                    if node.name == "_mint_owner_attestation"
+                    else "recovery_definition"
+                )
                 observed.add((
-                    "recovery_definition",
+                    category,
                     self.relative,
                     ".".join(self.stack),
                     node.name,
@@ -1329,6 +1347,9 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
 
     assert observed == {
         ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner", 4083),
+        ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation", 60),
+        ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation", 129),
+        ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation", 134),
         ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context", 9049),
         ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider", 335),
         ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context", 418),
@@ -1336,6 +1357,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context", 1926),
         ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context", 523),
         ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace", 989),
+        ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext", 8969),
         ("direct_block", "mimir/agent.py", "Agent._assemble_commitments_block", "PromptBlock", 3847),
         ("direct_block", "mimir/agent.py", "Agent._assemble_self_state_block", "PromptBlock", 3880),
         ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock", 4008),
@@ -1371,6 +1393,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels", 4092),
         ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel", 290),
         ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel", 469),
+        ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived", 574),
         ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label", 252),
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label", 866),
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label", 773),

@@ -257,12 +257,12 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         schema = handler(source)
         schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
             lambda value: {
-                "principal": value.principal,
+                "principal": None,
                 "domain": value.domain,
-                "resource_id": value.resource_id,
+                "resource_id": None,
                 "bridge_instance": value.bridge_instance,
                 "sensitivity": value.sensitivity,
-                "authorized_principals": value.authorized_principals,
+                "authorized_principals": frozenset(),
                 "source_kind": value.source_kind,
                 "integrity": value.integrity,
                 "integrity_effect": value.integrity_effect,
@@ -1128,7 +1128,14 @@ class ServerDiscoveredPRStates:
 
 
 class _AuthContextAuthoritySlot:
-    __slots__ = ("_audience_provider",)
+    __slots__ = (
+        "_audience_provider",
+        "_canonical_principal",
+        "_principal",
+    )
+
+
+_MISSING_AUTH_VALUE: Any = object()
 
 
 @dataclass(frozen=True)
@@ -1151,13 +1158,13 @@ class AuthContext(_AuthContextAuthoritySlot):
     _current_turn ContextVar is lost (chainlink #891).
     """
 
-    principal: str | None
-    canonical_principal: str | None
-    roles: tuple[str, ...]
-    event_ingress: str | None
-    trigger: str
-    channel_id: str | None
-    interactivity: "TurnInteractivity | None"
+    principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    canonical_principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    roles: tuple[str, ...] = _MISSING_AUTH_VALUE
+    event_ingress: str | None = _MISSING_AUTH_VALUE
+    trigger: str = _MISSING_AUTH_VALUE
+    channel_id: str | None = _MISSING_AUTH_VALUE
+    interactivity: "TurnInteractivity | None" = _MISSING_AUTH_VALUE
     policy_version: str | None = None
     is_service: bool = False
     service_authority: Any = field(default=None, repr=False)
@@ -1205,13 +1212,52 @@ class AuthContext(_AuthContextAuthoritySlot):
     saga_session_id: str | None = None
     audience_provider: InitVar[_RedactedAudienceProvider] = None
     cross_platform_pull: bool = True
+    _principal_fingerprint: str = field(default="", init=False, repr=False)
 
-    def __post_init__(self, audience_provider: Any) -> None:
+    def __post_init__(
+        self,
+        principal: str | None,
+        canonical_principal: str | None,
+        audience_provider: Any,
+    ) -> None:
+        if any(
+            value is _MISSING_AUTH_VALUE
+            for value in (
+                principal,
+                canonical_principal,
+                self.roles,
+                self.event_ingress,
+                self.trigger,
+                self.channel_id,
+                self.interactivity,
+            )
+        ):
+            raise TypeError("missing required authorization context field")
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_canonical_principal", canonical_principal)
         object.__setattr__(self, "_audience_provider", audience_provider)
+        object.__setattr__(self, "_principal_fingerprint", hashlib.sha256(
+            repr((principal, canonical_principal)).encode("utf-8"),
+        ).hexdigest())
 
     def __getattribute__(self, name: str) -> Any:
-        if name == "audience_provider":
-            return object.__getattribute__(self, "_audience_provider")
+        hidden = {
+            "audience_provider": "_audience_provider",
+            "canonical_principal": "_canonical_principal",
+            "principal": "_principal",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.pop("_principal_fingerprint", None)
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                canonical_principal=object.__getattribute__(
+                    self, "_canonical_principal",
+                ),
+            )
+            return values
         return object.__getattribute__(self, name)
 
     @classmethod

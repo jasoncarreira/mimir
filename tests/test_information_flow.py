@@ -3662,8 +3662,8 @@ def _service_turn_auth_context(tmp_path: Path) -> AuthContext:
         owner_attestation=attestation,
     )
     return AuthContext(
-        principal="runtime-operator",
-        canonical_principal="runtime-operator",
+        principal="attested-secret-principal",
+        canonical_principal="attested-secret-principal",
         roles=("user",),
         event_ingress=None, trigger="user_message",
         channel_id=destination.thread_id,
@@ -3755,11 +3755,11 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
         captured["attestation"] = source.owner_attestation
         captured["provider_result"] = context.audience_provider.audience_for(
             context.channel_id,
-            principal=source.principal,
+            principal=context.canonical_principal,
         )
         captured["predicate_result"] = _source_is_triggering_channel_compatible(
             source,
-            effective_principal=source.principal,
+            effective_principal=context.canonical_principal,
             triggering_principal=context.principal,
             resolved_triggering=ChannelResourceAdapter._resolve_channel(
                 context.channel_id,
@@ -3799,6 +3799,14 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     typed_context = TypeAdapter(AuthContext).dump_python(context)
     assert typed_source["owner_attestation"] is None
     assert typed_context["audience_provider"] is None
+    typed_serialized = repr((typed_source, typed_context))
+    for secret in (
+        authority_path,
+        "attested-secret-principal",
+        "raw-secret-author",
+        "attested-secret-channel",
+    ):
+        assert secret not in typed_serialized
     final_state: dict[str, Any] = {}
     async for item in graph.astream(
         {"messages": [HumanMessage(content="inspect")]},
