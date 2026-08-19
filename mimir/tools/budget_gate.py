@@ -87,6 +87,20 @@ _PULL_REQUEST_TOOLS = _STANDING_REVIEW_TOOLS | frozenset({
     "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
     "repo_revert_abort", "repo_push",
 })
+_TOOL_EVENT_ARGUMENT_ALLOWLIST = (
+    "path",
+    "file_path",
+    "paths",
+    "pattern",
+    "channel_id",
+    "repository",
+    "pull_request",
+    "session_id",
+    "job_id",
+)
+_TOOL_EVENT_ARGUMENT_VALUE_LIMIT = 200
+_TOOL_EVENT_ERROR_LIMIT = 500
+_TOOL_EVENT_ELISION = "...[truncated]..."
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_inline_review_comment",
     "pr_rerequest_review",
@@ -1217,6 +1231,31 @@ def _authorize_tool_call(
     )
 
 
+def _bounded_tool_event_error(error: str) -> str:
+    if len(error) <= _TOOL_EVENT_ERROR_LIMIT:
+        return error
+    remaining = _TOOL_EVENT_ERROR_LIMIT - len(_TOOL_EVENT_ELISION)
+    head_length = remaining // 2
+    return error[:head_length] + _TOOL_EVENT_ELISION + error[-(remaining - head_length):]
+
+
+def _tool_event_arguments(arguments: Mapping[str, Any] | None) -> dict[str, Any]:
+    if arguments is None:
+        return {}
+    summary: dict[str, Any] = {}
+    for key in _TOOL_EVENT_ARGUMENT_ALLOWLIST:
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        if isinstance(value, str):
+            summary[key] = value[:_TOOL_EVENT_ARGUMENT_VALUE_LIMIT]
+        elif value is None or isinstance(value, (bool, int, float)):
+            summary[key] = value
+        else:
+            summary[key] = str(value)[:_TOOL_EVENT_ARGUMENT_VALUE_LIMIT]
+    return summary
+
+
 def _emit_tool_call_sync(
     tool_name: str,
     *,
@@ -1227,23 +1266,28 @@ def _emit_tool_call_sync(
     arguments: dict[str, Any] | None = None,
 ) -> None:
     payload = {"tool": tool_name, "ok": ok}
+    argument_summary = _tool_event_arguments(arguments)
+    if argument_summary:
+        payload["arguments"] = argument_summary
     if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
         payload["repository"] = arguments.get("repository")
         payload["pull_request"] = arguments.get("pull_request")
     if duration_ms is not None:
         payload["duration_ms"] = round(duration_ms, 3)
     if error:
-        payload["error"] = error[:500]
+        payload["error"] = _bounded_tool_event_error(error)
     if denied:
         payload["denied"] = True
     _emit_event_sync("tool_call", **payload)
     if not ok:
         error_payload = {"tool": tool_name}
+        if argument_summary:
+            error_payload["arguments"] = argument_summary
         if tool_name in _PULL_REQUEST_TOOLS and arguments is not None:
             error_payload["repository"] = arguments.get("repository")
             error_payload["pull_request"] = arguments.get("pull_request")
         if error:
-            error_payload["error"] = error[:500]
+            error_payload["error"] = _bounded_tool_event_error(error)
         if denied:
             error_payload["denied"] = True
         # The companion ``tool_call(ok=false)`` event owns the dashboard's
@@ -1608,6 +1652,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ok=False,
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
+                arguments=validated_arguments,
             )
             raise
         finally:
@@ -1645,6 +1690,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             ok=not is_error,
             duration_ms=duration_ms,
             error=_result_error_text(result) if is_error else None,
+            arguments=validated_arguments,
         )
         return result
 
@@ -1908,6 +1954,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 ok=False,
                 duration_ms=(time.monotonic() - started) * 1000.0,
                 error=str(exc),
+                arguments=validated_arguments,
             )
             raise
         finally:
@@ -1945,5 +1992,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             ok=not is_error,
             duration_ms=duration_ms,
             error=_result_error_text(result) if is_error else None,
+            arguments=validated_arguments,
         )
         return result
