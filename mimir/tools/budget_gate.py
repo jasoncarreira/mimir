@@ -453,6 +453,13 @@ def _extract_sink_target(
             f"{scope.canonical_repo}#pull/{scope.pr_number}"
             f"@{scope.observed_head_sha}:{scope.scope_id}"
         )
+    if tool_name == "operator_alert":
+        from ..channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
+
+        return resolve_deliver_channel(
+            OPERATOR_CHANNEL_SENTINEL,
+            os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
+        )
     if tool_name in {"send_message", "react", "fetch_channel_history"}:
         explicit_channel = args.get("channel_id")
         if explicit_channel:

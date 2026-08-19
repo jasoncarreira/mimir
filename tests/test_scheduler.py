@@ -291,13 +291,7 @@ async def test_fire_heartbeat_principal_is_unchanged(tmp_path: Path):
         "heartbeat", home,
     )
     assert authority is not None
-    # operator_alert is represented by its executable send_message operation;
-    # compare every other effective operation, then prove the selected profile's
-    # declared set itself is exactly the heartbeat profile.
-    expected_operations = {
-        "send_message" if capability == "operator_alert" else capability
-        for capability in TRIGGER_AUTHORITY_PROFILES["heartbeat"]
-    }
+    expected_operations = set(TRIGGER_AUTHORITY_PROFILES["heartbeat"])
     assert set(authority.capabilities) == expected_operations
     assert (
         TRIGGER_AUTHORITY_PROFILES[authority.authority_profile]
@@ -3464,10 +3458,7 @@ async def test_bundled_scheduler_template_authority_profiles(
         event.extra["schedule_name"]: event.service_authority
         for event in enqueued
     }
-    expected_heartbeat_capabilities = {
-        "send_message" if capability == "operator_alert" else capability
-        for capability in TRIGGER_AUTHORITY_PROFILES["heartbeat"]
-    }
+    expected_heartbeat_capabilities = set(TRIGGER_AUTHORITY_PROFILES["heartbeat"])
     heartbeat = authorities["heartbeat"]
     assert heartbeat.canonical == "heartbeat"
     assert set(heartbeat.capabilities) == expected_heartbeat_capabilities
