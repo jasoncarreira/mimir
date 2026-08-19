@@ -1190,6 +1190,9 @@ class TurnContext:
     # produced final text but this is still 0 — i.e. the reply never went out
     # (0.3.0: send_message is the sole delivery path).
     send_message_count: int = 0
+    # Calls to the notify-only operator_alert tool are separately bounded and
+    # do not count as replies to an interactive triggering channel.
+    operator_alert_count: int = 0
     # Number of successful react tool calls this turn. A react is a valid
     # interactive response (an acknowledgment), so the forgot-to-send guard
     # treats react_count > 0 the same as a delivered send_message — otherwise

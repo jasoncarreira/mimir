@@ -172,6 +172,7 @@ class ToolFlowDirection(StrEnum):
 
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
+    "operator_alert": SinkCategory.NOTIFICATION,
     "react": SinkCategory.SAME_CHANNEL,
     # Harness-owned egress paths bypass model tool middleware, so they are
     # named explicitly and checked at their final send/edit boundary.
@@ -272,6 +273,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "bash_jobs_list": ToolFlowDirection.SOURCE,
     "bash_job_output": ToolFlowDirection.SOURCE,
     "send_message": ToolFlowDirection.SINK,
+    "operator_alert": ToolFlowDirection.SINK,
     "react": ToolFlowDirection.SINK,
     "fetch_channel_history": ToolFlowDirection.SOURCE,
     "list_channels": ToolFlowDirection.SOURCE,
@@ -675,10 +677,7 @@ def build_trigger_service_principal(
             *((Path(home) / "scratch",) if is_github_activity and home else ()),
         )
     ))
-    operations = tuple(dict.fromkeys(
-        "send_message" if capability == "operator_alert" else capability
-        for capability in capabilities
-    ))
+    operations = tuple(dict.fromkeys(capabilities))
     readable_domains = {
         "poller_payload" if trigger == "poller"
         else "session" if trigger == "saga_session_end"
@@ -711,7 +710,9 @@ def build_trigger_service_principal(
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
-        policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
+        policies.append(ServiceSinkPolicy(
+            "operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL",
+        ))
     return ServicePrincipal(
         canonical=canonical,
         trigger=trigger,
@@ -5068,6 +5069,11 @@ class SinkGate:
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
                 would_block=True,
+                refusal_detail=(
+                    "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                    if tool_name == "operator_alert"
+                    else None
+                ),
             )
 
         # Activity-panel payloads are constrained at their producer to fixed
@@ -5362,8 +5368,19 @@ class SinkGate:
                     is_shadow_decision=not enforce,
                     would_block=True,
                     resolved_sink_target=resolved_target,
-                    refusal_detail=repo_review_state_refusal or _service_shell_refusal_detail(
-                        target, service_policy, review_state,
+                    refusal_detail=(
+                        repo_review_state_refusal
+                        or _service_shell_refusal_detail(
+                            target, service_policy, review_state,
+                        )
+                        or (
+                            "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                            if tool_name == "operator_alert"
+                            and not os.environ.get(
+                                "MIMIR_OPERATOR_ALERT_CHANNEL", "",
+                            ).strip()
+                            else None
+                        )
                     ),
                     repo_pr_action_scope=scope,
                 )
@@ -6187,6 +6204,7 @@ class OperationCatalog:
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
         "issue_comment",
+        "operator_alert",
         "approve_declassification",
         "list_channels",
         "list_schedules",
@@ -8236,6 +8254,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "saga_forget": "saga",
     "memory_store": "saga",
     "send_message": "message",
+    "operator_alert": "notification",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
     "react": "message",
