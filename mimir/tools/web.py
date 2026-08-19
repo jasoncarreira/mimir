@@ -43,12 +43,15 @@ from urllib.request import (
 
 import yaml
 from langchain_core.tools import tool
+from pypdf import PdfReader
 
 from .web_search_destination import web_search_url
 
 log = logging.getLogger(__name__)
 
 FETCH_CHUNK_SIZE_BYTES = 64 * 1024
+FETCH_PDF_MAX_PAGES_DEFAULT = 100
+FETCH_PDF_MAX_TEXT_BYTES_DEFAULT = 1_000_000
 UTC = timezone.utc
 
 # ─── Module-level dependency injection ─────────────────────────────
@@ -84,6 +87,115 @@ def _fetch_cache_dir() -> Path:
             "build the agent runtime before using fetch tools."
         )
     return _home / "attachments" / "fetch-cache"
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _pdf_content_type(content_type: object) -> bool:
+    return str(content_type).partition(";")[0].strip().lower() == "application/pdf"
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _extract_pdf_text(
+    body_path: Path,
+    text_path: Path,
+    *,
+    max_pages: int,
+    max_text_bytes: int,
+) -> dict[str, Any]:
+    """Extract bounded text without changing or replacing the fetched PDF."""
+    result: dict[str, Any] = {
+        "status": "failed",
+        "max_pages": max_pages,
+        "max_output_bytes": max_text_bytes,
+    }
+    try:
+        text_path.unlink(missing_ok=True)
+        reader = PdfReader(body_path)
+        total_pages = len(reader.pages)
+        parts: list[str] = []
+        output_bytes = 0
+        output_truncated = False
+        pages_extracted = 0
+        for page in reader.pages[:max_pages]:
+            page_text = page.extract_text() or ""
+            if parts and page_text:
+                page_text = "\n\n" + page_text
+            remaining = max_text_bytes - output_bytes
+            bounded, truncated = _truncate_utf8(page_text, remaining)
+            if bounded:
+                parts.append(bounded)
+                output_bytes += len(bounded.encode("utf-8"))
+            pages_extracted += 1
+            if truncated or output_bytes >= max_text_bytes:
+                output_truncated = truncated or pages_extracted < min(total_pages, max_pages)
+                break
+
+        text = "".join(parts)
+        if not text.strip():
+            result["reason"] = "PDF contains no extractable text"
+            return result
+
+        truncation_reasons: list[str] = []
+        if total_pages > max_pages:
+            truncation_reasons.append("page_limit")
+        if output_truncated:
+            truncation_reasons.append("output_byte_limit")
+        text_path.write_text(text, encoding="utf-8")
+        result.update({
+            "status": "success",
+            "pages_extracted": pages_extracted,
+            "total_pages": total_pages,
+            "output_bytes": output_bytes,
+            "truncated": bool(truncation_reasons),
+            "truncation_reasons": truncation_reasons,
+        })
+        return result
+    except Exception as exc:
+        try:
+            text_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        result["reason"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+
+async def _add_pdf_extraction(
+    metadata: dict[str, Any],
+    *,
+    body_path: Path,
+    text_path: Path,
+) -> None:
+    max_pages = _positive_env_int(
+        "MIMIR_FETCH_PDF_MAX_PAGES", FETCH_PDF_MAX_PAGES_DEFAULT,
+    )
+    max_text_bytes = _positive_env_int(
+        "MIMIR_FETCH_PDF_MAX_TEXT_BYTES", FETCH_PDF_MAX_TEXT_BYTES_DEFAULT,
+    )
+    extraction = await asyncio.to_thread(
+        _extract_pdf_text,
+        body_path,
+        text_path,
+        max_pages=max_pages,
+        max_text_bytes=max_text_bytes,
+    )
+    metadata["pdf_extraction"] = extraction
+    if extraction["status"] == "success" and _home is not None:
+        metadata["text_path"] = _virtual_path(text_path, root=_home)
+    else:
+        metadata.pop("text_path", None)
 
 
 # ─── HTTP helpers (verbatim port from open-strix) ──────────────────
@@ -413,10 +525,11 @@ async def fetch_url(
 ) -> str:
     """Download a URL to a cache file and return the virtual path + metadata.
 
-    The body is written to ``<home>/attachments/fetch-cache/<stamp>-<digest>-<name>``;
+    The body is written to ``<home>/attachments/fetch-cache/<digest>-<name>``;
     a sidecar ``.meta.json`` records URL, status, content-type, sha256,
-    and bytes. The agent re-reads the body via the standard Read tool
-    using the returned ``file_path``.
+    and bytes. For ``application/pdf``, bounded extracted text is written
+    alongside the unchanged body and returned as ``text_path``. The agent
+    re-reads the appropriate returned path via the standard Read tool.
 
     Args:
         url: HTTP/HTTPS URL.
@@ -453,12 +566,25 @@ async def fetch_url(
     # files manually.
     body_path = cache_dir / f"{digest}-{base_name}"
     meta_path = cache_dir / f"{body_path.name}.meta.json"
+    text_path = cache_dir / f"{body_path.name}.txt"
     if body_path.is_file() and meta_path.is_file():
         try:
             existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing_meta = None
         if existing_meta and existing_meta.get("url") == normalized_url:
+            extraction = existing_meta.get("pdf_extraction")
+            needs_extraction = not isinstance(extraction, dict) or (
+                extraction.get("status") == "success" and not text_path.is_file()
+            )
+            if _pdf_content_type(existing_meta.get("content_type")) and needs_extraction:
+                await _add_pdf_extraction(
+                    existing_meta, body_path=body_path, text_path=text_path,
+                )
+                meta_path.write_text(
+                    json.dumps(existing_meta, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             return yaml.safe_dump(existing_meta, sort_keys=False)
 
     try:
@@ -495,6 +621,10 @@ async def fetch_url(
         "file_path": body_virtual_path,
         "metadata_path": meta_virtual_path,
     }
+    if _pdf_content_type(fetched["content_type"]):
+        await _add_pdf_extraction(
+            meta_payload, body_path=body_path, text_path=text_path,
+        )
     meta_path.write_text(
         json.dumps(meta_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
         encoding="utf-8",

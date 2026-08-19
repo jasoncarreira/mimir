@@ -6,16 +6,25 @@ calls leak from the suite.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+from mimir.access_control import _filesystem_result_integrity
+from mimir.readonly_backend import ReadOnlyFilesystemBackend
 from mimir.tools import web as web_tools_mod
 from mimir.tools.web import (
+    FETCH_PDF_MAX_PAGES_DEFAULT,
+    FETCH_PDF_MAX_TEXT_BYTES_DEFAULT,
     _name_from_url,
     _provider_from_model_spec,
     _sanitize_download_name,
@@ -113,12 +122,18 @@ class TestNameHelpers:
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes, status: int = 200, final_url: str = "https://example.com/x") -> None:
+    def __init__(
+        self,
+        body: bytes,
+        status: int = 200,
+        final_url: str = "https://example.com/x",
+        content_type: str = "text/html",
+    ) -> None:
         self._body = body
         self._pos = 0
         self._status = status
         self._final_url = final_url
-        self.headers = {"Content-Type": "text/html"}
+        self.headers = {"Content-Type": content_type}
 
     def __enter__(self) -> "_FakeResponse":
         return self
@@ -173,6 +188,31 @@ async def _drive_fetch_url(
     return _yaml.safe_load(yaml_str)
 
 
+def _pdf_bytes(*page_texts: str, password: str | None = None) -> bytes:
+    writer = PdfWriter()
+    for text in page_texts:
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({
+                NameObject("/F1"): writer._add_object(font),
+            }),
+        })
+        stream = DecodedStreamObject()
+        escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    if password is not None:
+        writer.encrypt(password)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 @pytest.mark.asyncio
 async def test_fetch_url_writes_body_and_meta(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -191,6 +231,175 @@ async def test_fetch_url_writes_body_and_meta(
     meta_disk = json.loads((tmp_path / meta_rel).read_text())
     assert meta_disk["url"] == meta["url"]
     assert meta_disk["sha256"] == meta["sha256"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_extracts_pdf_without_changing_cached_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _pdf_bytes("Readable paper text")
+    url = "https://example.com/paper.pdf"
+    _patch_safe_open(
+        monkeypatch,
+        lambda: _FakeResponse(body, content_type="application/pdf; charset=binary"),
+    )
+    popen_calls = 0
+
+    def reject_subprocess(*args: Any, **kwargs: Any) -> Any:
+        nonlocal popen_calls
+        popen_calls += 1
+        raise AssertionError("PDF extraction must not spawn a subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", reject_subprocess)
+    meta = await _drive_fetch_url(tmp_path, body, url=url)
+
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    body_path = tmp_path / meta["file_path"].lstrip("/")
+    sidecar = json.loads(
+        (tmp_path / meta["metadata_path"].lstrip("/")).read_text(encoding="utf-8")
+    )
+    assert body_path.name == f"{digest}-paper.pdf"
+    assert body_path.read_bytes() == body
+    assert sidecar["sha256"] == hashlib.sha256(body).hexdigest()
+    assert sidecar["file_path"] == f"/attachments/fetch-cache/{digest}-paper.pdf"
+    assert sidecar["content_type"] == "application/pdf; charset=binary"
+    assert popen_calls == 0
+
+    text_path = tmp_path / meta["text_path"].lstrip("/")
+    assert text_path.parent == body_path.parent
+    read_result = ReadOnlyFilesystemBackend(root_dir=tmp_path).read(meta["text_path"])
+    assert read_result.error is None
+    assert "Readable paper text" in read_result.file_data["content"]
+    assert meta["pdf_extraction"]["status"] == "success"
+
+
+@pytest.mark.asyncio
+def test_fetch_url_pdf_default_bounds_are_conservative() -> None:
+    """Pin the SHIPPED defaults, not just the bounding mechanism.
+
+    The bound tests below override both limits via the environment and assert
+    literal values, so they prove the mechanism works but say nothing about what
+    ships. A PDF fetched from the web is attacker-supplied by definition, so
+    widening either default should be a deliberate edit here.
+    """
+    assert FETCH_PDF_MAX_PAGES_DEFAULT == 100
+    assert FETCH_PDF_MAX_TEXT_BYTES_DEFAULT == 1_000_000
+
+
+async def test_fetch_url_pdf_page_limit_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _pdf_bytes("page one", "page two", "page three")
+    monkeypatch.setenv("MIMIR_FETCH_PDF_MAX_PAGES", "2")
+    _patch_safe_open(
+        monkeypatch, lambda: _FakeResponse(body, content_type="application/pdf"),
+    )
+
+    meta = await _drive_fetch_url(tmp_path, body, url="https://example.com/pages.pdf")
+    text = (tmp_path / meta["text_path"].lstrip("/")).read_text(encoding="utf-8")
+
+    assert "page one" in text and "page two" in text
+    assert "page three" not in text
+    assert meta["pdf_extraction"]["truncated"] is True
+    assert "page_limit" in meta["pdf_extraction"]["truncation_reasons"]
+    assert meta["pdf_extraction"]["pages_extracted"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_pdf_output_byte_limit_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _pdf_bytes("x" * 500)
+    monkeypatch.setenv("MIMIR_FETCH_PDF_MAX_TEXT_BYTES", "100")
+    _patch_safe_open(
+        monkeypatch, lambda: _FakeResponse(body, content_type="application/pdf"),
+    )
+
+    meta = await _drive_fetch_url(tmp_path, body, url="https://example.com/large-text.pdf")
+    text_bytes = (tmp_path / meta["text_path"].lstrip("/")).read_bytes()
+
+    assert len(text_bytes) <= 100
+    assert meta["pdf_extraction"]["output_bytes"] == len(text_bytes)
+    assert meta["pdf_extraction"]["truncated"] is True
+    assert "output_byte_limit" in meta["pdf_extraction"]["truncation_reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "reason_fragment"),
+    [
+        (b"not a pdf", "Error"),
+        (_pdf_bytes(""), "no extractable text"),
+        (_pdf_bytes("secret", password="password"), "FileNotDecryptedError"),
+    ],
+    ids=["malformed", "image-only", "encrypted"],
+)
+async def test_fetch_url_pdf_extraction_failure_preserves_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+    reason_fragment: str,
+) -> None:
+    _patch_safe_open(
+        monkeypatch, lambda: _FakeResponse(body, content_type="application/pdf"),
+    )
+
+    meta = await _drive_fetch_url(tmp_path, body, url="https://example.com/unreadable.pdf")
+
+    assert (tmp_path / meta["file_path"].lstrip("/")).read_bytes() == body
+    assert "text_path" not in meta
+    assert meta["pdf_extraction"]["status"] == "failed"
+    assert reason_fragment.lower() in meta["pdf_extraction"]["reason"].lower()
+    sidecar = json.loads(
+        (tmp_path / meta["metadata_path"].lstrip("/")).read_text(encoding="utf-8")
+    )
+    assert sidecar["pdf_extraction"] == meta["pdf_extraction"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_type",
+    ["text/html", "application/json", "text/plain", "application/octet-stream"],
+)
+async def test_fetch_url_only_converts_pdf_content_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content_type: str,
+) -> None:
+    body = b"ordinary response"
+    _patch_safe_open(
+        monkeypatch, lambda: _FakeResponse(body, content_type=content_type),
+    )
+
+    meta = await _drive_fetch_url(tmp_path, body)
+
+    assert set(meta) == {
+        "url", "final_url", "status", "content_type", "bytes", "sha256",
+        "file_path", "metadata_path",
+    }
+    cache_dir = tmp_path / "attachments" / "fetch-cache"
+    assert not list(cache_dir.glob("*.txt"))
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_pdf_text_has_same_untrusted_active_ingest_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _pdf_bytes("Untrusted fetched text")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _patch_safe_open(
+        monkeypatch, lambda: _FakeResponse(body, content_type="application/pdf"),
+    )
+    meta = await _drive_fetch_url(tmp_path, body, url="https://example.com/tainted.pdf")
+
+    body_path = tmp_path / meta["file_path"].lstrip("/")
+    text_path = tmp_path / meta["text_path"].lstrip("/")
+    assert _filesystem_result_integrity(None, str(body_path)) == (
+        "untrusted", "active_ingest",
+    )
+    assert _filesystem_result_integrity(None, str(text_path)) == (
+        "untrusted", "active_ingest",
+    )
 
 
 def _read_request(file_path: str) -> ToolCallRequest:
