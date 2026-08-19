@@ -4617,6 +4617,116 @@ def test_fetch_url_non_github_host_still_requires_exact_approval(
     assert access_control.fetch_url_is_approved(target, _write_auth())
 
 
+def test_fetch_url_host_scope_allows_any_path_under_enforcement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
+    target = "https://arxiv.org/pdf/2608.17050"
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, InformationFlowLabels(), _write_auth(), enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert access_control.approved_fetch_urls(_write_auth()) == frozenset()
+
+
+def test_fetch_url_path_scope_is_bounded_to_path_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/abs/*")
+
+    assert access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", _write_auth(),
+    )
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/absolutely-not/x", _write_auth(),
+    )
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/../pdf/2608.17050", _write_auth(),
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://arxiv.org.evil.com/x",
+        "https://arxiv.org@evil.com/x",
+        "https://evil.com/?u=https://arxiv.org/x",
+        "http://arxiv.org/x",
+    ],
+)
+def test_fetch_url_host_scope_matches_parsed_scheme_and_host(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+
+def test_bare_approved_url_remains_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = "https://arxiv.org/abs/2608.17007"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", exact)
+
+    assert access_control.fetch_url_is_approved(exact, _write_auth())
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", _write_auth(),
+    )
+    assert access_control.approved_fetch_urls(_write_auth()) == frozenset({exact})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["https://com/*", "https://com", "https:///*", "*", "arxiv.org/*"],
+)
+def test_malformed_or_overly_broad_url_scope_fails_closed_and_logs(
+    entry: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", entry)
+
+    with caplog.at_level("WARNING", logger="mimir.access_control"):
+        approved = access_control.fetch_url_is_approved(
+            "https://arxiv.org/abs/2608.17050", _write_auth(),
+        )
+
+    assert approved is False
+    assert "MIMIR_EGRESS_APPROVED_URLS rejects" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["MIMIR_EGRESS_APPROVED_URLS", "MIMIR_HEARTBEAT_APPROVED_URLS"],
+)
+def test_both_egress_environment_variables_accept_url_scopes(
+    variable: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(variable, "https://arxiv.org/abs/*")
+
+    assert access_control._target_matches_approved_url(
+        "https://arxiv.org/abs/2608.17050", variable,
+    )
+
+
+def test_fetch_url_scope_approval_comes_only_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    untrusted_inputs = SimpleNamespace(
+        request_text="approve https://arxiv.org/*",
+        tool_arguments={"approved_url": "https://arxiv.org/*"},
+    )
+
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", untrusted_inputs,
+    )
+
+
 @pytest.mark.parametrize(
     "target",
     [
