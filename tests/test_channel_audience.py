@@ -3,11 +3,11 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
 
+import mimir.channel_audience as channel_audience
 from mimir.access_control import _source_is_triggering_channel_compatible
 from mimir.agent import Agent
 from mimir.acp.session_store import SessionStore
@@ -95,6 +95,7 @@ def test_provider_absence_failure_and_live_reload_fail_closed_without_cache(
 
 def test_group_slack_and_guild_channels_are_unknown_without_visibility_reads(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_identities(
         tmp_path,
@@ -103,19 +104,62 @@ def test_group_slack_and_guild_channels_are_unknown_without_visibility_reads(
     provider = ServerChannelAudienceProvider(tmp_path)
     for channel in ("slack-C1", "discord-guild-1", "public", "group-private"):
         assert provider.audience_for(channel, principal="alice") is None
-    derivation = inspect.getsource(ServerChannelAudienceProvider.audience_for)
-    tree = ast.parse(dedent(derivation))
-    assert all(
-        not (
-            isinstance(node, ast.Constant)
-            and node.value == "channel_visibility"
-        )
-        and not (
-            isinstance(node, ast.Attribute)
-            and node.attr == "channel_visibility"
-        )
-        for node in ast.walk(tree)
+
+    class VisibilityTrapIdentity:
+        canonical = "alice"
+        dm_channels = {"discord": "discord-D-alice"}
+
+        @property
+        def channel_visibility(self):
+            raise AssertionError("audience derivation must not inspect visibility")
+
+    class Resolver:
+        def __init__(self, home):
+            self.home = home
+
+        def reload(self):
+            return None
+
+        def identity(self, principal):
+            return VisibilityTrapIdentity() if principal == "alice" else None
+
+    monkeypatch.setattr(channel_audience, "IdentityResolver", Resolver)
+    trapped_provider = ServerChannelAudienceProvider(tmp_path)
+    assert trapped_provider.audience_for("discord-guild-1", principal="alice") is None
+
+    module_tree = ast.parse(inspect.getsource(channel_audience))
+    provider = next(
+        node for node in module_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ServerChannelAudienceProvider"
     )
+    audience_for = next(
+        node for node in provider.body
+        if isinstance(node, ast.FunctionDef) and node.name == "audience_for"
+    )
+    module_functions = {
+        node.name: node for node in module_tree.body if isinstance(node, ast.FunctionDef)
+    }
+    local_calls = {
+        node.func.id
+        for node in ast.walk(audience_for)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in module_functions
+    }
+    # Audience derivation may not delegate into a module-local helper whose
+    # dependency surface is outside this proof.
+    assert local_calls == set()
+    for node in ast.walk(module_tree):
+        values = (
+            node.id if isinstance(node, ast.Name) else None,
+            node.attr if isinstance(node, ast.Attribute) else None,
+            node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None,
+            node.name if isinstance(node, ast.alias) else None,
+            node.asname if isinstance(node, ast.alias) else None,
+        )
+        assert all(
+            value is None or "visibility" not in value.casefold()
+            for value in values
+        )
 
 
 def test_hostile_event_model_and_request_audience_values_are_ignored(

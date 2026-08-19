@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime
 from langgraph.runtime import Runtime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -5717,42 +5718,22 @@ people:
         assert provider.calls
 
 
-@pytest.mark.parametrize(
-    ("ingress_path", "extra", "history_sentinel"),
-    [
-        (
-            "model",
-            {"model": {"audience": ["alice"], "channel_visibility": "private"}},
-            "HOSTILE-MODEL-AUDIENCE-SENTINEL",
-        ),
-        (
-            "tool",
-            {"tool_arguments": {"audience": ["alice"], "channel_visibility": "private"}},
-            "HOSTILE-TOOL-AUDIENCE-SENTINEL",
-        ),
-        (
-            "request",
-            {"audience": ["alice"], "channel_visibility": "private"},
-            "HOSTILE-REQUEST-AUDIENCE-SENTINEL",
-        ),
-    ],
-)
-async def test_hostile_audience_values_cannot_widen_real_turn_admission(
+def _audience_delivery_agent(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    ingress_path: str,
-    extra: dict[str, object],
-    history_sentinel: str,
-) -> None:
-    """Raw model/tool/request fields traverse ingress but never grant audience."""
-    _acp_turn(monkeypatch)
-    destination = f"ch-hostile-{ingress_path}-destination"
-    reply = f"HOSTILE-{ingress_path.upper()}-VALID-REPLY"
-    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    graph: Any,
+    *,
+    channel_prefix: str,
+) -> tuple[Agent, _BridgeStub]:
     bridge = _BridgeStub()
+    bridge.prefixes = (channel_prefix,)
     channels = ChannelRegistry()
     channels.register(bridge)  # type: ignore[arg-type]
-    agent = _build_agent(tmp_path, fake_agent=graph, fake_saga=_FakeSaga())
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[]),
+        fake_saga=_FakeSaga(),
+    )
+    agent._agent = graph
     agent._channels = channels  # type: ignore[attr-defined]
     agent._config.access_control_enforced = True
     resolver = _resolver(
@@ -5768,34 +5749,189 @@ people:
     agent._identity_resolver = resolver
     agent._buffer.resolver = resolver
     agent._feedback.identity_resolver = resolver
+    return agent, bridge
+
+
+def _append_hostile_cross_channel_history(agent: Agent, sentinel: str) -> None:
     agent._buffer._append_in_memory(agent._buffer.make_message(
         channel_id="discord-D-alice",
         kind="user_message",
-        content=history_sentinel,
+        content=sentinel,
         author="alice",
-        msg_id=f"hostile-{ingress_path}",
+        msg_id=f"history-{sentinel}",
         source="discord",
     ))
 
+
+async def test_hostile_request_audience_cannot_widen_web_ingress_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real HTTP request is sanitized before its event reaches Agent.run_turn."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from mimir.bridges.web_chat import WebChatBridge
+
+    _acp_turn(monkeypatch)
+    received: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        received.append(event)
+        return True
+
+    @web.middleware
+    async def authenticate(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="alice", display_name="Alice",
+        )
+        return await handler(request)
+
+    request_bridge = WebChatBridge(enqueue=enqueue, home=tmp_path)
+    app = web.Application(middlewares=[authenticate])
+    request_bridge.register_routes(app)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post("/chat", json={
+            "content": "continue",
+            "extra": {
+                "audience": ["attacker"],
+                "channel_visibility": "private",
+            },
+        })
+    assert response.status == 200
+    [event] = received
+    assert event.channel_id == "web-alice"
+    assert event.extra["audience"] == ["attacker"]
+    assert "channel_visibility" not in event.extra
+
+    sentinel = "HOSTILE-REQUEST-AUDIENCE-SENTINEL"
+    reply = "HOSTILE-REQUEST-VALID-REPLY"
+    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    agent, bridge = _audience_delivery_agent(tmp_path, graph, channel_prefix="web-")
+    _append_hostile_cross_channel_history(agent, sentinel)
+    await agent.run_turn(event)
+
+    assert sentinel not in graph.invocations[0]["state"]["messages"][0].content
+    context = graph.contexts[0]
+    assert context.audience_provider.audience_for("web-alice", principal="alice") is None
+    assert all(source.resource_id != "discord-D-alice" for source in context.ifc_state.current().sources)
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+async def test_hostile_model_audience_cannot_widen_real_deepagents_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real DeepAgents model output cannot alter selection-time authority."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from pydantic import Field
+
+    class CapturingModel(GenericFakeChatModel):
+        observed_prompts: list[list[Any]] = Field(default_factory=list)
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, *args, **kwargs):
+            self.observed_prompts.append(messages)
+            return super()._generate(messages, *args, **kwargs)
+
+    _acp_turn(monkeypatch)
+    sentinel = "HOSTILE-MODEL-AUDIENCE-SENTINEL"
+    reply = "HOSTILE-MODEL-VALID-REPLY"
+    model = CapturingModel(messages=iter([AIMessage(
+        content=reply,
+        additional_kwargs={
+            "audience": ["attacker"],
+            "channel_visibility": "private",
+        },
+    )]))
+    graph = create_deep_agent(
+        model=model, tools=[], system_prompt="test", context_schema=AuthContext,
+    )
+    agent, bridge = _audience_delivery_agent(tmp_path, graph, channel_prefix="ch-")
+    _append_hostile_cross_channel_history(agent, sentinel)
+    destination = "ch-hostile-model-destination"
     await agent.run_turn(AgentEvent(
-        trigger="user_message",
-        channel_id=destination,
-        content="continue",
-        author="alice",
-        source="acp",
-        extra=extra,
+        trigger="user_message", channel_id=destination, content="continue",
+        author="alice", source="acp",
     ))
 
-    prompt = graph.invocations[0]["state"]["messages"][0].content
-    assert history_sentinel not in prompt
-    context = graph.contexts[0]
-    assert context.audience_provider.audience_for(
-        destination, principal="alice",
-    ) is None
-    assert all(
-        source.resource_id != "discord-D-alice"
-        for source in context.ifc_state.current().sources
+    assert sentinel not in str(model.observed_prompts)
+    assert agent._audience_provider.audience_for(destination, principal="alice") is None
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+async def test_hostile_tool_arguments_cannot_widen_real_deepagents_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real graph tool receives hostile arguments but not widened authority."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+    from pydantic import Field
+
+    captured: dict[str, Any] = {}
+
+    class CapturingModel(GenericFakeChatModel):
+        observed_prompts: list[list[Any]] = Field(default_factory=list)
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, *args, **kwargs):
+            self.observed_prompts.append(messages)
+            return super()._generate(messages, *args, **kwargs)
+
+    @tool
+    def hostile_audience_tool(
+        audience: list[str], channel_visibility: str,
+        runtime: ToolRuntime[AuthContext],
+    ) -> str:
+        """Capture untrusted caller-supplied arguments and runtime authority."""
+        captured["audience"] = audience
+        captured["visibility"] = channel_visibility
+        captured["context"] = runtime.context
+        return "tool completed"
+
+    _acp_turn(monkeypatch)
+    sentinel = "HOSTILE-TOOL-AUDIENCE-SENTINEL"
+    reply = "HOSTILE-TOOL-VALID-REPLY"
+    model = CapturingModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "hostile_audience_tool",
+            "args": {
+                "audience": ["attacker"],
+                "channel_visibility": "private",
+            },
+            "id": "hostile-tool-call",
+            "type": "tool_call",
+        }]),
+        AIMessage(content=reply),
+    ]), disable_streaming=True)
+    graph = create_deep_agent(
+        model=model,
+        tools=[hostile_audience_tool],
+        system_prompt="test",
+        context_schema=AuthContext,
     )
+    agent, bridge = _audience_delivery_agent(tmp_path, graph, channel_prefix="ch-")
+    _append_hostile_cross_channel_history(agent, sentinel)
+    destination = "ch-hostile-tool-destination"
+    await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=destination, content="continue",
+        author="alice", source="acp",
+    ))
+
+    assert sentinel not in str(model.observed_prompts)
+    assert captured["audience"] == ["attacker"]
+    assert captured["visibility"] == "private"
+    context = captured["context"]
+    assert context.audience_provider is agent._audience_provider
+    assert context.audience_provider.audience_for(destination, principal="alice") is None
+    assert all(source.resource_id != "discord-D-alice" for source in context.ifc_state.current().sources)
     assert [sent[1] for sent in bridge.sends] == [reply]
 
 
