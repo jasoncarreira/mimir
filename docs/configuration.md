@@ -222,6 +222,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_PR_CHECKOUT_LEASE_ROOT` | absolute path | unset | Root for atomic, scope-bound PR checkout leases. GitHub activity receives write authority only for its active lease path, not this root generally or the live source checkout. |
 | `MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON` | cron | `*/15 * * * *` | Expired PR checkout lease reclamation cadence. Each lease's recorded `expires_at` determines eligibility; an empty value disables the scheduled sweep. |
 | `MIMIR_FETCH_URL_DISABLED` | bool | off | Truthy disables the `fetch_url` tool on non-`claude-code` providers. |
+| `MIMIR_FETCH_PDF_MAX_PAGES` | positive int | `100` | Maximum pages extracted from a fetched `application/pdf`; invalid or non-positive values use the default. |
+| `MIMIR_FETCH_PDF_MAX_TEXT_BYTES` | positive int | `1000000` | Maximum UTF-8 bytes written to a fetched PDF's text sibling; invalid or non-positive values use the default. |
 | `MIMIR_MCP_SERVERS_JSON` | json | `""` | Inline MCP server config list (wins over `_PATH`). MCP is opt-in. |
 | `MIMIR_MCP_SERVERS_PATH` | path | `""` | Path to a JSON MCP server config file. |
 
