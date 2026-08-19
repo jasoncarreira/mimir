@@ -31,6 +31,7 @@ _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _ESCALATION_DESCRIPTION_MAX_BYTES = 4_096
 _ESCALATION_ATTEMPT_MAX_BYTES = 512
 _ESCALATION_MAX_ATTEMPTS = 16
+_SCOPE_REFUSAL_TARGET_LIMIT = 5
 _clients: dict[str, ForgeClient] = {}
 _default_client: ForgeClient | None = None
 _escalation_lock = threading.Lock()
@@ -169,6 +170,42 @@ def resolve_review_state(
     return resolve_review_state_for_context(context, repository, pull_request)
 
 
+def _scope_miss_refusal(
+    cache: Any,
+    registry: Any,
+    repository: str,
+    pull_request: int,
+) -> str | None:
+    states: tuple[RepoReviewState, ...] = ()
+    if isinstance(cache, ServerDiscoveredPRStates):
+        with cache._lock:
+            states = tuple(cache._states.values())
+    if isinstance(registry, RepoPRScopeRegistry):
+        states += registry.review_states
+
+    targets = tuple(dict.fromkeys(
+        (state.repo.lower(), state.pr_number) for state in states
+    ))
+    if not targets:
+        return None
+
+    shown = targets[:_SCOPE_REFUSAL_TARGET_LIMIT]
+    rendered = "; ".join(
+        f"repository={json.dumps(repo)}, pull_request={number}"
+        for repo, number in shown
+    )
+    if len(targets) > len(shown):
+        rendered += (
+            f"; [{len(shown)} of {len(targets)} shown; "
+            f"{len(targets) - len(shown)} more]"
+        )
+    return (
+        "pull-request operation rejected: requested "
+        f"repository={json.dumps(repository)}, pull_request={pull_request} is outside "
+        f"this turn's scope; in-scope targets: {rendered}"
+    )
+
+
 def resolve_review_state_for_context(
     context: AuthContext | None,
     repository: str,
@@ -216,6 +253,11 @@ def resolve_review_state_for_context(
         or not context.canonical_principal
         or "admin" not in context.roles
     ):
+        scope_refusal = _scope_miss_refusal(
+            cache, registry, repository, pull_request,
+        )
+        if scope_refusal is not None:
+            raise ToolPolicyRefusal(scope_refusal)
         raise ToolPolicyRefusal(
             "pull-request operation rejected: live scope discovery requires an "
             "authenticated operator user turn"
