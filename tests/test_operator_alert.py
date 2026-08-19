@@ -188,6 +188,14 @@ async def test_operator_alert_bounds_text_and_per_turn_count(
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pin the VALUES, not just the mechanism. Every input and assertion below is
+    # expressed in terms of these constants, so raising one raises the test's own
+    # input to match and the bound can never fail. These two literals are what make
+    # the rest of this test load-bearing: they are the ceiling on how much
+    # attacker-supplied text an untrusted-ingest turn can push at the operator, so
+    # widening either must be a deliberate edit here rather than a silent one.
+    assert OPERATOR_ALERT_MAX_CHARS == 4000
+    assert OPERATOR_ALERT_MAX_PER_TURN == 3
     monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "discord-operator")
     channels = _Channels()
     set_operator_alert_dependencies(
