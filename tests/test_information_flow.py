@@ -3972,6 +3972,172 @@ def test_admin_operator_cross_channel_send_succeeds_through_real_sink() -> None:
     assert decision.allowed is True
 
 
+def test_real_sink_only_bypasses_audience_for_complete_authorized_agent_self() -> None:
+    """Exercise the ordered compatibility arms through the actual sink gate."""
+    class ExplodingProvider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("this source must not reach audience lookup")
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-sentinel",
+        bridge_instance="acp",
+        audience_provider=ExplodingProvider(),
+    )
+
+    def decision_for(source: SourceLabel):
+        labels = InformationFlowLabels().with_source(source)
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-sentinel",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        )
+
+    agent_self = SourceLabel(
+        principal="alice",
+        domain="feedback",
+        resource_id="events:channel-less-self-sentinel",
+        bridge_instance="mimir",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="agent_self",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+    assert decision_for(agent_self).allowed is True
+
+    incomplete = replace(agent_self, bridge_instance=None)
+    assert decision_for(incomplete).allowed is False
+
+    unauthorized = replace(agent_self, authorized_principals=frozenset({"bob"}))
+    assert decision_for(unauthorized).allowed is False
+
+    trusted_non_agent = replace(
+        agent_self,
+        resource_id="trusted-non-agent-sentinel",
+        source_kind="protected_prompt",
+    )
+    assert decision_for(trusted_non_agent).allowed is False
+
+
+def test_real_sink_requires_minted_recent_owner_attestation() -> None:
+    from mimir.channel_audience import attest_owner
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "alice-raw" else None
+
+    class SingletonAudience:
+        def audience_for(self, channel_id, *, principal):
+            assert (channel_id, principal) == ("destination-attested", "alice")
+            return frozenset({"alice"})
+
+    class HandBuiltAttestation:
+        canonical_principal = "alice"
+        raw_author = "alice-raw"
+        source_channel = "attested-source-sentinel"
+
+        __hash__ = object.__hash__
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-attested",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-attested",
+        bridge_instance="acp",
+        audience_provider=SingletonAudience(),
+    )
+    minted = attest_owner(Resolver(), "alice-raw", "attested-source-sentinel")
+    assert minted is not None
+
+    def decision_for(attestation: object) -> bool:
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice",
+            domain="recent_activity",
+            resource_id="attested-source-sentinel",
+            bridge_instance="discord",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+            source_kind="recent_activity_user",
+            owner_attestation=attestation,
+        ))
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-attested",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        ).allowed
+
+    assert decision_for(minted) is True
+    assert decision_for(HandBuiltAttestation()) is False
+
+
+def test_real_sink_applies_destination_audience_subset_in_the_safe_direction() -> None:
+    class AudienceProvider:
+        def audience_for(self, channel_id, *, principal):
+            audiences = {
+                "destination-audience-sentinel": frozenset({"alice", "bob"}),
+                "source-wide-sentinel": frozenset({"alice", "bob", "carol"}),
+                "source-narrow-sentinel": frozenset({"alice"}),
+            }
+            return audiences.get(channel_id)
+
+    auth = AuthContext(
+        principal="alice-raw",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-audience-sentinel",
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="destination-audience-sentinel",
+        bridge_instance="acp",
+        audience_provider=AudienceProvider(),
+    )
+
+    def decision_for(resource_id: str) -> bool:
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal="alice",
+            domain="feedback",
+            resource_id=resource_id,
+            bridge_instance="discord",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+            source_kind="protected_prompt",
+            integrity_effect="informational",
+        ))
+        return SinkGate.check_sink_flow(
+            "harness_auto_deliver",
+            "destination-audience-sentinel",
+            labels,
+            replace(auth, ifc_state=InformationFlowState(labels=labels)),
+            enforce=True,
+        ).allowed
+
+    assert decision_for("source-wide-sentinel") is True
+    assert decision_for("source-narrow-sentinel") is False
+
+
 @pytest.mark.parametrize(
     "case",
     [
