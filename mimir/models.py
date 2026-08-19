@@ -11,7 +11,7 @@ import json
 import time
 import threading
 import uuid
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, fields as dataclass_fields
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -1131,14 +1131,16 @@ class _AuthContextAuthoritySlot:
     __slots__ = (
         "_audience_provider",
         "_canonical_principal",
+        "_channel_id",
         "_principal",
+        "_resource_id",
     )
 
 
 _MISSING_AUTH_VALUE: Any = object()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AuthContext(_AuthContextAuthoritySlot):
     """Frozen, server-created authorization context (chainlink #864).
 
@@ -1163,7 +1165,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     roles: tuple[str, ...] = _MISSING_AUTH_VALUE
     event_ingress: str | None = _MISSING_AUTH_VALUE
     trigger: str = _MISSING_AUTH_VALUE
-    channel_id: str | None = _MISSING_AUTH_VALUE
+    channel_id: InitVar[str | None] = _MISSING_AUTH_VALUE
     interactivity: "TurnInteractivity | None" = _MISSING_AUTH_VALUE
     policy_version: str | None = None
     is_service: bool = False
@@ -1171,7 +1173,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     enforcement_enabled: bool = False
     ifc_labels: "InformationFlowLabels | None" = None
     domain: str | None = None
-    resource_id: str | None = None
+    resource_id: InitVar[str | None] = None
     bridge_instance: str | None = None
     # Write provenance selected at ingress. These are deliberately absent from
     # model-facing tool arguments and cannot be changed after construction.
@@ -1212,12 +1214,13 @@ class AuthContext(_AuthContextAuthoritySlot):
     saga_session_id: str | None = None
     audience_provider: InitVar[_RedactedAudienceProvider] = None
     cross_platform_pull: bool = True
-    _principal_fingerprint: str = field(default="", init=False, repr=False)
 
     def __post_init__(
         self,
         principal: str | None,
         canonical_principal: str | None,
+        channel_id: str | None,
+        resource_id: str | None,
         audience_provider: Any,
     ) -> None:
         if any(
@@ -1228,37 +1231,61 @@ class AuthContext(_AuthContextAuthoritySlot):
                 self.roles,
                 self.event_ingress,
                 self.trigger,
-                self.channel_id,
+                channel_id,
                 self.interactivity,
             )
         ):
             raise TypeError("missing required authorization context field")
         object.__setattr__(self, "_principal", principal)
         object.__setattr__(self, "_canonical_principal", canonical_principal)
+        object.__setattr__(self, "_channel_id", channel_id)
+        object.__setattr__(self, "_resource_id", resource_id)
         object.__setattr__(self, "_audience_provider", audience_provider)
-        object.__setattr__(self, "_principal_fingerprint", hashlib.sha256(
-            repr((principal, canonical_principal)).encode("utf-8"),
-        ).hexdigest())
 
     def __getattribute__(self, name: str) -> Any:
         hidden = {
             "audience_provider": "_audience_provider",
             "canonical_principal": "_canonical_principal",
+            "channel_id": "_channel_id",
             "principal": "_principal",
+            "resource_id": "_resource_id",
         }
         if name in hidden:
             return object.__getattribute__(self, hidden[name])
         if name == "__dict__":
             values = dict(object.__getattribute__(self, "__dict__"))
-            values.pop("_principal_fingerprint", None)
             values.update(
                 principal=object.__getattribute__(self, "_principal"),
                 canonical_principal=object.__getattribute__(
                     self, "_canonical_principal",
                 ),
+                channel_id=object.__getattribute__(self, "_channel_id"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
             )
             return values
         return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        compared = tuple(
+            getattr(self, model_field.name)
+            for model_field in dataclass_fields(self)
+            if model_field.compare
+        )
+        return (
+            self.principal,
+            self.canonical_principal,
+            self.channel_id,
+            self.resource_id,
+            *compared,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AuthContext):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:

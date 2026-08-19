@@ -3731,6 +3731,8 @@ def test_tool_parse_input_survives_pregel_runtime_in_config(tmp_path: Path):
 async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority(
     tmp_path: Path,
 ):
+    import hashlib
+
     from deepagents import create_deep_agent
     from langchain.tools import ToolRuntime
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -3753,6 +3755,7 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
         captured["context"] = context
         captured["provider"] = context.audience_provider
         captured["attestation"] = source.owner_attestation
+        captured["resource_authority"] = context.resource_id
         captured["provider_result"] = context.audience_provider.audience_for(
             context.channel_id,
             principal=context.canonical_principal,
@@ -3793,6 +3796,12 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     )
     context = _service_turn_auth_context(tmp_path)
     authority_path = str(context.audience_provider.home)
+    destination_channel = context.channel_id
+    resource_authority = context.resource_id
+    principal_fingerprint = hashlib.sha256(
+        repr((context.principal, context.canonical_principal)).encode("utf-8"),
+    ).hexdigest()
+    assert "_principal_fingerprint" not in AuthContext.__dataclass_fields__
     typed_source = TypeAdapter(SourceLabel).dump_python(
         context.ifc_labels.sources[0],
     )
@@ -3805,8 +3814,12 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
         "attested-secret-principal",
         "raw-secret-author",
         "attested-secret-channel",
+        destination_channel,
+        resource_authority,
+        principal_fingerprint,
     ):
         assert secret not in typed_serialized
+    assert "_principal_fingerprint" not in typed_serialized
     final_state: dict[str, Any] = {}
     async for item in graph.astream(
         {"messages": [HumanMessage(content="inspect")]},
@@ -3821,6 +3834,7 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
     assert captured["context"] is context
     assert captured["provider"] is context.audience_provider
     assert captured["attestation"] is context.ifc_labels.sources[0].owner_attestation
+    assert captured["resource_authority"] == context.channel_id
     assert captured["provider_result"] == frozenset({"attested-secret-principal"})
     assert captured["predicate_result"] is True
     serialized = repr(captured["duck_dump"])
@@ -3829,8 +3843,12 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
         "attested-secret-principal",
         "raw-secret-author",
         "attested-secret-channel",
+        destination_channel,
+        resource_authority,
+        principal_fingerprint,
     ):
         assert secret not in serialized
+    assert "_principal_fingerprint" not in serialized
     assert "owner_attestation" not in serialized
     assert "audience_provider" not in serialized
     assert any(

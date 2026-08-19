@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1259,7 +1260,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         "_event_to_stash": "recovery_call",
         "_event_from_stash": "recovery_call",
     }
-    observed: set[tuple[str, str, str, str, int]] = set()
+    observed: Counter[tuple[str, str, str, str]] = Counter()
 
     def dotted(node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
@@ -1297,13 +1298,12 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
                     if node.name == "_mint_owner_attestation"
                     else "recovery_definition"
                 )
-                observed.add((
+                observed[(
                     category,
                     self.relative,
                     ".".join(self.stack),
                     node.name,
-                    node.lineno,
-                ))
+                )] += 1
             self.generic_visit(node)
             self.stack.pop()
 
@@ -1319,108 +1319,86 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
             ):
                 category = "context_rescope"
             if category is not None and call is not None and self.stack:
-                observed.add((
+                observed[(
                     category,
                     self.relative,
                     ".".join(self.stack),
                     call,
-                    node.lineno,
-                ))
+                )] += 1
             self.generic_visit(node)
 
         def visit_Attribute(self, node: ast.Attribute) -> None:
             if node.attr == "recent_prompt_block" and self.stack:
                 attribute = dotted(node)
                 if attribute is not None:
-                    observed.add((
+                    observed[(
                         "feedback_loader",
                         self.relative,
                         ".".join(self.stack),
                         attribute,
-                        node.lineno,
-                    ))
+                    )] += 1
             self.generic_visit(node)
 
     for path in root.rglob("*.py"):
         relative = str(path.relative_to(root.parent))
         Visitor(relative).visit(ast.parse(path.read_text(encoding="utf-8")))
 
-    assert observed == {
-        ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner", 4083),
-        ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation", 60),
-        ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation", 129),
-        ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation", 134),
-        ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context", 9049),
-        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider", 335),
-        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context", 418),
-        ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider", 1202),
-        ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context", 1926),
-        ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context", 523),
-        ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace", 989),
-        ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext", 8969),
-        ("direct_block", "mimir/agent.py", "Agent._assemble_commitments_block", "PromptBlock", 3847),
-        ("direct_block", "mimir/agent.py", "Agent._assemble_self_state_block", "PromptBlock", 3880),
-        ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock", 4008),
-        ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock", 3792),
-        ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock", 3771),
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock", 4179),
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock", 4208),
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock", 4378),
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock", 4380),
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock", 4400),
-        ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock", 4115),
-        ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock", 686),
-        ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block", 4192),
-        ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit", 827),
-        ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit", 839),
-        ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel", 7859),
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel", 7903),
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel", 7931),
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel", 7956),
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel", 7982),
-        ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel", 7696),
-        ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels", 3835),
-        ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels", 3882),
-        ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels", 3994),
-        ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels", 3794),
-        ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels", 3773),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4181),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4210),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4362),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4369),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4382),
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels", 4389),
-        ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels", 4092),
-        ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel", 290),
-        ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel", 469),
-        ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived", 574),
-        ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label", 252),
-        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label", 866),
-        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label", 773),
-        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel", 244),
-        ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel", 405),
-        ("producer", "mimir/pollers.py", "run_poller", "SourceLabel", 2279),
-        ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel", 31),
-        ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates", 4048),
-        ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash", 393),
-        ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash", 223),
-        ("recovery_definition", "mimir/poller_recovery.py", "_event_from_stash", "_event_from_stash", 228),
-        ("recovery_definition", "mimir/poller_recovery.py", "_event_to_stash", "_event_to_stash", 148),
-        ("sink_predicate", "mimir/access_control.py", "SinkGate._get_allowed_sinks", "_source_is_triggering_channel_compatible", 5574),
-        ("sink_predicate", "mimir/access_control.py", "SinkGate._get_allowed_sinks", "_source_is_triggering_channel_compatible", 5670),
-        ("sink_predicate", "mimir/access_control.py", "_ifc_blocking_source", "_source_is_triggering_channel_compatible", 4810),
-        ("sink_predicate", "mimir/agent.py", "Agent._select_recent_activity", "_source_is_triggering_channel_compatible", 4105),
-        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible", 877),
-        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible", 788),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4178),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4191),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4207),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4218),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4231),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4242),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4243),
-        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use", 4250),
-    }
+    expected = Counter({
+        ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner"): 1,
+        ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation"): 1,
+        ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation"): 1,
+        ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation"): 1,
+        ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
+        ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
+        ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_commitments_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_self_state_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
+        ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
+        ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
+        ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
+        ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
+        ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 4,
+        ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
+        ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived"): 1,
+        ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel"): 1,
+        ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
+        ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
+        ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
+        ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_from_stash", "_event_from_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_to_stash", "_event_to_stash"): 1,
+        ("sink_predicate", "mimir/access_control.py", "SinkGate._get_allowed_sinks", "_source_is_triggering_channel_compatible"): 2,
+        ("sink_predicate", "mimir/access_control.py", "_ifc_blocking_source", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/agent.py", "Agent._select_recent_activity", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
+    })
+    assert observed == expected
 
 
 @pytest.mark.asyncio
