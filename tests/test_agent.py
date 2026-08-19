@@ -5127,6 +5127,7 @@ def _audience_auth(
     canonical: str,
     channel_id: str,
     cross_platform_pull: bool = True,
+    bridge_instance: str = "acp",
 ) -> AuthContext:
     return AuthContext(
         principal=principal,
@@ -5139,7 +5140,7 @@ def _audience_auth(
         enforcement_enabled=True,
         domain="channel",
         resource_id=channel_id,
-        bridge_instance="acp",
+        bridge_instance=bridge_instance,
         audience_provider=agent._audience_provider,
         cross_platform_pull=cross_platform_pull,
     )
@@ -5536,6 +5537,9 @@ def test_unknown_cross_history_is_omitted_and_reply_is_delivered(
             principal="alice",
             canonical="alice",
             channel_id="discord-current",
+            # The triggering event is source="discord"; production derives the
+            # auth context's bridge from that same event.
+            bridge_instance="discord",
         ),
         ifc_state=InformationFlowState(labels=labels),
     )

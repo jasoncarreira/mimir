@@ -4696,6 +4696,32 @@ def _has_untrusted_active_ingest(
     )
 
 
+def _same_channel_authority(
+    source: Any,
+    triggering_bridge_instance: str | None,
+) -> bool:
+    """Whether a source's channel id is scoped to the triggering authority.
+
+    A normalized channel id is unique within a bridge instance, not globally:
+    two independently scoped workspaces can each hold a channel that
+    normalizes to the same string. The same-channel shortcut admits with no
+    audience lookup, on the reasoning that the channel's own audience has
+    already seen the content -- which holds only if it is the same channel.
+
+    A mismatch declines the shortcut only. The flow stays eligible for the
+    audience arms below, which compare real audiences rather than strings.
+    """
+    source_domain = getattr(source, "domain", "") or ""
+    if not (source_domain == "channel" or source_domain.startswith("channel:")):
+        # Not a bridge-scoped channel source (e.g. a protected tool result
+        # carrying a "channel_metadata" domain); the shortcut is unaffected.
+        return True
+    source_bridge = getattr(source, "bridge_instance", None)
+    if not source_bridge or not triggering_bridge_instance:
+        return True
+    return source_bridge == triggering_bridge_instance
+
+
 def _source_is_triggering_channel_compatible(
     source: Any,
     *,
@@ -4716,21 +4742,6 @@ def _source_is_triggering_channel_compatible(
         return False
     if admin_operator_cross_channel:
         return True
-    source_domain = getattr(source, "domain", "") or ""
-    if (
-        source_domain.startswith("channel")
-        and triggering_bridge_instance
-        and getattr(source, "bridge_instance", None) != triggering_bridge_instance
-    ):
-        # A normalized channel identifier is not unique across independently
-        # scoped bridge instances or tenants, so two separately authorized
-        # workspaces can present the same resolved string. The same-channel
-        # shortcut below admits without any audience lookup, on the reasoning
-        # that the channel's audience has already seen its own content — which
-        # holds only if it is the same channel. Fail closed on a channel-domain
-        # source carrying a different bridge authority; the pre-audience
-        # predicate required this same equality.
-        return False
     source_kind = getattr(source, "source_kind", "channel")
     if (
         source_kind == "agent_self"
@@ -4739,7 +4750,12 @@ def _source_is_triggering_channel_compatible(
     ):
         return True
     source_channel = ChannelResourceAdapter._resolve_channel(source.resource_id)
-    if source_channel and resolved_triggering and source_channel == resolved_triggering:
+    if (
+        source_channel
+        and resolved_triggering
+        and source_channel == resolved_triggering
+        and _same_channel_authority(source, triggering_bridge_instance)
+    ):
         return True
     if source_kind == "recent_activity_user":
         from .models import OwnerAttestation
