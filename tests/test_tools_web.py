@@ -23,6 +23,8 @@ from mimir.access_control import _filesystem_result_integrity
 from mimir.readonly_backend import ReadOnlyFilesystemBackend
 from mimir.tools import web as web_tools_mod
 from mimir.tools.web import (
+    FETCH_PDF_MAX_PAGES_DEFAULT,
+    FETCH_PDF_MAX_TEXT_BYTES_DEFAULT,
     _name_from_url,
     _provider_from_model_spec,
     _sanitize_download_name,
@@ -272,6 +274,18 @@ async def test_fetch_url_extracts_pdf_without_changing_cached_body(
 
 
 @pytest.mark.asyncio
+def test_fetch_url_pdf_default_bounds_are_conservative() -> None:
+    """Pin the SHIPPED defaults, not just the bounding mechanism.
+
+    The bound tests below override both limits via the environment and assert
+    literal values, so they prove the mechanism works but say nothing about what
+    ships. A PDF fetched from the web is attacker-supplied by definition, so
+    widening either default should be a deliberate edit here.
+    """
+    assert FETCH_PDF_MAX_PAGES_DEFAULT == 100
+    assert FETCH_PDF_MAX_TEXT_BYTES_DEFAULT == 1_000_000
+
+
 async def test_fetch_url_pdf_page_limit_is_recorded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
