@@ -5825,7 +5825,10 @@ async def test_hostile_model_audience_cannot_widen_real_deepagents_turn(
     """A real DeepAgents model output cannot alter selection-time authority."""
     from deepagents import create_deep_agent
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
     from pydantic import Field
+
+    captured: dict[str, Any] = {}
 
     class CapturingModel(GenericFakeChatModel):
         observed_prompts: list[list[Any]] = Field(default_factory=list)
@@ -5837,18 +5840,36 @@ async def test_hostile_model_audience_cannot_widen_real_deepagents_turn(
             self.observed_prompts.append(messages)
             return super()._generate(messages, *args, **kwargs)
 
+    @tool
+    def observe_post_model_context(runtime: ToolRuntime[AuthContext]) -> str:
+        """Observe the runtime carrier after the hostile model output."""
+        captured["context"] = runtime.context
+        return "context observed"
+
     _acp_turn(monkeypatch)
     sentinel = "HOSTILE-MODEL-AUDIENCE-SENTINEL"
     reply = "HOSTILE-MODEL-VALID-REPLY"
-    model = CapturingModel(messages=iter([AIMessage(
-        content=reply,
-        additional_kwargs={
-            "audience": ["attacker"],
-            "channel_visibility": "private",
-        },
-    )]))
+    model = CapturingModel(messages=iter([
+        AIMessage(
+            content="",
+            additional_kwargs={
+                "audience": ["attacker"],
+                "channel_visibility": "private",
+            },
+            tool_calls=[{
+                "name": "observe_post_model_context",
+                "args": {},
+                "id": "post-model-context-observer",
+                "type": "tool_call",
+            }],
+        ),
+        AIMessage(content=reply),
+    ]), disable_streaming=True)
     graph = create_deep_agent(
-        model=model, tools=[], system_prompt="test", context_schema=AuthContext,
+        model=model,
+        tools=[observe_post_model_context],
+        system_prompt="test",
+        context_schema=AuthContext,
     )
     agent, bridge = _audience_delivery_agent(tmp_path, graph, channel_prefix="ch-")
     _append_hostile_cross_channel_history(agent, sentinel)
@@ -5859,7 +5880,18 @@ async def test_hostile_model_audience_cannot_widen_real_deepagents_turn(
     ))
 
     assert sentinel not in str(model.observed_prompts)
-    assert agent._audience_provider.audience_for(destination, principal="alice") is None
+    assert len(model.observed_prompts) == 2
+    transported = [
+        message for message in model.observed_prompts[1]
+        if isinstance(message, AIMessage)
+        and message.additional_kwargs.get("audience") == ["attacker"]
+    ]
+    assert len(transported) == 1
+    assert transported[0].additional_kwargs["channel_visibility"] == "private"
+    context = captured["context"]
+    assert context.audience_provider is agent._audience_provider
+    assert context.audience_provider.audience_for(destination, principal="alice") is None
+    assert all(source.resource_id != "discord-D-alice" for source in context.ifc_state.current().sources)
     assert [sent[1] for sent in bridge.sends] == [reply]
 
 
