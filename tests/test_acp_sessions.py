@@ -264,6 +264,11 @@ async def test_prompt_auth_context_is_scoped_to_the_session_channel(
     assert context.roles == connection_context.roles
     assert context.is_service == connection_context.is_service
     assert context.enforcement_enabled == connection_context.enforcement_enabled
+    assert context.audience_provider is connection_context.audience_provider
+    assert context.cross_platform_pull == connection_context.cross_platform_pull
+    assert context.audience_provider.audience_for(
+        context.channel_id, principal="operator",
+    ) == frozenset({"operator"})
 
 
 async def test_cancelled_bound_turn_terminalizes_open_tools(tmp_path: Path) -> None:

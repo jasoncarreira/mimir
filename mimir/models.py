@@ -14,7 +14,14 @@ import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any
+
+from pydantic import PlainSerializer
+
+if TYPE_CHECKING:
+    from .channel_audience import ChannelAudienceProvider
+else:
+    ChannelAudienceProvider = Any
 
 
 class TurnInteractivity(StrEnum):
@@ -95,6 +102,53 @@ class IntegrityEffect(StrEnum):
     INFORMATIONAL = "informational"
 
 
+_OWNER_ATTESTATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class OwnerAttestation:
+    canonical_principal: str
+    raw_author: str
+    source_channel: str
+
+    def __init__(
+        self,
+        canonical_principal: str,
+        raw_author: str,
+        source_channel: str,
+        *,
+        _token: object,
+    ) -> None:
+        if _token is not _OWNER_ATTESTATION_TOKEN:
+            raise TypeError("owner attestations must be minted by the server factory")
+        object.__setattr__(self, "canonical_principal", canonical_principal)
+        object.__setattr__(self, "raw_author", raw_author)
+        object.__setattr__(self, "source_channel", source_channel)
+
+
+def _mint_owner_attestation(
+    canonical_principal: str,
+    raw_author: str,
+    source_channel: str,
+) -> OwnerAttestation:
+    return OwnerAttestation(
+        canonical_principal,
+        raw_author,
+        source_channel,
+        _token=_OWNER_ATTESTATION_TOKEN,
+    )
+
+
+_RedactedOwnerAttestation = Annotated[
+    OwnerAttestation | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+_RedactedAudienceProvider = Annotated[
+    ChannelAudienceProvider | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+
+
 @dataclass(frozen=True)
 class SourceLabel:
     """Server-authoritative provenance for one protected input.
@@ -113,6 +167,7 @@ class SourceLabel:
     source_kind: str = "channel"
     integrity: str = Integrity.UNTRUSTED
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
+    owner_attestation: _RedactedOwnerAttestation = None
 
     def __post_init__(self) -> None:
         if self.integrity not in Integrity._value2member_map_:
@@ -1050,6 +1105,10 @@ class AuthContext:
     # Server-selected SAGA resource for a synthesis turn. Model-supplied
     # session IDs are only selectors and must match this immutable value.
     saga_session_id: str | None = None
+    audience_provider: _RedactedAudienceProvider = field(
+        default=None, repr=False, compare=False,
+    )
+    cross_platform_pull: bool = True
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:

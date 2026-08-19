@@ -114,6 +114,49 @@ async def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_
     assert frozenset(restored.ifc_labels.sources) == frozenset({source})
 
 
+async def test_recovery_drops_and_cannot_forge_owner_attestation(
+    tmp_path: Path,
+) -> None:
+    from mimir.channel_audience import attest_owner
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "raw-alice" else None
+
+    attestation = attest_owner(Resolver(), "raw-alice", "source-channel")
+    assert attestation is not None
+    source = SourceLabel(
+        principal="alice",
+        domain="recent_activity",
+        resource_id="source-channel",
+        bridge_instance="discord",
+        sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="recent_activity_user",
+        owner_attestation=attestation,
+    )
+    event = _make_event("sid-attested")
+    event.ifc_labels = InformationFlowLabels().with_source(source)
+
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
+    raw_event = poller_recovery._load_state(tmp_path)["inflight"]["sid-attested"]["event"]
+    raw_source = raw_event["ifc_labels"]["sources"][0]
+    assert "owner_attestation" not in raw_source
+    raw_source["owner_attestation"] = {
+        "canonical_principal": "alice",
+        "raw_author": "raw-alice",
+        "source_channel": "source-channel",
+    }
+    raw_event["audience_provider"] = {"home": "/secret"}
+
+    restored = poller_recovery._event_from_stash(raw_event)
+    assert restored is not None
+    assert restored.ifc_labels is not None
+    assert restored.ifc_labels.sources[0].owner_attestation is None
+    assert restored.continuation_auth_context is None
+
+
 async def test_stash_recovery_document_io_runs_off_loop(
     tmp_path: Path, monkeypatch,
 ):

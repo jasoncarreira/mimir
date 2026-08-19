@@ -223,6 +223,9 @@ def test_ownerless_non_self_feedback_is_complete_untrusted_and_channel_bound(
 
     block = log.recent_prompt_block(auth)
 
+    if record_channel != "shared":
+        assert block is None
+        return
     assert block is not None
     assert "OWNERLESS-USER-SECRET" in block.content
     assert len(block.labels.sources) == 1
@@ -268,6 +271,9 @@ def test_owned_feedback_keeps_owner_acl_and_untrusted_integrity(
 
     block = log.recent_prompt_block(auth)
 
+    if principal == "root":
+        assert block is None
+        return
     assert block is not None
     assert len(block.labels.sources) == 1
     source = block.labels.sources[0]
@@ -335,16 +341,7 @@ def test_privileged_view_of_ownerless_non_agent_record_stays_untrusted(tmp_path:
 
     block = log.recent_prompt_block(admin)
 
-    # The privileged view does surface the record -- that is the point of the
-    # short-circuit -- so the assertion below is not vacuous.
-    assert block is not None
-    assert injected in (block.content or ""), (
-        "precondition: the privileged view must actually render this record"
-    )
-    assert block.labels.sources
-    assert {source.integrity for source in block.labels.sources} == {
-        Integrity.UNTRUSTED
-    }
+    assert block is None
 
 
 @pytest.mark.parametrize(
@@ -373,11 +370,7 @@ def test_ownerless_commitment_feedback_with_external_text_stays_untrusted(
 
     block = log.recent_prompt_block(admin)
 
-    assert block is not None
-    assert "conversation-derived text" in block.content
-    assert {source.integrity for source in block.labels.sources} == {
-        Integrity.UNTRUSTED
-    }
+    assert block is None
 
 
 def test_interactive_no_reply_is_visible_as_trusted_agent_self_feedback(
@@ -431,11 +424,7 @@ def test_classified_kind_absent_from_agent_self_allowlist_stays_untrusted(
 
     block = log.recent_prompt_block(admin)
 
-    assert block is not None
-    assert "external denial detail" in block.content
-    assert {source.integrity for source in block.labels.sources} == {
-        Integrity.UNTRUSTED
-    }
+    assert block is None
 
 
 def test_agent_self_feedback_sources_are_trusted(tmp_path: Path):
@@ -3026,6 +3015,245 @@ def test_parse_resolved_ts_bad_input_returns_none() -> None:
     """Unparseable input returns None rather than raising."""
     assert _parse_resolved_ts("not-a-date") is None
     assert _parse_resolved_ts("") is None
+
+
+def test_feedback_selection_labels_exactly_security_admitted_events(
+    tmp_path: Path,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            values = {"slack-alice": "alice", "slack-bob": "bob"}
+            canonical = values.get(author)
+            return Identity(canonical=canonical) if canonical else None
+
+        def resolve(self, author):
+            raise AssertionError("feedback eligibility must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            values = {
+                ("acp:alice", "alice"): frozenset({"alice"}),
+                ("slack-D-alice", "alice"): frozenset({"alice"}),
+                ("slack-D-bob", "bob"): frozenset({"bob"}),
+            }
+            return values.get((channel_id, principal))
+
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "tool": "admitted-tool",
+            "reason": "ADMITTED",
+            "channel_id": "slack-D-alice",
+            "owner_principal": "slack-alice",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "tool": "foreign-tool",
+            "reason": "FOREIGN",
+            "channel_id": "slack-D-bob",
+            "owner_principal": "slack-bob",
+        },
+    ])
+    log.identity_resolver = Resolver()
+    auth = AuthContext(
+        principal="slack-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:alice",
+        interactivity=None,
+        audience_provider=Provider(),
+    )
+
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "ADMITTED" in block.content
+    assert "FOREIGN" not in block.content
+    assert len(block.labels.sources) == 1
+    source = block.labels.sources[0]
+    assert source.principal == "alice"
+    assert source.owner_attestation is None
+    assert source.resource_id == "slack-D-alice"
+
+
+def test_turn_error_content_and_label_share_one_admission(tmp_path: Path) -> None:
+    log = _make_log(tmp_path, turns=[
+        {
+            "ts": _ts(0.2),
+            "turn_id": "own",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "error": "OWN ERROR",
+        },
+        {
+            "ts": _ts(0.1),
+            "turn_id": "foreign",
+            "channel_id": "foreign",
+            "owner_principal": "bob",
+            "error": "FOREIGN ERROR",
+        },
+    ])
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "OWN ERROR" in block.content
+    assert "FOREIGN ERROR" not in block.content
+    assert [source.resource_id for source in block.labels.sources] == ["current"]
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "commitment_due",
+        "commitment_expired",
+        "commitment_snooze_pileup",
+        "react_received",
+    ],
+)
+def test_channel_scoped_feedback_never_crosses_channels(
+    tmp_path: Path,
+    event_type: str,
+) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="root") if author == "root" else None
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return frozenset({"root"})
+
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": event_type,
+        "channel_id": "source",
+        "owner_principal": "root",
+        "commitment_id": "c1",
+        "text": "CHANNEL SECRET",
+        "emoji": "heart",
+        "author": "root",
+        "polarity": "positive",
+        "snooze_count": 4,
+        "threshold": 3,
+    }])
+    log.identity_resolver = Resolver()
+    auth = AuthContext(
+        principal="root",
+        canonical_principal="root",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination",
+        interactivity=None,
+        audience_provider=Provider(),
+    )
+    assert log.recent_prompt_block(auth) is None
+
+
+def test_privileged_context_without_channel_loads_only_agent_self_records(
+    tmp_path: Path,
+) -> None:
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2),
+            "type": "send_message_loop_warning",
+            "count": 3,
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "commitment_due",
+            "owner_principal": "root",
+            "text": "USER RECORD",
+            "commitment_id": "c1",
+        },
+    ])
+    auth = AuthContext(
+        principal="root",
+        canonical_principal="root",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id=None,
+        interactivity=None,
+    )
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "loop" in block.content.lower()
+    assert "USER RECORD" not in block.content
+    assert {source.source_kind for source in block.labels.sources} == {"agent_self"}
+
+
+def test_display_dropped_labels_remain_sink_compatible(tmp_path: Path) -> None:
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "tool": "one",
+            "reason": "one",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "source": "one",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "tool": "two",
+            "reason": "two",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "source": "two",
+        },
+    ])
+    log.default_limit_per_polarity = 1
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert len(block.labels.sources) == 2
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
+    )
+    assert decision.allowed is True
+
+
+def test_channel_scoped_free_text_renderer_inventory_is_exhaustive() -> None:
+    from mimir.feedback.renderers import CHANNEL_SCOPED_FREE_TEXT_KINDS
+
+    assert CHANNEL_SCOPED_FREE_TEXT_KINDS == frozenset({
+        "commitment_due",
+        "commitment_expired",
+        "commitment_snooze_pileup",
+        "react",
+    })
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

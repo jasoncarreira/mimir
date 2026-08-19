@@ -57,6 +57,7 @@ from .channel_registry import (
     post_job_failure_notice,
     resolve_deliver_channel,
 )
+from .channel_audience import ServerChannelAudienceProvider, attest_owner
 from .chat_skills import CHAT_SKILL_EXTRA_KEY, ChatSkillRegistry
 from .config import Config
 from .model_registry import DEFAULT_MODEL_SPEC
@@ -82,11 +83,13 @@ from .models import (
     Integrity,
     IntegrityEffect,
     PromptBlock,
+    OwnerAttestation,
     SourceLabel,
     TurnInteractivity,
     TurnRecord,
 )
 from .access_control import (
+    _source_is_triggering_channel_compatible,
     create_auth_context,
     get_event_service_principal,
     get_trusted_service_from_auth_context,
@@ -231,6 +234,7 @@ def _prompt_source_labels(
     authorized_principals: frozenset[str] | None = None,
     source_kind: str = "protected_prompt",
     self_authored: bool,
+    owner_attestation: OwnerAttestation | None = None,
 ) -> InformationFlowLabels:
     """Create one complete, server-authoritative protected prompt source."""
     requester = auth_context.canonical_principal or auth_context.principal
@@ -242,6 +246,8 @@ def _prompt_source_labels(
     acl = authorized_principals
     if acl is None:
         acl = frozenset({effective_requester}) if effective_requester else frozenset()
+    if self_authored and source_kind == "protected_prompt":
+        source_kind = "agent_self"
     return InformationFlowLabels().with_source(prompt_sources.prompt_source_label(
         auth_context,
         principal=owner,
@@ -252,6 +258,7 @@ def _prompt_source_labels(
         authorized_principals=acl,
         source_kind=source_kind,
         self_authored=self_authored,
+        owner_attestation=owner_attestation,
     ))
 
 
@@ -507,6 +514,8 @@ def _create_turn_auth_context(
     policy_version: str | None,
     enforce: bool,
     ifc_labels: InformationFlowLabels,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
     if inherited is None:
@@ -516,6 +525,8 @@ def _create_turn_auth_context(
             policy_version=policy_version,
             enforce=enforce,
             ifc_labels=ifc_labels,
+            audience_provider=audience_provider,
+            cross_platform_pull=cross_platform_pull,
         )
     return replace(
         inherited,
@@ -1187,6 +1198,7 @@ class Agent:
         self._turn_logger = turn_logger
         self._buffer = message_buffer
         self._identity_resolver = getattr(message_buffer, "resolver", None)
+        self._audience_provider = ServerChannelAudienceProvider(config.home)
         self._indexes = index_generator
         self._indexer = indexer
         self._saga = saga_client
@@ -1258,6 +1270,8 @@ class Agent:
             events_snapshot=self._events_snapshot,
             turns_snapshot=self._turns_snapshot,
             resolved_incidents_path=config.home / "resolved-incidents.jsonl",
+            identity_resolver=self._identity_resolver,
+            cross_platform_pull=config.cross_platform_pull,
         )
         # Plan-window rate-limit state — real RateLimitStore (replaces
         # the deprecated _RateLimitStub). The oauth_usage_poller writes
@@ -1780,6 +1794,8 @@ class Agent:
                 policy_version=getattr(self._config, "policy_version", None),
                 enforce=self._config.access_control_enforced,
                 ifc_labels=initial_ifc_labels,
+                audience_provider=self._audience_provider,
+                cross_platform_pull=self._config.cross_platform_pull,
             )
         emitter = TurnEventEmitter(
             self._turn_event_bus,
@@ -1913,6 +1929,8 @@ class Agent:
                     enforce=self._config.access_control_enforced,
                     event_ingress=event_ingress,
                     ifc_labels=initial_ifc_labels,
+                    audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
@@ -4021,6 +4039,75 @@ class Agent:
             prompts_dir=self._config.prompts_dir,
         )
 
+    def _select_recent_activity(
+        self,
+        event: AgentEvent,
+        auth_context: AuthContext,
+    ) -> tuple[list[Message], tuple[PromptBlock, ...]]:
+        candidates = self._buffer.assemble_recent_activity_candidates(
+            channel_id=event.channel_id or "",
+            author=event.author,
+            recent_per_channel=self._config.recent_per_channel,
+            recent_author_cross=self._config.recent_author_cross,
+            cross_hours=self._config.recent_cross_hours,
+            source_allowlist=self._config.recent_sources,
+        )
+        effective_principal = (
+            auth_context.canonical_principal or auth_context.principal
+        )
+        if auth_context.is_service and effective_principal:
+            effective_principal = f"service:{effective_principal}"
+        if not effective_principal:
+            return [], ()
+
+        admitted: list[Message] = []
+        blocks: list[PromptBlock] = []
+        for message in candidates:
+            same_channel = message.channel_id == (event.channel_id or "")
+            owner_attestation = None
+            source_kind = (
+                "recent_activity_assistant"
+                if message.kind == "assistant_message" or not message.author
+                else "recent_activity_user"
+            )
+            principal = effective_principal
+            acl = frozenset({effective_principal})
+            if not same_channel and source_kind == "recent_activity_user":
+                owner_attestation = attest_owner(
+                    self._identity_resolver,
+                    message.author,
+                    message.channel_id,
+                )
+                if owner_attestation is None:
+                    continue
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+            labels = _prompt_source_labels(
+                auth_context,
+                domain="recent_activity",
+                resource=f"message:{message.msg_id}",
+                channel_id=message.channel_id,
+                principal=principal,
+                bridge=message.source,
+                authorized_principals=acl,
+                source_kind=source_kind,
+                self_authored=_recent_message_is_self_authored(message),
+                owner_attestation=owner_attestation,
+            )
+            source = labels.sources[0]
+            if not _source_is_triggering_channel_compatible(
+                source,
+                effective_principal=effective_principal,
+                triggering_principal=auth_context.principal,
+                resolved_triggering=event.channel_id,
+                audience_provider=auth_context.audience_provider,
+                cross_platform_pull=auth_context.cross_platform_pull,
+            ):
+                continue
+            admitted.append(message)
+            blocks.append(PromptBlock(message.content, labels))
+        return admitted, tuple(blocks)
+
     async def _build_turn_prompt(
         self,
         ctx: Any,
@@ -4065,14 +4152,8 @@ class Agent:
             source_blocks.append(block)
             return block.content
 
-        recent = self._buffer.assemble_recent_activity(
-            channel_id=event.channel_id or "",
-            author=event.author,
-            recent_per_channel=self._config.recent_per_channel,
-            recent_author_cross=self._config.recent_author_cross,
-            cross_hours=self._config.recent_cross_hours,
-            source_allowlist=self._config.recent_sources,
-        )
+        recent, recent_blocks = self._select_recent_activity(event, auth_context)
+        source_blocks.extend(recent_blocks)
         # Channel memory injection (chainlink #187): load per-channel fact
         # files (operator name, preferences, patterns) from
         # ``memory/channels/<channel_id>/``. Returns None for synthetic
@@ -4261,7 +4342,13 @@ class Agent:
             for author in [event.author, *(message.author for message in recent)]:
                 if not author:
                     continue
-                canonical = resolver.resolve(author)
+                identity_lookup = getattr(resolver, "identity", None)
+                identity = identity_lookup(author) if callable(identity_lookup) else None
+                if identity is not None:
+                    canonical = identity.canonical
+                else:
+                    resolve = getattr(resolver, "resolve", None)
+                    canonical = resolve(author) if callable(resolve) else author
                 if canonical and canonical != author:
                     identity_principals.add(canonical)
         if identity_principals:
@@ -4282,22 +4369,6 @@ class Agent:
                     ),
                 )
             source_blocks.append(PromptBlock("known identities", identity_labels))
-        for message in recent:
-            message_principal = message.author
-            if resolver is not None and message_principal:
-                message_principal = resolver.resolve(message_principal)
-            source_blocks.append(PromptBlock(
-                message.content,
-                _prompt_source_labels(
-                    auth_context,
-                    domain="recent_activity",
-                    resource=f"message:{message.msg_id}",
-                    channel_id=message.channel_id,
-                    principal=message_principal,
-                    bridge=message.source,
-                    self_authored=_recent_message_is_self_authored(message),
-                ),
-            ))
         if saga_block:
             source_blocks.append(PromptBlock(
                 saga_block,

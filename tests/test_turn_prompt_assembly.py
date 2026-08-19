@@ -17,7 +17,9 @@ silently shipping an empty-block prompt to the model.
 from __future__ import annotations
 
 import json
+import inspect
 import os
+import re
 import sqlite3
 import time
 from dataclasses import replace
@@ -248,20 +250,12 @@ async def test_channel_less_untrusted_recent_activity_is_refused_at_sink(
         ctx, event, saga_block=None, initial_auth_context=auth,
     )
 
-    assert "legacy unbound message" in prompt
-    assert legacy in recent
-    source = next(
-        item for item in ctx.ifc_labels.sources
-        if item.resource_id == "message:legacy-message"
+    assert "legacy unbound message" not in prompt
+    assert legacy not in recent
+    assert all(
+        item.resource_id != "message:legacy-message"
+        for item in ctx.ifc_labels.sources
     )
-    assert source.integrity == Integrity.UNTRUSTED
-    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
-    decision = SinkGate.check_sink_flow(
-        "harness_auto_deliver", event.channel_id, ctx.ifc_labels, sink_auth,
-        enforce=True,
-    )
-    assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.asyncio
@@ -1039,7 +1033,137 @@ async def test_ownerless_non_self_feedback_does_not_abort_prompt_assembly(
         _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
     )
 
-    assert "turn error: (no detail)" in turn_prompt
+    assert "turn error: (no detail)" not in turn_prompt
+
+
+def test_recent_content_and_labels_are_selected_together(tmp_path: Path) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "discord-alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id in {"discord-D1", "acp:session"} and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    admitted = agent._buffer.make_message(
+        channel_id="discord-D1",
+        kind="user_message",
+        content="ADMITTED",
+        author="discord-alice",
+        msg_id="admitted",
+        source="discord",
+    )
+    excluded = agent._buffer.make_message(
+        channel_id="discord-guild",
+        kind="user_message",
+        content="EXCLUDED",
+        author="unknown",
+        msg_id="excluded",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(admitted)
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp:session",
+        author="discord-alice",
+        content="now",
+        source="acp",
+    )
+    auth = AuthContext(
+        principal="discord-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:session",
+        interactivity=None,
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == [admitted]
+    assert [block.content for block in blocks] == ["ADMITTED"]
+    assert len(blocks[0].labels.sources) == 1
+    source = blocks[0].labels.sources[0]
+    assert source.owner_attestation is not None
+    assert source.source_kind == "recent_activity_user"
+    assert source.resource_id == "discord-D1"
+
+
+def test_excluded_recent_messages_add_no_identity_or_recent_labels(
+    tmp_path: Path,
+) -> None:
+    class Resolver:
+        def identity(self, author):
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    excluded = agent._buffer.make_message(
+        channel_id="foreign",
+        kind="user_message",
+        content="FOREIGN",
+        author="canonical-looking",
+        msg_id="foreign",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="destination",
+        author="canonical-looking",
+        content="now",
+    )
+    auth = AuthContext(
+        principal="canonical-looking",
+        canonical_principal="canonical-looking",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination",
+        interactivity=None,
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == []
+    assert blocks == ()
+
+
+def test_channel_bearing_source_inventory_is_closed() -> None:
+    source = inspect.getsource(Agent._build_turn_prompt)
+    use_targets = set(re.findall(r"(\w+_block)\s*=\s*use\(", source))
+    assert use_targets == {
+        "channel_memory_block",
+        "feedback_block",
+        "core_proposals_block",
+        "session_summaries_block",
+        "usage_block",
+        "upcoming_block",
+        "commitments_block",
+        "self_state_block",
+    }
+    assert "self._select_recent_activity(event, auth_context)" in source
+    assert "source_blocks.extend(recent_blocks)" in source
+    assert "self._feedback.recent_prompt_block" in source
+    assert "for message in recent:" not in source
+    assert source.count("source_blocks.append(PromptBlock(") == 3
 
 
 @pytest.mark.asyncio

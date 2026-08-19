@@ -1253,8 +1253,9 @@ async def test_user_turn_web_searches_then_replies_to_origin_under_enforcement(
     assert record.error is None
     assert all(result.status != "error" for result in fake_agent.search_results)
     assert fake_agent.reply_result is not None
-    assert fake_agent.reply_result.status != "error", fake_agent.reply_result.content
-    assert fake_agent.reply_calls == 1
+    assert fake_agent.reply_result.status == "error"
+    assert "ifc_label_blocked:same_channel" in fake_agent.reply_result.content
+    assert fake_agent.reply_calls == 0
     assert fake_agent.labels_after_reply is not None
     assert fake_agent.labels_after_reply.has_untrusted_active_ingest is True
 

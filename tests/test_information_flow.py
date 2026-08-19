@@ -146,7 +146,7 @@ def test_two_principals_in_shared_channel_fail_closed():
     assert decision.allowed is False
 
 
-def test_same_textual_channel_on_different_bridge_instance_fails_closed():
+def test_same_normalized_channel_does_not_query_cross_channel_authority():
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver",
         "slack-C1",
@@ -154,7 +154,8 @@ def test_same_textual_channel_on_different_bridge_instance_fails_closed():
         _auth(),
         enforce=True,
     )
-    assert decision.allowed is False
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
 
 
 def test_labels_without_source_provenance_fail_closed():
@@ -671,7 +672,7 @@ def test_untrusted_ingest_recloses_operator_action_sinks_but_not_reply(
     assert reply.allowed is True
     assert cross_channel.allowed is False
     assert declassification.allowed is True
-    assert incompatible_reply.allowed is True
+    assert incompatible_reply.allowed is False
     assert harness.allowed is True
     assert harness.reason == "harness_metadata_display"
 
@@ -799,13 +800,8 @@ def test_cross_channel_recent_activity_requires_trust_for_same_channel_sinks():
             tool, event.channel_id, untrusted_labels, untrusted_auth, enforce=True,
         )
         assert trusted.allowed is True, (tool, trusted.reason)
-        if tool == "send_message":
-            # Authenticated interactive ingress retains its explicit-reply
-            # carveout; harness delivery and other same-channel sinks do not.
-            assert untrusted.allowed is True, (tool, untrusted.reason)
-        else:
-            assert untrusted.allowed is False, (tool, untrusted.reason)
-            assert untrusted.reason == "ifc_label_blocked:same_channel"
+        assert untrusted.allowed is False, (tool, untrusted.reason)
+        assert untrusted.reason == "ifc_label_blocked:same_channel"
 
 
 def test_prompt_source_labels_preserve_full_trusted_label():
@@ -815,11 +811,11 @@ def test_prompt_source_labels_preserve_full_trusted_label():
     assert source == SourceLabel(
         principal="user-1",
         domain="saga",
-        resource_id="slack-C1",
+        resource_id="auto-recall",
         bridge_instance="slack",
         sensitivity="private",
         authorized_principals=frozenset({"user-1"}),
-        source_kind="protected_prompt",
+        source_kind="agent_self",
         integrity="trusted",
         integrity_effect="informational",
     )
@@ -1418,7 +1414,7 @@ def test_complete_forged_label_cannot_egress_from_service_turn(
         resource_id="scheduler:heartbeat",
         bridge_instance="service:scheduler",
         sensitivity="internal",
-        authorized_principals=frozenset({"service:scheduler"}),
+        authorized_principals=frozenset({source_principal}),
         integrity="trusted",
     ))
     auth = create_auth_context(event, enforce=True, ifc_labels=forged)
@@ -2577,15 +2573,18 @@ def test_channel_source_still_requires_exact_triggering_provenance(mismatch: str
     )
 
     assert matching.allowed is True
-    assert blocked.allowed is False
-    assert blocked.reason == "ifc_label_blocked:same_channel"
+    expected_allowed = mismatch != "resource_id"
+    assert blocked.allowed is expected_allowed
+    assert blocked.reason == (
+        "ifc_allowed" if expected_allowed else "ifc_label_blocked:same_channel"
+    )
 
 
 @pytest.mark.parametrize(
     ("bridge_instance", "resource_id", "expected_allowed"),
     [
         ("slack", "slack-C1", True),
-        ("discord", "slack-C1", False),
+        ("discord", "slack-C1", True),
         ("slack", "slack-C2", False),
     ],
 )
@@ -3636,10 +3635,23 @@ def test_ifc_sources_is_append_only_deduped_tuple():
 
 
 def _service_turn_auth_context() -> AuthContext:
+    from mimir.channel_audience import ServerChannelAudienceProvider, attest_owner
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="service:github")
+
+    attestation = attest_owner(
+        Resolver(), "service:github", "poller:github-activity",
+    )
     src = SourceLabel(
         principal="service:github", domain="channel",
-        resource_id="poller:github-activity", bridge_instance=None,
+        resource_id="poller:github-activity", bridge_instance="poller",
         sensitivity="internal",
+        authorized_principals=frozenset({"service:github"}),
+        source_kind="recent_activity_user",
+        owner_attestation=attestation,
     )
     return AuthContext(
         principal="service:github", canonical_principal="service:github", roles=(),
@@ -3647,6 +3659,7 @@ def _service_turn_auth_context() -> AuthContext:
         channel_id="poller:github-activity",
         interactivity=TurnInteractivity.NON_INTERACTIVE, is_service=True,
         ifc_labels=InformationFlowLabels().with_source(src),
+        audience_provider=ServerChannelAudienceProvider(Path("/authority-secret")),
     )
 
 
@@ -3701,6 +3714,24 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
     )
     with pytest.raises(TypeError, match="unhashable"):
         _parse(replace(ctx, ifc_labels=bad))
+
+
+def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority():
+    from pydantic import TypeAdapter
+
+    ctx = _service_turn_auth_context()
+    source = ctx.ifc_labels.sources[0]
+    assert ctx.audience_provider is not None
+    assert source.owner_attestation is not None
+    dumped_context = TypeAdapter(AuthContext).dump_python(ctx)
+    dumped_labels = TypeAdapter(InformationFlowLabels).dump_python(ctx.ifc_labels)
+    serialized = repr((dumped_context, dumped_labels))
+    assert dumped_context is None
+    assert dumped_labels["sources"][0]["owner_attestation"] is None
+    assert "/authority-secret" not in serialized
+    assert "service:github" not in repr(
+        dumped_labels["sources"][0]["owner_attestation"]
+    )
 
 
 async def test_agent_graph_tool_call_survives_populated_auth_context():
