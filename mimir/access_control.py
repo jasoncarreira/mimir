@@ -4705,6 +4705,7 @@ def _source_is_triggering_channel_compatible(
     audience_provider: Any,
     cross_platform_pull: bool,
     admin_operator_cross_channel: bool = False,
+    triggering_bridge_instance: str | None = None,
 ) -> bool:
     """Return whether one IFC source may flow to the triggering channel."""
     if not getattr(source, "is_complete", False):
@@ -4715,6 +4716,21 @@ def _source_is_triggering_channel_compatible(
         return False
     if admin_operator_cross_channel:
         return True
+    source_domain = getattr(source, "domain", "") or ""
+    if (
+        source_domain.startswith("channel")
+        and triggering_bridge_instance
+        and getattr(source, "bridge_instance", None) != triggering_bridge_instance
+    ):
+        # A normalized channel identifier is not unique across independently
+        # scoped bridge instances or tenants, so two separately authorized
+        # workspaces can present the same resolved string. The same-channel
+        # shortcut below admits without any audience lookup, on the reasoning
+        # that the channel's audience has already seen its own content — which
+        # holds only if it is the same channel. Fail closed on a channel-domain
+        # source carrying a different bridge authority; the pre-audience
+        # predicate required this same equality.
+        return False
     source_kind = getattr(source, "source_kind", "channel")
     if (
         source_kind == "agent_self"
@@ -4815,6 +4831,9 @@ def _ifc_blocking_source(
                     audience_provider=getattr(auth_context, "audience_provider", None),
                     cross_platform_pull=getattr(
                         auth_context, "cross_platform_pull", True,
+                    ),
+                    triggering_bridge_instance=getattr(
+                        auth_context, "bridge_instance", None,
                     ),
                 ):
                     return source, "causing_source"
@@ -5583,6 +5602,9 @@ class SinkGate:
                 audience_provider=getattr(auth_context, "audience_provider", None),
                 cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
                 admin_operator_cross_channel=True,
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
             ) for source in sources)
         ):
             return frozenset({resolved_target_channel})
@@ -5674,6 +5696,9 @@ class SinkGate:
                 resolved_triggering=resolved_triggering,
                 audience_provider=getattr(auth_context, "audience_provider", None),
                 cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
             ):
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:

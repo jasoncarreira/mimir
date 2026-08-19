@@ -152,12 +152,32 @@ def test_same_normalized_channel_does_not_query_cross_channel_authority():
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver",
         "slack-C1",
-        _labels(bridge_instance="slack-workspace-2"),
+        _labels(bridge_instance="slack"),
         _auth(),
         enforce=True,
     )
     assert decision.allowed is True
     assert decision.reason == "ifc_allowed"
+
+
+def test_same_normalized_channel_from_other_bridge_authority_is_not_admitted():
+    """A channel id is unique only within its own bridge authority.
+
+    Two independently scoped workspaces can each hold a channel that
+    normalizes to the same string, so the same-channel shortcut -- which
+    admits with no audience lookup, on the reasoning that the channel's own
+    audience has already seen the content -- must not fire across bridge
+    instances.
+    """
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "slack-C1",
+        _labels(bridge_instance="slack-workspace-2"),
+        _auth(),
+        enforce=True,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 def test_labels_without_source_provenance_fail_closed():
@@ -2575,7 +2595,9 @@ def test_channel_source_still_requires_exact_triggering_provenance(mismatch: str
     )
 
     assert matching.allowed is True
-    expected_allowed = mismatch != "resource_id"
+    # bridge_instance scopes the channel namespace: the same channel id in a
+    # different bridge authority is a different channel, not the same one.
+    expected_allowed = mismatch not in {"resource_id", "bridge_instance"}
     assert blocked.allowed is expected_allowed
     assert blocked.reason == (
         "ifc_allowed" if expected_allowed else "ifc_label_blocked:same_channel"
@@ -2586,7 +2608,7 @@ def test_channel_source_still_requires_exact_triggering_provenance(mismatch: str
     ("bridge_instance", "resource_id", "expected_allowed"),
     [
         ("slack", "slack-C1", True),
-        ("discord", "slack-C1", True),
+        ("discord", "slack-C1", False),
         ("slack", "slack-C2", False),
     ],
 )
