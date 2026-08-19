@@ -51,6 +51,7 @@ from mimir.identities import IdentityResolver
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     _check_and_increment_or_deny,
+    _emit_tool_call_sync,
 )
 from tests.auth_helpers import attach_middleware_auth_context
 
@@ -3197,7 +3198,14 @@ async def test_middleware_emits_tool_call_events_for_success_and_error(
     token = set_current_turn(ctx)
     try:
         await mw.awrap_tool_call(_make_request("memory_query", "id-ok"), ok_handler)
-        await mw.awrap_tool_call(_make_request("memory_query", "id-err"), err_handler)
+        await mw.awrap_tool_call(
+            _make_request(
+                "memory_query",
+                "id-err",
+                args={"path": "/mimir-home/state/x", "content": "private content"},
+            ),
+            err_handler,
+        )
     finally:
         reset_current_turn(token)
 
@@ -3212,6 +3220,109 @@ async def test_middleware_emits_tool_call_events_for_success_and_error(
     assert tool_errors[0]["tool"] == "memory_query"
     assert tool_errors[0]["paired_tool_call"] is True
     assert "boom" in tool_errors[0]["error"]
+    assert tool_calls[1]["arguments"] == {"path": "/mimir-home/state/x"}
+    assert tool_errors[0]["arguments"] == {"path": "/mimir-home/state/x"}
+    assert "private content" not in str(tool_calls[1])
+    assert "private content" not in str(tool_errors[0])
+
+
+def test_failed_tool_events_keep_error_head_and_tail_within_existing_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **payload: captured.append((kind, payload)),
+    )
+    error = (
+        "Error invoking tool 'saga_end_session' with kwargs {"
+        + "x" * 600
+        + "} ValueError: the real cause"
+    )
+
+    _emit_tool_call_sync("saga_end_session", ok=False, error=error)
+
+    assert [kind for kind, _ in captured] == ["tool_call", "tool_error"]
+    for _, payload in captured:
+        assert len(payload["error"]) == 500
+        assert payload["error"].startswith("Error invoking tool 'saga_end_session'")
+        assert "...[truncated]..." in payload["error"]
+        assert payload["error"].endswith("ValueError: the real cause")
+
+
+def test_failed_tool_events_preserve_untruncated_error_byte_identically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **payload: captured.append((kind, payload)),
+    )
+    error = "read_file denied: path is outside the service boundary"
+
+    _emit_tool_call_sync("read_file", ok=False, error=error, denied=True)
+
+    assert [payload["error"] for _, payload in captured] == [error, error]
+
+
+def test_failed_tool_events_record_only_bounded_allowlisted_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **payload: captured.append((kind, payload)),
+    )
+    private_values = {
+        "content": "private content",
+        "text": "private text",
+        "body": "private body",
+        "summary": "private summary",
+        "message": "private message",
+    }
+    arguments = {
+        "path": "/mimir-home/state/x",
+        "pattern": "p" * 300,
+        **private_values,
+    }
+
+    _emit_tool_call_sync(
+        "read_file", ok=False, error="read denied", denied=True, arguments=arguments,
+    )
+
+    assert [kind for kind, _ in captured] == ["tool_call", "tool_error"]
+    for kind, payload in captured:
+        assert payload["arguments"]["path"] == "/mimir-home/state/x"
+        assert payload["arguments"]["pattern"] == "p" * 200
+        assert set(payload["arguments"]) == {"path", "pattern"}
+        assert all(value not in str(payload) for value in private_values.values())
+        if kind == "tool_error":
+            assert payload["paired_tool_call"] is True
+
+
+def test_failed_pr_tool_events_keep_top_level_repository_and_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **payload: captured.append((kind, payload)),
+    )
+
+    _emit_tool_call_sync(
+        "pr_diff",
+        ok=False,
+        error="failed",
+        arguments={"repository": "owner/repo", "pull_request": 1297},
+    )
+
+    for _, payload in captured:
+        assert payload["repository"] == "owner/repo"
+        assert payload["pull_request"] == 1297
+        assert payload["arguments"] == {
+            "repository": "owner/repo",
+            "pull_request": 1297,
+        }
 
 
 @pytest.mark.asyncio
