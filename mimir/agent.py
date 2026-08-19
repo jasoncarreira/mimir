@@ -89,6 +89,7 @@ from .models import (
     TurnRecord,
 )
 from .access_control import (
+    ChannelResourceAdapter,
     _source_is_triggering_channel_compatible,
     create_auth_context,
     get_event_service_principal,
@@ -4099,7 +4100,9 @@ class Agent:
                 source,
                 effective_principal=effective_principal,
                 triggering_principal=auth_context.principal,
-                resolved_triggering=event.channel_id,
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    event.channel_id,
+                ),
                 audience_provider=auth_context.audience_provider,
                 cross_platform_pull=auth_context.cross_platform_pull,
             ):

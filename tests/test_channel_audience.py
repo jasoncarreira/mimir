@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mimir.access_control import _source_is_triggering_channel_compatible
+from mimir.agent import Agent
 from mimir.acp.session_store import SessionStore
 from mimir.channel_audience import ServerChannelAudienceProvider, attest_owner
 from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
 from mimir.identities import Identity, IdentityResolver
-from mimir.models import OwnerAttestation, SourceLabel
+from mimir.models import AuthContext, OwnerAttestation, SourceLabel
 
 
 def _write_identities(home: Path, body: str) -> None:
@@ -135,15 +137,117 @@ def test_owner_attestation_is_factory_minted_by_strict_identity() -> None:
         OwnerAttestation("alice", "discord-alice", "discord-D1")
 
 
-def test_eligibility_paths_never_call_identity_resolver_resolve() -> None:
+def test_eligibility_paths_never_call_identity_resolver_resolve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StrictResolver:
+        identity_calls: list[str | None] = []
+
+        def __init__(self, home=None):
+            self.home = home
+
+        def reload(self):
+            return None
+
+        def identity(self, author):
+            self.identity_calls.append(author)
+            if author in {"alice", "alice-alias"}:
+                return Identity(
+                    canonical="alice",
+                    dm_channels={"discord": "dm-alice"},
+                )
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("eligibility called permissive resolve")
+
+    import mimir.channel_audience as audience_module
+
+    monkeypatch.setattr(audience_module, "IdentityResolver", StrictResolver)
+    provider = ServerChannelAudienceProvider(tmp_path)
+    assert provider.audience_for("dm-alice", principal="alice-alias") == frozenset({"alice"})
+    resolver = StrictResolver()
+    assert attest_owner(resolver, "alice-alias", "dm-alice") is not None
+
+    buffer = MessageBuffer(history_path=tmp_path / "history.jsonl", resolver=resolver)
+    message = buffer.make_message(
+        channel_id="dm-alice",
+        kind="user_message",
+        content="strict history",
+        author="alice-alias",
+    )
+    buffer._append_in_memory(message)
+    assert buffer.assemble_recent_activity_candidates(
+        channel_id="destination",
+        author="alice",
+        recent_per_channel=5,
+        recent_author_cross=5,
+        cross_hours=24,
+    ) == [message]
+
+    class KnownProvider:
+        def audience_for(self, channel_id, *, principal):
+            return frozenset({"alice"})
+
+    agent = object.__new__(Agent)
+    agent._buffer = buffer
+    agent._identity_resolver = resolver
+    agent._config = SimpleNamespace(
+        recent_per_channel=5,
+        recent_author_cross=5,
+        recent_cross_hours=24,
+        recent_sources=None,
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination",
+        interactivity=None,
+        audience_provider=KnownProvider(),
+    )
+    from mimir.models import AgentEvent
+
+    selected, _ = agent._select_recent_activity(
+        AgentEvent(
+            trigger="user_message",
+            channel_id="destination",
+            author="alice",
+        ),
+        auth,
+    )
+    assert selected == [message]
+
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        '{"timestamp":"2999-01-01T00:00:00+00:00","type":"tool_call_denied",'
+        '"tool":"strict","reason":"strict","channel_id":"dm-alice",'
+        '"owner_principal":"alice-alias"}\n',
+        encoding="utf-8",
+    )
+    feedback = FeedbackLog(
+        events_path=events,
+        turns_path=tmp_path / "turns.jsonl",
+        identity_resolver=resolver,
+    )
+    block = feedback.recent_prompt_block(auth)
+    assert block is not None
+    assert "strict" in block.content
+
     protected_sources = (
         inspect.getsource(ServerChannelAudienceProvider.audience_for),
         inspect.getsource(attest_owner),
         inspect.getsource(MessageBuffer.assemble_recent_activity_candidates),
         inspect.getsource(FeedbackLog._select_prompt_recent),
+        inspect.getsource(Agent._select_recent_activity),
         inspect.getsource(_source_is_triggering_channel_compatible),
     )
     assert all(".resolve(" not in source for source in protected_sources)
+    assert "attest_owner(" in protected_sources[4]
+    assert "_source_is_triggering_channel_compatible(" in protected_sources[4]
 
 
 def test_destination_audience_subset_direction() -> None:

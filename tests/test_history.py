@@ -1039,7 +1039,7 @@ def test_adjacent_assistant_candidates_remain_independent_records(
 
 def test_message_buffer_consumer_inventory_is_closed() -> None:
     root = Path(__file__).parents[1] / "mimir"
-    methods = {
+    read_methods = {
         "recent_for_channel",
         "recent_in_channel",
         "cross_author_messages",
@@ -1049,24 +1049,59 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
         "replay",
         "evict_channel",
     }
+    producer_methods = {
+        "_append_inbound_to_buffer",
+        "on_message_injected",
+    }
+
+    def dotted(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted(node.value)
+            return f"{parent}.{node.attr}" if parent else None
+        return None
+
     observed: set[tuple[str, str]] = set()
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in methods
-            ):
-                observed.add((str(path.relative_to(root.parent)), node.func.attr))
+            if not isinstance(node, ast.Call):
+                continue
+            call = dotted(node.func)
+            if call is None:
+                continue
+            terminal = call.rsplit(".", 1)[-1]
+            if terminal in read_methods | producer_methods:
+                observed.add((str(path.relative_to(root.parent)), call))
+            elif call in {
+                "self._append_in_memory",
+                "self._buffer.make_message",
+                "self._buffer.append",
+                "_buf.make_message",
+                "_buf.append",
+                "get_global_buffer",
+                "set_global_buffer",
+            }:
+                observed.add((str(path.relative_to(root.parent)), call))
     assert observed == {
-        ("mimir/agent.py", "assemble_recent_activity_candidates"),
-        ("mimir/agent.py", "recent_for_channel"),
-        ("mimir/bridges/web_chat.py", "recent_in_channel"),
-        ("mimir/history.py", "cross_author_context"),
-        ("mimir/history.py", "cross_author_messages"),
-        ("mimir/history.py", "recent_for_channel"),
-        ("mimir/runtime.py", "evict_channel"),
-        ("mimir/runtime.py", "replay"),
-        ("mimir/tools/registry.py", "recent_for_channel"),
+        ("mimir/agent.py", "buffer.recent_for_channel"),
+        ("mimir/agent.py", "self._append_inbound_to_buffer"),
+        ("mimir/agent.py", "self._buffer.append"),
+        ("mimir/agent.py", "self._buffer.assemble_recent_activity_candidates"),
+        ("mimir/agent.py", "self._buffer.make_message"),
+        ("mimir/agent.py", "self.on_message_injected"),
+        ("mimir/bridges/web_chat.py", "buffer.recent_in_channel"),
+        ("mimir/bridges/web_chat.py", "get_global_buffer"),
+        ("mimir/history.py", "self._append_in_memory"),
+        ("mimir/history.py", "self.cross_author_context"),
+        ("mimir/history.py", "self.cross_author_messages"),
+        ("mimir/history.py", "self.recent_for_channel"),
+        ("mimir/runtime.py", "message_buffer.evict_channel"),
+        ("mimir/runtime.py", "message_buffer.replay"),
+        ("mimir/runtime.py", "set_global_buffer"),
+        ("mimir/tools/registry.py", "_buf.append"),
+        ("mimir/tools/registry.py", "_buf.make_message"),
+        ("mimir/tools/registry.py", "buf.recent_for_channel"),
+        ("mimir/tools/registry.py", "get_global_buffer"),
     }

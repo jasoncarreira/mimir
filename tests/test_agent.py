@@ -29,7 +29,8 @@ from langgraph.runtime import Runtime
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mimir import mid_turn_injection as _mti
-from mimir.access_control import ServicePrincipal
+from mimir.access_control import ServicePrincipal, SinkGate
+from mimir.acp.session_store import SessionStore
 from mimir.agent import Agent, _initialize_ifc_labels
 from mimir.chat_skills import (
     CHAT_SKILL_EXTRA_KEY,
@@ -46,6 +47,7 @@ from mimir.models import (
     AgentEvent,
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     Integrity,
     SourceLabel,
     TurnContext,
@@ -5088,3 +5090,390 @@ async def test_run_turn_bound_cancellation_emits_error_not_success(tmp_path: Pat
     assert len(terminal) == 1
     assert terminal[0]["status"] == "error"
     assert terminal[0]["turn_id"] == "turn-cancelled"
+
+
+def _audience_auth(
+    agent: Agent,
+    *,
+    principal: str,
+    canonical: str,
+    channel_id: str,
+    cross_platform_pull: bool = True,
+) -> AuthContext:
+    return AuthContext(
+        principal=principal,
+        canonical_principal=canonical,
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=TurnInteractivity.INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id=channel_id,
+        bridge_instance="acp",
+        audience_provider=agent._audience_provider,
+        cross_platform_pull=cross_platform_pull,
+    )
+
+
+async def test_owned_acp_sessions_share_recent_activity_concurrent_reopen_and_restart(
+    tmp_path: Path,
+) -> None:
+    fake = _FakeAgent(response_messages=[AIMessage(content="unused")])
+    agent = _build_agent(tmp_path, fake_agent=fake)
+    home = agent._config.home
+    resolver = _resolver(
+        home,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-alice, slack-alice]
+            dm_channels: {discord: discord-D-alice, slack: slack-D-alice}
+          - canonical: bob
+            aliases: [discord-bob]
+            dm_channels: {discord: discord-D-bob}
+        """,
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    store = SessionStore(home)
+    first = store.create_owned_session("alice")
+    second = store.create_owned_session("alice")
+    foreign = store.create_owned_session("bob")
+    messages = [
+        agent._buffer.make_message(
+            channel_id=first.thread_id,
+            kind="user_message",
+            content="ACP-FIRST-ALICE",
+            author="alice",
+            msg_id="acp-first",
+            source="acp",
+        ),
+        agent._buffer.make_message(
+            channel_id=second.thread_id,
+            kind="user_message",
+            content="ACP-SECOND-ALICE",
+            author="alice",
+            msg_id="acp-second",
+            source="acp",
+        ),
+        agent._buffer.make_message(
+            channel_id=foreign.thread_id,
+            kind="user_message",
+            content="ACP-FOREIGN-BOB",
+            author="discord-bob",
+            msg_id="acp-foreign",
+            source="acp",
+        ),
+        agent._buffer.make_message(
+            channel_id="discord-D-alice",
+            kind="user_message",
+            content="DM-ALICE-AUTHORED",
+            author="discord-alice",
+            msg_id="dm-alice",
+            source="discord",
+        ),
+        agent._buffer.make_message(
+            channel_id="discord-D-alice",
+            kind="assistant_message",
+            content="DM-ALICE-ASSISTANT",
+            msg_id="dm-alice-reply",
+            source="discord",
+        ),
+        agent._buffer.make_message(
+            channel_id="discord-D-bob",
+            kind="user_message",
+            content="DM-FOREIGN-BOB",
+            author="discord-bob",
+            msg_id="dm-bob",
+            source="discord",
+        ),
+        agent._buffer.make_message(
+            channel_id="discord-guild",
+            kind="user_message",
+            content="GUILD-ALICE-ANCHOR",
+            author="discord-alice",
+            msg_id="guild-anchor",
+            source="discord",
+        ),
+        agent._buffer.make_message(
+            channel_id="discord-guild",
+            kind="assistant_message",
+            content="GUILD-UNKNOWN-ASSISTANT",
+            msg_id="guild-reply",
+            source="discord",
+        ),
+    ]
+    for message in messages:
+        await agent._buffer.append(message)
+
+    second_event = AgentEvent(
+        trigger="user_message",
+        channel_id=second.thread_id,
+        author="discord-alice",
+        content="second",
+        source="acp",
+    )
+    second_auth = _audience_auth(
+        agent,
+        principal="discord-alice",
+        canonical="alice",
+        channel_id=second.thread_id,
+    )
+    selected, blocks = agent._select_recent_activity(second_event, second_auth)
+    selected_content = {message.content for message in selected}
+    assert "ACP-FIRST-ALICE" in selected_content
+    assert "DM-ALICE-AUTHORED" in selected_content
+    assert "DM-ALICE-ASSISTANT" in selected_content
+    assert "ACP-FOREIGN-BOB" not in selected_content
+    assert "DM-FOREIGN-BOB" not in selected_content
+    assert "GUILD-UNKNOWN-ASSISTANT" not in selected_content
+
+    first_event = replace(second_event, channel_id=first.thread_id, content="first")
+    first_auth = replace(
+        second_auth,
+        channel_id=first.thread_id,
+        resource_id=first.thread_id,
+    )
+    concurrent, _ = agent._select_recent_activity(first_event, first_auth)
+    assert "ACP-SECOND-ALICE" in {message.content for message in concurrent}
+
+    authored_block = next(
+        block for block in blocks if block.content == "ACP-FIRST-ALICE"
+    )
+    authored_source = authored_block.labels.sources[0]
+    assert authored_source.owner_attestation is not None
+    sink_auth = replace(
+        second_auth,
+        ifc_state=InformationFlowState(labels=authored_block.labels),
+    )
+    sink = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        second.thread_id,
+        authored_block.labels,
+        sink_auth,
+        enforce=True,
+    )
+    assert sink.allowed is True
+
+    for unknown_destination in ("discord-public", "slack-private-group"):
+        public_auth = replace(
+            second_auth,
+            channel_id=unknown_destination,
+            resource_id=unknown_destination,
+        )
+        public_event = replace(second_event, channel_id=unknown_destination)
+        public_selected, public_blocks = agent._select_recent_activity(
+            public_event, public_auth,
+        )
+        assert "DM-ALICE-AUTHORED" not in {
+            message.content for message in public_selected
+        }
+        assert public_blocks == ()
+
+    restarted = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+    )
+    restarted_resolver = _resolver(home, (home / "state" / "identities.yaml").read_text())
+    restarted._identity_resolver = restarted_resolver
+    restarted._buffer.resolver = restarted_resolver
+    assert restarted._buffer.replay() == len(messages)
+    restarted_auth = _audience_auth(
+        restarted,
+        principal="discord-alice",
+        canonical="alice",
+        channel_id=second.thread_id,
+    )
+    restarted_selected, restarted_blocks = restarted._select_recent_activity(
+        second_event, restarted_auth,
+    )
+    assert "ACP-FIRST-ALICE" in {
+        message.content for message in restarted_selected
+    }
+    restarted_source = next(
+        block.labels.sources[0]
+        for block in restarted_blocks
+        if block.content == "ACP-FIRST-ALICE"
+    )
+    assert restarted_source.owner_attestation is not None
+    assert restarted_source.owner_attestation is not authored_source.owner_attestation
+    assert "owner_attestation" not in messages[0].to_dict()
+
+
+def test_agent_prompt_respects_cross_platform_pull_false(tmp_path: Path) -> None:
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+    )
+    resolver = _resolver(
+        agent._config.home,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-alice, slack-alice]
+            dm_channels: {slack: slack-D-alice}
+        """,
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._buffer.cross_platform_pull = False
+    session = SessionStore(agent._config.home).create_owned_session("alice")
+    mapped_alias = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="MAPPED-ALIAS-MUST-NOT-CROSS",
+        author="slack-alice",
+        source="slack",
+    )
+    exact_raw = agent._buffer.make_message(
+        channel_id="slack-D-alice",
+        kind="user_message",
+        content="EXACT-RAW-MAY-CROSS",
+        author="discord-alice",
+        source="slack",
+    )
+    agent._buffer._append_in_memory(mapped_alias)
+    agent._buffer._append_in_memory(exact_raw)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id=session.thread_id,
+        author="discord-alice",
+        content="now",
+    )
+    auth = _audience_auth(
+        agent,
+        principal="discord-alice",
+        canonical="alice",
+        channel_id=session.thread_id,
+        cross_platform_pull=False,
+    )
+    selected, _ = agent._select_recent_activity(event, auth)
+    content = {message.content for message in selected}
+    assert "EXACT-RAW-MAY-CROSS" in content
+    assert "MAPPED-ALIAS-MUST-NOT-CROSS" not in content
+
+
+def test_unknown_cross_history_is_omitted_and_reply_is_delivered(
+    tmp_path: Path,
+) -> None:
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+    )
+    resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: alice\n",
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    unknown = agent._buffer.make_message(
+        channel_id="discord-public",
+        kind="user_message",
+        content="UNKNOWN-CROSS-HISTORY",
+        author="alice",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(unknown)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="discord-current",
+        author="alice",
+        content="reply",
+        source="discord",
+    )
+    labels = _initialize_ifc_labels(event, resolver=resolver)
+    auth = replace(
+        _audience_auth(
+            agent,
+            principal="alice",
+            canonical="alice",
+            channel_id="discord-current",
+        ),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    selected, blocks = agent._select_recent_activity(event, auth)
+    assert selected == []
+    assert blocks == ()
+    reply = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        event.channel_id,
+        labels,
+        auth,
+        enforce=True,
+    )
+    assert reply.allowed is True
+
+
+async def test_audience_excluded_feedback_adds_no_label_and_does_not_block_reply(
+    tmp_path: Path,
+) -> None:
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
+    )
+    resolver = _resolver(
+        agent._config.home,
+        """
+        people:
+          - canonical: alice
+          - canonical: bob
+            dm_channels: {discord: discord-D-bob}
+        """,
+    )
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._feedback.identity_resolver = resolver
+    session = SessionStore(agent._config.home).create_owned_session("alice")
+    agent._config.events_log.write_text(json.dumps({
+        "timestamp": "2999-01-01T00:00:00+00:00",
+        "type": "tool_call_denied",
+        "tool": "foreign-secret-tool",
+        "reason": "FOREIGN-FEEDBACK-SECRET",
+        "channel_id": "discord-D-bob",
+        "owner_principal": "bob",
+    }) + "\n", encoding="utf-8")
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id=session.thread_id,
+        author="alice",
+        content="reply",
+        source="acp",
+    )
+    labels = _initialize_ifc_labels(event, resolver=resolver)
+    auth = replace(
+        _audience_auth(
+            agent,
+            principal="alice",
+            canonical="alice",
+            channel_id=session.thread_id,
+        ),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    ctx = TurnContext(
+        turn_id="audience-excluded-feedback",
+        session_id=session.thread_id,
+        trigger="user_message",
+        channel_id=session.thread_id,
+        started_at=time.monotonic(),
+        auth_context=auth,
+        ifc_labels=labels,
+    )
+    prompt, _ = await agent._build_turn_prompt(
+        ctx,
+        event,
+        saga_block=None,
+        initial_auth_context=auth,
+    )
+    assert "FOREIGN-FEEDBACK-SECRET" not in prompt
+    assert all(source.domain != "feedback" for source in ctx.ifc_labels.sources)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
+    reply = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        session.thread_id,
+        ctx.ifc_labels,
+        sink_auth,
+        enforce=True,
+    )
+    assert reply.allowed is True

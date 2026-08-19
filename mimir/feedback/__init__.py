@@ -44,7 +44,10 @@ from ..models import (
     InformationFlowLabels,
     PromptBlock,
 )
-from ..access_control import _source_is_triggering_channel_compatible
+from ..access_control import (
+    ChannelResourceAdapter,
+    _source_is_triggering_channel_compatible,
+)
 from .. import prompt_sources
 
 # --- Sub-module imports + backward-compat re-exports ---
@@ -110,6 +113,11 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "wiki_backlinks_unhealthy",
 })
 _AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
+_VALENCE_CHAIN_INPUT_KINDS = frozenset(
+    kind
+    for group in _VALENCE_GROUPS.values()
+    for kind in (*group.positive_kinds, *group.negative_kinds)
+)
 _AGENT_SELF_CHANNEL_CARRIERS = frozenset({
     "cross_turn_send_duplicate",
     "send_message_loop_hard_stop",
@@ -702,10 +710,20 @@ class FeedbackLog:
         def admit(record: dict, stream: str) -> dict | None:
             nonlocal labels
             raw_owner = _record_principal(record)
-            agent_self = raw_owner is None and _is_agent_self_record(record)
             channel = record.get("channel_id")
             if not isinstance(channel, str) or not channel:
                 channel = None
+            classified = classify(record.get("type"))
+            valence_chain_input = bool(
+                raw_owner is None
+                and channel is None
+                and classified is not None
+                and classified[1] in _VALENCE_CHAIN_INPUT_KINDS
+            )
+            agent_self = (
+                raw_owner is None
+                and (_is_agent_self_record(record) or valence_chain_input)
+            )
             same_channel = bool(
                 channel
                 and auth_context.channel_id
@@ -746,8 +764,6 @@ class FeedbackLog:
                 if _is_privileged(auth_context):
                     acl_values.add(effective_requester)
                 acl = frozenset(acl_values)
-                event_type = record.get("type")
-                classified = classify(event_type) if isinstance(event_type, str) else None
                 if classified and classified[1] in CHANNEL_SCOPED_FREE_TEXT_KINDS:
                     source_kind = "channel_scoped_feedback"
             else:
@@ -781,7 +797,9 @@ class FeedbackLog:
                 source,
                 effective_principal=effective_requester,
                 triggering_principal=auth_context.principal,
-                resolved_triggering=auth_context.channel_id,
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    auth_context.channel_id,
+                ),
                 audience_provider=auth_context.audience_provider,
                 cross_platform_pull=auth_context.cross_platform_pull,
             ):

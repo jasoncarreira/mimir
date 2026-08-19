@@ -5,12 +5,15 @@ classifies records by polarity, renders a prompt block."""
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import subprocess
 from dataclasses import replace
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 
@@ -3127,42 +3130,48 @@ def test_turn_error_content_and_label_share_one_admission(tmp_path: Path) -> Non
         "react_received",
     ],
 )
+@pytest.mark.parametrize("context_kind", ["admin", "service"])
 def test_channel_scoped_feedback_never_crosses_channels(
     tmp_path: Path,
     event_type: str,
+    context_kind: str,
 ) -> None:
     from mimir.identities import Identity
 
     class Resolver:
         def identity(self, author):
-            return Identity(canonical="root") if author == "root" else None
+            expected = "root" if context_kind == "admin" else "service:ops"
+            return Identity(canonical=expected) if author == expected else None
 
     class Provider:
         def audience_for(self, channel_id, *, principal):
-            return frozenset({"root"})
+            return frozenset({principal})
+
+    owner = "root" if context_kind == "admin" else "service:ops"
 
     log = _make_log(tmp_path, events=[{
         "timestamp": _ts(0.1),
         "type": event_type,
         "channel_id": "source",
-        "owner_principal": "root",
+        "owner_principal": owner,
         "commitment_id": "c1",
         "text": "CHANNEL SECRET",
         "emoji": "heart",
-        "author": "root",
+        "author": owner,
         "polarity": "positive",
         "snooze_count": 4,
         "threshold": 3,
     }])
     log.identity_resolver = Resolver()
     auth = AuthContext(
-        principal="root",
-        canonical_principal="root",
-        roles=("admin",),
+        principal="root" if context_kind == "admin" else "ops",
+        canonical_principal="root" if context_kind == "admin" else "ops",
+        roles=("admin",) if context_kind == "admin" else (),
         event_ingress=None,
         trigger="user_message",
         channel_id="destination",
         interactivity=None,
+        is_service=context_kind == "service",
         audience_provider=Provider(),
     )
     assert log.recent_prompt_block(auth) is None
@@ -3246,14 +3255,172 @@ def test_display_dropped_labels_remain_sink_compatible(tmp_path: Path) -> None:
 
 
 def test_channel_scoped_free_text_renderer_inventory_is_exhaustive() -> None:
-    from mimir.feedback.renderers import CHANNEL_SCOPED_FREE_TEXT_KINDS
+    from mimir.feedback.renderers import (
+        CHANNEL_SCOPED_FREE_TEXT_KINDS,
+        _render_event_line,
+    )
 
-    assert CHANNEL_SCOPED_FREE_TEXT_KINDS == frozenset({
-        "commitment_due",
-        "commitment_expired",
-        "commitment_snooze_pileup",
-        "react",
-    })
+    tree = ast.parse(dedent(inspect.getsource(_render_event_line)))
+    observed: dict[str, frozenset[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        kinds: set[str] = set()
+        test = node.test
+        if isinstance(test, ast.Compare) and isinstance(test.left, ast.Name):
+            if test.left.id != "rule_kind" or len(test.ops) != 1:
+                continue
+            comparator = test.comparators[0]
+            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+                kinds.add(comparator.value)
+            elif isinstance(comparator, (ast.Tuple, ast.Set)):
+                kinds.update(
+                    item.value
+                    for item in comparator.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                )
+        if not kinds:
+            continue
+        fields = {
+            call.args[0].value
+            for statement in node.body
+            for call in ast.walk(statement)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "ev"
+            and call.func.attr == "get"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        }
+        if "text" in fields or {"emoji", "author"} <= fields:
+            for kind in kinds:
+                observed[kind] = frozenset(fields)
+
+    assert observed == {
+        "commitment_due": frozenset({
+            "commitment_id", "text", "channel_id", "recipient_identity",
+        }),
+        "commitment_expired": frozenset({"commitment_id", "text", "channel_id"}),
+        "commitment_snooze_pileup": frozenset({
+            "commitment_id", "text", "snooze_count", "threshold",
+        }),
+        "react": frozenset({"emoji", "author", "target_age_minutes"}),
+    }
+    assert CHANNEL_SCOPED_FREE_TEXT_KINDS == frozenset(observed)
+
+
+def test_feedback_content_and_labels_cover_chain_loop_commitment_and_turn_error(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {"timestamp": _ts(0.6), "type": "git_push_failed", "reason": "failed"},
+        {"timestamp": _ts(0.5), "type": "git_push_ok", "via": "retry"},
+        *[
+            {
+                "timestamp": _ts(0.4 - index * 0.01),
+                "type": "send_message_sent",
+                "channel_id": "current",
+                "content_hash": "repeat",
+                "source": f"send-{index}",
+            }
+            for index in range(3)
+        ],
+        {
+            "timestamp": _ts(0.1),
+            "type": "commitment_due",
+            "channel_id": "current",
+            "owner_principal": "root",
+            "commitment_id": "commitment-unique",
+            "text": "COMMITMENT-PROVENANCE",
+        },
+    ]
+    turns = [{
+        "ts": _ts(0.05),
+        "turn_id": "turn-error-unique",
+        "channel_id": "current",
+        "owner_principal": "root",
+        "error": "TURN-ERROR-PROVENANCE",
+    }]
+    log = _make_log(tmp_path, events=events, turns=turns)
+    auth = AuthContext(
+        principal="root",
+        canonical_principal="root",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "git push:" in block.content
+    assert "cross-turn send loop" in block.content
+    assert "COMMITMENT-PROVENANCE" in block.content
+    assert "TURN-ERROR-PROVENANCE" in block.content
+    assert {source.source_kind for source in block.labels.sources} >= {
+        "agent_self",
+        "channel_bound_unowned_feedback",
+        "channel_scoped_feedback",
+        "protected_prompt",
+    }
+    assert all(source.is_complete for source in block.labels.sources)
+
+
+def test_dedupe_and_arousal_dropped_records_keep_admission_labels(
+    tmp_path: Path,
+) -> None:
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.3),
+            "type": "interactive_turn_no_send_message",
+            "turn_id": "visible",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "tool": "same",
+            "reason": "same",
+            "source": "dedupe-one",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "alice",
+            "tool": "same",
+            "reason": "same",
+            "source": "dedupe-two",
+        },
+    ])
+    log.arousal_thresholds = {"tool_denied": 3}
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    block = log.recent_prompt_block(auth)
+    assert block is not None
+    assert "tool_denied" not in block.content
+    assert len(block.labels.sources) == 3
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
+    )
+    assert decision.allowed is True
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

@@ -7,10 +7,12 @@ import logging
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 
@@ -3640,10 +3642,10 @@ def _service_turn_auth_context() -> AuthContext:
 
     class Resolver:
         def identity(self, author):
-            return Identity(canonical="service:github")
+            return Identity(canonical="attested-secret-principal")
 
     attestation = attest_owner(
-        Resolver(), "service:github", "poller:github-activity",
+        Resolver(), "raw-secret-author", "attested-secret-channel",
     )
     src = SourceLabel(
         principal="service:github", domain="channel",
@@ -3679,7 +3681,6 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
     the same runtime with an empty config parses fine.) Storing ``sources`` as a
     tuple fixes the data itself, so the duck-typed path is safe too.
     """
-    from langchain.tools import ToolRuntime
     from langgraph.runtime import Runtime
 
     from mimir.tools.store import memory_store
@@ -3716,21 +3717,86 @@ def test_tool_parse_input_survives_pregel_runtime_in_config():
         _parse(replace(ctx, ifc_labels=bad))
 
 
-def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority():
+async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience_authority():
+    from deepagents import create_deep_agent
+    from langchain.tools import ToolRuntime
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain_core.tools import tool
     from pydantic import TypeAdapter
 
-    ctx = _service_turn_auth_context()
-    source = ctx.ifc_labels.sources[0]
-    assert ctx.audience_provider is not None
-    assert source.owner_attestation is not None
-    dumped_context = TypeAdapter(AuthContext).dump_python(ctx)
-    dumped_labels = TypeAdapter(InformationFlowLabels).dump_python(ctx.ifc_labels)
-    serialized = repr((dumped_context, dumped_labels))
-    assert dumped_context is None
-    assert dumped_labels["sources"][0]["owner_attestation"] is None
-    assert "/authority-secret" not in serialized
-    assert "service:github" not in repr(
-        dumped_labels["sources"][0]["owner_attestation"]
+    captured: dict[str, object] = {}
+
+    @tool
+    def inspect_audience_authority(runtime: ToolRuntime[AuthContext]) -> str:
+        """Inspect server-provided audience authority."""
+        context = runtime.context
+        captured["context"] = context
+        captured["provider"] = context.audience_provider
+        captured["attestation"] = context.ifc_labels.sources[0].owner_attestation
+        captured["provider_result"] = context.audience_provider.audience_for(
+            None, principal="service:github",
+        )
+        captured["duck_dump"] = TypeAdapter(dict[str, Any]).dump_python(
+            runtime.config,
+        )
+        return "authority inspected"
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    model = ToolCallingModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "name": "inspect_audience_authority",
+            "args": {},
+            "id": "authority-call",
+            "type": "tool_call",
+        }]),
+        AIMessage(content="done"),
+    ]))
+    graph = create_deep_agent(
+        model=model,
+        tools=[inspect_audience_authority],
+        system_prompt="test",
+        context_schema=AuthContext,
+    )
+    context = _service_turn_auth_context()
+    typed_source = TypeAdapter(SourceLabel).dump_python(
+        context.ifc_labels.sources[0],
+    )
+    typed_context = TypeAdapter(AuthContext).dump_python(context)
+    assert typed_source["owner_attestation"] is None
+    assert typed_context["audience_provider"] is None
+    final_state: dict[str, Any] = {}
+    async for item in graph.astream(
+        {"messages": [HumanMessage(content="inspect")]},
+        context=context,
+        stream_mode=["values"],
+    ):
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "values":
+            final_state = item[1]
+        elif isinstance(item, dict):
+            final_state = item
+
+    assert captured["context"] is context
+    assert captured["provider"] is context.audience_provider
+    assert captured["attestation"] is context.ifc_labels.sources[0].owner_attestation
+    assert captured["provider_result"] is None
+    serialized = repr(captured["duck_dump"])
+    for secret in (
+        "/authority-secret",
+        "attested-secret-principal",
+        "raw-secret-author",
+        "attested-secret-channel",
+    ):
+        assert secret not in serialized
+    assert "owner_attestation" not in serialized
+    assert "audience_provider" not in serialized
+    assert any(
+        isinstance(message, ToolMessage)
+        and "authority inspected" in str(message.content)
+        for message in final_state.get("messages", [])
     )
 
 
@@ -3825,6 +3891,137 @@ def test_non_admin_operator_turn_is_denied_cross_channel_at_the_sink_gate() -> N
         target_channel=event.channel_id, ifc_labels=labels,
     )
     assert reply.allowed is True
+
+
+def test_admin_operator_cross_channel_send_succeeds_through_real_sink() -> None:
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-origin",
+        author="operator",
+        source="slack",
+        content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    decision = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-destination",
+        ifc_labels=labels,
+    )
+    assert decision.allowed is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "non_admin",
+        "shell_job_complete",
+        "indeterminate_ifc",
+        "incomplete_source",
+        "unauthorized_source",
+    ],
+)
+def test_cross_channel_sink_refusal_matrix(case: str) -> None:
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="slack-origin",
+        author="operator",
+        source="slack",
+        content="send the requested update",
+    )
+    auth, labels = _runtime_operator_context(event)
+    if case == "non_admin":
+        auth = replace(auth, roles=("user",))
+    elif case == "shell_job_complete":
+        auth = replace(auth, trigger="shell_job_complete")
+    elif case == "indeterminate_ifc":
+        auth = replace(auth, ifc_state=SimpleNamespace(
+            has_untrusted_active_ingest=lambda _: None,
+            consume_sink_approval=lambda **_: False,
+        ))
+    elif case == "incomplete_source":
+        labels = labels.with_source(SourceLabel(
+            principal="operator",
+            domain="channel",
+            resource_id="slack-origin",
+            bridge_instance=None,
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+        ))
+        auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+    else:
+        labels = labels.with_source(SourceLabel(
+            principal="foreign",
+            domain="channel",
+            resource_id="slack-origin",
+            bridge_instance="slack",
+            sensitivity="private",
+            authorized_principals=frozenset({"foreign"}),
+        ))
+        auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+
+    decision = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-destination",
+        ifc_labels=labels,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
+def test_noninteractive_delivery_only_allows_configured_operator_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operator_channel = "slack-operator-alert"
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", operator_channel)
+    event = AgentEvent(
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        author="operator",
+        source="scheduler",
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="operator",
+        domain="channel",
+        resource_id="foreign-channel",
+        bridge_instance=None,
+        sensitivity="private",
+        authorized_principals=frozenset(),
+    ))
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="scheduler:heartbeat",
+        bridge_instance="scheduler",
+        ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    configured = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel=operator_channel,
+        ifc_labels=labels,
+    )
+    arbitrary = ToolRegistry().authorize_tool(
+        "send_message",
+        auth,
+        enforce=True,
+        target_channel="slack-arbitrary",
+        ifc_labels=labels,
+    )
+    assert configured.allowed is True
+    assert arbitrary.allowed is False
 
 
 def _approval_reply_source() -> SourceLabel:

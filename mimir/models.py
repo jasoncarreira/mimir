@@ -11,7 +11,7 @@ import json
 import time
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -149,8 +149,12 @@ _RedactedAudienceProvider = Annotated[
 ]
 
 
-@dataclass(frozen=True)
-class SourceLabel:
+class _SourceLabelAuthoritySlot:
+    __slots__ = ("_owner_attestation",)
+
+
+@dataclass(frozen=True, eq=False)
+class SourceLabel(_SourceLabelAuthoritySlot):
     """Server-authoritative provenance for one protected input.
 
     ``authorized_principals`` is the effective read ACL. Derived service data
@@ -167,15 +171,64 @@ class SourceLabel:
     source_kind: str = "channel"
     integrity: str = Integrity.UNTRUSTED
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
-    owner_attestation: _RedactedOwnerAttestation = None
+    owner_attestation: InitVar[_RedactedOwnerAttestation] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, owner_attestation: OwnerAttestation | None) -> None:
         if self.integrity not in Integrity._value2member_map_:
             raise ValueError(f"invalid source integrity: {self.integrity!r}")
         if self.integrity_effect not in IntegrityEffect._value2member_map_:
             raise ValueError(
                 f"invalid source integrity effect: {self.integrity_effect!r}"
             )
+        object.__setattr__(self, "_owner_attestation", owner_attestation)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "owner_attestation":
+            return object.__getattribute__(self, "_owner_attestation")
+        return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        return (
+            self.principal,
+            self.domain,
+            self.resource_id,
+            self.bridge_instance,
+            self.sensitivity,
+            self.authorized_principals,
+            self.source_kind,
+            self.integrity,
+            self.integrity_effect,
+            self.owner_attestation,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SourceLabel):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        from pydantic_core import core_schema
+
+        schema = handler(source)
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            lambda value: {
+                "principal": value.principal,
+                "domain": value.domain,
+                "resource_id": value.resource_id,
+                "bridge_instance": value.bridge_instance,
+                "sensitivity": value.sensitivity,
+                "authorized_principals": value.authorized_principals,
+                "source_kind": value.source_kind,
+                "integrity": value.integrity,
+                "integrity_effect": value.integrity_effect,
+                "owner_attestation": None,
+            },
+        )
+        return schema
 
     @property
     def is_complete(self) -> bool:
@@ -1033,8 +1086,12 @@ class ServerDiscoveredPRStates:
             return self._states.setdefault(target, state)
 
 
+class _AuthContextAuthoritySlot:
+    __slots__ = ("_audience_provider",)
+
+
 @dataclass(frozen=True)
-class AuthContext:
+class AuthContext(_AuthContextAuthoritySlot):
     """Frozen, server-created authorization context (chainlink #864).
 
     This context carries immutable authorization state from the server's ingress
@@ -1105,10 +1162,16 @@ class AuthContext:
     # Server-selected SAGA resource for a synthesis turn. Model-supplied
     # session IDs are only selectors and must match this immutable value.
     saga_session_id: str | None = None
-    audience_provider: _RedactedAudienceProvider = field(
-        default=None, repr=False, compare=False,
-    )
+    audience_provider: InitVar[_RedactedAudienceProvider] = None
     cross_platform_pull: bool = True
+
+    def __post_init__(self, audience_provider: Any) -> None:
+        object.__setattr__(self, "_audience_provider", audience_provider)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "audience_provider":
+            return object.__getattribute__(self, "_audience_provider")
+        return object.__getattribute__(self, name)
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
@@ -1139,7 +1202,7 @@ class AuthContext:
 
         schema = handler(source)
         schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
-            lambda _value: None,
+            lambda _value: {"audience_provider": None},
         )
         return schema
 
