@@ -4718,7 +4718,10 @@ def _same_channel_authority(
         return True
     source_bridge = getattr(source, "bridge_instance", None)
     if not source_bridge or not triggering_bridge_instance:
-        return True
+        # Unknown authority is not proof of the same authority. Treating it as
+        # compatible would let a channel-scoped source with no recorded bridge
+        # take the fast path and skip the audience lookup entirely.
+        return False
     return source_bridge == triggering_bridge_instance
 
 

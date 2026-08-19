@@ -180,6 +180,25 @@ def test_same_normalized_channel_from_other_bridge_authority_is_not_admitted():
     assert decision.reason == "ifc_label_blocked:same_channel"
 
 
+@pytest.mark.parametrize("absent", ["source", "trigger"])
+def test_absent_bridge_authority_does_not_take_the_same_channel_shortcut(absent: str):
+    """Unknown authority is not proof of the same authority.
+
+    The same-channel shortcut skips the audience lookup entirely, so it must
+    fire only on a proven authority match. A missing bridge on either side
+    leaves that unproven and declines the shortcut.
+    """
+    labels = _labels(bridge_instance="" if absent == "source" else "slack")
+    auth = _auth() if absent == "source" else replace(_auth(), bridge_instance=None)
+
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "slack-C1", labels, auth, enforce=True,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:same_channel"
+
+
 def test_labels_without_source_provenance_fail_closed():
     labels = InformationFlowLabels(
         labels=frozenset({"private"}),
