@@ -941,6 +941,67 @@ def test_poller_managed_state_is_untrusted_active_ingest(
     assert source.integrity_effect == "active_ingest"
 
 
+@pytest.mark.parametrize("root", ["docs", "prompts"])
+def test_seeded_reference_roots_are_trusted_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+) -> None:
+    """``docs/`` and ``prompts/`` are scaffolded, not ingested.
+
+    Reading either used to mark the turn untrusted/active_ingest, which is the
+    unconditional egress veto -- so a turn that read its own seeded reference
+    material could no longer answer the person who asked.
+    """
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    seeded = tmp_path / root / "configuration.md"
+    seeded.parent.mkdir(parents=True)
+    seeded.write_text("# seeded by mimir setup\n", encoding="utf-8")
+
+    source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(seeded.resolve()), bridge_instance="filesystem",
+    )
+
+    assert source.integrity == "trusted"
+    assert source.integrity_effect == "informational"
+
+
+@pytest.mark.parametrize("root", ["docs", "prompts"])
+def test_untrusted_model_write_cannot_launder_through_reference_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+) -> None:
+    """Widening the trusted roots must not open a laundering path.
+
+    The trusted default is the *path*; integrity still comes from the persisted
+    map, so content the model wrote while tainted stays untrusted even though it
+    now lives under a trusted root.
+    """
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = tmp_path / root / "notes.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("attacker-derived instructions", encoding="utf-8")
+
+    tainted_source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str((tmp_path / "attachments" / "page.html")),
+        bridge_instance="filesystem",
+    )
+    tainted = InformationFlowLabels(sources=(tainted_source,))
+    assert tainted.has_untrusted_active_ingest is True
+
+    record_file_write_integrity(str(target), tainted)
+
+    reread = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(target.resolve()), bridge_instance="filesystem",
+    )
+    assert reread.integrity == "untrusted"
+    assert reread.integrity_effect == "active_ingest"
+
+
 @pytest.mark.parametrize("approved", [True, False])
 def test_fetch_approval_never_confers_integrity(
     tmp_path: Path,
