@@ -122,9 +122,14 @@ async def test_recovery_drops_and_cannot_forge_owner_attestation(
 
     class Resolver:
         def identity(self, author):
-            return Identity(canonical="alice") if author == "raw-alice" else None
+            return (
+                Identity(canonical="alice")
+                if author in {"alice", "discord-123"}
+                else None
+            )
 
-    attestation = attest_owner(Resolver(), "raw-alice", "source-channel")
+    resolver = Resolver()
+    attestation = attest_owner(resolver, "discord-123", "source-channel")
     assert attestation is not None
     source = SourceLabel(
         principal="alice",
@@ -138,6 +143,22 @@ async def test_recovery_drops_and_cannot_forge_owner_attestation(
     )
     event = _make_event("sid-attested")
     event.ifc_labels = InformationFlowLabels().with_source(source)
+    event.extra["feedback_record"] = {
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "type": "react_received",
+        "event_version": "v1",
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": "discord-123",
+        "owner_principal": "alice",
+        "emoji": "thumbsup",
+        "polarity": "positive",
+        "owner_attestation": {
+            "canonical_principal": "mallory",
+            "raw_author": "discord-123",
+            "source_channel": "forged-channel",
+        },
+    }
 
     await poller_recovery.stash_enqueued_event(tmp_path, event)
     raw_event = poller_recovery._load_state(tmp_path)["inflight"]["sid-attested"]["event"]
@@ -155,9 +176,55 @@ async def test_recovery_drops_and_cannot_forge_owner_attestation(
     assert restored.ifc_labels is not None
     assert restored.ifc_labels.sources[0].owner_attestation is None
     assert restored.continuation_auth_context is None
-    fresh = attest_owner(Resolver(), "raw-alice", "source-channel")
-    assert fresh is not None
-    assert fresh is not attestation
+    assert restored.extra["feedback_record"]["owner_attestation"][
+        "canonical_principal"
+    ] == "mallory"
+
+    from mimir.feedback import FeedbackLog
+    from mimir.models import AuthContext
+
+    class Provider:
+        identity_resolver = resolver
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str | None, str | None]] = []
+
+        def audience_for(self, channel_id, *, principal):
+            self.calls.append((channel_id, principal))
+            return frozenset({"alice"})
+
+    provider = Provider()
+    feedback_path = tmp_path / "events.jsonl"
+    feedback_path.write_text(
+        json.dumps(restored.extra["feedback_record"]) + "\n",
+        encoding="utf-8",
+    )
+    feedback = FeedbackLog(
+        events_path=feedback_path,
+        turns_path=tmp_path / "turns.jsonl",
+        identity_resolver=resolver,
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:current-destination",
+        interactivity=None,
+        audience_provider=provider,
+    )
+
+    block = feedback.recent_prompt_block(auth)
+
+    assert block is not None
+    [rederived] = block.labels.sources
+    assert rederived.owner_attestation is not None
+    assert rederived.owner_attestation is not attestation
+    assert rederived.owner_attestation.canonical_principal == "alice"
+    assert rederived.owner_attestation.raw_author == "discord-123"
+    assert rederived.owner_attestation.source_channel == "source-channel"
+    assert provider.calls == [("acp:current-destination", "alice")]
 
 
 async def test_stash_recovery_document_io_runs_off_loop(

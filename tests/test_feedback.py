@@ -17,7 +17,8 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.access_control import SinkGate, _source_is_triggering_channel_compatible
+from mimir.access_control import SinkGate, create_auth_context
+from mimir.agent import _initialize_ifc_labels
 from mimir.feedback import (
     FeedbackLog,
     FeedbackSignal,
@@ -32,11 +33,13 @@ from mimir.feedback import (
 from mimir.jsonl_snapshot import JsonlSnapshot
 from mimir.models import (
     AuthContext,
+    AgentEvent,
     InformationFlowLabels,
     InformationFlowState,
     Integrity,
     IntegrityEffect,
     SourceLabel,
+    TurnInteractivity,
 )
 
 
@@ -90,10 +93,12 @@ class _FeedbackResolver:
     def __init__(self, identities: dict[str, str]) -> None:
         self.identities = identities
         self.raises = False
+        self.identity_calls: list[object] = []
 
     def identity(self, value):
         from mimir.identities import Identity
 
+        self.identity_calls.append(value)
         if self.raises:
             raise RuntimeError("resolver unavailable")
         canonical = self.identities.get(value)
@@ -117,6 +122,7 @@ def _feedback_owner_auth(
     *,
     principal: str = "alice",
     audience: frozenset[str] | None = None,
+    audience_resolver: object | None = None,
 ) -> AuthContext:
     return AuthContext(
         principal=principal,
@@ -128,7 +134,7 @@ def _feedback_owner_auth(
         interactivity=None,
         enforcement_enabled=True,
         audience_provider=_FeedbackAudienceProvider(
-            resolver,
+            audience_resolver if audience_resolver is not None else resolver,
             audience if audience is not None else frozenset({principal}),
         ),
         cross_platform_pull=True,
@@ -3498,6 +3504,108 @@ def test_commitment_feedback_requires_extraction_acl_provenance_for_each_kind(
         assert rejected_log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
 
 
+@pytest.mark.parametrize(
+    "event_kind",
+    ["commitment_due", "commitment_expired", "commitment_snooze_pileup"],
+)
+async def test_real_commitment_pollers_feed_only_provenance_attested_owner_history(
+    tmp_path: Path,
+    event_kind: str,
+) -> None:
+    import time
+
+    from mimir.commitments.extractor import assign_extraction_acl
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.commitments.poller import check_due_and_expired
+    from mimir.commitments.store import CommitmentsStore
+    from mimir.event_logger import init_logger
+    from mimir.models import SessionACL
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    init_logger(events_path, session_id=f"feedback-{event_kind}")
+    store = CommitmentsStore(tmp_path / "commitments.jsonl")
+    now = time.time()
+    timing = {
+        "commitment_due": {
+            "due_window_start_unix": now - 10,
+            "due_window_end_unix": now + 10,
+        },
+        "commitment_expired": {
+            "due_window_start_unix": now - 20,
+            "due_window_end_unix": now - 1,
+        },
+        "commitment_snooze_pileup": {
+            "snooze_count": 3,
+        },
+    }[event_kind]
+    attested = CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="commitment-source",
+        text=f"ATTESTED-{event_kind}",
+        **timing,
+    )
+    assign_extraction_acl(
+        attested,
+        SessionACL(
+            owner_principal="alice",
+            origin_channel="commitment-source",
+            origin_domain="discord",
+            visibility="private",
+            provenance_complete=True,
+        ),
+        service_name="mimir",
+    )
+    copied = CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="commitment-source",
+        text=f"COPIED-{event_kind}",
+        owner_principal="alice",
+        **timing,
+    )
+    await store.add(attested)
+    await store.add(copied)
+    replayed = store.current_state()
+    assert replayed[attested.id].ownership_provenance is not None
+    assert replayed[copied.id].ownership_provenance is None
+
+    result = await check_due_and_expired(store, now_unix=now)
+
+    emitted_count = {
+        "commitment_due": result.due_emitted,
+        "commitment_expired": result.expired_emitted,
+        "commitment_snooze_pileup": result.snooze_pileup_emitted,
+    }[event_kind]
+    assert emitted_count == 2
+    persisted = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    emitted = [row for row in persisted if row.get("type") == event_kind]
+    assert len(emitted) == 2
+    assert {row["ownership_provenance"] for row in emitted} == {
+        "extraction_acl",
+        None,
+    }
+
+    resolver = _FeedbackResolver({"alice": "alice"})
+    feedback = FeedbackLog(
+        events_path=events_path,
+        turns_path=tmp_path / "logs" / "turns.jsonl",
+        identity_resolver=resolver,
+    )
+    block = feedback.recent_prompt_block(_feedback_owner_auth(resolver))
+
+    assert block is not None
+    assert f"ATTESTED-{event_kind}" in block.content
+    assert f"COPIED-{event_kind}" not in block.content
+    assert len(block.labels.sources) == 1
+    [source] = block.labels.sources
+    assert source.source_kind == "owner_attested_feedback"
+    assert source.owner_attestation is not None
+    assert source.owner_attestation.raw_author == "alice"
+
+
 def test_snooze_pileup_legacy_ineligible_v1_eligible(tmp_path: Path) -> None:
     resolver = _FeedbackResolver({"alice": "alice", "owner-alias": "alice"})
     base = {
@@ -3592,53 +3700,92 @@ def test_feedback_owner_reassignment_and_removal_are_read_time_only_for_v0_and_v
     assert log.events_path.read_bytes() == original
 
 
-@pytest.mark.parametrize("mode", ["identical-unknown", "canonical-shaped", "raises"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "identical-unknown",
+        "canonical-shaped",
+        "owner-raises",
+        "audience-raises",
+    ],
+)
 def test_feedback_unknown_owner_matrix_omits_secret_without_blocking_reply(
     tmp_path: Path,
     mode: str,
 ) -> None:
-    raw = "alice" if mode == "canonical-shaped" else "discord-999"
-    resolver = _FeedbackResolver({"alice": "alice"})
+    owner_resolver = _FeedbackResolver({
+        "alice": "alice",
+        "discord-123": "alice",
+    })
+    audience_resolver = owner_resolver
     if mode == "canonical-shaped":
-        resolver.identities = {}
-    if mode == "raises":
-        resolver.raises = True
-    log = _make_log(tmp_path, events=[{
-        "timestamp": _ts(0.1),
-        "type": "react_received",
-        "event_version": "v1",
-        "bridge": "discord",
-        "channel_id": "source-channel",
-        "author": raw,
-        "owner_principal": raw,
-        "emoji": "UNKNOWN-OWNER-SECRET",
-        "polarity": "positive",
-    }])
-    log.identity_resolver = resolver
-    auth = replace(_feedback_owner_auth(resolver), roles=("admin",))
+        owner_resolver.identities = {}
+        record = {
+            "timestamp": _ts(0.1),
+            "type": "commitment_due",
+            "event_version": "v1",
+            "channel_id": "source-channel",
+            "owner_principal": "alice",
+            "ownership_provenance": "extraction_acl",
+            "commitment_id": "c-canonical-unknown",
+            "text": "UNKNOWN-OWNER-SECRET",
+        }
+        expected_owner_call = "alice"
+    else:
+        raw = "discord-999" if mode == "identical-unknown" else "discord-123"
+        record = {
+            "timestamp": _ts(0.1),
+            "type": "react_received",
+            "event_version": "v1",
+            "bridge": "discord",
+            "channel_id": "source-channel",
+            "author": raw,
+            "owner_principal": raw,
+            "emoji": "UNKNOWN-OWNER-SECRET",
+            "polarity": "positive",
+        }
+        expected_owner_call = raw
+    if mode == "owner-raises":
+        owner_resolver.raises = True
+    if mode == "audience-raises":
+        audience_resolver = _FeedbackResolver({})
+        audience_resolver.raises = True
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = owner_resolver
+    auth = _feedback_owner_auth(
+        owner_resolver,
+        audience_resolver=audience_resolver,
+    )
 
     block = log.recent_prompt_block(auth)
 
     assert block is None
-    labels = InformationFlowLabels().with_source(
-        SourceLabel(
-            principal="alice",
-            domain="channel",
-            resource_id="acp:destination",
-            bridge_instance="acp",
-            sensitivity="private",
-            authorized_principals=frozenset({"alice"}),
-        )
+    assert "UNKNOWN-OWNER-SECRET" not in (block.content if block else "")
+    assert expected_owner_call in owner_resolver.identity_calls
+    if mode == "audience-raises":
+        assert audience_resolver.identity_calls == ["alice"]
+
+    reply_event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp:destination",
+        author="alice",
+        source="acp",
     )
-    assert _source_is_triggering_channel_compatible(
-        labels.sources[0],
-        effective_principal="alice",
-        triggering_principal="alice",
-        resolved_triggering="acp:destination",
-        audience_provider=auth.audience_provider,
-        cross_platform_pull=True,
-        triggering_bridge_instance="acp",
-    ) is True
+    labels = _initialize_ifc_labels(reply_event)
+    reply_auth = replace(
+        create_auth_context(reply_event, enforce=True, ifc_labels=labels),
+        roles=("user", "admin"),
+        interactivity=TurnInteractivity.INTERACTIVE,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    decision = SinkGate.check_sink_flow(
+        "send_message",
+        reply_event.channel_id,
+        labels,
+        reply_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
 
 
 def test_turn_error_content_and_label_share_one_admission(tmp_path: Path) -> None:
