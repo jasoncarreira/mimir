@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 from typing import Callable, Sequence
 import uuid
 
@@ -656,8 +657,15 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
         verified = runner([
             "git", "-C", str(lease.path), "bundle", "verify", str(bundle),
         ])
-        if verified.returncode != 0:
+        if verified.returncode != 0 or bundle.stat().st_size == 0:
             raise RuntimeError("existing PR checkout lease recovery bundle is invalid")
+        heads = _run(
+            runner,
+            ["git", "-C", str(lease.path), "bundle", "list-heads", str(bundle)],
+            "existing PR checkout lease recovery bundle has no heads",
+        )
+        if head not in {line.split()[0].lower() for line in heads.splitlines() if line}:
+            raise RuntimeError("existing PR checkout lease recovery bundle has another HEAD")
         return bundle
     staging = recovery_root / f".{bundle.name}.{uuid.uuid4().hex}.tmp"
     try:
@@ -671,9 +679,64 @@ def _preserve_checkout_head(lease: PRCheckoutLease, head: str, runner: Runner) -
             ["git", "-C", str(lease.path), "bundle", "verify", str(staging)],
             "PR checkout lease recovery bundle verification failed",
         )
+        if staging.stat().st_size == 0:
+            raise RuntimeError("PR checkout lease recovery bundle is empty")
         os.replace(staging, bundle)
     finally:
         staging.unlink(missing_ok=True)
+    return bundle
+
+
+def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
+    """Atomically archive dirty tracked and untracked files without changing them."""
+    archive = bundle.with_suffix(".worktree.tar.gz")
+    if archive.exists():
+        if not archive.is_file() or archive.stat().st_size == 0:
+            raise RuntimeError("existing dirty-worktree recovery archive is invalid")
+        with tarfile.open(archive, "r:gz") as retained:
+            if not retained.getmembers():
+                raise RuntimeError("existing dirty-worktree recovery archive is empty")
+        return archive
+
+    staging = archive.with_name(f".{archive.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tarfile.open(staging, "w:gz") as retained:
+            for entry in lease.path.iterdir():
+                if entry.name != ".git":
+                    retained.add(entry, arcname=str(Path("worktree") / entry.name))
+        with tarfile.open(staging, "r:gz") as retained:
+            if not retained.getmembers():
+                raise RuntimeError("dirty-worktree recovery archive is empty")
+        if staging.stat().st_size == 0:
+            raise RuntimeError("dirty-worktree recovery archive is empty")
+        os.replace(staging, archive)
+    finally:
+        staging.unlink(missing_ok=True)
+    return archive
+
+
+def _recover_retained_checkout(
+    lease: PRCheckoutLease,
+    *,
+    head: str,
+    dirty: bool,
+    runner: Runner,
+) -> Path:
+    """Preserve all retained state before releasing its checkout directory."""
+    try:
+        bundle = _preserve_checkout_head(lease, head, runner)
+        if not bundle.is_file() or bundle.stat().st_size == 0:
+            raise RuntimeError("recovery bundle was not confirmed present and non-empty")
+        if dirty:
+            archive = _preserve_dirty_worktree(lease, bundle)
+            if not archive.is_file() or archive.stat().st_size == 0:
+                raise RuntimeError("dirty-worktree recovery archive was not confirmed")
+    except (OSError, RuntimeError, tarfile.TarError) as exc:
+        raise RuntimeError(
+            "PR checkout lease recovery failed; lease retained at "
+            f"{lease.path} with HEAD {head}. Operator must preserve the checkout "
+            f"and recover or publish its work manually: {exc}"
+        ) from exc
     return bundle
 
 
@@ -749,7 +812,19 @@ def reclaim_expired_pr_checkout_leases(
             recovery_bundle: Path | None = None
             canonical_origin_contains_head: bool | None = None
             try:
+                head = _run(
+                    runner,
+                    ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+                    "PR checkout lease reclamation found no HEAD",
+                ).lower()
+                canonical_origin_contains_head = _origin_contains_head(lease, head, runner)
                 reclaimed = cleanup_pr_checkout_lease(lease, runner=runner)
+                candidate = (
+                    root / _RECOVERY_DIRECTORY
+                    / f"{lease.path.name}-{lease.recovery_id}.bundle"
+                )
+                if candidate.is_file():
+                    recovery_bundle = candidate
             except RuntimeError as exc:
                 error = str(exc)
                 if error in {
@@ -936,7 +1011,6 @@ def acquire_pr_checkout_lease(
                 if observed_head is not None and lease.head_sha.lower() != observed_head
             ]
             retained: list[tuple[Path, str]] = []
-            retained_details: list[str] = []
             for lease in stale:
                 head = _run(
                     runner,
@@ -951,7 +1025,6 @@ def acquire_pr_checkout_lease(
                 )
                 if status:
                     retained.append((lease.path, head))
-                    retained_details.append(f"dirty worktree ({lease.path})")
                     continue
                 if head != lease.head_sha.lower():
                     published_head = _run(
@@ -980,21 +1053,11 @@ def acquire_pr_checkout_lease(
                             runner=runner,
                         )
                     )
-                    if unexplained:
+                    if unexplained and _origin_contains_head(lease, head, runner) is not True:
                         retained.append((lease.path, head))
-                        retained_details.append(
-                            f"unexplained paths {', '.join(repr(name) for name in unexplained)} "
-                            f"({lease.path})"
-                        )
 
             if retained:
                 _report_retained_candidates("pr_checkout_lease_retained", scope, retained)
-                named = ", ".join(f"{head} ({path})" for path, head in retained)
-                detail = "; ".join(retained_details)
-                raise RuntimeError(
-                    "superseded PR checkout lease has retained work; refusing release: "
-                    f"{named}; {detail}"
-                )
 
             for lease in stale:
                 cleanup_pr_checkout_lease(
@@ -1074,11 +1137,11 @@ def cleanup_pr_checkout_lease(
     review_state: RepoReviewState | None = None,
     runner: Runner = _default_runner,
 ) -> bool:
-    """Revoke and remove an exact lease; repeated cleanup is a safe no-op."""
-    if review_state is not None:
-        review_state.revoke_checkout_lease(lease)
-    lease.revoke()
+    """Remove an exact lease, preserving any work not proven published."""
     if not lease.path.exists() and not lease.path.is_symlink():
+        if review_state is not None:
+            review_state.revoke_checkout_lease(lease)
+        lease.revoke()
         return False
     _safe_lease_path(lease.lease_root, lease.path, must_exist=True)
     try:
@@ -1130,24 +1193,32 @@ def cleanup_pr_checkout_lease(
             "PR checkout lease cleanup branch mismatch: "
             f"expected {expected_branch!r}; actual {branch!r}"
         )
+    status = _run(
+        runner,
+        ["git", "-C", str(lease.path), "status", "--porcelain=v1",
+         "--untracked-files=all"],
+        "PR checkout lease cleanup status inspection failed",
+    )
     published = runner([
         "git", "-C", str(lease.path), "rev-parse", "--verify",
         f"{PUBLISHED_HEAD_REF}^{{commit}}",
     ])
-    if published.returncode != 0:
-        raise RuntimeError("PR checkout lease cleanup found no publication proof")
-    published_head = published.stdout.strip().lower()
-    ancestor = runner([
-        "git", "-C", str(lease.path), "merge-base", "--is-ancestor", head,
-        published_head,
-    ])
-    if ancestor.returncode not in {0, 1}:
-        raise RuntimeError(
-            (ancestor.stderr or ancestor.stdout).strip()
-            or "PR checkout lease publication ancestry inspection failed"
-        )
+    ancestor_returncode = 1
+    published_head = "<missing>"
+    if published.returncode == 0:
+        published_head = published.stdout.strip().lower()
+        ancestor = runner([
+            "git", "-C", str(lease.path), "merge-base", "--is-ancestor", head,
+            published_head,
+        ])
+        if ancestor.returncode not in {0, 1}:
+            raise RuntimeError(
+                (ancestor.stderr or ancestor.stdout).strip()
+                or "PR checkout lease publication ancestry inspection failed"
+            )
+        ancestor_returncode = ancestor.returncode
     unexplained: tuple[str, ...] = ()
-    if ancestor.returncode == 1 and base_ref is not None:
+    if published.returncode == 0 and ancestor_returncode == 1 and base_ref is not None:
         unexplained = _unexplained_publication_paths(
             lease,
             head=head,
@@ -1155,15 +1226,18 @@ def cleanup_pr_checkout_lease(
             base_ref=base_ref,
             runner=runner,
         )
-    if ancestor.returncode == 1 and (base_ref is None or unexplained):
-        detail = (
-            f"; unexplained paths: {', '.join(repr(name) for name in unexplained)}"
-            if unexplained else ""
-        )
-        raise RuntimeError(
-            "PR checkout lease cleanup publication mismatch: "
-            f"HEAD {head!r} is not contained in published commit {published_head!r}"
-            f"{detail}"
+    retained_head = (
+        published.returncode != 0
+        or (ancestor_returncode == 1 and (base_ref is None or bool(unexplained)))
+    )
+    if retained_head and not status and _origin_contains_head(lease, head, runner) is True:
+        retained_head = False
+    if status or retained_head:
+        _recover_retained_checkout(
+            lease, head=head, dirty=bool(status), runner=runner,
         )
     rmtree_missing_ok(lease.path)
+    if review_state is not None:
+        review_state.revoke_checkout_lease(lease)
+    lease.revoke()
     return True
