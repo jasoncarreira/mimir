@@ -111,6 +111,7 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
 class FakeForge:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.diff = "diff --git a/src/app.py b/src/app.py"
         self.snapshot_author = "untrusted-author"
         self.snapshot_heads = ["c" * 40]
         self.snapshot_repo = "owner/repo"
@@ -149,7 +150,7 @@ class FakeForge:
 
     def get_diff(self, scope):
         self.calls.append(("diff", scope))
-        return "diff --git a/src/app.py b/src/app.py"
+        return self.diff
 
     def list_checks(self, scope):
         self.calls.append(("checks", scope))
