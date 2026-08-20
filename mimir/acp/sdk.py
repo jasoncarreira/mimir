@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -967,11 +967,32 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         return task
 
 
+#: How long a cancelled ``run_stdio_agent`` will wait for the shielded
+#: ``connection.close()`` before cancelling it and re-raising.
+#:
+#: The close is shielded so a cancel does not abandon a half-written frame, but
+#: the wait must still be bounded: ``AcpDaemon._finish_runner`` allows
+#: ``ACP_PEER_CANCEL_TIMEOUT`` before it escalates to ``transport.abort()`` and
+#: then gives up, and the daemon releases its single admission slot when the
+#: runner task completes. An unbounded wait here therefore lets a close that
+#: resists cancellation keep a retired generation's dispatcher alive past the
+#: point where the daemon has stopped waiting for it and a replacement peer can
+#: be admitted -- two generations against one agent, which ``ACP_MAX_PEERS = 1``
+#: exists to prevent.
+#:
+#: Two intervals must stay strictly below the daemon's cancel timeout so the
+#: runner resolves
+#: on its own rather than being aborted; asserted by
+#: ``test_close_bound_fits_inside_the_daemon_cancel_budget``.
+ACP_CLOSE_CANCEL_TIMEOUT = 0.5
+
+
 async def run_stdio_agent(
     agent: Agent,
     *,
     request_reader: asyncio.StreamReader,
     response_writer: asyncio.StreamWriter,
+    on_close_abandoned: Callable[[asyncio.Task[None]], None] | None = None,
 ) -> None:
     holder: dict[str, AcpPeer] = {}
     base_router = build_agent_router(agent, use_unstable_protocol=False)
@@ -1016,7 +1037,29 @@ async def run_stdio_agent(
         try:
             await asyncio.shield(close_task)
         except asyncio.CancelledError:
-            await close_task
+            # asyncio.wait does not deliver the cancellation into close_task, so
+            # a well-behaved close still finishes; one that resists is cancelled
+            # rather than waited on forever.
+            _, unfinished = await asyncio.wait(
+                {close_task}, timeout=ACP_CLOSE_CANCEL_TIMEOUT,
+            )
+            if unfinished:
+                close_task.cancel()
+                # Bounded a second time on purpose. A close that also swallows
+                # cancellation must not pin the runner either, so the worst case
+                # is two intervals and the runner still resolves inside the
+                # daemon's cancel window.
+                await asyncio.wait(
+                    {close_task}, timeout=ACP_CLOSE_CANCEL_TIMEOUT,
+                )
+                if not close_task.done() and on_close_abandoned is not None:
+                    # Bounding the wait is not the same as retiring the
+                    # generation. Returning here frees the daemon's admission
+                    # slot -- it is released from the runner task's done
+                    # callback -- while this close is still running, so the
+                    # caller has to know the generation is unretired or it will
+                    # admit a replacement alongside live old work.
+                    on_close_abandoned(close_task)
             raise
     except BaseException as exc:
         close_failure = exc

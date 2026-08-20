@@ -271,7 +271,20 @@ def test_pinned_agent_signatures_and_error_objects() -> None:
         "self", "session_id", "prompt", "kwargs"
     ]
     runner_parameters = inspect.signature(sdk.run_stdio_agent).parameters
-    assert list(runner_parameters) == ["agent", "request_reader", "response_writer"]
+    # ``on_close_abandoned`` is keyword-only with a None default, so every
+    # existing caller is unaffected. It exists because bounding the runner's
+    # wait for the shielded close is not the same as retiring the generation:
+    # the runner can return while that close is still live, and the daemon
+    # frees its single admission slot from the runner task's done callback. The
+    # daemon has no other handle on that task, so it has to be told.
+    assert list(runner_parameters) == [
+        "agent", "request_reader", "response_writer", "on_close_abandoned",
+    ]
+    assert (
+        runner_parameters["on_close_abandoned"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert runner_parameters["on_close_abandoned"].default is None
     assert runner_parameters["request_reader"].kind is inspect.Parameter.KEYWORD_ONLY
     assert runner_parameters["response_writer"].kind is inspect.Parameter.KEYWORD_ONLY
     assert sdk.AUTH_METHOD_ID == "mimir-web-key"

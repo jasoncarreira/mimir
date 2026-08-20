@@ -162,6 +162,8 @@ class AcpDaemon:
         self._connection_runners: set[asyncio.Task[None]] = set()
         self._runner_writers: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._admitted = 0
+        self._abandoned_closes: set[asyncio.Task[None]] = set()
+        self._failed_retirements = 0
         self._stopping = False
 
     async def start(self) -> None:
@@ -278,7 +280,7 @@ class AcpDaemon:
             except (TimeoutError, OSError):
                 writer.transport.abort()
             return
-        if self._admitted >= ACP_MAX_PEERS:
+        if self._admitted + self._unretired_generations() >= ACP_MAX_PEERS:
             payload = {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -322,7 +324,10 @@ class AcpDaemon:
         connection_agent = _ConnectionAgent(agent)
         runner = asyncio.create_task(
             run_stdio_agent(
-                connection_agent, request_reader=reader, response_writer=writer
+                connection_agent,
+                request_reader=reader,
+                response_writer=writer,
+                on_close_abandoned=self._record_abandoned_close,
             )
         )
         self._connection_runners.add(runner)
@@ -374,6 +379,59 @@ class AcpDaemon:
                 await asyncio.wait_for(writer.drain(), ACP_PEER_DRAIN_TIMEOUT)
             except TimeoutError as exc:
                 raise AcpDaemonError("authenticated ACP peer stopped draining") from exc
+
+    def _record_abandoned_close(self, task: asyncio.Task[None]) -> None:
+        """Note a generation whose close outlived its runner.
+
+        ``run_stdio_agent`` bounds how long it waits for the shielded close, so
+        it can return while that close is still running -- and returning frees
+        this daemon's admission slot, which is released from the runner task's
+        done callback. Recording the task lets ``_unretired_generations`` fence
+        admission until it terminates, and surfaces the condition so the
+        supervisor can recycle a peer that never finishes retiring.
+        """
+        self._abandoned_closes.add(task)
+        _LOGGER.error(
+            "ACP peer left an unretired close task; refusing new peers until it "
+            "terminates (ACP_MAX_PEERS=%d)",
+            ACP_MAX_PEERS,
+        )
+
+    def _unretired_generations(self) -> int:
+        """Generations that have not demonstrably finished retiring.
+
+        Counted against capacity so a replacement peer cannot join a generation
+        still holding old work. Finishing is not the same as retiring: a close
+        that completes *with an exception* tore down into an unknown state, so
+        releasing capacity on ``done()`` alone would admit a replacement on a
+        failed teardown and swallow the failure, because nothing retrieves the
+        task's result.
+
+        A close that returns, or that honours the cancellation, has stopped —
+        nothing of that generation is running, so capacity returns. One that
+        raises keeps the fence permanently and is surfaced once, leaving the
+        supervisor to recycle a daemon whose teardown cannot be trusted.
+        """
+        live: set[asyncio.Task[None]] = set()
+        for task in self._abandoned_closes:
+            if not task.done():
+                live.add(task)
+                continue
+            if task.cancelled():
+                # It honoured the cancel: nothing of that generation is left
+                # running, so this is a clean retirement.
+                continue
+            failure = task.exception()
+            if failure is None:
+                continue
+            self._failed_retirements += 1
+            _LOGGER.error(
+                "ACP abandoned close failed to retire (%r); admission stays "
+                "closed until this daemon is recycled",
+                failure,
+            )
+        self._abandoned_closes = live
+        return len(live) + self._failed_retirements
 
     async def _finish_runner(
         self,
