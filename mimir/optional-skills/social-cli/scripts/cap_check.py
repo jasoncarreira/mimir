@@ -54,6 +54,7 @@ import glob
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     import yaml
@@ -84,6 +85,32 @@ def _today_str() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+def _archive_is_recognized(data: Any) -> bool:
+    """Whether a parsed archive matches a shape we know how to read.
+
+    The mirror of count.py's ledger check, and for the same reason: valid YAML
+    can still be an archive we cannot interpret — a bare scalar, a mapping
+    with no `dispatch` key, or a `dispatch` holding something other than a
+    list of action entries. Each yields no actions for exactly the reason an
+    empty archive does, and the file may be the only evidence of a dispatch.
+
+    The legitimately empty shapes are recognized: an absent document (an empty
+    file parses to None), an empty list, and an empty `dispatch`. Sibling keys
+    alongside `dispatch` are fine — the deployed archives include a few with
+    an extra `notifications` key.
+    """
+    if data is None:
+        return True
+    if isinstance(data, list):
+        return all(isinstance(item, dict) for item in data)
+    if not isinstance(data, dict):
+        return False
+    actions = data.get("dispatch")
+    if actions is None:
+        return False
+    return isinstance(actions, list) and all(isinstance(item, dict) for item in actions)
+
+
 def count_archive(home: Path, today: str) -> tuple[int, int]:
     """Count committed dispatches today from outbox_archive/.
 
@@ -111,21 +138,25 @@ def count_archive(home: Path, today: str) -> tuple[int, int]:
             continue
         try:
             with open(archive) as f:
-                data = yaml.safe_load(f) or {}
+                data = yaml.safe_load(f)
         except (OSError, yaml.YAMLError) as exc:
             # One corrupt file must not be read as "no dispatch here" without
             # saying so — an unreported skip under-counts against the cap.
             sys.stderr.write(f"cap_check: unreadable archive {base}: {exc}\n")
             unreadable += 1
             continue
+        if not _archive_is_recognized(data):
+            sys.stderr.write(
+                f"cap_check: unrecognised archive structure in {base} "
+                f"(top level is {type(data).__name__}); treating as unreadable\n"
+            )
+            unreadable += 1
+            continue
         # Archive doc shape is either a dict with `dispatch:` key or a
         # bare list. Handle both — older dispatches stored the bare list.
-        actions = data.get("dispatch", []) if isinstance(data, dict) else data
-        if not isinstance(actions, list):
-            continue
+        # An empty file parses to None, which is a real "no dispatch here".
+        actions = data.get("dispatch", []) if isinstance(data, dict) else (data or [])
         for entry in actions:
-            if not isinstance(entry, dict):
-                continue
             for verb, payload in entry.items():
                 if verb in POST_CLASS_ACTIONS and not (
                     isinstance(payload, dict) and payload.get("dryRun")

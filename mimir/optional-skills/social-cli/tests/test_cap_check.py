@@ -438,3 +438,103 @@ def test_end_to_end_the_production_ledger_shape_still_counts(e2e_env, tmp_path):
         ],
     }))
     assert module.count_ledger(tmp_path, "2026-08-20") == 2
+
+
+# --------------------------------------------------------------------------
+# Structurally invalid archives — the mirror of the ledger validation.
+#
+# Fixing this for the ledger and not the archive was the same asymmetry as
+# fixing the ledger fail-open and not the archive one, two revisions earlier.
+# Both sources now get identical treatment: I/O damage, parse damage,
+# unrecognized structure, and a missing directory all make the count a floor.
+#
+# Shapes verified against the 1539 deployed archive files before tightening:
+# every one is a dict whose `dispatch` is a list of dicts, and four carry an
+# extra `notifications` key alongside it, so sibling keys must stay legal.
+# --------------------------------------------------------------------------
+
+
+def _write_archive_raw(home: Path, name: str, text: str) -> Path:
+    d = home / "state" / "pollers" / "social-cli-bsky" / "outbox_archive"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+_TODAY = "2026-08-20T10-00-00-000Z_outbox-bsky.yaml"
+
+
+def test_archive_scalar_is_unreadable(tmp_path):
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "garbage\n")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_archive_mapping_without_dispatch_is_unreadable(tmp_path):
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "unexpected:\n  - post: {}\n")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_archive_mistyped_dispatch_container_is_unreadable(tmp_path):
+    """`dispatch:` as a mapping rather than a list — the reported case."""
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "dispatch:\n  post:\n    text: a\n")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_archive_list_holding_a_non_entry_is_unreadable(tmp_path):
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "- post:\n    text: a\n- just-a-string\n")
+    count, unreadable = module.count_archive(tmp_path, "2026-08-20")
+    assert unreadable == 1
+
+
+def test_archive_empty_file_is_a_real_zero(tmp_path):
+    """An empty archive parses to None and must not be flagged as damage."""
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 0)
+
+
+def test_archive_empty_dispatch_is_a_real_zero(tmp_path):
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "dispatch: []\n")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 0)
+
+
+def test_archive_empty_list_is_a_real_zero(tmp_path):
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "[]\n")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 0)
+
+
+def test_archive_sibling_keys_alongside_dispatch_are_legal(tmp_path):
+    """Four deployed archives carry `notifications` next to `dispatch`."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {
+        "dispatch": [{"post": {"text": "a"}}],
+        "notifications": [],
+    })
+    assert module.count_archive(tmp_path, "2026-08-20") == (1, 0)
+
+
+def test_main_fails_closed_on_a_structurally_invalid_archive(monkeypatch, capsys, tmp_path):
+    """End to end: the archive is the only evidence and the ledger is missing.
+
+    This is the whole scenario in one test — a dispatched post recorded only
+    in an archive we cannot interpret, with no ledger row to corroborate it.
+    Reported as `effective=0` it would be worth the full daily cap.
+    """
+    module = fresh_cap_check()
+    _write_archive_raw(tmp_path, _TODAY, "dispatch:\n  post:\n    text: a\n")
+    monkeypatch.setattr(module, "_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "count_ledger", lambda home, today: 0)
+    monkeypatch.setattr(module, "_today_str", lambda: "2026-08-20")
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert "effective=unknown" in out
+    assert "effective=0" not in out
+    assert "archive_unreadable=1" in out
