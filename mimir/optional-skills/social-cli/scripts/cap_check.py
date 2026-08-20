@@ -26,9 +26,16 @@ Output (one line):
 
     today_utc=YYYY-MM-DD archive=N ledger=M effective=K / 5
 
+When a source cannot be read, its count is reported as `unavailable`
+and `effective` as `unknown` — never as a number. A failed read is not
+evidence of zero posts, and printing `0` there is what makes an outage
+look like headroom.
+
 Exit codes:
-  0 — check ran (regardless of effective value; agent reads effective)
+  0 — check ran, both sources readable (agent reads effective)
   2 — sources diverge by more than 1 (smell worth surfacing)
+  3 — the ledger could not be read, so no cap headroom was established;
+      treat as "do not post until this is fixed", not as zero posts
 
 Why this lives as a separate script instead of an option on
 `count.py`: the upstream skill rule is "do not maintain a separate
@@ -37,6 +44,8 @@ diagnostic on the dispatcher, not a counter. Keeping it separate
 preserves `count.py`'s ledger-only purity and lets the agent invoke
 the two scripts independently (cap check vs. divergence audit).
 """
+
+from __future__ import annotations
 
 import datetime
 import glob
@@ -70,14 +79,19 @@ def _today_str() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
-def count_archive(home: Path, today: str) -> int:
+def count_archive(home: Path, today: str) -> tuple[int, int]:
     """Count committed dispatches today from outbox_archive/.
+
+    Returns ``(count, unreadable)`` — the number of post-class actions
+    found, and the number of archive files that could not be parsed.
+    A caller that ignores the second value is under-counting silently.
 
     Archive files are named `<UTC-timestamp>_outbox-bsky.yaml` —
     filename prefix is the timestamp. Filter on the YYYY-MM-DD form
     plus the YYYYMMDD-then-T compact form.
     """
     count = 0
+    unreadable = 0
     pattern = str(
         home / "state" / "pollers" / "social-cli-*"
         / "outbox_archive" / "*_outbox-bsky.yaml"
@@ -93,7 +107,11 @@ def count_archive(home: Path, today: str) -> int:
         try:
             with open(archive) as f:
                 data = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, yaml.YAMLError) as exc:
+            # One corrupt file must not be read as "no dispatch here" without
+            # saying so — an unreported skip under-counts against the cap.
+            sys.stderr.write(f"cap_check: unreadable archive {base}: {exc}\n")
+            unreadable += 1
             continue
         # Archive doc shape is either a dict with `dispatch:` key or a
         # bare list. Handle both — older dispatches stored the bare list.
@@ -108,15 +126,21 @@ def count_archive(home: Path, today: str) -> int:
                     isinstance(payload, dict) and payload.get("dryRun")
                 ):
                     count += 1
-    return count
+    return count, unreadable
 
 
-def count_ledger(home: Path, today: str) -> int:
+def count_ledger(home: Path, today: str) -> int | None:
     """Count ledger entries today via the canonical count.py.
 
     Delegates to `count.py` so the ledger walk stays single-sourced
-    there. Imports dynamically to avoid pulling count.py's argparse
-    setup overhead at module load.
+    there.
+
+    Returns the count, or ``None`` when the delegate could not be run to
+    a trustworthy number — a missing or timed-out `count.py`, a nonzero
+    exit, or output that is not an integer. ``None`` is not ``0``: a
+    failed read says nothing about how many posts went out today, and
+    reporting it as zero is what turned a deleted `count.py` into silent
+    headroom against the daily cap.
     """
     import subprocess
 
@@ -137,25 +161,47 @@ def count_ledger(home: Path, today: str) -> int:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         sys.stderr.write(f"cap_check: count.py invocation failed: {exc}\n")
-        return 0
+        return None
     if result.returncode != 0:
         sys.stderr.write(f"cap_check: count.py exited {result.returncode}: {result.stderr}\n")
-        return 0
+        return None
+    raw = result.stdout.strip()
     try:
-        return int(result.stdout.strip())
+        return int(raw)
     except ValueError:
-        return 0
+        sys.stderr.write(f"cap_check: count.py printed non-integer output: {raw!r}\n")
+        return None
+
+
+LEDGER_UNAVAILABLE = 3
 
 
 def main() -> int:
     home = _home()
     today = _today_str()
-    archive_count = count_archive(home, today)
+    archive_count, archive_unreadable = count_archive(home, today)
     ledger_count = count_ledger(home, today)
+
+    suffix = f" archive_unreadable={archive_unreadable}" if archive_unreadable else ""
+
+    if ledger_count is None:
+        # Fail closed. The ledger is the canonical surface, and without it
+        # there is no established headroom to spend — so report the gap
+        # rather than a number the caller would read as room to post.
+        print(
+            f"today_utc={today} archive={archive_count} "
+            f"ledger=unavailable effective=unknown / {CAP}{suffix}"
+        )
+        sys.stderr.write(
+            "cap_check: ledger unavailable — cap headroom NOT established; "
+            "fix count.py before posting\n"
+        )
+        return LEDGER_UNAVAILABLE
+
     effective = max(archive_count, ledger_count)
     print(
         f"today_utc={today} archive={archive_count} "
-        f"ledger={ledger_count} effective={effective} / {CAP}"
+        f"ledger={ledger_count} effective={effective} / {CAP}{suffix}"
     )
     # Smell threshold: the two sources diverge by more than 1. Don't
     # treat divergence as a hard error — both surfaces can be valid in
