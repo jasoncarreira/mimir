@@ -6,6 +6,96 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-08-20
+
+Twenty-four pull requests since 0.8.5. The through-line is the agent's ability
+to act on its own pull requests: it could reach a verdict but not deliver one,
+and the reasons were spread across the poller, the forge tools and the
+information-flow labels.
+
+**Operator action is required.** Two items, and a version bump alone satisfies
+neither:
+
+- `pypdf>=6.16` was added, so a source deployment needs `uv sync` and not only
+  a pull.
+- The bundled `github-poller` skill changed. Skills are installed *into the
+  agent home*, so a pull and a restart leave the deployed copy stale and the
+  PR-snapshot fix inert. Run `mimir skills update github-poller --apply`.
+  Verify with `mimir skills update github-poller` first — it is read-only and
+  prints the diff.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+### Fixed
+
+**The agent could not act on most pull requests.** `mimir/access_control.py`
+issues a `RepoPRActionScope` only from a complete PR snapshot — `head_repo`,
+`head_remote`, `head_ref`, `head_sha`, `base_ref`, `base_sha`. Only four
+github-poller passes supplied one. Measured against a live payload, 16 of 16
+items from those passes were scopeable and 0 of 27 from the rest: 19
+`pr_synchronize`, 4 `pr_opened`, 4 `pr_review`. Those three are the ordinary
+ways a pull request becomes worth looking at — it opened, its head moved, or
+someone reviewed it. Every PR tool refused for such a turn, and the refusal
+named the live-discovery operator gate rather than the missing snapshot, so the
+agent reported that it needed an authenticated operator turn and escalated to a
+human. It could review only when a review was *explicitly requested*, because
+that one pass carried the snapshot.
+
+**It also could not remediate its own pull requests.** The `pr_review` pass put
+the *reviewer's* login in `author`, which the framework reads as the scope
+principal. Remediation authority is granted only when that principal is the
+agent itself, so a CHANGES_REQUESTED review on the agent's own PR produced the
+review-only action set — no write, commit or push. It could read the review and
+never fix it. `author` now carries the PR's author, with the reviewer in its own
+field.
+
+**A scope miss was reported as missing authority.** `resolve_review_state_for_context`
+refused with the live-discovery gate message whenever the cache and registry
+both missed, which is a precondition of the fallback path rather than the
+caller's actual failure. A service turn can never satisfy that gate and was
+never meant to. The refusal now names the requested repository and pull request,
+states that it is outside the turn's scope, and enumerates the in-scope targets
+bounded to five with an overflow count.
+
+**`pr_diff` failed outright above its size cap**, so the diff was unavailable
+for exactly the pull requests most in need of review. It now returns a bounded
+diff truncated on file boundaries, with a marker naming the truncation reasons,
+the original size and the omitted paths. The fetch itself remains bounded, at a
+ceiling above the output cap.
+
+**A fetched PDF was unreadable.** `fetch_url` returned bytes no turn could
+interpret, and the `pdftotext` shortcut was unavailable to precisely the turns
+that fetch PDFs. Extraction is now bounded by page count and output bytes, with
+the two limits reported distinctly.
+
+**`operator_alert` was granted and sink-policed but had no tool**, so an
+untrusted-ingest poller with no other egress reached for the shell instead. It
+now exists as a tool with no destination parameter, bounded per turn.
+
+**Tool-event errors carried unbounded argument text into durable logs.** The
+budget gate now truncates with an explicit elision marker and an allowlist of
+argument keys.
+
+**Information-flow labels.** Several fixes to which sources a prompt carries
+and what they permit: agent-authored feedback telemetry is now labelled from
+provenance rather than assumed; ownerless non-agent-self feedback records no
+longer receive an empty ACL that aborted the whole turn; framework-written
+telemetry is recognised as agent-self, so the no-reply loop no longer silences
+same-channel replies; `protected_prompt` and `protected_tool` are aligned as
+ACL-gated server-mediated sources; first-party file reads no longer land in the
+fail-closed unknown-provenance label; and channel egress now compares channel
+*audiences* rather than identities, scoped to the bridge authority that issued
+the channel, so one user's history cannot cross into another's channel on a
+normalised-name collision.
+
+**Worklink and the factory.** The feature-factory backend moved to the 0.7.0
+three-package architecture. A bare `shutil.rmtree` raced concurrent removal, so
+git auto-maintenance could fail a live publication teardown. Factory-recovery
+argv assertions read `WORKLINK_RUN_BIN` off the environment, so they passed in
+CI and failed in every deployment sandbox — they are now pinned.
+
+**CI.** The macOS leg is green and ready to be promoted to a required check.
+
 ## [0.8.5] — 2026-08-17
 
 A large patch release: 66 pull requests, almost all of them acting on a
