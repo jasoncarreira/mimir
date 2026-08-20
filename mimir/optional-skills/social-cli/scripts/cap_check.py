@@ -65,6 +65,9 @@ except ImportError:
     sys.exit(1)
 
 CAP = 5  # post-class actions per UTC day, per core/70-bluesky-guidelines.md
+# Mirrors count.py's EXIT_LEDGER_UNREADABLE: the count it printed is a floor
+# because at least one ledger file could not be parsed.
+COUNT_LEDGER_UNREADABLE = 3
 POST_CLASS_ACTIONS = {"post", "reply", "thread", "quote"}
 
 
@@ -139,7 +142,9 @@ def count_ledger(home: Path, today: str) -> int | None:
 
     Returns the count, or ``None`` when the delegate could not be run to
     a trustworthy number — a missing or timed-out `count.py`, a nonzero
-    exit, or output that is not an integer. ``None`` is not ``0``: a
+    exit, output that is not an integer, or a count `count.py` itself
+    flagged as a floor because a ledger file would not parse. ``None`` is
+    not ``0``: a
     failed read says nothing about how many posts went out today, and
     reporting it as zero is what turned a deleted `count.py` into silent
     headroom against the daily cap.
@@ -163,6 +168,14 @@ def count_ledger(home: Path, today: str) -> int | None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         sys.stderr.write(f"cap_check: count.py invocation failed: {exc}\n")
+        return None
+    if result.returncode == COUNT_LEDGER_UNREADABLE:
+        # count.py counted what it could and told us the total is a floor,
+        # because at least one ledger would not parse. A floor cannot
+        # establish headroom, so this is unavailable rather than a count.
+        sys.stderr.write(
+            f"cap_check: count.py reported unreadable ledger file(s): {result.stderr}"
+        )
         return None
     if result.returncode != 0:
         sys.stderr.write(f"cap_check: count.py exited {result.returncode}: {result.stderr}\n")

@@ -9,10 +9,12 @@ silently — it still exits 0 and prints a number, just a wrong one.
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -318,3 +320,89 @@ def test_archive_reports_unreadable_files_rather_than_skipping_silently(tmp_path
     _write_archive(tmp_path, "2026-08-20T11-00-00-000Z_outbox-bsky.yaml",
                    {"dispatch": [{"post": {"text": "a"}}]})
     assert module.count_archive(tmp_path, "2026-08-20") == (1, 1)
+
+
+# --------------------------------------------------------------------------
+# End-to-end against the real count.py delegate.
+#
+# The mocked tests above pin cap_check's handling of a failed delegate. These
+# run the actual subprocess, because the fail-open they cover lived *inside*
+# count.py: it caught unreadable and malformed ledgers, skipped them, printed
+# the partial total, and exited 0. Nothing in cap_check could see that, so a
+# damaged ledger holding the only record of a post still established headroom.
+# --------------------------------------------------------------------------
+
+
+def _write_ledger(home: Path, name: str, text: str) -> Path:
+    d = home / "state" / "pollers" / "social-cli-e2e"
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _ledger_entry(ts: str) -> dict:
+    return {"action": "post", "platform": "bsky", "timestamp": ts}
+
+
+@pytest.fixture
+def e2e_env(monkeypatch):
+    """count.py resolves state from STATE_DIR first, so clear it."""
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+
+def test_end_to_end_real_delegate_counts_a_valid_ledger(e2e_env, tmp_path):
+    """Positive control: without this, the failure test could pass for any reason."""
+    module = fresh_cap_check()
+    _write_ledger(
+        tmp_path, "sent_ledger-bsky.yaml",
+        yaml.safe_dump([_ledger_entry("2026-08-20T01:00:00Z"),
+                        _ledger_entry("2026-08-20T02:00:00Z")]),
+    )
+    assert module.count_ledger(tmp_path, "2026-08-20") == 2
+
+
+def test_end_to_end_real_delegate_reports_a_malformed_ledger_as_unavailable(
+    e2e_env, tmp_path
+):
+    """A ledger that will not parse must not come back as a smaller count."""
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", "{[ not: valid: yaml")
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_end_to_end_a_malformed_ledger_hides_a_real_post(e2e_env, tmp_path):
+    """The reported scenario, end to end.
+
+    Two ledger files: one readable and empty, one malformed that holds the
+    only record of a post. The old behaviour counted 0 from the readable
+    file, skipped the other, and returned 0 — indistinguishable from a quiet
+    day, and worth five posts of headroom.
+    """
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", yaml.safe_dump([]))
+    _write_ledger(tmp_path, "sent_ledger-bsky-archive.yaml", "{[ malformed")
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_end_to_end_an_unreadable_ledger_is_unavailable(e2e_env, tmp_path):
+    """Unreadable is the OSError arm, distinct from the YAMLError arm."""
+    module = fresh_cap_check()
+    path = _write_ledger(tmp_path, "sent_ledger-bsky.yaml",
+                         yaml.safe_dump([_ledger_entry("2026-08-20T01:00:00Z")]))
+    path.chmod(0o000)
+    try:
+        result = module.count_ledger(tmp_path, "2026-08-20")
+    finally:
+        path.chmod(0o644)
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses the permission bit, so nothing is unreadable")
+    assert result is None
+
+
+def test_end_to_end_an_empty_ledger_is_a_genuine_zero(e2e_env, tmp_path):
+    """An empty file is not damage — it must stay a real zero, not unknown."""
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", "")
+    assert module.count_ledger(tmp_path, "2026-08-20") == 0

@@ -180,3 +180,117 @@ def test_cli_today_window_ends_at_next_utc_midnight(tmp_path, capsys, monkeypatc
 
     assert rc == 0
     assert capsys.readouterr().out.strip() == "1"
+
+
+# --------------------------------------------------------------------------
+# Unreadable ledgers: the count becomes a floor, and callers must be told.
+#
+# _load_yaml previously returned None for both "empty" and "would not parse",
+# so a damaged ledger was silently worth zero posts and count.py exited 0 with
+# a plausible integer. A cap check built on that cannot tell a quiet day from
+# an unreadable record of a busy one.
+# --------------------------------------------------------------------------
+
+
+def test_detailed_reports_unreadable_ledger_files(tmp_path):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir(parents=True)
+    (poller / "sent_ledger-bsky.yaml").write_text("{[ not: valid: yaml", encoding="utf-8")
+
+    count, unreadable = mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    )
+    assert (count, unreadable) == (0, 1)
+
+
+def test_detailed_does_not_flag_an_empty_ledger_as_unreadable(tmp_path):
+    """An empty ledger is a real zero; only damage makes the count a floor."""
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir(parents=True)
+    (poller / "sent_ledger-bsky.yaml").write_text("", encoding="utf-8")
+
+    assert mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    ) == (0, 0)
+
+
+def test_detailed_counts_the_readable_ledger_alongside_a_damaged_one(tmp_path):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+    ])
+    (poller / "sent_ledger-bsky-two.yaml").write_text("{[ malformed", encoding="utf-8")
+
+    assert mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    ) == (1, 1)
+
+
+def test_count_ledgers_still_returns_a_bare_total(tmp_path):
+    """The int-returning entry point stays as it was for existing callers."""
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+    ])
+    total = mod.count_ledgers(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    )
+    assert total == 1
+    assert isinstance(total, int)
+
+
+def test_main_exits_nonzero_when_a_ledger_is_unreadable(tmp_path, capsys, monkeypatch):
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir(parents=True)
+    (poller / "sent_ledger-bsky.yaml").write_text("{[ malformed", encoding="utf-8")
+
+    rc = mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                   "--state-root", str(tmp_path)])
+    assert rc == mod.EXIT_LEDGER_UNREADABLE
+    assert rc != 0
+    # stdout keeps its shape so plain-text consumers are unchanged
+    assert capsys.readouterr().out.strip() == "0"
+
+
+def test_main_json_exposes_the_unreadable_count(tmp_path, capsys, monkeypatch):
+    """Structured, so a caller need not scrape warning text off stderr."""
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir(parents=True)
+    (poller / "sent_ledger-bsky.yaml").write_text("{[ malformed", encoding="utf-8")
+
+    mod.main(["--platform", "bsky", "--since", "2026-06-28",
+              "--state-root", str(tmp_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unreadable"] == 1
+    assert payload["count"] == 0
+
+
+def test_main_exits_zero_and_reports_no_damage_on_a_clean_ledger(
+    tmp_path, capsys, monkeypatch
+):
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+    ])
+    rc = mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                   "--state-root", str(tmp_path), "--json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["unreadable"] == 0

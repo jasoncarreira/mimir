@@ -55,7 +55,14 @@ def _today_utc() -> datetime:
     return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 
 
-def _load_yaml(path: Path) -> Any:
+def _load_yaml(path: Path) -> tuple[Any, bool]:
+    """Load one ledger, returning ``(data, damaged)``.
+
+    ``damaged`` distinguishes a ledger we could not read from one that is
+    legitimately empty. Both yield no records, but only the former means the
+    resulting count is a floor rather than a count — and a caller enforcing a
+    cap has to be able to tell those apart.
+    """
     try:
         import yaml  # type: ignore[import-untyped]
     except ImportError as exc:
@@ -64,14 +71,14 @@ def _load_yaml(path: Path) -> Any:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         _eprint(f"social-cli count: could not read {path}: {exc}")
-        return None
+        return None, True
     if not text.strip():
-        return None
+        return None, False
     try:
-        return yaml.safe_load(text)
+        return yaml.safe_load(text), False
     except yaml.YAMLError as exc:
         _eprint(f"social-cli count: skipping malformed ledger {path}: {exc}")
-        return None
+        return None, True
 
 
 def _records(data: Any) -> Iterable[dict[str, Any]]:
@@ -117,6 +124,9 @@ def _action_matches(record_action: str, requested: str) -> bool:
     return record_action == requested
 
 
+EXIT_LEDGER_UNREADABLE = 3
+
+
 def _default_state_root() -> Path:
     state_dir = os.environ.get("STATE_DIR", "").strip()
     if state_dir:
@@ -147,7 +157,7 @@ def _ledger_files(
     return files
 
 
-def count_ledgers(
+def count_ledgers_detailed(
     *,
     platform: str,
     action: str,
@@ -155,10 +165,21 @@ def count_ledgers(
     until: datetime | None,
     state_root: Path,
     state_dirs: list[Path],
-) -> int:
+) -> tuple[int, int]:
+    """Count matching ledger entries, returning ``(count, unreadable)``.
+
+    ``unreadable`` is the number of ledger files that could not be read or
+    parsed. Any nonzero value makes ``count`` a floor rather than a count:
+    the skipped file may hold the only record of a post. Callers enforcing a
+    cap must treat that as an unestablished count, not as a smaller one.
+    """
     count = 0
+    unreadable = 0
     for path in _ledger_files(platform, state_root, state_dirs):
-        for record in _records(_load_yaml(path)):
+        data, damaged = _load_yaml(path)
+        if damaged:
+            unreadable += 1
+        for record in _records(data):
             record_action = str(record.get("action") or "")
             if not _action_matches(record_action, action):
                 continue
@@ -172,6 +193,32 @@ def count_ledgers(
             if until is not None and ts >= until:
                 continue
             count += 1
+    return count, unreadable
+
+
+def count_ledgers(
+    *,
+    platform: str,
+    action: str,
+    since: datetime,
+    until: datetime | None,
+    state_root: Path,
+    state_dirs: list[Path],
+) -> int:
+    """Count matching ledger entries.
+
+    Kept for callers that only need the total. Anything enforcing a cap
+    should use :func:`count_ledgers_detailed`, which also reports whether
+    any ledger was unreadable.
+    """
+    count, _unreadable = count_ledgers_detailed(
+        platform=platform,
+        action=action,
+        since=since,
+        until=until,
+        state_root=state_root,
+        state_dirs=state_dirs,
+    )
     return count
 
 
@@ -229,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state_root = (args.state_root or _default_state_root()).expanduser()
     state_dirs = [p.expanduser() for p in args.state_dir]
-    total = count_ledgers(
+    total, unreadable = count_ledgers_detailed(
         platform=args.platform,
         action=args.action,
         since=since,
@@ -240,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps({
             "count": total,
+            "unreadable": unreadable,
             "platform": args.platform,
             "action": args.action,
             "since": since.isoformat(),
@@ -247,6 +295,16 @@ def main(argv: list[str] | None = None) -> int:
         }, separators=(",", ":")))
     else:
         print(total)
+    if unreadable:
+        # The count is a floor, so exit non-zero rather than let a caller
+        # spend the difference as headroom. This is reported through the
+        # status code as well as --json so that a consumer which reads only
+        # stdout still cannot mistake a partial count for a complete one.
+        _eprint(
+            f"social-cli count: {unreadable} ledger file(s) unreadable; "
+            f"{total} is a floor, not a count"
+        )
+        return EXIT_LEDGER_UNREADABLE
     return 0
 
 
