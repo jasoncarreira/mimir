@@ -1002,3 +1002,66 @@ async def test_an_abandoned_close_that_honours_cancellation_returns_capacity(
     assert daemon._unretired_generations() == 0
     assert daemon._failed_retirements == 0
     shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_close_that_raises_on_forced_cancel_still_fences_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close that fails *while being cancelled* must not free the slot.
+
+    ``run_stdio_agent`` cancels the shielded close after the first bound, then
+    waits again. If the close answers that cancel by raising, the task is
+    ``done()`` — but teardown failed. Reporting only not-done tasks would let
+    the runner return, free the single admission slot, admit a replacement
+    after a failed teardown, and leave the exception unretrieved.
+
+    Drives the real runner and then a real ``_admit_peer``, because the whole
+    point is what the daemon does with the handoff.
+    """
+    import mimir.acp.sdk as sdk
+
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    daemon._uid = os.getuid()
+
+    entered = asyncio.Event()
+
+    async def raises_on_cancel(self: object) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Answer the forced cancel by failing, not by stopping.
+            raise RuntimeError("cleanup failed during cancellation") from None
+
+    monkeypatch.setattr(sdk.Connection, "close", raises_on_cancel)
+    monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 0.01)
+
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(
+            _StubAgent(),
+            request_reader=_eof_reader(),
+            response_writer=_Writer(),
+            on_close_abandoned=daemon._record_abandoned_close,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1.0)
+        runner.cancel()
+        _, pending = await asyncio.wait({runner}, timeout=0.5)
+        assert not pending, "runner did not resolve within the bound"
+
+        # The failed teardown must have been routed into the accounting.
+        assert daemon._unretired_generations() >= 1
+        assert daemon._failed_retirements == 1
+
+        writer = _Writer()
+        await daemon._admit_peer(asyncio.StreamReader(), writer)
+        assert daemon._admitted == 0, "replacement admitted after failed teardown"
+        assert not daemon._peers
+        assert b"error" in bytes(writer.data)
+    finally:
+        await asyncio.wait({runner}, timeout=1.0)
+        shutil.rmtree(home)
