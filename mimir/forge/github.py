@@ -31,6 +31,7 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_DIFF_BYTES = 524_288
+_MAX_DIFF_FETCH_BYTES = 8_388_608
 _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
@@ -39,6 +40,98 @@ _MAX_BODY_BYTES = 65_536
 GITHUB_IDENTITY_CACHE_TTL_SECONDS: None = None
 _identity_lock = threading.Lock()
 _verified_identity: tuple[str, str] | None = None
+
+
+def _diff_path(section: bytes) -> str:
+    header = section.splitlines()[0] if section else b""
+    marker = b" b/"
+    if marker in header:
+        path = header.rsplit(marker, 1)[1]
+    elif b' "b/' in header:
+        path = header.rsplit(b' "b/', 1)[1].removesuffix(b'"')
+    else:
+        path = b"(unknown)"
+    text = path[:4_096].decode("utf-8", errors="replace")
+    return "".join(character if ord(character) >= 32 else "?" for character in text)
+
+
+def _diff_truncation_marker(
+    *, original_bytes: int, omitted: list[tuple[str, str, int]], paths_shown: int | None = None,
+) -> bytes:
+    shown = omitted if paths_shown is None else omitted[:paths_shown]
+    reasons = list(dict.fromkeys(reason for _path, reason, _size in omitted))
+    lines = [
+        "",
+        "[pr_diff truncated]",
+        f"truncation_reasons: {', '.join(reasons)}",
+        f"original_bytes: {original_bytes}",
+        f"max_bytes: {_MAX_DIFF_BYTES}",
+        f"omitted_file_count: {len(omitted)}",
+        "omitted_files:",
+    ]
+    lines.extend(
+        f"- {json.dumps(path, ensure_ascii=True)} ({reason}, {size} bytes)"
+        for path, reason, size in shown
+    )
+    if len(shown) < len(omitted):
+        lines.append(f"- [{len(omitted) - len(shown)} additional paths not shown]")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def bound_diff(diff: str) -> str:
+    """Return a UTF-8 bounded diff containing only complete file sections."""
+    raw = diff.encode("utf-8")
+    if len(raw) <= _MAX_DIFF_BYTES:
+        return diff
+
+    starts = [match.start() for match in re.finditer(br"(?m)^diff --git ", raw)]
+    if not starts:
+        sections = [raw]
+    else:
+        starts.append(len(raw))
+        sections = [raw[starts[index]:starts[index + 1]] for index in range(len(starts) - 1)]
+        if starts[0]:
+            sections[0] = raw[:starts[0]] + sections[0]
+
+    included = list(range(len(sections)))
+    omitted: dict[int, tuple[str, str, int]] = {
+        index: (_diff_path(section), "per_file_byte_limit", len(section))
+        for index, section in enumerate(sections)
+        if len(section) > _MAX_DIFF_BYTES
+    }
+    included = [index for index in included if index not in omitted]
+
+    while True:
+        ordered_omitted = [omitted[index] for index in sorted(omitted)]
+        content_bytes = sum(len(sections[index]) for index in included)
+        minimum_marker = _diff_truncation_marker(
+            original_bytes=len(raw), omitted=ordered_omitted, paths_shown=0,
+        )
+        if content_bytes + len(minimum_marker) <= _MAX_DIFF_BYTES:
+            break
+        if not included:
+            raise ForgeResponseTooLarge("forge diff truncation marker exceeded size limit")
+        index = max(included, key=lambda item: (len(sections[item]), item))
+        included.remove(index)
+        section = sections[index]
+        omitted[index] = (_diff_path(section), "whole_diff_byte_limit", len(section))
+
+    paths_low = 0
+    paths_high = len(ordered_omitted)
+    while paths_low < paths_high:
+        paths_shown = (paths_low + paths_high + 1) // 2
+        candidate = _diff_truncation_marker(
+            original_bytes=len(raw), omitted=ordered_omitted, paths_shown=paths_shown,
+        )
+        if content_bytes + len(candidate) <= _MAX_DIFF_BYTES:
+            paths_low = paths_shown
+        else:
+            paths_high = paths_shown - 1
+    marker = _diff_truncation_marker(
+        original_bytes=len(raw), omitted=ordered_omitted, paths_shown=paths_low,
+    )
+    bounded = b"".join(sections[index] for index in sorted(included)) + marker
+    return bounded.decode("utf-8")
 
 
 class GitHubIdentityFailureKind(StrEnum):
@@ -380,11 +473,11 @@ class GitHubForgeClient:
             "GET",
             f"/repos/{repository}/pulls/{number}",
             accept="application/vnd.github.diff",
-            max_bytes=_MAX_DIFF_BYTES,
+            max_bytes=_MAX_DIFF_FETCH_BYTES,
         )
         if not isinstance(data, str):
             raise ForgeError("forge returned an invalid diff")
-        return data
+        return bound_diff(data)
 
     def list_checks(self, scope: RepoPRActionScope) -> tuple[CheckProjection, ...]:
         repository, _number = self._target(scope)
