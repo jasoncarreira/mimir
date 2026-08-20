@@ -406,3 +406,35 @@ def test_end_to_end_an_empty_ledger_is_a_genuine_zero(e2e_env, tmp_path):
     module = fresh_cap_check()
     _write_ledger(tmp_path, "sent_ledger-bsky.yaml", "")
     assert module.count_ledger(tmp_path, "2026-08-20") == 0
+
+
+def test_end_to_end_a_scalar_ledger_is_unavailable(e2e_env, tmp_path):
+    """Syntactically valid YAML, structurally not a ledger."""
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", "garbage\n")
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_end_to_end_a_mistyped_entries_container_is_unavailable(e2e_env, tmp_path):
+    """`entries: {}` — parses, yields nothing, must not read as zero posts.
+
+    The live ledger nests under `entries:`, so this is the shape a format
+    change or a bad write would actually produce.
+    """
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", "entries: {}\n")
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_end_to_end_the_production_ledger_shape_still_counts(e2e_env, tmp_path):
+    """Positive control in the live format, through the real subprocess."""
+    module = fresh_cap_check()
+    _write_ledger(tmp_path, "sent_ledger-bsky.yaml", yaml.safe_dump({
+        "entries": [
+            {"action": "post", "platform": "bsky",
+             "timestamp": "2026-08-20T01:00:00.000Z", "dryRun": False},
+            {"action": "reply", "platform": "bsky",
+             "timestamp": "2026-08-20T02:00:00.000Z", "dryRun": False},
+        ],
+    }))
+    assert module.count_ledger(tmp_path, "2026-08-20") == 2

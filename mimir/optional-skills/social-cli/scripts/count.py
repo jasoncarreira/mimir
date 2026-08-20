@@ -75,10 +75,55 @@ def _load_yaml(path: Path) -> tuple[Any, bool]:
     if not text.strip():
         return None, False
     try:
-        return yaml.safe_load(text), False
+        data = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         _eprint(f"social-cli count: skipping malformed ledger {path}: {exc}")
         return None, True
+    if not _document_is_recognized(data):
+        _eprint(
+            f"social-cli count: unrecognised ledger structure in {path} "
+            f"(top level is {type(data).__name__}); treating as unreadable"
+        )
+        return None, True
+    return data, False
+
+
+# Top-level keys under which a ledger may nest its record list. The live
+# format is ``{entries: [...]}``; the rest are tolerated historical shapes.
+_LEDGER_CONTAINER_KEYS = ("entries", "ledger", "sent", "items", "results", "dispatch")
+
+
+def _document_is_recognized(data: Any) -> bool:
+    """Whether a parsed ledger matches a shape we know how to read.
+
+    Syntactically valid YAML can still be a ledger we cannot interpret — a
+    bare scalar, a mapping in no known shape, or a container key holding
+    something other than a list of records. Those yield no records for the
+    same reason an empty ledger does, which is precisely the ambiguity that
+    matters here: an unreadable structure may hold the only record of a post,
+    so it must not be reported as zero.
+
+    The legitimately empty shapes (an absent document, an empty list, an empty
+    container) are recognized, because an empty ledger is a real zero.
+    """
+    if data is None:
+        return True
+    if isinstance(data, list):
+        return all(isinstance(item, dict) for item in data)
+    if not isinstance(data, dict):
+        return False
+    if "action" in data and "timestamp" in data:
+        return True
+    present = [key for key in _LEDGER_CONTAINER_KEYS if key in data]
+    if not present:
+        return False
+    # _records reads every container key it finds, so every one of them has
+    # to be a list of records for the document to be fully interpretable.
+    return all(
+        isinstance(data[key], list)
+        and all(isinstance(item, dict) for item in data[key])
+        for key in present
+    )
 
 
 def _records(data: Any) -> Iterable[dict[str, Any]]:
@@ -92,7 +137,7 @@ def _records(data: Any) -> Iterable[dict[str, Any]]:
     if "action" in data and "timestamp" in data:
         yield data
         return
-    for key in ("entries", "ledger", "sent", "items", "results", "dispatch"):
+    for key in _LEDGER_CONTAINER_KEYS:
         value = data.get(key)
         if isinstance(value, list):
             yield from _records(value)

@@ -294,3 +294,119 @@ def test_main_exits_zero_and_reports_no_damage_on_a_clean_ledger(
                    "--state-root", str(tmp_path), "--json"])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["unreadable"] == 0
+
+
+# --------------------------------------------------------------------------
+# Structurally invalid but syntactically valid ledgers.
+#
+# yaml.safe_load succeeds on a bare scalar and on any mapping, so a ledger can
+# parse cleanly and still be uninterpretable. _records() then yields nothing,
+# which is indistinguishable from an empty ledger — and the file may hold the
+# only record of a post. The live format nests under `entries:`, so a mistyped
+# container is the realistic version of this, not an exotic one: were the
+# upstream shape to change, every file would silently read as zero.
+# --------------------------------------------------------------------------
+
+
+def _detailed(mod, tmp_path):
+    return mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    )
+
+
+def _write_raw(tmp_path: Path, text: str) -> None:
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir(parents=True, exist_ok=True)
+    (poller / "sent_ledger-bsky.yaml").write_text(text, encoding="utf-8")
+
+
+def test_a_bare_scalar_ledger_is_damaged(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "garbage\n")
+    assert _detailed(mod, tmp_path) == (0, 1)
+
+
+def test_a_mistyped_entries_container_is_damaged(tmp_path):
+    """`entries: {}` parses fine and yields nothing — the reported case."""
+    mod = fresh_count()
+    _write_raw(tmp_path, "entries: {}\n")
+    assert _detailed(mod, tmp_path) == (0, 1)
+
+
+def test_an_unknown_top_level_mapping_is_damaged(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "unexpected:\n  - action: post\n")
+    assert _detailed(mod, tmp_path) == (0, 1)
+
+
+def test_a_list_holding_a_non_record_is_damaged(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "- action: post\n  platform: bsky\n  timestamp: 2026-06-28T01:00:00Z\n- just-a-string\n")
+    count, unreadable = _detailed(mod, tmp_path)
+    assert unreadable == 1
+
+
+def test_an_empty_list_ledger_is_a_real_zero(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "[]\n")
+    assert _detailed(mod, tmp_path) == (0, 0)
+
+
+def test_an_empty_entries_container_is_a_real_zero(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "entries: []\n")
+    assert _detailed(mod, tmp_path) == (0, 0)
+
+
+def test_an_explicit_null_ledger_is_a_real_zero(tmp_path):
+    mod = fresh_count()
+    _write_raw(tmp_path, "null\n")
+    assert _detailed(mod, tmp_path) == (0, 0)
+
+
+def test_a_single_record_mapping_is_recognized(tmp_path):
+    mod = fresh_count()
+    _write_raw(
+        tmp_path,
+        "action: post\nplatform: bsky\ntimestamp: 2026-06-28T01:00:00Z\n",
+    )
+    assert _detailed(mod, tmp_path) == (1, 0)
+
+
+def test_the_production_ledger_shape_is_recognized_and_counted(tmp_path):
+    """Pins the live format so tightening this validator cannot reject it.
+
+    Taken from the deployed `sent_ledger-bsky.yaml`: a mapping whose only key
+    is `entries`, holding records with this field set. Rejecting this shape
+    would report every real post as unreadable and block posting outright,
+    which is a worse failure than the one the validation prevents.
+    """
+    mod = fresh_count()
+    _write_ledger(tmp_path / "social-cli-notifications" / "sent_ledger-bsky.yaml", [])
+    (tmp_path / "social-cli-notifications" / "sent_ledger-bsky.yaml").write_text(
+        yaml_dump_entries(), encoding="utf-8"
+    )
+    assert _detailed(mod, tmp_path) == (1, 0)
+
+
+def yaml_dump_entries() -> str:
+    import yaml
+
+    return yaml.safe_dump({
+        "entries": [{
+            "key": "reply:bsky:at://did:plc:x/app.bsky.feed.post/abc:hash",
+            "action": "reply",
+            "platform": "bsky",
+            "targetId": "at://did:plc:x/app.bsky.feed.post/abc",
+            "textHash": "hash",
+            "createdId": "at://did:plc:y/app.bsky.feed.post/def",
+            "timestamp": "2026-06-28T01:00:00.000Z",
+            "cwd": "/mimir-home/state/pollers/social-cli-notifications",
+            "outboxPath": "/mimir-home/state/pollers/social-cli-notifications/outbox-bsky.yaml",
+            "inboxPath": "/mimir-home/state/pollers/social-cli-notifications/inbox-bsky.yaml",
+            "dispatchTimestamp": "2026-06-28T00:59:58.000Z",
+            "dryRun": False,
+        }],
+    })
