@@ -31,6 +31,7 @@ from mimir.pr_checkout_lease import (
     create_pr_checkout_lease,
 )
 from mimir.project_tests import (
+    _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     RepoProjectTests,
 )
@@ -1444,7 +1445,9 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert env["GIT_CONFIG_VALUE_0"] == "*"
     assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 64 * 1024
-    assert kwargs["timeout_s"] == 300.0
+    # Assert propagation, not the magnitude: the value is pinned as a floor
+    # by test_project_test_timeout_can_actually_run_this_repository_suite.
+    assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
     assert result.git_context == (
         "contained Git context: runner=worklink uid=42002 gid=42003; "
         "checkout_owner=mimir uid=42001 gid=42003; global_config=/dev/null; "
@@ -2381,3 +2384,20 @@ def test_real_subprocess_runner_enforces_wall_time_and_capture_cap(mode: str) ->
     else:
         assert result.output_limited is True
         assert len(result.stdout.encode()) <= 64
+
+
+def test_project_test_timeout_can_actually_run_this_repository_suite() -> None:
+    """The bound has to exceed how long this repository's own suite takes.
+
+    At 300s it did not. Every measured full-suite run sat between 492s and
+    597s, so ``repo_test`` on the gate command timed out every time -- not
+    intermittently, arithmetically -- and the agent reviewed pull requests
+    reporting "the bounded runner timed out with empty output", falling back to
+    whatever counts the author supplied.
+
+    Pinned as a floor rather than an exact value so the bound can rise with the
+    suite, but cannot silently drop back under it. 700s is the observed ceiling
+    (597s) plus headroom; if the suite ever legitimately exceeds that, this test
+    is the place to notice.
+    """
+    assert _TIMEOUT_SECONDS >= 700.0

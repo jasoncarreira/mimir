@@ -34,7 +34,18 @@ from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
 
 
-_TIMEOUT_SECONDS = 300.0
+#: Wall-clock ceiling for one project-test invocation.
+#:
+#: 300s could not run this repository's own suite. Every measured full-suite run
+#: sits between 492s and 597s, so ``repo_test`` timed out on the gate command
+#: every time -- not intermittently, arithmetically. The agent reviewed pull
+#: requests reporting "the bounded runner timed out with empty output" and fell
+#: back to whatever counts the author supplied.
+#:
+#: 900s clears the observed ceiling with room for a slow or loaded runner, and
+#: sits between the two bounds CI already allows its own pytest jobs (600s and
+#: 1800s).
+_TIMEOUT_SECONDS = 900.0
 _CAPTURE_BYTES = 64 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
