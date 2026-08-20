@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tarfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -386,7 +387,8 @@ def test_reaper_marks_preservation_failure_once(tmp_path: Path) -> None:
     )
 
     assert len(first) == 1 and first[0].reclaimed is False
-    assert "preservation failed: disk full" in (first[0].error or "")
+    assert "recovery failed" in (first[0].error or "")
+    assert "disk full" in (first[0].error or "")
     assert second == []
     assert lease.path.is_dir()
     marker = lease.path / ".git" / "mimir-pr-checkout-lease-reclamation.json"
@@ -673,7 +675,6 @@ def test_acquire_releases_published_head_after_metadata_head(
     _git(old_lease.path, "add", "published.txt")
     _git(old_lease.path, "commit", "-q", "-m", "published commit")
     published = _git(old_lease.path, "rev-parse", "HEAD")
-    _git(old_lease.path, "update-ref", "refs/mimir/pr-checkout-lease/published", published)
     _git(old_lease.path, "push", "-q", "origin", f"HEAD:{old_scope.destination_ref}")
     fresh_scope = replace(
         old_scope, observed_head_sha=published, provenance="server_discovered",
@@ -690,6 +691,7 @@ def test_acquire_releases_published_head_after_metadata_head(
     assert candidates == ()
     assert not old_lease.path.exists()
     assert fresh_lease.path.is_dir()
+    assert not (lease_root / ".recovery").exists()
 
 
 def test_acquire_releases_rebased_published_work_by_blob_identity(
@@ -717,7 +719,7 @@ def test_acquire_releases_rebased_published_work_by_blob_identity(
     assert fresh_lease.path.is_dir()
 
 
-def test_acquire_names_unexplained_rebased_path_and_preserves_lease(
+def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -730,13 +732,18 @@ def test_acquire_names_unexplained_rebased_path_and_preserves_lease(
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
-    with pytest.raises(RuntimeError, match="retained work; refusing release") as refusal:
-        acquire_pr_checkout_lease(
-            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
-        )
+    unpublished = _git(old_lease.path, "rev-parse", "HEAD")
 
-    assert "unpublished.bin" in str(refusal.value)
-    assert old_lease.path.is_dir()
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
+
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert bundle.name == f"{old_lease.path.name}-{old_lease.recovery_id}.bundle"
+    assert unpublished in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+    assert candidates == ()
 
 
 def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
@@ -850,7 +857,7 @@ def test_acquire_does_not_trust_new_scope_sha_to_release_matching_live_head(
 
 
 @pytest.mark.parametrize("dirty_kind", ["tracked", "untracked"])
-def test_acquire_refuses_to_release_superseded_lease_with_uncommitted_work(
+def test_acquire_archives_dirty_superseded_lease_before_releasing_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     dirty_kind: str,
@@ -874,14 +881,22 @@ def test_acquire_refuses_to_release_superseded_lease_with_uncommitted_work(
         lambda kind, **fields: events.append((kind, fields)),
     )
 
-    with pytest.raises(RuntimeError, match="retained work; refusing release") as refusal:
-        acquire_pr_checkout_lease(
-            fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
-        )
+    fresh_lease, candidates = acquire_pr_checkout_lease(
+        fresh_scope, owner=fresh_scope.principal, lease_root=lease_root,
+    )
 
-    assert str(old_lease.path) in str(refusal.value)
-    assert retained.read_text(encoding="utf-8") == "unfinished fix\n"
-    assert events == [(
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    archive = bundle.with_suffix(".worktree.tar.gz")
+    with tarfile.open(archive, "r:gz") as recovered:
+        restored = recovered.extractfile(
+            f"worktree/{'file.txt' if dirty_kind == 'tracked' else 'retained.txt'}"
+        )
+        assert restored is not None
+        assert restored.read() == b"unfinished fix\n"
+    assert not old_lease.path.exists()
+    assert fresh_lease.path.is_dir()
+    assert candidates == ()
+    assert events[0] == (
         "pr_checkout_lease_retained",
         {
             "repository": fresh_scope.canonical_repo,
@@ -892,10 +907,52 @@ def test_acquire_refuses_to_release_superseded_lease_with_uncommitted_work(
                 "path": str(old_lease.path),
             }],
         },
-    )]
+    )
 
 
-def test_pr_checkout_lease_cleanup_refuses_unpublished_commit_on_lease_branch(
+def test_acquire_leaves_superseded_lease_when_recovery_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, old_scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    old_lease = create_pr_checkout_lease(
+        old_scope, owner=old_scope.principal, lease_root=lease_root,
+    )
+    (old_lease.path / "fix.txt").write_text("unpublished\n", encoding="utf-8")
+    _git(old_lease.path, "add", "fix.txt")
+    _git(old_lease.path, "commit", "-q", "-m", "unpublished")
+    head = _git(old_lease.path, "rev-parse", "HEAD")
+    fresh_scope = _advance_pr_head(repo, old_scope)
+    monkeypatch.setattr(
+        "mimir.pr_checkout_lease._observe_current_pr_head",
+        lambda _scope: fresh_scope.observed_head_sha,
+    )
+
+    def runner(args):
+        if "bundle" in args and "create" in args:
+            return subprocess.CompletedProcess(args, 1, "", "disk full\n")
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    with pytest.raises(RuntimeError) as failure:
+        acquire_pr_checkout_lease(
+            fresh_scope,
+            owner=fresh_scope.principal,
+            lease_root=lease_root,
+            runner=runner,
+        )
+
+    message = str(failure.value)
+    assert str(old_lease.path) in message
+    assert head in message
+    assert "Operator must preserve the checkout and recover or publish" in message
+    assert old_lease.path.is_dir()
+    assert old_lease.revoked is False
+    assert not list((lease_root / ".recovery").glob("*.bundle"))
+
+
+def test_pr_checkout_lease_cleanup_bundles_unpublished_commit_on_lease_branch(
     tmp_path: Path,
 ) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
@@ -907,13 +964,17 @@ def test_pr_checkout_lease_cleanup_refuses_unpublished_commit_on_lease_branch(
     _git(lease.path, "commit", "-q", "-m", "fix")
 
     assert _git(lease.path, "rev-parse", "HEAD") != lease.head_sha
-    with pytest.raises(RuntimeError, match="cleanup publication mismatch"):
-        cleanup_pr_checkout_lease(lease)
+    fix_head = _git(lease.path, "rev-parse", "HEAD")
+    assert cleanup_pr_checkout_lease(lease) is True
 
-    assert lease.path.is_dir()
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert fix_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not lease.path.exists()
 
 
-def test_pr_checkout_lease_cleanup_refuses_without_publication_proof(tmp_path: Path) -> None:
+def test_pr_checkout_lease_cleanup_rechecks_remote_without_publication_proof(
+    tmp_path: Path,
+) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
     lease_root = tmp_path / "leases"
     lease_root.mkdir()
@@ -923,10 +984,10 @@ def test_pr_checkout_lease_cleanup_refuses_without_publication_proof(tmp_path: P
     _git(lease.path, "push", "--force", "origin", f"HEAD:{scope.destination_ref}")
     _git(lease.path, "fetch", "origin", scope.destination_ref)
 
-    with pytest.raises(RuntimeError, match="found no publication proof"):
-        cleanup_pr_checkout_lease(lease)
+    assert cleanup_pr_checkout_lease(lease) is True
 
-    assert lease.path.is_dir()
+    assert not lease.path.exists()
+    assert not (lease_root / ".recovery").exists()
 
 
 def test_pr_checkout_lease_cleanup_refuses_mismatched_origin(tmp_path: Path) -> None:
@@ -1000,7 +1061,7 @@ def test_pr_checkout_lease_cleanup_refuses_wrong_branch(tmp_path: Path) -> None:
     assert lease.path.is_dir()
 
 
-def test_pr_checkout_lease_cleanup_refuses_unrelated_head_on_expected_branch(
+def test_pr_checkout_lease_cleanup_bundles_unrelated_head_on_expected_branch(
     tmp_path: Path,
 ) -> None:
     _repo, scope = _repo_and_scope(tmp_path)
@@ -1015,14 +1076,11 @@ def test_pr_checkout_lease_cleanup_refuses_unrelated_head_on_expected_branch(
     unrelated_head = _git(lease.path, "rev-parse", "HEAD")
     _git(lease.path, "branch", "-M", scope.head_ref)
 
-    with pytest.raises(RuntimeError) as refusal:
-        cleanup_pr_checkout_lease(lease)
+    assert cleanup_pr_checkout_lease(lease) is True
 
-    assert str(refusal.value) == (
-        "PR checkout lease cleanup publication mismatch: "
-        f"HEAD {unrelated_head!r} is not contained in published commit {lease.head_sha!r}"
-    )
-    assert lease.path.is_dir()
+    bundle = next((lease_root / ".recovery").glob("*.bundle"))
+    assert unrelated_head in _git(bundle.parent, "bundle", "list-heads", str(bundle))
+    assert not lease.path.exists()
 
 
 def test_pr_checkout_lease_cleanup_refuses_missing_required_identity_field(
