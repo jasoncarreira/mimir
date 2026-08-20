@@ -20,7 +20,7 @@ from ..forge import ForgeClient, ForgeError, IssueTarget, ReviewVerdict
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
-    ServerDiscoveredPRStates,
+    ServerDiscoveredPRScopeStore, ServerDiscoveredPRStates,
 )
 from .refusals import ToolPolicyRefusal
 
@@ -244,6 +244,47 @@ def resolve_review_state_for_context(
         raise ToolPolicyRefusal(
             "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
         )
+    refusal = cache.refusal(repository, pull_request) if isinstance(
+        cache, ServerDiscoveredPRStates,
+    ) else None
+    if refusal is not None:
+        raise ToolPolicyRefusal(refusal)
+    store = getattr(context, "server_discovered_pr_scope_store", None)
+    stored_scope = store.resolve(repository, pull_request) if (
+        isinstance(store, ServerDiscoveredPRScopeStore)
+        and context is not None
+        and context.event_ingress is None
+    ) else None
+    if stored_scope is not None:
+        client = _client_for_repository(repository)
+        try:
+            snapshot = client.get_pull_request_snapshot(
+                stored_scope.canonical_repo, stored_scope.pr_number,
+            )
+        except ForgeError as exc:
+            raise ToolException(f"pull-request operation rejected: {exc}") from exc
+        if (
+            snapshot.state == "open"
+            and isinstance(snapshot.repo, str)
+            and snapshot.repo.lower() == stored_scope.canonical_repo
+            and snapshot.number == stored_scope.pr_number
+            and snapshot.head_sha.lower() == stored_scope.observed_head_sha
+        ):
+            reused = RepoReviewState(stored_scope)
+            return cache.remember(reused) if isinstance(
+                cache, ServerDiscoveredPRStates,
+            ) else reused
+        store.discard(
+            repository, pull_request, expected_scope=stored_scope,
+        )
+        stale_refusal = (
+            "pull-request operation rejected: stored server-discovered scope for "
+            f"repository={json.dumps(repository)}, pull_request={pull_request} is stale; "
+            "the pull request head advanced or is no longer open"
+        )
+        if isinstance(cache, ServerDiscoveredPRStates):
+            cache.remember_refusal(repository, pull_request, stale_refusal)
+        raise ToolPolicyRefusal(stale_refusal)
     if (
         context is None
         or context.trigger != "user_message"
@@ -256,11 +297,19 @@ def resolve_review_state_for_context(
             cache, registry, repository, pull_request,
         )
         if scope_refusal is not None:
+            if isinstance(cache, ServerDiscoveredPRStates):
+                cache.remember_refusal(
+                    repository, pull_request, scope_refusal,
+                )
             raise ToolPolicyRefusal(scope_refusal)
-        raise ToolPolicyRefusal(
-            "pull-request operation rejected: live scope discovery requires an "
-            "authenticated operator user turn"
+        scope_refusal = (
+            "pull-request operation rejected: requested "
+            f"repository={json.dumps(repository)}, pull_request={pull_request}; "
+            "live scope discovery requires an authenticated operator user turn"
         )
+        if isinstance(cache, ServerDiscoveredPRStates):
+            cache.remember_refusal(repository, pull_request, scope_refusal)
+        raise ToolPolicyRefusal(scope_refusal)
     cached = cache.resolve(repository, pull_request) if cache is not None else None
     if cached is not None:
         return cached
@@ -299,6 +348,9 @@ def resolve_review_state_for_context(
             "pull-request operation rejected: live pull request is closed or invalid"
         ))
     state = RepoReviewState(scope)
+    store = getattr(context, "server_discovered_pr_scope_store", None)
+    if isinstance(store, ServerDiscoveredPRScopeStore):
+        store.remember_server_discovery(scope)
     return cache.remember(state) if cache is not None else state
 
 
