@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-import poller
+from github_poller_test_support import poller
 
 
 def _pr(number: int, sha: str, login: str = "alice",

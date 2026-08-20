@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-import poller
+from github_poller_test_support import poller
 
 
 SINCE = "2026-06-28T15:45:00Z"
