@@ -943,6 +943,16 @@ class ServerDiscoveredPRStates:
         default_factory=set, init=False, repr=False,
     )
 
+    @property
+    def review_states(self) -> tuple[RepoReviewState, ...]:
+        """Every state discovered this turn.
+
+        Named to match RepoPRScopeRegistry.review_states so a caller holding
+        either scope carrier can enumerate it the same way.
+        """
+        with self._lock:
+            return tuple(self._states.values())
+
     def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
         with self._lock:
             return self._states.get((repository.lower(), pull_request))

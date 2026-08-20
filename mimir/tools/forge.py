@@ -178,8 +178,7 @@ def _scope_miss_refusal(
 ) -> str | None:
     states: tuple[RepoReviewState, ...] = ()
     if isinstance(cache, ServerDiscoveredPRStates):
-        with cache._lock:
-            states = tuple(cache._states.values())
+        states = cache.review_states
     if isinstance(registry, RepoPRScopeRegistry):
         states += registry.review_states
 
