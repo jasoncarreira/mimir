@@ -3587,7 +3587,7 @@ def test_content_dedupe_keeps_both_admission_labels_and_sink_compatibility(
     assert decision.allowed is True
 
 
-def test_arousal_dropped_records_keep_all_admission_labels(
+def test_arousal_suppressed_records_do_not_label_the_block(
     tmp_path: Path,
 ) -> None:
     log = _make_log(tmp_path, events=[
@@ -3633,12 +3633,91 @@ def test_arousal_dropped_records_keep_all_admission_labels(
     assert block is not None
     assert "arousal-one" not in block.content
     assert "arousal-two" not in block.content
-    assert len(block.labels.sources) == 3
+    # The arousal filter suppresses a whole kind below its threshold, so these
+    # two contribute neither a line nor a count to the one rendered signal.
+    # Nothing derived from them reached the model, so they must not label the
+    # block -- see test_suppressed_record_does_not_veto_a_compatible_sink for
+    # why carrying them is not merely redundant.
+    assert len(block.labels.sources) == 1
+    assert block.labels.sources[0].source_kind == "agent_self"
     sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
     )
     assert decision.allowed is True
+
+
+def test_suppressed_record_does_not_veto_a_compatible_sink(tmp_path: Path) -> None:
+    """A record the model never saw must not block a delivery.
+
+    Admission compatibility is judged against the TRIGGERING channel; a sink
+    can have a different destination with a different audience. So a record
+    admitted into the window, then suppressed by the arousal filter, would --
+    if it still labelled the block -- veto a destination that every visible
+    source is cleared for.
+    """
+    class Resolver:
+        def identity(self, author):
+            from mimir.identities import Identity
+
+            return Identity(canonical="alice") if author == "alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("feedback eligibility must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return {
+                "current": frozenset({"alice"}),
+                "secret-channel": frozenset({"alice"}),
+                "other-channel": frozenset({"alice", "bob"}),
+            }.get(channel_id)
+
+    log = _make_log(tmp_path, events=[
+        # Renders: agent-self, trusted, constrains no destination.
+        {
+            "timestamp": _ts(0.3),
+            "type": "interactive_turn_no_send_message",
+            "turn_id": "visible",
+        },
+        # Suppressed: one occurrence against a threshold of 3.
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "channel_id": "secret-channel",
+            "owner_principal": "alice",
+            "tool": "suppressed-tool",
+            "reason": "quiet",
+        },
+    ])
+    log.arousal_thresholds = {"tool_denied": 3}
+    log.identity_resolver = Resolver()
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="current",
+        interactivity=None, domain="channel", resource_id="current",
+        bridge_instance="test", audience_provider=Provider(),
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "suppressed-tool" not in block.content
+    assert "secret-channel" not in {
+        source.resource_id for source in block.labels.sources
+    }
+
+    # Retaining the suppressed record's label refuses this delivery: its
+    # channel is not the triggering channel, so the sink's same-channel arm
+    # rejects it even though the visible agent-self line is cleared. Verified
+    # by reverting the kind-scoped labelling, which turns this False.
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "current", block.labels, sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

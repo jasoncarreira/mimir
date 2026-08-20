@@ -707,6 +707,17 @@ class FeedbackLog:
         admitted_events: list[dict] = []
         admitted_turns: list[dict] = []
         chain_inputs: list[tuple[dict, str]] = []
+        # Admission decides eligibility, not contribution. The arousal filter
+        # suppresses a whole kind whose occurrences stay below its threshold,
+        # and a suppressed kind contributes no line and no count to anything
+        # rendered -- so labelling it lets a record the model never saw veto a
+        # delivery every visible source is cleared for.
+        #
+        # Granularity is the signal kind, deliberately. A record dropped by the
+        # per-polarity cap, or collapsed into a duplicate run, still feeds the
+        # "(xN in 24h)" count on a rendered line of its own kind, so it did
+        # contribute and its provenance is retained.
+        sources_by_kind: dict[str, list[SourceLabel]] = {}
 
         def admit(record: dict, stream: str) -> dict | None:
             nonlocal labels
@@ -796,7 +807,19 @@ class FeedbackLog:
                 cross_platform_pull=auth_context.cross_platform_pull,
             ):
                 return None
-            labels = labels.with_source(source)
+            signal_kind = (
+                "turn_error" if stream == "turns"
+                else classified[1] if classified
+                else None
+            )
+            if signal_kind is None:
+                # Admitted without a feedback classification: the loop-detection
+                # carriers (send_message_sent, cross_turn_send_duplicate) feed
+                # synthesized content rather than a signal of their own, so they
+                # keep contributing provenance.
+                labels = labels.with_source(source)
+            else:
+                sources_by_kind.setdefault(signal_kind, []).append(source)
             return sanitized
 
         for record in iter_window_records(self.events_snapshot, self.events_path):
@@ -846,6 +869,12 @@ class FeedbackLog:
             turns_snapshot=_RecordSnapshot(admitted_turns),
         )
         negatives, positives = selected_log.recent(auth_context=None)
+        rendered_kinds = {signal.kind for signal in (*negatives, *positives)}
+        for kind, kind_sources in sources_by_kind.items():
+            if kind not in rendered_kinds:
+                continue
+            for source in kind_sources:
+                labels = labels.with_source(source)
         if chain_inputs:
             chain_snapshot = _RecordSnapshot([record for record, _ in chain_inputs])
             group_runs = _compute_group_runs(
