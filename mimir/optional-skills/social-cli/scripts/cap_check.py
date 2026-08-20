@@ -36,6 +36,8 @@ Exit codes:
   2 — sources diverge by more than 1 (smell worth surfacing)
   3 — the ledger could not be read, so no cap headroom was established;
       treat as "do not post until this is fixed", not as zero posts
+  4 — one or more archive files could not be parsed, so the archive count
+      is a floor rather than a count; headroom is likewise unestablished
 
 Why this lives as a separate script instead of an option on
 `count.py`: the upstream skill rule is "do not maintain a separate
@@ -174,6 +176,7 @@ def count_ledger(home: Path, today: str) -> int | None:
 
 
 LEDGER_UNAVAILABLE = 3
+ARCHIVE_UNREADABLE = 4
 
 
 def main() -> int:
@@ -184,19 +187,31 @@ def main() -> int:
 
     suffix = f" archive_unreadable={archive_unreadable}" if archive_unreadable else ""
 
-    if ledger_count is None:
-        # Fail closed. The ledger is the canonical surface, and without it
-        # there is no established headroom to spend — so report the gap
-        # rather than a number the caller would read as room to post.
+    # Fail closed on either unreadable source. The archive exists precisely
+    # because ledger writes can lag or be skipped, so a readable ledger is not
+    # a substitute for an archive we could not parse: the only record of a
+    # dispatched post may be in the file that failed to load. Reporting a
+    # number there would be the same unverified headroom the ledger path fixes.
+    if ledger_count is None or archive_unreadable:
+        ledger_field = (
+            "ledger=unavailable" if ledger_count is None else f"ledger={ledger_count}"
+        )
         print(
             f"today_utc={today} archive={archive_count} "
-            f"ledger=unavailable effective=unknown / {CAP}{suffix}"
+            f"{ledger_field} effective=unknown / {CAP}{suffix}"
         )
+        if ledger_count is None:
+            sys.stderr.write(
+                "cap_check: ledger unavailable — cap headroom NOT established; "
+                "fix count.py before posting\n"
+            )
+            return LEDGER_UNAVAILABLE
         sys.stderr.write(
-            "cap_check: ledger unavailable — cap headroom NOT established; "
-            "fix count.py before posting\n"
+            f"cap_check: {archive_unreadable} archive file(s) unparseable — the "
+            "archive count is a floor, so cap headroom is NOT established; "
+            "repair or remove them before posting\n"
         )
-        return LEDGER_UNAVAILABLE
+        return ARCHIVE_UNREADABLE
 
     effective = max(archive_count, ledger_count)
     print(

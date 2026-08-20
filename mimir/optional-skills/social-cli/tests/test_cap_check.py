@@ -193,8 +193,56 @@ def test_main_tolerates_divergence_of_one(monkeypatch, capsys):
 def test_main_surfaces_unreadable_archive_files(monkeypatch, capsys):
     module = fresh_cap_check()
     _patch_sources(monkeypatch, module, archive=1, unreadable=2, ledger=1)
-    module.main()
-    assert "archive_unreadable=2" in capsys.readouterr().out
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert "archive_unreadable=2" in out
+    assert rc == module.ARCHIVE_UNREADABLE
+
+
+def test_main_fails_closed_when_an_archive_file_is_unreadable(monkeypatch, capsys):
+    """The regression for the reported case: 0 / 0 / one unparseable file.
+
+    A malformed archive can be the only record of a dispatched post — that is
+    the whole reason the archive is cross-checked, since the ledger write is
+    the thing that can go missing. Reading both zeros as "no posts today"
+    would hand back the full cap on the strength of a file we failed to open.
+    """
+    module = fresh_cap_check()
+    _patch_sources(monkeypatch, module, archive=0, unreadable=1, ledger=0)
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert rc != 0
+    assert "effective=unknown" in out
+    assert "effective=0" not in out
+    assert "archive_unreadable=1" in out
+
+
+def test_main_fails_closed_on_unreadable_archive_despite_a_readable_ledger(
+    monkeypatch, capsys
+):
+    """A readable ledger is not a substitute for an unparseable archive."""
+    module = fresh_cap_check()
+    _patch_sources(monkeypatch, module, archive=2, unreadable=1, ledger=2)
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert "effective=unknown" in out
+    assert "effective=2" not in out
+    assert "ledger=2" in out
+
+
+def test_ledger_unavailability_is_reported_ahead_of_archive_damage(
+    monkeypatch, capsys
+):
+    """Both sources broken: name the canonical one, since it gates the fix."""
+    module = fresh_cap_check()
+    _patch_sources(monkeypatch, module, archive=0, unreadable=1, ledger=None)
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.LEDGER_UNAVAILABLE
+    assert "ledger=unavailable" in out
+    assert "effective=unknown" in out
 
 
 def test_main_omits_the_unreadable_field_when_clean(monkeypatch, capsys):
