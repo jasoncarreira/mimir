@@ -1065,3 +1065,104 @@ async def test_close_that_raises_on_forced_cancel_still_fences_admission(
     finally:
         await asyncio.wait({runner}, timeout=1.0)
         shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_close_that_raises_in_the_first_grace_interval_fences_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close can fail before any forced cancellation, and must still fence.
+
+    The retirement decision used to live inside the ``if unfinished`` branch, so
+    a close that raised during the FIRST bounded wait left that branch unentered
+    and was never reported: the runner returned, the single admission slot was
+    freed, and a replacement could enter after failed teardown.
+    """
+    import mimir.acp.sdk as sdk
+
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    daemon._uid = os.getuid()
+    entered = asyncio.Event()
+
+    async def fails_during_grace(self: object) -> None:
+        entered.set()
+        await asyncio.sleep(0)          # let the runner reach the shield
+        raise RuntimeError("cleanup failed before any cancel")
+
+    monkeypatch.setattr(sdk.Connection, "close", fails_during_grace)
+    # Generous, so the close finishes INSIDE the first interval rather than
+    # being cancelled: this is the path that skipped the report.
+    monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 1.0)
+
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(
+            _StubAgent(),
+            request_reader=_eof_reader(),
+            response_writer=_Writer(),
+            on_close_abandoned=daemon._record_abandoned_close,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1.0)
+        runner.cancel()
+        _, pending = await asyncio.wait({runner}, timeout=2.0)
+        assert not pending, "runner did not resolve"
+
+        assert daemon._unretired_generations() >= 1
+        assert daemon._failed_retirements == 1
+
+        writer = _Writer()
+        await daemon._admit_peer(asyncio.StreamReader(), writer)
+        assert daemon._admitted == 0, "replacement admitted after failed teardown"
+        assert b"error" in bytes(writer.data)
+    finally:
+        await asyncio.wait({runner}, timeout=1.0)
+        shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_close_failure_surfaced_by_the_shield_fences_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close that simply fails -- no cancellation anywhere -- must fence too.
+
+    Here the shield surfaces the failure directly and it becomes
+    ``close_failure``. That was never registered as a failed retirement, so the
+    generation looked retired while teardown had not succeeded.
+    """
+    import mimir.acp.sdk as sdk
+
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    daemon._uid = os.getuid()
+
+    async def fails_immediately(self: object) -> None:
+        raise RuntimeError("close failed outright")
+
+    monkeypatch.setattr(sdk.Connection, "close", fails_immediately)
+
+    # No runner.cancel() at all: the close just fails. run_stdio_agent
+    # propagates that failure, which it should -- the fence has to be raised
+    # regardless, and that is what this asserts.
+    with pytest.raises(RuntimeError, match="close failed outright"):
+        await asyncio.wait_for(
+            sdk.run_stdio_agent(
+                _StubAgent(),
+                request_reader=_eof_reader(),
+                response_writer=_Writer(),
+                on_close_abandoned=daemon._record_abandoned_close,
+            ),
+            2.0,
+        )
+
+    assert daemon._unretired_generations() >= 1
+    assert daemon._failed_retirements == 1
+
+    writer = _Writer()
+    await daemon._admit_peer(asyncio.StreamReader(), writer)
+    assert daemon._admitted == 0, "replacement admitted after failed teardown"
+    assert b"error" in bytes(writer.data)
+    shutil.rmtree(home)

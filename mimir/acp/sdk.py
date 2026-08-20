@@ -987,6 +987,28 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
 ACP_CLOSE_CANCEL_TIMEOUT = 0.5
 
 
+def _close_retired_cleanly(close_task: asyncio.Task[None]) -> bool:
+    """Whether a shielded close left nothing of its generation running.
+
+    Clean means the task finished and either returned or honoured a
+    cancellation -- in both cases nothing of that generation is still
+    executing. Still pending is not clean, and neither is finishing by raising:
+    teardown reached an unknown state, and the exception would otherwise go
+    unretrieved.
+
+    The caller fences admission on anything not clean, so this decision has to
+    be reached on EVERY exit path out of the close -- the shield raising, either
+    grace interval expiring, the close failing inside a grace interval, or the
+    runner being cancelled again. Deciding it in one place is what keeps a path
+    from silently skipping it.
+    """
+    if not close_task.done():
+        return False
+    if close_task.cancelled():
+        return True
+    return close_task.exception() is None
+
+
 async def run_stdio_agent(
     agent: Agent,
     *,
@@ -1032,6 +1054,7 @@ async def run_stdio_agent(
         primary = exc
         traceback = exc.__traceback__
     close_failure: BaseException | None = None
+    close_task: asyncio.Task[None] | None = None
     try:
         close_task = asyncio.create_task(connection.close())
         try:
@@ -1052,26 +1075,20 @@ async def run_stdio_agent(
                 await asyncio.wait(
                     {close_task}, timeout=ACP_CLOSE_CANCEL_TIMEOUT,
                 )
-                # ``done()`` is not the same as retired. If the forced cancel
-                # makes the close finish by RAISING during the wait above, the
-                # task is done but teardown failed -- and skipping the report
-                # here would both free the daemon's admission slot and leave
-                # that exception unretrieved. Report anything that did not stop
-                # cleanly; the daemon's retirement accounting classifies it.
-                retired_cleanly = close_task.done() and (
-                    close_task.cancelled() or close_task.exception() is None
-                )
-                if not retired_cleanly and on_close_abandoned is not None:
-                    # Bounding the wait is not the same as retiring the
-                    # generation. Returning here frees the daemon's admission
-                    # slot -- it is released from the runner task's done
-                    # callback -- while this close is still running, so the
-                    # caller has to know the generation is unretired or it will
-                    # admit a replacement alongside live old work.
-                    on_close_abandoned(close_task)
             raise
     except BaseException as exc:
         close_failure = exc
+    finally:
+        # THE retirement decision, made once for every way this block can be
+        # left: the shield raising, either grace interval expiring, the close
+        # failing inside a grace interval, or the runner being cancelled again.
+        # It lived inside the ``if unfinished`` branch before, so a close that
+        # raised during the FIRST interval -- or one whose failure the shield
+        # surfaced directly -- was never reported, and the runner went on to
+        # free the daemon's single admission slot after a failed teardown.
+        if close_task is not None and on_close_abandoned is not None:
+            if not _close_retired_cleanly(close_task):
+                on_close_abandoned(close_task)
     peer.mark_transport_dead()
     try:
         on_closed = getattr(agent, "on_transport_closed", None)
