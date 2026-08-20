@@ -4834,7 +4834,7 @@ def _source_is_triggering_channel_compatible(
         and _same_channel_authority(source, triggering_bridge_instance)
     ):
         return True
-    if source_kind == "recent_activity_user":
+    if source_kind in {"recent_activity_user", "owner_attested_feedback"}:
         from .models import OwnerAttestation
 
         attestation = getattr(source, "owner_attestation", None)
@@ -4856,7 +4856,45 @@ def _source_is_triggering_channel_compatible(
             )
         except Exception:
             return False
-        return destination_audience == frozenset({effective_principal})
+        if source_kind == "recent_activity_user":
+            return destination_audience == frozenset({effective_principal})
+        try:
+            resolver = getattr(audience_provider, "identity_resolver", None)
+            identity = getattr(resolver, "identity", None)
+        except Exception:
+            return False
+        if (
+            not callable(identity)
+            or not isinstance(destination_audience, frozenset)
+            or not destination_audience
+        ):
+            return False
+        human_audience: set[str] = set()
+        for value in destination_audience:
+            if not isinstance(value, str) or not value.strip():
+                return False
+            if value.startswith("service:"):
+                continue
+            try:
+                resolved = identity(value)
+                canonical = getattr(resolved, "canonical", None)
+                is_service = getattr(
+                    getattr(resolved, "access", None),
+                    "is_service",
+                    False,
+                )
+            except Exception:
+                return False
+            if resolved is None:
+                return False
+            if not isinstance(canonical, str) or not canonical:
+                return False
+            if is_service:
+                continue
+            if canonical.startswith("service:"):
+                continue
+            human_audience.add(canonical)
+        return frozenset(human_audience) == frozenset({effective_principal})
     if source_kind in {
         "channel_scoped_feedback",
         "channel_bound_unowned_feedback",

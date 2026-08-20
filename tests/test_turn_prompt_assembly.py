@@ -1354,6 +1354,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
     expected = Counter({
         ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner"): 1,
         ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation"): 1,
+        ("attestation", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "attest_owner"): 1,
         ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation"): 1,
         ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation"): 1,
         ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context"): 1,

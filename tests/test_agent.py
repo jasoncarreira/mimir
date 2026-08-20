@@ -793,6 +793,28 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+def test_agent_audience_provider_reuses_message_buffer_identity_resolver(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    resolver = _resolver(home, "people:\n  - canonical: alice\n")
+    buffer = MessageBuffer(
+        history_path=home / "messages.jsonl",
+        resolver=resolver,
+    )
+
+    agent = Agent(
+        config=_make_config(home),
+        turn_logger=TurnLogger(home / "logs" / "turns.jsonl"),
+        message_buffer=buffer,
+        index_generator=IndexGenerator(home),
+    )
+
+    assert agent._identity_resolver is resolver
+    assert agent._audience_provider.identity_resolver is resolver
+
+
 def test_agent_wires_resolved_provider_into_budget_arbiter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5554,6 +5576,294 @@ def test_unknown_cross_history_is_omitted_and_reply_is_delivered(
         enforce=True,
     )
     assert reply.allowed is True
+
+
+def _feedback_delivery_agent(
+    tmp_path: Path,
+    identities: str,
+    reply: str,
+) -> tuple[Agent, _ContextCaptureAgent, _BridgeStub, IdentityResolver, str]:
+    from mimir.channel_audience import ServerChannelAudienceProvider
+
+    graph = _ContextCaptureAgent(response_messages=[AIMessage(content=reply)])
+    bridge = _BridgeStub()
+    bridge.prefixes = ("acp:",)
+    channels = ChannelRegistry()
+    channels.register(bridge)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=graph,
+        fake_saga=_FakeSaga(),
+        channel_registry=channels,
+    )
+    agent._config.access_control_enforced = True
+    resolver = _resolver(agent._config.home, identities)
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    agent._feedback.identity_resolver = resolver
+    agent._audience_provider = ServerChannelAudienceProvider(
+        agent._config.home,
+        identity_resolver=resolver,
+    )
+    session = SessionStore(agent._config.home).create_owned_session("alice")
+    return agent, graph, bridge, resolver, session.thread_id
+
+
+async def _emit_discord_feedback(
+    resolver: IdentityResolver,
+    *,
+    user_id: int,
+    channel_id: int = 777,
+) -> None:
+    from datetime import datetime, timezone
+
+    from mimir.bridges.discord import DiscordBridge
+
+    async def enqueue(event):
+        return True
+
+    target = SimpleNamespace(
+        author=SimpleNamespace(id=999),
+        created_at=datetime.now(tz=timezone.utc),
+    )
+
+    class Channel:
+        id = channel_id
+        type = None
+        name = "feedback"
+
+        async def fetch_message(self, message_id):
+            return target
+
+    class Client:
+        user = SimpleNamespace(id=999)
+
+        def get_channel(self, requested):
+            return Channel() if requested == channel_id else None
+
+    emitter = DiscordBridge(
+        token="test",
+        enqueue=enqueue,
+        identity_resolver=resolver,
+    )
+    emitter._client = Client()
+    await emitter._on_reaction(SimpleNamespace(
+        user_id=user_id,
+        channel_id=channel_id,
+        message_id=12345,
+        emoji="thumbsup",
+    ))
+
+
+async def _emit_slack_feedback(resolver: IdentityResolver) -> None:
+    from mimir.bridges.slack import SlackBridge
+
+    async def enqueue(event):
+        return True
+
+    emitter = SlackBridge(
+        bot_token="xoxb-test",
+        app_token="xapp-test",
+        enqueue=enqueue,
+        identity_resolver=resolver,
+    )
+    emitter._bot_id = "BSELF"
+    await emitter._on_reaction({
+        "user": "U123ALICE",
+        "reaction": "heart",
+        "item": {
+            "type": "message",
+            "channel": "CMULTI",
+            "ts": "1714768925.000100",
+            "bot_id": "BSELF",
+        },
+    })
+
+
+async def test_discord_feedback_owner_history_reaches_same_principal_acp_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _acp_turn(monkeypatch)
+    reply = "DISCORD-FEEDBACK-REPLY"
+    agent, graph, bridge, resolver, destination = _feedback_delivery_agent(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-123]
+            access: {roles: [user]}
+        """,
+        reply,
+    )
+    await _emit_discord_feedback(resolver, user_id=123)
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="reply",
+        author="discord-123",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert "discord-123" in prompt
+    feedback_sources = [
+        source
+        for source in graph.contexts[0].ifc_state.current().sources
+        if source.source_kind == "owner_attested_feedback"
+    ]
+    assert len(feedback_sources) == 1
+    assert feedback_sources[0].owner_attestation is not None
+    assert feedback_sources[0].owner_attestation.raw_author == "discord-123"
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+async def test_slack_feedback_owner_history_reaches_same_principal_acp_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _acp_turn(monkeypatch)
+    reply = "SLACK-FEEDBACK-REPLY"
+    agent, graph, bridge, resolver, destination = _feedback_delivery_agent(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [slack-U123ALICE]
+            access: {roles: [user]}
+        """,
+        reply,
+    )
+    await _emit_slack_feedback(resolver)
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="reply",
+        author="slack-U123ALICE",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert "slack-U123ALICE" in prompt
+    feedback_sources = [
+        source
+        for source in graph.contexts[0].ifc_state.current().sources
+        if source.source_kind == "owner_attested_feedback"
+    ]
+    assert len(feedback_sources) == 1
+    assert feedback_sources[0].resource_id == "slack-CMULTI"
+    assert feedback_sources[0].owner_attestation is not None
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+async def test_attested_commitment_feedback_reaches_same_principal_acp_reply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from mimir.commitments.extractor import assign_extraction_acl
+    from mimir.commitments.models import CommitmentRecord, make_commitment_id
+    from mimir.commitments.poller import check_due_and_expired
+    from mimir.commitments.store import CommitmentsStore
+    from mimir.models import SessionACL
+
+    _acp_turn(monkeypatch)
+    reply = "COMMITMENT-FEEDBACK-REPLY"
+    agent, graph, bridge, resolver, destination = _feedback_delivery_agent(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-123]
+            access: {roles: [user]}
+        """,
+        reply,
+    )
+    now = time.time()
+    record = CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="discord-commitment-source",
+        text="ATTESTED-COMMITMENT-SENTINEL",
+        due_window_start_unix=now - 1,
+        due_window_end_unix=now + 60,
+    )
+    assign_extraction_acl(
+        record,
+        SessionACL(
+            owner_principal="alice",
+            origin_channel="discord-commitment-source",
+            origin_domain="discord",
+            visibility="private",
+            provenance_complete=True,
+        ),
+        service_name="mimir",
+    )
+    store = CommitmentsStore(agent._config.home / "commitments.jsonl")
+    await store.add(record)
+    assert store.current_state()[record.id].ownership_provenance is not None
+    result = await check_due_and_expired(store, now_unix=now)
+    assert result.due_emitted == 1
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="reply",
+        author="discord-123",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert "ATTESTED-COMMITMENT-SENTINEL" in prompt
+    feedback_sources = [
+        source
+        for source in graph.contexts[0].ifc_state.current().sources
+        if source.source_kind == "owner_attested_feedback"
+    ]
+    assert len(feedback_sources) == 1
+    assert feedback_sources[0].owner_attestation is not None
+    assert feedback_sources[0].owner_attestation.raw_author == "alice"
+    assert [sent[1] for sent in bridge.sends] == [reply]
+
+
+async def test_other_principal_feedback_is_omitted_but_acp_reply_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _acp_turn(monkeypatch)
+    reply = "OTHER-PRINCIPAL-REPLY"
+    agent, graph, bridge, resolver, destination = _feedback_delivery_agent(
+        tmp_path,
+        """
+        people:
+          - canonical: alice
+            aliases: [discord-123]
+            access: {roles: [user]}
+          - canonical: bob
+            aliases: [discord-456]
+            access: {roles: [user]}
+        """,
+        reply,
+    )
+    await _emit_discord_feedback(resolver, user_id=456)
+
+    await agent.run_turn(AgentEvent(
+        trigger="user_message",
+        channel_id=destination,
+        content="reply",
+        author="discord-123",
+        source="acp",
+    ))
+
+    prompt = graph.invocations[0]["state"]["messages"][0].content
+    assert "discord-456" not in prompt
+    assert all(
+        source.source_kind != "owner_attested_feedback"
+        for source in graph.contexts[0].ifc_state.current().sources
+    )
+    assert [sent[1] for sent in bridge.sends] == [reply]
 
 
 async def test_unknown_audience_and_unknown_author_history_do_not_silence_real_delivery(

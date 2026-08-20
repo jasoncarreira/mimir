@@ -36,6 +36,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..background_tasks import spawn_background
+from ..identities import IdentityResolver
 from ..models import AgentEvent
 from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
@@ -318,6 +319,9 @@ class DiscordBridge(Bridge):
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
+    identity_resolver: IdentityResolver | None = field(
+        default=None, repr=False, kw_only=True
+    )
     _client: _DiscordClient | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
     _background_tasks: set[asyncio.Task[Any]] = field(
@@ -1093,7 +1097,7 @@ class DiscordBridge(Bridge):
         on_reaction_add(reaction, user), the raw variant fires even
         when the target message isn't in the client's message cache
         (i.e., reactions to messages from before the bot started)."""
-        from ..event_logger import log_event
+        from ..event_logger import FEEDBACK_EVENT_VERSION, log_event
         from ..reactions import classify_reaction, normalize_emoji
 
         # Skip our own reactions (the agent reacting via the react tool).
@@ -1138,17 +1142,30 @@ class DiscordBridge(Bridge):
         except Exception:  # noqa: BLE001
             pass
 
-        author_id = str(getattr(payload, "user_id", "") or "") or None
+        author_id = str(getattr(payload, "user_id", "") or "")
+        if re.fullmatch(r"[0-9]+", author_id) is None:
+            return
+        author = f"discord-{author_id}"
+        owner_principal: str | None = None
+        if self.identity_resolver is not None:
+            try:
+                identity = self.identity_resolver.identity(author)
+                if identity is not None:
+                    owner_principal = identity.canonical
+            except Exception:  # noqa: BLE001
+                pass
         channel_id = _channel_to_id(channel)
         try:
             await log_event(
                 "react_received",
+                event_version=FEEDBACK_EVENT_VERSION,
                 bridge=self.name,
                 channel_id=channel_id,
                 emoji=emoji_glyph,
                 polarity=polarity,
                 action=action,
-                author=f"discord-{author_id}" if author_id else "?",
+                author=author,
+                owner_principal=owner_principal,
                 target_message_id=str(getattr(payload, "message_id", "") or "") or None,
                 target_age_minutes=target_age_minutes,
             )

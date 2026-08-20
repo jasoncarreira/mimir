@@ -24,11 +24,12 @@ from mimir.commitments import (
     CommitmentsStore,
     make_commitment_id,
 )
+from mimir.commitments.models import CommitmentOwnershipProvenance
 from mimir.commitments.poller import (
     DEFAULT_SNOOZE_PILEUP_THRESHOLD,
     check_due_and_expired,
 )
-from mimir.event_logger import init_logger
+from mimir.event_logger import FEEDBACK_EVENT_VERSION, init_logger
 
 
 def _events(home: Path) -> list[dict]:
@@ -142,6 +143,7 @@ async def test_emits_due_when_window_open(tmp_path: Path, home: Path):
         id=make_commitment_id(), channel_id="chan-1",
         text="Review PR #111", kind=CommitmentKind.AGENT_PROMISE.value,
         recipient_identity="alice", owner_principal="user:alice",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
         due_window_start_unix=now - 60,  # just-opened
         due_window_end_unix=now + 86400,
     ))
@@ -160,6 +162,8 @@ async def test_emits_due_when_window_open(tmp_path: Path, home: Path):
     assert due_events[0]["text"] == "Review PR #111"
     assert due_events[0]["recipient_identity"] == "alice"
     assert due_events[0]["owner_principal"] == "user:alice"
+    assert due_events[0]["event_version"] == FEEDBACK_EVENT_VERSION
+    assert due_events[0]["ownership_provenance"] == "extraction_acl"
 
 
 @pytest.mark.asyncio
@@ -213,6 +217,7 @@ async def test_emits_expired_when_window_ends(tmp_path: Path, home: Path):
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="X",
         owner_principal="user:alice",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
         due_window_start_unix=base - 86400,
         due_window_end_unix=end,
     ))
@@ -230,6 +235,8 @@ async def test_emits_expired_when_window_ends(tmp_path: Path, home: Path):
     assert len(expired_events) == 1
     assert expired_events[0]["commitment_id"] == rec.id
     assert expired_events[0]["owner_principal"] == "user:alice"
+    assert expired_events[0]["event_version"] == FEEDBACK_EVENT_VERSION
+    assert expired_events[0]["ownership_provenance"] == "extraction_acl"
 
 
 @pytest.mark.asyncio
@@ -335,6 +342,8 @@ async def test_pileup_emits_above_threshold(tmp_path: Path, home: Path):
     store = CommitmentsStore(path=tmp_path / "c.jsonl")
     rec = await store.add(CommitmentRecord(
         id=make_commitment_id(), channel_id="c1", text="punted thing",
+        owner_principal="user:alice",
+        ownership_provenance=CommitmentOwnershipProvenance.EXTRACTION_ACL,
     ))
     for i in range(3):
         await store.snooze(rec.id, until_unix=time.time() + (i + 1) * 86400)
@@ -350,6 +359,56 @@ async def test_pileup_emits_above_threshold(tmp_path: Path, home: Path):
     assert pileups[0]["snooze_count"] == 3
     assert pileups[0]["threshold"] == 3
     assert pileups[0]["text"] == "punted thing"
+    assert pileups[0]["event_version"] == FEEDBACK_EVENT_VERSION
+    assert pileups[0]["owner_principal"] == "user:alice"
+    assert pileups[0]["ownership_provenance"] == "extraction_acl"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "window"),
+    [
+        ("commitment_due", "due"),
+        ("commitment_expired", "expired"),
+        ("commitment_snooze_pileup", "pileup"),
+    ],
+)
+async def test_feedback_emitters_do_not_attest_copied_owner(
+    tmp_path: Path, home: Path, event_type: str, window: str,
+):
+    store = CommitmentsStore(path=tmp_path / f"{window}.jsonl")
+    now = time.time()
+    record_kwargs = {
+        "due_window_start_unix": now - 60,
+        "due_window_end_unix": now + 60,
+        "snooze_count": 0,
+    }
+    if window == "expired":
+        record_kwargs["due_window_end_unix"] = now - 1
+    elif window == "pileup":
+        record_kwargs["due_window_start_unix"] = None
+        record_kwargs["due_window_end_unix"] = None
+        record_kwargs["snooze_count"] = DEFAULT_SNOOZE_PILEUP_THRESHOLD
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(),
+        channel_id="ch-copied",
+        text=f"Copied owner {window}",
+        owner_principal="user:copied",
+        **record_kwargs,
+    ))
+
+    await check_due_and_expired(
+        store,
+        now_unix=now,
+        snooze_pileup_threshold=DEFAULT_SNOOZE_PILEUP_THRESHOLD,
+    )
+
+    emitted = [event for event in _events(home) if event.get("type") == event_type]
+    assert len(emitted) == 1
+    assert emitted[0]["commitment_id"] == rec.id
+    assert emitted[0]["event_version"] == FEEDBACK_EVENT_VERSION
+    assert emitted[0]["owner_principal"] == "user:copied"
+    assert emitted[0]["ownership_provenance"] is None
 
 
 @pytest.mark.asyncio

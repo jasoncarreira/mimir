@@ -7,7 +7,7 @@ import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -428,6 +428,11 @@ async def test_on_reaction_matches_self_bot_id_when_user_id_unresolved(
     bridge, _, _ = bridge_with_fake_app
     bridge._bot_user_id = None
     bridge._bot_id = "BSELF123"
+    resolver = SimpleNamespace(
+        identity=MagicMock(return_value=SimpleNamespace(canonical="alice")),
+        resolve=MagicMock(side_effect=AssertionError("resolve must not be called")),
+    )
+    bridge.identity_resolver = resolver
 
     await bridge._on_reaction(
         {
@@ -444,13 +449,85 @@ async def test_on_reaction_matches_self_bot_id_when_user_id_unresolved(
 
     lines = (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
-    assert any(
-        record["type"] == "react_received"
-        and record["bridge"] == "slack"
-        and record["channel_id"] == "slack-C01ENG"
-        and record["author"] == "slack-U05ALICE"
-        for record in records
+    assert len(records) == 1
+    record = records[0]
+    assert record["type"] == "react_received"
+    assert record["event_version"] == "v1"
+    assert record["bridge"] == "slack"
+    assert record["channel_id"] == "slack-C01ENG"
+    assert record["author"] == "slack-U05ALICE"
+    assert record["owner_principal"] == "alice"
+    resolver.identity.assert_called_once_with("slack-U05ALICE")
+    resolver.resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True], ids=["unknown", "raises"])
+async def test_on_reaction_emits_null_owner_when_strict_identity_is_unavailable(
+    bridge_with_fake_app,
+    tmp_path: Path,
+    raises: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+    resolver = SimpleNamespace(
+        identity=MagicMock(
+            side_effect=RuntimeError("resolver unavailable") if raises else None,
+            return_value=None,
+        ),
+        resolve=MagicMock(side_effect=AssertionError("resolve must not be called")),
     )
+    bridge.identity_resolver = resolver
+
+    await bridge._on_reaction(
+        {
+            "user": "U05ALICE",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    record = json.loads((tmp_path / "logs" / "events.jsonl").read_text())
+    assert record["event_version"] == "v1"
+    assert record["author"] == "slack-U05ALICE"
+    assert record["owner_principal"] is None
+    resolver.identity.assert_called_once_with("slack-U05ALICE")
+    resolver.resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_rejects_unvalidated_platform_user_id(
+    bridge_with_fake_app,
+    tmp_path: Path,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+    resolver = SimpleNamespace(identity=MagicMock())
+    bridge.identity_resolver = resolver
+
+    await bridge._on_reaction(
+        {
+            "user": "alice",
+            "reaction": "thumbsup",
+            "item": {
+                "type": "message",
+                "channel": "C01ENG",
+                "ts": "1714768925.000100",
+                "bot_id": "BSELF123",
+            },
+        }
+    )
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert not events_path.exists()
+    resolver.identity.assert_not_called()
 
 
 @pytest.mark.asyncio

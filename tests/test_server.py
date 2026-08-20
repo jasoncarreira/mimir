@@ -594,10 +594,12 @@ def _controlled_server_app(
 
     class DiscordBridge:
         def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
             control.hit("discord")
 
     class SlackBridge:
         def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
             control.hit("slack")
 
     class Indexer:
@@ -874,6 +876,22 @@ def test_server_collaborator_and_bridge_parity(
     assert app["pairing_notifier"]._channels is app["channels"]
     assert control.web_chat.chat_skill_registry is control.core.chat_skill_registry
     assert control.web_chat.enqueue.__self__ is app["dispatcher"]
+
+
+def test_optional_feedback_bridges_receive_core_identity_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver = object()
+    control = _ServerControl(optional_bridges=True, identity_resolver=resolver)
+
+    app, _ = _controlled_server_app(tmp_path, monkeypatch, control)
+
+    optional_bridges = app["channels"].bridges()[2:]
+    assert [bridge.kwargs["identity_resolver"] for bridge in optional_bridges] == [
+        resolver,
+        resolver,
+    ]
 
 
 def test_route_and_hook_parity_with_runtime_proxies(

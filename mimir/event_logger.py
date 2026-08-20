@@ -13,12 +13,14 @@ import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .redaction import redact_payload
 
 log = logging.getLogger(__name__)
+
+FEEDBACK_EVENT_VERSION: Final[str] = "v1"
 
 
 def _utc_now_iso() -> str:

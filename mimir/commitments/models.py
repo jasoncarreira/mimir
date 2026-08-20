@@ -144,6 +144,10 @@ class CommitmentVisibility(str, Enum):
     PRIVATE = "private"
 
 
+class CommitmentOwnershipProvenance(str, Enum):
+    EXTRACTION_ACL = "extraction_acl"
+
+
 @dataclass
 class CommitmentRecord:
     """Replayed current state of a commitment. The store's append-only
@@ -229,6 +233,7 @@ class CommitmentRecord:
     dismiss_reason: str | None = None
     snooze_reason: str | None = None
     extraction_prompt_version: str | None = None
+    ownership_provenance: CommitmentOwnershipProvenance | None = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
@@ -238,7 +243,12 @@ class CommitmentRecord:
         event. Includes all fields (even None) so the replay's
         ``CommitmentRecord(**rec_data)`` reconstruction has every
         keyword argument the dataclass expects."""
-        return dict(self.__dict__)
+        data = dict(self.__dict__)
+        if isinstance(
+            self.ownership_provenance, CommitmentOwnershipProvenance,
+        ):
+            data["ownership_provenance"] = self.ownership_provenance.value
+        return data
 
 
 def make_commitment_id() -> str:
