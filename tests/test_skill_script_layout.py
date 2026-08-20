@@ -51,6 +51,11 @@ def test_poller_manifest_commands_resolve(manifest: Path) -> None:
 
 @pytest.mark.parametrize("skill_dir", _skill_dirs(), ids=lambda path: path.name)
 def test_skill_root_has_no_executable_code(skill_dir: Path) -> None:
+    if skill_dir.parent.name == "optional-skills":
+        assert not (skill_dir / "tests" / "__init__.py").exists(), (
+            f"{skill_dir}: optional skill test directories must not be packages "
+            "named 'tests'"
+        )
     root_scripts = sorted(
         path.name
         for path in skill_dir.iterdir()
