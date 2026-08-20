@@ -59,6 +59,32 @@ def _make_log(tmp_path: Path, events: list[dict] | None = None,
     return FeedbackLog(events_path=events_path, turns_path=turns_path)
 
 
+
+class _OwnerResolver:
+    """Resolve the fixture owner so a cross-channel record clears admission.
+
+    Admission-time selection admits an owner-attributed record from another
+    channel only when its owner resolves and the destination audience is a
+    subset of the source's. These cases are about what survives the polarity
+    cap and content collapsing, not about provenance, so they supply both.
+    """
+
+    def identity(self, author):
+        from mimir.identities import Identity
+
+        return Identity(canonical="jason") if author == "jason" else None
+
+    def resolve(self, author):
+        raise AssertionError("feedback eligibility must not call resolve")
+
+
+class _SharedAudience:
+    """Every fixture channel carries the same single-member audience."""
+
+    def audience_for(self, channel_id, *, principal):
+        return frozenset({"jason"})
+
+
 # ---- Empty / missing files ----------------------------------------------
 
 
@@ -549,7 +575,7 @@ def test_unclassified_telemetry_does_not_label_or_veto_feedback_reply(
         bridge_instance="acp-primary",
         sensitivity="private",
         authorized_principals=frozenset({"jason"}),
-        source_kind="protected_prompt",
+        source_kind="channel_scoped_feedback",
         integrity=Integrity.UNTRUSTED,
         integrity_effect=IntegrityEffect.INFORMATIONAL,
     ),)
@@ -561,7 +587,14 @@ def test_unclassified_telemetry_does_not_label_or_veto_feedback_reply(
     assert decision.reason == "ifc_allowed"
 
 
-def test_feedback_records_beyond_polarity_cap_produce_no_label(tmp_path: Path):
+def test_feedback_records_beyond_polarity_cap_keep_their_labels(tmp_path: Path):
+    """Records the cap drops still contributed, so their provenance stays.
+
+    The rendered block carries per-kind arousal counts computed across the
+    whole admitted window, so a record dropped from the rendered lines still
+    informs what the block says. Retaining its label is the conservative
+    reading; dropping it would under-taint content its channel influenced.
+    """
     events = [
         {
             "timestamp": _ts(0.4 - index * 0.1),
@@ -576,22 +609,30 @@ def test_feedback_records_beyond_polarity_cap_produce_no_label(tmp_path: Path):
     ]
     log = _make_log(tmp_path, events=events)
     log.default_limit_per_polarity = 2
+    log.identity_resolver = _OwnerResolver()
     auth = AuthContext(
         principal="jason", canonical_principal="jason", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="shared",
         interactivity=None, enforcement_enabled=True, bridge_instance="test",
+        audience_provider=_SharedAudience(),
     )
 
     block = log.recent_prompt_block(auth)
 
     assert block is not None
-    assert len(block.labels.sources) == 2
+    rendered = [line for line in block.content.splitlines() if line.startswith("- ")]
+    assert len(rendered) == 2
     assert {source.resource_id for source in block.labels.sources} == {
-        "channel-2", "channel-3",
+        "channel-0", "channel-1", "channel-2", "channel-3",
     }
 
 
-def test_duplicate_feedback_content_uses_newest_record_label(tmp_path: Path):
+def test_duplicate_feedback_content_keeps_every_contributing_label(tmp_path: Path):
+    """A collapsed run renders once and keeps the provenance of every member.
+
+    The rendered line reports the run's size, so every record in the run
+    informs it -- including the ones whose own line was collapsed away.
+    """
     log = _make_log(tmp_path, events=[
         {
             "timestamp": _ts(0.2),
@@ -612,19 +653,21 @@ def test_duplicate_feedback_content_uses_newest_record_label(tmp_path: Path):
             "reason": "denied",
         },
     ])
+    log.identity_resolver = _OwnerResolver()
     auth = AuthContext(
         principal="jason", canonical_principal="jason", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="shared",
         interactivity=None, enforcement_enabled=True, bridge_instance="test",
+        audience_provider=_SharedAudience(),
     )
 
     block = log.recent_prompt_block(auth)
 
     assert block is not None
     assert "(×2 in 24h)" in block.content
-    assert [source.resource_id for source in block.labels.sources] == [
-        "newer-channel"
-    ]
+    assert {source.resource_id for source in block.labels.sources} == {
+        "older-channel", "newer-channel",
+    }
 
 
 def test_feedback_imports_first_in_fresh_interpreter():
