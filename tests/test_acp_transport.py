@@ -185,21 +185,39 @@ async def _release_after(event: asyncio.Event, delay: float) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release_delay,before", [(0.005, True), (0.03, False)])
+@pytest.mark.parametrize("release_delay,before", [(0.005, True), (None, False)])
 async def test_drain_deadline_before_and_after_witnesses(
-    release_delay: float,
+    release_delay: float | None,
     before: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Witness a drain that beat its deadline, and one that did not.
+
+    The "did not" case releases nothing rather than releasing late. It used to
+    schedule the gate for 0.03 against a 0.02 deadline -- a 10ms margin -- and
+    asserted the gate was still unset afterwards. On a loaded runner
+    ``close_writer`` can itself take longer than 30ms, the release lands first,
+    and the witness inverts: it failed twice on macOS 3.11 while the 3.12 leg
+    passed the same commits. Scheduling no release makes the assertion
+    deterministic without a long wait, and still witnesses exactly what the case
+    is about -- the deadline expiring with the drain incomplete.
+    """
     monkeypatch.setattr("mimir.acp.transport.WRITER_DRAIN_TIMEOUT", 0.02)
     gate = asyncio.Event()
     writer = StagedWriter(drain_gate=gate)
-    release = asyncio.create_task(_release_after(gate, release_delay))
+    release = (
+        asyncio.create_task(_release_after(gate, release_delay))
+        if release_delay is not None
+        else None
+    )
     await close_writer(writer)
     assert writer.closed
     assert writer.aborted is False
     assert gate.is_set() is before
-    await release
+    if release is not None:
+        await release
+    else:
+        gate.set()
 
 
 @pytest.mark.asyncio
