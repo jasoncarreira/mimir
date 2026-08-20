@@ -104,6 +104,7 @@ _COUNT = _count_module()
 # One canonical post-creating vocabulary and one status code, both owned by
 # count.py.
 POST_CLASS_ACTIONS = frozenset(_COUNT.POST_CREATING_ACTIONS)
+KNOWN_ACTIONS = frozenset(_COUNT.KNOWN_ACTIONS)
 COUNT_LEDGER_UNREADABLE = _COUNT.EXIT_LEDGER_UNREADABLE
 
 
@@ -197,6 +198,18 @@ def count_archive(home: Path, today: str) -> tuple[int, int]:
                 # padded verb cannot be counted on one source and missed on the
                 # other.
                 verb = str(raw_verb).strip()
+                if verb not in KNOWN_ACTIONS:
+                    # The ledger treats an unclassifiable action as damage
+                    # because it may be a corrupted post verb; the archive has
+                    # to agree, or a typo such as `pst:` is structurally valid
+                    # here, counts as nothing, and the guard reports a
+                    # complete zero from the only evidence of a dispatch.
+                    sys.stderr.write(
+                        f"cap_check: unknown archive action {verb!r} in {base}; "
+                        "treating as unreadable\n"
+                    )
+                    unreadable += 1
+                    continue
                 if verb in POST_CLASS_ACTIONS and not (
                     isinstance(payload, dict) and payload.get("dryRun")
                 ):

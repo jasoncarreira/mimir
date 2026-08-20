@@ -633,3 +633,60 @@ def test_a_padded_archive_verb_is_still_counted(tmp_path):
     module = fresh_cap_check()
     _write_archive(tmp_path, _TODAY, {"dispatch": [{" post ": {"text": "a"}}]})
     assert module.count_archive(tmp_path, "2026-08-20") == (1, 0)
+
+
+# --------------------------------------------------------------------------
+# Archive verbs face the same vocabulary as ledger actions.
+#
+# Third time this asymmetry has appeared in this PR: the ledger gained a guard
+# and the archive kept the hole. Here the ledger treated an unclassifiable
+# action as damage while the archive accepted any string key structurally and
+# ignored it unless post-creating, so `pst:` as the only evidence of a dispatch
+# read as a complete zero.
+# --------------------------------------------------------------------------
+
+
+def test_the_known_action_vocabulary_comes_from_the_ledger_counter():
+    module = fresh_cap_check()
+    assert set(module.KNOWN_ACTIONS) == set(module._COUNT.KNOWN_ACTIONS)
+
+
+def test_an_unknown_archive_verb_is_unreadable(tmp_path):
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{"pst": {"text": "a"}}]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_known_non_post_archive_verbs_stay_normal_skips(tmp_path):
+    """Bounds it: the deployed archive is mostly likes and ignores."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [
+        {"like": {"uri": "x"}}, {"ignore": {"uri": "y"}},
+        {"follow": {"did": "z"}},
+    ]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 0)
+
+
+def test_every_archive_verb_seen_in_deployed_data_is_known(tmp_path):
+    """The verbs actually present across the 4688 deployed archive entries."""
+    module = fresh_cap_check()
+    for verb in ("like", "reply", "ignore", "follow", "thread"):
+        assert verb in module.KNOWN_ACTIONS, verb
+
+
+def test_main_fails_closed_on_a_typo_archive_verb(monkeypatch, capsys, tmp_path):
+    """End to end: a typo'd verb is the only record of a dispatch.
+
+    The reported path — archive says `pst`, no ledger row corroborates it, and
+    the guard previously printed `archive=0 ledger=0 effective=0` at exit 0.
+    """
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{"pst": {"text": "a"}}]})
+    monkeypatch.setattr(module, "_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "count_ledger", lambda home, today: 0)
+    monkeypatch.setattr(module, "_today_str", lambda: "2026-08-20")
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert "effective=unknown" in out
+    assert "effective=0" not in out
