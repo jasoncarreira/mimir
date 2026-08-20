@@ -691,9 +691,12 @@ def _preserve_dirty_worktree(lease: PRCheckoutLease, bundle: Path) -> Path:
     """Atomically archive dirty tracked and untracked files without changing them."""
     archive = bundle.with_suffix(".worktree.tar.gz")
     if archive.exists():
-        raise RuntimeError(
-            "dirty-worktree recovery archive already exists and requires operator verification"
-        )
+        if not archive.is_file() or archive.stat().st_size == 0:
+            raise RuntimeError("existing dirty-worktree recovery archive is invalid")
+        with tarfile.open(archive, "r:gz") as retained:
+            if not retained.getmembers():
+                raise RuntimeError("existing dirty-worktree recovery archive is empty")
+        return archive
 
     staging = archive.with_name(f".{archive.name}.{uuid.uuid4().hex}.tmp")
     try:

@@ -25,6 +25,9 @@ from mimir.models import (
 )
 from mimir.pr_checkout_lease import (
     PRCheckoutLease,
+    _preserve_checkout_head,
+    _preserve_dirty_worktree,
+    _recover_retained_checkout,
     acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
@@ -908,6 +911,33 @@ def test_acquire_archives_dirty_superseded_lease_before_releasing_it(
             }],
         },
     )
+
+
+def test_dirty_worktree_recovery_reuses_existing_archive_on_retry(
+    tmp_path: Path,
+) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=lease_root)
+    retained = lease.path / "retained.txt"
+    retained.write_text("unfinished fix\n", encoding="utf-8")
+    head = _git(lease.path, "rev-parse", "HEAD")
+
+    def runner(args):
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    bundle = _preserve_checkout_head(lease, head, runner)
+    archive = _preserve_dirty_worktree(lease, bundle)
+
+    assert _preserve_dirty_worktree(lease, bundle) == archive
+    assert _recover_retained_checkout(
+        lease, head=head, dirty=True, runner=runner,
+    ) == bundle
+    with tarfile.open(archive, "r:gz") as recovered:
+        restored = recovered.extractfile("worktree/retained.txt")
+        assert restored is not None
+        assert restored.read() == b"unfinished fix\n"
 
 
 def test_acquire_leaves_superseded_lease_when_recovery_fails(
