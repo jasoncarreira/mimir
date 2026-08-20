@@ -695,3 +695,129 @@ async def test_connection_failure_leaves_separate_peer_and_runtime_turn_alive(
     survivor_release.set()
     await survivor
     shutil.rmtree(home)
+
+
+def _resistant_close(
+    entered: asyncio.Event,
+    release: asyncio.Event,
+    captured: list[asyncio.Task[None]],
+):
+    """A ``connection.close()`` that swallows cancellation while it flushes.
+
+    ``release`` is the test's escape hatch: without it the task would outlive
+    the test and block event-loop teardown, which is why the existing stubborn
+    peers in this module are written the same way. ``captured`` lets the test
+    drain the task once released.
+    """
+
+    async def close(self: object) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            captured.append(task)
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    return close
+
+
+async def _spawn_stdio_runner(writer: object) -> asyncio.Task[None]:
+    import mimir.acp.sdk as sdk
+
+    class _Agent:
+        def on_connect(self, peer: object) -> int:
+            return 1
+
+    reader = asyncio.StreamReader()
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(_Agent(), request_reader=reader, response_writer=writer)
+    )
+    await asyncio.sleep(0)
+    reader.feed_eof()
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_close_bound_fits_inside_the_daemon_cancel_budget() -> None:
+    """The runner must resolve on its own before the daemon escalates.
+
+    ``run_stdio_agent`` waits for the shielded ``connection.close()`` at most
+    twice, so two intervals have to fit inside the window the daemon allows
+    before it aborts the transport and gives up. If this relationship inverts a
+    retired generation can outlive ``_finish_runner``.
+    """
+    from mimir.acp.daemon import ACP_PEER_CANCEL_TIMEOUT as daemon_cancel
+    from mimir.acp.sdk import ACP_CLOSE_CANCEL_TIMEOUT
+
+    assert 2 * ACP_CLOSE_CANCEL_TIMEOUT < daemon_cancel
+
+
+@pytest.mark.asyncio
+async def test_resistant_close_does_not_pin_a_cancelled_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close that ignores cancellation must not keep the runner alive.
+
+    The cancellation handler used to await the shielded close with no deadline,
+    so a close stuck flushing pinned the runner task indefinitely. The bound is
+    the only thing that can end this wait: the close here swallows every
+    cancellation, so without it the runner never completes.
+    """
+    import mimir.acp.sdk as sdk
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    captured: list[asyncio.Task[None]] = []
+    monkeypatch.setattr(
+        sdk.Connection, "close", _resistant_close(entered, release, captured)
+    )
+    monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 0.01)
+
+    runner = await _spawn_stdio_runner(_Writer())
+    try:
+        await asyncio.wait_for(entered.wait(), 1.0)
+        runner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner, 1.0)
+        assert runner.done()
+    finally:
+        release.set()
+        await asyncio.gather(runner, *captured, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_resistant_close_still_lets_the_daemon_retire_the_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_finish_runner`` must retire such a peer without giving up.
+
+    The daemon releases its single admission slot from the runner task's done
+    callback, so a runner that never completes leaves the generation unretired
+    while ``_finish_runner`` has already stopped waiting for it — the window in
+    which a replacement peer could be admitted alongside it. A self-bounding
+    runner satisfies the daemon's cancel contract instead of raising.
+    """
+    import mimir.acp.sdk as sdk
+
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    entered, release = asyncio.Event(), asyncio.Event()
+    captured: list[asyncio.Task[None]] = []
+    monkeypatch.setattr(
+        sdk.Connection, "close", _resistant_close(entered, release, captured)
+    )
+    monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 0.01)
+
+    writer = _Writer()
+    runner = await _spawn_stdio_runner(writer)
+    try:
+        await asyncio.wait_for(entered.wait(), 1.0)
+        # No AcpDaemonError: the runner resolves inside the cancel window.
+        await asyncio.wait_for(daemon._finish_runner(runner, writer), 1.0)
+        assert runner.done()
+    finally:
+        release.set()
+        await asyncio.gather(runner, *captured, return_exceptions=True)
+        shutil.rmtree(home)
