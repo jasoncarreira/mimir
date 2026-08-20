@@ -1311,6 +1311,14 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
             call = dotted(node.func)
             terminal = call.rsplit(".", 1)[-1] if call else None
             category = categories.get(terminal or "")
+            if terminal == "admit" and self.relative != "mimir/feedback/__init__.py":
+                # ``admit`` is too common a method name to match on bare. The
+                # feedback stream's admission helper is the only channel-bearing
+                # one; mimir/worklink/orchestrator.py calls an unrelated
+                # ``selected.admit()`` to pick a factory launcher. Matching that
+                # would inventory it as a feedback stream, which is worse than
+                # not inventorying it at all.
+                category = None
             if (
                 category is None
                 and self.relative == "mimir/acp/agent.py"
