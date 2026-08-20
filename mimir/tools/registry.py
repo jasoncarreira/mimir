@@ -2706,6 +2706,7 @@ def all_mimir_tools(
         saga_mark_contributions,
         saga_record_skill_learning,
     )
+    from .operator_alert import operator_alert
     tools = [
         approve_declassification,
         request_operator_approval,
@@ -2736,7 +2737,7 @@ def all_mimir_tools(
         # tools query the per-process ShellJobRegistry.
         bash_async, bash_jobs_list, bash_job_output,
         # Channel ops
-        send_message, react, fetch_channel_history, list_channels,
+        operator_alert, send_message, react, fetch_channel_history, list_channels,
         # Mid-turn injection escape hatch (chainlink #384): punt a folded
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,

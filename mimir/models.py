@@ -1092,6 +1092,16 @@ class ServerDiscoveredPRStates:
         default_factory=set, init=False, repr=False,
     )
 
+    @property
+    def review_states(self) -> tuple[RepoReviewState, ...]:
+        """Every state discovered this turn.
+
+        Named to match RepoPRScopeRegistry.review_states so a caller holding
+        either scope carrier can enumerate it the same way.
+        """
+        with self._lock:
+            return tuple(self._states.values())
+
     def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
         with self._lock:
             return self._states.get((repository.lower(), pull_request))
@@ -1426,6 +1436,9 @@ class TurnContext:
     # produced final text but this is still 0 — i.e. the reply never went out
     # (0.3.0: send_message is the sole delivery path).
     send_message_count: int = 0
+    # Calls to the notify-only operator_alert tool are separately bounded and
+    # do not count as replies to an interactive triggering channel.
+    operator_alert_count: int = 0
     # Number of successful react tool calls this turn. A react is a valid
     # interactive response (an acknowledgment), so the forgot-to-send guard
     # treats react_count > 0 the same as a delivered send_message — otherwise

@@ -1094,50 +1094,30 @@ export interface TurnStreamEvent {
 
 export interface FactoryRunSummary {
   run_id: string;
+  issue_key: string;
+  valid: boolean;
+  sandbox_path: string;
   status: string;
-  heartbeat_at: string;
-  is_terminal: boolean;
-  is_stale: boolean;
-  pending_gate: string | null;
-  gate_statuses: Array<[string, string]>;
-  validator_verdict: string | null;
-  security_verdict: string | null;
-  pr_url?: string;
-  error?: string;
-  diagnostic?: boolean;
-  cost?: {
-    status: string;
-    total_tokens: number | null;
-    cost_total: number | null;
-    cost_currency: string | null;
-  };
-  terminal_result?: {
-    status: string;
-    pr_url: string | null;
-    reason: string | null;
-    summary: string | null;
-  };
+  mode: string;
+  branch: string;
+  pr_base: string;
+  pr_draft: boolean;
+  lock: "fresh" | "stale" | "absent";
+  dead_lock: boolean;
+  lock_session: string | null;
+  pr_url: string | null;
+  next?: string | null;
+  controller_phase: string;
+  observed_at: string | null;
+  controller_error: string | null;
 }
 
 export interface FactoryRunDetail extends FactoryRunSummary {
-  steps: Array<[string, string]>;
-  slices: Array<[string, string]>;
-  debug?: {
-    created_at: string | null;
-    resumed_at: string | null;
-    resume_count: number | null;
-  };
-  cost?: {
-    status: string;
-    updated_at: string | null;
-    entry_count: number | null;
-    request_count: number | null;
-    total_tokens: number | null;
-    cost_total: number | null;
-    cost_currency: string | null;
-    mixed_currency: boolean;
-    missing: string[];
-  };
+  gates: Record<string, unknown>;
+  steps: string[];
+  slices: string[];
+  validator: Record<string, unknown> | null;
+  terminal_result: Record<string, unknown> | null;
 }
 
 export interface FactoryRunsData {

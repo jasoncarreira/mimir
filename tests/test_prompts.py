@@ -276,6 +276,20 @@ def test_turn_prompt_scheduled_tick_omits_msg_id():
     assert "msg_id" not in prompt
 
 
+def test_poller_turn_guidance_names_operator_alert_for_reporting():
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    prompt = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="poller:research", content="assess"),
+        trigger_authority_present=True,
+        trigger_capabilities=("operator_alert",),
+    )
+
+    assert "operator_alert(text=...)" in prompt
+    assert "cannot write" in prompt
+
+
 # ---- saga_session_id surfacing for chainlink #23 #26 (Option P) ----
 
 

@@ -42,6 +42,8 @@ FROM python:3.11-slim AS base
 #     alone — orientation detection only). Pinning ``eng`` explicitly
 #     removes that ambiguity.
 ENV NODE_VERSION=22
+ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
+ENV PATH="/opt/mimir-opencode/bin:${PATH}"
 ARG MIMIR_ENABLE_OPENCODE=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq procps ripgrep xz-utils \
@@ -49,11 +51,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
-        npm install -g opencode-ai@1.18.9 ; \
-        npm install -g opencode-feature-factory@0.2.1 ; \
-        npm install -g opencode-project-memory@0.1.0 ; \
-        npm install -g opencode-openai-codex-auth@4.4.0 ; \
-        npm install -g opencode-anthropic-auth@0.0.13 ; \
+        npm install --global --prefix /opt/mimir-opencode \
+            opencode-ai@1.18.9 \
+            feature-factory@0.7.0 \
+            opencode-feature-factory@0.7.0 \
+            opencode-project-memory@0.1.0 \
+            opencode-openai-codex-auth@4.4.0 \
+            opencode-anthropic-auth@0.0.13 ; \
     fi \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -135,7 +139,12 @@ RUN python3 -m venv /opt/mimir-worklink/venv \
 COPY --chown=root:root pyproject.toml README.md LICENSE .env.example /opt/mimir-worklink/source/
 COPY --chown=root:root docs/ /opt/mimir-worklink/source/docs/
 COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/
-RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source \
+# The published package above supplies the worker venv's dependency set, while
+# the no-deps source overlay keeps the image proof on this checkout's code. A
+# newly introduced runtime dependency is not in the previously published wheel,
+# so install it explicitly before importing the overlay during this PR's proof.
+RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16" \
+    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source \
     && rm -rf /opt/mimir-worklink/source \
     && chown -R root:root /opt/mimir-worklink \
     && chmod -R go-w /opt/mimir-worklink

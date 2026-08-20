@@ -41,7 +41,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
 
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",
-        "opencode", "opencode-feature-factory", "opencode-project-memory",
+        "opencode", "feature-factory", "opencode-feature-factory", "opencode-project-memory",
         "opencode-openai-codex-auth", "opencode-anthropic-auth",
     }
     assert set(pins) == expected

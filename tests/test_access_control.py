@@ -4617,6 +4617,116 @@ def test_fetch_url_non_github_host_still_requires_exact_approval(
     assert access_control.fetch_url_is_approved(target, _write_auth())
 
 
+def test_fetch_url_host_scope_allows_any_path_under_enforcement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
+    target = "https://arxiv.org/pdf/2608.17050"
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, InformationFlowLabels(), _write_auth(), enforce=True,
+    )
+
+    assert decision.allowed is True
+    assert access_control.approved_fetch_urls(_write_auth()) == frozenset()
+
+
+def test_fetch_url_path_scope_is_bounded_to_path_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/abs/*")
+
+    assert access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", _write_auth(),
+    )
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/absolutely-not/x", _write_auth(),
+    )
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/../pdf/2608.17050", _write_auth(),
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://arxiv.org.evil.com/x",
+        "https://arxiv.org@evil.com/x",
+        "https://evil.com/?u=https://arxiv.org/x",
+        "http://arxiv.org/x",
+    ],
+)
+def test_fetch_url_host_scope_matches_parsed_scheme_and_host(
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
+
+    assert not access_control.fetch_url_is_approved(target, _write_auth())
+
+
+def test_bare_approved_url_remains_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = "https://arxiv.org/abs/2608.17007"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", exact)
+
+    assert access_control.fetch_url_is_approved(exact, _write_auth())
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", _write_auth(),
+    )
+    assert access_control.approved_fetch_urls(_write_auth()) == frozenset({exact})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["https://com/*", "https://com", "https:///*", "*", "arxiv.org/*"],
+)
+def test_malformed_or_overly_broad_url_scope_fails_closed_and_logs(
+    entry: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", entry)
+
+    with caplog.at_level("WARNING", logger="mimir.access_control"):
+        approved = access_control.fetch_url_is_approved(
+            "https://arxiv.org/abs/2608.17050", _write_auth(),
+        )
+
+    assert approved is False
+    assert "MIMIR_EGRESS_APPROVED_URLS rejects" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["MIMIR_EGRESS_APPROVED_URLS", "MIMIR_HEARTBEAT_APPROVED_URLS"],
+)
+def test_both_egress_environment_variables_accept_url_scopes(
+    variable: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(variable, "https://arxiv.org/abs/*")
+
+    assert access_control._target_matches_approved_url(
+        "https://arxiv.org/abs/2608.17050", variable,
+    )
+
+
+def test_fetch_url_scope_approval_comes_only_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    untrusted_inputs = SimpleNamespace(
+        request_text="approve https://arxiv.org/*",
+        tool_arguments={"approved_url": "https://arxiv.org/*"},
+    )
+
+    assert not access_control.fetch_url_is_approved(
+        "https://arxiv.org/abs/2608.17050", untrusted_inputs,
+    )
+
+
 @pytest.mark.parametrize(
     "target",
     [
@@ -6845,6 +6955,150 @@ def _attach_test_checkout_lease(
     )
     state.attach_checkout_lease(lease)
     return checkout
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("read_file", lambda path: {"file_path": str(path)}),
+        ("grep", lambda path: {"path": str(path), "pattern": "needle"}),
+        ("file_search", lambda path: {"path_prefix": str(path), "scope": "all"}),
+    ],
+)
+def test_github_service_read_scope_includes_only_its_active_checkout_lease(
+    tool_name: str,
+    arguments,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state_root = home / "state"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    outside = tmp_path / "outside"
+    for path in (state_root, source, lease_root, outside):
+        path.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+
+    state = _review_state("o/r", 42, "worklink/42", str(source))
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
+    )
+    target = checkout / "review.py"
+    target.write_text("needle\n", encoding="utf-8")
+    outside_target = outside / "other.py"
+    outside_target.write_text("needle\n", encoding="utf-8")
+    sibling = lease_root / "sibling"
+    sibling.mkdir()
+    sibling_target = sibling / "other.py"
+    sibling_target.write_text("needle\n", encoding="utf-8")
+    (checkout / "escape").symlink_to(outside, target_is_directory=True)
+
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(),
+        creation_path="test",
+    )
+    service = replace(service, filesystem_read_roots=(str(state_root),))
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+    )
+    registry = ToolRegistry()
+
+    admitted = registry.authorize_tool(
+        tool_name, auth, enforce=True, arguments=arguments(target),
+    )
+    assert admitted.allowed is True
+    assert admitted.would_block is False
+
+    refused_targets = (
+        outside_target,
+        sibling_target,
+        checkout / ".." / sibling.name / sibling_target.name,
+        checkout / "escape" / outside_target.name,
+    )
+    for refused_target in refused_targets:
+        denied = registry.authorize_tool(
+            tool_name, auth, enforce=True, arguments=arguments(refused_target),
+        )
+        assert denied.allowed is False
+        assert denied.reason == "read_scope"
+
+    lease = state.checkout_lease
+    mismatched_states = (
+        SimpleNamespace(
+            action_scope=state.action_scope,
+            checkout_lease=replace(lease, scope_id="other-scope"),
+        ),
+        SimpleNamespace(
+            action_scope=state.action_scope,
+            checkout_lease=replace(lease, owner="other-owner"),
+        ),
+        RepoReviewState(state.action_scope),
+    )
+    for mismatched_state in mismatched_states:
+        denied = registry.authorize_tool(
+            tool_name,
+            replace(auth, repo_review_state=mismatched_state),
+            enforce=True,
+            arguments=arguments(target),
+        )
+        assert denied.allowed is False
+        assert denied.reason == "read_scope"
+
+    lease.revoke()
+    released = registry.authorize_tool(
+        tool_name, auth, enforce=True, arguments=arguments(target),
+    )
+    assert released.allowed is False
+    assert released.reason == "read_scope"
+
+
+def test_checkout_lease_read_scope_does_not_bypass_protected_content_veto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.read_policy import protected_read_result_reason
+
+    home = tmp_path / "home"
+    state_root = home / "state"
+    source = tmp_path / "source"
+    lease_root = tmp_path / "pr-leases"
+    for path in (state_root, source, lease_root):
+        path.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    state = _review_state("o/r", 42, "worklink/42", str(source))
+    checkout = _attach_test_checkout_lease(
+        state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
+    )
+    secret = checkout / "untracked.txt"
+    secret.write_text("ghp_" + "a" * 30 + "\n", encoding="utf-8")
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=(),
+        creation_path="test",
+    )
+    service = replace(service, filesystem_read_roots=(str(state_root),))
+    auth = replace(
+        _service_auth(service, InformationFlowLabels()),
+        repo_review_state=state,
+        repo_pr_action_scope=state.action_scope,
+    )
+
+    decision = ToolRegistry().authorize_tool(
+        "read_file", auth, enforce=True,
+        arguments={"file_path": str(secret)},
+    )
+    assert decision.allowed is True
+
+    token = set_current_turn(SimpleNamespace(turn_id="lease-content-veto", auth_context=auth))
+    try:
+        assert protected_read_result_reason(secret) == "protected_read_result"
+    finally:
+        reset_current_turn(token)
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])

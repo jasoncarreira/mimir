@@ -30,7 +30,13 @@ from mimir.feedback import (
     render_feedback_block,
 )
 from mimir.jsonl_snapshot import JsonlSnapshot
-from mimir.models import AuthContext, InformationFlowState, Integrity
+from mimir.models import (
+    AuthContext,
+    InformationFlowState,
+    Integrity,
+    IntegrityEffect,
+    SourceLabel,
+)
 
 
 def _ts(hours_ago: float = 0) -> str:
@@ -51,6 +57,32 @@ def _make_log(tmp_path: Path, events: list[dict] | None = None,
     if turns is not None:
         _write_jsonl(turns_path, turns)
     return FeedbackLog(events_path=events_path, turns_path=turns_path)
+
+
+
+class _OwnerResolver:
+    """Resolve the fixture owner so a cross-channel record clears admission.
+
+    Admission-time selection admits an owner-attributed record from another
+    channel only when its owner resolves and the destination audience is a
+    subset of the source's. These cases are about what survives the polarity
+    cap and content collapsing, not about provenance, so they supply both.
+    """
+
+    def identity(self, author):
+        from mimir.identities import Identity
+
+        return Identity(canonical="jason") if author == "jason" else None
+
+    def resolve(self, author):
+        raise AssertionError("feedback eligibility must not call resolve")
+
+
+class _SharedAudience:
+    """Every fixture channel carries the same single-member audience."""
+
+    def audience_for(self, channel_id, *, principal):
+        return frozenset({"jason"})
 
 
 # ---- Empty / missing files ----------------------------------------------
@@ -498,6 +530,144 @@ def test_feedback_and_agent_labels_use_shared_prompt_source_constructor(
 
     assert block is not None
     assert domains == ["saga", "feedback"]
+
+
+def test_unclassified_telemetry_does_not_label_or_veto_feedback_reply(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    signal_ts = _ts(0.4)
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(0.5), "type": "tool_call", "id": "tool-1"},
+        {
+            "timestamp": signal_ts,
+            "type": "commitment_due",
+            "id": "feedback-1",
+            "channel_id": "shared",
+            "owner_principal": "jason",
+            "bridge": "acp-primary",
+            "text": "Review the rollout",
+            "commitment_id": "commitment-1",
+        },
+        {
+            "timestamp": _ts(0.3),
+            "type": "codex_plus_usage_ok",
+            "id": "usage-1",
+        },
+        {"timestamp": _ts(0.2), "type": "api_started", "id": "boot-1"},
+    ])
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, domain="channel",
+        resource_id="shared", bridge_instance="acp-primary",
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert block.content == log.recent_block(auth_context=auth)
+    assert block.labels.sources == (SourceLabel(
+        principal="jason",
+        domain="feedback",
+        resource_id="shared",
+        bridge_instance="acp-primary",
+        sensitivity="private",
+        authorized_principals=frozenset({"jason"}),
+        source_kind="channel_scoped_feedback",
+        integrity=Integrity.UNTRUSTED,
+        integrity_effect=IntegrityEffect.INFORMATIONAL,
+    ),)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "send_message", "shared", block.labels, sink_auth, enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+def test_feedback_records_beyond_polarity_cap_keep_their_labels(tmp_path: Path):
+    """Records the cap drops still contributed, so their provenance stays.
+
+    The rendered block carries per-kind arousal counts computed across the
+    whole admitted window, so a record dropped from the rendered lines still
+    informs what the block says. Retaining its label is the conservative
+    reading; dropping it would under-taint content its channel influenced.
+    """
+    events = [
+        {
+            "timestamp": _ts(0.4 - index * 0.1),
+            "type": "tool_call_denied",
+            "id": f"denial-{index}",
+            "channel_id": f"channel-{index}",
+            "owner_principal": "jason",
+            "tool": f"tool-{index}",
+            "reason": "denied",
+        }
+        for index in range(4)
+    ]
+    log = _make_log(tmp_path, events=events)
+    log.default_limit_per_polarity = 2
+    log.identity_resolver = _OwnerResolver()
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+        audience_provider=_SharedAudience(),
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    rendered = [line for line in block.content.splitlines() if line.startswith("- ")]
+    assert len(rendered) == 2
+    assert {source.resource_id for source in block.labels.sources} == {
+        "channel-0", "channel-1", "channel-2", "channel-3",
+    }
+
+
+def test_duplicate_feedback_content_keeps_every_contributing_label(tmp_path: Path):
+    """A collapsed run renders once and keeps the provenance of every member.
+
+    The rendered line reports the run's size, so every record in the run
+    informs it -- including the ones whose own line was collapsed away.
+    """
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "id": "older",
+            "channel_id": "older-channel",
+            "owner_principal": "jason",
+            "tool": "Read",
+            "reason": "denied",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "tool_call_denied",
+            "id": "newer",
+            "channel_id": "newer-channel",
+            "owner_principal": "jason",
+            "tool": "Read",
+            "reason": "denied",
+        },
+    ])
+    log.identity_resolver = _OwnerResolver()
+    auth = AuthContext(
+        principal="jason", canonical_principal="jason", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+        audience_provider=_SharedAudience(),
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "(×2 in 24h)" in block.content
+    assert {source.resource_id for source in block.labels.sources} == {
+        "older-channel", "newer-channel",
+    }
 
 
 def test_feedback_imports_first_in_fresh_interpreter():
@@ -3417,7 +3587,7 @@ def test_content_dedupe_keeps_both_admission_labels_and_sink_compatibility(
     assert decision.allowed is True
 
 
-def test_arousal_dropped_records_keep_all_admission_labels(
+def test_arousal_suppressed_records_do_not_label_the_block(
     tmp_path: Path,
 ) -> None:
     log = _make_log(tmp_path, events=[
@@ -3463,12 +3633,91 @@ def test_arousal_dropped_records_keep_all_admission_labels(
     assert block is not None
     assert "arousal-one" not in block.content
     assert "arousal-two" not in block.content
-    assert len(block.labels.sources) == 3
+    # The arousal filter suppresses a whole kind below its threshold, so these
+    # two contribute neither a line nor a count to the one rendered signal.
+    # Nothing derived from them reached the model, so they must not label the
+    # block -- see test_suppressed_record_does_not_veto_a_compatible_sink for
+    # why carrying them is not merely redundant.
+    assert len(block.labels.sources) == 1
+    assert block.labels.sources[0].source_kind == "agent_self"
     sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
     decision = SinkGate.check_sink_flow(
         "harness_auto_deliver", "current", block.labels, sink_auth, enforce=True,
     )
     assert decision.allowed is True
+
+
+def test_suppressed_record_does_not_veto_a_compatible_sink(tmp_path: Path) -> None:
+    """A record the model never saw must not block a delivery.
+
+    Admission compatibility is judged against the TRIGGERING channel; a sink
+    can have a different destination with a different audience. So a record
+    admitted into the window, then suppressed by the arousal filter, would --
+    if it still labelled the block -- veto a destination that every visible
+    source is cleared for.
+    """
+    class Resolver:
+        def identity(self, author):
+            from mimir.identities import Identity
+
+            return Identity(canonical="alice") if author == "alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("feedback eligibility must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            return {
+                "current": frozenset({"alice"}),
+                "secret-channel": frozenset({"alice"}),
+                "other-channel": frozenset({"alice", "bob"}),
+            }.get(channel_id)
+
+    log = _make_log(tmp_path, events=[
+        # Renders: agent-self, trusted, constrains no destination.
+        {
+            "timestamp": _ts(0.3),
+            "type": "interactive_turn_no_send_message",
+            "turn_id": "visible",
+        },
+        # Suppressed: one occurrence against a threshold of 3.
+        {
+            "timestamp": _ts(0.2),
+            "type": "tool_call_denied",
+            "channel_id": "secret-channel",
+            "owner_principal": "alice",
+            "tool": "suppressed-tool",
+            "reason": "quiet",
+        },
+    ])
+    log.arousal_thresholds = {"tool_denied": 3}
+    log.identity_resolver = Resolver()
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="current",
+        interactivity=None, domain="channel", resource_id="current",
+        bridge_instance="test", audience_provider=Provider(),
+    )
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is not None
+    assert "suppressed-tool" not in block.content
+    assert "secret-channel" not in {
+        source.resource_id for source in block.labels.sources
+    }
+
+    # Retaining the suppressed record's label refuses this delivery: its
+    # channel is not the triggering channel, so the sink's same-channel arm
+    # rejects it even though the visible agent-self line is cleared. Verified
+    # by reverting the kind-scoped labelling, which turns this False.
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver", "current", block.labels, sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
 
 
 def test_is_event_resolved_naive_resolved_at_same_second() -> None:

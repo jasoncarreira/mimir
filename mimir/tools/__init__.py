@@ -13,6 +13,7 @@ API is the flat ``mimir.tools`` namespace.
 
 from .memory import memory_get, memory_query, set_memory_client
 from .store import memory_store
+from .operator_alert import operator_alert, set_operator_alert_dependencies
 from .extra import (
     file_search,
     get_turn,
@@ -109,6 +110,7 @@ __all__ = [
     "get_turn",
     "shell_exec",
     "send_message",
+    "operator_alert",
     "react",
     "fetch_channel_history",
     "list_channels",
@@ -181,6 +183,7 @@ __all__ = [
     "set_index_generator",
     "set_turns_log_path",
     "set_channel_registry",
+    "set_operator_alert_dependencies",
     "set_identity_resolver",
     "set_dispatcher",
     "set_scheduler",

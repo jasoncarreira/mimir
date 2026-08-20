@@ -28,6 +28,14 @@ def test_image_provisions_protected_worklink_roots() -> None:
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY --chown=root:root mimir/ /opt/mimir-worklink/source/mimir/" in text
+    # TRANSITIONAL, and deliberately version-agnostic. The worker venv takes its
+    # dependency set from the published wheel and then overlays this checkout with
+    # --no-deps, so a runtime dependency newer than the last release is absent and
+    # the overlay cannot import it. Delete this assertion and the Dockerfile line it
+    # guards once a published wheel declares pypdf. Asserting the exact specifier
+    # here would make a floor bump fail an unrelated image-identity test.
+    assert "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir" in text
+    assert "pypdf" in text
     assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text

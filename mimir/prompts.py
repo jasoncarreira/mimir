@@ -375,6 +375,12 @@ def build_turn_prompt(
             lines.append("``fetch_url`` is not available to this trigger.")
         if "web_search" not in capabilities:
             lines.append("``web_search`` is not available to this trigger.")
+        if event.trigger == "poller" and "operator_alert" in capabilities:
+            lines.append(
+                "When a judgement is worth reporting but this turn cannot write, "
+                "call ``operator_alert(text=...)``. Its destination is fixed by the "
+                "operator; do not use shell or file writes as a notification path."
+            )
         if "worklink_run" in capabilities:
             lines.append(
                 "``worklink_run`` is usable only before any untrusted active ingest "

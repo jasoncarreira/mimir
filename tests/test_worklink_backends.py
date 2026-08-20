@@ -77,8 +77,7 @@ backends:
     bin: /opt/bin/opencode
     args: [--verbose]
   feature_factory:
-    bin: /opt/bin/feature-factory
-    args: [--verbose]
+    entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 """.strip()
     )
 
@@ -101,14 +100,48 @@ backends:
     assert opencode.extra_args == ("--verbose",)
     feature_factory = registry.get("feature_factory")
     assert isinstance(feature_factory, FeatureFactoryBackend)
-    assert feature_factory.bin == "/opt/bin/feature-factory"
-    assert feature_factory.extra_args == ("--verbose",)
+    assert (
+        feature_factory.entrypoint
+        == "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
+    )
     assert config.defaults.compute_backend == "local_subprocess"
     assert isinstance(registry.select_compute(), LocalSubprocessComputeBackend)
-    # Unset base_branch falls back to the built-in default.
     assert config.defaults.base_branch == "main"
-
     assert config.tool_pins == ()
+
+
+@pytest.mark.parametrize("retired", ["bin", "args", "ready", "reviewer"])
+def test_feature_factory_rejects_retired_settings(retired: str) -> None:
+    value: object = [] if retired == "args" else "legacy"
+    config = WorklinkConfig(backend_settings={"feature_factory": {retired: value}})
+    with pytest.raises(ValueError, match="retired setting"):
+        BackendRegistry(config)
+
+
+def test_feature_factory_retired_settings_error_names_every_key() -> None:
+    """A config carrying several retired keys must name them all in one error.
+
+    The live ``<home>/worklink.yaml`` carried both ``bin`` and ``args``. Naming
+    only the first means the operator fixes it, redeploys, and hits the second —
+    and each cycle is a silent dispatch outage, because Worklink crashes emit no
+    events (the failure is visible only in ``run-<id>.log``).
+    """
+    config = WorklinkConfig(
+        backend_settings={"feature_factory": {"bin": "legacy", "args": []}}
+    )
+    with pytest.raises(ValueError) as excinfo:
+        BackendRegistry(config)
+    message = str(excinfo.value)
+    assert "'args'" in message
+    assert "'bin'" in message
+
+
+def test_feature_factory_requires_absolute_entrypoint() -> None:
+    config = WorklinkConfig(
+        backend_settings={"feature_factory": {"entrypoint": "feature-factory/bin/factory.js"}}
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        BackendRegistry(config)
 
 
 def test_worklink_config_malformed_autonomy_ints_fall_back(tmp_path: Path) -> None:
@@ -513,8 +546,9 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
     assert calls == [
         {
             "args": ("tool", "arg", "--cd", str(tmp_path), "prompt"),
-            "kwargs": {
-                "stdout": asyncio.subprocess.PIPE,
+                "kwargs": {
+                    "stdin": asyncio.subprocess.DEVNULL,
+                    "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
                 "cwd": str(tmp_path),
                 "env": {"PATH": "/custom/bin", "X": "1"},

@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,22 +22,48 @@ from mimir.worklink.backends import (
     RawResult,
     WorkOrder,
 )
-from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
+from mimir.worklink.evidence import EvidenceValidation, TestResult, WorklinkEvidence
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, claim_records_from_comments
+from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
+from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
+from mimir.worklink.factory_state import FactoryRunRecord
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkRunner,
     _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
+    _epic_run_timeout_s,
+    _epic_stale_heartbeat_s,
     _read_pr_body_section,
     render_decomposition_prompt,
     run_worklink,
     validate_leaf,
 )
+
+
+@pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
+def test_factory_timeout_defaults_and_falls_back_to_twelve_hours(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_RUN_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", value)
+    assert _epic_run_timeout_s() == 43200.0
+
+
+@pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
+def test_factory_stale_diagnostic_defaults_and_falls_back_to_fifteen_minutes(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", value)
+    assert _epic_stale_heartbeat_s() == 900.0
 
 
 class FakeCompute:
@@ -1653,7 +1681,9 @@ class _CodexNamedBackend(FakeBackend):
 
 from mimir.worklink.compute import LaunchHandle as _LaunchHandle
 
-def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: Path) -> None:
+def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     epic_json = json.dumps(
@@ -1677,15 +1707,11 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: 
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
         return cp(args)
 
-    class FactoryBackend(FakeBackend):
-        name = "feature_factory"
-
-    compute = FakeCompute(shared_filesystem=True)
-    registry = BackendRegistry(
-        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    monkeypatch.setattr(
+        "mimir.worklink.backends.feature_factory.FeatureFactoryBackend.admit",
+        lambda self: Path(self.entrypoint),
     )
-    registry.register(FactoryBackend(status="success"))
-    registry.register_compute(compute)
+    registry = BackendRegistry(WorklinkConfig())
 
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run_epic(701)
@@ -1694,123 +1720,1094 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(tmp_path: 
     assert result.status == "failed"
     assert result.reason == "lifecycle_state_incompatible"
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
-    assert compute.specs == []
     assert not (repo / ".worklink").exists()
 
 
-def test_run_epic_waits_on_launch_handle_and_finalizes(tmp_path: Path) -> None:
-    """Regression (mimir review on #1030): run_epic must call
-    ``compute.wait(handle, timeout_s)`` — the same 2-arg signature run() uses —
-    after launching the factory compute job. A prior bug passed only
-    ``timeout_s``; it bound to ``handle`` and dropped ``timeout_s``, so run-epic
-    crashed with a TypeError right after launch and transitioned the epic to
-    failed. This drives run_epic through launch/wait with a fake compute whose
-    autonomous factory writes a completed run.json (with terminal_result) into
-    the WORKTREE, and asserts review_ready mirroring plus the exact wait() args.
+@pytest.mark.parametrize("autonomous", [False, True])
+def test_every_epic_claim_uses_factory_concurrency_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    autonomous: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
 
-    Under the autonomous model the factory opens + promotes/requests review on
-    the PR itself (via --ready/--reviewer), so the adapter only MIRRORS the
-    outcome — it must NOT re-run ``gh pr ready`` / ``--add-reviewer``.
-    """
     repo = tmp_path / "repo"
     repo.mkdir()
-    worktree = repo.parent / ".worklink" / repo.name / "700-1"
-
-    epic_json = json.dumps(
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    epic = json.dumps(
         {
             "id": 700,
             "title": "epic",
-            "description": "build the thing",
+            "description": "build",
             "labels": ["worklink", "worklink:epic", "worklink:ready"],
-            "parent_id": None,
             "comments": [],
         }
     )
+    observed: list[dict[str, object]] = []
 
-    class FactoryCompute(FakeCompute):
-        def __init__(self, **kwargs: object) -> None:
-            super().__init__(**kwargs)
-            self.waited: tuple[object, int] | None = None
-
-        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
-            self.waited = (handle, timeout_s)
-            spec = self.specs[-1]
-            # The factory namespaces run.json under .opencode/factory/<run-id>/
-            # (run-id = chainlink-<issue_id>) inside its ``--repo`` worktree.
-            factory_run = (
-                spec.local_checkout / ".opencode" / "factory" / "chainlink-700" / "run.json"
-            )
-            factory_run.parent.mkdir(parents=True, exist_ok=True)
-            factory_run.write_text(
-                json.dumps(
-                    {
-                        "run_id": "chainlink-700",
-                        "heartbeat_at": datetime.now(UTC).isoformat(),
-                        "status": "completed",
-                        "gates": {
-                            "story": {"status": "approved"},
-                            "brief": {"status": "approved"},
-                            "pre_pr": {"status": "approved"},
-                        },
-                        "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
-                        "terminal_result": {
-                            "status": "completed",
-                            "run_id": "chainlink-700",
-                            "pr_url": "https://github.com/jasoncarreira/mimir/pull/999",
-                            "summary": "shipped",
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return ComputeResult(exit_code=0, stdout="factory ok", stderr="")
-
-    class FactoryBackend(FakeBackend):
-        name = "feature_factory"
-
-    compute = FactoryCompute(shared_filesystem=True)
-    gh_calls: list[list[str]] = []
-
-    def runner(
-        args: Sequence[str] | str, **_: object
-    ) -> subprocess.CompletedProcess[str]:
-        checkout_result = _isolated_checkout_result(args, repo, worktree)
-        if checkout_result is not None:
-            return checkout_result
+    def runner(args: Sequence[str] | str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
-            return cp(args, stdout=epic_json)
+            return cp(args, stdout=epic)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
-            return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
-        if isinstance(args, list) and args[:2] == ["gh", "pr"]:
-            gh_calls.append(list(args))
-            return cp(args)
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
         return cp(args)
 
-    registry = BackendRegistry(
-        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    def claim_issue(self: ChainlinkClaims, issue_id: int, comments: object, **kwargs: object):
+        observed.append(kwargs)
+        return ClaimResult(False, reason="concurrency cap reached (1/1 active claims)")
+
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "1")
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(
+            700, autonomous=autonomous
+        )
     )
-    registry.register(FactoryBackend(status="success"))
-    registry.register_compute(compute)
+
+    assert result.reason == "concurrency cap reached (1/1 active claims)"
+    assert observed == [{
+        "labels": {"worklink", "worklink:epic", "worklink:ready"},
+        "max_active_locks": 1,
+        "active_label": "worklink:epic",
+    }]
+
+
+def _factory_lifecycle_status(
+    sandbox: Path,
+    *,
+    status: str,
+    lock: str = "fresh",
+    session: str | None = "session-1",
+) -> Any:
+    return parse_factory_status(
+        {
+            "run_id": "700",
+            "issue_key": "700",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": status,
+            "mode": "autonomous",
+            "branch": "epic/700",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": lock,
+            "dead_lock": False,
+            "lock_session": session,
+            "gates": {},
+            "steps": ["implementation"],
+            "slices": ["factory-070-migration"],
+            "validator": None,
+            "pr_url": None,
+            "terminal_result": None,
+            "next": "implementation",
+        }
+    )
+
+
+def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRunRecord:
+    return FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=handle,
+        status=None,
+        observed_at=None,
+        controller_phase="running",
+    )
+
+
+def test_factory_supervision_drains_exact_handle_while_status_is_polled(
+    tmp_path: Path,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    wait_started = threading.Event()
+    cancelled = asyncio.Event()
+    waited: list[tuple[LaunchHandle, int]] = []
+    lifecycle: list[tuple[str, LaunchHandle]] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            waited.append((selected, timeout_s))
+            wait_started.set()
+            await cancelled.wait()
+            return ComputeResult(-15, "debug output", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not cancelled.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append(("cancel", selected))
+            cancelled.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append(("cleanup", selected))
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            assert wait_started.wait(1)
+            return _factory_lifecycle_status(sandbox, status="needs-human")
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
 
     result = asyncio.run(
-        WorklinkRunner(
-            home=tmp_path, repo=repo, runner=runner, registry=registry
-        ).run_epic(700)
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=object(),
+            backend=Backend(),
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
     )
 
-    # With the bug (compute.wait(spec.timeout_s)) run_epic caught a TypeError and
-    # returned status="failed"; the fix reaches wait() with the launch handle and
-    # mirrors the completed run's PR to review-ready.
-    assert result.status == "review_ready", (result.status, result.reason)
-    assert result.review_ready is True
-    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
-    # The factory already opened/promoted the PR; the adapter must NOT re-run gh.
-    assert not any(c[:2] == ["gh", "pr"] for c in gh_calls)
-    assert compute.specs, "compute.launch was never called"
-    assert compute.waited is not None, "compute.wait was never reached"
-    handle, waited_timeout = compute.waited
-    assert handle == LaunchHandle("fake_compute", "job-1")
-    assert waited_timeout == compute.specs[0].timeout_s
+    assert result.status == "needs-human"
+    assert waited and waited[0][0] == handle
+    assert lifecycle == [("cancel", handle), ("cleanup", handle)]
+
+
+@pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
+def test_factory_supervision_cancels_and_cleans_on_every_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    lifecycle: list[str] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 0.01
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            if failure == "status":
+                raise ValueError("malformed status")
+            return _factory_lifecycle_status(sandbox, status="running")
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            if failure == "heartbeat":
+                raise RuntimeError("heartbeat failed")
+
+    if failure == "persistence":
+        monkeypatch.setattr(
+            orchestrator,
+            "save_factory_record",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("persist failed")),
+        )
+    if failure == "timeout":
+        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 0.02)
+
+    with pytest.raises((ValueError, RuntimeError, OSError, orchestrator.WorklinkError)):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=object(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    assert lifecycle == ["cancel", "cleanup"]
+
+
+def test_factory_startup_status_handshake_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    lifecycle: list[str] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            time.sleep(0.1)
+            return _factory_lifecycle_status(sandbox, status="running")
+
+    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 0.01)
+    with pytest.raises(orchestrator.WorklinkError, match="startup status handshake timed out"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=object(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    assert lifecycle == ["cancel", "cleanup"]
+
+
+def _completion_record(sandbox: Path) -> FactoryRunRecord:
+    status = parse_factory_status(
+        {
+            **_factory_lifecycle_status(sandbox, status="completed").to_json(),
+            "lock": "absent",
+            "lock_session": None,
+            "pr_url": "https://github.com/owner/repo/pull/42",
+        }
+    )
+    return FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=None,
+        status=status,
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="terminal",
+    )
+
+
+def _completion_validation(
+    sandbox: Path,
+    *,
+    files: list[str] | None = None,
+    tests: TestResult | None = None,
+    review_ready: bool = True,
+    diff_observed: bool = True,
+) -> EvidenceValidation:
+    evidence = WorklinkEvidence(
+        issue=700,
+        attempt=1,
+        backend="feature_factory",
+        branch="epic/700",
+        checkout=str(sandbox),
+        started_at="2026-08-18T12:00:00+00:00",
+        finished_at="2026-08-18T12:05:00+00:00",
+        files_changed=["changed.py"] if files is None else files,
+        diff_stat=" changed.py | 1 +",
+        commands=[],
+        tests=tests if tests is not None else TestResult("pytest -q", 0, "ok"),
+        pr_url="https://github.com/owner/repo/pull/42",
+        status="completed",
+        diff_observed=diff_observed,
+    )
+    return EvidenceValidation(
+        status="completed" if review_ready else "failed",
+        review_ready=review_ready,
+        reasons=(),
+        evidence=evidence,
+    )
+
+
+def _completion_runner(
+    sandbox: Path,
+    *,
+    case: str,
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    head_reads = 0
+
+    def runner(args: Sequence[str] | str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal head_reads
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{sandbox}\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{sandbox / '.git'}\n")
+        if isinstance(args, list) and args[-2:] == ["branch", "--show-current"]:
+            return cp(args, stdout="epic/700\n")
+        if isinstance(args, list) and args[-3:] == ["config", "--get", "remote.origin.url"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "HEAD"]:
+            head_reads += 1
+            value = "a" * 40
+            if case == "moved_evidence" and head_reads >= 2:
+                value = "b" * 40
+            if case == "moved_publication" and head_reads >= 3:
+                value = "b" * 40
+            return cp(args, stdout=value + "\n")
+        if isinstance(args, list) and "rev-parse" in args:
+            return cp(args, stdout="c" * 40 + "\n")
+        if isinstance(args, list) and args[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            return cp(args, stdout="?? dirty.txt\n" if case == "dirty" else "")
+        if isinstance(args, list) and args[:2] == ["gh", "api"]:
+            if case == "github_failure":
+                return cp(args, returncode=1, stderr="api failed")
+            payload: dict[str, Any] = {
+                "html_url": "https://github.com/owner/repo/pull/42",
+                "state": "open",
+                "draft": False,
+                "base": {"repo": {"full_name": "owner/repo"}, "ref": "main"},
+                "head": {
+                    "repo": {"full_name": "owner/repo"},
+                    "ref": "epic/700",
+                    "sha": "a" * 40,
+                },
+            }
+            if case == "github_url":
+                payload["html_url"] = "https://github.com/owner/repo/pull/43"
+            elif case == "github_state":
+                payload["state"] = "closed"
+            elif case == "github_draft":
+                payload["draft"] = True
+            elif case == "base_repository":
+                payload["base"]["repo"]["full_name"] = "other/repo"
+            elif case == "base_ref":
+                payload["base"]["ref"] = "develop"
+            elif case == "head_repository":
+                payload["head"]["repo"]["full_name"] = "fork/repo"
+            elif case == "head_ref":
+                payload["head"]["ref"] = "wrong"
+            elif case == "head_sha":
+                payload["head"]["sha"] = "b" * 40
+            elif case.startswith("missing_"):
+                path = {
+                    "missing_html_url": ("html_url",),
+                    "missing_state": ("state",),
+                    "missing_draft": ("draft",),
+                    "missing_base": ("base",),
+                    "missing_base_repo": ("base", "repo"),
+                    "missing_base_repo_full_name": ("base", "repo", "full_name"),
+                    "missing_base_ref": ("base", "ref"),
+                    "missing_head": ("head",),
+                    "missing_head_repo": ("head", "repo"),
+                    "missing_head_repo_full_name": ("head", "repo", "full_name"),
+                    "missing_head_ref": ("head", "ref"),
+                    "missing_head_sha": ("head", "sha"),
+                }[case]
+                target: dict[str, Any] = payload
+                for part in path[:-1]:
+                    target = target[part]
+                target.pop(path[-1], None)
+            return cp(args, stdout=json.dumps(payload))
+        return cp(args)
+
+    return runner
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_status",
+        "status",
+        "valid",
+        "run",
+        "issue",
+        "sandbox",
+        "mode",
+        "branch",
+        "base",
+        "draft",
+        "url_missing",
+        "url_noncanonical",
+        "url_repository",
+        "empty_diff",
+        "diff_unobserved",
+        "tests_missing",
+        "tests_unobserved",
+        "tests_skipped",
+        "tests_red",
+        "evidence_rejected",
+        "dirty",
+        "moved_evidence",
+        "moved_publication",
+        "github_failure",
+        "github_url",
+        "github_state",
+        "github_draft",
+        "base_repository",
+        "base_ref",
+        "head_repository",
+        "head_ref",
+        "head_sha",
+        "missing_html_url",
+        "missing_state",
+        "missing_draft",
+        "missing_base",
+        "missing_base_repo",
+        "missing_base_repo_full_name",
+        "missing_base_ref",
+        "missing_head",
+        "missing_head_repo",
+        "missing_head_repo_full_name",
+        "missing_head_ref",
+        "missing_head_sha",
+    ],
+)
+def test_factory_completion_rejection_matrix_persists_failed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _completion_record(sandbox)
+    status = record.status
+    assert status is not None
+    status_overrides: dict[str, Any] = {}
+    if case == "missing_status":
+        object.__setattr__(record, "status", None)
+    elif case == "status":
+        status_overrides["status"] = "partial"
+    elif case == "valid":
+        status_overrides["valid"] = False
+    elif case == "run":
+        status_overrides["run_id"] = "701"
+    elif case == "issue":
+        status_overrides["issue_key"] = "701"
+    elif case == "sandbox":
+        status_overrides["sandbox_path"] = str(tmp_path / "other")
+    elif case == "mode":
+        status_overrides["mode"] = "interactive"
+    elif case == "branch":
+        status_overrides["branch"] = "wrong"
+    elif case == "base":
+        status_overrides["pr_base"] = "develop"
+    elif case == "draft":
+        status_overrides["pr_draft"] = True
+    elif case == "url_missing":
+        status_overrides["pr_url"] = None
+    elif case == "url_noncanonical":
+        status_overrides["pr_url"] = "http://github.com/owner/repo/pull/42"
+    elif case == "url_repository":
+        status_overrides["pr_url"] = "https://github.com/other/repo/pull/42"
+    if status_overrides:
+        object.__setattr__(record, "status", parse_factory_status({**status.to_json(), **status_overrides}))
+
+    validation = _completion_validation(sandbox)
+    if case == "empty_diff":
+        validation = _completion_validation(sandbox, files=[])
+    elif case == "diff_unobserved":
+        validation = _completion_validation(sandbox, diff_observed=False)
+    elif case == "tests_missing":
+        validation = replace(validation, evidence=replace(validation.evidence, tests=None))
+    elif case == "tests_unobserved":
+        validation = _completion_validation(
+            sandbox,
+            tests=TestResult("pytest -q", 0, "ok", observed=False),
+        )
+    elif case == "tests_skipped":
+        validation = _completion_validation(
+            sandbox,
+            tests=TestResult("pytest -q", None, skipped_reason="disabled"),
+        )
+    elif case == "tests_red":
+        validation = _completion_validation(
+            sandbox,
+            tests=TestResult("pytest -q", 1, "failed"),
+        )
+    elif case == "evidence_rejected":
+        validation = _completion_validation(sandbox, review_ready=False)
+
+    async def observed(**kwargs: object) -> EvidenceValidation:
+        return validation
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    with pytest.raises(Exception):
+        asyncio.run(
+            orchestrator._verify_factory_completion(
+                home=tmp_path,
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                record=record,
+                test_command="pytest -q",
+                started_at=datetime.now(UTC),
+                runner=_completion_runner(sandbox, case=case),
+            )
+        )
+
+    evidence_path = tmp_path / "state" / "worklink" / "evidence" / "700-1.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "failed"
+    assert evidence["failure_reason"]
+
+
+def test_factory_completion_requires_entire_success_conjunction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    validation = _completion_validation(sandbox)
+
+    async def observed(**kwargs: object) -> EvidenceValidation:
+        return validation
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    evidence_path, pr_url = asyncio.run(
+        orchestrator._verify_factory_completion(
+            home=tmp_path,
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            record=_completion_record(sandbox),
+            test_command="pytest -q",
+            started_at=datetime.now(UTC),
+            runner=_completion_runner(sandbox, case="success"),
+        )
+    )
+
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert pr_url == "https://github.com/owner/repo/pull/42"
+    assert evidence["status"] == "completed"
+    assert evidence["head_sha"] == "a" * 40
+
+
+def test_factory_completion_failure_never_transitions_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    transitions: list[dict[str, object]] = []
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            transitions.append(kwargs)
+
+    async def reject(**kwargs: object) -> tuple[Path, str]:
+        raise orchestrator.WorklinkError("verification rejected")
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", reject)
+    with pytest.raises(orchestrator.WorklinkError, match="verification rejected"):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=Claims(),
+                backend=object(),
+                compute=object(),
+                factory_record=_completion_record(sandbox),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    assert transitions == []
+
+
+@pytest.mark.parametrize(
+    ("lock", "dead_lock", "action"),
+    [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
+)
+def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
+    tmp_path: Path,
+    lock: str,
+    dead_lock: bool,
+    action: str | None,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    historical = {"reason": "opaque and nonauthoritative"}
+
+    def status(value: str, lock_value: str, next_value: str | None = None):
+        payload: dict[str, Any] = {
+            "run_id": "700",
+            "issue_key": "700",
+            "valid": True,
+            "sandbox_path": str(sandbox),
+            "status": value,
+            "mode": "autonomous",
+            "branch": "epic/700",
+            "pr_base": "main",
+            "pr_draft": False,
+            "lock": lock_value,
+            "dead_lock": dead_lock if lock_value == lock else False,
+            "lock_session": None if lock_value == "absent" else "session-1",
+            "gates": {},
+            "steps": ["implementation"],
+            "slices": ["factory-070-migration"],
+            "validator": None,
+            "pr_url": None,
+            "terminal_result": historical,
+        }
+        if next_value is not None:
+            payload["next"] = next_value
+        return parse_factory_status(payload)
+
+    statuses = [status("needs-human", lock)]
+    if action is not None:
+        statuses.append(status("needs-human", "fresh"))
+    statuses.extend([
+        status("running", "fresh", "implementation"),
+        status("needs-human", "fresh"),
+    ])
+    calls: list[tuple[str, ...]] = []
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, run_id: str, *, sandbox: Path, launcher: str):
+            calls.append(("status", run_id, str(sandbox), launcher))
+            return statuses.pop(0)
+
+        def lock(self, run_id: str, selected_action: str, **kwargs: Any) -> None:
+            calls.append(("lock", run_id, selected_action, kwargs["session"], str(kwargs["sandbox"])))
+
+        def resume(self, run_id: str, **kwargs: Any):
+            calls.append(("resume", run_id, kwargs["session"], str(kwargs["sandbox"])))
+            return self.status(
+                run_id,
+                sandbox=kwargs["sandbox"],
+                launcher=kwargs["launcher"],
+            )
+
+        def heartbeat(self, run_id: str, **kwargs: Any) -> None:
+            calls.append(("heartbeat", run_id, kwargs["session"], str(kwargs["sandbox"])))
+
+        def work_spec(self, order: WorkOrder, **kwargs: Any) -> WorkSpec:
+            return FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js").work_spec(
+                order, **kwargs
+            )
+
+    class Compute:
+        def __init__(self) -> None:
+            self.handle = LaunchHandle("local_subprocess", "123", 456)
+            self.cancelled = False
+            self.cleaned = False
+            self.launches = 0
+
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            self.launches += 1
+            return self.handle
+
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            while not self.cancelled:
+                await asyncio.sleep(0)
+            return ComputeResult(-15, "", "cancelled", handle=handle)
+
+        def job_alive(self, handle: LaunchHandle) -> bool:
+            return True
+
+        async def cancel(self, handle: LaunchHandle) -> None:
+            self.cancelled = True
+
+        async def cleanup(self, handle: LaunchHandle) -> None:
+            self.cleaned = True
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{sandbox}\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{sandbox / '.git'}\n")
+        if isinstance(args, list) and args[-2:] == ["branch", "--show-current"]:
+            return cp(args, stdout="epic/700\n")
+        if isinstance(args, list) and args[-3:] == ["config", "--get", "remote.origin.url"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if isinstance(args, list) and "rev-parse" in args:
+            return cp(args, stdout="a" * 40 + "\n")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(tmp_path / "repo"), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    retained = FactoryRunRecord(
+        run_id="700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=LaunchHandle("local_subprocess", "99999999", 456),
+        status=status("needs-human", lock),
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="parked",
+    )
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    class Claims:
+        agent_id = "agent"
+
+        def _lock_still_held_by(self, record: ClaimRecord) -> bool:
+            return record is claim
+
+    compute = Compute()
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", agent_id="agent")._recover_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=claim,
+            claims=Claims(),
+            backend=Backend(),
+            compute=compute,
+            retained=retained,
+            launcher=Path(retained.launcher),
+            repo_slug="owner/repo",
+            base="main",
+            test_cmd="uv run pytest -q",
+            runner=runner,
+        )
+    )
+    assert result.status == "needs-human"
+    expected = [("status", "700", str(sandbox), retained.launcher)]
+    if action is not None:
+        expected.extend([
+            ("lock", "700", action, "session-1", str(sandbox)),
+            ("status", "700", str(sandbox), retained.launcher),
+        ])
+    expected.extend([
+        ("resume", "700", "session-1", str(sandbox)),
+        ("status", "700", str(sandbox), retained.launcher),
+    ])
+    assert calls[:len(expected)] == expected
+    assert calls[-1] == ("heartbeat", "700", "session-1", str(sandbox))
+    assert compute.cancelled and compute.cleaned
+    assert compute.launches == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("fresh_foreign", ["status"]),
+        ("changed_owner", ["status", "lock:claim", "status"]),
+        ("changed_history", ["status", "lock:claim", "status"]),
+        ("missing_next", ["status", "resume", "status"]),
+        ("live_process", ["status"]),
+    ],
+)
+def test_factory_recovery_rejection_command_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: list[str],
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    history = {"reason": "opaque"}
+
+    def status(
+        *,
+        lock: str,
+        owner: str | None,
+        current: str = "needs-human",
+        next_present: bool = True,
+        changed_history: bool = False,
+    ) -> Any:
+        payload = {
+            **_factory_lifecycle_status(
+                sandbox,
+                status=current,
+                lock=lock,
+                session=owner,
+            ).to_json(),
+            "terminal_result": {"reason": "changed"} if changed_history else history,
+        }
+        if not next_present:
+            payload.pop("next", None)
+        return parse_factory_status(payload)
+
+    if case == "fresh_foreign":
+        statuses = [status(lock="fresh", owner="foreign")]
+    elif case == "changed_owner":
+        statuses = [
+            status(lock="absent", owner=None),
+            status(lock="fresh", owner="foreign"),
+        ]
+    elif case == "changed_history":
+        statuses = [
+            status(lock="absent", owner=None),
+            status(lock="fresh", owner="session-1", changed_history=True),
+        ]
+    elif case == "missing_next":
+        statuses = [
+            status(lock="fresh", owner="session-1"),
+            status(
+                lock="fresh",
+                owner="session-1",
+                current="running",
+                next_present=False,
+            ),
+        ]
+    else:
+        statuses = [status(lock="fresh", owner="session-1")]
+    events: list[str] = []
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            events.append("status")
+            return statuses.pop(0)
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            events.append(f"lock:{action}")
+
+        def resume(self, run_id: str, **kwargs: object) -> Any:
+            events.append("resume")
+            return self.status(run_id, **kwargs)
+
+    class Compute:
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            raise AssertionError("rejected recovery launched a duplicate process")
+
+    retained = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "999999999", 1),
+    )
+    retained = replace(
+        retained,
+        status=status(lock="fresh", owner="session-1"),
+        session="session-1",
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="parked",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_verify_factory_recovery_binding",
+        lambda **kwargs: sandbox,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "factory_process_is_alive",
+        lambda record: case == "live_process",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "factory_process_is_verified_dead",
+        lambda record: case != "live_process",
+    )
+
+    with pytest.raises(Exception):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=object(),
+                backend=Backend(),
+                compute=Compute(),
+                retained=retained,
+                launcher=Path(retained.launcher),
+                repo_slug="owner/repo",
+                base="main",
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+            )
+        )
+
+    assert events == expected
+
+
+def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    terminal = parse_factory_status(
+        {
+            **_factory_lifecycle_status(
+                sandbox,
+                status="blocked",
+                lock="absent",
+                session=None,
+            ).to_json(),
+            "terminal_result": {"reason": "opaque"},
+        }
+    )
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    retained = replace(
+        _factory_lifecycle_record(sandbox, handle),
+        status=terminal,
+        observed_at="2026-08-18T12:00:00+00:00",
+        controller_phase="terminal",
+    )
+    events: list[str] = []
+
+    class Backend:
+        def status(self, *args: object, **kwargs: object) -> Any:
+            events.append("status")
+            return terminal
+
+        def lock(self, *args: object, **kwargs: object) -> None:
+            events.append("lock")
+
+        def resume(self, *args: object, **kwargs: object) -> Any:
+            events.append("resume")
+            return terminal
+
+    class Compute:
+        async def cancel(self, selected: LaunchHandle) -> None:
+            events.append("cancel")
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            events.append("cleanup")
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            events.append("transition")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_verify_factory_recovery_binding",
+        lambda **kwargs: sandbox,
+    )
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda record: True)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=Backend(),
+            compute=Compute(),
+            retained=retained,
+            launcher=Path(retained.launcher),
+            repo_slug="owner/repo",
+            base="main",
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert events == ["status", "cancel", "cleanup", "transition"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "repository",
+        "base",
+        "launcher",
+        "lifecycle",
+        "session",
+        "claim_issue",
+        "claim_owner",
+        "claim_missing",
+        "sandbox",
+        "checkout_branch",
+        "checkout_repository",
+    ],
+)
+def test_factory_recovery_binding_rejects_every_precontrol_mismatch(
+    tmp_path: Path, case: str
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    retained = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "999999999", 1),
+    )
+    replacements: dict[str, object] = {}
+    if case == "repository":
+        replacements["repository"] = "other/repo"
+    elif case == "base":
+        replacements["base_ref"] = "develop"
+    elif case == "launcher":
+        replacements["launcher"] = "/opt/other/factory.js"
+    elif case == "lifecycle":
+        replacements["controller_phase"] = "stopped"
+    elif case == "session":
+        replacements["session"] = None
+    elif case == "sandbox":
+        replacements["sandbox"] = str(tmp_path / "missing")
+    retained = replace(retained, **replacements)
+    claim = ClaimRecord(
+        701 if case == "claim_issue" else 700,
+        1,
+        "foreign" if case == "claim_owner" else "agent",
+        datetime.now(UTC),
+    )
+
+    class Claims:
+        agent_id = "agent"
+
+        def _lock_still_held_by(self, record: ClaimRecord) -> bool:
+            return case != "claim_missing"
+
+    def runner(args: Sequence[str] | str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(args, stdout=f"{sandbox}\n")
+        if isinstance(args, list) and args[-2:] == ["rev-parse", "--absolute-git-dir"]:
+            return cp(args, stdout=f"{sandbox / '.git'}\n")
+        if isinstance(args, list) and args[-3:] == ["config", "--get", "remote.origin.url"]:
+            remote = "other/repo" if case == "checkout_repository" else "owner/repo"
+            return cp(args, stdout=f"git@github.com:{remote}.git\n")
+        if isinstance(args, list) and args[-2:] == ["branch", "--show-current"]:
+            branch = "wrong" if case == "checkout_branch" else "epic/700"
+            return cp(args, stdout=branch + "\n")
+        if isinstance(args, list) and "rev-parse" in args:
+            return cp(args, stdout="a" * 40 + "\n")
+        return cp(args)
+
+    with pytest.raises(orchestrator.WorklinkError):
+        orchestrator._verify_factory_recovery_binding(
+            runner=WorklinkRunner(home=tmp_path, repo=tmp_path, agent_id="agent"),
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=claim,
+            claims=Claims(),
+            retained=retained,
+            launcher=Path("/opt/factory/bin/factory.js"),
+            repo_slug="owner/repo",
+            base="main",
+            command_runner=runner,
+        )
 
 
 def _commit_runner(
