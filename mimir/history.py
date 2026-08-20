@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 from ._jsonl_tail import _tail_lines, count_lines_chunked
+from .access_control import ChannelResourceAdapter
 from .pollers import POLLER_CHANNEL_PREFIX
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
@@ -548,7 +549,10 @@ class MessageBuffer:
         sources participate. Mirrors open-strix's hard-coded
         ``{"discord","web","stdin"}`` filter (``app.py:734``).
         """
-        if channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES):
+        if (
+            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+            or recent_per_channel <= 0
+        ):
             # Synthetic scheduler:* or poller:* channel — no useful
             # prior context. See docstring above for rationale.
             within: list[Message] = []
@@ -584,6 +588,114 @@ class MessageBuffer:
                 continue
             seen.add(key)
             unique.append(m)
+        return unique
+
+    def assemble_recent_activity_candidates(
+        self,
+        *,
+        channel_id: str,
+        author: str | None,
+        recent_per_channel: int,
+        recent_author_cross: int,
+        cross_hours: int,
+        source_allowlist: frozenset[str] | None = None,
+    ) -> list[Message]:
+        resolved_channel = ChannelResourceAdapter._resolve_channel(channel_id)
+
+        def same_channel(candidate: str) -> bool:
+            return (
+                ChannelResourceAdapter._resolve_channel(candidate)
+                == resolved_channel
+            )
+
+        if (
+            channel_id.startswith(SYNTHETIC_CHANNEL_PREFIXES)
+            or recent_per_channel <= 0
+        ):
+            within: list[Message] = []
+        else:
+            same_channel_messages = [
+                message
+                for buffered_channel, messages in self._by_channel.items()
+                if same_channel(buffered_channel)
+                for message in messages
+                if source_allowlist is None or message.source in source_allowlist
+            ]
+            within = sorted(
+                same_channel_messages, key=lambda message: message.ts,
+            )[-recent_per_channel:]
+
+        anchors: list[Message] = []
+        if author and recent_author_cross > 0:
+            target_identity = None
+            target_identity_loaded = False
+            cutoff = datetime.now(tz=timezone.utc).timestamp() - cross_hours * 3600
+            for message in reversed(self._all):
+                if len(anchors) >= recent_author_cross:
+                    break
+                if same_channel(message.channel_id) or not message.author:
+                    continue
+                if source_allowlist is not None and message.source not in source_allowlist:
+                    continue
+                if self.cross_platform_pull:
+                    identity = getattr(self.resolver, "identity", None)
+                    if not target_identity_loaded:
+                        target_identity = identity(author) if callable(identity) else None
+                        target_identity_loaded = True
+                    candidate_identity = (
+                        identity(message.author) if callable(identity) else None
+                    )
+                    if (
+                        target_identity is None
+                        or candidate_identity is None
+                        or candidate_identity.canonical != target_identity.canonical
+                    ):
+                        continue
+                elif message.author != author:
+                    continue
+                try:
+                    message_ts = datetime.fromisoformat(
+                        message.ts.replace("Z", "+00:00")
+                    ).timestamp()
+                except (ValueError, AttributeError):
+                    continue
+                if message_ts < cutoff:
+                    break
+                anchors.append(message)
+        anchors.reverse()
+
+        anchor_ids = {id(message) for message in anchors}
+        cross: list[Message] = []
+        include_replies_by_channel: dict[str, bool] = {}
+        for message in self._all:
+            if same_channel(message.channel_id):
+                continue
+            if id(message) in anchor_ids:
+                cross.append(message)
+                include_replies_by_channel[message.channel_id] = True
+                continue
+            if message.kind == "user_message":
+                include_replies_by_channel[message.channel_id] = False
+                continue
+            if (
+                message.kind == "assistant_message"
+                and include_replies_by_channel.get(message.channel_id)
+                and (
+                    source_allowlist is None
+                    or message.source in source_allowlist
+                )
+            ):
+                cross.append(message)
+
+        merged = sorted((*within, *cross), key=lambda message: message.ts)
+        seen: set[tuple[str, str | None, str]] = set()
+        unique: list[Message] = []
+        for message in merged:
+            key = (message.channel_id, message.msg_id, message.ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(message)
         return unique
 
 

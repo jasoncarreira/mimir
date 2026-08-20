@@ -414,48 +414,35 @@ async def test_debounced_push_aborts_rebase_and_skips_push_on_pull_failure(
 
 @pytest.mark.asyncio
 async def test_debounce_coalesces_burst_to_single_push(
-    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    home_repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """5 commits within the debounce window produce 5 commits and
-    exactly 1 push (the prior 4 push tasks are cancelled before
-    firing).
+    """Five rapid commits produce five commits but one completed push task.
 
-    Debounce window is set to 0.50s and inter-commit yields use
-    ``asyncio.sleep(0)`` (pure event-loop yield, no wall-clock delay).
-    This eliminates the timing flake that appeared with the previous
-    0.10s / 0.01s pairing: under CI load, a 0.01s sleep could take
-    >100ms of real time, allowing the prior debounce timer to fire
-    before the next commit cancelled it.  With sleep(0) the interim
-    tasks never advance past their ``asyncio.sleep(DEBOUNCE_SECONDS)``
-    call before being cancelled; only the final task's timer actually
-    expires.
+    A controlled worker owns its release event, so the assertion measures the
+    component's cancellation behavior rather than scheduler or Git subprocess
+    timing.  Separate push-path tests cover the real worker.
     """
-    _short_debounce(monkeypatch, 0.50)
-    subprocess.run(
-        ["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")],
-        cwd=home_repo, check=True,
-    )
+    release_push = asyncio.Event()
+    completed_pushes: list[tuple[str, Path]] = []
+
+    async def controlled_push(*, turn_id: str, home: Path) -> None:
+        try:
+            await release_push.wait()
+        except asyncio.CancelledError:
+            return
+        completed_pushes.append((turn_id, home))
+
+    monkeypatch.setattr(git_tracking, "_debounced_push", controlled_push)
 
     (home_repo / "memory").mkdir()
-    push_calls = []
-    real_git = git_tracking._git
-
-    async def counting_git(*args: str, **kwargs: Any) -> Any:
-        if args and args[0] == "push":
-            push_calls.append(args)
-        return await real_git(*args, **kwargs)
-
-    monkeypatch.setattr(git_tracking, "_git", counting_git)
 
     for i in range(5):
         (home_repo / "memory" / f"file{i}.md").write_text(f"v{i}\n")
         await git_tracking.commit_turn_changes(
             turn_id=f"t{i}", trigger="user_message", home=home_repo, enabled=True,
         )
-        # Yield to the event loop once so each new push task is
-        # scheduled, but use sleep(0) — no wall-clock delay — so the
-        # debounce timer never expires between successive commits
-        # regardless of CI load.
+        # Let each worker reach its component-owned event before the next
+        # commit cancels it.  No wall-clock timer participates.
         await asyncio.sleep(0)
 
     # 5 commits landed on the branch.
@@ -465,18 +452,16 @@ async def test_debounce_coalesces_burst_to_single_push(
     ).stdout
     assert log.count("\n") == 6  # seed + 5
 
-    # Let the debounce expire and the final push fire.
+    # Release all non-cancelled workers.  Only the final scheduled task may
+    # complete; the prior four were cancelled by the component under test.
     assert git_tracking._pending_push_task is not None
+    release_push.set()
     try:
         await asyncio.wait_for(git_tracking._pending_push_task, timeout=3.0)
     except asyncio.CancelledError:
         pass
 
-    # Exactly one push attempt — the earlier 4 were cancelled before sleep
-    # completed, so they never reached the `git push` invocation.
-    assert len(push_calls) == 1, (
-        f"expected 1 coalesced push, got {len(push_calls)}: {push_calls}"
-    )
+    assert completed_pushes == [("t4", home_repo)]
 
 
 @pytest.mark.asyncio
