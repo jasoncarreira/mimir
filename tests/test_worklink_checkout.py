@@ -507,9 +507,9 @@ def test_stale_remote_tracking_base_fails_with_shas_and_behind_count(tmp_path: P
     assert not any(call[3:5] == ["worktree", "add"] for call in calls)
 
 
-def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> None:
+def test_create_worktree_real_git_feature_acp_remote_base(tmp_path: Path) -> None:
     # Regression for #467: a feature base that exists only as a remote-tracking
-    # branch (origin/integration/worklink) must still yield the attempt-scoped
+    # branch (origin/feature/acp) must still yield the attempt-scoped
     # branch. With a bare `worktree add -b ... <base>`, git's DWIM ignores -b and
     # checks out the base branch instead. Verified here with real git.
     origin = tmp_path / "origin.git"
@@ -520,27 +520,28 @@ def test_create_worktree_real_git_slash_named_remote_base(tmp_path: Path) -> Non
     _git(work, "config", "user.name", "t")
     _git(work, "commit", "-q", "--allow-empty", "-m", "main commit")
     _git(work, "push", "-q", "origin", "HEAD:main")
-    _git(work, "checkout", "-q", "-b", "integration/worklink")
+    _git(work, "checkout", "-q", "-b", "feature/acp")
     _git(work, "commit", "-q", "--allow-empty", "-m", "feature commit")
-    _git(work, "push", "-q", "origin", "integration/worklink")
+    _git(work, "push", "-q", "origin", "feature/acp")
+    feature_sha = _git(work, "rev-parse", "HEAD")
 
-    # Fresh clone: integration/worklink exists only as origin/integration/worklink.
+    # Fresh clone: feature/acp exists only as origin/feature/acp.
     repo = tmp_path / "fresh"
     subprocess.run(["git", "clone", "-q", str(origin), str(repo)], check=True)
     _git(repo, "config", "user.email", "t@e.com")
     _git(repo, "config", "user.name", "t")
 
-    lease = create_worktree(repo, issue_id=441, attempt=1, base="integration/worklink")
+    lease = create_worktree(repo, issue_id=441, attempt=1, base="feature/acp")
 
     assert lease.branch == "issue/441-a1"
-    assert lease.base_ref == "integration/worklink"
-    assert lease.local_base == "origin/integration/worklink"
+    assert lease.base_ref == "feature/acp"
+    assert lease.local_base == "origin/feature/acp"
     # The worktree must be on the attempt branch, NOT the base branch (the DWIM bug).
     assert _git(lease.path, "branch", "--show-current") == "issue/441-a1"
-    assert _git(lease.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "origin/integration/worklink")
+    assert _git(lease.path, "merge-base", "HEAD", "origin/feature/acp") == feature_sha
     # No stray local branch named after the base was created by DWIM.
     local_branches = _git(repo, "branch", "--format=%(refname:short)").split()
-    assert "integration/worklink" not in local_branches
+    assert "feature/acp" not in local_branches
 
 
 def test_create_isolated_checkout_has_real_git_dir_and_preserves_origin(tmp_path: Path) -> None:

@@ -471,6 +471,8 @@ def _orchestrator_runner(
     files_stdout: str = "changed.txt\n",
     dirty_after_commit: bool = False,
     cleanup_returncode: int = 0,
+    issue_json: str = ISSUE_JSON,
+    fetch_failure_base: str | None = None,
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
@@ -487,7 +489,7 @@ def _orchestrator_runner(
         if checkout_result is not None:
             return checkout_result
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
-            return cp(args, stdout=ISSUE_JSON)
+            return cp(args, stdout=issue_json)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
@@ -502,6 +504,12 @@ def _orchestrator_runner(
             return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+        if (
+            fetch_failure_base is not None
+            and isinstance(args, list)
+            and args == ["git", "-C", str(repo), "fetch", "origin", fetch_failure_base]
+        ):
+            return cp(args, returncode=128, stderr=f"fatal: couldn't find remote ref {fetch_failure_base}\n")
         if isinstance(args, list) and args[3:] == [
             "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRTUXB"
         ]:
@@ -634,6 +642,12 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert result.review_ready is True
     assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
     assert (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").is_file()
+    evidence = json.loads(
+        (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert evidence["base_ref"] == "main"
     assert ["git", "-C", str(worktree), "commit", "-m", "worklink: issue #441"] in calls
     assert ["chainlink", "locks", "release", "441"] in calls
     # #518: the attempt branch is pushed from the checkout that owns it (lease.path),
@@ -977,6 +991,66 @@ def test_worklink_runner_cuts_worktree_and_pr_from_configured_base(tmp_path: Pat
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls
     assert pr_calls[0][pr_calls[0].index("--base") + 1] == "integration/worklink"
+
+
+def test_leaf_target_branch_selects_checkout_pr_work_spec_and_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    issue_json = ISSUE_JSON.replace(
+        "- Suggested test command: echo ok",
+        "- Target branch: feature/acp\\n- Suggested test command: echo ok",
+    )
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+    compute = FakeCompute(shared_filesystem=True)
+    backend = FakeBackend()
+    registry = BackendRegistry(
+        WorklinkConfig(defaults=WorklinkDefaults(compute_backend="fake_compute"))
+    )
+    registry.register(backend)
+    registry.register_compute(compute)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert ["git", "-C", str(repo), "fetch", "origin", "feature/acp"] in calls
+    assert compute.specs[0].base_ref == "feature/acp"
+    pr_call = next(call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"])
+    assert pr_call[pr_call.index("--base") + 1] == "feature/acp"
+    evidence = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+    assert evidence["base_ref"] == "feature/acp"
+
+
+def test_unknown_leaf_target_branch_fails_without_falling_back_to_main(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    issue_json = ISSUE_JSON.replace(
+        "- Suggested test command: echo ok",
+        "- Target branch: feature/does-not-exist\\n- Suggested test command: echo ok",
+    )
+    calls, runner = _orchestrator_runner(
+        repo,
+        worktree,
+        issue_json=issue_json,
+        fetch_failure_base="feature/does-not-exist",
+    )
+    backend = FakeBackend()
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(backend)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "base repo fetch failed for origin/feature/does-not-exist"
+    assert backend.orders == []
+    assert ["git", "-C", str(repo), "fetch", "origin", "main"] not in calls
 
 
 def test_worklink_runner_uses_repository_base_over_deployment_default(tmp_path: Path) -> None:
