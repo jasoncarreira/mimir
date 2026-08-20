@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -23,6 +23,9 @@ class ChannelAudienceProvider(Protocol):
 @dataclass(frozen=True, slots=True)
 class ServerChannelAudienceProvider:
     home: Path
+    identity_resolver: IdentityResolver | None = field(
+        default=None, repr=False, kw_only=True
+    )
 
     def audience_for(
         self,

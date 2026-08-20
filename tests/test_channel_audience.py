@@ -14,7 +14,7 @@ from mimir.acp.session_store import SessionStore
 from mimir.channel_audience import ServerChannelAudienceProvider, attest_owner
 from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
-from mimir.identities import Identity, IdentityResolver
+from mimir.identities import AccessMetadata, Identity, IdentityResolver
 from mimir.models import AuthContext, OwnerAttestation, SourceLabel
 
 
@@ -432,3 +432,241 @@ def test_recent_user_requires_bound_minted_attestation_and_singleton_destination
             "audience_provider": Provider(frozenset({"alice", "bob"})),
         },
     ) is False
+
+
+def test_provider_retains_injected_resolver_without_changing_audience_semantics(
+    tmp_path: Path,
+) -> None:
+    resolver = IdentityResolver(tmp_path)
+    provider = ServerChannelAudienceProvider(
+        tmp_path,
+        identity_resolver=resolver,
+    )
+
+    assert provider.identity_resolver is resolver
+    assert provider.audience_for("discord-guild", principal="alice") is None
+    assert ServerChannelAudienceProvider(tmp_path).identity_resolver is None
+
+
+def test_recent_activity_and_owner_attested_feedback_use_distinct_audience_policies() -> None:
+    class Resolver:
+        def identity(self, value):
+            if value == "alice":
+                return Identity(canonical="alice")
+            return None
+
+    class ProtocolProvider:
+        def audience_for(self, channel_id, *, principal):
+            return frozenset({"alice"})
+
+    class ResolverProvider:
+        identity_resolver = Resolver()
+
+        def audience_for(self, channel_id, *, principal):
+            return frozenset({"alice", "service:mimir"})
+
+    marker = attest_owner(Resolver(), "alice", "source")
+    assert marker is not None
+    recent = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="recent_activity_user",
+        owner_attestation=marker,
+    )
+    feedback = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="owner_attested_feedback",
+        owner_attestation=marker,
+    )
+    kwargs = {
+        "effective_principal": "alice",
+        "triggering_principal": "alice",
+        "resolved_triggering": "destination",
+        "cross_platform_pull": True,
+    }
+
+    assert _source_is_triggering_channel_compatible(
+        recent, audience_provider=ProtocolProvider(), **kwargs,
+    ) is True
+    assert _source_is_triggering_channel_compatible(
+        feedback, audience_provider=ProtocolProvider(), **kwargs,
+    ) is False
+    assert _source_is_triggering_channel_compatible(
+        recent, audience_provider=ResolverProvider(), **kwargs,
+    ) is False
+    assert _source_is_triggering_channel_compatible(
+        feedback, audience_provider=ResolverProvider(), **kwargs,
+    ) is True
+
+
+def test_owner_attested_feedback_requires_bound_marker() -> None:
+    class Resolver:
+        def identity(self, value):
+            return (
+                Identity(canonical="alice")
+                if value in {"raw-alice", "alice"}
+                else None
+            )
+
+    class Provider:
+        identity_resolver = Resolver()
+
+        def audience_for(self, channel_id, *, principal):
+            return frozenset({"alice"})
+
+    marker = attest_owner(Resolver(), "raw-alice", "source")
+    assert marker is not None
+    kwargs = {
+        "effective_principal": "alice",
+        "triggering_principal": "raw-alice",
+        "resolved_triggering": "destination",
+        "audience_provider": Provider(),
+        "cross_platform_pull": False,
+    }
+    sources = (
+        _source(
+            source_kind="owner_attested_feedback",
+            resource_id="source",
+            owner_attestation=None,
+        ),
+        _source(
+            source_kind="owner_attested_feedback",
+            resource_id="source",
+            owner_attestation=SimpleNamespace(
+                canonical_principal="alice",
+                raw_author="raw-alice",
+                source_channel="source",
+            ),
+        ),
+        _source(
+            source_kind="owner_attested_feedback",
+            resource_id="other",
+            owner_attestation=marker,
+        ),
+    )
+
+    assert all(
+        not _source_is_triggering_channel_compatible(source, **kwargs)
+        for source in sources
+    )
+    assert _source_is_triggering_channel_compatible(
+        _source(
+            source_kind="owner_attested_feedback",
+            resource_id="source",
+            owner_attestation=marker,
+        ),
+        **kwargs,
+    ) is True
+
+
+def test_owner_audience_normalization_skips_service_and_service_mimir() -> None:
+    class Resolver:
+        def identity(self, value):
+            values = {
+                "alice-alias": Identity(canonical="alice"),
+                "bob-alias": Identity(canonical="bob"),
+                "worker-alias": Identity(
+                    canonical="worker",
+                    access=AccessMetadata(is_service=True),
+                ),
+                "canonical-service": Identity(canonical="service:worker"),
+            }
+            return values.get(value)
+
+        def resolve(self, value):
+            raise AssertionError("resolve must not be called")
+
+    class Provider:
+        identity_resolver = Resolver()
+
+        def __init__(self, audience):
+            self.audience = audience
+
+        def audience_for(self, channel_id, *, principal):
+            return self.audience
+
+    marker = attest_owner(Resolver(), "alice-alias", "source")
+    assert marker is not None
+    source = _source(
+        principal="alice",
+        resource_id="source",
+        source_kind="owner_attested_feedback",
+        owner_attestation=marker,
+    )
+    kwargs = {
+        "effective_principal": "alice",
+        "triggering_principal": "alice-alias",
+        "resolved_triggering": "destination",
+        "cross_platform_pull": True,
+    }
+    positive = (
+        frozenset({"alice-alias"}),
+        frozenset({"alice-alias", "worker-alias"}),
+        frozenset({"alice-alias", "canonical-service"}),
+        frozenset({"alice-alias", "service:mimir"}),
+    )
+    negative = (
+        frozenset({"alice-alias", "bob-alias"}),
+        frozenset({"alice-alias", "unknown"}),
+        frozenset({"unknown"}),
+        frozenset({"worker-alias"}),
+        frozenset({"service:mimir"}),
+        frozenset(),
+    )
+
+    for audience in positive:
+        snapshot = frozenset(audience)
+        assert _source_is_triggering_channel_compatible(
+            source, audience_provider=Provider(audience), **kwargs,
+        ) is True
+        assert audience == snapshot
+    for audience in negative:
+        snapshot = frozenset(audience)
+        assert _source_is_triggering_channel_compatible(
+            source, audience_provider=Provider(audience), **kwargs,
+        ) is False
+        assert audience == snapshot
+    assert source.authorized_principals == frozenset({"alice"})
+
+
+def test_trusted_agent_arm_does_not_call_resolver_or_provider() -> None:
+    class Provider:
+        @property
+        def identity_resolver(self):
+            raise AssertionError("resolver metadata was not expected")
+
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("provider lookup was not expected")
+
+    assert _source_is_triggering_channel_compatible(
+        _source(
+            source_kind="agent_self",
+            integrity="trusted",
+            integrity_effect="informational",
+        ),
+        effective_principal="alice",
+        triggering_principal="alice",
+        resolved_triggering="destination",
+        audience_provider=Provider(),
+        cross_platform_pull=True,
+    ) is True
+
+
+def test_same_channel_arm_does_not_call_resolver_or_provider() -> None:
+    class Provider:
+        @property
+        def identity_resolver(self):
+            raise AssertionError("resolver metadata was not expected")
+
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("provider lookup was not expected")
+
+    assert _source_is_triggering_channel_compatible(
+        _source(resource_id="destination"),
+        effective_principal="alice",
+        triggering_principal="alice",
+        resolved_triggering="destination",
+        audience_provider=Provider(),
+        cross_platform_pull=True,
+    ) is True

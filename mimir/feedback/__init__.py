@@ -44,6 +44,7 @@ from ..models import (
     InformationFlowLabels,
     PromptBlock,
 )
+from ..channel_audience import attest_owner
 from ..access_control import (
     ChannelResourceAdapter,
     _source_is_triggering_channel_compatible,
@@ -123,6 +124,63 @@ _AGENT_SELF_CHANNEL_CARRIERS = frozenset({
     "send_message_loop_hard_stop",
     "send_message_loop_warning",
 })
+_OWNER_ATTESTED_COMMITMENT_KINDS = frozenset({
+    "commitment_due",
+    "commitment_expired",
+    "commitment_snooze_pileup",
+})
+_DISCORD_REACTION_AUTHOR_RE = re.compile(r"discord-[0-9]+")
+_SLACK_REACTION_AUTHOR_RE = re.compile(r"slack-[UW][A-Z0-9]+")
+
+
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _reaction_author(record: dict) -> str | None:
+    bridge = record.get("bridge")
+    author = record.get("author")
+    if not isinstance(author, str):
+        return None
+    if bridge == "discord" and _DISCORD_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    if bridge == "slack" and _SLACK_REACTION_AUTHOR_RE.fullmatch(author):
+        return author
+    return None
+
+
+def _owner_attested_feedback_evidence(
+    record: dict,
+    stream: str,
+) -> tuple[bool, str | None]:
+    kind = record.get("type")
+    if stream != "events":
+        return False, None
+    if kind == "react_received":
+        if "event_version" not in record:
+            if "owner_principal" in record:
+                return True, None
+            author = _reaction_author(record)
+            return True, author
+        if record.get("event_version") != "v1":
+            return True, None
+        if not _nonempty_string(record.get("owner_principal")):
+            return True, None
+        author = _reaction_author(record)
+        return True, author
+    if kind not in _OWNER_ATTESTED_COMMITMENT_KINDS:
+        return False, None
+    if "event_version" not in record:
+        return False, None
+    if record.get("event_version") != "v1":
+        return True, None
+    if (
+        not _nonempty_string(record.get("owner_principal"))
+        or record.get("ownership_provenance") != "extraction_acl"
+        or record.get("author") not in (None, "")
+    ):
+        return True, None
+    return True, record["owner_principal"]
 
 
 def _is_agent_self_record(record: dict) -> bool:
@@ -736,13 +794,35 @@ class FeedbackLog:
             principal = effective_requester
             acl = frozenset({effective_requester})
             sanitized = record
+            owner_attested_shape, owner_evidence = (
+                _owner_attested_feedback_evidence(record, stream)
+            )
 
             if agent_self:
                 source_kind = "agent_self"
                 sanitized = _sanitize_agent_self_record(record)
+            elif owner_attested_shape:
+                if owner_evidence is None or channel is None:
+                    return None
+                try:
+                    owner_attestation = attest_owner(
+                        self.identity_resolver,
+                        owner_evidence,
+                        channel,
+                    )
+                except Exception:
+                    return None
+                if owner_attestation is None:
+                    return None
+                principal = owner_attestation.canonical_principal
+                acl = frozenset({principal})
+                source_kind = "owner_attested_feedback"
             elif raw_owner is not None:
                 identity = getattr(self.identity_resolver, "identity", None)
-                resolved_owner = identity(raw_owner) if callable(identity) else None
+                try:
+                    resolved_owner = identity(raw_owner) if callable(identity) else None
+                except Exception:
+                    return None
                 if resolved_owner is None:
                     if (
                         not same_channel
@@ -795,6 +875,11 @@ class FeedbackLog:
                 authorized_principals=acl,
                 source_kind=source_kind,
                 self_authored=agent_self,
+                owner_attestation=(
+                    owner_attestation
+                    if source_kind == "owner_attested_feedback"
+                    else None
+                ),
             )
             if not _source_is_triggering_channel_compatible(
                 source,

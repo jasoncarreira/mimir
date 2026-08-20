@@ -1199,7 +1199,10 @@ class Agent:
         self._turn_logger = turn_logger
         self._buffer = message_buffer
         self._identity_resolver = getattr(message_buffer, "resolver", None)
-        self._audience_provider = ServerChannelAudienceProvider(config.home)
+        self._audience_provider = ServerChannelAudienceProvider(
+            config.home,
+            identity_resolver=self._identity_resolver,
+        )
         self._indexes = index_generator
         self._indexer = indexer
         self._saga = saga_client

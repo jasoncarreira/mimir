@@ -17,7 +17,7 @@ from textwrap import dedent
 
 import pytest
 
-from mimir.access_control import SinkGate
+from mimir.access_control import SinkGate, _source_is_triggering_channel_compatible
 from mimir.feedback import (
     FeedbackLog,
     FeedbackSignal,
@@ -32,6 +32,7 @@ from mimir.feedback import (
 from mimir.jsonl_snapshot import JsonlSnapshot
 from mimir.models import (
     AuthContext,
+    InformationFlowLabels,
     InformationFlowState,
     Integrity,
     IntegrityEffect,
@@ -83,6 +84,55 @@ class _SharedAudience:
 
     def audience_for(self, channel_id, *, principal):
         return frozenset({"jason"})
+
+
+class _FeedbackResolver:
+    def __init__(self, identities: dict[str, str]) -> None:
+        self.identities = identities
+        self.raises = False
+
+    def identity(self, value):
+        from mimir.identities import Identity
+
+        if self.raises:
+            raise RuntimeError("resolver unavailable")
+        canonical = self.identities.get(value)
+        return Identity(canonical=canonical) if canonical else None
+
+    def resolve(self, value):
+        raise AssertionError("resolve must not be called")
+
+
+class _FeedbackAudienceProvider:
+    def __init__(self, resolver: object, audience: frozenset[str]) -> None:
+        self.identity_resolver = resolver
+        self.audience = audience
+
+    def audience_for(self, channel_id, *, principal):
+        return self.audience
+
+
+def _feedback_owner_auth(
+    resolver: object,
+    *,
+    principal: str = "alice",
+    audience: frozenset[str] | None = None,
+) -> AuthContext:
+    return AuthContext(
+        principal=principal,
+        canonical_principal=principal,
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:destination",
+        interactivity=None,
+        enforcement_enabled=True,
+        audience_provider=_FeedbackAudienceProvider(
+            resolver,
+            audience if audience is not None else frozenset({principal}),
+        ),
+        cross_platform_pull=True,
+    )
 
 
 # ---- Empty / missing files ----------------------------------------------
@@ -3197,7 +3247,12 @@ def test_feedback_selection_labels_exactly_security_admitted_events(
 
     class Resolver:
         def identity(self, author):
-            values = {"slack-alice": "alice", "slack-bob": "bob"}
+            values = {
+                "alice": "alice",
+                "bob": "bob",
+                "slack-U1ALICE": "alice",
+                "slack-U1BOB": "bob",
+            }
             canonical = values.get(author)
             return Identity(canonical=canonical) if canonical else None
 
@@ -3205,6 +3260,8 @@ def test_feedback_selection_labels_exactly_security_admitted_events(
             raise AssertionError("feedback eligibility must not call resolve")
 
     class Provider:
+        identity_resolver = Resolver()
+
         def audience_for(self, channel_id, *, principal):
             values = {
                 ("acp:alice", "alice"): frozenset({"alice"}),
@@ -3216,19 +3273,25 @@ def test_feedback_selection_labels_exactly_security_admitted_events(
     log = _make_log(tmp_path, events=[
         {
             "timestamp": _ts(0.2),
-            "type": "tool_call_denied",
-            "tool": "admitted-tool",
-            "reason": "ADMITTED",
+            "type": "react_received",
+            "event_version": "v1",
+            "emoji": "thumbsup",
+            "polarity": "positive",
             "channel_id": "slack-D-alice",
-            "owner_principal": "slack-alice",
+            "bridge": "slack",
+            "author": "slack-U1ALICE",
+            "owner_principal": "alice",
         },
         {
             "timestamp": _ts(0.1),
-            "type": "tool_call_denied",
-            "tool": "foreign-tool",
-            "reason": "FOREIGN",
+            "type": "react_received",
+            "event_version": "v1",
+            "emoji": "thumbsdown",
+            "polarity": "negative",
             "channel_id": "slack-D-bob",
-            "owner_principal": "slack-bob",
+            "bridge": "slack",
+            "author": "slack-U1BOB",
+            "owner_principal": "bob",
         },
     ])
     log.identity_resolver = Resolver()
@@ -3245,13 +3308,337 @@ def test_feedback_selection_labels_exactly_security_admitted_events(
 
     block = log.recent_prompt_block(auth)
     assert block is not None
-    assert "ADMITTED" in block.content
-    assert "FOREIGN" not in block.content
+    assert "slack-U1ALICE" in block.content
+    assert "slack-U1BOB" not in block.content
     assert len(block.labels.sources) == 1
     source = block.labels.sources[0]
     assert source.principal == "alice"
-    assert source.owner_attestation is None
+    assert source.owner_attestation is not None
+    assert source.owner_attestation.raw_author == "slack-U1ALICE"
+    assert source.source_kind == "owner_attested_feedback"
     assert source.resource_id == "slack-D-alice"
+
+
+@pytest.mark.parametrize(
+    ("bridge", "author", "expected"),
+    [
+        ("discord", "discord-123", True),
+        ("slack", "slack-U123ABC", True),
+        ("discord", "discord-alice", False),
+        ("discord", "discord--1", False),
+        ("slack", "slack-alice", False),
+        ("slack", "slack-C123", False),
+        ("matrix", "discord-123", False),
+        (None, "slack-U123ABC", False),
+    ],
+)
+def test_v0_react_owner_allowlist_is_closed(
+    tmp_path: Path,
+    bridge: str | None,
+    author: str,
+    expected: bool,
+) -> None:
+    resolver = _FeedbackResolver({
+        "alice": "alice",
+        "discord-123": "alice",
+        "slack-U123ABC": "alice",
+    })
+    record = {
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "bridge": bridge,
+        "channel_id": "source-channel",
+        "author": author,
+        "emoji": "thumbsup",
+        "polarity": "positive",
+    }
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = resolver
+
+    block = log.recent_prompt_block(_feedback_owner_auth(resolver))
+
+    assert (block is not None) is expected
+    if block is not None:
+        [source] = block.labels.sources
+        assert source.source_kind == "owner_attested_feedback"
+        assert source.owner_attestation is not None
+        assert source.owner_attestation.raw_author == author
+
+
+@pytest.mark.parametrize("owner", [None, "", "alice", "unknown"])
+def test_v0_react_rejects_any_present_owner_principal(
+    tmp_path: Path,
+    owner: object,
+) -> None:
+    resolver = _FeedbackResolver({
+        "alice": "alice",
+        "discord-123": "alice",
+    })
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": "discord-123",
+        "owner_principal": owner,
+        "emoji": "thumbsup",
+        "polarity": "positive",
+    }])
+    log.identity_resolver = resolver
+
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+
+def test_v1_reaction_owner_is_rederived_from_raw_author(tmp_path: Path) -> None:
+    resolver = _FeedbackResolver({
+        "bob": "bob",
+        "slack-U123": "bob",
+    })
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "event_version": "v1",
+        "bridge": "slack",
+        "channel_id": "slack-CMULTI",
+        "author": "slack-U123",
+        "owner_principal": "stale-alice-audit",
+        "emoji": "thumbsup",
+        "polarity": "positive",
+    }])
+    log.identity_resolver = resolver
+
+    block = log.recent_prompt_block(_feedback_owner_auth(resolver, principal="bob"))
+
+    assert block is not None
+    [source] = block.labels.sources
+    assert source.principal == "bob"
+    assert source.authorized_principals == frozenset({"bob"})
+    assert source.owner_attestation is not None
+    assert source.owner_attestation.raw_author == "slack-U123"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"event_version": None},
+        {"event_version": 1},
+        {"event_version": "v2"},
+        {"owner_principal": None},
+        {"owner_principal": ""},
+        {"bridge": "matrix"},
+        {"author": "discord-alice"},
+        {"type": "reaction_added"},
+    ],
+)
+def test_v1_reaction_shape_and_version_matrix_fails_closed(
+    tmp_path: Path,
+    changes: dict,
+) -> None:
+    resolver = _FeedbackResolver({
+        "alice": "alice",
+        "discord-123": "alice",
+    })
+    record = {
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "event_version": "v1",
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": "discord-123",
+        "owner_principal": "alice",
+        "emoji": "thumbsup",
+        "polarity": "positive",
+        **changes,
+    }
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = resolver
+
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["commitment_due", "commitment_expired", "commitment_snooze_pileup"],
+)
+def test_commitment_feedback_requires_extraction_acl_provenance_for_each_kind(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    resolver = _FeedbackResolver({"alice": "alice", "owner-alias": "alice"})
+    base = {
+        "timestamp": _ts(0.1),
+        "type": kind,
+        "event_version": "v1",
+        "channel_id": "source-channel",
+        "owner_principal": "owner-alias",
+        "commitment_id": f"c-{kind}",
+        "text": f"ATTESTED-{kind}",
+        "snooze_count": 4,
+        "threshold": 3,
+    }
+    eligible = {**base, "ownership_provenance": "extraction_acl"}
+    log = _make_log(tmp_path, events=[eligible])
+    log.identity_resolver = resolver
+    block = log.recent_prompt_block(_feedback_owner_auth(resolver))
+    assert block is not None
+    assert f"ATTESTED-{kind}" in block.content
+    [source] = block.labels.sources
+    assert source.source_kind == "owner_attested_feedback"
+    assert source.owner_attestation is not None
+
+    for changes in (
+        {"ownership_provenance": None},
+        {"ownership_provenance": "legacy_admin"},
+        {"ownership_provenance": "extraction_acl", "author": "owner-alias"},
+        {"ownership_provenance": "extraction_acl", "owner_principal": ""},
+    ):
+        rejected = {**base, **changes}
+        rejected_log = _make_log(tmp_path, events=[rejected])
+        rejected_log.identity_resolver = resolver
+        assert rejected_log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+
+def test_snooze_pileup_legacy_ineligible_v1_eligible(tmp_path: Path) -> None:
+    resolver = _FeedbackResolver({"alice": "alice", "owner-alias": "alice"})
+    base = {
+        "timestamp": _ts(0.1),
+        "type": "commitment_snooze_pileup",
+        "channel_id": "source-channel",
+        "owner_principal": "owner-alias",
+        "commitment_id": "c-pileup",
+        "text": "PILEUP-POLICY-SENTINEL",
+        "snooze_count": 4,
+        "threshold": 3,
+    }
+    legacy = _make_log(tmp_path, events=[base])
+    legacy.identity_resolver = resolver
+    assert legacy.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+    current = _make_log(tmp_path, events=[{
+        **base,
+        "event_version": "v1",
+        "ownership_provenance": "extraction_acl",
+    }])
+    current.identity_resolver = resolver
+    block = current.recent_prompt_block(_feedback_owner_auth(resolver))
+    assert block is not None
+    assert "PILEUP-POLICY-SENTINEL" in block.content
+
+
+def test_feedback_owner_reassignment_and_removal_are_read_time_only_for_v0_and_v1(
+    tmp_path: Path,
+) -> None:
+    resolver = _FeedbackResolver({
+        "alice": "alice",
+        "discord-123": "alice",
+        "slack-U123": "alice",
+        "commitment-owner": "alice",
+    })
+    events = [
+        {
+            "timestamp": _ts(0.3),
+            "type": "react_received",
+            "bridge": "discord",
+            "channel_id": "discord-source",
+            "author": "discord-123",
+            "emoji": "thumbsup",
+            "polarity": "positive",
+        },
+        {
+            "timestamp": _ts(0.2),
+            "type": "react_received",
+            "event_version": "v1",
+            "bridge": "slack",
+            "channel_id": "slack-source",
+            "author": "slack-U123",
+            "owner_principal": "alice",
+            "emoji": "heart",
+            "polarity": "positive",
+        },
+        {
+            "timestamp": _ts(0.1),
+            "type": "commitment_due",
+            "event_version": "v1",
+            "channel_id": "commitment-source",
+            "owner_principal": "commitment-owner",
+            "ownership_provenance": "extraction_acl",
+            "commitment_id": "c-reassignment",
+            "text": "REASSIGNMENT-COMMITMENT",
+        },
+    ]
+    log = _make_log(tmp_path, events=events)
+    log.identity_resolver = resolver
+    original = log.events_path.read_bytes()
+
+    alice = log.recent_prompt_block(_feedback_owner_auth(resolver))
+    assert alice is not None
+    assert len(alice.labels.sources) == 3
+    assert {source.principal for source in alice.labels.sources} == {"alice"}
+
+    resolver.identities = {
+        "bob": "bob",
+        "discord-123": "bob",
+        "slack-U123": "bob",
+        "commitment-owner": "bob",
+    }
+    bob = log.recent_prompt_block(_feedback_owner_auth(resolver, principal="bob"))
+    assert bob is not None
+    assert len(bob.labels.sources) == 3
+    assert {source.principal for source in bob.labels.sources} == {"bob"}
+    assert log.events_path.read_bytes() == original
+
+    resolver.identities = {"bob": "bob"}
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver, principal="bob")) is None
+    assert log.events_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("mode", ["identical-unknown", "canonical-shaped", "raises"])
+def test_feedback_unknown_owner_matrix_omits_secret_without_blocking_reply(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    raw = "alice" if mode == "canonical-shaped" else "discord-999"
+    resolver = _FeedbackResolver({"alice": "alice"})
+    if mode == "canonical-shaped":
+        resolver.identities = {}
+    if mode == "raises":
+        resolver.raises = True
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "event_version": "v1",
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": raw,
+        "owner_principal": raw,
+        "emoji": "UNKNOWN-OWNER-SECRET",
+        "polarity": "positive",
+    }])
+    log.identity_resolver = resolver
+    auth = replace(_feedback_owner_auth(resolver), roles=("admin",))
+
+    block = log.recent_prompt_block(auth)
+
+    assert block is None
+    labels = InformationFlowLabels().with_source(
+        SourceLabel(
+            principal="alice",
+            domain="channel",
+            resource_id="acp:destination",
+            bridge_instance="acp",
+            sensitivity="private",
+            authorized_principals=frozenset({"alice"}),
+        )
+    )
+    assert _source_is_triggering_channel_compatible(
+        labels.sources[0],
+        effective_principal="alice",
+        triggering_principal="alice",
+        resolved_triggering="acp:destination",
+        audience_provider=auth.audience_provider,
+        cross_platform_pull=True,
+        triggering_bridge_instance="acp",
+    ) is True
 
 
 def test_turn_error_content_and_label_share_one_admission(tmp_path: Path) -> None:

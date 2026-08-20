@@ -56,6 +56,17 @@ def _agent(resolver: IdentityResolver) -> MimirAcpAgent:
     return MimirAcpAgent(bundle)
 
 
+def test_acp_agent_audience_provider_reuses_runtime_identity_resolver(
+    tmp_path: Path,
+) -> None:
+    resolver = _resolver(tmp_path)
+
+    agent = _agent(resolver)
+
+    assert agent._identity_resolver is resolver
+    assert agent._audience_provider.identity_resolver is resolver
+
+
 async def _agent_with_session(tmp_path: Path) -> tuple[MimirAcpAgent, str, int]:
     agent = _agent(_resolver(tmp_path))
     generation = agent.on_connect(SimpleNamespace())

@@ -332,7 +332,10 @@ class MimirAcpAgent:
             home = Path(self._identity_resolver._yaml_path).parents[1]
         self._ttl_days = getattr(config, "acp_journal_ttl_days", 7)
         self._store = SessionStore(home)
-        self._audience_provider = ServerChannelAudienceProvider(Path(home))
+        self._audience_provider = ServerChannelAudienceProvider(
+            Path(home),
+            identity_resolver=self._identity_resolver,
+        )
         self._last_sweep: float | None = None
         self._sweep_lock = asyncio.Lock()
         self._journals = JournalCache(self._store)

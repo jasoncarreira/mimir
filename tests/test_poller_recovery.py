@@ -133,7 +133,7 @@ async def test_recovery_drops_and_cannot_forge_owner_attestation(
         bridge_instance="discord",
         sensitivity="private",
         authorized_principals=frozenset({"alice"}),
-        source_kind="recent_activity_user",
+        source_kind="owner_attested_feedback",
         owner_attestation=attestation,
     )
     event = _make_event("sid-attested")
@@ -155,6 +155,9 @@ async def test_recovery_drops_and_cannot_forge_owner_attestation(
     assert restored.ifc_labels is not None
     assert restored.ifc_labels.sources[0].owner_attestation is None
     assert restored.continuation_auth_context is None
+    fresh = attest_owner(Resolver(), "raw-alice", "source-channel")
+    assert fresh is not None
+    assert fresh is not attestation
 
 
 async def test_stash_recovery_document_io_runs_off_loop(
