@@ -1108,6 +1108,29 @@ def test_untrusted_model_write_cannot_launder_through_self_authored_state(
     ) == {"state/notes.md": "untrusted"}
 
 
+def test_file_write_integrity_records_through_symlinked_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(linked_home))
+    target = linked_home / "memory" / "notes.md"
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    assert record_file_write_integrity(str(target), tainted) is True
+    assert json.loads(
+        (real_home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    ) == {"memory/notes.md": "untrusted"}
+
+
 def test_file_write_fails_closed_when_integrity_metadata_is_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
