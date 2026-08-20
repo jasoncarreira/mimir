@@ -6,11 +6,11 @@ the user who initiated the turn. It is not a global transcript.
 
 ## Scoping rules
 
-| Turn target | Active channel | Same canonical user's other public channels | Same canonical user's other DMs | Other users' channels |
+| Turn target | Active channel | Same user's registered DM or ACP channels | Unknown/group/public channels | Other users' channels |
 | --- | --- | --- | --- | --- |
-| Public channel | Included | Included | Excluded | Excluded |
-| DM | Included | Included | Included | Excluded |
-| Synthetic `scheduler:*` / `poller:*` channel | Excluded | Only when the event has an author | Only for a private target with an author | Excluded |
+| Unknown, public, guild, or group channel | Included | Excluded | Excluded | Excluded |
+| Registered one-person DM or ACP session | Included | Included when audiences are compatible | Excluded | Excluded |
+| Synthetic `scheduler:*` / `poller:*` channel | Excluded | Excluded | Excluded | Excluded |
 
 The active-channel stream includes recent messages from the conversation,
 regardless of author, so replies retain local continuity. Cross-channel context
@@ -18,18 +18,26 @@ is anchored only by messages written by the initiating user. Mimir also includes
 assistant replies immediately following those anchors, stopping at the next user
 message, so imported messages are not presented without their response context.
 
-Private context flows only into a DM turn for the same canonical user. A public
-turn never receives DM content.
+ACP sessions and registered one-person DM channels have audience `{P}`. A
+server-attested message authored by P can enter an exact `{P}` destination.
+Adjacent assistant replies do not inherit that attestation; they enter only when
+the destination audience is a subset of their source audience. Missing, empty,
+public, guild, and multi-user audiences are unknown and receive no cross-channel
+content. DM content therefore never enters an unknown or multi-user destination.
 
 ## Identity resolution
 
 When `state/identities.yaml` maps platform-specific aliases to one canonical
 identity, cross-channel matching uses that canonical identity. For example, the
-same person's Discord and Slack messages can contribute to one turn. Unknown
-identities fall back to exact author-ID matching.
+same person's Discord and Slack DM messages can contribute to one ACP turn.
+Protected cross-channel admission uses strict registered identities; unknown
+authors are omitted.
 
-`MIMIR_CROSS_PLATFORM_PULL=false` disables resolver-based matching and uses
-exact author equality instead. It does not restore a global message pool.
+`MIMIR_CROSS_PLATFORM_PULL=false` disables canonical alias matching and uses
+raw author equality for cross-channel anchors and feedback owners. It is a raw-
+author privacy kill switch, not a ban on exact-author continuity. A strict
+identity lookup is still required before protected admission can mint owner
+attestation or construct a canonical ACL, so unknown authors remain omitted.
 
 ## Bounds and filtering
 
@@ -56,7 +64,9 @@ recent material must not change the memory query before retrieval.
 
 ## Implementation
 
-The behavior lives in `MessageBuffer.assemble_recent_activity()` in
-`mimir/history.py`. `MessageBuffer.recent_for_channel()` is intentionally an
-exact-channel primitive; user-scoped cross-channel augmentation is performed by
-`cross_author_context()`.
+Protected candidates are produced by
+`MessageBuffer.assemble_recent_activity_candidates()` in `mimir/history.py` and
+admitted with server-derived provenance by `Agent._select_recent_activity()`.
+`MessageBuffer.recent_for_channel()` remains an exact-channel primitive for SAGA
+query rewriting and other direct consumers. The legacy public assembly helpers
+retain their compatibility behavior for non-protected callers.

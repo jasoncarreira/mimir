@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from .models import AuthContext, Integrity, IntegrityEffect, SourceLabel
+from .models import (
+    AuthContext,
+    Integrity,
+    IntegrityEffect,
+    OwnerAttestation,
+    SourceLabel,
+)
 
 
 def prompt_source_label(
@@ -16,10 +22,11 @@ def prompt_source_label(
     channel_id: str | None = None,
     source_kind: str = "protected_prompt",
     self_authored: bool,
+    owner_attestation: OwnerAttestation | None = None,
 ) -> SourceLabel:
     """Create a private, informational prompt source with explicit provenance."""
     target_channel = channel_id
-    if self_authored and not target_channel:
+    if self_authored and source_kind != "agent_self" and not target_channel:
         target_channel = auth_context.resource_id or auth_context.channel_id
     return SourceLabel(
         principal=principal,
@@ -31,4 +38,5 @@ def prompt_source_label(
         source_kind=source_kind,
         integrity=Integrity.TRUSTED if self_authored else Integrity.UNTRUSTED,
         integrity_effect=IntegrityEffect.INFORMATIONAL,
+        owner_attestation=owner_attestation,
     )

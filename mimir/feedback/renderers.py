@@ -12,6 +12,13 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+CHANNEL_SCOPED_FREE_TEXT_KINDS = frozenset({
+    "commitment_due",
+    "commitment_expired",
+    "commitment_snooze_pileup",
+    "react",
+})
+
 # ---------------------------------------------------------------------------
 # Prompt-injection hardening helper
 # ---------------------------------------------------------------------------

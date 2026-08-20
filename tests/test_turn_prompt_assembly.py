@@ -16,17 +16,25 @@ silently shipping an empty-block prompt to the model.
 
 from __future__ import annotations
 
+import ast
 import json
+import inspect
 import os
+import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from mimir.access_control import SinkGate, build_scheduled_tick_service_principal
+from mimir.access_control import (
+    ChannelResourceAdapter,
+    SinkGate,
+    build_scheduled_tick_service_principal,
+)
 from mimir.agent import (
     Agent,
     _REFLECTION_CHANNEL_ID,
@@ -34,6 +42,7 @@ from mimir.agent import (
     _prompt_source_labels,
 )
 from mimir.config import Config
+from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.models import (
@@ -248,20 +257,12 @@ async def test_channel_less_untrusted_recent_activity_is_refused_at_sink(
         ctx, event, saga_block=None, initial_auth_context=auth,
     )
 
-    assert "legacy unbound message" in prompt
-    assert legacy in recent
-    source = next(
-        item for item in ctx.ifc_labels.sources
-        if item.resource_id == "message:legacy-message"
+    assert "legacy unbound message" not in prompt
+    assert legacy not in recent
+    assert all(
+        item.resource_id != "message:legacy-message"
+        for item in ctx.ifc_labels.sources
     )
-    assert source.integrity == Integrity.UNTRUSTED
-    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=ctx.ifc_labels))
-    decision = SinkGate.check_sink_flow(
-        "harness_auto_deliver", event.channel_id, ctx.ifc_labels, sink_auth,
-        enforce=True,
-    )
-    assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:same_channel"
 
 
 @pytest.mark.asyncio
@@ -1039,7 +1040,621 @@ async def test_ownerless_non_self_feedback_does_not_abort_prompt_assembly(
         _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
     )
 
-    assert "turn error: (no detail)" in turn_prompt
+    assert "turn error: (no detail)" not in turn_prompt
+
+
+def test_recent_content_and_labels_are_selected_together(tmp_path: Path) -> None:
+    from mimir.identities import Identity
+
+    class Resolver:
+        def identity(self, author):
+            return Identity(canonical="alice") if author == "discord-alice" else None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            if channel_id in {"discord-D1", "acp:session"} and principal == "alice":
+                return frozenset({"alice"})
+            return None
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    admitted = agent._buffer.make_message(
+        channel_id="discord-D1",
+        kind="user_message",
+        content="ADMITTED",
+        author="discord-alice",
+        msg_id="admitted",
+        source="discord",
+    )
+    excluded = agent._buffer.make_message(
+        channel_id="discord-guild",
+        kind="user_message",
+        content="EXCLUDED",
+        author="unknown",
+        msg_id="excluded",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(admitted)
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="acp:session",
+        author="discord-alice",
+        content="now",
+        source="acp",
+    )
+    auth = AuthContext(
+        principal="discord-alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="acp:session",
+        interactivity=None,
+        audience_provider=Provider(),
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == [admitted]
+    assert [block.content for block in blocks] == ["ADMITTED"]
+    assert len(blocks[0].labels.sources) == 1
+    source = blocks[0].labels.sources[0]
+    assert source.owner_attestation is not None
+    assert source.source_kind == "recent_activity_user"
+    assert source.resource_id == "discord-D1"
+
+
+def test_excluded_recent_messages_add_no_identity_or_recent_labels(
+    tmp_path: Path,
+) -> None:
+    class Resolver:
+        def identity(self, author):
+            return None
+
+        def resolve(self, author):
+            raise AssertionError("selection must not call resolve")
+
+    agent = _make_agent(tmp_path)
+    resolver = Resolver()
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    excluded = agent._buffer.make_message(
+        channel_id="foreign",
+        kind="user_message",
+        content="FOREIGN",
+        author="canonical-looking",
+        msg_id="foreign",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(excluded)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="destination",
+        author="canonical-looking",
+        content="now",
+    )
+    auth = AuthContext(
+        principal="canonical-looking",
+        canonical_principal="canonical-looking",
+        roles=(),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination",
+        interactivity=None,
+    )
+
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert recent == []
+    assert blocks == ()
+
+
+def test_selection_and_sink_share_normalized_channel_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Resolver:
+        def identity(self, author):
+            raise AssertionError("same canonical channel must not resolve identity")
+
+        def resolve_channel(self, channel_id):
+            return {
+                "destination-alias": "shared-canonical",
+                "source-alias": "shared-canonical",
+            }.get(channel_id, channel_id)
+
+        def resolve(self, author):
+            raise AssertionError("eligibility must not call resolve")
+
+    class Provider:
+        def audience_for(self, channel_id, *, principal):
+            raise AssertionError("same canonical channel must not query audience")
+
+    resolver = Resolver()
+    monkeypatch.setattr(ChannelResourceAdapter, "_global_resolver", resolver)
+    agent = _make_agent(tmp_path)
+    agent._identity_resolver = resolver
+    agent._buffer.resolver = resolver
+    message = agent._buffer.make_message(
+        channel_id="source-alias",
+        kind="assistant_message",
+        content="ALIASED-ASSISTANT",
+        source="discord",
+    )
+    anchor = agent._buffer.make_message(
+        channel_id="source-alias",
+        kind="user_message",
+        content="ALIASED-ANCHOR",
+        author="unknown-author",
+        source="discord",
+    )
+    agent._buffer._append_in_memory(anchor)
+    agent._buffer._append_in_memory(message)
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="destination-alias",
+        author="alice",
+        content="now",
+    )
+    auth = AuthContext(
+        principal="alice",
+        canonical_principal="alice",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="destination-alias",
+        interactivity=None,
+        enforcement_enabled=True,
+        domain="channel",
+        resource_id="shared-canonical",
+        bridge_instance="acp",
+        audience_provider=Provider(),
+    )
+    recent, blocks = agent._select_recent_activity(event, auth)
+    assert {item.content for item in recent} == {
+        "ALIASED-ANCHOR", "ALIASED-ASSISTANT",
+    }
+    labels = InformationFlowLabels()
+    for block in blocks:
+        for source in block.labels.sources:
+            labels = labels.with_source(source)
+    sink_auth = replace(auth, ifc_state=InformationFlowState(labels=labels))
+    decision = SinkGate.check_sink_flow(
+        "harness_auto_deliver",
+        "destination-alias",
+        labels,
+        sink_auth,
+        enforce=True,
+    )
+    assert decision.allowed is True
+
+    agent._config.recent_per_channel = 0
+    disabled_recent, disabled_blocks = agent._select_recent_activity(event, auth)
+    assert disabled_recent == []
+    assert disabled_blocks == ()
+
+
+def test_channel_bearing_source_inventory_is_closed() -> None:
+    root = Path(__file__).parents[1] / "mimir"
+    categories = {
+        "AuthContext": "context_factory",
+        "OwnerAttestation": "attestation_factory",
+        "SourceLabel": "producer",
+        "derived": "producer",
+        "_prompt_source_labels": "producer",
+        "prompt_source_label": "producer",
+        "PromptBlock": "direct_block",
+        "use": "use_loader",
+        "recent_prompt_block": "feedback_loader",
+        "admit": "feedback_stream",
+        "assemble_recent_activity_candidates": "recent_loader",
+        "attest_owner": "attestation",
+        "_mint_owner_attestation": "attestation",
+        "_source_is_triggering_channel_compatible": "sink_predicate",
+        "create_auth_context": "context_boundary",
+        "ServerChannelAudienceProvider": "context_boundary",
+        "_event_to_stash": "recovery_call",
+        "_event_from_stash": "recovery_call",
+    }
+    observed: Counter[tuple[str, str, str, str]] = Counter()
+
+    def dotted(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted(node.value)
+            return f"{parent}.{node.attr}" if parent else None
+        return None
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.stack.append(node.name)
+            if node.name in {
+                "_event_to_stash",
+                "_event_from_stash",
+                "_mint_owner_attestation",
+            }:
+                category = (
+                    "attestation_definition"
+                    if node.name == "_mint_owner_attestation"
+                    else "recovery_definition"
+                )
+                observed[(
+                    category,
+                    self.relative,
+                    ".".join(self.stack),
+                    node.name,
+                )] += 1
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            call = dotted(node.func)
+            terminal = call.rsplit(".", 1)[-1] if call else None
+            category = categories.get(terminal or "")
+            if (
+                category is None
+                and self.relative == "mimir/acp/agent.py"
+                and self.stack[-1:] == ["_auth_context_for"]
+                and terminal == "replace"
+            ):
+                category = "context_rescope"
+            if category is not None and call is not None and self.stack:
+                observed[(
+                    category,
+                    self.relative,
+                    ".".join(self.stack),
+                    call,
+                )] += 1
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if node.attr == "recent_prompt_block" and self.stack:
+                attribute = dotted(node)
+                if attribute is not None:
+                    observed[(
+                        "feedback_loader",
+                        self.relative,
+                        ".".join(self.stack),
+                        attribute,
+                    )] += 1
+            self.generic_visit(node)
+
+    for path in root.rglob("*.py"):
+        relative = str(path.relative_to(root.parent))
+        Visitor(relative).visit(ast.parse(path.read_text(encoding="utf-8")))
+
+    expected = Counter({
+        ("attestation", "mimir/agent.py", "Agent._select_recent_activity", "attest_owner"): 1,
+        ("attestation", "mimir/channel_audience.py", "attest_owner", "_mint_owner_attestation"): 1,
+        ("attestation_definition", "mimir/models.py", "_mint_owner_attestation", "_mint_owner_attestation"): 1,
+        ("attestation_factory", "mimir/models.py", "_mint_owner_attestation", "OwnerAttestation"): 1,
+        ("context_boundary", "mimir/access_control.py", "create_local_operator_auth_context", "create_auth_context"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/acp/agent.py", "MimirAcpAgent.authenticate", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
+        ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
+        ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
+        ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
+        ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_commitments_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_self_state_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
+        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
+        ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
+        ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
+        ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
+        ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
+        ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 4,
+        ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
+        ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
+        ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel"): 1,
+        ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived"): 1,
+        ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
+        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel"): 1,
+        ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
+        ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
+        ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
+        ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
+        ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_from_stash", "_event_from_stash"): 1,
+        ("recovery_definition", "mimir/poller_recovery.py", "_event_to_stash", "_event_to_stash"): 1,
+        ("sink_predicate", "mimir/access_control.py", "SinkGate._get_allowed_sinks", "_source_is_triggering_channel_compatible"): 2,
+        ("sink_predicate", "mimir/access_control.py", "_ifc_blocking_source", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/agent.py", "Agent._select_recent_activity", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible"): 1,
+        ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
+    })
+    assert observed == expected
+
+
+@pytest.mark.asyncio
+async def test_channel_less_non_allowlisted_valence_payload_is_not_admitted(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "git_push_failed",
+        "reason": "RAW-OPERATIONAL-PAYLOAD",
+        "repository": "PRIVATE-REPOSITORY",
+    }
+    agent._config.events_log.write_text(
+        json.dumps(record) + "\n", encoding="utf-8",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+
+    assert agent._feedback.recent_prompt_block(auth) is None
+
+
+@pytest.mark.asyncio
+async def test_valence_transition_only_feedback_passes_real_use_guard(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": (now.replace(microsecond=100000)).isoformat(),
+            "type": "git_push_failed",
+            "reason": "non-fast-forward",
+            "attempt": 1,
+        },
+        {
+            "timestamp": (now.replace(microsecond=200000)).isoformat(),
+            "type": "git_push_ok",
+            "via": "retry",
+            "attempt": 2,
+        },
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "git push:" in prompt
+    assert "failed ×1" in prompt
+    assert "succeeded ×1" in prompt
+    assert "non-fast-forward" not in prompt
+    assert "retry" not in prompt
+    chain_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(chain_sources) == 2
+    assert all(source.source_kind == "feedback_chain" for source in chain_sources)
+    assert all(source.integrity == Integrity.UNTRUSTED for source in chain_sources)
+    assert all(source.is_complete for source in chain_sources)
+    assert {source.resource_id for source in chain_sources} == {"current"}
+    assert len({source.bridge_instance for source in chain_sources}) == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_turn_loop_only_feedback_passes_real_use_guard(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": now.replace(microsecond=index * 100000).isoformat(),
+            "type": "send_message_sent",
+            "channel_id": "current",
+            "content_hash": "same-content",
+            "source": f"send-{index}",
+        }
+        for index in (1, 2, 3)
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("admin",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "cross-turn send loop" in prompt
+    loop_sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(loop_sources) == 3
+    assert all(source.is_complete for source in loop_sources)
+
+
+@pytest.mark.asyncio
+async def test_collapsed_and_capacity_dropped_feedback_keep_complete_provenance(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    now = datetime.now(timezone.utc)
+    records = []
+    kinds = ["git_push_failed", "git_push_ok"] * 4
+    for index, kind in enumerate(kinds, start=1):
+        records.append({
+            "timestamp": now.replace(microsecond=index * 10000).isoformat(),
+            "type": kind,
+            "reason": f"reason-{index}",
+            "attempt": index,
+        })
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    agent._feedback.default_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert "... (4 more)" in prompt
+    sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(sources) == len(records)
+    assert all(source.is_complete for source in sources)
+
+
+@pytest.mark.asyncio
+async def test_capacity_drop_window_passes_real_use_guard_with_all_labels(
+    tmp_path: Path,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._feedback.default_limit_per_polarity = 1
+    now = datetime.now(timezone.utc)
+    records = [
+        {
+            "timestamp": now.replace(microsecond=index * 100000).isoformat(),
+            "type": "tool_call_denied",
+            "channel_id": "current",
+            "owner_principal": "operator",
+            "tool": f"capacity-tool-{index}",
+            "reason": f"capacity-reason-{index}",
+            "source": f"capacity-source-{index}",
+        }
+        for index in (1, 2, 3)
+    ]
+    agent._config.events_log.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    event = AgentEvent(
+        trigger="user_message",
+        channel_id="current",
+        content="continue",
+        author="operator",
+        source="test",
+    )
+    auth = AuthContext(
+        principal="operator",
+        canonical_principal="operator",
+        roles=("user",),
+        event_ingress=None,
+        trigger="user_message",
+        channel_id="current",
+        interactivity=None,
+        domain="channel",
+        resource_id="current",
+        bridge_instance="test",
+    )
+    ctx = _make_ctx(event)
+    prompt, _ = await agent._build_turn_prompt(
+        ctx, event, saga_block=None, initial_auth_context=auth,
+    )
+    assert sum(f"capacity-tool-{index}" in prompt for index in (1, 2, 3)) == 1
+    sources = [
+        source for source in ctx.ifc_labels.sources
+        if source.domain == "feedback"
+    ]
+    assert len(sources) == 3
+    assert all(source.is_complete for source in sources)
 
 
 @pytest.mark.asyncio

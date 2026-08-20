@@ -11,10 +11,17 @@ import json
 import time
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field, fields as dataclass_fields
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Annotated, Any
+
+from pydantic import PlainSerializer
+
+if TYPE_CHECKING:
+    from .channel_audience import ChannelAudienceProvider
+else:
+    ChannelAudienceProvider = Any
 
 
 class TurnInteractivity(StrEnum):
@@ -95,8 +102,67 @@ class IntegrityEffect(StrEnum):
     INFORMATIONAL = "informational"
 
 
-@dataclass(frozen=True)
-class SourceLabel:
+_OWNER_ATTESTATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class OwnerAttestation:
+    canonical_principal: str
+    raw_author: str
+    source_channel: str
+
+    def __init__(
+        self,
+        canonical_principal: str,
+        raw_author: str,
+        source_channel: str,
+        *,
+        _token: object,
+    ) -> None:
+        if _token is not _OWNER_ATTESTATION_TOKEN:
+            raise TypeError("owner attestations must be minted by the server factory")
+        object.__setattr__(self, "canonical_principal", canonical_principal)
+        object.__setattr__(self, "raw_author", raw_author)
+        object.__setattr__(self, "source_channel", source_channel)
+
+
+def _mint_owner_attestation(
+    canonical_principal: str,
+    raw_author: str,
+    source_channel: str,
+) -> OwnerAttestation:
+    return OwnerAttestation(
+        canonical_principal,
+        raw_author,
+        source_channel,
+        _token=_OWNER_ATTESTATION_TOKEN,
+    )
+
+
+_RedactedOwnerAttestation = Annotated[
+    OwnerAttestation | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+_RedactedAudienceProvider = Annotated[
+    ChannelAudienceProvider | None,
+    PlainSerializer(lambda _value: None, return_type=type(None)),
+]
+
+
+class _SourceLabelAuthoritySlot:
+    __slots__ = (
+        "_authorized_principals",
+        "_owner_attestation",
+        "_principal",
+        "_resource_id",
+    )
+
+
+_MISSING_SOURCE_VALUE: Any = object()
+
+
+@dataclass(frozen=True, eq=False)
+class SourceLabel(_SourceLabelAuthoritySlot):
     """Server-authoritative provenance for one protected input.
 
     ``authorized_principals`` is the effective read ACL. Derived service data
@@ -104,23 +170,106 @@ class SourceLabel:
     not public. All identity fields are required for ordinary channel egress.
     """
 
-    principal: str | None
-    domain: str | None
-    resource_id: str | None
-    bridge_instance: str | None
-    sensitivity: str
-    authorized_principals: frozenset[str] = frozenset()
+    principal: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    domain: str | None = _MISSING_SOURCE_VALUE
+    resource_id: InitVar[str | None] = _MISSING_SOURCE_VALUE
+    bridge_instance: str | None = _MISSING_SOURCE_VALUE
+    sensitivity: str = _MISSING_SOURCE_VALUE
+    authorized_principals: InitVar[frozenset[str]] = frozenset()
     source_kind: str = "channel"
     integrity: str = Integrity.UNTRUSTED
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
+    owner_attestation: InitVar[_RedactedOwnerAttestation] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        principal: str | None,
+        resource_id: str | None,
+        authorized_principals: frozenset[str],
+        owner_attestation: OwnerAttestation | None,
+    ) -> None:
+        if any(
+            value is _MISSING_SOURCE_VALUE
+            for value in (
+                principal, self.domain, resource_id,
+                self.bridge_instance, self.sensitivity,
+            )
+        ):
+            raise TypeError("missing required source label field")
         if self.integrity not in Integrity._value2member_map_:
             raise ValueError(f"invalid source integrity: {self.integrity!r}")
         if self.integrity_effect not in IntegrityEffect._value2member_map_:
             raise ValueError(
                 f"invalid source integrity effect: {self.integrity_effect!r}"
             )
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_resource_id", resource_id)
+        object.__setattr__(self, "_authorized_principals", authorized_principals)
+        object.__setattr__(self, "_owner_attestation", owner_attestation)
+
+    def __getattribute__(self, name: str) -> Any:
+        hidden = {
+            "authorized_principals": "_authorized_principals",
+            "owner_attestation": "_owner_attestation",
+            "principal": "_principal",
+            "resource_id": "_resource_id",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
+                authorized_principals=object.__getattribute__(
+                    self, "_authorized_principals",
+                ),
+            )
+            return values
+        return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        return (
+            self.principal,
+            self.domain,
+            self.resource_id,
+            self.bridge_instance,
+            self.sensitivity,
+            self.authorized_principals,
+            self.source_kind,
+            self.integrity,
+            self.integrity_effect,
+            self.owner_attestation,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SourceLabel):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        from pydantic_core import core_schema
+
+        schema = handler(source)
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            lambda value: {
+                "principal": None,
+                "domain": value.domain,
+                "resource_id": None,
+                "bridge_instance": value.bridge_instance,
+                "sensitivity": value.sensitivity,
+                "authorized_principals": frozenset(),
+                "source_kind": value.source_kind,
+                "integrity": value.integrity,
+                "integrity_effect": value.integrity_effect,
+                "owner_attestation": None,
+            },
+        )
+        return schema
 
     @property
     def is_complete(self) -> bool:
@@ -978,8 +1127,21 @@ class ServerDiscoveredPRStates:
             return self._states.setdefault(target, state)
 
 
-@dataclass(frozen=True)
-class AuthContext:
+class _AuthContextAuthoritySlot:
+    __slots__ = (
+        "_audience_provider",
+        "_canonical_principal",
+        "_channel_id",
+        "_principal",
+        "_resource_id",
+    )
+
+
+_MISSING_AUTH_VALUE: Any = object()
+
+
+@dataclass(frozen=True, eq=False)
+class AuthContext(_AuthContextAuthoritySlot):
     """Frozen, server-created authorization context (chainlink #864).
 
     This context carries immutable authorization state from the server's ingress
@@ -998,20 +1160,20 @@ class AuthContext:
     _current_turn ContextVar is lost (chainlink #891).
     """
 
-    principal: str | None
-    canonical_principal: str | None
-    roles: tuple[str, ...]
-    event_ingress: str | None
-    trigger: str
-    channel_id: str | None
-    interactivity: "TurnInteractivity | None"
+    principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    canonical_principal: InitVar[str | None] = _MISSING_AUTH_VALUE
+    roles: tuple[str, ...] = _MISSING_AUTH_VALUE
+    event_ingress: str | None = _MISSING_AUTH_VALUE
+    trigger: str = _MISSING_AUTH_VALUE
+    channel_id: InitVar[str | None] = _MISSING_AUTH_VALUE
+    interactivity: "TurnInteractivity | None" = _MISSING_AUTH_VALUE
     policy_version: str | None = None
     is_service: bool = False
     service_authority: Any = field(default=None, repr=False)
     enforcement_enabled: bool = False
     ifc_labels: "InformationFlowLabels | None" = None
     domain: str | None = None
-    resource_id: str | None = None
+    resource_id: InitVar[str | None] = None
     bridge_instance: str | None = None
     # Write provenance selected at ingress. These are deliberately absent from
     # model-facing tool arguments and cannot be changed after construction.
@@ -1050,6 +1212,80 @@ class AuthContext:
     # Server-selected SAGA resource for a synthesis turn. Model-supplied
     # session IDs are only selectors and must match this immutable value.
     saga_session_id: str | None = None
+    audience_provider: InitVar[_RedactedAudienceProvider] = None
+    cross_platform_pull: bool = True
+
+    def __post_init__(
+        self,
+        principal: str | None,
+        canonical_principal: str | None,
+        channel_id: str | None,
+        resource_id: str | None,
+        audience_provider: Any,
+    ) -> None:
+        if any(
+            value is _MISSING_AUTH_VALUE
+            for value in (
+                principal,
+                canonical_principal,
+                self.roles,
+                self.event_ingress,
+                self.trigger,
+                channel_id,
+                self.interactivity,
+            )
+        ):
+            raise TypeError("missing required authorization context field")
+        object.__setattr__(self, "_principal", principal)
+        object.__setattr__(self, "_canonical_principal", canonical_principal)
+        object.__setattr__(self, "_channel_id", channel_id)
+        object.__setattr__(self, "_resource_id", resource_id)
+        object.__setattr__(self, "_audience_provider", audience_provider)
+
+    def __getattribute__(self, name: str) -> Any:
+        hidden = {
+            "audience_provider": "_audience_provider",
+            "canonical_principal": "_canonical_principal",
+            "channel_id": "_channel_id",
+            "principal": "_principal",
+            "resource_id": "_resource_id",
+        }
+        if name in hidden:
+            return object.__getattribute__(self, hidden[name])
+        if name == "__dict__":
+            values = dict(object.__getattribute__(self, "__dict__"))
+            values.update(
+                principal=object.__getattribute__(self, "_principal"),
+                canonical_principal=object.__getattribute__(
+                    self, "_canonical_principal",
+                ),
+                channel_id=object.__getattribute__(self, "_channel_id"),
+                resource_id=object.__getattribute__(self, "_resource_id"),
+            )
+            return values
+        return object.__getattribute__(self, name)
+
+    def _identity(self) -> tuple[Any, ...]:
+        compared = tuple(
+            getattr(self, model_field.name)
+            for model_field in dataclass_fields(self)
+            if model_field.compare
+        )
+        return (
+            self.principal,
+            self.canonical_principal,
+            self.channel_id,
+            self.resource_id,
+            *compared,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AuthContext):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash(self._identity())
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
@@ -1080,7 +1316,7 @@ class AuthContext:
 
         schema = handler(source)
         schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
-            lambda _value: None,
+            lambda _value: {"audience_provider": None},
         )
         return schema
 

@@ -188,7 +188,10 @@ async def test_authenticate_uses_resolved_identity_and_factory(
         "bridge_instance": "acp-stdio",
     }
     assert captured["resolver"] is resolver
-    assert captured["kwargs"] == {"enforce": True, "event_ingress": "acp"}
+    assert captured["kwargs"]["enforce"] is True
+    assert captured["kwargs"]["event_ingress"] == "acp"
+    assert captured["kwargs"]["audience_provider"] is agent._audience_provider
+    assert captured["kwargs"]["cross_platform_pull"] is True
     assert agent._auth_context is not None
     assert agent._auth_context.principal == "operator"
     assert agent._auth_context.canonical_principal == "operator"

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import mimir
 
 from mimir.access_control import create_auth_context
+from mimir.channel_audience import ServerChannelAudienceProvider
 from mimir.models import AgentEvent
 from mimir.tools.client_provider import (
     MIMIR_HANDS_V1,
@@ -331,6 +332,7 @@ class MimirAcpAgent:
             home = Path(self._identity_resolver._yaml_path).parents[1]
         self._ttl_days = getattr(config, "acp_journal_ttl_days", 7)
         self._store = SessionStore(home)
+        self._audience_provider = ServerChannelAudienceProvider(Path(home))
         self._last_sweep: float | None = None
         self._sweep_lock = asyncio.Lock()
         self._journals = JournalCache(self._store)
@@ -413,7 +415,18 @@ class MimirAcpAgent:
             if identity is None or not identity.access.is_admin or identity.access.is_service:
                 raise ValueError
             event = AgentEvent(trigger="acp_authenticate", channel_id="acp:stdio", content="", author=identity.canonical, author_display=identity.display_name or identity.canonical, author_id=None, source_id=None, source="acp", extra={"channel_visibility": "private", "bridge_instance": _ACP_BRIDGE_INSTANCE})
-            auth_context = create_auth_context(event, self._identity_resolver, enforce=True, event_ingress="acp")
+            auth_context = create_auth_context(
+                event,
+                self._identity_resolver,
+                enforce=True,
+                event_ingress="acp",
+                audience_provider=self._audience_provider,
+                cross_platform_pull=getattr(
+                    getattr(self._bundle, "config", None),
+                    "cross_platform_pull",
+                    True,
+                ),
+            )
             if auth_context.principal != identity.canonical or auth_context.canonical_principal != identity.canonical or "admin" not in auth_context.roles or auth_context.is_service or not auth_context.enforcement_enabled:
                 raise ValueError
         except Exception:

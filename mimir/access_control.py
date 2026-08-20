@@ -4696,50 +4696,118 @@ def _has_untrusted_active_ingest(
     )
 
 
+def _same_channel_authority(
+    source: Any,
+    triggering_bridge_instance: str | None,
+) -> bool:
+    """Whether a source's channel id is scoped to the triggering authority.
+
+    A normalized channel id is unique within a bridge instance, not globally:
+    two independently scoped workspaces can each hold a channel that
+    normalizes to the same string. The same-channel shortcut admits with no
+    audience lookup, on the reasoning that the channel's own audience has
+    already seen the content -- which holds only if it is the same channel.
+
+    A mismatch declines the shortcut only. The flow stays eligible for the
+    audience arms below, which compare real audiences rather than strings.
+    """
+    source_domain = getattr(source, "domain", "") or ""
+    if not (source_domain == "channel" or source_domain.startswith("channel:")):
+        # Not a bridge-scoped channel source (e.g. a protected tool result
+        # carrying a "channel_metadata" domain); the shortcut is unaffected.
+        return True
+    source_bridge = getattr(source, "bridge_instance", None)
+    if not source_bridge or not triggering_bridge_instance:
+        # Unknown authority is not proof of the same authority. Treating it as
+        # compatible would let a channel-scoped source with no recorded bridge
+        # take the fast path and skip the audience lookup entirely.
+        return False
+    return source_bridge == triggering_bridge_instance
+
+
 def _source_is_triggering_channel_compatible(
     source: Any,
     *,
     effective_principal: str,
-    domain: str,
-    bridge_instance: str,
-    resolved_triggering: str,
+    triggering_principal: str | None,
+    resolved_triggering: str | None,
+    audience_provider: Any,
+    cross_platform_pull: bool,
+    admin_operator_cross_channel: bool = False,
+    triggering_bridge_instance: str | None = None,
 ) -> bool:
     """Return whether one IFC source may flow to the triggering channel."""
     if not getattr(source, "is_complete", False):
         return False
-    # Fresh protected-result sources include the authenticated reader by
-    # construction; inherited or externally supplied labels do not, so keep
-    # this check as the fail-closed guard for those paths.
-    if effective_principal not in source.authorized_principals:
+    if not effective_principal:
         return False
+    if effective_principal not in getattr(source, "authorized_principals", ()):
+        return False
+    if admin_operator_cross_channel:
+        return True
     source_kind = getattr(source, "source_kind", "channel")
-    if source_kind == "channel":
-        return (
-            source.principal == effective_principal
-            and source.domain == domain
-            and source.bridge_instance == bridge_instance
-            and ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
+    if (
+        source_kind == "agent_self"
+        and source.integrity == "trusted"
+        and source.integrity_effect == "informational"
+    ):
+        return True
+    source_channel = ChannelResourceAdapter._resolve_channel(source.resource_id)
+    if (
+        source_channel
+        and resolved_triggering
+        and source_channel == resolved_triggering
+        and _same_channel_authority(source, triggering_bridge_instance)
+    ):
+        return True
+    if source_kind == "recent_activity_user":
+        from .models import OwnerAttestation
+
+        attestation = getattr(source, "owner_attestation", None)
+        if not isinstance(attestation, OwnerAttestation):
+            return False
+        if (
+            attestation.source_channel != source.resource_id
+            or attestation.canonical_principal != source.principal
+            or source.principal != effective_principal
+        ):
+            return False
+        if not cross_platform_pull and attestation.raw_author != triggering_principal:
+            return False
+        if audience_provider is None or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+        except Exception:
+            return False
+        return destination_audience == frozenset({effective_principal})
+    if source_kind in {
+        "channel_scoped_feedback",
+        "channel_bound_unowned_feedback",
+    }:
+        return False
+    if source_kind in {"protected_prompt", "recent_activity_assistant"}:
+        if audience_provider is None or not source_channel or not resolved_triggering:
+            return False
+        try:
+            destination_audience = audience_provider.audience_for(
+                resolved_triggering, principal=effective_principal,
+            )
+            source_audience = audience_provider.audience_for(
+                source_channel, principal=source.principal,
+            )
+        except Exception:
+            return False
+        return bool(
+            destination_audience
+            and source_audience
+            and destination_audience <= source_audience
         )
     if source_kind == "service":
-        # Trusted service/derived data retains its input ACL. It may return only
-        # to the triggering channel when its channel provenance matches.
-        return not source.domain.startswith("channel") or (
-            source.bridge_instance == bridge_instance
-            and ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
-        )
-    if source_kind == "protected_prompt":
-        # Trusted framework-written records may be surfaced across channels.
-        # Untrusted prompt records remain bound to their originating channel
-        # even when upstream authorization added the current requester to the
-        # ACL; the ACL alone must not declassify foreign-channel content.
-        return (
-            source.integrity == "trusted"
-            or ChannelResourceAdapter._resolve_channel(source.resource_id)
-            == resolved_triggering
-        )
-    return source_kind == "protected_tool"
+        return not source.domain.startswith("channel")
+    return source_kind in {"protected_tool", "auto_recall", "mcp"}
 
 
 def _ifc_blocking_source(
@@ -4772,16 +4840,20 @@ def _ifc_blocking_source(
             if service is not None
             else getattr(auth_context, "canonical_principal", None)
         )
-        domain = getattr(auth_context, "domain", None)
-        bridge_instance = getattr(auth_context, "bridge_instance", None)
-        if all((effective_principal, domain, bridge_instance, resolved_triggering)):
+        if effective_principal and resolved_triggering:
             for source in current.sources:
                 if not _source_is_triggering_channel_compatible(
                     source,
                     effective_principal=effective_principal,
-                    domain=domain,
-                    bridge_instance=bridge_instance,
+                    triggering_principal=getattr(auth_context, "principal", None),
                     resolved_triggering=resolved_triggering,
+                    audience_provider=getattr(auth_context, "audience_provider", None),
+                    cross_platform_pull=getattr(
+                        auth_context, "cross_platform_pull", True,
+                    ),
+                    triggering_bridge_instance=getattr(
+                        auth_context, "bridge_instance", None,
+                    ),
                 ):
                     return source, "causing_source"
 
@@ -5537,12 +5609,22 @@ class SinkGate:
             and target is not None
             and isinstance(sources, tuple)
             and bool(sources)
-            and all(
-                source.is_complete
-                and getattr(auth_context, "canonical_principal", None)
-                in source.authorized_principals
-                for source in sources
-            )
+            and all(_source_is_triggering_channel_compatible(
+                source,
+                effective_principal=getattr(
+                    auth_context, "canonical_principal", None,
+                ) or "",
+                triggering_principal=getattr(auth_context, "principal", None),
+                resolved_triggering=ChannelResourceAdapter._resolve_channel(
+                    triggering_channel,
+                ),
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                admin_operator_cross_channel=True,
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
+            ) for source in sources)
         ):
             return frozenset({resolved_target_channel})
         if (
@@ -5611,48 +5693,16 @@ class SinkGate:
                 resolved_target_channel or "", "MIMIR_OPERATOR_ALERT_CHANNEL",
             ):
                 return frozenset({resolved_target_channel})
-            from .models import TurnInteractivity
-
-            resolved_resource = ChannelResourceAdapter._resolve_channel(
-                getattr(auth_context, "resource_id", None),
-            )
-            canonical_principal = getattr(auth_context, "canonical_principal", None)
-            domain = getattr(auth_context, "domain", None)
-            bridge_instance = getattr(auth_context, "bridge_instance", None)
-            sources = getattr(ifc_labels, "sources", ())
-            has_authenticated_ingress = any(
-                source.source_kind == "channel"
-                and source.principal == canonical_principal
-                and source.domain == domain
-                and ChannelResourceAdapter._resolve_channel(source.resource_id)
-                == resolved_resource
-                and source.bridge_instance == bridge_instance
-                and canonical_principal in source.authorized_principals
-                and source.integrity == "trusted"
-                and source.integrity_effect == "active_ingest"
-                for source in sources
-            )
-            if (
-                getattr(auth_context, "trigger", None) == "user_message"
-                and getattr(auth_context, "interactivity", None)
-                is TurnInteractivity.INTERACTIVE
-                and getattr(auth_context, "event_ingress", None) is None
-                and has_authenticated_ingress
-                and resolved_resource == resolved_triggering == resolved_target_channel
-            ):
-                return frozenset({resolved_target_channel})
 
         canonical_principal = getattr(auth_context, "canonical_principal", None)
         service = get_trusted_service_from_auth_context(auth_context)
         service_source_principal = (
             f"service:{service.canonical}" if service is not None else None
         )
-        domain = getattr(auth_context, "domain", None)
         resource_id = getattr(auth_context, "resource_id", None)
-        bridge_instance = getattr(auth_context, "bridge_instance", None)
         sources = getattr(ifc_labels, "sources", None)
         effective_principal = service_source_principal or canonical_principal
-        if not all((effective_principal, domain, resource_id, bridge_instance)):
+        if not all((effective_principal, resource_id)):
             return frozenset()
         if not isinstance(sources, tuple) or not sources:
             return frozenset()
@@ -5661,9 +5711,13 @@ class SinkGate:
             if not _source_is_triggering_channel_compatible(
                 source,
                 effective_principal=effective_principal,
-                domain=domain,
-                bridge_instance=bridge_instance,
+                triggering_principal=getattr(auth_context, "principal", None),
                 resolved_triggering=resolved_triggering,
+                audience_provider=getattr(auth_context, "audience_provider", None),
+                cross_platform_pull=getattr(auth_context, "cross_platform_pull", True),
+                triggering_bridge_instance=getattr(
+                    auth_context, "bridge_instance", None,
+                ),
             ):
                 return frozenset()
         if ChannelResourceAdapter._resolve_channel(resource_id) != resolved_triggering:
@@ -8870,6 +8924,8 @@ def create_auth_context(
     enforce: bool = False,
     event_ingress: str | None = None,
     ifc_labels: "InformationFlowLabels | None" = None,
+    audience_provider: Any = None,
+    cross_platform_pull: bool = True,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -8999,6 +9055,8 @@ def create_auth_context(
             else event.trigger
         ),
         origin_ref=event.source_id,
+        audience_provider=audience_provider,
+        cross_platform_pull=cross_platform_pull,
     )
 
 

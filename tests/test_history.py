@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from mimir.history import MessageBuffer, render_recent_activity
+from mimir.identities import Identity
 
 
 def _now_iso(offset_minutes: int = 0) -> str:
@@ -23,6 +25,20 @@ def _make_buffer(tmp_path: Path, **kwargs) -> MessageBuffer:
         per_channel_max=kwargs.get("per_channel_max", 20),
         disk_max=kwargs.get("disk_max", 5000),
     )
+
+
+class _StrictResolver:
+    def __init__(self, identities: dict[str, str]) -> None:
+        self.identities = identities
+        self.identity_calls: list[str | None] = []
+
+    def identity(self, author: str | None) -> Identity | None:
+        self.identity_calls.append(author)
+        canonical = self.identities.get(author or "")
+        return Identity(canonical=canonical) if canonical else None
+
+    def resolve(self, author: str | None) -> str | None:
+        raise AssertionError("protected candidate generation must not call resolve")
 
 
 @pytest.mark.asyncio
@@ -893,3 +909,229 @@ async def test_recent_in_channel_is_channel_scoped_and_ordered(tmp_path: Path):
     assert [m.content for m in buf.recent_in_channel("web-a", 50)] == ["a1", "a2", "a3"]
     assert buf.recent_in_channel("web-a", 0) == []
     assert buf.recent_in_channel("web-missing", 5) == []
+
+
+def test_protected_recent_same_channel_never_queries_identity(tmp_path: Path) -> None:
+    class Resolver:
+        def identity(self, author):
+            raise AssertionError("same-channel candidates must not query identity")
+
+        def resolve(self, author):
+            raise AssertionError("same-channel candidates must not resolve identity")
+
+    buffer = _make_buffer(tmp_path)
+    buffer.resolver = Resolver()
+    local = buffer.make_message(
+        channel_id="current",
+        kind="user_message",
+        content="local",
+        author="unknown",
+        ts=_now_iso(),
+    )
+    buffer._append_in_memory(local)
+
+    candidates = buffer.assemble_recent_activity_candidates(
+        channel_id="current",
+        author="unknown",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert candidates == [local]
+
+
+def test_strict_cross_author_candidates_require_known_identity(tmp_path: Path) -> None:
+    buffer = _make_buffer(tmp_path)
+    resolver = _StrictResolver({"discord-alice": "alice", "slack-alice": "alice"})
+    buffer.resolver = resolver
+    known = buffer.make_message(
+        channel_id="slack-D1",
+        kind="user_message",
+        content="known",
+        author="slack-alice",
+        ts=_now_iso(-2),
+    )
+    unknown = buffer.make_message(
+        channel_id="discord-guild",
+        kind="user_message",
+        content="unknown",
+        author="alice-looking",
+        ts=_now_iso(-1),
+    )
+    buffer._append_in_memory(known)
+    buffer._append_in_memory(unknown)
+
+    candidates = buffer.assemble_recent_activity_candidates(
+        channel_id="acp:session",
+        author="discord-alice",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert candidates == [known]
+
+
+def test_disabled_cross_platform_candidates_use_raw_author_equality(
+    tmp_path: Path,
+) -> None:
+    buffer = _make_buffer(tmp_path)
+    buffer.cross_platform_pull = False
+    buffer.resolver = _StrictResolver({})
+    exact = buffer.make_message(
+        channel_id="source-a",
+        kind="user_message",
+        content="exact",
+        author="raw-alice",
+        ts=_now_iso(-2),
+    )
+    alias = buffer.make_message(
+        channel_id="source-b",
+        kind="user_message",
+        content="alias",
+        author="mapped-alice",
+        ts=_now_iso(-1),
+    )
+    buffer._append_in_memory(exact)
+    buffer._append_in_memory(alias)
+
+    candidates = buffer.assemble_recent_activity_candidates(
+        channel_id="destination",
+        author="raw-alice",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert candidates == [exact]
+    assert buffer.resolver.identity_calls == []
+
+
+def test_adjacent_assistant_candidates_remain_independent_records(
+    tmp_path: Path,
+) -> None:
+    buffer = _make_buffer(tmp_path)
+    buffer.resolver = _StrictResolver({"alice": "alice"})
+    anchor = buffer.make_message(
+        channel_id="dm-alice",
+        kind="user_message",
+        content="question",
+        author="alice",
+        ts=_now_iso(-2),
+    )
+    reply = buffer.make_message(
+        channel_id="dm-alice",
+        kind="assistant_message",
+        content="answer",
+        ts=_now_iso(-1),
+    )
+    buffer._append_in_memory(anchor)
+    buffer._append_in_memory(reply)
+
+    candidates = buffer.assemble_recent_activity_candidates(
+        channel_id="acp:session",
+        author="alice",
+        recent_per_channel=10,
+        recent_author_cross=10,
+        cross_hours=24,
+    )
+    assert candidates == [anchor, reply]
+    assert reply.author is None
+
+
+def test_message_buffer_consumer_inventory_is_closed() -> None:
+    root = Path(__file__).parents[1] / "mimir"
+    read_methods = {
+        "recent_for_channel",
+        "recent_in_channel",
+        "cross_author_messages",
+        "cross_author_context",
+        "assemble_recent_activity",
+        "assemble_recent_activity_candidates",
+        "replay",
+        "evict_channel",
+    }
+    producer_methods = {
+        "_append_inbound_to_buffer",
+        "on_message_injected",
+    }
+
+    def dotted(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parent = dotted(node.value)
+            return f"{parent}.{node.attr}" if parent else None
+        return None
+
+    observed: set[tuple[str, str, str]] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self, relative: str) -> None:
+            self.relative = relative
+            self.stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            call = dotted(node.func)
+            if call is not None and self.stack:
+                terminal = call.rsplit(".", 1)[-1]
+                if terminal in read_methods | producer_methods or call in {
+                    "self._append_in_memory",
+                    "self._buffer.make_message",
+                    "self._buffer.append",
+                    "_buf.make_message",
+                    "_buf.append",
+                    "get_global_buffer",
+                    "set_global_buffer",
+                }:
+                    observed.add((
+                        self.relative,
+                        ".".join(self.stack),
+                        call,
+                    ))
+            self.generic_visit(node)
+
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        Visitor(str(path.relative_to(root.parent))).visit(tree)
+    assert observed == {
+        ("mimir/agent.py", "_rewrite_context_from_buffer", "buffer.recent_for_channel"),
+        ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.append"),
+        ("mimir/agent.py", "Agent._append_inbound_to_buffer", "self._buffer.make_message"),
+        ("mimir/agent.py", "Agent._maybe_auto_deliver_final_text", "self._buffer.append"),
+        ("mimir/agent.py", "Agent._maybe_auto_deliver_final_text", "self._buffer.make_message"),
+        ("mimir/agent.py", "Agent._run_turn_body", "self._append_inbound_to_buffer"),
+        ("mimir/agent.py", "Agent._run_turn_body", "self.on_message_injected"),
+        ("mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"),
+        ("mimir/agent.py", "Agent.on_message_injected", "self._append_inbound_to_buffer"),
+        ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "buffer.recent_in_channel"),
+        ("mimir/bridges/web_chat.py", "WebChatBridge._handle_history", "get_global_buffer"),
+        ("mimir/history.py", "MessageBuffer.append", "self._append_in_memory"),
+        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.cross_author_context"),
+        ("mimir/history.py", "MessageBuffer.assemble_recent_activity", "self.recent_for_channel"),
+        ("mimir/history.py", "MessageBuffer.cross_author_context", "self.cross_author_messages"),
+        ("mimir/history.py", "MessageBuffer.replay", "self._append_in_memory"),
+        ("mimir/runtime.py", "_clear_runtime_globals", "set_global_buffer"),
+        ("mimir/runtime.py", "_install_runtime_globals", "set_global_buffer"),
+        ("mimir/runtime.py", "create_agent_runtime", "message_buffer.replay"),
+        ("mimir/runtime.py", "create_agent_runtime.on_channel_idle", "message_buffer.evict_channel"),
+        ("mimir/tools/registry.py", "_resolve_recent_message_id", "buf.recent_for_channel"),
+        ("mimir/tools/registry.py", "_resolve_recent_message_id", "get_global_buffer"),
+        ("mimir/tools/registry.py", "send_message", "_buf.append"),
+        ("mimir/tools/registry.py", "send_message", "_buf.make_message"),
+        ("mimir/tools/registry.py", "send_message", "get_global_buffer"),
+    }
