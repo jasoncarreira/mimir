@@ -579,3 +579,99 @@ def test_main_json_reports_state_dirs(tmp_path, capsys, monkeypatch):
     mod.main(["--platform", "bsky", "--since", "2026-06-28",
               "--state-root", str(tmp_path), "--json"])
     assert json.loads(capsys.readouterr().out)["stateDirs"] == 1
+
+
+# --------------------------------------------------------------------------
+# Malformed-present fields.
+#
+# Presence was not enough. `_platform_matches` stringifies whatever it finds,
+# so `platform: []` compares as the literal "[]" and the record is filed as
+# another platform's traffic; and any non-empty action string was accepted, so
+# a corrupted spelling read as a legitimate non-post. Both silently withhold a
+# record that may be today's only post.
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_platform_string_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_a_list_valued_platform_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": [],
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_a_mapping_valued_platform_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": {"name": "bsky"},
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_a_mapping_valued_platforms_container_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": {"bsky": True},
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_an_empty_platforms_list_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": [],
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_a_platforms_list_holding_a_non_name_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": ["bsky", {}],
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    assert _detailed_full(mod, tmp_path).damaged_records == 1
+
+
+def test_a_comma_separated_platforms_string_is_interpretable(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": "bsky, mastodon",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_an_unknown_action_is_damage(tmp_path):
+    """A corrupted spelling is indistinguishable from a new upstream verb.
+
+    Either way it cannot be classified, so the count becomes a floor rather
+    than quietly treating the record as a non-post that does not count.
+    """
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "pst", "platform": "bsky",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 1)
+    assert r.is_floor
+
+
+def test_every_action_seen_in_deployed_data_is_known(tmp_path):
+    """Guards the cost of the vocabulary check against real traffic.
+
+    These are the verbs present in the deployed ledgers and outbox archives.
+    If the vocabulary ever stops covering them, every such record becomes
+    damage and the guard reports an unestablished count for good.
+    """
+    mod = fresh_count()
+    for action in ("post", "reply", "thread", "like", "repost", "ignore", "follow", "quote"):
+        assert action in mod.KNOWN_ACTIONS, action
+
+
+def test_known_non_post_actions_stay_normal_skips(tmp_path):
+    mod = fresh_count()
+    for action in ("like", "repost", "ignore", "follow"):
+        _one_record(tmp_path, {"action": action, "platform": "bsky",
+                               "timestamp": "2026-06-28T01:00:00Z"})
+        r = _detailed_full(mod, tmp_path)
+        assert (r.count, r.damaged_records) == (0, 0), action

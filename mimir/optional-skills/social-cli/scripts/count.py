@@ -18,6 +18,25 @@ from typing import Any, Iterable, NamedTuple
 
 POST_CREATING_ACTIONS = {"post", "reply", "thread"}
 
+# Actions the ledger is known to record: the post-creating set plus the
+# non-post verbs seen in deployed ledgers and archives. An action outside this
+# set cannot be classified — it may be a verb upstream added, or a corrupted
+# spelling of a post-creating one, and those are indistinguishable from here.
+# Treating it as damage makes the count a floor instead of silently filing it
+# as a non-post that does not count against the cap.
+#
+# The cost is deliberate: a genuinely new upstream verb makes the guard report
+# an unestablished count until that verb is added here. A loud stop is the
+# right trade against a silent under-count on a safety cap, and the repair is
+# one entry in this set.
+KNOWN_ACTIONS = POST_CREATING_ACTIONS | {
+    "quote",
+    "like",
+    "repost",
+    "ignore",
+    "follow",
+}
+
 
 def _eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
@@ -229,6 +248,29 @@ class LedgerCount(NamedTuple):
         return bool(self.unreadable or self.damaged_records)
 
 
+def _platform_value_is_interpretable(record: dict[str, Any]) -> bool:
+    """Whether the record names its platform in a shape we can compare.
+
+    ``_platform_matches`` stringifies whatever it finds, so a mapping or an
+    empty list does not raise — it simply fails to equal the requested
+    platform and the record is filed as another platform's traffic. That is
+    the silent path this rules out. The accepted shapes mirror the matcher: a
+    non-empty ``platform`` string, or a ``platforms`` list of non-empty scalar
+    names, or a non-empty comma-separated ``platforms`` string.
+    """
+    direct = record.get("platform")
+    if direct is not None:
+        return isinstance(direct, str) and bool(direct.strip())
+    platforms = record.get("platforms")
+    if isinstance(platforms, list):
+        return bool(platforms) and all(
+            isinstance(name, str) and name.strip() for name in platforms
+        )
+    if isinstance(platforms, str):
+        return any(part.strip() for part in platforms.split(","))
+    return False
+
+
 def _record_is_interpretable(record: dict[str, Any]) -> bool:
     """Whether a record carries the fields this count depends on.
 
@@ -246,11 +288,11 @@ def _record_is_interpretable(record: dict[str, Any]) -> bool:
     action = record.get("action")
     if not isinstance(action, str) or not action.strip():
         return False
+    if action.strip() not in KNOWN_ACTIONS:
+        return False
     if _parse_dt(record.get("timestamp")) is None:
         return False
-    if record.get("platform") is None and record.get("platforms") is None:
-        return False
-    return True
+    return _platform_value_is_interpretable(record)
 
 
 def count_ledgers_detailed(
