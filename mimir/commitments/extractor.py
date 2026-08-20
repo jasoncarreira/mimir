@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from .models import (
     DEFAULT_SNOOZE_WINDOW_SECS,
     CommitmentKind,
+    CommitmentOwnershipProvenance,
     CommitmentRecord,
     CommitmentSensitivity,
     make_commitment_id,
@@ -234,11 +235,15 @@ def assign_extraction_acl(
         record.originating_channel = source_acl.origin_channel
         record.origin_domain = source_acl.origin_domain
         record.visibility = source_acl.visibility
+        record.ownership_provenance = (
+            CommitmentOwnershipProvenance.EXTRACTION_ACL
+        )
     else:
         record.owner_principal = "legacy_admin"
         record.originating_channel = None
         record.origin_domain = None
         record.visibility = "service"
+        record.ownership_provenance = None
     record.service_name = service_name
     record.dedupe_key = make_dedupe_key(
         channel_id=record.channel_id,

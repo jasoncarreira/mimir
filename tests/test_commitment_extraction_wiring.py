@@ -32,7 +32,10 @@ from typing import Any
 import pytest
 
 from mimir.agent import Agent
-from mimir.commitments.models import CommitmentRecord
+from mimir.commitments.models import (
+    CommitmentOwnershipProvenance,
+    CommitmentRecord,
+)
 from mimir.config import Config
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
@@ -260,6 +263,7 @@ async def test_added_emits_commitments_extracted(
     assert added.owner_principal == "legacy_admin"
     assert added.visibility == "service"
     assert added.service_name == "synthesis"
+    assert added.ownership_provenance is None
 
 
 @pytest.mark.asyncio
@@ -306,6 +310,10 @@ async def test_commitment_extraction_inherits_source_session_acl(
     assert rec.origin_domain == "discord"
     assert rec.visibility == "private"
     assert rec.service_name == "synthesis"
+    assert (
+        rec.ownership_provenance
+        is CommitmentOwnershipProvenance.EXTRACTION_ACL
+    )
 
 
 @pytest.mark.asyncio

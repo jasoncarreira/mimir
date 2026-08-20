@@ -95,6 +95,24 @@ def test_list_renders_owned_private_commitment_for_operator(
     assert "owner=alice" in out
 
 
+def test_add_owner_does_not_mint_ownership_provenance(
+    home: Path, capsys: pytest.CaptureFixture,
+):
+    rc = _run([
+        "commitments", "add",
+        "--channel", "alice-channel",
+        "--owner", "alice",
+        "--visibility", "private",
+        "--text", "Alice manual commitment",
+    ], home)
+
+    assert rc == 0
+    capsys.readouterr()
+    record = _read_events(home)[0]["record"]
+    assert record["owner_principal"] == "alice"
+    assert record["ownership_provenance"] is None
+
+
 def test_complete_marks_terminal(home: Path, capsys: pytest.CaptureFixture):
     _run(["commitments", "add",
           "--channel", "c1", "--text", "X"], home)

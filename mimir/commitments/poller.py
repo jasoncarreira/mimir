@@ -46,8 +46,8 @@ import logging
 import time
 from dataclasses import dataclass
 
-from ..event_logger import log_event
-from .models import CommitmentStatus
+from ..event_logger import FEEDBACK_EVENT_VERSION, log_event
+from .models import CommitmentOwnershipProvenance, CommitmentStatus
 from .store import CommitmentsStore
 
 log = logging.getLogger(__name__)
@@ -166,6 +166,16 @@ async def check_due_and_expired(
                         threshold=snooze_pileup_threshold,
                         kind=rec.kind,
                         sensitivity=rec.sensitivity,
+                        event_version=FEEDBACK_EVENT_VERSION,
+                        owner_principal=rec.owner_principal,
+                        ownership_provenance=(
+                            rec.ownership_provenance.value
+                            if isinstance(
+                                rec.ownership_provenance,
+                                CommitmentOwnershipProvenance,
+                            )
+                            else None
+                        ),
                     )
                     result.snooze_pileup_emitted += 1
                 except Exception:  # noqa: BLE001
@@ -201,6 +211,15 @@ async def check_due_and_expired(
                         due_window_end_unix=end,
                         kind=rec.kind,
                         sensitivity=rec.sensitivity,
+                        event_version=FEEDBACK_EVENT_VERSION,
+                        ownership_provenance=(
+                            rec.ownership_provenance.value
+                            if isinstance(
+                                rec.ownership_provenance,
+                                CommitmentOwnershipProvenance,
+                            )
+                            else None
+                        ),
                     )
             except Exception:  # noqa: BLE001
                 log.exception(
@@ -235,6 +254,15 @@ async def check_due_and_expired(
                     due_window_end_unix=rec.due_window_end_unix,
                     kind=rec.kind,
                     sensitivity=rec.sensitivity,
+                    event_version=FEEDBACK_EVENT_VERSION,
+                    ownership_provenance=(
+                        rec.ownership_provenance.value
+                        if isinstance(
+                            rec.ownership_provenance,
+                            CommitmentOwnershipProvenance,
+                        )
+                        else None
+                    ),
                 )
         except Exception:  # noqa: BLE001
             log.exception(
