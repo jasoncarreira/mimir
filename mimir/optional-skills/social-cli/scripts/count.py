@@ -210,17 +210,38 @@ def count_ledgers_detailed(
     until: datetime | None,
     state_root: Path,
     state_dirs: list[Path],
-) -> tuple[int, int]:
-    """Count matching ledger entries, returning ``(count, unreadable)``.
+) -> tuple[int, int, int]:
+    """Count matching ledger entries: ``(count, unreadable, scanned)``.
 
-    ``unreadable`` is the number of ledger files that could not be read or
-    parsed. Any nonzero value makes ``count`` a floor rather than a count:
-    the skipped file may hold the only record of a post. Callers enforcing a
-    cap must treat that as an unestablished count, not as a smaller one.
+    ``unreadable`` counts sources that could not be read — a ledger file that
+    would not load or parse, a ledger in no recognized shape, or a state
+    directory that does not exist. Any nonzero value makes ``count`` a floor
+    rather than a count, because the source we could not read may hold the
+    only record of a post. Callers enforcing a cap must treat that as an
+    unestablished count, not merely a smaller one.
+
+    ``scanned`` is how many ledger files were actually read, which lets a
+    caller notice that a configured location produced nothing at all.
     """
     count = 0
     unreadable = 0
+    scanned = 0
+
+    # A source directory that does not exist is not an absence of posts, it is
+    # an absence of evidence: we are looking in the wrong place. Counting zero
+    # from a missing root reports full confidence in a number derived from
+    # nothing. A root that exists but holds no ledger yet is left alone — that
+    # is what a fresh install looks like before the poller first runs.
+    for missing in (
+        [d for d in state_dirs if not d.is_dir()]
+        if state_dirs
+        else ([] if state_root.is_dir() else [state_root])
+    ):
+        _eprint(f"social-cli count: state directory does not exist: {missing}")
+        unreadable += 1
+
     for path in _ledger_files(platform, state_root, state_dirs):
+        scanned += 1
         data, damaged = _load_yaml(path)
         if damaged:
             unreadable += 1
@@ -238,7 +259,7 @@ def count_ledgers_detailed(
             if until is not None and ts >= until:
                 continue
             count += 1
-    return count, unreadable
+    return count, unreadable, scanned
 
 
 def count_ledgers(
@@ -256,7 +277,7 @@ def count_ledgers(
     should use :func:`count_ledgers_detailed`, which also reports whether
     any ledger was unreadable.
     """
-    count, _unreadable = count_ledgers_detailed(
+    count, _unreadable, _scanned = count_ledgers_detailed(
         platform=platform,
         action=action,
         since=since,
@@ -321,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state_root = (args.state_root or _default_state_root()).expanduser()
     state_dirs = [p.expanduser() for p in args.state_dir]
-    total, unreadable = count_ledgers_detailed(
+    total, unreadable, scanned = count_ledgers_detailed(
         platform=args.platform,
         action=args.action,
         since=since,
@@ -333,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "count": total,
             "unreadable": unreadable,
+            "scanned": scanned,
             "platform": args.platform,
             "action": args.action,
             "since": since.isoformat(),
@@ -346,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         # status code as well as --json so that a consumer which reads only
         # stdout still cannot mistake a partial count for a complete one.
         _eprint(
-            f"social-cli count: {unreadable} ledger file(s) unreadable; "
+            f"social-cli count: {unreadable} source(s) unreadable; "
             f"{total} is a floor, not a count"
         )
         return EXIT_LEDGER_UNREADABLE

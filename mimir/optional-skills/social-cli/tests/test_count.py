@@ -198,12 +198,7 @@ def test_detailed_reports_unreadable_ledger_files(tmp_path):
     poller.mkdir(parents=True)
     (poller / "sent_ledger-bsky.yaml").write_text("{[ not: valid: yaml", encoding="utf-8")
 
-    count, unreadable = mod.count_ledgers_detailed(
-        platform="bsky", action="post",
-        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[],
-    )
-    assert (count, unreadable) == (0, 1)
+    assert _detailed(mod, tmp_path) == (0, 1)
 
 
 def test_detailed_does_not_flag_an_empty_ledger_as_unreadable(tmp_path):
@@ -213,11 +208,7 @@ def test_detailed_does_not_flag_an_empty_ledger_as_unreadable(tmp_path):
     poller.mkdir(parents=True)
     (poller / "sent_ledger-bsky.yaml").write_text("", encoding="utf-8")
 
-    assert mod.count_ledgers_detailed(
-        platform="bsky", action="post",
-        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[],
-    ) == (0, 0)
+    assert _detailed(mod, tmp_path) == (0, 0)
 
 
 def test_detailed_counts_the_readable_ledger_alongside_a_damaged_one(tmp_path):
@@ -228,11 +219,7 @@ def test_detailed_counts_the_readable_ledger_alongside_a_damaged_one(tmp_path):
     ])
     (poller / "sent_ledger-bsky-two.yaml").write_text("{[ malformed", encoding="utf-8")
 
-    assert mod.count_ledgers_detailed(
-        platform="bsky", action="post",
-        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[],
-    ) == (1, 1)
+    assert _detailed(mod, tmp_path) == (1, 1)
 
 
 def test_count_ledgers_still_returns_a_bare_total(tmp_path):
@@ -309,6 +296,16 @@ def test_main_exits_zero_and_reports_no_damage_on_a_clean_ledger(
 
 
 def _detailed(mod, tmp_path):
+    """``(count, unreadable)`` — `scanned` is asserted separately below."""
+    count, unreadable, _scanned = mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[],
+    )
+    return count, unreadable
+
+
+def _detailed_full(mod, tmp_path):
     return mod.count_ledgers_detailed(
         platform="bsky", action="post",
         since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
@@ -410,3 +407,54 @@ def yaml_dump_entries() -> str:
             "dryRun": False,
         }],
     })
+
+
+# --------------------------------------------------------------------------
+# Missing state directories: absence of evidence, not evidence of absence.
+# --------------------------------------------------------------------------
+
+
+def test_a_state_root_that_does_not_exist_is_damage(tmp_path):
+    """Counting zero from a directory that isn't there is a wrong-place read."""
+    mod = fresh_count()
+    count, unreadable = _detailed(mod, tmp_path / "nowhere")
+    assert (count, unreadable) == (0, 1)
+
+
+def test_a_present_state_root_with_no_ledger_yet_is_not_damage(tmp_path):
+    """What a fresh install looks like before the poller first runs."""
+    mod = fresh_count()
+    assert _detailed(mod, tmp_path) == (0, 0)
+
+
+def test_an_explicitly_named_missing_state_dir_is_damage(tmp_path):
+    mod = fresh_count()
+    count, unreadable, scanned = mod.count_ledgers_detailed(
+        platform="bsky", action="post",
+        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path, state_dirs=[tmp_path / "absent"],
+    )
+    assert (count, unreadable, scanned) == (0, 1, 0)
+
+
+def test_scanned_reports_how_many_ledgers_were_read(tmp_path):
+    mod = fresh_count()
+    _write_ledger(tmp_path / "social-cli-a" / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+    ])
+    _write_ledger(tmp_path / "social-cli-b" / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T02:00:00Z"},
+    ])
+    count, unreadable, scanned = _detailed_full(mod, tmp_path)
+    assert (count, unreadable, scanned) == (2, 0, 2)
+
+
+def test_main_json_exposes_scanned(tmp_path, capsys, monkeypatch):
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    _write_ledger(tmp_path / "social-cli-a" / "sent_ledger-bsky.yaml", [
+        {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+    ])
+    mod.main(["--platform", "bsky", "--since", "2026-06-28",
+              "--state-root", str(tmp_path), "--json"])
+    assert json.loads(capsys.readouterr().out)["scanned"] == 1
