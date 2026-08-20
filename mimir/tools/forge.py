@@ -525,10 +525,7 @@ def pr_diff(
 ) -> str:
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
-    diff = _call(lambda: _client(scope).get_diff(scope))
-    from ..forge.github import bound_diff
-
-    return bound_diff(diff)
+    return _call(lambda: _client(scope).get_diff(scope))
 
 
 @tool

@@ -370,17 +370,41 @@ def test_single_file_larger_than_whole_budget_returns_only_actionable_marker() -
     assert '"only-huge.txt"' in result
 
 
+def test_many_tiny_files_fit_a_bounded_marker_without_raising() -> None:
+    diff = "".join(
+        f"diff --git a/f{index} b/f{index}\n@@ -1 +1 @@\n-a\n+b\n"
+        for index in range(12_000)
+    )
+
+    result = bound_diff(diff)
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "[pr_diff truncated]" in result
+    assert "whole_diff_byte_limit" in result
+    assert "omitted_file_count:" in result
+    assert "additional paths not shown" in result
+
+
 def test_github_diff_over_generic_response_cap_uses_diff_truncation() -> None:
     diff = _file_diff("provider-huge.txt", github_module._MAX_RESPONSE_BYTES + 1)
-    client = GitHubForgeClient(session=Session([
-        Response(diff, content_type="text/plain"),
-    ]))
+    session = Session([Response(diff, content_type="text/plain")])
+    client = GitHubForgeClient(session=session)
 
     result = client.get_diff(_scope())
 
     assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
     assert "per_file_byte_limit" in result
     assert '"provider-huge.txt"' in result
+    assert session.calls[0][2]["timeout"] == client._timeout
+
+
+def test_github_diff_fetch_keeps_a_finite_input_ceiling() -> None:
+    client = GitHubForgeClient(session=Session([
+        Response("x" * (github_module._MAX_DIFF_FETCH_BYTES + 1), content_type="text/plain"),
+    ]))
+
+    with pytest.raises(ForgeResponseTooLarge, match="size limit"):
+        client.get_diff(_scope())
 
 
 def test_provider_errors_are_mapped_without_response_payload() -> None:

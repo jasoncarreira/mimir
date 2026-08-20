@@ -269,31 +269,6 @@ def test_read_uses_only_immutable_scope_target() -> None:
     assert client.calls == [("metadata", scope)]
 
 
-def test_pr_diff_bounds_an_oversized_diff_from_any_forge_client() -> None:
-    from mimir.forge.github import _MAX_DIFF_BYTES
-
-    client = FakeForge()
-    client.diff = (
-        "diff --git a/huge.txt b/huge.txt\n"
-        + "secret-content-that-must-not-reach-the-marker\n"
-        + "x" * _MAX_DIFF_BYTES
-    )
-    set_forge_client(client)
-    scope = _scope(RepoPRAction.INSPECT)
-
-    result = pr_diff.func(
-        repository="owner/repo", pull_request=17, runtime=_runtime(scope),
-    )
-
-    assert len(result.encode("utf-8")) <= _MAX_DIFF_BYTES
-    assert "[pr_diff truncated]" in result
-    assert "per_file_byte_limit" in result
-    assert "omitted_file_count: 1" in result
-    assert '"huge.txt"' in result
-    assert "secret-content-that-must-not-reach-the-marker" not in result
-    assert client.calls == [("diff", scope)]
-
-
 def test_review_scope_cannot_rerequest_review() -> None:
     client = FakeForge()
     set_forge_client(client)
