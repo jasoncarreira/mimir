@@ -295,22 +295,19 @@ def test_main_exits_zero_and_reports_no_damage_on_a_clean_ledger(
 # --------------------------------------------------------------------------
 
 
-def _detailed(mod, tmp_path):
-    """``(count, unreadable)`` — `scanned` is asserted separately below."""
-    count, unreadable, _scanned = mod.count_ledgers_detailed(
-        platform="bsky", action="post",
-        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[],
-    )
-    return count, unreadable
-
-
-def _detailed_full(mod, tmp_path):
+def _detailed_full(mod, tmp_path, state_dirs=None):
+    """The whole LedgerCount."""
     return mod.count_ledgers_detailed(
         platform="bsky", action="post",
         since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[],
+        state_root=tmp_path, state_dirs=state_dirs or [],
     )
+
+
+def _detailed(mod, tmp_path):
+    """``(count, unreadable)`` — the other fields are asserted separately."""
+    r = _detailed_full(mod, tmp_path)
+    return r.count, r.unreadable
 
 
 def _write_raw(tmp_path: Path, text: str) -> None:
@@ -429,12 +426,8 @@ def test_a_present_state_root_with_no_ledger_yet_is_not_damage(tmp_path):
 
 def test_an_explicitly_named_missing_state_dir_is_damage(tmp_path):
     mod = fresh_count()
-    count, unreadable, scanned = mod.count_ledgers_detailed(
-        platform="bsky", action="post",
-        since=mod._parse_dt("2026-06-28"), until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path, state_dirs=[tmp_path / "absent"],
-    )
-    assert (count, unreadable, scanned) == (0, 1, 0)
+    r = _detailed_full(mod, tmp_path, state_dirs=[tmp_path / "absent"])
+    assert (r.count, r.unreadable, r.scanned) == (0, 1, 0)
 
 
 def test_scanned_reports_how_many_ledgers_were_read(tmp_path):
@@ -445,8 +438,8 @@ def test_scanned_reports_how_many_ledgers_were_read(tmp_path):
     _write_ledger(tmp_path / "social-cli-b" / "sent_ledger-bsky.yaml", [
         {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T02:00:00Z"},
     ])
-    count, unreadable, scanned = _detailed_full(mod, tmp_path)
-    assert (count, unreadable, scanned) == (2, 0, 2)
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.unreadable, r.scanned) == (2, 0, 2)
 
 
 def test_main_json_exposes_scanned(tmp_path, capsys, monkeypatch):
@@ -458,3 +451,131 @@ def test_main_json_exposes_scanned(tmp_path, capsys, monkeypatch):
     mod.main(["--platform", "bsky", "--since", "2026-06-28",
               "--state-root", str(tmp_path), "--json"])
     assert json.loads(capsys.readouterr().out)["scanned"] == 1
+
+
+# --------------------------------------------------------------------------
+# Record-level interpretability.
+#
+# The distinction that bounds this: a record we *chose* not to count is a
+# normal skip, and flagging those would make every `like` look like damage. A
+# record we *could not read* is different — if the action, timestamp or
+# platform is missing or uninterpretable, it may have been today's post.
+# --------------------------------------------------------------------------
+
+
+def _one_record(tmp_path, record):
+    _write_ledger(tmp_path / "social-cli-notifications" / "sent_ledger-bsky.yaml", [record])
+
+
+def test_a_record_without_an_action_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 1)
+    assert r.is_floor
+
+
+def test_a_record_without_a_timestamp_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "bsky"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 1)
+
+
+def test_a_record_with_an_uninterpretable_timestamp_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "bsky", "timestamp": "not-a-date"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 1)
+
+
+def test_a_record_without_a_platform_is_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 1)
+
+
+def test_a_like_is_a_normal_skip_not_damage(tmp_path):
+    """Bounds the rule: filtering by action must not read as damage.
+
+    Without this, every non-post record in a real ledger — 3681 likes in the
+    deployed data — would make the count a floor and the guard would never
+    establish headroom again.
+    """
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "like", "platform": "bsky",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 0)
+    assert not r.is_floor
+
+
+def test_another_platform_is_a_normal_skip_not_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "mastodon",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 0)
+
+
+def test_a_timestamp_outside_the_window_is_a_normal_skip_not_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "bsky",
+                           "timestamp": "2020-01-01T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 0)
+
+
+def test_a_dry_run_is_a_normal_skip_not_damage(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": "bsky", "dryRun": True,
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (0, 0)
+
+
+def test_a_datetime_timestamp_is_interpretable(tmp_path):
+    """The production form. YAML parses an unquoted ISO timestamp to datetime.
+
+    Every deployed record arrives this way, so a validator that type-checked
+    for `str` would mark all 543 of them damaged and block posting outright.
+    """
+    import datetime as _dt
+
+    mod = fresh_count()
+    _one_record(tmp_path, {
+        "action": "post", "platform": "bsky",
+        "timestamp": _dt.datetime(2026, 6, 28, 1, 0, 0, tzinfo=_dt.timezone.utc),
+    })
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_the_platforms_list_form_is_interpretable(tmp_path):
+    """`_platform_matches` also accepts a `platforms` list or CSV."""
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": ["bsky", "mastodon"],
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_main_exits_nonzero_on_an_uninterpretable_record(tmp_path, capsys, monkeypatch):
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    _one_record(tmp_path, {"platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"})
+    rc = mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                   "--state-root", str(tmp_path), "--json"])
+    assert rc == mod.EXIT_LEDGER_UNREADABLE
+    assert json.loads(capsys.readouterr().out)["damagedRecords"] == 1
+
+
+def test_main_json_reports_state_dirs(tmp_path, capsys, monkeypatch):
+    mod = fresh_count()
+    monkeypatch.delenv("STATE_DIR", raising=False)
+    _one_record(tmp_path, {"action": "post", "platform": "bsky",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    mod.main(["--platform", "bsky", "--since", "2026-06-28",
+              "--state-root", str(tmp_path), "--json"])
+    assert json.loads(capsys.readouterr().out)["stateDirs"] == 1

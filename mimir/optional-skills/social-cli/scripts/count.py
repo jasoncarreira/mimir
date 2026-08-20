@@ -14,7 +14,7 @@ import os
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 POST_CREATING_ACTIONS = {"post", "reply", "thread"}
 
@@ -202,6 +202,57 @@ def _ledger_files(
     return files
 
 
+class LedgerCount(NamedTuple):
+    """What a ledger scan established, and how much of it is trustworthy.
+
+    ``count``            matching records found
+    ``unreadable``       sources that could not be read at all
+    ``scanned``          ledger files actually read
+    ``damaged_records``  records missing a field the count depends on
+    ``state_dirs``       ``social-cli-*`` directories found
+
+    ``count`` is only a complete answer when ``unreadable`` and
+    ``damaged_records`` are both zero. ``state_dirs`` separates "the poller
+    has run here and simply has nothing to report" from "we found no sign the
+    poller has ever run", which read identically in ``count`` alone.
+    """
+
+    count: int
+    unreadable: int
+    scanned: int
+    damaged_records: int
+    state_dirs: int
+
+    @property
+    def is_floor(self) -> bool:
+        """Whether ``count`` is a lower bound rather than a count."""
+        return bool(self.unreadable or self.damaged_records)
+
+
+def _record_is_interpretable(record: dict[str, Any]) -> bool:
+    """Whether a record carries the fields this count depends on.
+
+    A record we *chose* not to count is a normal skip: a like, another
+    platform, a timestamp outside the window. A record we *could not read* is
+    different — if we cannot tell what action it was, when it happened, or
+    which platform it went to, we cannot rule out that it was today's post,
+    and silently skipping it under-counts against the cap.
+
+    Note that a real ledger's ``timestamp`` arrives as a ``datetime``, not a
+    string: YAML parses an unquoted ISO timestamp natively. Validation goes
+    through ``_parse_dt``, which accepts both, rather than a type check that
+    would reject every deployed record.
+    """
+    action = record.get("action")
+    if not isinstance(action, str) or not action.strip():
+        return False
+    if _parse_dt(record.get("timestamp")) is None:
+        return False
+    if record.get("platform") is None and record.get("platforms") is None:
+        return False
+    return True
+
+
 def count_ledgers_detailed(
     *,
     platform: str,
@@ -210,28 +261,17 @@ def count_ledgers_detailed(
     until: datetime | None,
     state_root: Path,
     state_dirs: list[Path],
-) -> tuple[int, int, int]:
-    """Count matching ledger entries: ``(count, unreadable, scanned)``.
-
-    ``unreadable`` counts sources that could not be read — a ledger file that
-    would not load or parse, a ledger in no recognized shape, or a state
-    directory that does not exist. Any nonzero value makes ``count`` a floor
-    rather than a count, because the source we could not read may hold the
-    only record of a post. Callers enforcing a cap must treat that as an
-    unestablished count, not merely a smaller one.
-
-    ``scanned`` is how many ledger files were actually read, which lets a
-    caller notice that a configured location produced nothing at all.
-    """
+) -> LedgerCount:
+    """Scan the ledgers and report both the count and its trustworthiness."""
     count = 0
     unreadable = 0
     scanned = 0
+    damaged_records = 0
 
     # A source directory that does not exist is not an absence of posts, it is
     # an absence of evidence: we are looking in the wrong place. Counting zero
     # from a missing root reports full confidence in a number derived from
-    # nothing. A root that exists but holds no ledger yet is left alone — that
-    # is what a fresh install looks like before the poller first runs.
+    # nothing.
     for missing in (
         [d for d in state_dirs if not d.is_dir()]
         if state_dirs
@@ -240,12 +280,24 @@ def count_ledgers_detailed(
         _eprint(f"social-cli count: state directory does not exist: {missing}")
         unreadable += 1
 
+    if state_dirs:
+        found_dirs = [d for d in state_dirs if d.is_dir()]
+    else:
+        found_dirs = [p for p in state_root.glob("social-cli-*") if p.is_dir()] if state_root.is_dir() else []
+
     for path in _ledger_files(platform, state_root, state_dirs):
         scanned += 1
         data, damaged = _load_yaml(path)
         if damaged:
             unreadable += 1
         for record in _records(data):
+            if not _record_is_interpretable(record):
+                _eprint(
+                    f"social-cli count: unreadable record in {path}: "
+                    "missing or uninterpretable action/timestamp/platform"
+                )
+                damaged_records += 1
+                continue
             record_action = str(record.get("action") or "")
             if not _action_matches(record_action, action):
                 continue
@@ -259,7 +311,13 @@ def count_ledgers_detailed(
             if until is not None and ts >= until:
                 continue
             count += 1
-    return count, unreadable, scanned
+    return LedgerCount(
+        count=count,
+        unreadable=unreadable,
+        scanned=scanned,
+        damaged_records=damaged_records,
+        state_dirs=len(found_dirs),
+    )
 
 
 def count_ledgers(
@@ -277,15 +335,14 @@ def count_ledgers(
     should use :func:`count_ledgers_detailed`, which also reports whether
     any ledger was unreadable.
     """
-    count, _unreadable, _scanned = count_ledgers_detailed(
+    return count_ledgers_detailed(
         platform=platform,
         action=action,
         since=since,
         until=until,
         state_root=state_root,
         state_dirs=state_dirs,
-    )
-    return count
+    ).count
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -342,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
 
     state_root = (args.state_root or _default_state_root()).expanduser()
     state_dirs = [p.expanduser() for p in args.state_dir]
-    total, unreadable, scanned = count_ledgers_detailed(
+    result = count_ledgers_detailed(
         platform=args.platform,
         action=args.action,
         since=since,
@@ -350,11 +407,14 @@ def main(argv: list[str] | None = None) -> int:
         state_root=state_root,
         state_dirs=state_dirs,
     )
+    total = result.count
     if args.json:
         print(json.dumps({
             "count": total,
-            "unreadable": unreadable,
-            "scanned": scanned,
+            "unreadable": result.unreadable,
+            "scanned": result.scanned,
+            "damagedRecords": result.damaged_records,
+            "stateDirs": result.state_dirs,
             "platform": args.platform,
             "action": args.action,
             "since": since.isoformat(),
@@ -362,13 +422,14 @@ def main(argv: list[str] | None = None) -> int:
         }, separators=(",", ":")))
     else:
         print(total)
-    if unreadable:
+    if result.is_floor:
         # The count is a floor, so exit non-zero rather than let a caller
         # spend the difference as headroom. This is reported through the
         # status code as well as --json so that a consumer which reads only
         # stdout still cannot mistake a partial count for a complete one.
         _eprint(
-            f"social-cli count: {unreadable} source(s) unreadable; "
+            f"social-cli count: {result.unreadable} source(s) unreadable and "
+            f"{result.damaged_records} record(s) uninterpretable; "
             f"{total} is a floor, not a count"
         )
         return EXIT_LEDGER_UNREADABLE

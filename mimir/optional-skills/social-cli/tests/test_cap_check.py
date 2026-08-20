@@ -9,6 +9,7 @@ silently — it still exits 0 and prints a number, just a wrong one.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import subprocess
 import sys
@@ -115,17 +116,77 @@ def test_ledger_is_unavailable_when_the_delegate_prints_non_integer(monkeypatch,
     assert module.count_ledger(tmp_path, "2026-08-20") is None
 
 
+def _payload(**over):
+    """A well-formed count.py --json report, overridable per test."""
+    base = {"count": 0, "unreadable": 0, "scanned": 1,
+            "damagedRecords": 0, "stateDirs": 1}
+    base.update(over)
+    return json.dumps(base)
+
+
 def test_ledger_returns_the_delegate_count_on_success(monkeypatch, tmp_path):
     module = fresh_cap_check()
-    monkeypatch.setattr(subprocess, "run", _fake_run(stdout="3\n"))
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(count=3)))
     assert module.count_ledger(tmp_path, "2026-08-20") == 3
 
 
 def test_a_real_zero_from_the_delegate_is_still_zero(monkeypatch, tmp_path):
     """The fix must not turn a genuine zero into `unavailable`."""
     module = fresh_cap_check()
-    monkeypatch.setattr(subprocess, "run", _fake_run(stdout="0\n"))
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(count=0)))
     assert module.count_ledger(tmp_path, "2026-08-20") == 0
+
+
+def test_ledger_is_unavailable_when_no_state_directory_was_found(monkeypatch, tmp_path):
+    """A zero drawn from nowhere is not a zero.
+
+    No `social-cli-*` directory means no evidence the poller has ever run
+    here, so there is nothing behind the number.
+    """
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(stateDirs=0, scanned=0)))
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_an_initialised_state_dir_with_no_ledger_yet_is_a_real_zero(monkeypatch, tmp_path):
+    """A poller that has run and written nothing must not block the first post.
+
+    The framework creates the poller's state directory on first run, before
+    any dispatch, so this is genuinely "nothing sent yet" rather than
+    "looking in the wrong place". Failing closed here would deadlock: the
+    ledger only appears after a post, and the post needs the guard to pass.
+    """
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(scanned=0, stateDirs=1)))
+    assert module.count_ledger(tmp_path, "2026-08-20") == 0
+
+
+def test_ledger_is_unavailable_when_the_report_admits_damage(monkeypatch, tmp_path):
+    """Belt and braces: damage in the payload, even with a clean exit code."""
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(count=2, unreadable=1)))
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_ledger_is_unavailable_when_records_were_uninterpretable(monkeypatch, tmp_path):
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout=_payload(count=2, damagedRecords=1)))
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_ledger_is_unavailable_when_the_report_omits_state_dirs(monkeypatch, tmp_path):
+    """An older count.py cannot report this, so it must fail closed."""
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(
+        stdout=json.dumps({"count": 3, "unreadable": 0, "scanned": 1})))
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
+
+
+def test_ledger_is_unavailable_when_the_delegate_prints_a_bare_integer(monkeypatch, tmp_path):
+    """The plain-text path is no longer the contract; it carries no evidence."""
+    module = fresh_cap_check()
+    monkeypatch.setattr(subprocess, "run", _fake_run(stdout="3\n"))
+    assert module.count_ledger(tmp_path, "2026-08-20") is None
 
 
 # --------------------------------------------------------------------------

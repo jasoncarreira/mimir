@@ -180,6 +180,7 @@ def count_ledger(home: Path, today: str) -> int | None:
     reporting it as zero is what turned a deleted `count.py` into silent
     headroom against the daily cap.
     """
+    import json
     import subprocess
 
     count_script = Path(__file__).resolve().parent / "count.py"
@@ -191,6 +192,7 @@ def count_ledger(home: Path, today: str) -> int | None:
                 "--platform", "bsky",
                 "--action", "post",
                 "--since", today,
+                "--json",
             ],
             capture_output=True,
             text=True,
@@ -201,22 +203,57 @@ def count_ledger(home: Path, today: str) -> int | None:
         sys.stderr.write(f"cap_check: count.py invocation failed: {exc}\n")
         return None
     if result.returncode == COUNT_LEDGER_UNREADABLE:
-        # count.py counted what it could and told us the total is a floor,
-        # because at least one ledger would not parse. A floor cannot
-        # establish headroom, so this is unavailable rather than a count.
+        # count.py counted what it could and told us the total is a floor.
+        # A floor cannot establish headroom.
         sys.stderr.write(
-            f"cap_check: count.py reported unreadable ledger file(s): {result.stderr}"
+            f"cap_check: count.py reported unreadable ledger source(s): {result.stderr}"
         )
         return None
     if result.returncode != 0:
         sys.stderr.write(f"cap_check: count.py exited {result.returncode}: {result.stderr}\n")
         return None
+
     raw = result.stdout.strip()
     try:
-        return int(raw)
+        payload = json.loads(raw)
     except ValueError:
-        sys.stderr.write(f"cap_check: count.py printed non-integer output: {raw!r}\n")
+        sys.stderr.write(f"cap_check: count.py printed non-JSON output: {raw!r}\n")
         return None
+    if not isinstance(payload, dict):
+        sys.stderr.write(f"cap_check: count.py returned {type(payload).__name__}, not an object\n")
+        return None
+
+    # The status code should already have caught these; checking the structured
+    # fields too means a future change that reports damage without changing the
+    # exit code cannot quietly reopen the hole.
+    if payload.get("unreadable") or payload.get("damagedRecords"):
+        sys.stderr.write(
+            "cap_check: count.py reported damaged ledger data "
+            f"(unreadable={payload.get('unreadable')}, "
+            f"damagedRecords={payload.get('damagedRecords')})\n"
+        )
+        return None
+
+    # No `social-cli-*` state directory means we found no sign the poller has
+    # ever run here, so a zero is drawn from nothing. This is deliberately not
+    # the same as a directory that exists with no ledger in it yet: the poller
+    # framework creates its state directory on first run, independent of any
+    # dispatch, so that is a genuine initialised-empty state. Failing closed on
+    # it instead would deadlock the first post ever sent, since the ledger only
+    # appears after a dispatch. An absent field is treated as zero, which fails
+    # closed against an older count.py that cannot report this.
+    if not payload.get("stateDirs"):
+        sys.stderr.write(
+            "cap_check: no social-cli state directory found; no evidence the "
+            "poller has run, so today's count cannot be established\n"
+        )
+        return None
+
+    count = payload.get("count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        sys.stderr.write(f"cap_check: count.py reported a non-integer count: {count!r}\n")
+        return None
+    return count
 
 
 LEDGER_UNAVAILABLE = 3
