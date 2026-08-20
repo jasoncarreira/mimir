@@ -55,6 +55,12 @@ from mimir.server import (
 def test_server_startup_routes_factory_recovery_to_run_epic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The expected argv below is the DEFAULT run_bin. server.py resolves it as
+    # shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir"), and the live
+    # deployment sets WORKLINK_RUN_BIN="uv run mimir", so without pinning it here
+    # this test asserts ambient state it does not own: green in CI, red in every
+    # Worklink sandbox that inherits the container env.
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
     import mimir.worklink.control as control
     import mimir.worklink.factory_state as factory_state
 

@@ -796,6 +796,9 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
     ticks: int | None,
     expected: list[int],
 ) -> None:
+    # Pin run_bin: server.py reads WORKLINK_RUN_BIN and the deployment sets it to
+    # "uv run mimir", which would prepend ["uv", "run"] to the asserted argv.
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
     from mimir import server
 
     _factory_restart_record(tmp_path, status=status, ticks=ticks)

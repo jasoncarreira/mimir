@@ -21,6 +21,7 @@ New in chainlink #866:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -171,6 +172,7 @@ class ToolFlowDirection(StrEnum):
 
 _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "send_message": SinkCategory.SAME_CHANNEL,
+    "operator_alert": SinkCategory.NOTIFICATION,
     "react": SinkCategory.SAME_CHANNEL,
     # Harness-owned egress paths bypass model tool middleware, so they are
     # named explicitly and checked at their final send/edit boundary.
@@ -273,6 +275,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "bash_jobs_list": ToolFlowDirection.SOURCE,
     "bash_job_output": ToolFlowDirection.SOURCE,
     "send_message": ToolFlowDirection.SINK,
+    "operator_alert": ToolFlowDirection.SINK,
     "react": ToolFlowDirection.SINK,
     "fetch_channel_history": ToolFlowDirection.SOURCE,
     "list_channels": ToolFlowDirection.SOURCE,
@@ -748,10 +751,7 @@ def build_trigger_service_principal(
             *((Path(home) / "scratch",) if is_github_activity and home else ()),
         )
     ))
-    operations = tuple(dict.fromkeys(
-        "send_message" if capability == "operator_alert" else capability
-        for capability in capabilities
-    ))
+    operations = tuple(dict.fromkeys(capabilities))
     readable_domains = {
         "poller_payload" if trigger == "poller"
         else "session" if trigger == "saga_session_end"
@@ -784,7 +784,9 @@ def build_trigger_service_principal(
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
     if "operator_alert" in capabilities:
-        policies.append(ServiceSinkPolicy("send_message", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"))
+        policies.append(ServiceSinkPolicy(
+            "operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL",
+        ))
     return ServicePrincipal(
         canonical=canonical,
         trigger=trigger,
@@ -4458,9 +4460,26 @@ def _target_matches_operator_alert(target: str, destination: str) -> bool:
 
 
 def _target_matches_approved_url(target: str, destination: str) -> bool:
-    """Match one exact URL from an operator-fixed URL or JSON list."""
+    """Match an exact or explicitly scoped operator-configured URL."""
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
-    return normalized is not None and normalized in _configured_exact_urls(destination)
+    if normalized is None:
+        return False
+    exact_urls, scopes = _configured_url_approvals(destination)
+    if normalized in exact_urls:
+        return True
+    parsed = urlsplit(normalized)
+    if (
+        "%" in parsed.path
+        or "\\" in parsed.path
+        or any(segment in {".", ".."} for segment in parsed.path.split("/"))
+    ):
+        return False
+    return any(
+        parsed.scheme == scope.scheme
+        and parsed.netloc == scope.netloc
+        and parsed.path.startswith(scope.path_prefix)
+        for scope in scopes
+    )
 
 
 _GITHUB_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -4509,18 +4528,41 @@ def _target_matches_github_pr_api(target: str, destination: str) -> bool:
     return (match[1].lower(), match[2].lower()) in _configured_github_repos(destination)
 
 
-def _configured_exact_urls(variable: str) -> frozenset[str]:
-    """Read one exact URL or a JSON array of exact URLs from an environment variable."""
+@dataclass(frozen=True)
+class _ApprovedURLScope:
+    scheme: str
+    netloc: str
+    path_prefix: str
+
+
+def _url_approval_host_is_bounded(hostname: str | None) -> bool:
+    """Reject empty and public-suffix-shaped hosts while retaining IP literals."""
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.rstrip(".").split(".")
+        return len(labels) >= 2 and all(labels)
+    return True
+
+
+def _configured_url_approvals(
+    variable: str,
+) -> tuple[frozenset[str], frozenset[_ApprovedURLScope]]:
+    """Read exact URLs and explicit ``/*`` URL scopes from operator config."""
     configured = os.environ.get(variable, "").strip()
     if not configured:
-        return frozenset()
+        return frozenset(), frozenset()
     if configured.startswith("["):
         try:
             parsed = json.loads(configured)
         except json.JSONDecodeError:
-            return frozenset()
+            log.warning("%s contains malformed JSON; no URLs will be approved", variable)
+            return frozenset(), frozenset()
         if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-            return frozenset()
+            log.warning("%s must be a URL or a JSON array of URLs; no URLs will be approved", variable)
+            return frozenset(), frozenset()
         items = parsed
     else:
         if "," in configured:
@@ -4532,11 +4574,40 @@ def _configured_exact_urls(variable: str) -> frozenset[str]:
         items = [configured]
 
     urls: set[str] = set()
+    scopes: set[_ApprovedURLScope] = set()
     for item in items:
-        normalized = normalize_sink_destination(SinkCategory.NETWORK, item.strip())
-        if normalized is not None:
-            urls.add(normalized)
-    return frozenset(urls)
+        value = item.strip()
+        if value.endswith("/*"):
+            normalized = normalize_sink_destination(SinkCategory.NETWORK, value[:-1])
+            parsed_scope = urlsplit(normalized) if normalized is not None else None
+            if (
+                parsed_scope is None
+                or parsed_scope.query
+                or not _url_approval_host_is_bounded(parsed_scope.hostname)
+                or "%" in parsed_scope.path
+                or "\\" in parsed_scope.path
+                or any(segment in {".", ".."} for segment in parsed_scope.path.split("/"))
+            ):
+                log.warning("%s rejects malformed or overly broad URL scope %r", variable, item)
+                continue
+            scopes.add(_ApprovedURLScope(
+                scheme=parsed_scope.scheme,
+                netloc=parsed_scope.netloc,
+                path_prefix=parsed_scope.path,
+            ))
+            continue
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, value)
+        normalized_host = urlsplit(normalized).hostname if normalized is not None else None
+        if normalized is None or not _url_approval_host_is_bounded(normalized_host):
+            log.warning("%s rejects malformed URL approval %r", variable, item)
+            continue
+        urls.add(normalized)
+    return frozenset(urls), frozenset(scopes)
+
+
+def _configured_exact_urls(variable: str) -> frozenset[str]:
+    """Return only exact URLs, excluding explicitly host-scoped entries."""
+    return _configured_url_approvals(variable)[0]
 
 
 def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
@@ -4588,7 +4659,10 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
     if normalized is None:
         return False
-    if normalized in approved_fetch_urls(auth_context):
+    if (
+        normalized in approved_fetch_urls(auth_context)
+        or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
+    ):
         return True
     if _target_matches_configured_github_repo_fetch(target):
         return True
@@ -5069,6 +5143,11 @@ class SinkGate:
                 enforcement_enabled=enforce,
                 is_shadow_decision=not enforce,
                 would_block=True,
+                refusal_detail=(
+                    "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                    if tool_name == "operator_alert"
+                    else None
+                ),
             )
 
         # Activity-panel payloads are constrained at their producer to fixed
@@ -5191,7 +5270,7 @@ class SinkGate:
             )
         if tool_name in {"webhook", "http_request"} and (
             normalized_target is None
-            or normalized_target not in _configured_exact_urls("MIMIR_EGRESS_APPROVED_URLS")
+            or not _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
         ):
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -5363,8 +5442,19 @@ class SinkGate:
                     is_shadow_decision=not enforce,
                     would_block=True,
                     resolved_sink_target=resolved_target,
-                    refusal_detail=repo_review_state_refusal or _service_shell_refusal_detail(
-                        target, service_policy, review_state,
+                    refusal_detail=(
+                        repo_review_state_refusal
+                        or _service_shell_refusal_detail(
+                            target, service_policy, review_state,
+                        )
+                        or (
+                            "MIMIR_OPERATOR_ALERT_CHANNEL is not configured"
+                            if tool_name == "operator_alert"
+                            and not os.environ.get(
+                                "MIMIR_OPERATOR_ALERT_CHANNEL", "",
+                            ).strip()
+                            else None
+                        )
                     ),
                     repo_pr_action_scope=scope,
                 )
@@ -6189,6 +6279,7 @@ class OperationCatalog:
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
         "issue_comment",
+        "operator_alert",
         "approve_declassification",
         "list_channels",
         "list_schedules",
@@ -7418,6 +7509,26 @@ class ToolRegistry:
                     )
                 return write_auth
             if tool_name in READ_RESOURCE_OPERATIONS:
+                target_in_active_lease = False
+                if (
+                    auth_context is not None
+                    and service_principal is not None
+                    and service_principal.authority_profile == "github"
+                ):
+                    requested_read_target = requested_read_target_from_arguments(
+                        tool_name, arguments,
+                    )
+                    if isinstance(requested_read_target, str):
+                        read_review_state, _read_state_refusal = (
+                            resolve_repository_review_state(
+                                auth_context, path=requested_read_target,
+                            )
+                        )
+                        target_in_active_lease = (
+                            _target_within_active_pr_checkout_lease(
+                                requested_read_target, read_review_state,
+                            )
+                        )
                 if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
                     allowed = True
                 elif (
@@ -7473,6 +7584,7 @@ class ToolRegistry:
                         auth_context is not None
                         and read_target_from_arguments(tool_name, arguments) is not None
                     )
+                allowed = allowed or target_in_active_lease
                 required_tier = AccessTier.USER if allowed else AccessTier.ADMIN
                 if not allowed:
                     reason = "read_scope"
@@ -8279,6 +8391,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "saga_forget": "saga",
     "memory_store": "saga",
     "send_message": "message",
+    "operator_alert": "notification",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
     "react": "message",

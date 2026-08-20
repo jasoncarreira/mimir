@@ -642,10 +642,7 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     ), enforce=True, ifc_labels=InformationFlowLabels())
     registry = ToolRegistry()
 
-    assert service.capabilities == tuple(dict.fromkeys(
-        "send_message" if capability == "operator_alert" else capability
-        for capability in declared_capabilities
-    ))
+    assert service.capabilities == tuple(dict.fromkeys(declared_capabilities))
     from mimir.read_policy import framework_large_tool_results_root
 
     assert service.filesystem_read_roots == (
@@ -960,8 +957,8 @@ def test_instance_root_and_operator_alert_are_exact(
     assert not SinkGate.check_sink_flow("write_file", str(other), labels, auth, enforce=True).allowed
 
     monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "slack-alerts")
-    assert SinkGate.check_sink_flow("send_message", "slack-alerts", labels, auth, enforce=True).allowed
-    assert not SinkGate.check_sink_flow("send_message", "slack-other", labels, auth, enforce=True).allowed
+    assert SinkGate.check_sink_flow("operator_alert", "slack-alerts", labels, auth, enforce=True).allowed
+    assert not SinkGate.check_sink_flow("operator_alert", "slack-other", labels, auth, enforce=True).allowed
 
 
 def test_poller_authority_is_stable_across_shell_continuation(tmp_path: Path) -> None:

@@ -28,6 +28,7 @@ from mimir.models import (
     RepoPRAction, RepoPRActionScope,
     RepoPRScopeRegistry,
     RepoReviewState,
+    ServerDiscoveredPRStates,
 )
 from mimir.identities import IdentityResolver
 from mimir.tools.forge import (
@@ -44,6 +45,7 @@ from mimir.tools.forge import (
     pr_review_requests,
     pr_reviews,
     pr_submit_review,
+    resolve_review_state_for_context,
     set_forge_client,
     unsupported_operation,
 )
@@ -294,6 +296,164 @@ def test_batched_turn_resolves_each_exact_existing_scope() -> None:
     pr_metadata.func(repository="owner/repo", pull_request=18, runtime=runtime)
 
     assert [call[1] for call in client.calls] == [first, second]
+
+
+def test_service_registry_miss_names_requested_and_bounded_in_scope_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    runtime = _runtime_for_scopes(*(
+        _scope(RepoPRAction.INSPECT, number=number)
+        for number in range(1, 8)
+    ))
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(runtime.context, "owner/repo", 99)
+
+    assert str(refused.value) == (
+        'pull-request operation rejected: requested repository="owner/repo", '
+        'pull_request=99 is outside this turn\'s scope; in-scope targets: '
+        'repository="owner/repo", pull_request=1; repository="owner/repo", '
+        'pull_request=2; repository="owner/repo", pull_request=3; '
+        'repository="owner/repo", pull_request=4; repository="owner/repo", '
+        'pull_request=5; [5 of 7 shown; 2 more]'
+    )
+
+
+def test_service_cache_miss_names_cached_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    cache = ServerDiscoveredPRStates()
+    cache.remember(RepoReviewState(_scope(RepoPRAction.INSPECT, number=1)))
+    context = AuthContext(
+        principal="service:poller", canonical_principal="poller", roles=("service",),
+        event_ingress=None, trigger="poller", channel_id="poller:forge",
+        interactivity=None, is_service=True, server_discovered_pr_states=cache,
+    )
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(context, "owner/repo", 2)
+
+    assert 'repository="owner/repo", pull_request=2 is outside' in str(refused.value)
+    assert 'repository="owner/repo", pull_request=1' in str(refused.value)
+
+
+def test_empty_service_scope_keeps_live_discovery_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    context = AuthContext(
+        principal="service:poller", canonical_principal="poller", roles=("service",),
+        event_ingress=None, trigger="poller", channel_id="poller:forge",
+        interactivity=None, is_service=True,
+        repo_pr_scope_registry=RepoPRScopeRegistry(()),
+    )
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(context, "owner/repo", 2)
+
+    assert str(refused.value) == (
+        "pull-request operation rejected: live scope discovery requires an "
+        "authenticated operator user turn"
+    )
+
+
+@pytest.mark.parametrize(
+    ("repository", "pull_request"),
+    [(None, 2), ("owner/repo", True), ("owner/repo", 0)],
+)
+def test_scope_miss_keeps_malformed_selector_refusal(
+    repository: object,
+    pull_request: object,
+) -> None:
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _runtime(_scope(RepoPRAction.INSPECT, number=1)).context,
+            repository,  # type: ignore[arg-type]
+            pull_request,  # type: ignore[arg-type]
+        )
+
+    assert str(refused.value) == (
+        "pull-request operation rejected: repository must be text and pull_request "
+        "must be a positive integer; for example, repository='owner/repo', pull_request=17"
+    )
+
+
+def test_operator_registry_miss_still_discovers_live_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda _repo: access_control.RepoBindingResolution(
+            ("/server/configured/repo", "git@github.com:owner/repo.git"),
+            ("/server/configured/repo",), 1,
+        ),
+    )
+    state = RepoReviewState(_scope(RepoPRAction.INSPECT, number=1))
+    context = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("admin",),
+        event_ingress=None, trigger="user_message", channel_id="operator",
+        interactivity=None, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+
+    resolved = resolve_review_state_for_context(context, "owner/repo", 2)
+
+    assert resolved.pr_number == 2
+    assert client.calls == [("snapshot", "owner/repo", 2)]
+
+
+def test_scope_refusal_escapes_hostile_requested_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(access_control, "is_configured_github_repo", lambda _repo: True)
+    hostile = "owner/repo\nforged-event=true"
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _runtime(_scope(RepoPRAction.INSPECT, number=1)).context,
+            hostile,
+            2,
+        )
+
+    assert hostile not in str(refused.value)
+    assert "owner/repo\\nforged-event=true" in str(refused.value)
+    assert "\n" not in str(refused.value)
+
+
+def test_unsupported_operation_registry_miss_uses_scope_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+
+    with pytest.raises(ToolException) as refused:
+        unsupported_operation.func(
+            repository="owner/repo", pull_request=2,
+            description="Resolve a review thread",
+            runtime=_runtime(_scope(RepoPRAction.INSPECT, number=1)),
+        )
+
+    assert "outside this turn's scope" in str(refused.value)
+    assert 'repository="owner/repo", pull_request=1' in str(refused.value)
+
+
+def test_unconfigured_repository_precedes_nonempty_scope_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+
+    with pytest.raises(ToolException) as refused:
+        resolve_review_state_for_context(
+            _runtime(_scope(RepoPRAction.INSPECT, number=1)).context,
+            "attacker/other",
+            2,
+        )
+
+    assert str(refused.value) == (
+        "pull-request operation rejected: repository is not configured in GITHUB_REPOS"
+    )
 
 
 def test_forge_refusal_names_unconfigured_repository() -> None:

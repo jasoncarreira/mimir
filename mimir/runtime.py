@@ -582,6 +582,7 @@ def _install_runtime_globals(bundle: AgentRuntimeBundle) -> None:
     tools.set_index_generator(bundle.indexes)
     tools.set_turns_log_path(bundle.config.turns_log)
     tools.set_channel_registry(bundle.adapters.channels)
+    tools.set_operator_alert_dependencies(bundle.adapters.channels, bundle.config)
     tools.set_identity_resolver(bundle.core.identity_resolver)
     tools.set_dispatcher(bundle.adapters.dispatcher)
     tools.set_scheduler(bundle.adapters.scheduler)
@@ -619,6 +620,7 @@ def _clear_runtime_globals() -> None:
         lambda: tools.set_index_generator(None),
         lambda: tools.set_turns_log_path(None),
         lambda: tools.set_channel_registry(None),
+        lambda: tools.set_operator_alert_dependencies(None, None),
         lambda: tools.set_identity_resolver(None),
         lambda: tools.set_dispatcher(None),
         lambda: tools.set_scheduler(None),
