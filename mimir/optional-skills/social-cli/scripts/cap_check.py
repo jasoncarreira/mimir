@@ -37,7 +37,10 @@ Exit codes:
   3 — the ledger could not be read, so no cap headroom was established;
       treat as "do not post until this is fixed", not as zero posts
   4 — an archive file could not be read, so the archive count is a floor
-      rather than a count; headroom is likewise unestablished
+      rather than a count; headroom is likewise unestablished. Recover the
+      file rather than deleting it: deleting it makes the next run report a
+      confident count that omits whatever it recorded, which is the same
+      laundering this exit code exists to prevent.
 
 Why this lives as a separate script instead of an option on
 `count.py`: the upstream skill rule is "do not maintain a separate
@@ -207,7 +210,9 @@ def main() -> int:
             return LEDGER_UNAVAILABLE
         sys.stderr.write(
             f"cap_check: {archive_unreadable} archive file(s) unreadable — cap "
-            "headroom NOT established; repair or remove them before posting\n"
+            "headroom NOT established. Recover their contents; do NOT delete "
+            "them, which would discard the dispatches they record and restore "
+            "a count that omits them.\n"
         )
         return ARCHIVE_UNREADABLE
 

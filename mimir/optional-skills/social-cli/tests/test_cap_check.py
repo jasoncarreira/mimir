@@ -171,3 +171,20 @@ def test_an_unparseable_archive_file_is_reported(tmp_path) -> None:
     d.mkdir(parents=True)
     (d / _TODAY).write_text("{[ not: valid: yaml", encoding="utf-8")
     assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_the_unreadable_archive_remedy_does_not_prescribe_deletion(
+    monkeypatch, capsys
+) -> None:
+    """The message is the actionable surface, so its advice has to be safe.
+
+    Deleting an unreadable archive makes the next run forget the dispatches it
+    recorded and report a confident count that omits them — the same laundering
+    the exit code exists to prevent.
+    """
+    module = fresh_cap_check()
+    _patch(monkeypatch, module, archive=0, unreadable=1, ledger=0)
+    module.main()
+    err = capsys.readouterr().err
+    assert "do NOT delete" in err
+    assert "remove them" not in err
