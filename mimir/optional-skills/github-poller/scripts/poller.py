@@ -765,6 +765,30 @@ def _review_requested(pr: dict, me: str) -> bool:
     )
 
 
+def _pr_scope_fields(pr: dict, repo: str) -> dict[str, object]:
+    """The PR head/base snapshot the framework needs to issue a PR scope.
+
+    Without every one of these fields mimir/access_control.py refuses to issue
+    a RepoPRActionScope, so the agent cannot review, comment on, or check out
+    the PR it was woken for -- and the refusal it sees names the live-discovery
+    operator gate rather than the missing snapshot.
+
+    ``head_remote`` distinguishes a same-repo branch from a fork. Remediation
+    scopes additionally require "origin", so a same-repo PR must report it.
+    """
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    head_repo = ((head.get("repo") or {}).get("full_name") or "")
+    return {
+        "head_repo": head_repo or None,
+        "head_remote": "origin" if head_repo.lower() == repo.lower() else "source",
+        "head_ref": head.get("ref"),
+        "head_sha": head.get("sha"),
+        "base_ref": base.get("ref"),
+        "base_sha": base.get("sha"),
+    }
+
+
 def _emit_pr_synchronize(
     repo: str,
     number: int,
@@ -775,6 +799,7 @@ def _emit_pr_synchronize(
     token: str,
     reviewer: str,
     *,
+    pr: dict | None = None,
     related_comment: str = "",
 ) -> bool:
     compare = _gh_api(
@@ -818,8 +843,11 @@ def _emit_pr_synchronize(
         url=url,
         previous_head=previous_head,
         new_head=current_head,
-        head_sha=current_head,
         author=push_author,
+        **(
+            _pr_scope_fields(pr, repo) if pr is not None
+            else {"head_sha": current_head}
+        ),
         related_comment=related_comment,
     )
 
@@ -941,7 +969,7 @@ def _check_prs(
             number=number,
             url=url,
             author=author,
-            head_sha=(pr.get("head") or {}).get("sha"),
+            **_pr_scope_fields(pr, repo),
             related_comment=review_context.get(str(number), ""),
         )
         if emitted:
@@ -1247,6 +1275,7 @@ def _check_pr_pushes(
                         current_sha,
                         token,
                         me,
+                        pr=pr,
                         related_comment=review_context.get(key, ""),
                     )
                     if emitted:
@@ -2452,7 +2481,7 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
             state = (review.get("state") or "").upper()
             if state == "PENDING":
                 continue
-            author = review.get("user", {}).get("login", "unknown")
+            reviewer_login = review.get("user", {}).get("login", "unknown")
             body = _truncate(review.get("body") or "")
             url = review.get("html_url", "")
             pr_title = pr.get("title", "")
@@ -2463,15 +2492,23 @@ def _check_pr_reviews(repo: str, since: str, token: str, me: str) -> int:
                 "DISMISSED": "dismissed review on",
             }.get(state, f"reviewed ({state})")
             prompt = (
-                f"@{author} {state_label} PR #{pr_number} "
+                f"@{reviewer_login} {state_label} PR #{pr_number} "
                 f"({pr_title}) on {repo}"
             )
             if body:
                 prompt += f"\n{body}"
             prompt += f"\n{url}"
+            # ``author`` carries the PR's author, not the reviewer, matching
+            # the pr_review_requested pass. The framework reads it as the scope
+            # principal: a CHANGES_REQUESTED review on a PR this agent authored
+            # is what grants remediation authority (write/commit/push), and
+            # naming the reviewer here left the agent able to read the review
+            # but not to act on it.
             _emit(prompt, event_type="pr_review",
                   repo=repo, number=pr_number, url=url, state=state,
-                  author=author)
+                  author=(pr.get("user") or {}).get("login"),
+                  reviewer=reviewer_login,
+                  **_pr_scope_fields(pr, repo))
             count += 1
     return count
 
