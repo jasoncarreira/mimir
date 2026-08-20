@@ -43,6 +43,7 @@ from .evidence import (
 from .planning import (
     missing_leaf_template_parts,
     render_decompose_prompt,
+    target_branch_from_description,
     uses_strict_leaf_validation,
 )
 from .run_state import (
@@ -202,6 +203,10 @@ class ChainlinkIssueReader:
 def validate_leaf(issue: IssueContext) -> None:
     if "worklink:epic" in issue.labels:
         return
+    try:
+        target_branch_from_description(issue.description)
+    except ValueError as exc:
+        raise LeafValidationError(str(exc)) from exc
     missing = missing_leaf_template_parts(issue.description)
     if not missing:
         return
@@ -349,9 +354,11 @@ class WorklinkRunner:
             else config.defaults.test_command
         )
         template_path = _template_path(self.home)
-        # Per-run override beats worklink.yaml, which beats the built-in "main".
+        # An explicit operator override wins; otherwise the leaf can select its
+        # integration branch ahead of repository/deployment defaults.
         base = (
             base_branch
+            or target_branch_from_description(issue.description)
             or (repository_config.base_branch if repository_config is not None else None)
             or config.defaults.base_branch
         )
@@ -1919,6 +1926,7 @@ async def _verify_factory_completion(
         tests=None,
         pr_url=status.pr_url if status is not None else None,
         status="failed",
+        base_ref=record.base_ref,
         diff_observed=False,
     )
     try:

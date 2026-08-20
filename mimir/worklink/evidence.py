@@ -48,6 +48,7 @@ class WorklinkEvidence:
     tests: TestResult | None
     pr_url: str | None
     status: str
+    base_ref: str = "main"
     model: str | None = None
     failure_reason: str | None = None
     blocked_reason: str | None = None
@@ -343,6 +344,7 @@ async def _observe_evidence_from_ref(
         tests=tests,
         pr_url=pr_url,
         status=_common_status(backend_status),
+        base_ref=work_spec.base_ref if work_spec is not None else base_ref,
         model=model,
         failure_reason=failure_reason,
         blocked_reason=blocked_reason,

@@ -26,6 +26,10 @@ _REQUIRED_SECTIONS = (
     "- Suggested test command:",
 )
 
+_TARGET_BRANCH_BULLET = re.compile(
+    r"(?im)^- Target branch:[ \t]*(.*?)[ \t]*$",
+)
+
 # Slice 2 tightened the executor/planner contract. Earlier Chainlink issues were
 # not authored with the Worklink-notes sections, so strict refusal would orphan
 # already queued leaves. New issues are strict; pre-contract issues are
@@ -52,6 +56,53 @@ def missing_leaf_template_parts(description: str) -> list[str]:
     if not re.search(r"(?m)^- \[[ xX]\] ", description):
         missing.append("acceptance checklist item")
     return missing
+
+
+def target_branch_from_description(description: str) -> str | None:
+    """Return the optional target branch declared in the Worklink notes."""
+
+    section = re.search(r"(?im)^Worklink notes:\s*$", description)
+    if section is None:
+        return None
+    notes = description[section.end():]
+    following_section = re.search(r"(?m)^[A-Za-z][^\n]*:\s*$", notes)
+    if following_section is not None:
+        notes = notes[:following_section.start()]
+
+    matches = _TARGET_BRANCH_BULLET.findall(notes)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("Worklink notes contain multiple Target branch bullets")
+
+    branch = matches[0].strip()
+    if not _plausible_branch_name(branch):
+        raise ValueError(f"invalid Worklink target branch: {branch!r}")
+    return branch
+
+
+def _plausible_branch_name(branch: str) -> bool:
+    """Apply Git branch-name constraints before the value reaches Git or gh."""
+
+    if (
+        not branch
+        or len(branch.encode("utf-8")) > 255
+        or branch.startswith(("-", "/", "refs/", "origin/"))
+        or branch.endswith(("/", "."))
+        or branch == "@"
+        or "//" in branch
+        or ".." in branch
+        or "@{" in branch
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in branch)
+        or any(char in "~^:?*[\\" for char in branch)
+    ):
+        return False
+    return all(
+        part
+        and not part.startswith(".")
+        and not part.endswith(".lock")
+        for part in branch.split("/")
+    )
 
 
 def uses_strict_leaf_validation(created_at: datetime | None) -> bool:
