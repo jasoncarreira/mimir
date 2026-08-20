@@ -675,3 +675,47 @@ def test_known_non_post_actions_stay_normal_skips(tmp_path):
                                "timestamp": "2026-06-28T01:00:00Z"})
         r = _detailed_full(mod, tmp_path)
         assert (r.count, r.damaged_records) == (0, 0), action
+
+
+def test_a_padded_action_is_counted_not_silently_skipped(tmp_path):
+    """`_record_is_interpretable` strips, so matching must strip too."""
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": " post ", "platform": "bsky",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_a_padded_platform_is_counted_not_silently_skipped(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platform": " bsky ",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_a_padded_platforms_list_entry_is_counted(tmp_path):
+    mod = fresh_count()
+    _one_record(tmp_path, {"action": "post", "platforms": [" bsky "],
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_a_quote_is_post_creating(tmp_path):
+    """Unattested upstream, but a quote creates a post, so it consumes cap.
+
+    It also has to agree with the archive side, which counted `quote` before
+    this set became canonical.
+    """
+    mod = fresh_count()
+    assert "quote" in mod.POST_CREATING_ACTIONS
+    _one_record(tmp_path, {"action": "quote", "platform": "bsky",
+                           "timestamp": "2026-06-28T01:00:00Z"})
+    r = _detailed_full(mod, tmp_path)
+    assert (r.count, r.damaged_records) == (1, 0)
+
+
+def test_a_padded_requested_action_still_matches(tmp_path):
+    mod = fresh_count()
+    assert mod._action_matches(" like ", " like ")

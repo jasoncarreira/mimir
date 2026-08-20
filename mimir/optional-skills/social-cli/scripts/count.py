@@ -16,7 +16,18 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
 
-POST_CREATING_ACTIONS = {"post", "reply", "thread"}
+# The canonical post-creating set: actions that produce a post and therefore
+# consume the daily cap. cap_check.py takes this set from here rather than
+# keeping its own copy, because the archive counting a verb the ledger does not
+# would make the two sources disagree about the same dispatch.
+#
+# `quote` is unattested in deployed data — zero occurrences across 543 ledger
+# records, whose key set contains no quote field, and zero across 4688 archive
+# payloads. It is included because a quote creates a post, so if the verb ever
+# does appear, counting it against the cap is the correct direction. If upstream
+# instead represents a quote post as `post` with a quote reference, the action is
+# `post` and this set already covers it.
+POST_CREATING_ACTIONS = {"post", "reply", "thread", "quote"}
 
 # Actions the ledger is known to record: the post-creating set plus the
 # non-post verbs seen in deployed ledgers and archives. An action outside this
@@ -171,21 +182,29 @@ def _is_true(value: Any) -> bool:
 
 
 def _platform_matches(record: dict[str, Any], platform: str) -> bool:
+    # Normalization has to match _platform_value_is_interpretable, which tests
+    # the stripped value. Comparing raw here would declare a padded value
+    # interpretable and then fail to match it, which reads as another
+    # platform's traffic rather than as a record we could not classify.
     direct = record.get("platform")
     if direct is not None:
-        return str(direct) == platform
+        return str(direct).strip() == platform
     platforms = record.get("platforms")
     if isinstance(platforms, list):
-        return platform in {str(p) for p in platforms}
+        return platform in {str(p).strip() for p in platforms}
     if isinstance(platforms, str):
         return platform in {p.strip() for p in platforms.split(",")}
     return False
 
 
 def _action_matches(record_action: str, requested: str) -> bool:
+    # Stripped for the same reason as _platform_matches: validation accepts the
+    # stripped action, so matching must use the same form or a padded value is
+    # called interpretable and then silently not counted.
+    action = record_action.strip()
     if requested in {"post", "posts", "post-create", "post-creating"}:
-        return record_action in POST_CREATING_ACTIONS
-    return record_action == requested
+        return action in POST_CREATING_ACTIONS
+    return action == requested.strip()
 
 
 EXIT_LEDGER_UNREADABLE = 3

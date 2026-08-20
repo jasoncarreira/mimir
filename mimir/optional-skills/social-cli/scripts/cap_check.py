@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Cross-source Bluesky post-cap check (archive + ledger).
 
+This is an advisory integrity and counting guard, not an enforcement boundary.
+Both sources it reads — the ledger and the outbox archive — live under the
+agent home on a bind mount where the agent's own uid can write, delete and
+create files, so a determined writer can remove the very evidence the count is
+derived from. What this script does provide is that an *accidentally* damaged,
+unreadable or missing source is reported as an unestablished count rather than
+silently as zero, which is the failure that actually occurs. Treating its
+output as a hard limit would overstate what it can know; real enforcement would
+need the evidence held outside the agent's write scope.
+
 The primary cap check is `count.py` — it walks `sent_ledger-*.yaml`
 files across `social-cli-*` poller state dirs and counts post-creating
 actions for the UTC window. `count.py` is ledger-only because that's
@@ -66,10 +76,35 @@ except ImportError:
     sys.exit(1)
 
 CAP = 5  # post-class actions per UTC day, per core/70-bluesky-guidelines.md
-# Mirrors count.py's EXIT_LEDGER_UNREADABLE: the count it printed is a floor
-# because at least one ledger file could not be parsed.
-COUNT_LEDGER_UNREADABLE = 3
-POST_CLASS_ACTIONS = {"post", "reply", "thread", "quote"}
+
+
+def _count_module() -> Any:
+    """Load count.py so its vocabulary and status codes have one definition.
+
+    These were previously copied here, which is how the two sources came to
+    disagree about whether a quote is post-creating: the archive counted it and
+    the ledger did not, so the same dispatch would land on only one side of the
+    cross-check. count.py is already a hard dependency — this script executes
+    it — so importing it is no new coupling, and failing loudly at import beats
+    a copy that silently drifts.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "count.py"
+    spec = importlib.util.spec_from_file_location("_social_cli_count", path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load the ledger counter beside this script: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_COUNT = _count_module()
+
+# One canonical post-creating vocabulary and one status code, both owned by
+# count.py.
+POST_CLASS_ACTIONS = frozenset(_COUNT.POST_CREATING_ACTIONS)
+COUNT_LEDGER_UNREADABLE = _COUNT.EXIT_LEDGER_UNREADABLE
 
 
 def _home() -> Path:
@@ -157,7 +192,11 @@ def count_archive(home: Path, today: str) -> tuple[int, int]:
         # An empty file parses to None, which is a real "no dispatch here".
         actions = data.get("dispatch", []) if isinstance(data, dict) else (data or [])
         for entry in actions:
-            for verb, payload in entry.items():
+            for raw_verb, payload in entry.items():
+                # Stripped to match count.py's ledger-side normalization, so a
+                # padded verb cannot be counted on one source and missed on the
+                # other.
+                verb = str(raw_verb).strip()
                 if verb in POST_CLASS_ACTIONS and not (
                     isinstance(payload, dict) and payload.get("dryRun")
                 ):

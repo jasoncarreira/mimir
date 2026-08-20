@@ -599,3 +599,37 @@ def test_main_fails_closed_on_a_structurally_invalid_archive(monkeypatch, capsys
     assert "effective=unknown" in out
     assert "effective=0" not in out
     assert "archive_unreadable=1" in out
+
+
+# --------------------------------------------------------------------------
+# One vocabulary across both sources, and consistent normalization.
+#
+# The two scripts each kept their own post-class set, which is how they came to
+# disagree about `quote`: the archive counted it, the ledger did not, so the
+# same dispatch would land on one side of the cross-check only. Validation also
+# stripped values that matching then compared raw, so a padded action or verb
+# was declared interpretable and silently not counted.
+# --------------------------------------------------------------------------
+
+
+def test_the_post_class_vocabulary_comes_from_the_ledger_counter(tmp_path):
+    module = fresh_cap_check()
+    assert set(module.POST_CLASS_ACTIONS) == set(module._COUNT.POST_CREATING_ACTIONS)
+
+
+def test_the_unreadable_status_comes_from_the_ledger_counter(tmp_path):
+    module = fresh_cap_check()
+    assert module.COUNT_LEDGER_UNREADABLE == module._COUNT.EXIT_LEDGER_UNREADABLE
+
+
+def test_a_quote_counts_as_a_post_in_the_archive(tmp_path):
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{"quote": {"text": "a"}}]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (1, 0)
+
+
+def test_a_padded_archive_verb_is_still_counted(tmp_path):
+    """Declared interpretable, so it must not then be silently skipped."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{" post ": {"text": "a"}}]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (1, 0)
