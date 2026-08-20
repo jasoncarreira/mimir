@@ -44,6 +44,8 @@ class _ModuleScopeImportVisitor(ast.NodeVisitor):
     def __init__(self, modules: set[str]) -> None:
         self.modules = modules
         self.imports: list[tuple[int, str]] = []
+        self.importlib_aliases: set[str] = set()
+        self.import_module_aliases: set[str] = set()
 
     def _record(self, name: str, lineno: int) -> None:
         module = name.partition(".")[0]
@@ -53,17 +55,31 @@ class _ModuleScopeImportVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._record(alias.name, node.lineno)
+            if alias.name == "importlib":
+                self.importlib_aliases.add(alias.asname or alias.name)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.level == 0 and node.module:
             self._record(node.module, node.lineno)
+            if node.module == "importlib":
+                self.import_module_aliases.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name == "import_module"
+                )
 
     def visit_Call(self, node: ast.Call) -> None:
-        if (
+        is_import_module_call = (
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "importlib"
+            and node.func.value.id in self.importlib_aliases
             and node.func.attr == "import_module"
+        ) or (
+            isinstance(node.func, ast.Name)
+            and node.func.id in self.import_module_aliases
+        )
+        if (
+            is_import_module_call
             and node.args
             and isinstance(node.args[0], ast.Constant)
             and isinstance(node.args[0].value, str)
@@ -190,6 +206,8 @@ def _write_shared_script_fixture(root: Path, test_source: str) -> None:
         "import poller\n",
         "from poller import main\n",
         'import importlib\npoller = importlib.import_module("poller")\n',
+        'from importlib import import_module\npoller = import_module("poller")\n',
+        'import importlib as il\npoller = il.import_module("poller")\n',
     ],
 )
 def test_shared_script_import_guard_rejects_collision(
