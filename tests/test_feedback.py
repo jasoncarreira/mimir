@@ -3395,6 +3395,52 @@ def test_v0_react_rejects_any_present_owner_principal(
     assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
 
 
+@pytest.mark.parametrize("event_version", [None, "", "v2", 1])
+def test_owner_absent_reaction_rejects_explicit_non_v0_or_v1_versions(
+    tmp_path: Path,
+    event_version: object,
+) -> None:
+    """Only an absent version can select the otherwise-valid v0 reaction row."""
+    resolver = _FeedbackResolver({"alice": "alice", "discord-123": "alice"})
+    record = {
+        "timestamp": _ts(0.1),
+        "type": "react_received",
+        "event_version": event_version,
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": "discord-123",
+        "emoji": "thumbsup",
+        "polarity": "positive",
+    }
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = resolver
+
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+    # The bridge shape and owner absence are valid, so rejection precedes
+    # ownership resolution and is solely the explicit version value.
+    assert resolver.identity_calls == []
+
+
+def test_versionless_reaction_with_unsupported_kind_is_not_v0_eligible(
+    tmp_path: Path,
+) -> None:
+    resolver = _FeedbackResolver({"alice": "alice", "discord-123": "alice"})
+    record = {
+        "timestamp": _ts(0.1),
+        "type": "reaction_added",
+        "bridge": "discord",
+        "channel_id": "source-channel",
+        "author": "discord-123",
+        "emoji": "thumbsup",
+        "polarity": "positive",
+    }
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = resolver
+
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+    assert resolver.identity_calls == []
+
+
 def test_v1_reaction_owner_is_rederived_from_raw_author(tmp_path: Path) -> None:
     resolver = _FeedbackResolver({
         "bob": "bob",
@@ -3460,6 +3506,50 @@ def test_v1_reaction_shape_and_version_matrix_fails_closed(
     log.identity_resolver = resolver
 
     assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+
+@pytest.mark.parametrize(
+    ("event_type", "include_version", "event_version", "expected_identity_calls"),
+    [
+        ("commitment_due", False, None, ["owner-alias"]),
+        ("commitment_due", True, None, []),
+        ("commitment_due", True, "", []),
+        ("commitment_due", True, "v2", []),
+        ("commitment_due", True, 1, []),
+        ("commitment_created", True, "v1", []),
+    ],
+    ids=["absent", "null", "empty", "unknown", "non-string", "unsupported-kind"],
+)
+def test_commitment_feedback_version_and_kind_matrix_fails_closed(
+    tmp_path: Path,
+    event_type: str,
+    include_version: bool,
+    event_version: object,
+    expected_identity_calls: list[str],
+) -> None:
+    """All fields except the finite version/kind discriminator are eligible."""
+    resolver = _FeedbackResolver({"alice": "alice", "owner-alias": "alice"})
+    record = {
+        "timestamp": _ts(0.1),
+        "type": event_type,
+        "channel_id": "source-channel",
+        "owner_principal": "owner-alias",
+        "ownership_provenance": "extraction_acl",
+        "commitment_id": "c-closed-version-kind",
+        "text": "CLOSED-MATRIX-SENTINEL",
+        "snooze_count": 4,
+        "threshold": 3,
+    }
+    if include_version:
+        record["event_version"] = event_version
+    log = _make_log(tmp_path, events=[record])
+    log.identity_resolver = resolver
+
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+    # No malformed owner/provenance can explain rejection. Versionless
+    # commitments resolve their otherwise-valid owner before rejecting their
+    # v0 shape; every explicit unsupported discriminator rejects earlier.
+    assert resolver.identity_calls == expected_identity_calls
 
 
 @pytest.mark.parametrize(
