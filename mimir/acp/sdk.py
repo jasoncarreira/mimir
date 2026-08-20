@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -992,6 +992,7 @@ async def run_stdio_agent(
     *,
     request_reader: asyncio.StreamReader,
     response_writer: asyncio.StreamWriter,
+    on_close_abandoned: Callable[[asyncio.Task[None]], None] | None = None,
 ) -> None:
     holder: dict[str, AcpPeer] = {}
     base_router = build_agent_router(agent, use_unstable_protocol=False)
@@ -1047,11 +1048,18 @@ async def run_stdio_agent(
                 # Bounded a second time on purpose. A close that also swallows
                 # cancellation must not pin the runner either, so the worst case
                 # is two intervals and the runner still resolves inside the
-                # daemon's cancel window. The daemon aborts the transport after
-                # that, which is what actually forces the socket down.
+                # daemon's cancel window.
                 await asyncio.wait(
                     {close_task}, timeout=ACP_CLOSE_CANCEL_TIMEOUT,
                 )
+                if not close_task.done() and on_close_abandoned is not None:
+                    # Bounding the wait is not the same as retiring the
+                    # generation. Returning here frees the daemon's admission
+                    # slot -- it is released from the runner task's done
+                    # callback -- while this close is still running, so the
+                    # caller has to know the generation is unretired or it will
+                    # admit a replacement alongside live old work.
+                    on_close_abandoned(close_task)
             raise
     except BaseException as exc:
         close_failure = exc

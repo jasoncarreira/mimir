@@ -724,6 +724,17 @@ def _resistant_close(
     return close
 
 
+class _StubAgent:
+    def on_connect(self, peer: object) -> int:
+        return 1
+
+
+def _eof_reader() -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    return reader
+
+
 async def _spawn_stdio_runner(writer: object) -> asyncio.Task[None]:
     import mimir.acp.sdk as sdk
 
@@ -832,3 +843,91 @@ async def test_resistant_close_still_lets_the_daemon_retire_the_generation(
         release.set()
         await asyncio.wait({runner, *captured}, timeout=2.0)
         shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_second_peer_is_refused_while_an_old_close_is_still_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admission fence must outlast the runner, not just the wait.
+
+    Bounding ``run_stdio_agent``'s wait for the shielded close lets the runner
+    return while that close is still live -- and the runner's done callback is
+    what decrements ``_admitted``. So the bound alone would *free* the slot for
+    a replacement peer while old-generation work continues, which is the
+    overlap ``ACP_MAX_PEERS = 1`` exists to prevent.
+
+    Drives a real second admission, which is the only way to show the fence
+    holds; asserting on counters alone would not.
+    """
+    import mimir.acp.sdk as sdk
+
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    daemon._uid = os.getuid()
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    captured: list[asyncio.Task[None]] = []
+    monkeypatch.setattr(
+        sdk.Connection, "close", _resistant_close(entered, release, captured)
+    )
+    monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 0.01)
+
+    first_writer = _Writer()
+    runner = asyncio.create_task(
+        sdk.run_stdio_agent(
+            _StubAgent(),
+            request_reader=_eof_reader(),
+            response_writer=first_writer,
+            on_close_abandoned=daemon._record_abandoned_close,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 1.0)
+        runner.cancel()
+        _, pending = await asyncio.wait({runner}, timeout=0.5)
+        assert not pending, "runner did not resolve within the bound"
+
+        # The close is still live, so the generation has not retired.
+        assert daemon._unretired_generations() == 1
+
+        second_writer = _Writer()
+        await daemon._admit_peer(asyncio.StreamReader(), second_writer)
+
+        assert daemon._admitted == 0, "a replacement peer was admitted"
+        assert not daemon._peers
+        assert b"error" in bytes(second_writer.data), (
+            "the second peer was neither admitted nor refused"
+        )
+        assert second_writer.closed
+    finally:
+        release.set()
+        await asyncio.wait({runner, *captured}, timeout=2.0)
+        shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_capacity_returns_once_the_old_close_terminates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close that does finish must not fence admission forever.
+
+    The fence prunes completed tasks, so a slow-but-terminating close costs a
+    refusal window rather than bricking admission until the process restarts.
+    """
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    release = asyncio.Event()
+
+    async def eventually() -> None:
+        await release.wait()
+
+    task = asyncio.create_task(eventually())
+    daemon._record_abandoned_close(task)
+    assert daemon._unretired_generations() == 1
+
+    release.set()
+    await task
+    assert daemon._unretired_generations() == 0
+    shutil.rmtree(home)

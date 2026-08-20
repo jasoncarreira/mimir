@@ -162,6 +162,7 @@ class AcpDaemon:
         self._connection_runners: set[asyncio.Task[None]] = set()
         self._runner_writers: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._admitted = 0
+        self._abandoned_closes: set[asyncio.Task[None]] = set()
         self._stopping = False
 
     async def start(self) -> None:
@@ -278,7 +279,7 @@ class AcpDaemon:
             except (TimeoutError, OSError):
                 writer.transport.abort()
             return
-        if self._admitted >= ACP_MAX_PEERS:
+        if self._admitted + self._unretired_generations() >= ACP_MAX_PEERS:
             payload = {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -322,7 +323,10 @@ class AcpDaemon:
         connection_agent = _ConnectionAgent(agent)
         runner = asyncio.create_task(
             run_stdio_agent(
-                connection_agent, request_reader=reader, response_writer=writer
+                connection_agent,
+                request_reader=reader,
+                response_writer=writer,
+                on_close_abandoned=self._record_abandoned_close,
             )
         )
         self._connection_runners.add(runner)
@@ -374,6 +378,37 @@ class AcpDaemon:
                 await asyncio.wait_for(writer.drain(), ACP_PEER_DRAIN_TIMEOUT)
             except TimeoutError as exc:
                 raise AcpDaemonError("authenticated ACP peer stopped draining") from exc
+
+    def _record_abandoned_close(self, task: asyncio.Task[None]) -> None:
+        """Note a generation whose close outlived its runner.
+
+        ``run_stdio_agent`` bounds how long it waits for the shielded close, so
+        it can return while that close is still running -- and returning frees
+        this daemon's admission slot, which is released from the runner task's
+        done callback. Recording the task lets ``_unretired_generations`` fence
+        admission until it terminates, and surfaces the condition so the
+        supervisor can recycle a peer that never finishes retiring.
+        """
+        self._abandoned_closes.add(task)
+        _LOGGER.error(
+            "ACP peer left an unretired close task; refusing new peers until it "
+            "terminates (ACP_MAX_PEERS=%d)",
+            ACP_MAX_PEERS,
+        )
+
+    def _unretired_generations(self) -> int:
+        """Old-generation closes still live after their runner returned.
+
+        Counted against capacity so a replacement peer cannot join a generation
+        that has not finished retiring. Completed tasks are pruned, so a close
+        that eventually terminates releases capacity on its own; one that never
+        does keeps admission refused, which is the safe direction when only one
+        peer may run at a time.
+        """
+        self._abandoned_closes = {
+            task for task in self._abandoned_closes if not task.done()
+        }
+        return len(self._abandoned_closes)
 
     async def _finish_runner(
         self,
