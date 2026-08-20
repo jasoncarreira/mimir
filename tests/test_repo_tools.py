@@ -2396,8 +2396,15 @@ def test_project_test_timeout_can_actually_run_this_repository_suite() -> None:
     whatever counts the author supplied.
 
     Pinned as a floor rather than an exact value so the bound can rise with the
-    suite, but cannot silently drop back under it. 700s is the observed ceiling
-    (597s) plus headroom; if the suite ever legitimately exceeds that, this test
-    is the place to notice.
+    suite, but cannot silently drop back under it.
+
+    The floor was 700s, chosen as the observed ceiling (597s) plus headroom,
+    with a note that this test was the place to notice if a run ever
+    legitimately exceeded it. One did: 1023s, with two worklink builds running
+    concurrently on the same host. The suite passed -- load stretches the run
+    rather than breaking it -- but every earlier measurement had been taken on
+    an idle machine, and the runner's normal condition is a busy one, because
+    the agent and its builds share a host. 1200s is the loaded measurement plus
+    headroom.
     """
-    assert _TIMEOUT_SECONDS >= 700.0
+    assert _TIMEOUT_SECONDS >= 1200.0

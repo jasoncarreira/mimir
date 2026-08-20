@@ -42,10 +42,21 @@ from .worklink.worker_client import StaleWorkerExecutorError
 #: requests reporting "the bounded runner timed out with empty output" and fell
 #: back to whatever counts the author supplied.
 #:
-#: 900s clears the observed ceiling with room for a slow or loaded runner, and
-#: sits between the two bounds CI already allows its own pytest jobs (600s and
-#: 1800s).
-_TIMEOUT_SECONDS = 900.0
+#: 900s was then chosen from those same measurements, and that was the wrong
+#: basis: every one of them was taken on an idle machine, while the runner's
+#: normal condition is a busy one. The agent and the worklink builds share a
+#: host, so the suite competes with whatever the factory is doing. Measured at
+#: 1023s with two concurrent builds running -- it passed, load stretches the
+#: run rather than breaking it, but 1023s is already past 900s, so the bound
+#: reintroduced the same arithmetic timeout under the load the runner actually
+#: sees.
+#:
+#: 1800s is sized against the loaded case instead, and matches the upper bound
+#: CI already allows its own pytest jobs. A generous bound fails safe here: too
+#: high merely delays a report that something is wrong, while too low silently
+#: denies the agent any full-suite evidence of its own, which is what happened
+#: through nine review rounds on #1594.
+_TIMEOUT_SECONDS = 1800.0
 _CAPTURE_BYTES = 64 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
