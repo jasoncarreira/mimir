@@ -181,8 +181,16 @@ The poller surfaces notifications. The agent responds:
    current UTC day. With an explicit `--since` date/datetime and no
    `--until`, the window is open-ended.
 
+   **Check the exit status, not just the number.** Exit 3 means at least
+   one ledger file could not be read or parsed, so the number printed is a
+   floor rather than a count — the skipped file may hold the only record of
+   a post. Treat that as "the count is unknown" and do not post until the
+   ledger is repaired; the stderr line names how many files were skipped.
+   Exit 0 means the count is complete.
+
    The default output is just the number, suitable for cron or an
-   agent guard. Add `--json` for compact machine-readable metadata:
+   agent guard. Add `--json` for compact machine-readable metadata
+   (including an `unreadable` count, so a caller need not read stderr):
    ```bash
    bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications count --platform bsky --action post --since today --json
    ```
