@@ -147,3 +147,27 @@ def test_archive_ignores_other_days(tmp_path) -> None:
     _write_archive(tmp_path, "2026-08-19T10-00-00-000Z_outbox-bsky.yaml",
                    {"dispatch": [{"post": {"text": "yesterday"}}]})
     assert module.count_archive(tmp_path, "2026-08-20") == (0, 0)
+
+
+def test_main_fails_closed_when_an_archive_file_is_unreadable(monkeypatch, capsys) -> None:
+    """The sibling of the ledger case: a file we could not read is not a zero.
+
+    The archive exists precisely because a ledger write can lag or be skipped,
+    so a readable ledger does not stand in for an archive that would not parse.
+    """
+    module = fresh_cap_check()
+    _patch(monkeypatch, module, archive=0, unreadable=1, ledger=0)
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert "effective=unknown" in out
+    assert "effective=0" not in out
+    assert "archive_unreadable=1" in out
+
+
+def test_an_unparseable_archive_file_is_reported(tmp_path) -> None:
+    module = fresh_cap_check()
+    d = tmp_path / "state" / "pollers" / "social-cli-bsky" / "outbox_archive"
+    d.mkdir(parents=True)
+    (d / _TODAY).write_text("{[ not: valid: yaml", encoding="utf-8")
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
