@@ -690,3 +690,44 @@ def test_main_fails_closed_on_a_typo_archive_verb(monkeypatch, capsys, tmp_path)
     assert rc == module.ARCHIVE_UNREADABLE
     assert "effective=unknown" in out
     assert "effective=0" not in out
+
+
+def test_an_empty_archive_action_entry_is_unreadable(tmp_path):
+    """`dispatch: [{}]` reaches the verb loop with no verb to classify.
+
+    A multi-key entry already fails closed, because every key is checked and a
+    non-verb key reads as unknown. The empty entry was the one shape that
+    produced no verb at all and so was never validated.
+    """
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{}]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (0, 1)
+
+
+def test_an_empty_entry_beside_a_real_one_is_still_flagged(tmp_path):
+    """It was previously dropped even when other entries counted."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{}, {"post": {"text": "a"}}]})
+    assert module.count_archive(tmp_path, "2026-08-20") == (1, 1)
+
+
+def test_a_verb_with_a_sibling_metadata_key_fails_closed(tmp_path):
+    """Pins the reason 'exactly one key' need not be encoded separately."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{"reply": {}, "meta": 1}]})
+    count, unreadable = module.count_archive(tmp_path, "2026-08-20")
+    assert unreadable == 1
+
+
+def test_main_fails_closed_on_an_empty_archive_entry(monkeypatch, capsys, tmp_path):
+    """End to end with no ledger row, per the review request."""
+    module = fresh_cap_check()
+    _write_archive(tmp_path, _TODAY, {"dispatch": [{}]})
+    monkeypatch.setattr(module, "_home", lambda: tmp_path)
+    monkeypatch.setattr(module, "count_ledger", lambda home, today: 0)
+    monkeypatch.setattr(module, "_today_str", lambda: "2026-08-20")
+    rc = module.main()
+    out = capsys.readouterr().out
+    assert rc == module.ARCHIVE_UNREADABLE
+    assert "effective=unknown" in out
+    assert "effective=0" not in out

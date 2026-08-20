@@ -193,6 +193,18 @@ def count_archive(home: Path, today: str) -> tuple[int, int]:
         # An empty file parses to None, which is a real "no dispatch here".
         actions = data.get("dispatch", []) if isinstance(data, dict) else (data or [])
         for entry in actions:
+            if not entry:
+                # An action entry with no verb describes nothing, so it cannot
+                # be classified — the ledger reaches the same conclusion about
+                # an empty record through _record_is_interpretable. Deployed
+                # archives carry exactly one verb key per entry, so an empty
+                # one is a malformed write, not a shape we should read as zero.
+                sys.stderr.write(
+                    f"cap_check: empty archive action entry in {base}; "
+                    "treating as unreadable\n"
+                )
+                unreadable += 1
+                continue
             for raw_verb, payload in entry.items():
                 # Stripped to match count.py's ledger-side normalization, so a
                 # padded verb cannot be counted on one source and missed on the
