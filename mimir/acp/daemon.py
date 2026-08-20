@@ -163,6 +163,7 @@ class AcpDaemon:
         self._runner_writers: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._admitted = 0
         self._abandoned_closes: set[asyncio.Task[None]] = set()
+        self._failed_retirements = 0
         self._stopping = False
 
     async def start(self) -> None:
@@ -397,18 +398,40 @@ class AcpDaemon:
         )
 
     def _unretired_generations(self) -> int:
-        """Old-generation closes still live after their runner returned.
+        """Generations that have not demonstrably finished retiring.
 
         Counted against capacity so a replacement peer cannot join a generation
-        that has not finished retiring. Completed tasks are pruned, so a close
-        that eventually terminates releases capacity on its own; one that never
-        does keeps admission refused, which is the safe direction when only one
-        peer may run at a time.
+        still holding old work. Finishing is not the same as retiring: a close
+        that completes *with an exception* tore down into an unknown state, so
+        releasing capacity on ``done()`` alone would admit a replacement on a
+        failed teardown and swallow the failure, because nothing retrieves the
+        task's result.
+
+        A close that returns, or that honours the cancellation, has stopped —
+        nothing of that generation is running, so capacity returns. One that
+        raises keeps the fence permanently and is surfaced once, leaving the
+        supervisor to recycle a daemon whose teardown cannot be trusted.
         """
-        self._abandoned_closes = {
-            task for task in self._abandoned_closes if not task.done()
-        }
-        return len(self._abandoned_closes)
+        live: set[asyncio.Task[None]] = set()
+        for task in self._abandoned_closes:
+            if not task.done():
+                live.add(task)
+                continue
+            if task.cancelled():
+                # It honoured the cancel: nothing of that generation is left
+                # running, so this is a clean retirement.
+                continue
+            failure = task.exception()
+            if failure is None:
+                continue
+            self._failed_retirements += 1
+            _LOGGER.error(
+                "ACP abandoned close failed to retire (%r); admission stays "
+                "closed until this daemon is recycled",
+                failure,
+            )
+        self._abandoned_closes = live
+        return len(live) + self._failed_retirements
 
     async def _finish_runner(
         self,

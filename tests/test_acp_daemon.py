@@ -931,3 +931,74 @@ async def test_capacity_returns_once_the_old_close_terminates(
     await task
     assert daemon._unretired_generations() == 0
     shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_close_that_fails_keeps_admission_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finishing is not retiring: a late failure must not return capacity.
+
+    An abandoned close can complete *with an exception* -- cleanup failing
+    after the runner already returned. Releasing capacity on ``done()`` alone
+    would admit a replacement on a teardown that did not succeed, and would
+    also swallow the failure, since nothing retrieves the task's result.
+    """
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    daemon._uid = os.getuid()
+    release = asyncio.Event()
+
+    async def fails_late() -> None:
+        await release.wait()
+        raise RuntimeError("teardown did not complete")
+
+    task = asyncio.create_task(fails_late())
+    daemon._record_abandoned_close(task)
+    assert daemon._unretired_generations() == 1
+
+    release.set()
+    await asyncio.wait({task}, timeout=1.0)
+    assert task.done()
+
+    # Still fenced: the close finished, but not cleanly.
+    assert daemon._unretired_generations() == 1
+    assert daemon._failed_retirements == 1
+
+    writer = _Writer()
+    await daemon._admit_peer(asyncio.StreamReader(), writer)
+    assert daemon._admitted == 0, "a replacement was admitted after failed retirement"
+    assert not daemon._peers
+    assert b"error" in bytes(writer.data)
+
+    # The failure was consumed, so it cannot resurface as a lost-exception warning.
+    assert isinstance(task.exception(), RuntimeError)
+    shutil.rmtree(home)
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_close_that_honours_cancellation_returns_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close that stops on cancel has retired: nothing is left running."""
+    home = _short_home()
+    daemon = AcpDaemon(_bundle(home))
+    started = asyncio.Event()
+
+    async def stops_on_cancel() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(stops_on_cancel())
+    await asyncio.wait_for(started.wait(), 1.0)
+    daemon._record_abandoned_close(task)
+    assert daemon._unretired_generations() == 1
+
+    task.cancel()
+    await asyncio.wait({task}, timeout=1.0)
+    assert task.cancelled()
+
+    assert daemon._unretired_generations() == 0
+    assert daemon._failed_retirements == 0
+    shutil.rmtree(home)
