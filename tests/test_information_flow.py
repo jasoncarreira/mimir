@@ -1131,6 +1131,33 @@ def test_file_write_integrity_records_through_symlinked_home(
     ) == {"memory/notes.md": "untrusted"}
 
 
+@pytest.mark.parametrize("symlinked_home", [False, True])
+def test_file_write_integrity_rejects_symlink_escape_from_configured_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlinked_home: bool,
+) -> None:
+    real_home = tmp_path / "real-home"
+    scratch = real_home / "scratch"
+    scratch.mkdir(parents=True)
+    configured_home = real_home
+    if symlinked_home:
+        configured_home = tmp_path / "linked-home"
+        configured_home.symlink_to(real_home, target_is_directory=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (scratch / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(configured_home))
+
+    assert record_file_write_integrity(
+        str(configured_home / "scratch" / "escape" / "notes.md"),
+        InformationFlowLabels(),
+    ) is False
+    assert record_file_write_integrity(
+        str(outside / "notes.md"), InformationFlowLabels(),
+    ) is True
+
+
 def test_file_write_fails_closed_when_integrity_metadata_is_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
