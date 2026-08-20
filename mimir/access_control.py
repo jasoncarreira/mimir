@@ -7772,9 +7772,22 @@ def record_file_write_integrity(
     requested = Path(resource_id)
     if requested.is_absolute():
         try:
-            requested.relative_to(home)
-            resource = requested
+            resolved_requested = requested.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        try:
+            resolved_requested.relative_to(home)
+            resource = resolved_requested
         except ValueError:
+            # A path lexically under the configured home but resolving outside
+            # it is a symlink escape, not an unrelated write to permit.
+            configured_home = Path(os.path.abspath(home_value))
+            try:
+                requested.relative_to(configured_home)
+            except ValueError:
+                pass
+            else:
+                return False
             # Must list every root the recording set below covers. The
             # backend runs virtual_mode rooted at the home, so a file tool
             # addresses these as "/docs/notes.md" rather than

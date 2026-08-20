@@ -1108,6 +1108,56 @@ def test_untrusted_model_write_cannot_launder_through_self_authored_state(
     ) == {"state/notes.md": "untrusted"}
 
 
+def test_file_write_integrity_records_through_symlinked_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(linked_home))
+    target = linked_home / "memory" / "notes.md"
+    tainted = InformationFlowLabels().with_source(SourceLabel(
+        principal="mallory", domain="channel", resource_id="github:pr:7",
+        bridge_instance="github", sensitivity="internal",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+
+    assert record_file_write_integrity(str(target), tainted) is True
+    assert json.loads(
+        (real_home / ".mimir" / "file-integrity.json").read_text(encoding="utf-8")
+    ) == {"memory/notes.md": "untrusted"}
+
+
+@pytest.mark.parametrize("symlinked_home", [False, True])
+def test_file_write_integrity_rejects_symlink_escape_from_configured_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlinked_home: bool,
+) -> None:
+    real_home = tmp_path / "real-home"
+    scratch = real_home / "scratch"
+    scratch.mkdir(parents=True)
+    configured_home = real_home
+    if symlinked_home:
+        configured_home = tmp_path / "linked-home"
+        configured_home.symlink_to(real_home, target_is_directory=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (scratch / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(configured_home))
+
+    assert record_file_write_integrity(
+        str(configured_home / "scratch" / "escape" / "notes.md"),
+        InformationFlowLabels(),
+    ) is False
+    assert record_file_write_integrity(
+        str(outside / "notes.md"), InformationFlowLabels(),
+    ) is True
+
+
 def test_file_write_fails_closed_when_integrity_metadata_is_invalid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
