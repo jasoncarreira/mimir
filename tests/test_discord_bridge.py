@@ -4,9 +4,10 @@ contract under a fake discord client (SPEC §7.2.1)."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -214,6 +215,107 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
     assert result.chunks == 3  # 2*limit + 100 → 3 chunks under the limit
     # All chunks landed on the right channel.
     assert all(item["channel_id"] == 1 for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_emits_v1_canonical_owner_from_strict_identity(
+    bridge_with_fake_client,
+    tmp_path: Path,
+) -> None:
+    bridge, _, _ = bridge_with_fake_client
+    resolver = SimpleNamespace(
+        identity=MagicMock(return_value=SimpleNamespace(canonical="alice")),
+        resolve=MagicMock(side_effect=AssertionError("resolve must not be called")),
+    )
+    bridge.identity_resolver = resolver
+    channel = bridge._client.get_channel(1)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(author=bridge._client.user)
+    )
+
+    await bridge._on_reaction(
+        SimpleNamespace(
+            user_id=123456789,
+            channel_id=1,
+            message_id=987654321,
+            emoji="👍",
+        )
+    )
+
+    record = json.loads((tmp_path / "logs" / "events.jsonl").read_text())
+    assert record["type"] == "react_received"
+    assert record["event_version"] == "v1"
+    assert record["bridge"] == "discord"
+    assert record["channel_id"] == "discord-1"
+    assert record["author"] == "discord-123456789"
+    assert record["owner_principal"] == "alice"
+    resolver.identity.assert_called_once_with("discord-123456789")
+    resolver.resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True], ids=["unknown", "raises"])
+async def test_on_reaction_emits_null_owner_when_strict_identity_is_unavailable(
+    bridge_with_fake_client,
+    tmp_path: Path,
+    raises: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_client
+    resolver = SimpleNamespace(
+        identity=MagicMock(
+            side_effect=RuntimeError("resolver unavailable") if raises else None,
+            return_value=None,
+        ),
+        resolve=MagicMock(side_effect=AssertionError("resolve must not be called")),
+    )
+    bridge.identity_resolver = resolver
+    channel = bridge._client.get_channel(1)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(author=bridge._client.user)
+    )
+
+    await bridge._on_reaction(
+        SimpleNamespace(
+            user_id=123456789,
+            channel_id=1,
+            message_id=987654321,
+            emoji="👍",
+        )
+    )
+
+    record = json.loads((tmp_path / "logs" / "events.jsonl").read_text())
+    assert record["event_version"] == "v1"
+    assert record["author"] == "discord-123456789"
+    assert record["owner_principal"] is None
+    resolver.identity.assert_called_once_with("discord-123456789")
+    resolver.resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_rejects_unvalidated_platform_user_id(
+    bridge_with_fake_client,
+    tmp_path: Path,
+) -> None:
+    bridge, _, _ = bridge_with_fake_client
+    resolver = SimpleNamespace(identity=MagicMock())
+    bridge.identity_resolver = resolver
+    channel = bridge._client.get_channel(1)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(author=bridge._client.user)
+    )
+
+    await bridge._on_reaction(
+        SimpleNamespace(
+            user_id="alice",
+            channel_id=1,
+            message_id=987654321,
+            emoji="👍",
+        )
+    )
+
+    events_path = tmp_path / "logs" / "events.jsonl"
+    assert not events_path.exists()
+    resolver.identity.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -1144,6 +1144,7 @@ def build_app(config: Config) -> web.Application:
                     enqueue=dispatcher.enqueue,
                     attachments_dir=attachments_inbound,
                     attachments_max_bytes=config.attachments_max_bytes,
+                    identity_resolver=core.identity_resolver,
                 )
             )
         except ImportError as exc:
@@ -1167,6 +1168,7 @@ def build_app(config: Config) -> web.Application:
                     enqueue=dispatcher.enqueue,
                     attachments_dir=attachments_inbound,
                     attachments_max_bytes=config.attachments_max_bytes,
+                    identity_resolver=core.identity_resolver,
                 )
             )
         except ImportError as exc:

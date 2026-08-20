@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ except ImportError as _exc:  # pragma: no cover - optional dep
     ) from _exc
 
 from ..background_tasks import spawn_background
+from ..identities import IdentityResolver
 from ..models import AgentEvent
 from ..redaction import redact_text
 from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
@@ -234,6 +236,9 @@ class SlackBridge(Bridge):
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
+    identity_resolver: IdentityResolver | None = field(
+        default=None, repr=False, kw_only=True
+    )
     _app: Any | None = field(default=None, init=False, repr=False)
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
@@ -1024,13 +1029,13 @@ class SlackBridge(Bridge):
           - reactions the bot itself didn't add (not own-tool feedback)
           - reactions on the bot's own messages (signal about us)
         """
-        from ..event_logger import log_event
+        from ..event_logger import FEEDBACK_EVENT_VERSION, log_event
         from ..reactions import classify_reaction, normalize_emoji
 
         user_id = event.get("user")
         if self._is_own_bot_actor(event):
             return
-        if user_id is None:
+        if not isinstance(user_id, str) or re.fullmatch(r"[UW][A-Z0-9]+", user_id) is None:
             return
 
         item = event.get("item") or {}
@@ -1058,15 +1063,27 @@ class SlackBridge(Bridge):
             except (ValueError, TypeError):
                 pass
 
+        author = f"slack-{user_id}"
+        owner_principal: str | None = None
+        if self.identity_resolver is not None:
+            try:
+                identity = self.identity_resolver.identity(author)
+                if identity is not None:
+                    owner_principal = identity.canonical
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
             await log_event(
                 "react_received",
+                event_version=FEEDBACK_EVENT_VERSION,
                 bridge=self.name,
                 channel_id=channel_id,
                 emoji=emoji_glyph,
                 polarity=polarity,
                 action="add",
-                author=f"slack-{user_id}",
+                author=author,
+                owner_principal=owner_principal,
                 target_message_id=target_ts,
                 target_age_minutes=target_age_minutes,
             )
