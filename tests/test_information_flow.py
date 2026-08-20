@@ -968,6 +968,49 @@ def test_seeded_reference_roots_are_trusted_informational(
 
 
 @pytest.mark.parametrize("root", ["docs", "prompts"])
+def test_virtual_path_write_to_a_reference_root_is_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root: str,
+) -> None:
+    """The write must be recorded when addressed the way file tools address it.
+
+    The backend runs ``virtual_mode`` rooted at the home, so a file tool targets
+    ``/docs/notes.md``, not ``<home>/docs/notes.md``. That absolute path is not
+    under the home, so ``record_file_write_integrity`` has to remap it before it
+    can reach the recording set -- and the remap listed only ``memory`` and
+    ``state``. A root trusted on read but recorded only for physical paths is
+    still a laundering path, because writes do not arrive in that shape.
+
+    Physical-path coverage cannot see this: it never exercises the remap.
+    """
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    physical = tmp_path / root / "notes.md"
+    physical.parent.mkdir(parents=True)
+    physical.write_text("attacker-derived instructions", encoding="utf-8")
+
+    tainted_source = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str((tmp_path / "attachments" / "page.html")),
+        bridge_instance="filesystem",
+    )
+    tainted = InformationFlowLabels(sources=(tainted_source,))
+    assert tainted.has_untrusted_active_ingest is True
+
+    # The virtual form, exactly as a file tool supplies it.
+    record_file_write_integrity(f"/{root}/notes.md", tainted)
+
+    reread = protected_result_source(
+        _auth(), principal="filesystem", domain="filesystem",
+        resource_id=str(physical.resolve()), bridge_instance="filesystem",
+    )
+    assert reread.integrity == "untrusted", (
+        f"a tainted write to the virtual /{root}/notes.md was not recorded, so "
+        "the trusted read default laundered it"
+    )
+
+
+@pytest.mark.parametrize("root", ["docs", "prompts"])
 def test_untrusted_model_write_cannot_launder_through_reference_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

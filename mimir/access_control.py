@@ -7775,7 +7775,15 @@ def record_file_write_integrity(
             requested.relative_to(home)
             resource = requested
         except ValueError:
-            if requested.parts[1:2] in {("memory",), ("state",)}:
+            # Must list every root the recording set below covers. The
+            # backend runs virtual_mode rooted at the home, so a file tool
+            # addresses these as "/docs/notes.md" rather than
+            # "<home>/docs/notes.md" -- a root recorded only for physical paths
+            # is not recorded for the shape writes actually arrive in, and the
+            # trusted read default then launders it.
+            if requested.parts[1:2] in {
+                ("docs",), ("memory",), ("prompts",), ("state",),
+            }:
                 resource = home / requested.as_posix().lstrip("/")
             else:
                 return True
