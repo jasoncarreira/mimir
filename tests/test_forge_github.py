@@ -10,6 +10,7 @@ from mimir.forge.github import (
     GitHubForgeClient,
     GitHubIdentityFailureKind,
     GitHubIdentityVerificationError,
+    bound_diff,
 )
 from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
@@ -318,6 +319,68 @@ def test_response_size_and_pagination_are_bounded() -> None:
     client = GitHubForgeClient(session=Session([Response(page) for _ in range(10)]))
     with pytest.raises(ForgeResponseTooLarge, match="page limit"):
         client.list_files(_scope())
+
+
+def _file_diff(path: str, body_bytes: int) -> str:
+    header = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+    return header + "+" + "x" * (body_bytes - len(header.encode("utf-8")) - 2) + "\n"
+
+
+def test_diff_under_cap_is_byte_identical() -> None:
+    diff = _file_diff("small.txt", 1_024)
+
+    assert bound_diff(diff).encode("utf-8") == diff.encode("utf-8")
+
+
+def test_diff_omits_one_file_over_cap_but_keeps_complete_sibling() -> None:
+    small = _file_diff("small.txt", 1_024)
+    huge = _file_diff("huge.txt", github_module._MAX_DIFF_BYTES + 1)
+
+    result = bound_diff(huge + small)
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert result.startswith(small)
+    assert "diff --git a/huge.txt" not in result
+    assert "per_file_byte_limit" in result
+    assert "whole_diff_byte_limit" not in result
+    assert "omitted_file_count: 1" in result
+    assert '"huge.txt"' in result
+
+
+def test_many_files_over_whole_diff_cap_stop_on_file_boundaries() -> None:
+    files = [_file_diff(f"file-{index}.txt", 200_000) for index in range(3)]
+
+    result = bound_diff("".join(files))
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert result.startswith(files[0] + files[1])
+    assert files[2] not in result
+    assert "whole_diff_byte_limit" in result
+    assert "omitted_file_count: 1" in result
+    assert '"file-2.txt"' in result
+
+
+def test_single_file_larger_than_whole_budget_returns_only_actionable_marker() -> None:
+    result = bound_diff(_file_diff("only-huge.txt", github_module._MAX_DIFF_BYTES + 1))
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "diff --git" not in result
+    assert "per_file_byte_limit" in result
+    assert "omitted_file_count: 1" in result
+    assert '"only-huge.txt"' in result
+
+
+def test_github_diff_over_generic_response_cap_uses_diff_truncation() -> None:
+    diff = _file_diff("provider-huge.txt", github_module._MAX_RESPONSE_BYTES + 1)
+    client = GitHubForgeClient(session=Session([
+        Response(diff, content_type="text/plain"),
+    ]))
+
+    result = client.get_diff(_scope())
+
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_BYTES
+    assert "per_file_byte_limit" in result
+    assert '"provider-huge.txt"' in result
 
 
 def test_provider_errors_are_mapped_without_response_payload() -> None:
