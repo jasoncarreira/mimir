@@ -779,12 +779,16 @@ async def test_resistant_close_does_not_pin_a_cancelled_runner(
     try:
         await asyncio.wait_for(entered.wait(), 1.0)
         runner.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(runner, 1.0)
-        assert runner.done()
+        # asyncio.wait rather than wait_for: it neither re-cancels nor raises on
+        # timeout, so an unbounded close shows up as a pending task and a clean
+        # assertion failure instead of hanging the suite. run_stdio_agent's
+        # outer ``except BaseException`` absorbs a second cancel, so wait_for
+        # could not force the runner down anyway.
+        _, pending = await asyncio.wait({runner}, timeout=0.5)
+        assert not pending, "cancelled runner did not resolve within the bound"
     finally:
         release.set()
-        await asyncio.gather(runner, *captured, return_exceptions=True)
+        await asyncio.wait({runner, *captured}, timeout=2.0)
 
 
 @pytest.mark.asyncio
@@ -810,14 +814,21 @@ async def test_resistant_close_still_lets_the_daemon_retire_the_generation(
     )
     monkeypatch.setattr("mimir.acp.sdk.ACP_CLOSE_CANCEL_TIMEOUT", 0.01)
 
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_CANCEL_TIMEOUT", 0.2)
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_ABORT_TIMEOUT", 0.2)
+
     writer = _Writer()
     runner = await _spawn_stdio_runner(writer)
     try:
         await asyncio.wait_for(entered.wait(), 1.0)
-        # No AcpDaemonError: the runner resolves inside the cancel window.
-        await asyncio.wait_for(daemon._finish_runner(runner, writer), 1.0)
+        # No AcpDaemonError: a self-bounding runner satisfies the cancel
+        # contract. An unbounded one makes _finish_runner abort and then raise.
+        finish = asyncio.create_task(daemon._finish_runner(runner, writer))
+        _, pending = await asyncio.wait({finish}, timeout=2.0)
+        assert not pending, "_finish_runner did not settle"
+        assert finish.exception() is None, f"daemon gave up: {finish.exception()!r}"
         assert runner.done()
     finally:
         release.set()
-        await asyncio.gather(runner, *captured, return_exceptions=True)
+        await asyncio.wait({runner, *captured}, timeout=2.0)
         shutil.rmtree(home)
