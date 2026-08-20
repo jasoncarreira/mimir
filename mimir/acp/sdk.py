@@ -1052,7 +1052,16 @@ async def run_stdio_agent(
                 await asyncio.wait(
                     {close_task}, timeout=ACP_CLOSE_CANCEL_TIMEOUT,
                 )
-                if not close_task.done() and on_close_abandoned is not None:
+                # ``done()`` is not the same as retired. If the forced cancel
+                # makes the close finish by RAISING during the wait above, the
+                # task is done but teardown failed -- and skipping the report
+                # here would both free the daemon's admission slot and leave
+                # that exception unretrieved. Report anything that did not stop
+                # cleanly; the daemon's retirement accounting classifies it.
+                retired_cleanly = close_task.done() and (
+                    close_task.cancelled() or close_task.exception() is None
+                )
+                if not retired_cleanly and on_close_abandoned is not None:
                     # Bounding the wait is not the same as retiring the
                     # generation. Returning here frees the daemon's admission
                     # slot -- it is released from the runner task's done
