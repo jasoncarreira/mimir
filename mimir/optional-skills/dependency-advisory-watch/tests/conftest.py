@@ -16,6 +16,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import scanner
 
 
+@pytest.fixture(autouse=True)
+def _local_scripts_first(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.syspath_prepend(str(_SCRIPTS_DIR))
+
+
 @pytest.fixture
 def tmp_root(tmp_path):
     """Create a temporary root directory for tests."""

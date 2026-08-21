@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import socket
 import select
+import shlex
 import signal
 import stat
 import struct
@@ -31,6 +32,7 @@ from mimir.pr_checkout_lease import (
     create_pr_checkout_lease,
 )
 from mimir.project_tests import (
+    _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     RepoProjectTests,
 )
@@ -1444,12 +1446,41 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert env["GIT_CONFIG_VALUE_0"] == "*"
     assert kwargs["stdout_limit"] == kwargs["stderr_limit"] == 64 * 1024
-    assert kwargs["timeout_s"] == 300.0
+    # Assert propagation, not the magnitude: the value is pinned as a floor
+    # by test_project_test_timeout_can_actually_run_this_repository_suite.
+    assert kwargs["timeout_s"] == _TIMEOUT_SECONDS
     assert result.git_context == (
         "contained Git context: runner=worklink uid=42002 gid=42003; "
         "checkout_owner=mimir uid=42001 gid=42003; global_config=/dev/null; "
         "system_config=disabled; safe.directory=*"
     )
+
+
+@pytest.mark.asyncio
+async def test_project_uv_uses_disposable_cache_and_preserves_uv_hardening(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run pytest -q")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    observed: dict[str, str] = {}
+
+    async def runner(_argv, _directory, env, _projections, **_kwargs):
+        observed.update(env)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok
+    assert observed["UV_NO_CONFIG"] == "1"
+    assert observed["UV_CACHE_DIR"] == f'{observed["XDG_CACHE_HOME"]}/uv'
+    assert "HOME" not in observed
 
 
 @pytest.mark.asyncio
@@ -1940,6 +1971,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     boundary = Path("/tmp") / f"mimir-repo-test-{uuid.uuid4()}"
     checkout_root = boundary / "repo-test-checkouts"
     home_root = boundary / "homes"
+    uv_cache = boundary / "uv-cache"
     controller_home = boundary / "controller-home"
     socket_path = boundary / "executor.sock"
     boundary.mkdir()
@@ -1950,6 +1982,10 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     home_root.mkdir(mode=0o710)
     home_root.chmod(0o710)
     os.chown(home_root, 0, 1002)
+    uv_cache.mkdir(mode=0o555)
+    cached_wheel = uv_cache / "cached-wheel"
+    cached_wheel.write_text("pre-populated", encoding="utf-8")
+    cached_wheel.chmod(0o444)
     controller_home.mkdir(mode=0o700)
     os.chown(controller_home, 1001, 1001)
     canary = controller_home / "repo-test-canary"
@@ -1959,7 +1995,25 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     config_home = boundary / "config"
     python_executable = shutil.which("python")
     assert python_executable is not None
-    _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
+    fake_uv = boundary / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'test "$(cat "$UV_CACHE_DIR/cached-wheel")" = pre-populated\n'
+        f"if touch {shlex.quote(str(uv_cache / 'cross-pr-write'))} 2>/dev/null; then exit 91; fi\n"
+        'printf downloaded > "$UV_CACHE_DIR/cache-miss"\n'
+        'echo "MIMIR_UV_CACHE=$UV_CACHE_DIR"\n'
+        f"exec {shlex.quote(python_executable)} -c "
+        + shlex.quote(
+            'namespace={}; exec(compile(open("conftest.py").read(), '
+            '"conftest.py", "exec"), namespace); '
+            'namespace["pytest_sessionstart"](None)'
+        )
+        + ' "$@"\n',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(config_home, f"{fake_uv} run pytest -q")
     for path in (config_home, *config_home.rglob("*"), lease, *lease.rglob("*")):
         os.chown(path, 1001, 1001, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
@@ -1985,12 +2039,14 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
         worker_exec.REPO_TEST_CHECKOUT_ROOT,
         worker_exec.HOME_ROOT,
+        worker_exec.REPO_TEST_UV_CACHE,
         contained_execution.WorkerClient,
     )
     contained_checkout.REPO_TEST_CHECKOUT_ROOT = checkout_root
     worklink_checkout._REPO_TEST_CHECKOUT_ROOT = checkout_root
     worker_exec.REPO_TEST_CHECKOUT_ROOT = checkout_root
     worker_exec.HOME_ROOT = home_root
+    worker_exec.REPO_TEST_UV_CACHE = uv_cache
     controller_pid = os.fork()
     if controller_pid == 0:
         os.close(result_read)
@@ -2137,6 +2193,13 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         assert Path(payload["home"]).parent == home_root
         assert payload["marker"] == "executed"
         assert payload["attacked"] is False
+        cache_line = next(
+            line.removeprefix("MIMIR_UV_CACHE=")
+            for line in positive["stdout"].splitlines()
+            if line.startswith("MIMIR_UV_CACHE=")
+        )
+        assert Path(cache_line).parent.parent == Path(payload["home"])
+        assert not (uv_cache / "cross-pr-write").exists()
         assert observed["positive_canary"] == "protected"
         assert not Path(payload["home"]).exists()
         assert not any(checkout_root.rglob("checkout"))
@@ -2165,6 +2228,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
             worker_exec.REPO_TEST_CHECKOUT_ROOT,
             worker_exec.HOME_ROOT,
+            worker_exec.REPO_TEST_UV_CACHE,
             contained_execution.WorkerClient,
         ) = previous_roots
         os.close(result_read)
@@ -2381,3 +2445,27 @@ def test_real_subprocess_runner_enforces_wall_time_and_capture_cap(mode: str) ->
     else:
         assert result.output_limited is True
         assert len(result.stdout.encode()) <= 64
+
+
+def test_project_test_timeout_can_actually_run_this_repository_suite() -> None:
+    """The bound has to exceed how long this repository's own suite takes.
+
+    At 300s it did not. Every measured full-suite run sat between 492s and
+    597s, so ``repo_test`` on the gate command timed out every time -- not
+    intermittently, arithmetically -- and the agent reviewed pull requests
+    reporting "the bounded runner timed out with empty output", falling back to
+    whatever counts the author supplied.
+
+    Pinned as a floor rather than an exact value so the bound can rise with the
+    suite, but cannot silently drop back under it.
+
+    The floor was 700s, chosen as the observed ceiling (597s) plus headroom,
+    with a note that this test was the place to notice if a run ever
+    legitimately exceeded it. One did: 1023s, with two worklink builds running
+    concurrently on the same host. The suite passed -- load stretches the run
+    rather than breaking it -- but every earlier measurement had been taken on
+    an idle machine, and the runner's normal condition is a busy one, because
+    the agent and its builds share a host. 1200s is the loaded measurement plus
+    headroom.
+    """
+    assert _TIMEOUT_SECONDS >= 1200.0

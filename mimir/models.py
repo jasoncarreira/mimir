@@ -1091,6 +1091,9 @@ class ServerDiscoveredPRStates:
     _remint_attempts: set[tuple[str, int]] = field(
         default_factory=set, init=False, repr=False,
     )
+    _refusals: dict[tuple[str, int], str] = field(
+        default_factory=dict, init=False, repr=False,
+    )
 
     @property
     def review_states(self) -> tuple[RepoReviewState, ...]:
@@ -1110,6 +1113,18 @@ class ServerDiscoveredPRStates:
         target = (state.repo.lower(), state.pr_number)
         with self._lock:
             return self._states.setdefault(target, state)
+
+    def refusal(self, repository: str, pull_request: int) -> str | None:
+        with self._lock:
+            return self._refusals.get((repository.lower(), pull_request))
+
+    def remember_refusal(
+        self, repository: str, pull_request: int, refusal: str,
+    ) -> str:
+        """Keep a deterministic scope failure from being retried this turn."""
+        target = (repository.lower(), pull_request)
+        with self._lock:
+            return self._refusals.setdefault(target, refusal)
 
     def begin_remint(self, repository: str, pull_request: int) -> bool:
         """Reserve the sole live-snapshot remediation re-mint for a turn."""
@@ -1135,6 +1150,53 @@ class ServerDiscoveredPRStates:
             if target not in self._remint_attempts:
                 raise ValueError("reminted review scope was not reserved")
             return self._states.setdefault(target, state)
+
+
+@dataclass
+class ServerDiscoveredPRScopeStore:
+    """Agent-owned immutable scope snapshots available to later turns."""
+
+    _scopes: dict[tuple[str, int], RepoPRActionScope] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def resolve(
+        self, repository: object, pull_request: object,
+    ) -> RepoPRActionScope | None:
+        if (
+            not isinstance(repository, str)
+            or not repository
+            or not isinstance(pull_request, int)
+            or isinstance(pull_request, bool)
+        ):
+            return None
+        with self._lock:
+            return self._scopes.get((repository.lower(), pull_request))
+
+    def remember_server_discovery(self, scope: RepoPRActionScope) -> None:
+        """Record authority minted by a trusted server discovery path only."""
+        if (
+            not isinstance(scope, RepoPRActionScope)
+            or scope.provenance != RepoPRScopeProvenance.SERVER_DISCOVERED
+        ):
+            raise ValueError("only server-discovered pull-request scopes can be stored")
+        target = (scope.canonical_repo, scope.pr_number)
+        with self._lock:
+            self._scopes[target] = scope
+
+    def discard(
+        self,
+        repository: str,
+        pull_request: int,
+        *,
+        expected_scope: RepoPRActionScope,
+    ) -> None:
+        """Discard only the stale snapshot the caller actually checked."""
+        target = (repository.lower(), pull_request)
+        with self._lock:
+            if self._scopes.get(target) is expected_scope:
+                self._scopes.pop(target, None)
 
 
 class _AuthContextAuthoritySlot:
@@ -1215,6 +1277,11 @@ class AuthContext(_AuthContextAuthoritySlot):
     # This cache is per turn and stores only immutable server-issued scopes.
     server_discovered_pr_states: ServerDiscoveredPRStates = field(
         default_factory=ServerDiscoveredPRStates, repr=False, compare=False,
+    )
+    # Agent-owned server provenance retained across turns. It contains only
+    # immutable scopes, never mutable checkout state, and is not model input.
+    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = field(
+        default=None, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does
     # not grant execution authority; it only attenuates durable output scope.

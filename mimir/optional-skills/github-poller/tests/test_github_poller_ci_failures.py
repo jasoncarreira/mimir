@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import poller
+from github_poller_test_support import poller
 import pytest
 
 

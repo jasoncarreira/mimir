@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-import poller
+from github_ci_test_support import poller
 
 
 def _run(run_id, conclusion="success", status="completed", workflow="CI"):

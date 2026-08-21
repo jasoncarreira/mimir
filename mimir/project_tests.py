@@ -34,7 +34,29 @@ from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
 
 
-_TIMEOUT_SECONDS = 300.0
+#: Wall-clock ceiling for one project-test invocation.
+#:
+#: 300s could not run this repository's own suite. Every measured full-suite run
+#: sits between 492s and 597s, so ``repo_test`` timed out on the gate command
+#: every time -- not intermittently, arithmetically. The agent reviewed pull
+#: requests reporting "the bounded runner timed out with empty output" and fell
+#: back to whatever counts the author supplied.
+#:
+#: 900s was then chosen from those same measurements, and that was the wrong
+#: basis: every one of them was taken on an idle machine, while the runner's
+#: normal condition is a busy one. The agent and the worklink builds share a
+#: host, so the suite competes with whatever the factory is doing. Measured at
+#: 1023s with two concurrent builds running -- it passed, load stretches the
+#: run rather than breaking it, but 1023s is already past 900s, so the bound
+#: reintroduced the same arithmetic timeout under the load the runner actually
+#: sees.
+#:
+#: 1800s is sized against the loaded case instead, and matches the upper bound
+#: CI already allows its own pytest jobs. A generous bound fails safe here: too
+#: high merely delays a report that something is wrong, while too low silently
+#: denies the agent any full-suite evidence of its own, which is what happened
+#: through nine review rounds on #1594.
+_TIMEOUT_SECONDS = 1800.0
 _CAPTURE_BYTES = 64 * 1024
 _RETURN_STDOUT_CHARS = 8_000
 _RETURN_STDERR_CHARS = 4_000
@@ -384,6 +406,10 @@ class RepoProjectTests:
             # The snapshot's 0700 isolation boundary deliberately cannot be
             # traversed by the worker, so ambient config discovery must be off.
             environment["UV_NO_CONFIG"] = "1"
+            # The executor may seed this disposable cache from its image-owned
+            # read-only cache. Misses remain writable here and can download
+            # normally without giving executions write access to shared state.
+            environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
         if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
             try:
                 checkout.close()

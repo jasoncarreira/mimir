@@ -32,10 +32,11 @@ from .worker_client import (
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
+REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v2-repo-copy-timeout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"
@@ -312,6 +313,42 @@ def _project_home(home: Path, projections: object) -> None:
             os.chmod(Path(root) / name, 0o600, follow_symlinks=False)
 
 
+def _seed_repo_test_uv_cache(home: Path) -> Path:
+    """Copy the immutable deployment cache into one execution's writable HOME."""
+    destination = home / ".cache" / "uv"
+    try:
+        source = REPO_TEST_UV_CACHE.resolve(strict=True)
+    except OSError:
+        return destination
+    metadata = source.stat()
+    if (
+        not source.is_dir()
+        or metadata.st_uid == get_identities().worklink_uid
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("repo test uv cache source is not immutable")
+    for root, directories, files in os.walk(source):
+        for name in (*directories, *files):
+            entry = Path(root) / name
+            entry_metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(entry_metadata.st_mode):
+                try:
+                    resolved_entry = entry.resolve(strict=True)
+                    resolved_entry.relative_to(source)
+                except (OSError, ValueError):
+                    raise RuntimeError(
+                        "repo test uv cache source is not immutable"
+                    ) from None
+                continue
+            if (
+                entry_metadata.st_uid == get_identities().worklink_uid
+                or entry_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise RuntimeError("repo test uv cache source is not immutable")
+    shutil.copytree(source, destination)
+    return destination
+
+
 def _cleanup_home(home: Path) -> None:
     if not home.exists():
         return
@@ -455,6 +492,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         candidate_home = HOME_ROOT / identifier
         candidate_home.mkdir(mode=0o700)
         home = candidate_home
+        if checkout_root == REPO_TEST_CHECKOUT_ROOT and Path(command[0]).name == "uv":
+            environment["UV_CACHE_DIR"] = str(_seed_repo_test_uv_cache(home))
         _project_home(home, request["projections"])
         os.chown(home, get_identities().worklink_uid, get_identities().worklink_gid)
         os.chmod(home, 0o700)
