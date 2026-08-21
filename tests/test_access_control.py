@@ -4486,7 +4486,7 @@ async def test_service_capability_allowed_admin_operation_emits_no_shadow_decisi
 
 
 @pytest.mark.asyncio
-async def test_shadow_suppression_uses_would_block_not_reason() -> None:
+async def test_shadow_emission_uses_would_block_not_reason() -> None:
     registry = ToolRegistry()
     registry.enable_shadow_logging()
     captured: list[tuple[str, dict[str, object]]] = []
@@ -4502,12 +4502,25 @@ async def test_shadow_suppression_uses_would_block_not_reason() -> None:
         is_shadow_decision=True,
         would_block=False,
     )
+    blocked = access_control.ToolAuthorization(
+        tool_name="remove_schedule",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason=None,
+        is_shadow_decision=True,
+        would_block=True,
+    )
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         registry._emit_shadow_decision(admitted)
+        registry._emit_shadow_decision(blocked)
         await asyncio.sleep(0)
 
-    assert captured == []
+    assert len(captured) == 1
+    assert all(fields["would_block"] is True for _, fields in captured)
+    assert captured[0][1]["reason"] is None
+
+
 
 
 @pytest.mark.asyncio
