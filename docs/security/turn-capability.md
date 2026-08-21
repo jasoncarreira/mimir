@@ -86,50 +86,72 @@ The conclusion is not that operator turns cannot have bounded steps. It is that
 boundedness must be a **fact produced by the execution path**, not a property
 inferred from a string.
 
+### And a bound execution does not make its output safe
+
+A second revision of this document then claimed that a bound argv executed with
+`shell=False` "introduces no content the model can be steered by." That is also
+false, and it is the more dangerous of the two errors.
+
+`shell=False` constrains **what the process executes**. It says nothing about
+**what the output contains**. Every command proposed for the bounded path returns
+attacker-controlled text by design: anyone can file the issue that `gh issue view`
+reads, write the pull-request body that `gh pr view` returns, or land the content
+that `git grep` matches.
+
+So marking bounded output `informational` would clear the active-ingest predicate
+and thereby admit a subsequent **arbitrary** `bash -lc` — laundering untrusted
+content into a state where unrestricted shell is permitted. That is precisely the
+outcome §8's regression exists to forbid.
+
+The property that matters is therefore not the trustworthiness of the *producer*.
+It is the boundedness of the *consumer*.
+
 ## 4. Proposal
 
-**Route bounded commands through the existing service-shell binding, and key the
-classification on the binding fact it produces.**
+**Make the active-ingest restriction conditional on the requested sink's
+boundedness, rather than absolute.**
 
-Nothing about arbitrary shell changes. `bash -lc` continues to work exactly as
-today: admitted until the turn ingests untrusted content, output classified as an
-active ingest. What is added is a
-second, narrower path.
+Today an untrusted active ingest refuses every subsequent shell sink. The proposal
+is that it refuse only the **unbounded** ones. After untrusted output has entered
+the turn:
 
-The machinery exists and is already the contract for service principals.
-`parse_service_shell_argv_with_diagnostics` returns a validated argv, and its own
-docstring states the property this design needs:
+- a further **server-bound** command remains admissible, because ingested content
+  cannot steer a command whose argv the server authored;
+- an **unbounded** `bash -lc` remains refused, exactly as today.
 
-> The returned argv is both the authorization artifact and the execution
-> artifact. Callers must exec it directly with `shell=False`; handing the original
-> string to a shell would reintroduce an expansion layer the profile did not
-> validate.
+This puts the mechanism in **sink authorization**, not in result classification.
+Classification keeps doing what it does — a bounded execution's output is
+`untrusted`, and it stays an active ingest. Nothing is relabelled as safe. What
+changes is which sinks that state forbids.
 
-So the shape is:
+Authorization is the right place because it already runs *before* execution and
+already parses the requested command to decide admission, so it can determine the
+requested sink's boundedness without inference. And the binding fact from §3 is
+what makes the requested command's boundedness a server-authored property rather
+than a guess about text.
 
-1. A command that a server-owned profile admits is executed as that **bound
-   argv**, with `shell=False`. No login shell, no expansion layer.
-2. The authorization records that the execution was bound, and to which profile —
-   a server-authored fact, not a re-derivable guess.
-3. `classify_protected_result` consults that fact. Bound execution earns the
-   complete `untrusted`/`informational` entry. Everything else keeps
-   `active_ingest`.
+### Why this finally explains the existing carve-out
 
-This answers the review objection structurally rather than by argument: the fact
-exists because the execution genuinely was bound, so there is nothing to replay
-and no way for an unbounded execution to be mistaken for a bounded one.
+The `repo_review_state` branch is safe, and the reason is not that review-turn
+output is trustworthy — it is not, for the same reasons as above. It is safe
+because **every** command on a review turn is argv-bounded. Ingested content has
+no arbitrary sink to steer into, so the door never needs closing.
 
-It also explains why a bounded command may repeat without limit while an
-unbounded one may not. The restriction was never about how many commands run; it
-is about whether the model could have been steered by something it just read. A
-bound argv executed with `shell=False` introduces no content the model can be
-steered by, so it does not close the door behind itself. An arbitrary command's
-output can, and does.
+An operator turn has both paths available. That asymmetry, not the turn kind, is
+why copying the classification there is unsafe — and why the fix belongs at the
+sink rather than at the label.
 
-It also makes the `repo_review_state` branch redundant rather than parallel — a
-review turn's shell is already bound, so it would earn the same classification
-through the same fact. Removing it afterwards is a separate, verifiable step and
-is **not** claimed here as equivalent without proof.
+Under this proposal the carve-out becomes a special case of the general rule and
+is expected to be removable. That remains an equivalence this document does not
+claim without proof.
+
+### What is not proposed
+
+- No change to what output is labelled `untrusted`. Bounded output is untrusted.
+- No change to the `active_ingest` effect for bounded output. It stays an ingest.
+- No relaxation of the predicate itself. It keeps refusing unbounded sinks after
+  ingestion, which is its whole purpose.
+- No change to arbitrary shell before ingestion, which remains admitted.
 
 ## 5. What is actually admissible today
 
@@ -182,14 +204,34 @@ available. Collapsing them in either direction forecloses this.
 
 Neither change needs to land first; they are coupled only through that invariant.
 
-## 8. Reversibility, and the required negative regression
+## 8. Reversibility, and the required negative regressions
 
-The classification change is a condition at one site, and the execution change is
-an additional path rather than a replacement — so backing out restores the
-`repo_review_state` gate and routes everything through `bash -lc` again. No
-persisted state, no migration.
+The change is a condition in sink authorization plus an additional execution path.
+Backing it out restores the absolute active-ingest refusal and routes everything
+through `bash -lc`. No persisted state, no migration, and no relabelled data to
+unwind — which is a consequence of the proposal touching authorization rather than
+classification.
 
-The signal it is wrong is a sink permitted after an **unbounded** command's output
-entered the turn. That is the required regression: a turn whose first command runs
-through `bash -lc` must not reach a shell sink on its second, even if that
-command's text would have been profile-admissible had it been routed.
+Three properties must be pinned, and the second and third are new to this
+revision:
+
+1. **An unbounded sink after ingestion stays refused.** A turn whose first command
+   runs through `bash -lc` must not reach an unbounded shell sink on its second,
+   even if that command's text would have been profile-admissible had it been
+   routed. This fails if anyone reintroduces inference from command text.
+
+2. **The bounded allowance is not reachable by claim.** An unbounded execution must
+   not be able to present itself as bounded. The admission must consult the
+   server-authored binding fact from §3, so a test should attempt an unbounded
+   command whose text matches a profile and assert it is still refused after
+   ingestion.
+
+3. **The allowance is stable under iteration.** Because bounded output remains
+   `untrusted` with an `active_ingest` effect, a turn that runs many bounded
+   commands must still refuse an unbounded one at the end. The state must not decay
+   toward permissive as bounded steps accumulate — that would reintroduce the
+   laundering path by a longer route.
+
+The third is the property this revision exists to guarantee. The previous revision
+would have failed it immediately, because it cleared the ingest state rather than
+narrowing what that state forbids.
