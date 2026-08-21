@@ -1404,16 +1404,10 @@ class WorklinkRunner:
             try:
                 GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
             except GitHubIdentityVerificationError as exc:
-                if (
-                    exc.authenticated_login
-                    and exc.authenticated_login.casefold() != publishing_identity.casefold()
-                ):
-                    raise WorklinkError(
-                        "github identity mismatch: authenticated as "
-                        f"{exc.authenticated_login}, selected identity {publishing_identity} "
-                        f"from {publishing_identity_source}"
-                    ) from exc
-                raise
+                raise WorklinkError(
+                    f"{exc}; selected identity {publishing_identity} "
+                    f"from {publishing_identity_source}"
+                ) from exc
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,

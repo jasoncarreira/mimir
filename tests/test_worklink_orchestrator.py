@@ -2446,10 +2446,40 @@ def test_factory_identity_override_mismatch_refuses_with_selected_source(
     )
 
     assert result.reason == (
-        "github identity mismatch: authenticated as token-owner, selected identity "
-        "deployment-owner from environment variable MIMIR_FACTORY_PUBLISHING_IDENTITY"
+        "github identity mismatch: authenticated as token-owner, declared as deployment-owner; "
+        "selected identity deployment-owner from environment variable "
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY"
     )
     assert launched == []
+    assert "secret-token" not in result.reason
+
+
+def test_factory_identity_cache_mismatch_preserves_diagnosis_and_adds_selected_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def cache_mismatch(_token: str, declared: str) -> str:
+        raise GitHubIdentityVerificationError(
+            "github identity verification cache does not match active credential",
+            declared_login=declared,
+            authenticated_login="cached-owner",
+        )
+
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "secret-token"},
+        publishing_identity="file-owner",
+        publishing_identity_override="deployment-owner",
+        verify=cache_mismatch,
+    )
+
+    assert result.reason == (
+        "github identity verification cache does not match active credential; "
+        "selected identity deployment-owner from environment variable "
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY"
+    )
+    assert launched == []
+    assert "cached-owner" not in result.reason
     assert "secret-token" not in result.reason
 
 
