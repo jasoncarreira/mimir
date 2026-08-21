@@ -196,13 +196,34 @@ the provenance model.
 
 ## 7. Dependency on the provenance model
 
-This requires that **"came from a bounded introduction" stay expressible
-separately from "is untrusted."** `provenance-model.md` keeps those on independent
-axes — trust in `integrity`, exposure kind in `integrity_effect` — and a bound
-command's output is `untrusted`/`informational` precisely because both are
-available. Collapsing them in either direction forecloses this.
+The dependency is the **opposite** of what an earlier revision of this document
+claimed, and getting it backwards is what made that revision unsafe.
 
-Neither change needs to land first; they are coupled only through that invariant.
+This proposal requires that **untrusted active-ingest provenance survive a bounded
+read.** A bounded command's output must continue to be recorded as `untrusted`
+with an `active_ingest` effect. The sink gate can only narrow what an ingest
+forbids if the ingest is still recorded; a provenance layer that relabelled
+bounded output as `informational` would clear the state this proposal reasons
+about, and a later arbitrary `bash -lc` would be admitted. That is the hole §3
+and §4 exist to close.
+
+So what must stay independently expressible is not a second *label* on the result.
+It is the server-authored **sink binding**, available to authorization when it
+judges a prospective consumer. Provenance describes what the turn has ingested;
+authorization decides what may consume it. Keeping those separate is the whole
+mechanism.
+
+**On the existing carve-out:** the `repo_review_state` branch in
+`classify_protected_result` does emit `integrity_effect="informational"` today.
+That is **current behaviour, not an invariant of this proposal** — and it is the
+producer-side relabelling this document argues against. It is safe in place only
+because every command on a review turn is bounded, so nothing unbounded remains to
+be admitted by the cleared state. Under this proposal that branch becomes a
+special case of the general rule and is expected to be removable, which §4 records
+as an equivalence not claimed without proof.
+
+Neither change needs to land first. They are coupled only through the requirement
+that provenance keep telling the truth about ingestion.
 
 ## 8. Reversibility, and the required negative regressions
 
