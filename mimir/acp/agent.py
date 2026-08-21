@@ -316,7 +316,14 @@ class _AcpProviderConnection:
             raise RuntimeError("Stale client provider result")
         if not isinstance(result, Mapping):
             raise RuntimeError("Malformed client provider result")
-        return dict(result)
+        if "structuredContent" not in result:
+            raise RuntimeError("Client provider result is missing structuredContent")
+        if result.get("isError") is True:
+            raise RuntimeError("Client provider tool returned isError")
+        structured_content = result["structuredContent"]
+        if not isinstance(structured_content, Mapping):
+            raise RuntimeError("Malformed client provider structuredContent")
+        return dict(structured_content)
 
 
 

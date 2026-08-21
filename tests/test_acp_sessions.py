@@ -844,7 +844,10 @@ class McpClient(Client):
                     for tool in MIMIR_HANDS_V1.tools
                 ]
             }
-        return {"changed": True}
+        return {
+            "content": [{"type": "text", "text": "changed"}],
+            "structuredContent": {"changed": True},
+        }
 
     async def notify_mcp(self, connection_id: str, method: str, params: Any = None) -> None:
         self.notifications.append((connection_id, method, params))
@@ -1058,7 +1061,10 @@ async def test_progress_token_collision_cleanup_preserves_successor_ownership(
     successor_ownership = active.progress_tokens["collision"]
 
     if earlier_outcome == "complete":
-        calls[0].set_result({"call": 1})
+        calls[0].set_result({
+            "content": [{"type": "text", "text": "first"}],
+            "structuredContent": {"call": 1},
+        })
         assert await earlier == {"call": 1}
     else:
         earlier.cancel()
@@ -1078,7 +1084,10 @@ async def test_progress_token_collision_cleanup_preserves_successor_ownership(
         "ignored",
     ]
 
-    calls[1].set_result({"call": 2})
+    calls[1].set_result({
+        "content": [{"type": "text", "text": "second"}],
+        "structuredContent": {"call": 2},
+    })
     assert await successor == {"call": 2}
     assert "collision" not in active.progress_tokens
     MimirAcpAgent._audit_progress(
@@ -1893,7 +1902,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
         assert agent._audit_events[-2]["status"] == "ignored"
         assert agent._audit_events[-1]["data"] == {"token": "[redacted]", "message": "working"}
         await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 4, "result": {"changed": True},
+            "jsonrpc": "2.0", "id": 4, "result": {
+                "content": [{"type": "text", "text": "changed"}],
+                "structuredContent": {"changed": True},
+            },
         })
         progress_1 = await next_outgoing()
         await transport.incoming.put({
@@ -1950,7 +1962,10 @@ async def test_integrated_hands_edit_permission_wire_and_provider_result(
             6, "notes-2.txt", "old-2", "new-2", progress_token_2
         )
         await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 6, "result": {"changed": True},
+            "jsonrpc": "2.0", "id": 6, "result": {
+                "content": [{"type": "text", "text": "changed"}],
+                "structuredContent": {"changed": True},
+            },
         })
         progress_2 = await next_outgoing()
         progress_2_update = progress_2["params"]["update"]
