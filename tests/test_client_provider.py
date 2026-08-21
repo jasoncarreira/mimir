@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Mapping
 import pytest
 from langchain_core.tools import ToolException
 
+from mimir.acp import agent as agent_module
 from mimir.access_control import (
     CLIENT_FILE_RESOURCE_POLICY,
     ClientFileResourcePolicy,
@@ -47,6 +49,38 @@ class FakeProvider:
     ) -> Mapping[str, Any]:
         self.calls.append((name, arguments))
         return self.results[name]
+
+
+class StockMcpPeer:
+    def __init__(self, response: Mapping[str, Any]) -> None:
+        self.response = response
+
+    async def message_mcp(
+        self, connection_id: str, method: str, params: Any = None
+    ) -> Mapping[str, Any]:
+        assert connection_id == "hands-connection"
+        assert method == "tools/call"
+        return self.response
+
+
+def _stock_provider(response: Mapping[str, Any]) -> Any:
+    owner = SimpleNamespace(_boundary_lock=asyncio.Lock())
+    state = SimpleNamespace(active_prompt=None, provider=None)
+    provider = agent_module._AcpProviderConnection(
+        owner, StockMcpPeer(response), "hands-connection", state
+    )
+    active = SimpleNamespace(
+        generation=1,
+        epoch=1,
+        progress_tokens={},
+        mcp_handles=[],
+        mcp_request_ids=set(),
+        mcp_tasks=set(),
+    )
+    active._is_current = lambda: state.active_prompt is active
+    state.active_prompt = active
+    state.provider = provider
+    return provider
 
 
 def _context(
@@ -111,6 +145,20 @@ def _thaw(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_thaw(child) for child in value]
     return value
+
+
+async def _invoke_wrapper(wrapper_name: str, provider: Any) -> dict[str, Any]:
+    token = set_turn_capability_context(_context(provider))
+    try:
+        if wrapper_name == "hands_read":
+            return await hands_read.ainvoke({"path": "notes.txt"})
+        if wrapper_name == "hands_edit":
+            return await hands_edit.ainvoke({
+                "path": "notes.txt", "old_text": "old", "new_text": "new"
+            })
+        return await hands_shell.ainvoke({"command": "pwd"})
+    finally:
+        reset_turn_capability_context(token)
 
 
 def test_registry_contains_only_immutable_mimir_hands_profile() -> None:
@@ -237,6 +285,89 @@ async def test_wrappers_route_through_current_turn_provider() -> None:
     assert first.calls[1] == (
         "edit", {"path": "a", "oldText": "x", "newText": "y"}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper_name", "structured_content"),
+    [
+        ("hands_read", {"content": "file contents"}),
+        ("hands_edit", {"changed": True}),
+        ("hands_shell", {"stdout": "/workspace\n", "stderr": "", "exitCode": 0}),
+    ],
+)
+async def test_wrappers_accept_recorded_stock_mcp_results(
+    wrapper_name: str, structured_content: dict[str, Any]
+) -> None:
+    response = {
+        "content": [{"type": "text", "text": "Tool completed"}],
+        "structuredContent": structured_content,
+        "isError": False,
+    }
+
+    assert await _invoke_wrapper(wrapper_name, _stock_provider(response)) == structured_content
+
+
+@pytest.mark.asyncio
+async def test_advertised_output_schemas_drive_accepted_result_shapes() -> None:
+    values_by_type = {"string": "value", "boolean": True, "integer": 1}
+
+    for policy in MIMIR_HANDS_V1.tools:
+        schema = _thaw(policy.result_schema)
+        structured_content = {
+            name: values_by_type[property_schema["type"]]
+            for name, property_schema in schema["properties"].items()
+        }
+        assert set(structured_content) == set(schema["required"])
+        response = {
+            "content": [{"type": "text", "text": "Tool completed"}],
+            "structuredContent": structured_content,
+        }
+
+        assert await _invoke_wrapper(
+            policy.wrapper_name, _stock_provider(response)
+        ) == structured_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "structured_content",
+    [
+        {"content": "ok", "extra": "unvalidated"},
+        {},
+        {"content": 1},
+    ],
+)
+async def test_unwrapped_payload_remains_exactly_validated(
+    structured_content: dict[str, Any]
+) -> None:
+    response = {
+        "content": [{"type": "text", "text": "Tool completed"}],
+        "structuredContent": structured_content,
+    }
+
+    with pytest.raises(ToolException, match="hands_read returned a malformed result"):
+        await _invoke_wrapper("hands_read", _stock_provider(response))
+
+
+@pytest.mark.asyncio
+async def test_schema_backed_result_requires_structured_content() -> None:
+    response = {"content": [{"type": "text", "text": "file contents"}]}
+
+    with pytest.raises(RuntimeError, match="missing structuredContent"):
+        await _invoke_wrapper("hands_read", _stock_provider(response))
+
+
+@pytest.mark.asyncio
+async def test_mcp_is_error_result_is_a_tool_failure() -> None:
+    response = {
+        "content": [{"type": "text", "text": "read failed"}],
+        "structuredContent": {"content": "must not be returned"},
+        "isError": True,
+    }
+
+    with pytest.raises(RuntimeError, match="returned isError"):
+        await _invoke_wrapper("hands_read", _stock_provider(response))
 
 
 @pytest.mark.asyncio
