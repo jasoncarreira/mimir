@@ -46,7 +46,13 @@ if not failed and authorization.result_integrity == "trusted"
 ```
 
 So a refused call publishes nothing, cannot take the trusted branch, and falls to
-`_incomplete_protected_result`. That fallback derives its `resource_id` from the
+`_incomplete_protected_result`.
+
+The refusal never presents as an exception. `mimir/readonly_backend.py` returns a
+result object carrying `error=`, and records the denial separately through
+`emit_hard_read_denial`. Because nothing is raised, the `ToolPolicyRefusal` branch
+in the classification path is never consulted, and `_result_is_error` reduces the
+error result to a generic `failed=True`. That fallback derives its `resource_id` from the
 **call's arguments** — `path`, `file_path`, `query`, `turn_id`, `atom_id`,
 `job_id` — and sets `principal=None`, `bridge_instance=None`, and an empty ACL,
 so `is_complete` is false.
@@ -111,31 +117,72 @@ and stay silent otherwise. Nothing in this document asks them to change.
 
 ## 5. Proposal
 
-**A failed call contributes no source.**
+**Route a read-policy refusal through `ToolPolicyRefusal`.**
 
-Nothing was returned, so nothing was ingested, so there is nothing to label. The
-`failed` flag already exists on `classify_protected_result` and is already
-consulted at three sites within it; it does not currently suppress the fallback.
+The distinction this needs is not new, and neither is the machinery. `ToolPolicyRefusal`
+already exists, and its docstring states the intent exactly:
 
-This is a narrower change than the previous revision proposed, and it does not
-touch the fallback's shape, the predicate, or any publisher.
+> A policy refusal happens before a tool exposes protected result data. It is
+> returned to the model like other `ToolException` failures, but must not taint
+> the turn as though protected content had been ingested.
 
-Two properties to preserve explicitly:
+It is already honoured in the classification path, at both call sites in
+`mimir/tools/budget_gate.py`:
 
-- **A successful call with unknown exact resources still yields the fail-closed
-  fallback.** Suppression applies to failure, not to uncertainty.
-- **Refusal remains audited.** Removing the source removes a *flow label*, not the
-  record that a call was refused. The refusal is already recorded independently as
-  a tool decision; nothing about the audit trail changes.
+```python
+except ToolException as exc:
+    ...
+    if isinstance(exc, ToolPolicyRefusal):
+        _record_tool_outcome(tool_name, refused_reason=str(exc))
+    else:
+        result_labels = _result_labels_for_call(...)
+```
 
-### Why this is safe
+A `ToolPolicyRefusal` therefore contributes no source today. The refusal is still
+recorded; only the flow label is absent.
 
-A refused call transfers no content into the turn. The only information it yields
-is the fact of the refusal — that a path was protected, or a resource absent —
-which is a side channel of a different kind and magnitude from data ingestion,
-and is not what `integrity_effect` models. The fallback's own entry is derived
-from the model's arguments, so the current behaviour labels the model's *input* as
-an untrusted source, which is circular: the model is penalised for having asked.
+Roughly twenty sites already raise it — across `mimir/tools/forge.py`,
+`mimir/tools/repo.py`, and `mimir/tools/github_review_guard.py`. The filesystem
+read path does not. `mimir/readonly_backend.py` returns a result object carrying
+`error=`, and separately calls `emit_hard_read_denial` for the audit record. No
+exception is raised, so the `ToolPolicyRefusal` branch is never reached, and the
+error result becomes a generic `failed=True`.
+
+So the defect is not a missing policy. It is one path not using an existing,
+documented mechanism that its siblings use.
+
+### Why keying on `ToolPolicyRefusal` is safe, and keying on `failed` is not
+
+An earlier revision of this document proposed that *a failed call contributes no
+source*. That was unsafe, and the review that caught it was right: `failed` is
+derived by `_result_is_error` from `status == "error"` on the tool message, so it
+covers every error-status result and handler exception — including an execution
+that ran, emitted stdout or an error body the model can read, and then exited
+non-zero. Suppressing labels for that class would permit a sink after genuine
+ingestion.
+
+`ToolPolicyRefusal` does not have that problem, because it is defined as the
+pre-execution case. A command that executed and produced output does not raise it;
+that path returns an error result and continues to be labelled exactly as it is
+today. The safety property is carried by the type's contract rather than by a
+heuristic over result status.
+
+### Required regression
+
+Because the change is scoped to the refusal path, the property to pin is that the
+*other* path is untouched: a tool execution that fails after producing
+model-visible output must still contribute a source and must still gate egress.
+That test should exist regardless of this change, and it is the specific evidence
+the review asked for.
+
+### Implementation note
+
+If the backend contract requires returning a result rather than raising —
+`aread` returns a result object by design, and the collection operations
+accumulate per-path outcomes — then the equivalent is to give the classification
+path the same signal the exception carries: *this was a server-authored refusal,
+no protected content was exposed*. What matters is that the signal be the typed,
+pre-execution one rather than inferred from error status.
 
 ## 6. What this does not resolve
 
@@ -165,7 +212,17 @@ Both were errors.
   targets, the predicate ends `return source_kind == "protected_tool"`. The line
   was read on one branch and analysed against another.
 
-The recording-versus-policy observation from that revision does survive in
+The second revision then proposed that *a failed call contributes no source*.
+That was also wrong, and unsafe in the fail-open direction. `failed` is derived
+from `status == "error"` on the tool message, so it covers executions that ran,
+exposed model-visible output, and then errored; suppressing labels for that class
+would permit a sink after real ingestion. The lesson is the same as the first
+error in a different costume — a signal that correlates with the observed case was
+adopted as though it were the authoritative one. `ToolPolicyRefusal` is the
+authoritative signal, and it was already in the tree, already honoured, and
+already documented as meaning exactly this.
+
+The recording-versus-policy observation from the first revision does survive in
 reduced form: the trusted-branch decision at `if not failed and
 authorization.result_integrity == "trusted"` is a policy choice sitting in the
 write path. It is no longer this document's headline, and no change to it is
