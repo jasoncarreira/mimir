@@ -18,7 +18,7 @@ MAX_REQUEST_BYTES = 256 * 1024
 MAX_PROJECTION_BYTES = 1024 * 1024
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v2-repo-copy-timeout"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v3-repo-uv-cache"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "identities do not match; rebuild the image and restart the container"

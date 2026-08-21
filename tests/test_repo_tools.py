@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import socket
 import select
+import shlex
 import signal
 import stat
 import struct
@@ -1456,6 +1457,33 @@ async def test_project_tests_use_snapshot_collected_result_and_worker_environmen
 
 
 @pytest.mark.asyncio
+async def test_project_uv_uses_disposable_cache_and_preserves_uv_hardening(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(home, f"{fake_uv} run pytest -q")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    observed: dict[str, str] = {}
+
+    async def runner(_argv, _directory, env, _projections, **_kwargs):
+        observed.update(env)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+
+    assert result.ok
+    assert observed["UV_NO_CONFIG"] == "1"
+    assert observed["UV_CACHE_DIR"] == f'{observed["XDG_CACHE_HOME"]}/uv'
+    assert "HOME" not in observed
+
+
+@pytest.mark.asyncio
 async def test_project_tests_scrub_checkout_home_and_sensitive_output(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1943,6 +1971,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     boundary = Path("/tmp") / f"mimir-repo-test-{uuid.uuid4()}"
     checkout_root = boundary / "repo-test-checkouts"
     home_root = boundary / "homes"
+    uv_cache = boundary / "uv-cache"
     controller_home = boundary / "controller-home"
     socket_path = boundary / "executor.sock"
     boundary.mkdir()
@@ -1953,6 +1982,10 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     home_root.mkdir(mode=0o710)
     home_root.chmod(0o710)
     os.chown(home_root, 0, 1002)
+    uv_cache.mkdir(mode=0o555)
+    cached_wheel = uv_cache / "cached-wheel"
+    cached_wheel.write_text("pre-populated", encoding="utf-8")
+    cached_wheel.chmod(0o444)
     controller_home.mkdir(mode=0o700)
     os.chown(controller_home, 1001, 1001)
     canary = controller_home / "repo-test-canary"
@@ -1962,7 +1995,25 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     config_home = boundary / "config"
     python_executable = shutil.which("python")
     assert python_executable is not None
-    _configure_worklink_test(config_home, "/bin/sh run-tests.sh")
+    fake_uv = boundary / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'test "$(cat "$UV_CACHE_DIR/cached-wheel")" = pre-populated\n'
+        f"if touch {shlex.quote(str(uv_cache / 'cross-pr-write'))} 2>/dev/null; then exit 91; fi\n"
+        'printf downloaded > "$UV_CACHE_DIR/cache-miss"\n'
+        'echo "MIMIR_UV_CACHE=$UV_CACHE_DIR"\n'
+        f"exec {shlex.quote(python_executable)} -c "
+        + shlex.quote(
+            'namespace={}; exec(compile(open("conftest.py").read(), '
+            '"conftest.py", "exec"), namespace); '
+            'namespace["pytest_sessionstart"](None)'
+        )
+        + ' "$@"\n',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    _configure_worklink_test(config_home, f"{fake_uv} run pytest -q")
     for path in (config_home, *config_home.rglob("*"), lease, *lease.rglob("*")):
         os.chown(path, 1001, 1001, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
@@ -1988,12 +2039,14 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
         worker_exec.REPO_TEST_CHECKOUT_ROOT,
         worker_exec.HOME_ROOT,
+        worker_exec.REPO_TEST_UV_CACHE,
         contained_execution.WorkerClient,
     )
     contained_checkout.REPO_TEST_CHECKOUT_ROOT = checkout_root
     worklink_checkout._REPO_TEST_CHECKOUT_ROOT = checkout_root
     worker_exec.REPO_TEST_CHECKOUT_ROOT = checkout_root
     worker_exec.HOME_ROOT = home_root
+    worker_exec.REPO_TEST_UV_CACHE = uv_cache
     controller_pid = os.fork()
     if controller_pid == 0:
         os.close(result_read)
@@ -2140,6 +2193,13 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         assert Path(payload["home"]).parent == home_root
         assert payload["marker"] == "executed"
         assert payload["attacked"] is False
+        cache_line = next(
+            line.removeprefix("MIMIR_UV_CACHE=")
+            for line in positive["stdout"].splitlines()
+            if line.startswith("MIMIR_UV_CACHE=")
+        )
+        assert Path(cache_line).parent.parent == Path(payload["home"])
+        assert not (uv_cache / "cross-pr-write").exists()
         assert observed["positive_canary"] == "protected"
         assert not Path(payload["home"]).exists()
         assert not any(checkout_root.rglob("checkout"))
@@ -2168,6 +2228,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
             worker_exec.REPO_TEST_CHECKOUT_ROOT,
             worker_exec.HOME_ROOT,
+            worker_exec.REPO_TEST_UV_CACHE,
             contained_execution.WorkerClient,
         ) = previous_roots
         os.close(result_read)

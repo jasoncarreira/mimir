@@ -296,6 +296,8 @@ def main() -> None:
             test "$(stat -c %a:%u:%g /home/mimir)" = 700:1001:1001
             test "$(stat -c %U:%G /usr/local/libexec/worklink-execd)" = root:root
             test "$(stat -c %U:%G /opt/mimir-worklink/venv/bin/python)" = root:root
+            test "$(stat -c %U:%G /opt/mimir-worklink/uv-cache)" = root:root
+            test "$(stat -c %a /opt/mimir-worklink/uv-cache)" = 755
             test "$(stat -c %a:%u:%g /var/lib/mimir-worklink/homes)" = 710:0:1002
         """)
         # Read the live uids from /proc INSIDE the container.

@@ -313,6 +313,29 @@ def test_project_home_completes_partial_writes_and_applies_modes(tmp_path: Path,
     assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
 
 
+def test_repo_test_uv_cache_seed_copies_cache_and_tolerates_missing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "shared"
+    source.mkdir()
+    (source / "seed.whl").write_text("cached", encoding="utf-8")
+    (source / "seed-link.whl").symlink_to("seed.whl")
+    source.chmod(0o555)
+    monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", source)
+
+    destination = worker_exec._seed_repo_test_uv_cache(tmp_path / "home")
+
+    assert (destination / "seed.whl").read_text(encoding="utf-8") == "cached"
+    assert not (destination / "seed-link.whl").is_symlink()
+    assert (destination / "seed-link.whl").read_text(encoding="utf-8") == "cached"
+    assert not (source / "miss.whl").exists()
+
+    monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", tmp_path / "absent")
+    missing_destination = worker_exec._seed_repo_test_uv_cache(tmp_path / "cold-home")
+    assert missing_destination == tmp_path / "cold-home" / ".cache" / "uv"
+    assert not missing_destination.exists()
+
+
 def _identity_can_access(path: Path, uid: int, gid: int, permissions: int) -> bool:
     observed = path.stat(follow_symlinks=False)
     shift = 6 if observed.st_uid == uid else 3 if observed.st_gid == gid else 0
