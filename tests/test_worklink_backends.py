@@ -862,6 +862,56 @@ def test_blocked_reason_from_output_requires_final_line_marker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_feature_factory_launch_remains_shell_free_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeProcess(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    order = WorkOrder(
+        issue_id=1606,
+        checkout=tmp_path,
+        prompt="factory owns the prompt",
+        rules=None,
+        timeout_s=30,
+        env={"MIMIR_HOME": str(tmp_path)},
+    )
+    spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
+        order,
+        attempt=1,
+        repo_url="git@github.com:owner/repo.git",
+        base_ref="main",
+        branch="issue/1606-a1",
+        test_command="uv run pytest -q",
+    )
+    compute = LocalSubprocessComputeBackend()
+
+    handle = await compute.launch(spec)
+    await compute.cleanup(handle)
+
+    assert calls[0]["args"] == (
+        "opencode",
+        "run",
+        "--log-level",
+        "DEBUG",
+        "--print-logs",
+        "--dir",
+        str(tmp_path),
+        "--command",
+        "feature",
+        " --autonomous --max-retries 5 1606",
+    )
+    assert "shell" not in calls[0]["kwargs"]
+    assert calls[0]["kwargs"]["cwd"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

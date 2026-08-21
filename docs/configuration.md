@@ -318,11 +318,20 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
 | `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.7.2 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
 | `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
+| `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
 | `MIMIR_FACTORY_STALE_HEARTBEAT_S` | float | `900` (15m) | Diagnostic threshold for stale factory lock observations. It never authorizes dispatch, lock stealing, cancellation, or deletion. |
 | `MIMIR_SOURCE_DIR` | path | unset | Override for locating the source checkout in the chainlink-orchestrator poller. |
 | `MIMIR_WORKLINK_MAX_STDOUT_BYTES` | positive int | `67108864` (64 MiB) | Maximum stdout retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
 | `MIMIR_WORKLINK_MAX_STDERR_BYTES` | positive int | `16777216` (16 MiB) | Maximum stderr retained from a Worklink backend subprocess. Invalid or non-positive values use the default; exceeding the cap terminates the subprocess. |
+
+The factory launch ends with `--command feature " --autonomous --max-retries 5
+<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+`[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
+invalid values. feature-factory 0.7.2 stages the workflow inside the run
+directory; exact token `--auto` is never passed. Worklink's base selects the
+checkout start point and PR target; it is not factory `--base`, which is never
+passed.
 
 ## Worklink YAML
 

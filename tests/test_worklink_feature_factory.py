@@ -20,6 +20,9 @@ from mimir.worklink.backends.feature_factory import (
     parse_factory_status,
     probe_factory_capabilities,
     resolve_factory_entrypoint,
+    _DEFAULT_FACTORY_MAX_RETRIES,
+    _MAX_FACTORY_MAX_RETRIES,
+    _factory_max_retries,
     _run_bounded,
 )
 
@@ -358,7 +361,55 @@ def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
         probe_factory_capabilities(entrypoint, runner=runner)
 
 
-def test_opencode_launch_argv_has_one_leading_space_in_final_token(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, 5),
+        ("", 5),
+        ("0", 5),
+        ("-1", 5),
+        ("+1", 5),
+        ("1.0", 5),
+        ("1e2", 5),
+        (" 1", 5),
+        ("1 ", 5),
+        ("١", 5),
+        ("９", 5),
+        ("9007199254740992", 5),
+        ("9" * 10_000, 5),
+        ("1", 1),
+        ("42", 42),
+        ("00042", 42),
+        ("0" * 10_000 + "1", 1),
+        ("9007199254740991", 9_007_199_254_740_991),
+    ],
+)
+def test_factory_max_retries_accepts_only_bounded_ascii_decimal(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+
+    assert _DEFAULT_FACTORY_MAX_RETRIES == 5
+    assert _MAX_FACTORY_MAX_RETRIES == 9_007_199_254_740_991
+    assert _factory_max_retries() == expected
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, 5), ("17", 17)])
+def test_opencode_launch_argv_has_exact_staged_factory_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
     order = WorkOrder(
         issue_id=1551,
         checkout=tmp_path,
@@ -385,8 +436,13 @@ def test_opencode_launch_argv_has_one_leading_space_in_final_token(tmp_path: Pat
         str(tmp_path),
         "--command",
         "feature",
-        " --autonomous 1551",
+        f" --autonomous --max-retries {expected} 1551",
     )
+    payload = (spec.local_argv or ())[-1]
+    assert payload.startswith(" ") and not payload.startswith("  ")
+    assert "--autonomous" in payload.split()
+    assert "--auto" not in payload.split()
+    assert "--base" not in payload.split()
     assert epic_run_id(1551) == "1551"
 
 

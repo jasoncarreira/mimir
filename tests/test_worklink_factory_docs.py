@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir.worklink.backends.feature_factory import (
+    FACTORY_VERSION,
+    _DEFAULT_FACTORY_MAX_RETRIES,
+    _MAX_FACTORY_MAX_RETRIES,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +39,39 @@ def test_current_factory_admission_claims_match_runtime_version() -> None:
     ) in configuration
     assert f"ship in\n{FACTORY_VERSION}." in configuration
     assert f"package/adapter {FACTORY_VERSION} verification" in worklink
+
+
+def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None:
+    assert FACTORY_DOCS == (
+        "docs/code-building-pipeline.md",
+        "docs/configuration.md",
+        "docs/internal/WORKLINK.md",
+    )
+    launch = (
+        f'--command feature " --autonomous --max-retries '
+        f'{_DEFAULT_FACTORY_MAX_RETRIES} <issue>"'
+    )
+    retry = (
+        f"`MIMIR_FACTORY_MAX_RETRIES` defaults to `{_DEFAULT_FACTORY_MAX_RETRIES}`, "
+        f"accepts exactly ASCII `[0-9]+` in range `1..{_MAX_FACTORY_MAX_RETRIES}`, "
+        f"and falls back to `{_DEFAULT_FACTORY_MAX_RETRIES}` for absent or invalid values."
+    )
+    staging = (
+        f"feature-factory {FACTORY_VERSION} stages the workflow inside the run directory; "
+        "exact token `--auto` is never passed."
+    )
+    base = (
+        "Worklink's base selects the checkout start point and PR target; it is not factory "
+        "`--base`, which is never passed."
+    )
+
+    for relative_path in FACTORY_DOCS:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        normalized = " ".join(text.split())
+        assert launch in normalized, relative_path
+        assert retry in normalized, relative_path
+        assert staging in normalized, relative_path
+        assert base in normalized, relative_path
 
 
 def test_internal_factory_status_contract_matches_runtime_binding() -> None:
