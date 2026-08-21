@@ -1369,8 +1369,10 @@ def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
 def test_synthesis_reaches_observed_read_only_github_shell_reads(
     command: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
     service = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
     )
@@ -1382,6 +1384,59 @@ def test_synthesis_reaches_observed_read_only_github_shell_reads(
     )
 
     assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 7 --repo other/repo --json number,title",
+        "gh issue view 9 --repo other/repo --json number,title --comments",
+        "gh pr view 7 --repo acme/widget-typosquat --json number,title",
+    ],
+)
+def test_session_boundary_github_reads_refuse_unconfigured_repository(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    """A syntactically valid `--repo` must still name configured server state.
+
+    The session-boundary profile carries no immutable pull-request scope, so an
+    unchecked operand would reach any repository the process token can see.
+    """
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False, decision.reason
+
+
+def test_session_boundary_github_read_refuses_repo_flag_without_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True,
+        target_channel="gh pr view 7 --repo",
+        arguments={"command": "gh pr view 7 --repo"},
+    )
+
+    assert decision.allowed is False, decision.reason
 
 
 def test_synthesis_fetch_is_bounded_to_configured_github_repository(

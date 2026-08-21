@@ -2910,14 +2910,41 @@ def _target_matches_repo_review_shell_command(
     return False
 
 
+def _gh_repo_operands_are_configured(arguments: list[str]) -> bool:
+    """Require every explicit ``--repo`` operand to name configured server state.
+
+    The syntax matchers accept ``--repo <value>`` without inspecting the value.
+    On a repo-review turn the bound comes from that turn's immutable pull-request
+    scope, but the session-boundary profile carries no such scope, so an
+    unchecked operand would reach any repository the process token can see.
+    """
+    index = 0
+    while index < len(arguments):
+        if arguments[index] != "--repo":
+            index += 1
+            continue
+        if index + 1 >= len(arguments):
+            return False
+        if not is_configured_github_repo(arguments[index + 1]):
+            return False
+        index += 2
+    return True
+
+
 def _target_matches_session_boundary_shell_command(argv: list[str]) -> bool:
     """Admit only tracker operations and the GitHub reads used at session close."""
     if _target_matches_chainlink_command(argv):
         return True
     if argv[:3] == ["gh", "issue", "view"]:
-        return _repo_review_gh_issue_view_arguments(argv[3:])
+        return (
+            _repo_review_gh_issue_view_arguments(argv[3:])
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
     if argv[:3] == ["gh", "pr", "view"]:
-        return _target_matches_repo_review_shell_command(argv)
+        return (
+            _target_matches_repo_review_shell_command(argv)
+            and _gh_repo_operands_are_configured(argv[3:])
+        )
     return False
 
 
