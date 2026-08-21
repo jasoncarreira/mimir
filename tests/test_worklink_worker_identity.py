@@ -37,6 +37,9 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir" in text
     assert "pypdf" in text
     assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
+    assert "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync" in text
+    assert "--locked --extra dev --extra bench --no-install-workspace" in text
+    assert "rm -rf /opt/mimir-worklink/source/.venv" in text
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
     assert "PYTHONPATH=" not in text

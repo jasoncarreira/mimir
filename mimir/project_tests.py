@@ -406,6 +406,10 @@ class RepoProjectTests:
             # The snapshot's 0700 isolation boundary deliberately cannot be
             # traversed by the worker, so ambient config discovery must be off.
             environment["UV_NO_CONFIG"] = "1"
+            # The executor may seed this disposable cache from its image-owned
+            # read-only cache. Misses remain writable here and can download
+            # normally without giving executions write access to shared state.
+            environment["UV_CACHE_DIR"] = f'{environment["XDG_CACHE_HOME"]}/uv'
         if any(scrubber.contains_sensitive(value) for value in (*command, *environment.values())):
             try:
                 checkout.close()
