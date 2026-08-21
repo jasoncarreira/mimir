@@ -277,12 +277,12 @@ class ChainlinkIssueReader:
 
 
 def validate_leaf(issue: IssueContext) -> None:
-    if "worklink:epic" in issue.labels:
-        return
     try:
         target_branch_from_description(issue.description)
     except ValueError as exc:
         raise LeafValidationError(str(exc)) from exc
+    if "worklink:epic" in issue.labels:
+        return
     missing = missing_leaf_template_parts(issue.description)
     if not missing:
         return
@@ -1276,6 +1276,7 @@ class WorklinkRunner:
         issue = issue_reader.read(issue_id)
         if "worklink:epic" not in issue.labels:
             return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
+        validate_leaf(issue)
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         selected = registry.get("feature_factory")
@@ -1298,10 +1299,28 @@ class WorklinkRunner:
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
         base = (
-            repository_config.base_branch
-            if repository_config is not None
-            else config.defaults.base_branch
+            target_branch_from_description(issue.description)
+            or (repository_config.base_branch if repository_config is not None else None)
+            or config.defaults.base_branch
         )
+        base_check = runner(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                f"refs/heads/{base.removeprefix('origin/')}",
+            ]
+        )
+        if base_check.returncode != 0:
+            return WorklinkRunResult(
+                issue_id,
+                None,
+                "refused",
+                reason=f"base branch does not exist in origin: {base}",
+            )
         test_cmd = (
             repository_config.test_command
             if repository_config is not None and repository_config.test_command is not None

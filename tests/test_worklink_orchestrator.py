@@ -434,6 +434,19 @@ def test_validate_leaf_refuses_missing_planner_template() -> None:
         validate_leaf(issue)
 
 
+def test_validate_leaf_checks_epic_target_without_requiring_leaf_template() -> None:
+    validate_leaf(IssueContext(1, "epic", "build the thing", {"worklink:epic"}))
+
+    issue = IssueContext(
+        1,
+        "epic",
+        "Worklink notes:\n- Target branch:\n- Target branch: feature/acp",
+        {"worklink:epic"},
+    )
+    with pytest.raises(LeafValidationError, match="multiple Target branch bullets"):
+        validate_leaf(issue)
+
+
 def test_dry_run_prints_rendered_work_order_without_mutations(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1759,6 +1772,91 @@ class _CodexNamedBackend(FakeBackend):
 
 from mimir.worklink.compute import LaunchHandle as _LaunchHandle
 
+
+@pytest.mark.parametrize(
+    ("target_bullets", "error"),
+    [
+        pytest.param("- Target branch:", "invalid Worklink target branch", id="malformed"),
+        pytest.param(
+            "- Target branch: feature/one\n- Target branch: feature/two",
+            "multiple Target branch bullets",
+            id="multiple",
+        ),
+    ],
+)
+def test_run_epic_refuses_invalid_target_branch_before_dispatch(
+    tmp_path: Path,
+    target_bullets: str,
+    error: str,
+) -> None:
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "invalid target",
+            "description": f"Worklink notes:\n{target_bullets}",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        assert isinstance(args, list)
+        calls.append(args)
+        if args[:4] == ["chainlink", "issue", "show", "701"]:
+            return cp(args, stdout=epic_json)
+        return cp(args)
+
+    with pytest.raises(LeafValidationError, match=error):
+        asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path, runner=runner).run_epic(701))
+
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
+def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "missing target",
+            "description": (
+                "Worklink notes:\n- Target branch: feature/does-not-exist"
+            ),
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        assert isinstance(args, list)
+        calls.append(args)
+        if args[:4] == ["chainlink", "issue", "show", "701"]:
+            return cp(args, stdout=epic_json)
+        if args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if "ls-remote" in args:
+            return cp(args, returncode=2)
+        return cp(args)
+
+    def unexpected_checkout(*args: object, **kwargs: object) -> object:
+        raise AssertionError("checkout creation reached for a nonexistent base")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", unexpected_checkout)
+
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(701))
+
+    assert result.status == "refused"
+    assert result.reason == "base branch does not exist in origin: feature/does-not-exist"
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+
+
 def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2252,8 +2350,22 @@ def test_conflicting_factory_tokens_refuse_dispatch_before_any_verification(
     assert "github-secret" not in result.reason
 
 
-def test_factory_new_run_uses_single_backend_checkout_placement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("description", "expected_base"),
+    [
+        pytest.param("build", "main", id="configured-default"),
+        pytest.param(
+            "build\n\nWorklink notes:\n- Target branch: feature/acp",
+            "feature/acp",
+            id="declared-target",
+        ),
+    ],
+)
+def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    description: str,
+    expected_base: str,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -2263,7 +2375,7 @@ def test_factory_new_run_uses_single_backend_checkout_placement(
         {
             "id": 700,
             "title": "epic",
-            "description": "build",
+            "description": description,
             "labels": ["worklink", "worklink:epic", "worklink:ready"],
             "comments": [],
         }
@@ -2277,8 +2389,8 @@ def test_factory_new_run_uses_single_backend_checkout_placement(
         repo=repo,
         path=tmp_path / "factory-checkout",
         branch="issue/700-a1",
-        base_ref="main",
-        local_base="origin/main",
+        base_ref=expected_base,
+        local_base=f"origin/{expected_base}",
         isolated_checkout=True,
     )
     declaration = repo / ".factory.json"
@@ -2382,7 +2494,7 @@ def test_factory_new_run_uses_single_backend_checkout_placement(
     assert checkout_repo == repo
     assert kwargs["issue_id"] == 700
     assert kwargs["attempt"] == 1
-    assert kwargs["base"] == "main"
+    assert kwargs["base"] == expected_base
     assert isinstance(kwargs["backend"], FeatureFactoryBackend)
     assert preflight_events == [
         "checkout",
