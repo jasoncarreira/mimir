@@ -189,6 +189,17 @@ def test_worklink_run_epic_cli_routes_manual_and_autonomous_modes(
     assert calls[0]["autonomous"] is autonomous
 
 
+def test_worklink_run_epic_cli_rejects_base_flag() -> None:
+    import mimir.commands.worklink as worklink_cmd
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    worklink_cmd.add_argparse(sub)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["worklink", "run-epic", "700", "--base", "feature/acp"])
+
+
 def test_worklink_cli_has_no_factory_cancel_transition() -> None:
     import mimir.commands.worklink as worklink_cmd
 

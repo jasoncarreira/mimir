@@ -87,6 +87,7 @@ from typing import Any, Awaitable, Callable
 
 from .billing import normalize_priority
 from .access_control import (
+    BOUNDED_PROFILE_CAPABILITIES,
     CapabilityTier,
     ServicePrincipal,
     TRIGGER_AUTHORITY_PROFILES,
@@ -862,7 +863,7 @@ def _parse_poller_authority(
             raise ValueError("session-boundary manifest cannot widen the built-in tier")
     # GitHub fetches are statically unbounded as a generic operation, but this
     # profile always receives the server-defined GITHUB_REPOS PR-path adapter.
-    bounded_profile_capabilities = {"fetch_url"} if profile == "github" else set()
+    bounded_profile_capabilities = BOUNDED_PROFILE_CAPABILITIES.get(profile, frozenset())
     if any(
         _TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier]
         for cap in capabilities

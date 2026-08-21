@@ -15,6 +15,7 @@ from mimir.access_control import (
     OperationDecision,
     ResourceScope,
     ServicePrincipal,
+    ServiceSinkPolicy,
     ToolRegistry,
     create_auth_context,
     get_operation_catalog,
@@ -1006,7 +1007,7 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
         "saga_session_end",
         replace(
             synthesis,
-            sink_destinations=synthesis.sink_destinations + ("network",),
+            sink_destinations=synthesis.sink_destinations + ("notification",),
         ),
     )
 
@@ -1014,7 +1015,7 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
 
     assert is_complete is False
     assert any(
-        "sink destination 'network' has no executable destination policy" in error
+        "sink destination 'notification' has no executable destination policy" in error
         for error in errors
     )
 
@@ -1067,6 +1068,7 @@ async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> Non
         required_tier=AccessTier.ADMIN,
         enforcement_enabled=False,
         is_shadow_decision=True,
+        would_block=True,
     )
 
     async def capture(kind: str, **fields: object) -> None:
@@ -1298,20 +1300,23 @@ def test_synthesis_principal_has_required_capabilities_for_session_end() -> None
     write_ops = {"write_file", "edit_file"}
     memory_ops = {"memory_get", "memory_store"}
     saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
-    shell_inspection_ops = {"bash_jobs_list", "bash_job_output"}
+    shell_inspection_ops = {"shell_exec", "bash_jobs_list", "bash_job_output"}
+    network_ops = {"fetch_url"}
     pr_read_ops = {"pr_metadata", "pr_checks", "pr_reviews"}
 
-    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops | pr_read_ops
+    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops | network_ops | pr_read_ops
     for cap in all_expected:
         assert synthesis.has_capability(cap), f"synthesis missing {cap}"
     assert synthesis.can_write_sink("filesystem")
     assert synthesis.can_read_domain("shell_jobs")
     assert synthesis.can_read_domain("repository")
-    assert not synthesis.can_write_sink("shell_process")
-    assert synthesis.sink_policy_for("shell_exec") is None
+    assert synthesis.can_write_sink("shell_process")
+    assert synthesis.can_write_sink("network")
+    assert synthesis.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "session_boundary",
+    )
 
     forbidden = {
-        "shell_exec",
         "bash_async",
         "spawn_open_code",
         "add_schedule",
@@ -1370,7 +1375,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
         ("scheduled_tick", "remove_schedule", False),
         ("scheduled_tick", "reload_pollers", False),
         ("saga_session_end", "saga_end_session", True),
-        ("saga_session_end", "shell_exec", False),
+        ("saga_session_end", "shell_exec", True),
         ("saga_session_end", "spawn_open_code", False),
         ("saga_session_end", "add_schedule", False),
         ("upgrade", "submit_proposal", True),
@@ -1400,8 +1405,12 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
             ctx,
             enforce=True,
             target_channel=(
-                f"git -C {maintenance_git_home} status"
-                if operation == "shell_exec"
+                    (
+                        "chainlink issue show 1"
+                        if trigger == "saga_session_end"
+                        else f"git -C {maintenance_git_home} status"
+                    )
+                    if operation == "shell_exec"
                 else None
             ),
         )

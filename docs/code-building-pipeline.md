@@ -84,11 +84,37 @@ running agent can instead activate a newly installed poller through its
 
 Factory epics use the same repository declaration and isolated-checkout allocator,
 but have separate admission and concurrency. The image installs
-`feature-factory@0.7.0` and `opencode-feature-factory@0.7.0` under
+`feature-factory@0.7.2` and `opencode-feature-factory@0.7.2` under
 `/opt/mimir-opencode`; `MIMIR_FACTORY_ENTRYPOINT` names the absolute
 `feature-factory/bin/factory.js`. Set `MIMIR_FACTORY_EPICS_ENABLED=1` to let the
 poller dispatch `worklink:epic` issues. `MIMIR_FACTORY_MAX_CONCURRENT` defaults
 to `1`, independently of the leaf default `2`.
+
+The launch ends with `--command feature " --autonomous --max-retries 5
+<issue>"`. `MIMIR_FACTORY_MAX_RETRIES` defaults to `5`, accepts exactly ASCII
+`[0-9]+` in range `1..9007199254740991`, and falls back to `5` for absent or
+invalid values. feature-factory 0.7.2 stages the workflow inside the run
+directory; exact token `--auto` is never passed. Worklink's base selects the
+checkout start point and PR target; it is not factory `--base`, which is never
+passed.
+
+Before first factory dispatch only, after checkout creation and before process
+launch, Worklink reads the effective checkout `git config --get user.name` and
+`git config --get user.email`. Both must be nonblank. The child receives
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+`GIT_COMMITTER_EMAIL`; Worklink never writes sandbox Git identity configuration.
+
+Worklink reads the nonblank `publishing_identity` only from the trusted
+controller checkout's `.factory.json`. For GitHub publication Worklink
+verifies the credential this process is already bound to, `GITHUB_TOKEN`, rather
+than selecting among candidates: `GH_TOKEN` is a child-only alias for `gh`, and
+verifying a second credential in a process that already verified one is refused
+by the forge identity memo before `/user` is ever reached. That token's owner is
+compared against the declared identity before dispatch, then both child aliases
+are normalized to it. `GH_TOKEN` and `GITHUB_TOKEN` set to different values fail
+dispatch as an operator ambiguity rather than one being preferred, and a missing
+`GITHUB_TOKEN` fails naming that variable - in both cases without disclosing
+values.
 
 Worklink supervises OpenCode while `/feature` owns factory transitions. The
 12-hour `MIMIR_FACTORY_RUN_TIMEOUT_S` default is only a process liveness

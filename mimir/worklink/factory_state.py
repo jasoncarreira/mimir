@@ -59,10 +59,16 @@ class FactoryRunRecord:
         if self.session is not None and (not self.session.strip() or "\x00" in self.session):
             raise FactoryRecordError("factory record session is invalid")
         if self.status is not None:
-            if self.status.run_id != self.run_id or self.status.issue_key != str(self.issue_id):
+            if (
+                self.status.run_id != self.run_id
+                or self.status.issue_key is None
+                or self.status.issue_key != str(self.issue_id)
+            ):
                 raise FactoryRecordError("factory record status identity mismatch")
             if self.status.sandbox_path != self.sandbox:
                 raise FactoryRecordError("factory record status sandbox mismatch")
+            if self.status.pr_base is not None and self.status.pr_base != self.base_ref:
+                raise FactoryRecordError("factory record status base mismatch")
         if self.controller_error is not None and len(self.controller_error.encode("utf-8")) > 65536:
             raise FactoryRecordError("factory record error exceeds size limit")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -37,7 +38,10 @@ from mimir.worklink.orchestrator import (
     _demote_template_invalid_ready_leaf,
     _epic_run_timeout_s,
     _epic_stale_heartbeat_s,
+    _read_checkout_git_identity,
+    _read_factory_publishing_identity,
     _read_pr_body_section,
+    _resolve_factory_github_credential,
     render_decomposition_prompt,
     run_worklink,
     validate_leaf,
@@ -1797,6 +1801,657 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
     assert not (repo / ".worklink").exists()
 
 
+def test_checkout_git_identity_reads_both_effective_values_with_fixed_argv(
+    tmp_path: Path,
+) -> None:
+    calls: list[Sequence[str] | str] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if isinstance(args, list) and args[-1] == "user.name":
+            return cp(args, stdout=" Factory Author \n")
+        return cp(args, stdout=" factory@example.com \n")
+
+    assert _read_checkout_git_identity(tmp_path, runner) == (
+        "Factory Author",
+        "factory@example.com",
+    )
+    assert calls == [
+        ["git", "-C", str(tmp_path), "config", "--get", "user.name"],
+        ["git", "-C", str(tmp_path), "config", "--get", "user.email"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ({"user.name": cp([], 1), "user.email": cp([], 1)}, "missing user.name, user.email"),
+        ({"user.name": cp([], stdout=" \n"), "user.email": cp([], stdout="a@b.test\n")}, "missing user.name"),
+        (
+            {"user.name": cp([], 128), "user.email": cp([], 1)},
+            "missing user.email; failed user.name (git exit 128)",
+        ),
+    ],
+)
+def test_checkout_git_identity_collects_all_failures_before_refusing(
+    tmp_path: Path,
+    results: dict[str, subprocess.CompletedProcess[str]],
+    expected: str,
+) -> None:
+    calls: list[str] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        assert isinstance(args, list)
+        key = args[-1]
+        calls.append(key)
+        result = results[key]
+        return cp(args, result.returncode, result.stdout, result.stderr)
+
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        _read_checkout_git_identity(tmp_path, runner)
+
+    assert calls == ["user.name", "user.email"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"publishing_identity": " factory-owner "}, "factory-owner"),
+        ({"publishing_identity": ""}, None),
+        ({"publishing_identity": 7}, None),
+        ({"bootstrap": "token=should-not-leak"}, None),
+    ],
+)
+def test_factory_publishing_identity_is_read_only_and_nonblank(
+    tmp_path: Path, payload: dict[str, object], expected: str | None
+) -> None:
+    declaration = tmp_path / ".factory.json"
+    declaration.write_text(json.dumps(payload), encoding="utf-8")
+    before = declaration.read_bytes()
+
+    if expected is None:
+        with pytest.raises(RuntimeError, match="factory publishing identity is missing") as exc:
+            _read_factory_publishing_identity(tmp_path)
+        assert "should-not-leak" not in str(exc.value)
+    else:
+        assert _read_factory_publishing_identity(tmp_path) == expected
+
+    assert declaration.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("{not-json token=should-not-leak", "declaration is invalid"),
+        ("[]", "declaration is invalid"),
+    ],
+)
+def test_factory_publishing_identity_errors_are_secret_safe(
+    tmp_path: Path, content: str, expected: str
+) -> None:
+    (tmp_path / ".factory.json").write_text(content, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=expected) as exc:
+        _read_factory_publishing_identity(tmp_path)
+
+    assert "should-not-leak" not in str(exc.value)
+
+
+def test_factory_publishing_identity_missing_declaration_is_secret_safe(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _read_factory_publishing_identity(tmp_path)
+
+    assert str(exc.value) == "factory publishing identity declaration is unreadable"
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({"GITHUB_TOKEN": "github-token"}, "github-token"),
+        ({"GH_TOKEN": "same-token", "GITHUB_TOKEN": "same-token"}, "same-token"),
+        ({"GITHUB_TOKEN": " github-token "}, "github-token"),
+        ({"GH_TOKEN": " github-token ", "GITHUB_TOKEN": " github-token "}, "github-token"),
+    ],
+)
+def test_factory_github_credential_inherits_process_token_and_normalizes_aliases(
+    environ: dict[str, str], expected: str
+) -> None:
+    token, child = _resolve_factory_github_credential(environ)
+
+    assert token == expected
+    assert child == {"GH_TOKEN": expected, "GITHUB_TOKEN": expected}
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"GH_TOKEN": " ", "GITHUB_TOKEN": ""},
+        {},
+        {"GH_TOKEN": "gh-token-only"},
+    ],
+)
+def test_factory_github_credential_requires_the_process_token(environ: dict[str, str]) -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_factory_github_credential(environ)
+
+    assert str(exc.value) == "factory publication requires GITHUB_TOKEN"
+    assert "gh-token-only" not in str(exc.value)
+
+
+def test_factory_github_credential_refuses_conflicting_aliases_without_values() -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_factory_github_credential(
+            {"GH_TOKEN": "gh-secret", "GITHUB_TOKEN": "github-secret"}
+        )
+
+    message = str(exc.value)
+    assert "GH_TOKEN" in message
+    assert "GITHUB_TOKEN" in message
+    assert "gh-secret" not in message
+    assert "github-secret" not in message
+
+
+def test_inherited_credential_clears_a_prebound_identity_memo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preflight must not collide with a memo an earlier forge call bound.
+
+    `verify_identity` memoizes `(login, fingerprint)` process-wide and refuses a
+    fingerprint change before it ever reaches `/user`. Selecting `GH_TOKEN` while
+    the rest of the process was bound to `GITHUB_TOKEN` therefore failed the
+    preflight even when both credentials belonged to the declared publisher.
+    Inheriting the process credential removes the second fingerprint entirely.
+    """
+    from mimir.forge import github as github_module
+
+    token, child = _resolve_factory_github_credential(
+        {"GITHUB_TOKEN": "process-token", "GH_TOKEN": "process-token"}
+    )
+    assert child == {"GH_TOKEN": "process-token", "GITHUB_TOKEN": "process-token"}
+
+    monkeypatch.setattr(
+        github_module,
+        "_verified_identity",
+        ("factory-owner", github_module._credential_fingerprint("process-token")),
+    )
+
+    def unexpected_request(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a bound memo must answer without re-querying /user")
+
+    monkeypatch.setattr(github_module.GitHubForgeClient, "_request", unexpected_request)
+
+    assert (
+        github_module.GitHubForgeClient(token=token).verify_identity("factory-owner")
+        == "factory-owner"
+    )
+
+    # The other half of the pair: a second credential is what the memo refuses,
+    # so this test fails if the guard it is protecting against stops existing.
+    with pytest.raises(RuntimeError, match="does not match active credential"):
+        github_module.GitHubForgeClient(token="a-second-token").verify_identity("factory-owner")
+
+
+def _run_factory_preflight_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    identity_results: dict[str, subprocess.CompletedProcess[str]] | None = None,
+    credentials: dict[str, str] | None = None,
+    publishing_identity: object = "factory-owner",
+    verify: Any = None,
+) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / "factory-checkout"
+    checkout.mkdir()
+    (repo / ".factory.json").write_text(
+        json.dumps({"publishing_identity": publishing_identity, "bootstrap": "uv sync"}),
+        encoding="utf-8",
+    )
+    epic = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    commands: list[list[str]] = []
+    defaults = {
+        "user.name": cp([], stdout="Factory Author\n"),
+        "user.email": cp([], stdout="factory@example.com\n"),
+    }
+    configured_results = identity_results or defaults
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list):
+            commands.append(args)
+            if args[:4] == ["chainlink", "issue", "show", "700"]:
+                return cp(args, stdout=epic)
+            if args[:4] == ["git", "-C", str(repo), "config"]:
+                return cp(args, stdout="git@github.com:owner/repo.git\n")
+            if args[:5] == ["git", "-C", str(checkout), "config", "--get"]:
+                result = configured_results[args[-1]]
+                return cp(args, result.returncode, result.stdout, result.stderr)
+        return cp(args)
+
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    lease = CheckoutLease(
+        issue_id=700,
+        attempt=1,
+        repo=repo,
+        path=checkout,
+        branch="issue/700-a1",
+        base_ref="main",
+        local_base="origin/main",
+        isolated_checkout=True,
+    )
+    launched: list[WorkSpec] = []
+
+    async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
+        launched.append(spec)
+        raise RuntimeError("launch reached")
+
+    verified_tokens: list[str] = []
+
+    class Client:
+        def __init__(self, *, token: str) -> None:
+            self.token = token
+            verified_tokens.append(token)
+
+        def verify_identity(self, declared: str) -> str:
+            if verify is not None:
+                return verify(self.token, declared)
+            return declared
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    for key, value in (credentials or {}).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", lambda *args, **kwargs: lease)
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", Client)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+    )
+    return result, launched, verified_tokens, commands
+
+
+@pytest.mark.parametrize(
+    ("credentials", "selected"),
+    [
+        ({"GITHUB_TOKEN": "github-token"}, "github-token"),
+        ({"GH_TOKEN": "same-token", "GITHUB_TOKEN": "same-token"}, "same-token"),
+    ],
+)
+def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    credentials: dict[str, str],
+    selected: str,
+) -> None:
+    result, launched, verified_tokens, commands = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials=credentials
+    )
+
+    assert result.reason == "launch reached"
+    assert verified_tokens == [selected]
+    assert len(launched) == 1
+    assert launched[0].env["GH_TOKEN"] == selected
+    assert launched[0].env["GITHUB_TOKEN"] == selected
+    assert launched[0].env["GIT_AUTHOR_NAME"] == "Factory Author"
+    assert launched[0].env["GIT_AUTHOR_EMAIL"] == "factory@example.com"
+    assert launched[0].env["GIT_COMMITTER_NAME"] == "Factory Author"
+    assert launched[0].env["GIT_COMMITTER_EMAIL"] == "factory@example.com"
+    checkout_configs = [
+        command
+        for command in commands
+        if command[:4] == ["git", "-C", str(tmp_path / "factory-checkout"), "config"]
+    ]
+    assert checkout_configs == [
+        ["git", "-C", str(tmp_path / "factory-checkout"), "config", "--get", "user.name"],
+        ["git", "-C", str(tmp_path / "factory-checkout"), "config", "--get", "user.email"],
+    ]
+
+
+def test_factory_dispatched_environment_sets_real_commit_author_and_committer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"}
+    )
+    checkout = tmp_path / "factory-checkout"
+    subprocess.run(["git", "-C", str(checkout), "init", "-q"], check=True)
+    (checkout / "change.txt").write_text("factory change\n", encoding="utf-8")
+    child_env = dict(os.environ)
+    child_env.update(launched[0].env)
+    child_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    child_env["GIT_CONFIG_GLOBAL"] = os.devnull
+    subprocess.run(["git", "-C", str(checkout), "add", "change.txt"], check=True, env=child_env)
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-q", "-m", "factory commit"],
+        check=True,
+        env=child_env,
+    )
+
+    identity = subprocess.run(
+        ["git", "-C", str(checkout), "show", "-s", "--format=%an <%ae>%n%cn <%ce>", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=child_env,
+    ).stdout.strip()
+    assert result.reason == "launch reached"
+    assert identity == "Factory Author <factory@example.com>\nFactory Author <factory@example.com>"
+    for key in ("user.name", "user.email"):
+        local = subprocess.run(
+            ["git", "-C", str(checkout), "config", "--local", "--get", key],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert local.returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("identity_results", "missing"),
+    [
+        (
+            {"user.name": cp([], 1), "user.email": cp([], stdout="factory@example.com\n")},
+            "user.name",
+        ),
+        (
+            {"user.name": cp([], stdout="Factory Author\n"), "user.email": cp([], 1)},
+            "user.email",
+        ),
+        ({"user.name": cp([], 1), "user.email": cp([], 1)}, "user.name, user.email"),
+    ],
+)
+def test_missing_checkout_git_identity_prevents_factory_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_results: dict[str, subprocess.CompletedProcess[str]],
+    missing: str,
+) -> None:
+    result, launched, verified_tokens, commands = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        identity_results=identity_results,
+        credentials={"GITHUB_TOKEN": "unused-token"},
+    )
+
+    assert result.reason is not None
+    assert f"missing {missing}" in result.reason
+    assert launched == []
+    assert verified_tokens == []
+    identity_commands = [command for command in commands if command[-1:] in [["user.name"], ["user.email"]]]
+    assert identity_commands == [
+        ["git", "-C", str(tmp_path / "factory-checkout"), "config", "--get", "user.name"],
+        ["git", "-C", str(tmp_path / "factory-checkout"), "config", "--get", "user.email"],
+    ]
+
+
+def test_missing_factory_github_credential_prevents_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result, launched, verified_tokens, _ = _run_factory_preflight_case(tmp_path, monkeypatch)
+
+    assert result.reason == "factory publication requires GITHUB_TOKEN"
+    assert launched == []
+    assert verified_tokens == []
+
+
+def test_missing_factory_publishing_identity_prevents_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, launched, verified_tokens, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "unused-token"},
+        publishing_identity=" ",
+    )
+
+    assert result.reason == "factory publishing identity is missing"
+    assert launched == []
+    assert verified_tokens == []
+
+
+def test_conflicting_factory_tokens_refuse_dispatch_before_any_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two different credentials are an operator ambiguity, not a precedence question.
+
+    Nothing is verified: preferring one silently is how publication proceeds under
+    the wrong identity, which is what `publishing_identity` exists to catch.
+    """
+    result, launched, verified_tokens, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GH_TOKEN": "gh-secret", "GITHUB_TOKEN": "github-secret"},
+    )
+
+    assert result.reason is not None
+    assert "GH_TOKEN" in result.reason
+    assert "GITHUB_TOKEN" in result.reason
+    assert launched == []
+    assert verified_tokens == []
+    assert "gh-secret" not in result.reason
+    assert "github-secret" not in result.reason
+
+
+def test_factory_new_run_uses_single_backend_checkout_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    placement_calls: list[tuple[Path, dict[str, object]]] = []
+    preflight_events: list[str] = []
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    lease = CheckoutLease(
+        issue_id=700,
+        attempt=1,
+        repo=repo,
+        path=tmp_path / "factory-checkout",
+        branch="issue/700-a1",
+        base_ref="main",
+        local_base="origin/main",
+        isolated_checkout=True,
+    )
+    declaration = repo / ".factory.json"
+    declaration.write_text(
+        json.dumps({"publishing_identity": "factory-owner", "bootstrap": "uv sync"}),
+        encoding="utf-8",
+    )
+    declaration_before = declaration.read_bytes()
+    lease.path.mkdir()
+    sandbox_declaration = lease.path / ".factory.json"
+    sandbox_declaration.write_text(
+        json.dumps({"publishing_identity": "sandbox-owner"}), encoding="utf-8"
+    )
+    sandbox_declaration_before = sandbox_declaration.read_bytes()
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if args == ["git", "-C", str(lease.path), "config", "--get", "user.name"]:
+            return cp(args, stdout="Factory Author\n")
+        if args == ["git", "-C", str(lease.path), "config", "--get", "user.email"]:
+            return cp(args, stdout="factory@example.com\n")
+        return cp(args)
+
+    def place(checkout_repo: Path, **kwargs: object) -> CheckoutLease:
+        preflight_events.append("checkout")
+        placement_calls.append((checkout_repo, kwargs))
+        return lease
+
+    async def stop_after_placement(self: object, spec: WorkSpec) -> LaunchHandle:
+        preflight_events.append("launch")
+        assert spec.env == {
+            "MIMIR_HOME": str(tmp_path),
+            "GH_TOKEN": "selected-token",
+            "GITHUB_TOKEN": "selected-token",
+            "GIT_AUTHOR_NAME": "Factory Author",
+            "GIT_AUTHOR_EMAIL": "factory@example.com",
+            "GIT_COMMITTER_NAME": "Factory Author",
+            "GIT_COMMITTER_EMAIL": "factory@example.com",
+        }
+        raise RuntimeError("stop after placement")
+
+    original_read_git_identity = orchestrator._read_checkout_git_identity
+    original_read_publishing_identity = orchestrator._read_factory_publishing_identity
+    original_resolve_credential = orchestrator._resolve_factory_github_credential
+
+    def read_git_identity(checkout: Path, command_runner: object) -> tuple[str, str]:
+        preflight_events.append("git-identity")
+        return original_read_git_identity(checkout, command_runner)
+
+    def read_publishing_identity(checkout_repo: Path) -> str:
+        preflight_events.append("publishing-identity")
+        return original_read_publishing_identity(checkout_repo)
+
+    def resolve_credential(environ: object) -> tuple[str, dict[str, str]]:
+        preflight_events.append("credential")
+        return original_resolve_credential(environ)
+
+    class VerifiedClient:
+        def __init__(self, *, token: str) -> None:
+            assert token == "selected-token"
+
+        def verify_identity(self, declared: str) -> str:
+            preflight_events.append("verify")
+            assert declared == "factory-owner"
+            return declared
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", " selected-token ")
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", place)
+    monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", read_git_identity)
+    monkeypatch.setattr(orchestrator, "_read_factory_publishing_identity", read_publishing_identity)
+    monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", resolve_credential)
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", VerifiedClient)
+    monkeypatch.setattr(
+        orchestrator.LocalSubprocessComputeBackend, "launch", stop_after_placement
+    )
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "stop after placement"
+    assert len(placement_calls) == 1
+    checkout_repo, kwargs = placement_calls[0]
+    assert checkout_repo == repo
+    assert kwargs["issue_id"] == 700
+    assert kwargs["attempt"] == 1
+    assert kwargs["base"] == "main"
+    assert isinstance(kwargs["backend"], FeatureFactoryBackend)
+    assert preflight_events == [
+        "checkout",
+        "git-identity",
+        "publishing-identity",
+        "credential",
+        "verify",
+        "launch",
+    ]
+    assert declaration.read_bytes() == declaration_before
+    assert sandbox_declaration.read_bytes() == sandbox_declaration_before
+
+
+def test_factory_identity_preflight_is_not_repeated_for_retained_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic = json.dumps(
+        {
+            "id": 700,
+            "title": "epic",
+            "description": "build",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    retained = object()
+
+    async def recover(self: object, **kwargs: object) -> object:
+        assert kwargs["retained"] is retained
+        return orchestrator.WorklinkRunResult(700, 1, "needs-human")
+
+    def unexpected(*args: object, **kwargs: object) -> object:
+        raise AssertionError("new-run identity preflight reached during recovery")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "claim_issue",
+        lambda self, *args, **kwargs: ClaimResult(True, claim),
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(orchestrator, "load_factory_record", lambda *args: retained)
+    monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
+    monkeypatch.setattr(orchestrator, "_read_checkout_git_identity", unexpected)
+    monkeypatch.setattr(orchestrator, "_read_factory_publishing_identity", unexpected)
+    monkeypatch.setattr(orchestrator, "_resolve_factory_github_credential", unexpected)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+    )
+
+    assert result.status == "needs-human"
+
+
 @pytest.mark.parametrize("autonomous", [False, True])
 def test_every_epic_claim_uses_factory_concurrency_cap(
     tmp_path: Path,
@@ -1856,6 +2511,7 @@ def _factory_lifecycle_status(
     status: str,
     lock: str = "fresh",
     session: str | None = "session-1",
+    pr_base: str | None = "main",
 ) -> Any:
     return parse_factory_status(
         {
@@ -1866,7 +2522,7 @@ def _factory_lifecycle_status(
             "status": status,
             "mode": "autonomous",
             "branch": "epic/700",
-            "pr_base": "main",
+            "pr_base": pr_base,
             "pr_draft": False,
             "lock": lock,
             "dead_lock": False,
@@ -1898,6 +2554,42 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
         observed_at=None,
         controller_phase="running",
     )
+
+
+@pytest.mark.parametrize("lifecycle", ["running", "needs-human", "blocked", "partial"])
+def test_factory_status_binding_allows_null_base_before_completion(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = _factory_lifecycle_status(sandbox, status=lifecycle, pr_base=None)
+
+    orchestrator._require_factory_status(status, record)
+    observed = record.observed(status, datetime.now(UTC).isoformat())
+    assert observed.status is not None
+    assert observed.status.pr_base is None
+
+
+def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = _factory_lifecycle_status(sandbox, status="running", pr_base="develop")
+
+    with pytest.raises(orchestrator.WorklinkError, match="base mismatch"):
+        orchestrator._require_factory_status(status, record)
 
 
 def test_factory_supervision_drains_exact_handle_while_status_is_polled(
@@ -2385,6 +3077,49 @@ def test_factory_completion_requires_entire_success_conjunction(
     assert pr_url == "https://github.com/owner/repo/pull/42"
     assert evidence["status"] == "completed"
     assert evidence["head_sha"] == "a" * 40
+
+
+@pytest.mark.parametrize("pr_base", [None, "develop"])
+def test_factory_completion_rejects_unbound_base_before_external_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pr_base: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _completion_record(sandbox)
+    status = record.status
+    assert status is not None
+    object.__setattr__(record, "status", replace(status, pr_base=pr_base))
+    external_calls: list[str] = []
+
+    async def observed(**kwargs: object) -> EvidenceValidation:
+        external_calls.append("evidence")
+        return _completion_validation(sandbox)
+
+    def runner(
+        args: Sequence[str] | str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        external_calls.append("runner")
+        return cp(args)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    with pytest.raises(orchestrator.WorklinkError, match="base mismatch"):
+        asyncio.run(
+            orchestrator._verify_factory_completion(
+                home=tmp_path,
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                record=record,
+                test_command="pytest -q",
+                started_at=datetime.now(UTC),
+                runner=runner,
+            )
+        )
+
+    assert external_calls == []
 
 
 def test_factory_completion_failure_never_transitions_to_review(

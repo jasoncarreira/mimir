@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from mimir.worklink.backends import ToolPin
+from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import (
     ChainlinkBumpFiler,
     ToolPinDrift,
@@ -50,6 +51,8 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["gogcli"].category == "integration-cli"
     assert pins["osv-scanner"].category == "security-scanner"
     assert pins["opencode"].category == "coding-cli"
+    assert pins["feature-factory"].pin == FACTORY_VERSION
+    assert pins["opencode-feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].category == "coding-plugin"
     assert pins["opencode-project-memory"].category == "coding-plugin"
     assert pins["opencode-openai-codex-auth"].category == "coding-plugin"
@@ -91,23 +94,28 @@ def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
 def test_default_tool_pin_inventory_matches_shipped_install_literals() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
     root = Path(__file__).resolve().parents[1]
-    install_text = "\n".join(
-        (root / relpath).read_text(encoding="utf-8")
-        for relpath in (
-            "Dockerfile",
-            "mimir/scaffold_docker.py",
-            "mimir/skills/chainlink/dockerfile.fragment",
-            "mimir/optional-skills/gmail-poller/dockerfile.fragment",
-            "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",
-        )
+    install_paths = (
+        "Dockerfile",
+        "mimir/scaffold_docker.py",
+        "mimir/skills/chainlink/dockerfile.fragment",
+        "mimir/optional-skills/gmail-poller/dockerfile.fragment",
+        "mimir/optional-skills/dependency-advisory-watch/dockerfile.fragment",
     )
+    install_sources = {
+        relpath: (root / relpath).read_text(encoding="utf-8")
+        for relpath in install_paths
+    }
+    install_text = "\n".join(install_sources.values())
 
     assert f"--tag {pins['chainlink'].pin}" in install_text
     assert f"@mermaid-js/mermaid-cli@{pins['mermaid-cli'].pin}" in install_text
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
-    assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in install_text
+    for relpath in ("Dockerfile", "mimir/scaffold_docker.py"):
+        source = install_sources[relpath]
+        assert f"feature-factory@{pins['feature-factory'].pin}" in source
+        assert f"opencode-feature-factory@{pins['opencode-feature-factory'].pin}" in source
     assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
     assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
     assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text

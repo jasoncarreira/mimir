@@ -1303,7 +1303,7 @@ def test_full_corpus_flag_changes_only_saga_read_authority(tmp_path: Path) -> No
         assert broad_decision.allowed is False
 
 
-def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> None:
+def test_synthesis_builtin_has_bounded_closing_reads(tmp_path: Path) -> None:
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
     )
@@ -1314,8 +1314,199 @@ def test_synthesis_builtin_has_scoped_pr_reads_without_shell(tmp_path: Path) -> 
     assert "repository" in principal.readable_domains
     for capability in ("pr_metadata", "pr_checks", "pr_reviews"):
         assert access_control.TRIGGER_CAPABILITY_TIERS[capability] is CapabilityTier.SCOPE_CONTAINED
-    assert "shell_exec" not in principal.capabilities
-    assert "shell_process" not in principal.sink_destinations
+    assert {"shell_exec", "fetch_url"} <= set(principal.capabilities)
+    assert principal.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "session_boundary",
+    )
+    assert principal.sink_policy_for("fetch_url") == ServiceSinkPolicy(
+        "fetch_url", "github_pr_api", "GITHUB_REPOS",
+    )
+    assert principal.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+
+
+def _trusted_service_auth(service: ServicePrincipal, *, channel_id: str) -> AuthContext:
+    labels = InformationFlowLabels()
+    return replace(
+        _service_auth(service, labels),
+        channel_id=channel_id,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "command"),
+    [
+        ("heartbeat", "chainlink issue comment 1321 closed"),
+        ("heartbeat", "chainlink issue close 1321"),
+        ("session-boundary", "chainlink issue show 1321 --json"),
+        ("session-boundary", "chainlink issue update 1321 --title closed"),
+    ],
+)
+def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
+    profile: str,
+    command: str,
+    tmp_path: Path,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    service = access_control.builtin_trigger_service_principal(profile, tmp_path)
+    auth = _trusted_service_auth(service, channel_id="scheduler:heartbeat")
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 7 --repo acme/widget --json number,title",
+        "gh issue view 9 --repo acme/widget --json number,title --comments",
+    ],
+)
+def test_synthesis_reaches_observed_read_only_github_shell_reads(
+    command: str,
+    tmp_path: Path,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is True, decision.reason
+
+
+def test_synthesis_fetch_is_bounded_to_configured_github_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    service = access_control.builtin_trigger_service_principal(
+        "session-boundary", tmp_path,
+    )
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+    registry = ToolRegistry()
+
+    allowed = registry.authorize_tool(
+        "fetch_url", auth, enforce=True,
+        target_channel="https://api.github.com/repos/acme/widget/pulls/7",
+    )
+    denied = registry.authorize_tool(
+        "fetch_url", auth, enforce=True,
+        target_channel="https://api.github.com/repos/other/repo/pulls/7",
+    )
+
+    assert allowed.allowed is True
+    assert denied.allowed is False
+    assert denied.reason == "egress_destination_not_approved"
+
+
+@pytest.mark.parametrize(
+    ("profile", "channel_id", "tool_name"),
+    [
+        ("heartbeat", "scheduler:heartbeat", "read_file"),
+        ("heartbeat", "scheduler:heartbeat", "ls"),
+        ("session-boundary", "channel-a", "read_file"),
+        ("session-boundary", "channel-a", "ls"),
+    ],
+)
+def test_closing_principals_read_only_their_own_channel_memory(
+    profile: str,
+    channel_id: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    own = home / "memory" / "channels" / channel_id
+    other = home / "memory" / "channels" / "channel-other"
+    own.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (own / "summary.md").write_text("own\n", encoding="utf-8")
+    (other / "summary.md").write_text("other\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = access_control.builtin_trigger_service_principal(profile, home)
+    auth = _trusted_service_auth(service, channel_id=channel_id)
+    registry = ToolRegistry()
+    argument_name = "file_path" if tool_name == "read_file" else "path"
+    own_target = own / "summary.md" if tool_name == "read_file" else own
+    other_target = other / "summary.md" if tool_name == "read_file" else other
+
+    allowed = registry.authorize_tool(
+        tool_name, auth, enforce=True, arguments={argument_name: str(own_target)},
+    )
+    denied = registry.authorize_tool(
+        tool_name, auth, enforce=True, arguments={argument_name: str(other_target)},
+    )
+
+    assert allowed.allowed is True, allowed.reason
+    assert denied.allowed is False
+
+
+@pytest.mark.parametrize("profile", ["heartbeat", "session-boundary"])
+@pytest.mark.parametrize(
+    "command",
+    ["gh pr merge 7 --repo acme/widget --merge", "gh pr close 7 --repo acme/widget", "git push origin HEAD"],
+)
+def test_closing_principals_still_refuse_github_and_repository_mutations(
+    profile: str,
+    command: str,
+    tmp_path: Path,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    service = access_control.builtin_trigger_service_principal(profile, tmp_path)
+    auth = _trusted_service_auth(service, channel_id="channel-a")
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=True, target_channel=command,
+        arguments={"command": command},
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "service_sink_destination_denied"
+
+
+def test_session_boundary_companion_conformance_detects_omitted_closing_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
+    monkeypatch.setitem(
+        access_control._TRUSTED_SERVICE_PRINCIPALS,
+        "saga_session_end",
+        replace(
+            principal,
+            capabilities=tuple(
+                capability for capability in principal.capabilities
+                if capability != "fetch_url"
+            ),
+        ),
+    )
+
+    complete, errors = access_control.check_capability_matrix_complete()
+
+    assert complete is False
+    assert any(
+        "capabilities without companions: fetch_url" in error for error in errors
+    )
+
+
+def test_unrelated_system_principal_does_not_inherit_closing_authority() -> None:
+    system = get_service_principal("upgrade")
+    assert system is not None
+
+    assert system.authority_profile is None
+    assert "fetch_url" not in system.capabilities
+    assert system.sink_policy_for("shell_exec") == ServiceSinkPolicy(
+        "shell_exec", "shell_profile", "upgrade_workspace",
+    )
 
 
 def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
@@ -4461,7 +4652,7 @@ def _service_auth(
 
 
 @pytest.mark.asyncio
-async def test_service_capability_allowed_admin_operation_emits_non_blocking_audit() -> None:
+async def test_service_capability_allowed_admin_operation_emits_no_shadow_decision() -> None:
     service = get_service_principal("saga_session_end")
     assert service is not None
     registry = ToolRegistry()
@@ -4479,20 +4670,48 @@ async def test_service_capability_allowed_admin_operation_emits_non_blocking_aud
     enforced = registry.authorize_tool("saga_feedback", auth, enforce=True)
 
     assert decision.allowed is True
-    assert captured[0][1]["would_block"] is (not enforced.allowed)
+    assert enforced.allowed is True
     assert decision.is_shadow_decision is True
-    assert captured == [(
-        "shadow_tool_decision",
-        {
-            **decision.as_log_fields(),
-            "would_block": False,
-            "target": "saga",
-            "requested_target": None,
-            "trigger": "saga_session_end",
-        },
-    )]
+    assert decision.would_block is False
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_emission_uses_would_block_not_reason() -> None:
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def capture(kind: str, **fields: object) -> None:
+        captured.append((kind, fields))
+
+    admitted = access_control.ToolAuthorization(
+        tool_name="saga_feedback",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason="diagnostic_only",
+        is_shadow_decision=True,
+        would_block=False,
+    )
+    blocked = access_control.ToolAuthorization(
+        tool_name="remove_schedule",
+        decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True,
+        reason=None,
+        is_shadow_decision=True,
+        would_block=True,
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        registry._emit_shadow_decision(admitted)
+        registry._emit_shadow_decision(blocked)
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    assert all(fields["would_block"] is True for _, fields in captured)
     assert captured[0][1]["reason"] is None
-    assert captured[0][1]["service_principal"] == service.canonical
+
+
 
 
 @pytest.mark.asyncio
@@ -4515,6 +4734,7 @@ async def test_shadow_denial_event_is_self_classifying() -> None:
 
     assert decision.allowed is True
     assert captured[0][1]["would_block"] is (not enforced.allowed)
+    assert all(fields["would_block"] is True for _, fields in captured)
     assert captured == [(
         "shadow_tool_decision",
         {
@@ -6979,6 +7199,7 @@ def test_github_service_read_scope_includes_only_its_active_checkout_lease(
     for path in (state_root, source, lease_root, outside):
         path.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease_root}:rw")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
 
     state = _review_state("o/r", 42, "worklink/42", str(source))
