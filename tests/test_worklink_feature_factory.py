@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
@@ -12,12 +13,16 @@ import pytest
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
+    FACTORY_VERSION,
     FactoryContractError,
     FeatureFactoryBackend,
     epic_run_id,
     parse_factory_status,
     probe_factory_capabilities,
     resolve_factory_entrypoint,
+    _DEFAULT_FACTORY_MAX_RETRIES,
+    _MAX_FACTORY_MAX_RETRIES,
+    _factory_max_retries,
     _run_bounded,
 )
 
@@ -57,11 +62,11 @@ def package_entrypoint(tmp_path: Path) -> Path:
     entrypoint = feature / "bin" / "factory.js"
     entrypoint.write_text("", encoding="utf-8")
     (feature / "package.json").write_text(
-        json.dumps({"name": "feature-factory", "version": "0.7.0"}),
+        json.dumps({"name": "feature-factory", "version": FACTORY_VERSION}),
         encoding="utf-8",
     )
     (adapter / "package.json").write_text(
-        json.dumps({"name": "opencode-feature-factory", "version": "0.7.0"}),
+        json.dumps({"name": "opencode-feature-factory", "version": FACTORY_VERSION}),
         encoding="utf-8",
     )
     return entrypoint
@@ -80,6 +85,25 @@ def test_status_contract_preserves_optional_next_and_opaque_terminal_result() ->
         status.require_recovery_next()
 
 
+def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
+    status = parse_factory_status(
+        status_payload(
+            issue_key=None,
+            pr_base=None,
+            lock_session=None,
+            validator={"status": "pending", "score": 0.5},
+            terminal_result={"reason": "opaque"},
+        )
+    )
+    assert status.issue_key is None
+    assert status.pr_base is None
+    assert status.lock_session is None
+    assert status.pr_url is None
+    assert status.validator == {"status": "pending", "score": 0.5}
+    assert status.terminal_result == {"reason": "opaque"}
+    assert parse_factory_status(status.to_json()) == status
+
+
 @pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
 def test_top_level_terminal_statuses(terminal: str) -> None:
     assert parse_factory_status(status_payload(status=terminal)).is_terminal
@@ -89,13 +113,13 @@ def test_top_level_terminal_statuses(terminal: str) -> None:
     ("field", "value"),
     [
         ("valid", "true"),
+        ("issue_key", 1551),
+        ("pr_base", 1551),
         ("steps", [{"status": "running"}]),
         ("slices", [""]),
         ("lock", {"status": "fresh"}),
         ("lock_session", 4),
         ("pr_url", 4),
-        ("validator", []),
-        ("terminal_result", "completed"),
         ("next", " "),
     ],
 )
@@ -104,13 +128,34 @@ def test_status_rejects_wrong_field_types(field: str, value: object) -> None:
         parse_factory_status(status_payload(**{field: value}))
 
 
-def test_status_rejects_missing_unknown_trailing_and_nul() -> None:
+@pytest.mark.parametrize("field", ["validator", "terminal_result"])
+@pytest.mark.parametrize("value", ["value", [], True, 1])
+def test_status_rejects_non_object_opaque_fields(field: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=f"{field} must be an object"):
+        parse_factory_status(status_payload(**{field: value}))
+
+
+def test_status_accepts_additive_top_level_fields_after_payload_validation() -> None:
+    status = parse_factory_status(
+        status_payload(
+            workflow="/tmp/factory/1551/WORKFLOW.md",
+            future_status_metadata={"generation": 2},
+        )
+    )
+    assert status.run_id == "1551"
+    assert status.status == "running"
+
+    with pytest.raises(FactoryContractError, match="finite JSON"):
+        parse_factory_status(
+            status_payload(future_status_metadata={"value": float("nan")})
+        )
+
+
+def test_status_rejects_missing_known_fields_trailing_json_and_nul() -> None:
     missing = status_payload()
     missing.pop("mode")
     with pytest.raises(FactoryContractError, match="missing field"):
         parse_factory_status(missing)
-    with pytest.raises(FactoryContractError, match="unknown field"):
-        parse_factory_status(status_payload(cost={"total": 0}))
     with pytest.raises(FactoryContractError, match="one JSON object"):
         parse_factory_status(json.dumps(status_payload()) + "\n{}")
     with pytest.raises(FactoryContractError, match="bounds"):
@@ -151,16 +196,42 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
+    assert FACTORY_VERSION == "0.7.2"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
-    manifest = entrypoint.parents[1] / "package.json"
+
+
+@pytest.mark.parametrize(
+    ("package", "expected_name"),
+    [
+        ("feature-factory", "feature-factory"),
+        ("opencode-feature-factory", "opencode-feature-factory"),
+    ],
+)
+def test_admit_rejects_either_package_version_mismatch(
+    tmp_path: Path,
+    package: str,
+    expected_name: str,
+) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": "feature-factory", "version": "0.6.0"}),
+        json.dumps({"name": expected_name, "version": "0.7.1"}),
         encoding="utf-8",
     )
-    with pytest.raises(FactoryContractError, match="feature-factory@0.7.0"):
-        resolve_factory_entrypoint(entrypoint)
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(tuple(args))
+        raise AssertionError("capability probe must not run for a mismatched installation")
+
+    with pytest.raises(
+        FactoryContractError,
+        match=rf"requires {expected_name}@{re.escape(FACTORY_VERSION)}",
+    ):
+        FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner).admit()
+    assert calls == []
 
 
 def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
@@ -178,7 +249,8 @@ def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
             diagnostic = f"usage: factory {command}\nmissing required argument for {command}"
         return subprocess.CompletedProcess(args, 2, stdout=b"", stderr=diagnostic.encode())
 
-    probe_factory_capabilities(entrypoint, runner=runner)
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    assert backend.admit() == entrypoint.resolve()
     assert len(FACTORY_COMMANDS) == 16
     assert [call[2:] for call in calls[1:]] == [argv for _, argv in FACTORY_COMMANDS]
     assert calls[0][2:] == ("__mimir_unknown_command_probe__",)
@@ -289,7 +361,55 @@ def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
         probe_factory_capabilities(entrypoint, runner=runner)
 
 
-def test_opencode_launch_argv_has_one_leading_space_in_final_token(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, 5),
+        ("", 5),
+        ("0", 5),
+        ("-1", 5),
+        ("+1", 5),
+        ("1.0", 5),
+        ("1e2", 5),
+        (" 1", 5),
+        ("1 ", 5),
+        ("١", 5),
+        ("９", 5),
+        ("9007199254740992", 5),
+        ("9" * 10_000, 5),
+        ("1", 1),
+        ("42", 42),
+        ("00042", 42),
+        ("0" * 10_000 + "1", 1),
+        ("9007199254740991", 9_007_199_254_740_991),
+    ],
+)
+def test_factory_max_retries_accepts_only_bounded_ascii_decimal(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+
+    assert _DEFAULT_FACTORY_MAX_RETRIES == 5
+    assert _MAX_FACTORY_MAX_RETRIES == 9_007_199_254_740_991
+    assert _factory_max_retries() == expected
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(None, 5), ("17", 17)])
+def test_opencode_launch_argv_has_exact_staged_factory_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    expected: int,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
     order = WorkOrder(
         issue_id=1551,
         checkout=tmp_path,
@@ -316,8 +436,13 @@ def test_opencode_launch_argv_has_one_leading_space_in_final_token(tmp_path: Pat
         str(tmp_path),
         "--command",
         "feature",
-        " --autonomous 1551",
+        f" --autonomous --max-retries {expected} 1551",
     )
+    payload = (spec.local_argv or ())[-1]
+    assert payload.startswith(" ") and not payload.startswith("  ")
+    assert "--autonomous" in payload.split()
+    assert "--auto" not in payload.split()
+    assert "--base" not in payload.split()
     assert epic_run_id(1551) == "1551"
 
 

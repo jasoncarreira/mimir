@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.scaffold_docker import (
     Fragment,
     collect_fragments,
@@ -401,8 +402,12 @@ def test_render_dockerfile_installs_opencode_when_enabled():
         out = render_dockerfile([], mode=mode, install_opencode=True)
         assert "npm install --global --prefix /opt/mimir-opencode" in out, mode
         assert "opencode-ai@1.18.9" in out, mode
-        assert "feature-factory@0.7.0" in out, mode
-        assert "opencode-feature-factory@0.7.0" in out, mode
+        assert (
+            f"# Pins: opencode-ai@1.18.9, feature-factory@{FACTORY_VERSION}," in out
+        ), mode
+        assert f"# opencode-feature-factory@{FACTORY_VERSION}," in out, mode
+        assert f"            feature-factory@{FACTORY_VERSION} \\" in out, mode
+        assert f"            opencode-feature-factory@{FACTORY_VERSION} \\" in out, mode
         assert "opencode-project-memory@0.1.0" in out, mode
         assert "opencode-openai-codex-auth@4.4.0" in out, mode
         assert "opencode-anthropic-auth@0.0.13" in out, mode

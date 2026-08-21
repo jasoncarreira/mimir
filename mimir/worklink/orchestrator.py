@@ -24,6 +24,7 @@ import warnings
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .._rmtree import rmtree_missing_ok
+from ..forge.github import GitHubForgeClient
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -131,6 +132,81 @@ class WorklinkError(RuntimeError):
 
 class LeafValidationError(WorklinkError):
     """Issue is not structured enough to hand to a backend."""
+
+
+def _read_factory_publishing_identity(repo: Path) -> str:
+    declaration = repo / ".factory.json"
+    try:
+        payload = json.loads(declaration.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise WorklinkError("factory publishing identity declaration is unreadable") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorklinkError("factory publishing identity declaration is invalid") from exc
+    if not isinstance(payload, Mapping):
+        raise WorklinkError("factory publishing identity declaration is invalid")
+    identity = payload.get("publishing_identity")
+    if not isinstance(identity, str) or not identity.strip():
+        raise WorklinkError("factory publishing identity is missing")
+    return identity.strip()
+
+
+def _read_checkout_git_identity(checkout: Path, runner: Runner) -> tuple[str, str]:
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    failed: list[str] = []
+    for key in ("user.name", "user.email"):
+        argv = ["git", "-C", str(checkout), "config", "--get", key]
+        try:
+            result = runner(argv)
+        except Exception as exc:
+            failed.append(f"{key} ({type(exc).__name__})")
+            continue
+        value = result.stdout.strip()
+        if result.returncode == 1 or (result.returncode == 0 and not value):
+            missing.append(key)
+        elif result.returncode != 0:
+            failed.append(f"{key} (git exit {result.returncode})")
+        else:
+            values[key] = value
+    if missing or failed:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if failed:
+            details.append("failed " + ", ".join(failed))
+        raise WorklinkError("factory checkout Git identity preflight failed: " + "; ".join(details))
+    return values["user.name"], values["user.email"]
+
+
+def _resolve_factory_github_credential(
+    environ: Mapping[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Return the credential this process is already bound to, plus child aliases.
+
+    The parent does not select among candidate credentials. ``GITHUB_TOKEN`` is
+    what both the forge client and configuration read, so it is *the* process
+    credential; ``GH_TOKEN`` exists only because the factory's child shells out
+    to ``gh``, which prefers that name. Borrowing gh's precedence rule for the
+    parent's own verification would introduce a second credential into a process
+    that already verified one, and the forge identity memo refuses a fingerprint
+    change - so the preflight would fail without ever reaching ``/user``.
+
+    Two different non-blank values are an operator ambiguity, not a precedence
+    question. Silently preferring one is how publication proceeds under the
+    wrong identity, which is the failure ``.factory.json`` ``publishing_identity``
+    exists to catch, so this refuses and names the variables to reconcile.
+    """
+    github_token = environ.get("GITHUB_TOKEN", "").strip()
+    gh_token = environ.get("GH_TOKEN", "").strip()
+    if gh_token and github_token and gh_token != github_token:
+        raise WorklinkError(
+            "factory publication credentials conflict: GH_TOKEN and GITHUB_TOKEN "
+            "are both set to different values; unset GH_TOKEN or set it to the "
+            "same credential"
+        )
+    if not github_token:
+        raise WorklinkError("factory publication requires GITHUB_TOKEN")
+    return github_token, {"GH_TOKEN": github_token, "GITHUB_TOKEN": github_token}
 
 
 def _heartbeat_claim_best_effort(claims: ChainlinkClaims, record: ClaimRecord) -> None:
@@ -1280,13 +1356,24 @@ class WorklinkRunner:
                 event_logger=_log_event,
                 runner=_list_runner(runner),
             )
+            git_name, git_email = _read_checkout_git_identity(lease.path, runner)
+            publishing_identity = _read_factory_publishing_identity(self.repo)
+            github_token, github_env = _resolve_factory_github_credential(os.environ)
+            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,
                 prompt=_epic_prompt(issue),
                 rules=None,
                 timeout_s=int(_epic_run_timeout_s()),
-                env={"MIMIR_HOME": str(self.home)},
+                env={
+                    "MIMIR_HOME": str(self.home),
+                    **github_env,
+                    "GIT_AUTHOR_NAME": git_name,
+                    "GIT_AUTHOR_EMAIL": git_email,
+                    "GIT_COMMITTER_NAME": git_name,
+                    "GIT_COMMITTER_EMAIL": git_email,
+                },
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             spec = selected.work_spec(
@@ -1807,7 +1894,12 @@ def _verify_factory_recovery_binding(
     return sandbox
 
 
-def _require_factory_status(status: FactoryStatus, record: FactoryRunRecord) -> None:
+def _require_factory_status(
+    status: FactoryStatus,
+    record: FactoryRunRecord,
+    *,
+    require_pr_base: bool = False,
+) -> None:
     if not status.valid:
         raise WorklinkError("factory status is invalid")
     if status.run_id != record.run_id:
@@ -1820,7 +1912,9 @@ def _require_factory_status(status: FactoryStatus, record: FactoryRunRecord) -> 
         raise WorklinkError("factory status mode mismatch")
     if status.branch != record.branch:
         raise WorklinkError("factory status branch mismatch")
-    if status.pr_base != record.base_ref:
+    if status.pr_base is not None and status.pr_base != record.base_ref:
+        raise WorklinkError("factory status base mismatch")
+    if require_pr_base and status.pr_base is None:
         raise WorklinkError("factory status base mismatch")
 
 
@@ -1934,7 +2028,7 @@ async def _verify_factory_completion(
             raise WorklinkError("factory completion status is missing")
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
-        _require_factory_status(status, record)
+        _require_factory_status(status, record, require_pr_base=True)
         if status.pr_draft:
             raise WorklinkError("factory completed with a draft PR")
         if status.pr_url is None:
