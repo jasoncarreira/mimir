@@ -82,6 +82,25 @@ def test_status_contract_preserves_optional_next_and_opaque_terminal_result() ->
         status.require_recovery_next()
 
 
+def test_status_contract_preserves_nullable_fields_and_opaque_objects() -> None:
+    status = parse_factory_status(
+        status_payload(
+            issue_key=None,
+            pr_base=None,
+            lock_session=None,
+            validator={"status": "pending", "score": 0.5},
+            terminal_result={"reason": "opaque"},
+        )
+    )
+    assert status.issue_key is None
+    assert status.pr_base is None
+    assert status.lock_session is None
+    assert status.pr_url is None
+    assert status.validator == {"status": "pending", "score": 0.5}
+    assert status.terminal_result == {"reason": "opaque"}
+    assert parse_factory_status(status.to_json()) == status
+
+
 @pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
 def test_top_level_terminal_statuses(terminal: str) -> None:
     assert parse_factory_status(status_payload(status=terminal)).is_terminal
@@ -91,13 +110,13 @@ def test_top_level_terminal_statuses(terminal: str) -> None:
     ("field", "value"),
     [
         ("valid", "true"),
+        ("issue_key", 1551),
+        ("pr_base", 1551),
         ("steps", [{"status": "running"}]),
         ("slices", [""]),
         ("lock", {"status": "fresh"}),
         ("lock_session", 4),
         ("pr_url", 4),
-        ("validator", []),
-        ("terminal_result", "completed"),
         ("next", " "),
     ],
 )
@@ -106,13 +125,34 @@ def test_status_rejects_wrong_field_types(field: str, value: object) -> None:
         parse_factory_status(status_payload(**{field: value}))
 
 
-def test_status_rejects_missing_unknown_trailing_and_nul() -> None:
+@pytest.mark.parametrize("field", ["validator", "terminal_result"])
+@pytest.mark.parametrize("value", ["value", [], True, 1])
+def test_status_rejects_non_object_opaque_fields(field: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=f"{field} must be an object"):
+        parse_factory_status(status_payload(**{field: value}))
+
+
+def test_status_accepts_additive_top_level_fields_after_payload_validation() -> None:
+    status = parse_factory_status(
+        status_payload(
+            workflow="/tmp/factory/1551/WORKFLOW.md",
+            future_status_metadata={"generation": 2},
+        )
+    )
+    assert status.run_id == "1551"
+    assert status.status == "running"
+
+    with pytest.raises(FactoryContractError, match="finite JSON"):
+        parse_factory_status(
+            status_payload(future_status_metadata={"value": float("nan")})
+        )
+
+
+def test_status_rejects_missing_known_fields_trailing_json_and_nul() -> None:
     missing = status_payload()
     missing.pop("mode")
     with pytest.raises(FactoryContractError, match="missing field"):
         parse_factory_status(missing)
-    with pytest.raises(FactoryContractError, match="unknown field"):
-        parse_factory_status(status_payload(cost={"total": 0}))
     with pytest.raises(FactoryContractError, match="one JSON object"):
         parse_factory_status(json.dumps(status_payload()) + "\n{}")
     with pytest.raises(FactoryContractError, match="bounds"):

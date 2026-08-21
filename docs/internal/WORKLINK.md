@@ -73,6 +73,15 @@ and final PR identity verification.
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
   <session> --repo <sandbox>`.
+- **Status contract**: Factory status responses are bounded whole JSON payloads
+  with required, typed known fields; additive top-level fields are ignored.
+  `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null, while
+  `validator` and `terminal_result` are object-or-null. Binding a status to a
+  Worklink record requires a non-null matching issue key. A null PR base is
+  allowed during recovery and ordinary running, parked, blocked, or partial
+  observation, but a populated base must always match the record. Completed
+  publication verification requires a non-null matching PR base before evidence
+  collection or GitHub API calls.
 - **State**: Worklink records live under
   `<MIMIR_HOME>/state/worklink/factory-runs/<numeric-run-id>.json`. They preserve
   the exact launcher, sandbox, session, process handle, strict latest status,
