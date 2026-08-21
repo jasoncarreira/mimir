@@ -5471,6 +5471,186 @@ async def test_acp_lifecycle_reloads_owned_session_and_delivers_bound_reply(
         await foreign.load_session("/workspace/foreign", second_id)
 
 
+async def _refusal_test_acp(
+    tmp_path: Path,
+    response: str,
+) -> tuple[MimirAcpAgent, str, Any]:
+    class Client:
+        def __init__(self) -> None:
+            self.updates: list[Any] = []
+
+        async def session_update(self, session_id: str, update: Any) -> None:
+            self.updates.append(update)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    resolver = _resolver(
+        home,
+        f"""
+        people:
+          - canonical: operator
+            aliases: [{hash_web_key("operator-key")}]
+            access: {{roles: [admin], is_service: false}}
+        """,
+    )
+    channels = ChannelRegistry()
+    bus = TurnEventBus()
+    core = _build_agent(
+        tmp_path,
+        fake_agent=_FakeAgent(response_messages=[AIMessage(content=response)]),
+        channel_registry=channels,
+        turn_event_bus=bus,
+    )
+    core._identity_resolver = resolver
+    core._buffer.resolver = resolver
+    core._feedback.identity_resolver = resolver
+    acp = MimirAcpAgent(
+        SimpleNamespace(
+            core=SimpleNamespace(identity_resolver=resolver),
+            config=core._config,
+            adapters=SimpleNamespace(channels=channels),
+            turn_event_bus=bus,
+            agent=core,
+        )
+    )
+    client = Client()
+    acp.on_connect(client)
+    await acp.authenticate("mimir-web-key", **{"mimir.webKey": "operator-key"})
+    session_id = (await acp.new_session("/workspace")).session_id
+    return acp, session_id, client
+
+
+@pytest.mark.parametrize("refusal_kind", ["sink_gate", "bridge"])
+async def test_acp_refused_final_text_surfaces_scrubbed_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal_kind: str,
+) -> None:
+    acp, session_id, client = await _refusal_test_acp(tmp_path, "TOOLDONE")
+    raw_reason = (
+        "ifc_label_blocked:same_channel api_key=super-secret "
+        "/absolute/controller HTTPS 503 from api.provider.example"
+    )
+    if refusal_kind == "sink_gate":
+        monkeypatch.setattr(
+            SinkGate,
+            "check_sink_flow",
+            classmethod(
+                lambda cls, *args, **kwargs: SimpleNamespace(
+                    allowed=False,
+                    reason=raw_reason,
+                    enforcement_enabled=True,
+                    is_shadow_decision=False,
+                )
+            ),
+        )
+        expected_reason = "ifc_label_blocked:same_channel"
+    else:
+        async def refuse_send(*args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(sent=False, error="unbound ACP channel")
+
+        monkeypatch.setattr(acp._bridge, "send", refuse_send)
+        expected_reason = "unbound ACP channel"
+
+    with pytest.raises(acp_sdk.RequestError) as raised:
+        await acp.prompt(
+            session_id,
+            [acp_sdk.TextContentBlock(type="text", text="answer")],
+        )
+
+    error = raised.value.to_error_obj()
+    assert error == {
+        "code": -32603,
+        "message": f"Final response delivery refused: {expected_reason}",
+        "data": None,
+    }
+    assert all(
+        update.session_update != "agent_message_chunk"
+        for update in client.updates
+    )
+    serialized = json.dumps(error)
+    assert "super-secret" not in serialized
+    assert "/absolute/controller" not in serialized
+    assert "api.provider.example" not in serialized
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "home" / "logs" / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    expected_event = "sink_blocked" if refusal_kind == "sink_gate" else "send_message_failed"
+    assert any(event.get("type") == expected_event for event in events)
+
+
+async def test_acp_successful_final_text_delivery_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    acp, session_id, client = await _refusal_test_acp(tmp_path, "ANSWER")
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="question")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert [update.session_update for update in client.updates] == [
+        "user_message_chunk",
+        "agent_message_chunk",
+    ]
+    assert client.updates[1].content.text == "ANSWER"
+
+
+async def test_acp_empty_final_text_remains_normal_silent_end_turn(
+    tmp_path: Path,
+) -> None:
+    acp, session_id, client = await _refusal_test_acp(tmp_path, "")
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="say nothing")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert all(
+        update.session_update != "agent_message_chunk"
+        for update in client.updates
+    )
+
+
+async def test_acp_refusal_reporting_failure_does_not_fail_the_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acp, session_id, client = await _refusal_test_acp(tmp_path, "TOOLDONE")
+
+    monkeypatch.setattr(
+        SinkGate,
+        "check_sink_flow",
+        classmethod(
+            lambda cls, *args, **kwargs: SimpleNamespace(
+                allowed=False,
+                reason="forced_refusal",
+                enforcement_enabled=True,
+                is_shadow_decision=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "mimir.acp.agent.ActivePrompt.report_final_text_delivery_failure",
+        lambda self, reason: (_ for _ in ()).throw(RuntimeError("reporting failed")),
+    )
+
+    response = await acp.prompt(
+        session_id,
+        [acp_sdk.TextContentBlock(type="text", text="answer")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert all(
+        update.session_update != "agent_message_chunk"
+        for update in client.updates
+    )
+
+
 def test_agent_prompt_respects_cross_platform_pull_false(tmp_path: Path) -> None:
     agent = _build_agent(
         tmp_path,

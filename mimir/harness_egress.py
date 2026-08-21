@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from .access_control import SinkGate, get_sink_category
@@ -16,6 +17,8 @@ def harness_sink_allowed(
     target_channel: str | None,
     ifc_labels: Any,
     auth_context: Any,
+    *,
+    on_refusal: Callable[[str], None] | None = None,
 ) -> bool:
     """Check one harness sink and record enforced or shadow denials."""
     if auth_context is not None:
@@ -32,6 +35,12 @@ def harness_sink_allowed(
     )
     if decision.allowed and not decision.is_shadow_decision:
         return True
+
+    if not decision.allowed and on_refusal is not None:
+        try:
+            on_refusal(decision.reason)
+        except Exception:  # noqa: BLE001 - failure reporting must not break delivery
+            log.debug("harness sink refusal callback failed", exc_info=True)
 
     try:
         log_event_sync(
