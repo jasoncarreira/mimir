@@ -74,6 +74,29 @@ def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None
         assert base in normalized, relative_path
 
 
+def test_factory_identity_preflight_contract_is_identical_in_bounded_documentation() -> None:
+    git_identity = (
+        "Before first factory dispatch only, after checkout creation and before process launch, "
+        "Worklink reads the effective checkout `git config --get user.name` and `git config "
+        "--get user.email`. Both must be nonblank. The child receives `GIT_AUTHOR_NAME`, "
+        "`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and `GIT_COMMITTER_EMAIL`; Worklink never "
+        "writes sandbox Git identity configuration."
+    )
+    publication = (
+        "Worklink reads the nonblank `publishing_identity` only from the trusted controller "
+        "checkout's `.factory.json`. For GitHub publication, nonblank `GH_TOKEN` wins over "
+        "`GITHUB_TOKEN`; otherwise `GITHUB_TOKEN` is selected. The selected token is explicitly "
+        "verified against the declared identity, then both child aliases are normalized to that "
+        "verified value. Differing credentials do not trigger fallback, and if neither exists "
+        "dispatch fails naming both variable names without disclosing values."
+    )
+
+    for relative_path in FACTORY_DOCS:
+        normalized = " ".join((ROOT / relative_path).read_text(encoding="utf-8").split())
+        assert git_identity in normalized, relative_path
+        assert publication in normalized, relative_path
+
+
 def test_internal_factory_status_contract_matches_runtime_binding() -> None:
     worklink = (ROOT / "docs/internal/WORKLINK.md").read_text(encoding="utf-8")
 
