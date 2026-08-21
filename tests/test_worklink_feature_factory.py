@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
@@ -12,6 +13,7 @@ import pytest
 from mimir.worklink.backends.base import WorkOrder
 from mimir.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
+    FACTORY_VERSION,
     FactoryContractError,
     FeatureFactoryBackend,
     epic_run_id,
@@ -57,11 +59,11 @@ def package_entrypoint(tmp_path: Path) -> Path:
     entrypoint = feature / "bin" / "factory.js"
     entrypoint.write_text("", encoding="utf-8")
     (feature / "package.json").write_text(
-        json.dumps({"name": "feature-factory", "version": "0.7.0"}),
+        json.dumps({"name": "feature-factory", "version": FACTORY_VERSION}),
         encoding="utf-8",
     )
     (adapter / "package.json").write_text(
-        json.dumps({"name": "opencode-feature-factory", "version": "0.7.0"}),
+        json.dumps({"name": "opencode-feature-factory", "version": FACTORY_VERSION}),
         encoding="utf-8",
     )
     return entrypoint
@@ -151,15 +153,34 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
+    assert FACTORY_VERSION == "0.7.2"
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
-    manifest = entrypoint.parents[1] / "package.json"
+
+
+@pytest.mark.parametrize(
+    ("package", "expected_name"),
+    [
+        ("feature-factory", "feature-factory"),
+        ("opencode-feature-factory", "opencode-feature-factory"),
+    ],
+)
+def test_resolve_entrypoint_rejects_either_package_version_mismatch(
+    tmp_path: Path,
+    package: str,
+    expected_name: str,
+) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": "feature-factory", "version": "0.6.0"}),
+        json.dumps({"name": expected_name, "version": "0.7.1"}),
         encoding="utf-8",
     )
-    with pytest.raises(FactoryContractError, match="feature-factory@0.7.0"):
+    with pytest.raises(
+        FactoryContractError,
+        match=rf"requires {expected_name}@{re.escape(FACTORY_VERSION)}",
+    ):
         resolve_factory_entrypoint(entrypoint)
 
 

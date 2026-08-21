@@ -50,8 +50,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.7.0` through the lockstep
-`opencode-feature-factory@0.7.0` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.7.2` through the lockstep
+`opencode-feature-factory@0.7.2` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -68,7 +68,7 @@ and final PR identity verification.
   Cancellation is verified process-group cancellation through `mimir worklink
   stop`; feature-factory has no cancel transition.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.7.0 verification and
+  Worklink admits the launcher only after package/adapter 0.7.2 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
