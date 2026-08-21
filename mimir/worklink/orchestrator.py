@@ -1315,11 +1315,19 @@ class WorklinkRunner:
             ]
         )
         if base_check.returncode != 0:
+            reason = (
+                f"base branch does not exist in origin: {base}"
+                if base_check.returncode == 2
+                else (
+                    "base branch lookup failed for origin: "
+                    f"{base} (git ls-remote exit code {base_check.returncode})"
+                )
+            )
             return WorklinkRunResult(
                 issue_id,
                 None,
                 "refused",
-                reason=f"base branch does not exist in origin: {base}",
+                reason=reason,
             )
         test_cmd = (
             repository_config.test_command

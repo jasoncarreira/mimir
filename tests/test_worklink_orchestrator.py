@@ -1857,6 +1857,44 @@ def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
 
 
+def test_run_epic_reports_target_branch_lookup_failure_without_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    epic_json = json.dumps(
+        {
+            "id": 701,
+            "title": "unreachable target",
+            "description": "Worklink notes:\n- Target branch: feature/acp",
+            "labels": ["worklink", "worklink:epic", "worklink:ready"],
+            "comments": [],
+        }
+    )
+    secret_stderr = "fatal: credential github-secret rejected"
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        assert isinstance(args, list)
+        if args[:4] == ["chainlink", "issue", "show", "701"]:
+            return cp(args, stdout=epic_json)
+        if args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        if "ls-remote" in args:
+            return cp(args, returncode=128, stderr=secret_stderr)
+        return cp(args)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(701))
+
+    assert result.status == "refused"
+    assert result.reason == (
+        "base branch lookup failed for origin: feature/acp "
+        "(git ls-remote exit code 128)"
+    )
+    assert secret_stderr not in result.reason
+
+
 def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
