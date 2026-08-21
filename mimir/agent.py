@@ -2340,7 +2340,13 @@ class Agent:
                 log.debug("hard-stop delivery bookkeeping failed", exc_info=True)
 
     @staticmethod
-    def _harness_sink_allowed(ctx: Any, target: str | None, sink_name: str) -> bool:
+    def _harness_sink_allowed(
+        ctx: Any,
+        target: str | None,
+        sink_name: str,
+        *,
+        on_refusal: Callable[[str], None] | None = None,
+    ) -> bool:
         """Apply IFC to a harness-owned final egress boundary."""
         auth_context = getattr(ctx, "auth_context", None)
         ifc_labels = getattr(ctx, "ifc_labels", None)
@@ -2349,7 +2355,39 @@ class Agent:
             target,
             ifc_labels,
             auth_context,
+            on_refusal=on_refusal,
         )
+
+    @staticmethod
+    def _report_acp_final_text_delivery_failure(reason: str) -> None:
+        """Report a scrubbed ACP delivery refusal without risking the turn."""
+        try:
+            from .tools.client_provider import get_turn_capability_context
+            from .turn_event_redaction import scrub_detail
+
+            raw_reason = str(reason).strip()
+            safe_reason = scrub_detail(raw_reason) or "delivery_refused"
+            safe_phrases = {
+                "ACP bridge is disconnected",
+                "ACP delivery failed",
+                "invalid ACP channel",
+                "rich ACP messages are unsupported",
+                "unbound ACP channel",
+            }
+            if raw_reason not in safe_phrases:
+                # Sink reasons are stable machine tokens. Keep that token but
+                # never forward an appended provider/transport diagnostic.
+                safe_reason = safe_reason.split(maxsplit=1)[0]
+            capability = get_turn_capability_context()
+            reporter = getattr(
+                getattr(capability, "permission_broker", None),
+                "report_final_text_delivery_failure",
+                None,
+            )
+            if reporter is not None:
+                reporter(safe_reason)
+        except Exception:  # noqa: BLE001 - reporting failure must not fail the turn
+            log.debug("ACP final-text refusal reporting failed", exc_info=True)
 
     async def _maybe_resend_nudge(
         self,
@@ -2478,6 +2516,11 @@ class Agent:
         parsed = parse_directives(output or "")
         clean_text = self._substantive_final_text(parsed.clean_text)
         acp_delivery = _is_acp_delivery_turn()
+
+        def refuse(reason: str) -> None:
+            if acp_delivery and clean_text:
+                self._report_acp_final_text_delivery_failure(reason)
+
         if clean_text is None and acp_delivery:
             # The substantiveness floor (>= 20 chars, >= 3 words) exists to
             # judge whether output is worth auto-shipping as *recovery* on a
@@ -2489,6 +2532,7 @@ class Agent:
         if clean_text is None and not parsed.directives:
             return
         if event.trigger != "user_message" or not turn_is_interactive:
+            refuse("turn_not_deliverable")
             return
         delivered = getattr(ctx, "delivered_channel_ids", None) or set()
         if event.channel_id in delivered:
@@ -2502,13 +2546,23 @@ class Agent:
         ):
             return
         if self._channels is None or not event.channel_id:
+            refuse("channel_unavailable")
             return
         bridge = self._channels.find(event.channel_id)
         if bridge is None:
+            refuse("bridge_unavailable")
             return
+        refusal_reason: str | None = None
+
+        def capture_refusal(reason: str) -> None:
+            nonlocal refusal_reason
+            refusal_reason = reason
+
         if not self._harness_sink_allowed(
             ctx, event.channel_id, "harness_auto_deliver",
+            on_refusal=capture_refusal,
         ):
+            refuse(refusal_reason or "delivery_refused")
             return
 
         result = None
@@ -2517,8 +2571,11 @@ class Agent:
                 result = await self._channels.send(event.channel_id, clean_text, final=False)
             except Exception:  # noqa: BLE001 — auto-recovery must not fail the turn
                 log.exception("auto-deliver final text send failed")
+                refuse("delivery_failed")
                 return
             if not getattr(result, "sent", True):
+                refusal = str(getattr(result, "error", None) or "").strip()
+                refuse(refusal or "delivery_refused")
                 try:
                     await safe_log_event(
                         "send_message_failed",

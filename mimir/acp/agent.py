@@ -158,6 +158,11 @@ class ActivePrompt:
     cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     progress_tokens: dict[str, ProgressTokenOwnership] = field(default_factory=dict)
     replaced: bool = False
+    final_text_delivery_failure: str | None = None
+
+    def report_final_text_delivery_failure(self, reason: str) -> None:
+        if self.final_text_delivery_failure is None:
+            self.final_text_delivery_failure = reason
 
     async def request_permission(
         self, eligibility: PermissionEligibility
@@ -633,6 +638,12 @@ class MimirAcpAgent:
             raise connection_replaced_error()
         if failed is not None:
             raise internal_error() from None
+        if active.final_text_delivery_failure is not None:
+            raise RequestError(
+                -32603,
+                "Final response delivery refused: "
+                f"{active.final_text_delivery_failure}",
+            )
         return response
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
