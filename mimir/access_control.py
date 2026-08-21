@@ -6891,6 +6891,21 @@ def _consume_task_exception(task: Any) -> None:
         log.error("shadow decision logging failed", exc_info=exc)
 
 
+def _operator_can_invoke_admin_shell(
+    tool_name: str,
+    ifc_labels: Any,
+    auth_context: "AuthContext | None",
+) -> bool:
+    """Admit shell only for an authenticated human on their live bridge turn."""
+    roles = (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
+    return (
+        tool_name == "shell_exec"
+        and not getattr(auth_context, "is_service", False)
+        and bool({"user", "admin"}.intersection(roles))
+        and SinkGate._is_trusted_operator_turn(ifc_labels, auth_context)
+    )
+
+
 class ToolRegistry:
     """Registry of runtime tools for inventory and authorization (chainlink #865).
 
@@ -7278,9 +7293,13 @@ class ToolRegistry:
         service_allowed_preliminary = (
             service_can_invoke_operation(preliminary_service, tool_name)
         )
+        operator_shell_allowed = _operator_can_invoke_admin_shell(
+            tool_name, ifc_labels, auth_context,
+        )
         preliminary_admin_denied = (
             preliminary_decision == OperationDecision.ADMIN_REQUIRED
             and not service_allowed_preliminary
+            and not operator_shell_allowed
             and "admin" not in (
                 (getattr(auth_context, "roles", ()) or ()) if auth_context else ()
             )
@@ -7348,7 +7367,10 @@ class ToolRegistry:
             would_block = False
         elif decision == OperationDecision.ADMIN_REQUIRED:
             required_tier = AccessTier.ADMIN
-            if auth_context and "admin" in (getattr(auth_context, "roles", ()) or ()):
+            if (
+                auth_context
+                and "admin" in (getattr(auth_context, "roles", ()) or ())
+            ) or operator_shell_allowed:
                 allowed = True
                 would_block = False
             elif service_allowed:
