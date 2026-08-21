@@ -1856,6 +1856,7 @@ def _factory_lifecycle_status(
     status: str,
     lock: str = "fresh",
     session: str | None = "session-1",
+    pr_base: str | None = "main",
 ) -> Any:
     return parse_factory_status(
         {
@@ -1866,7 +1867,7 @@ def _factory_lifecycle_status(
             "status": status,
             "mode": "autonomous",
             "branch": "epic/700",
-            "pr_base": "main",
+            "pr_base": pr_base,
             "pr_draft": False,
             "lock": lock,
             "dead_lock": False,
@@ -1898,6 +1899,42 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
         observed_at=None,
         controller_phase="running",
     )
+
+
+@pytest.mark.parametrize("lifecycle", ["running", "needs-human", "blocked", "partial"])
+def test_factory_status_binding_allows_null_base_before_completion(
+    tmp_path: Path,
+    lifecycle: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = _factory_lifecycle_status(sandbox, status=lifecycle, pr_base=None)
+
+    orchestrator._require_factory_status(status, record)
+    observed = record.observed(status, datetime.now(UTC).isoformat())
+    assert observed.status is not None
+    assert observed.status.pr_base is None
+
+
+def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _factory_lifecycle_record(
+        sandbox,
+        LaunchHandle("local_subprocess", "123", 456),
+    )
+    status = _factory_lifecycle_status(sandbox, status="running", pr_base="develop")
+
+    with pytest.raises(orchestrator.WorklinkError, match="base mismatch"):
+        orchestrator._require_factory_status(status, record)
 
 
 def test_factory_supervision_drains_exact_handle_while_status_is_polled(
@@ -2385,6 +2422,49 @@ def test_factory_completion_requires_entire_success_conjunction(
     assert pr_url == "https://github.com/owner/repo/pull/42"
     assert evidence["status"] == "completed"
     assert evidence["head_sha"] == "a" * 40
+
+
+@pytest.mark.parametrize("pr_base", [None, "develop"])
+def test_factory_completion_rejects_unbound_base_before_external_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pr_base: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    record = _completion_record(sandbox)
+    status = record.status
+    assert status is not None
+    object.__setattr__(record, "status", replace(status, pr_base=pr_base))
+    external_calls: list[str] = []
+
+    async def observed(**kwargs: object) -> EvidenceValidation:
+        external_calls.append("evidence")
+        return _completion_validation(sandbox)
+
+    def runner(
+        args: Sequence[str] | str,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        external_calls.append("runner")
+        return cp(args)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    with pytest.raises(orchestrator.WorklinkError, match="base mismatch"):
+        asyncio.run(
+            orchestrator._verify_factory_completion(
+                home=tmp_path,
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                record=record,
+                test_command="pytest -q",
+                started_at=datetime.now(UTC),
+                runner=runner,
+            )
+        )
+
+    assert external_calls == []
 
 
 def test_factory_completion_failure_never_transitions_to_review(

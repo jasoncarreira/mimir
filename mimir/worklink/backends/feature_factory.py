@@ -58,13 +58,13 @@ class FactoryContractError(RuntimeError):
 @dataclass(frozen=True)
 class FactoryStatus:
     run_id: str
-    issue_key: str
+    issue_key: str | None
     valid: bool
     sandbox_path: str
     status: str
     mode: str
     branch: str
-    pr_base: str
+    pr_base: str | None
     pr_draft: bool
     lock: str
     dead_lock: bool
@@ -143,7 +143,6 @@ _REQUIRED_STATUS_FIELDS = frozenset(
         "terminal_result",
     }
 )
-_STATUS_FIELDS = _REQUIRED_STATUS_FIELDS | {"next"}
 
 
 def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | None:
@@ -248,11 +247,8 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         raise FactoryContractError("factory status output exceeds bounds")
     keys = set(decoded)
     missing = _REQUIRED_STATUS_FIELDS - keys
-    unknown = keys - _STATUS_FIELDS
     if missing:
         raise FactoryContractError(f"factory status missing field: {sorted(missing)[0]}")
-    if unknown:
-        raise FactoryContractError(f"factory status contains unknown field: {sorted(unknown)[0]}")
     lock = _bounded_text(decoded["lock"], "lock")
     if lock not in {"fresh", "stale", "absent"}:
         raise FactoryContractError("factory status lock must be fresh, stale, or absent")
@@ -260,13 +256,13 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
     next_value = _bounded_text(decoded.get("next"), "next", nullable=True) if next_present else None
     return FactoryStatus(
         run_id=_bounded_text(decoded["run_id"], "run_id") or "",
-        issue_key=_bounded_text(decoded["issue_key"], "issue_key") or "",
+        issue_key=_bounded_text(decoded["issue_key"], "issue_key", nullable=True),
         valid=_bool(decoded["valid"], "valid"),
         sandbox_path=_bounded_text(decoded["sandbox_path"], "sandbox_path") or "",
         status=_bounded_text(decoded["status"], "status") or "",
         mode=_bounded_text(decoded["mode"], "mode") or "",
         branch=_bounded_text(decoded["branch"], "branch") or "",
-        pr_base=_bounded_text(decoded["pr_base"], "pr_base") or "",
+        pr_base=_bounded_text(decoded["pr_base"], "pr_base", nullable=True),
         pr_draft=_bool(decoded["pr_draft"], "pr_draft"),
         lock=lock,
         dead_lock=_bool(decoded["dead_lock"], "dead_lock"),

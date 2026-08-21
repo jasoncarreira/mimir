@@ -35,3 +35,21 @@ def test_current_factory_admission_claims_match_runtime_version() -> None:
     ) in configuration
     assert f"ship in\n{FACTORY_VERSION}." in configuration
     assert f"package/adapter {FACTORY_VERSION} verification" in worklink
+
+
+def test_internal_factory_status_contract_matches_runtime_binding() -> None:
+    worklink = (ROOT / "docs/internal/WORKLINK.md").read_text(encoding="utf-8")
+
+    assert "additive top-level fields are ignored" in worklink
+    assert (
+        "`issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null"
+        in worklink
+    )
+    assert "`validator` and `terminal_result` are object-or-null" in worklink
+    assert "requires a non-null matching issue key" in worklink
+    assert "A null PR base is\n  allowed during recovery" in worklink
+    assert "a populated base must always match the record" in worklink
+    assert (
+        "Completed\n  publication verification requires a non-null matching PR base before evidence"
+        in worklink
+    )

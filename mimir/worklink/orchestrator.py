@@ -1807,7 +1807,12 @@ def _verify_factory_recovery_binding(
     return sandbox
 
 
-def _require_factory_status(status: FactoryStatus, record: FactoryRunRecord) -> None:
+def _require_factory_status(
+    status: FactoryStatus,
+    record: FactoryRunRecord,
+    *,
+    require_pr_base: bool = False,
+) -> None:
     if not status.valid:
         raise WorklinkError("factory status is invalid")
     if status.run_id != record.run_id:
@@ -1820,7 +1825,9 @@ def _require_factory_status(status: FactoryStatus, record: FactoryRunRecord) -> 
         raise WorklinkError("factory status mode mismatch")
     if status.branch != record.branch:
         raise WorklinkError("factory status branch mismatch")
-    if status.pr_base != record.base_ref:
+    if status.pr_base is not None and status.pr_base != record.base_ref:
+        raise WorklinkError("factory status base mismatch")
+    if require_pr_base and status.pr_base is None:
         raise WorklinkError("factory status base mismatch")
 
 
@@ -1934,7 +1941,7 @@ async def _verify_factory_completion(
             raise WorklinkError("factory completion status is missing")
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
-        _require_factory_status(status, record)
+        _require_factory_status(status, record, require_pr_base=True)
         if status.pr_draft:
             raise WorklinkError("factory completed with a draft PR")
         if status.pr_url is None:
